@@ -1,4 +1,4 @@
-//! Hierarchical empirical-Bayes routing estimator (#4485), run in shadow.
+//! Hierarchical empirical-Bayes routing estimator (#4485).
 //!
 //! # Why this exists
 //!
@@ -10,104 +10,165 @@
 //! confidently as a peer seen two thousand times, and the 50% blend applies
 //! whether Renegade is right or wrong for this network.
 //!
-//! This estimator replaces all three with one model whose every weight is
-//! estimated from the data. It was selected on a synthetic bake-off
-//! (`exp/estimator-bakeoff`, commit e26a92c1d, estimator "H* on EB-shrunk long
-//! curve"): the only candidate that was not materially worse than legacy in any
-//! of 24 scenarios on both an original and a held-out confirmation seed set,
-//! and materially better in 21 of them. That evidence is synthetic; this module
-//! is shadow code so the same comparison can be made on real traffic before
-//! anything acts on it. Routing uses it only under `FREENET_ROUTING_HIERARCHICAL`.
+//! This estimator replaces all of that with one model whose every weight is
+//! estimated from the data. It is the intended REPLACEMENT for the legacy stack
+//! (Renegade, the per-peer EWMA, the fixed blend and the residual correction),
+//! which is removed in a later PR after a gateway soak. Until then it reaches
+//! routing only under `FREENET_ROUTING_HIERARCHICAL`, and is computed at all only
+//! when that flag is on or the routing dataset is being recorded.
+//!
+//! # Provenance, and what has changed since
+//!
+//! The structure was selected on a synthetic bake-off (`exp/estimator-bakeoff`,
+//! commit e26a92c1d, "H* on EB-shrunk long curve"). That bake-off validated a
+//! model WITH an attribute level, on a different traffic shape, and with the
+//! reference's estimators for the curve shrinkage and the variance components.
+//! A statistical review of the port found those estimators biased, and they have
+//! been replaced here (see "Estimators" below). The bake-off's numbers therefore
+//! describe a related model, not this one; the head-to-head tests in `router.rs`
+//! are what measure this one.
 //!
 //! # The model, per stage
 //!
 //! Each stage models one target on its own scale: failure as a probability
 //! (additive, clamped to `[0, 1]`), response time and transfer speed in natural
-//! log (so a composed prediction is multiplicative in seconds or bytes/s).
+//! log.
 //!
 //! 1. **Prior curve.** Isotonic (PAV) fit of the target on ring distance over
-//!    the last [`WINDOW_EVENTS`] events, refit every [`REFIT_EVERY`] events.
-//!    Each PAV block is then shrunk toward the pooled mean by
-//!    `B = tau2 / (tau2 + s2 / w_block)` (method of moments for `tau2`, pooled
-//!    residual variance for `s2`) and PAV is re-run so the result stays
-//!    monotone. Without the shrinkage a block resting on five events reads one
-//!    failure as 20%.
+//!    the last [`WINDOW_EVENTS`] events. Each PAV block mean is shrunk toward the
+//!    pooled mean and PAV is re-run over the shrunk blocks, so the result stays
+//!    monotone.
 //! 2. **Residuals against the CURRENT curve.** Every refit re-derives
 //!    `r = y - g(d)` for the whole window. Residuals stored against the curve as
 //!    it stood when each event arrived model a curve that no longer exists.
 //! 3. **Hierarchy root -> peer -> (peer, contract band).** Each node holds
-//!    exponentially-forgotten `(n, sum r, sum r^2)`. Variance components come
-//!    from method of moments at refit; a prediction descends the levels with a
-//!    normal-normal update (`B = P / (P + V)`), so a node with little evidence
-//!    contributes little and a missing node passes its level's variance down.
+//!    exponentially-forgotten `(n, sum w^2, sum r, sum r^2)`. A prediction
+//!    descends the levels with a normal-normal update (`B = P / (P + V)`), so a
+//!    node with little evidence contributes little and a missing node passes its
+//!    level's variance down.
 //! 4. **Forgetting horizon chosen online.** One hierarchy per horizon in
 //!    [`HORIZONS_HOURS`]; the one with the lowest decayed prequential squared
-//!    loss predicts. Every horizon is scored before the event is learned.
+//!    loss of its FINISHED forecast predicts. Every horizon is scored before the
+//!    event is learned.
+//!
+//! # Estimators
+//!
+//! - **Curve shrinkage** is the one-way random-effects method of moments for
+//!   unequal group sizes, over the PAV blocks as groups: `s2` is the pooled
+//!   within-block variance about the block means,
+//!   `tau2 = max(0, [sum w_b (ybar_b - g)^2 - (k-1) s2] / [W - sum w_b^2 / W])`,
+//!   and each block moves toward the pool by `B_b = tau2 / (tau2 + s2 / w_b)`.
+//!   What this does and does not give: a block resting on a handful of events
+//!   moves most of the way to the pool when the between-block variance is small
+//!   relative to its own sampling noise, and a real monotone trend backed by
+//!   well-populated blocks survives. It is not a guarantee about any single
+//!   block; `tau2` is estimated from the same blocks it is shrinking.
+//! - **Variance components** use leave-one-out contrasts: a cell is compared
+//!   with the mean of its peer's OTHER cells, and a peer with the mean of every
+//!   OTHER event, so a child never sits inside the mean it is compared against.
+//!   The earlier child-vs-parent form was biased low whenever one child
+//!   dominates its parent, which is the normal case under routing locality (a
+//!   peer mostly sees contracts near its own location). A peer seen in only one
+//!   band contributes nothing to `tau2_cell`: it has no other cell to contrast.
+//! - **Decayed evidence is counted by Kish effective size**, `n_eff = n^2 / sum
+//!   w^2`, in the sampling variance of every mean, in the degrees of freedom of
+//!   `sigma2`, and in the minimum-evidence gates. Counting the raw weight sum
+//!   instead overstates the evidence of a short horizon by about 2x, which drove
+//!   the between-group variance estimates to zero at low event rates.
+//! - **The descent uses each node's full mean**, not a leave-one-out mean. The
+//!   review measured a 4-5% gain from leave-one-out evidence in general but a 12%
+//!   loss with very few peers, which is exactly a young node's situation, so it
+//!   is not adopted.
+//!
+//! # Timing and speed return expectations
+//!
+//! The router's cost formula adds seconds and divides bytes by speed, so the
+//! stages return what those operations need, not medians: response time
+//! `E[T] = exp(mu + (sigma2 + v)/2)` and the effective transfer speed
+//! `exp(mu - (sigma2 + v)/2)`, whose reciprocal is `E[1/speed]`, so
+//! `bytes / speed = bytes * E[1/speed]`. `v` is the posterior variance of the
+//! peer's own mean. Keeping it in is deliberate: an unknown or rarely-seen peer
+//! carries more variance, so it is priced as slower, which is the cold-peer
+//! penalty the router wants rather than an optimism it would have to unlearn.
 //!
 //! # Where production differs from the reference, and why
 //!
-//! - **Time is wall-clock hours, not event count.** The reference assumed 60
-//!   events per hour, so its 1.5h horizon was 90 events. Production event rates
-//!   span orders of magnitude, and what the horizons exist to track (a peer
-//!   degrading, a region of the ring going bad) happens in wall-clock time. The
-//!   horizon is chosen by prequential loss, so a horizon that is wrong for a
-//!   node's rate is simply not selected. On a busy node the window, not the
-//!   horizon, is what bounds memory: 10k events at 10k/h is one hour, so every
-//!   horizon then sees about the same data, which is harmless. On a quiet node
-//!   (tens of events per hour) the horizons behave as the reference's did.
-//! - **Variance components are frozen between refits.** The reference
-//!   recomputed them for every prediction, which is `O(nodes)` per candidate.
-//!   Here they are recomputed at refit, i.e. at most [`REFIT_EVERY`] events
-//!   stale, exactly as stale as the curve they describe. Node counts and means
-//!   stay live, so a new peer's evidence is used from its first event.
+//! - **Time comes from the router's injected `TimeSource`**, as hours since the
+//!   router was built, not event count and not the host wall clock. Horizons
+//!   therefore advance under simulated time. The horizon is chosen by
+//!   prequential loss, so one that does not suit a node's event rate is simply
+//!   not selected; on a busy node the window binds before any horizon does.
+//! - **Variance components are frozen between refits**, exactly as stale as the
+//!   curve they describe. Node means stay live.
 //! - **Decay is stored epoch-scaled.** Sums are kept as
-//!   `sum_i exp((t_i - epoch)/h) x_i`, so reading a node at `now` is one
-//!   multiplication and an add needs no per-node timestamp. The same algebra
-//!   keeps the squared child counts the variance formulas need as running sums.
-//!   Each refit rebases the epoch to `now`; an add that would push the scale
-//!   past [`REBASE_EXPONENT`] forces a refit first.
+//!   `sum_i exp((t_i - epoch)/h) x_i`. Every quantity a prediction reads is a
+//!   ratio in which the scale cancels. Each refit rebases the epoch to `now`; an
+//!   add that would push the scale past [`REBASE_EXPONENT`] forces a refit first.
 //! - **No attribute level.** The router holds no cheap per-peer attribute at
-//!   `add_event` time (connection age, version and gateway status live behind
-//!   connection-manager locks). The level is skipped, which the reference's
-//!   `attribute: false` configuration also supports. Future work: feed one in
-//!   once the routing dataset shows which attribute carries signal.
-//! - **The log-scale curves are not floored at zero.** The reference clamped
-//!   every curve value at 0 because its timing target was log-milliseconds,
-//!   which is non-negative in practice. Production records seconds and bytes/s,
-//!   whose logs are routinely negative, so only the failure stage is clamped.
-//! - **Peers are bounded.** Peers churn, so the peer table is capped at
-//!   [`MAX_PEERS`] with batched least-recently-used eviction (entries are
+//!   `add_event` time. Future work, once the routing dataset shows which one
+//!   carries signal.
+//! - **Log stages are bounded.** Beyond the fitted distance range a log curve
+//!   holds its end value instead of extrapolating along the centroid line, and
+//!   every log prediction is clamped to the window's observed range widened by
+//!   [`LOG_PREDICTION_MARGIN`].
+//! - **Peers are bounded** by [`peer_capacity`], derived from the configured
+//!   connection cap, with batched least-recently-used eviction (entries are
 //!   refreshed by every event, so refusing newcomers would starve them — see
-//!   `.claude/rules/code-style.md`). Evictions are counted. An evicted peer's
-//!   events still inform the curve and the root; they no longer form a peer node.
+//!   `.claude/rules/code-style.md`). Evictions are counted and exported. An
+//!   evicted peer's events still inform the curve and the root.
 //!
 //! # Cost
 //!
 //! A prediction is one hash lookup, one binary search over the curve's blocks
 //! and a constant amount of arithmetic for the selected horizon. A refit is
-//! linear in the window: the window is kept sorted by distance with an in-place
-//! merge of the events since the last refit, so PAV never sorts, and the
-//! hierarchy rebuild touches each event once per horizon with no hashing.
+//! linear in the window, and once the window is full runs every
+//! [`refit_interval`] events.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use super::routing_predictor::{RoutingOutcome, wall_clock_hours};
+use super::routing_predictor::RoutingOutcome;
 use crate::ring::{Location, PeerKeyLocation};
 
 /// Events the prior curve and the hierarchy are fitted over.
 pub(crate) const WINDOW_EVENTS: usize = 10_000;
 
-/// Learned events between refits: the legacy isotonic estimator's own refit
-/// cadence at saturation, kept from the reference.
+/// Learned events between refits while the window is filling: the legacy
+/// isotonic estimator's own refit cadence, kept from the reference.
 pub(crate) const REFIT_EVERY: usize = 50;
+
+/// Once the window is full, refit after this share of it has turned over.
+///
+/// A refit is linear in the window and runs under the router's write lock, so
+/// its cadence is what sets the lock-hold budget. One percent of a full window
+/// changes the curve and the variance components by about one percent, which
+/// is well inside their own sampling error, so refitting more often buys
+/// nothing measurable.
+const REFIT_TURNOVER_DIVISOR: usize = 100;
 
 /// Below this many windowed events every event triggers a refit, so a cold
 /// stage acquires a curve immediately. Refits are trivially cheap at this size.
 const EAGER_REFIT_BELOW: usize = 100;
 
-/// A curve needs at least this many points before it is worth fitting.
-const MIN_CURVE_POINTS: usize = 5;
+/// Minimum points before the failure curve is fitted: the legacy isotonic
+/// estimator's own `MIN_POINTS_FOR_REGRESSION`. A failure curve is clamped to
+/// `[0, 1]`, so a sparse one cannot produce an out-of-range estimate.
+const MIN_CURVE_POINTS_FAILURE: usize = 5;
+
+/// Minimum points before a log-scale (timing, speed) curve is fitted.
+///
+/// Log response times and speeds are unbounded, and a log curve's error
+/// becomes a multiplicative error in the router's cost formula. At a typical
+/// log-space spread of 0.5-1.0, 30 events put the standard error of a pooled
+/// mean at 0.1-0.2 (a factor of about 1.1-1.2) and give the within-block
+/// variance roughly 25 degrees of freedom, which is where its own relative
+/// error falls below 30%. Five points, the failure floor, would allow a factor
+/// of two.
+const MIN_CURVE_POINTS_LOG: usize = 30;
+
+/// Log-scale predictions are clamped to the observed target range widened by
+/// this much on each side: a factor of two beyond anything the window has seen.
+pub(crate) const LOG_PREDICTION_MARGIN: f64 = std::f64::consts::LN_2;
 
 /// Contract-location bands per peer: `band = floor(8 * contract_location)`.
 pub(crate) const BANDS: usize = 8;
@@ -115,25 +176,49 @@ const _: () = assert!(BANDS.is_power_of_two(), "band masking needs a power of tw
 
 /// Forgetting horizons, in hours. `None` forgets nothing inside the window.
 /// Powers of four down from 24h, as in the reference.
-pub(crate) const HORIZONS_HOURS: [Option<f64>; 4] = [None, Some(24.0), Some(6.0), Some(1.5)];
+pub(crate) const HORIZONS_HOURS: [Option<f64>; HORIZONS] = [None, Some(24.0), Some(6.0), Some(1.5)];
+pub(crate) const HORIZONS: usize = 4;
 
 /// Forgetting of the horizon selector's accumulated loss, in hours.
 const SELECTOR_FORGETTING_HOURS: f64 = 24.0;
 
-/// Peers tracked per stage. Production nodes run `max_connections = 200`;
-/// this leaves room for churn inside one window without evicting live peers.
-pub(crate) const MAX_PEERS: usize = 512;
+/// Floor on the peer table, for nodes configured with very few connections.
+const MIN_PEER_CAPACITY: usize = 64;
 
 /// Largest decay exponent an epoch-scaled weight may carry before a refit
 /// rebases it. `e^30` keeps every weight far from overflow and precision loss.
 const REBASE_EXPONENT: f64 = 30.0;
 
-/// Below this effective count a node carries no usable evidence. Guards the
-/// variance formulas against a count that decay has underflowed toward zero.
-const MIN_EFFECTIVE_COUNT: f64 = 1e-12;
+/// Minimum Kish effective sample size for a node to count as replicated.
+const MIN_EFFECTIVE_N: f64 = 2.0;
 
 /// Floor on the pooled within-cell variance, as in the reference.
 const MIN_SIGMA2: f64 = 1e-9;
+
+/// Response times below this are floored before taking the log.
+///
+/// The legacy multiplicative estimator ingests a 0 s response as-is; a log
+/// stage cannot. A sub-millisecond time to first response is below anything
+/// the router can act on, so it is recorded as one millisecond and counted.
+pub(crate) const MIN_RESPONSE_SECS: f64 = 1e-3;
+
+/// Peer-table capacity for a node with this connection cap.
+///
+/// Every peer that appears in the event stream is, or was, a connection. Twice
+/// the cap lets the whole connection set turn over once inside a window before
+/// an active peer can be evicted; the floor covers tiny configurations.
+pub(crate) fn peer_capacity(max_connections: usize) -> usize {
+    max_connections.saturating_mul(2).max(MIN_PEER_CAPACITY)
+}
+
+/// Events between refits for a window of this size and fill.
+pub(crate) fn refit_interval(window_capacity: usize, windowed: usize) -> usize {
+    if windowed >= window_capacity {
+        REFIT_EVERY.max(window_capacity / REFIT_TURNOVER_DIVISOR)
+    } else {
+        REFIT_EVERY
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Targets
@@ -158,11 +243,25 @@ impl Target {
         }
     }
 
-    /// Map a composed value onto the target's range.
-    fn finish(self, value: f64) -> f64 {
+    fn is_log(self) -> bool {
         match self {
-            Target::Failure => value.clamp(0.0, 1.0),
-            Target::LogResponseTime | Target::LogTransferSpeed => value,
+            Target::Failure => false,
+            Target::LogResponseTime | Target::LogTransferSpeed => true,
+        }
+    }
+
+    fn min_curve_points(self) -> usize {
+        if self.is_log() {
+            MIN_CURVE_POINTS_LOG
+        } else {
+            MIN_CURVE_POINTS_FAILURE
+        }
+    }
+
+    fn valid(self, y: f64) -> bool {
+        match self {
+            Target::Failure => (0.0..=1.0).contains(&y),
+            Target::LogResponseTime | Target::LogTransferSpeed => y.is_finite(),
         }
     }
 }
@@ -181,19 +280,22 @@ struct Block {
 
 /// A monotone piecewise-linear curve.
 ///
-/// Built and read with exactly the semantics of `pav_regression` 0.7, which the
-/// reference used: equal-`x` points are ordered by descending `y` so they pool,
-/// a violating neighbour is pooled into the incoming point, and queries outside
-/// the block range extrapolate along the line through the end block and the
-/// centroid of the input. Reimplemented rather than called because the crate
-/// re-sorts its input on every fit, and the window here is already sorted;
-/// `curve_matches_pav_regression` pins the equivalence.
+/// PAV and interpolation follow `pav_regression` 0.7 exactly (equal-`x` points
+/// ordered by descending `y` so they pool; queries outside the block range
+/// extrapolate along the line through the end block and the input centroid),
+/// pinned by `curve_matches_pav_regression`. Reimplemented because the crate
+/// re-sorts its input on every fit and the window here is already sorted.
 #[derive(Debug, Clone)]
 struct Curve {
     /// Blocks in ascending `x`.
     blocks: Vec<Block>,
     /// Weighted centroid of the input points.
     centroid: (f64, f64),
+    /// Hold the end values beyond the block range instead of extrapolating.
+    flat_ends: bool,
+    /// Pooled within-block variance of the raw fit, the curve's own estimate of
+    /// single-observation noise. `None` without replication.
+    within_variance: Option<f64>,
 }
 
 impl Curve {
@@ -231,15 +333,19 @@ impl Curve {
         Some(Curve {
             blocks,
             centroid: (sum_x / sum_w, sum_y / sum_w),
+            flat_ends: false,
+            within_variance: None,
         })
     }
 
-    /// The reference's EB-shrunk curve over `window`, sorted by `(x, -y)`.
-    fn fit_shrunk(window: &[Event], ascending: bool) -> Option<Curve> {
-        if window.len() < MIN_CURVE_POINTS {
+    /// The shrunk curve over `window`, sorted by `(x, -y)`, using the one-way
+    /// random-effects method of moments over the PAV blocks (module docs).
+    fn fit_shrunk(window: &[Event], target: Target) -> Option<Curve> {
+        if window.len() < target.min_curve_points() {
             return None;
         }
-        let fit = Curve::pav(
+        let ascending = target.ascending();
+        let mut fit = Curve::pav(
             window.iter().map(|event| Block {
                 x: event.distance,
                 y: event.y,
@@ -247,40 +353,46 @@ impl Curve {
             }),
             ascending,
         )?;
-        let blocks = &fit.blocks;
-        let total: f64 = blocks.iter().map(|block| block.w).sum();
-        if blocks.len() < 2 || total <= 0.0 {
+        fit.flat_ends = target.is_log();
+        let k = fit.blocks.len();
+        let n = window.len();
+        if n <= k {
+            // No replication inside any block: noise and signal cannot be told
+            // apart, so there is nothing principled to shrink by.
             return Some(fit);
         }
-        let grand = blocks.iter().map(|block| block.w * block.y).sum::<f64>() / total;
-        let (mut ss, mut sw) = (0.0, 0.0);
-        let mut cursor = 0;
-        for event in window {
-            if let Some(fitted) = fit.value_sorted(event.distance, &mut cursor) {
-                ss += (event.y - fitted).powi(2);
-                sw += 1.0;
-            }
+        let sum_y2: f64 = window.iter().map(|event| event.y * event.y).sum();
+        let explained: f64 = fit.blocks.iter().map(|b| b.w * b.y * b.y).sum();
+        let s2 = (sum_y2 - explained).max(0.0) / (n - k) as f64;
+        fit.within_variance = Some(s2);
+        if k < 2 {
+            return Some(fit);
         }
-        let s2 = if sw > 0.0 { ss / sw } else { 0.0 };
-        let tau2 = (blocks
-            .iter()
-            .map(|block| (block.y - grand).powi(2) - s2 / block.w)
-            .sum::<f64>()
-            / blocks.len() as f64)
-            .max(0.0);
-        let shrunk = blocks.iter().map(|block| {
+        let total: f64 = fit.blocks.iter().map(|b| b.w).sum();
+        let grand = fit.blocks.iter().map(|b| b.w * b.y).sum::<f64>() / total;
+        let between: f64 = fit.blocks.iter().map(|b| b.w * (b.y - grand).powi(2)).sum();
+        let denominator = total - fit.blocks.iter().map(|b| b.w * b.w).sum::<f64>() / total;
+        let tau2 = if denominator > 0.0 {
+            ((between - (k - 1) as f64 * s2) / denominator).max(0.0)
+        } else {
+            0.0
+        };
+        let shrunk = fit.blocks.iter().map(|b| {
             let factor = if tau2 > 0.0 {
-                tau2 / (tau2 + s2 / block.w)
+                tau2 / (tau2 + s2 / b.w)
             } else {
                 0.0
             };
             Block {
-                x: block.x,
-                y: grand + factor * (block.y - grand),
-                w: block.w,
+                x: b.x,
+                y: grand + factor * (b.y - grand),
+                w: b.w,
             }
         });
-        Curve::pav(shrunk, ascending).or(Some(fit))
+        let mut shrunk = Curve::pav(shrunk, ascending)?;
+        shrunk.flat_ends = fit.flat_ends;
+        shrunk.within_variance = fit.within_variance;
+        Some(shrunk)
     }
 
     fn value(&self, x: f64) -> Option<f64> {
@@ -310,9 +422,17 @@ impl Curve {
             len => {
                 let above = *cursor;
                 if above == 0 {
-                    interpolate(blocks[0], centroid, x)
+                    if self.flat_ends {
+                        blocks[0].y
+                    } else {
+                        interpolate(blocks[0], centroid, x)
+                    }
                 } else if above == len {
-                    interpolate(centroid, blocks[len - 1], x)
+                    if self.flat_ends {
+                        blocks[len - 1].y
+                    } else {
+                        interpolate(centroid, blocks[len - 1], x)
+                    }
                 } else {
                     interpolate(blocks[above - 1], blocks[above], x)
                 }
@@ -330,11 +450,14 @@ fn interpolate(a: Block, b: Block, x: f64) -> f64 {
 // Hierarchy
 // ---------------------------------------------------------------------------
 
-/// Epoch-scaled forgotten moments: true value at `now` is the stored value
-/// times the level's `scale(now)`. Means are scale-free.
-#[derive(Debug, Clone, Copy, Default)]
+/// Epoch-scaled forgotten moments. Every quantity read from them is a ratio in
+/// which the epoch scale cancels (`n^2 / w2`, `w2 / n^2`, means).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Moments {
+    /// `sum w`.
     n: f64,
+    /// `sum w^2`.
+    w2: f64,
     sum: f64,
     sumsq: f64,
 }
@@ -342,6 +465,7 @@ struct Moments {
 impl Moments {
     fn add(&mut self, weight: f64, value: f64) {
         self.n += weight;
+        self.w2 += weight * weight;
         self.sum += weight * value;
         self.sumsq += weight * value * value;
     }
@@ -349,13 +473,32 @@ impl Moments {
     fn mean(&self) -> f64 {
         self.sum / self.n
     }
+
+    /// Kish effective sample size.
+    fn effective_n(&self) -> f64 {
+        if self.w2 > 0.0 {
+            self.n * self.n / self.w2
+        } else {
+            0.0
+        }
+    }
+
+    fn replicated(&self) -> bool {
+        self.effective_n() >= MIN_EFFECTIVE_N
+    }
+
+    /// Sampling variance of the mean per unit single-observation variance:
+    /// `sum w^2 / (sum w)^2 = 1 / n_eff`.
+    fn mean_variance_factor(&self) -> f64 {
+        self.w2 / (self.n * self.n)
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PeerNode {
     peer: Moments,
     cells: [Moments; BANDS],
-    /// `sum over bands of cells[b].n^2`, epoch-scaled squared.
+    /// `sum over bands of cells[b].n^2`.
     sq_cells: f64,
 }
 
@@ -364,10 +507,17 @@ struct PeerNode {
 struct Components {
     /// Pooled within-cell variance.
     sigma2: f64,
-    /// Between-peer variance of peer effects around the root.
+    /// Between-peer variance of peer effects.
     tau2_peer: f64,
-    /// Between-cell variance of cell effects around their peer.
+    /// Between-cell variance of cell effects within a peer.
     tau2_cell: f64,
+}
+
+/// Posterior of the residual at a query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Posterior {
+    mean: f64,
+    variance: f64,
 }
 
 /// One hierarchy, forgetting at one horizon.
@@ -420,11 +570,6 @@ impl Level {
         self.exponent(time).exp()
     }
 
-    /// Factor converting stored values into true values at `now`.
-    fn scale(&self, now: f64) -> f64 {
-        (-self.exponent(now).max(0.0)).exp()
-    }
-
     fn add(&mut self, slot: Option<usize>, band: usize, weight: f64, residual: f64) {
         self.root.add(weight, residual);
         let Some(slot) = slot else {
@@ -437,7 +582,7 @@ impl Level {
         let before = node.peer.n;
         node.peer.add(weight, residual);
         self.sq_peers += 2.0 * before * weight + weight * weight;
-        let cell = &mut node.cells[band];
+        let cell = &mut node.cells[band & (BANDS - 1)];
         let before = cell.n;
         cell.add(weight, residual);
         let delta = 2.0 * before * weight + weight * weight;
@@ -446,8 +591,7 @@ impl Level {
     }
 
     /// Accumulate a whole prepared window into a freshly reset level. The
-    /// squared-count sums are left for `recount_squares`, which recomputes them
-    /// exactly anyway, so this loop does only the moment updates.
+    /// squared-count sums are left for `recount_squares`.
     fn rebuild(&mut self, prepared: &mut [Prepared], weighting: Weighting) {
         let mut root = Moments::default();
         let nodes = &mut self.nodes;
@@ -463,20 +607,10 @@ impl Level {
                     event.weight
                 }
             };
-            let weighted = weight * event.residual;
-            let weighted_sq = weighted * event.residual;
-            root.n += weight;
-            root.sum += weighted;
-            root.sumsq += weighted_sq;
+            root.add(weight, event.residual);
             if let Some(node) = nodes.get_mut(event.slot as usize) {
-                node.peer.n += weight;
-                node.peer.sum += weighted;
-                node.peer.sumsq += weighted_sq;
-                // `band < BANDS` by construction; the mask spares a bounds check.
-                let cell = &mut node.cells[event.band as usize & (BANDS - 1)];
-                cell.n += weight;
-                cell.sum += weighted;
-                cell.sumsq += weighted_sq;
+                node.peer.add(weight, event.residual);
+                node.cells[event.band as usize & (BANDS - 1)].add(weight, event.residual);
             }
         }
         self.root = root;
@@ -502,78 +636,85 @@ impl Level {
         }
     }
 
-    /// The reference's `snapshot` variance components, evaluated at the epoch
-    /// (a refit always rebases the epoch to now, so stored counts are true).
+    /// Variance components by method of moments on leave-one-out contrasts,
+    /// with decayed evidence counted by Kish effective size (module docs).
     fn compute_components(&self) -> Option<Components> {
         let (mut ss, mut df) = (0.0, 0.0);
         for node in &self.nodes {
             for cell in &node.cells {
-                if cell.n >= 2.0 {
+                if cell.replicated() {
                     ss += (cell.sumsq - cell.sum * cell.sum / cell.n).max(0.0);
-                    df += cell.n - 1.0;
+                    df += cell.n - cell.w2 / cell.n;
                 }
             }
         }
-        if df < 2.0 {
+        if df <= 0.0 || !self.root.replicated() {
             return None;
         }
         let sigma2 = (ss / df).max(MIN_SIGMA2);
-        let base = self.root.mean();
-        if !base.is_finite() {
-            return None;
-        }
 
-        let (mut acc, mut count) = (0.0, 0.0);
-        for node in &self.nodes {
-            for cell in &node.cells {
-                if cell.n >= 2.0 {
-                    acc += (cell.mean() - node.peer.mean()).powi(2)
-                        - sigma2 * (1.0 / cell.n - 1.0 / node.peer.n).max(0.0);
-                    count += 1.0;
-                }
-            }
-        }
-        let tau2_cell = if count > 0.0 {
-            (acc / count).max(0.0)
-        } else {
-            0.0
-        };
-
-        let (mut acc, mut count) = (0.0, 0.0);
+        // tau2_cell: each replicated cell against the mean of its peer's other
+        // cells. Weighted by the design factor of that contrast so peers whose
+        // other cells are thin do not dominate.
+        let (mut acc, mut den) = (0.0, 0.0);
         for node in &self.nodes {
             let peer = node.peer;
-            if peer.n < 2.0 {
+            for cell in &node.cells {
+                if !cell.replicated() {
+                    continue;
+                }
+                let rest = peer.n - cell.n;
+                if rest <= peer.n * 1e-9 {
+                    continue;
+                }
+                let rest_w2 = (peer.w2 - cell.w2).max(0.0);
+                let contrast = cell.mean() - (peer.sum - cell.sum) / rest;
+                let noise = sigma2 * (cell.mean_variance_factor() + rest_w2 / (rest * rest));
+                acc += contrast * contrast - noise;
+                den += 1.0 + (node.sq_cells - cell.n * cell.n).max(0.0) / (rest * rest);
+            }
+        }
+        let tau2_cell = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
+
+        // tau2_peer: each replicated peer against the mean of every other
+        // windowed event (including events whose peer has been evicted).
+        let root = self.root;
+        let (mut acc, mut den) = (0.0, 0.0);
+        for node in &self.nodes {
+            let peer = node.peer;
+            if !peer.replicated() {
                 continue;
             }
-            let noise = tau2_cell * node.sq_cells / (peer.n * peer.n) + sigma2 / peer.n;
-            acc += (peer.mean() - base).powi(2) - noise;
-            count += 1.0;
+            let rest = root.n - peer.n;
+            if rest <= root.n * 1e-9 {
+                continue;
+            }
+            let rest_w2 = (root.w2 - peer.w2).max(0.0);
+            let contrast = peer.mean() - (root.sum - peer.sum) / rest;
+            let noise = tau2_cell
+                * (node.sq_cells / (peer.n * peer.n)
+                    + (self.sq_cells - node.sq_cells).max(0.0) / (rest * rest))
+                + sigma2 * (peer.mean_variance_factor() + rest_w2 / (rest * rest));
+            acc += contrast * contrast - noise;
+            den += 1.0 + (self.sq_peers - peer.n * peer.n).max(0.0) / (rest * rest);
         }
-        let tau2_peer = if count > 0.0 {
-            (acc / count).max(0.0)
-        } else {
-            0.0
-        };
+        let tau2_peer = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
 
-        let components = Components {
-            sigma2,
-            tau2_peer,
-            tau2_cell,
-        };
         [sigma2, tau2_peer, tau2_cell]
             .iter()
             .all(|value| value.is_finite())
-            .then_some(components)
+            .then_some(Components {
+                sigma2,
+                tau2_peer,
+                tau2_cell,
+            })
     }
 
-    /// Posterior mean residual at a query, descending root -> peer -> cell with
-    /// the reference's normal-normal update. `0.0` with no components.
-    fn residual(&self, slot: Option<usize>, band: usize, now: f64) -> f64 {
-        let Some(components) = self.components else {
-            return 0.0;
-        };
-        let scale = self.scale(now);
-        // `(mean, noise)` of a node, or `None` where the reference had none.
+    /// Posterior of the residual at a query, descending root -> peer -> cell
+    /// with a normal-normal update. `None` without components.
+    fn residual(&self, slot: Option<usize>, band: usize) -> Option<Posterior> {
+        let components = self.components?;
+        // `(mean, noise)` of a node, or `None` where there is no node.
         let step = |(mu, v): (f64, f64), node: Option<(f64, f64)>, tau2: f64| match node {
             Some((mean, noise)) if tau2 > 0.0 => {
                 let prior = tau2 + v;
@@ -584,11 +725,11 @@ impl Level {
         };
 
         let mut state = (0.0, 0.0);
-        let root_n = self.root.n * scale;
-        if root_n >= 2.0 {
-            let n2 = self.root.n * self.root.n;
-            let mean = self.root.mean();
-            let noise = components.sigma2 / root_n
+        let root = self.root;
+        if root.replicated() {
+            let n2 = root.n * root.n;
+            let mean = root.mean();
+            let noise = components.sigma2 * root.mean_variance_factor()
                 + components.tau2_peer * self.sq_peers.max(0.0) / n2
                 + components.tau2_cell * self.sq_cells.max(0.0) / n2;
             let tau2_root = (mean * mean - noise).max(0.0);
@@ -597,24 +738,26 @@ impl Level {
 
         let node = slot.and_then(|slot| self.nodes.get(slot));
         let peer = node.and_then(|node| {
-            let n = node.peer.n * scale;
-            (n > MIN_EFFECTIVE_COUNT).then(|| {
-                let noise = components.tau2_cell * node.sq_cells.max(0.0)
-                    / (node.peer.n * node.peer.n)
-                    + components.sigma2 / n;
-                (node.peer.mean(), noise)
+            let peer = node.peer;
+            (peer.n > 0.0 && peer.w2 > 0.0).then(|| {
+                let noise = components.tau2_cell * node.sq_cells.max(0.0) / (peer.n * peer.n)
+                    + components.sigma2 * peer.mean_variance_factor();
+                (peer.mean(), noise)
             })
         });
         state = step(state, peer, components.tau2_peer);
 
         let cell = node.and_then(|node| {
-            let cell = node.cells[band];
-            let n = cell.n * scale;
-            (n > MIN_EFFECTIVE_COUNT).then(|| (cell.mean(), components.sigma2 / n))
+            let cell = node.cells[band & (BANDS - 1)];
+            (cell.n > 0.0 && cell.w2 > 0.0)
+                .then(|| (cell.mean(), components.sigma2 * cell.mean_variance_factor()))
         });
         state = step(state, cell, components.tau2_cell);
 
-        if state.0.is_finite() { state.0 } else { 0.0 }
+        (state.0.is_finite() && state.1.is_finite()).then_some(Posterior {
+            mean: state.0,
+            variance: state.1.max(0.0),
+        })
     }
 }
 
@@ -665,17 +808,22 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
             .map(|slot| slot.generation)
     }
 
-    /// Slot for `key`, marking it used. Returns the evicted slots, which the
-    /// caller must clear from every level before using the returned slot.
-    fn touch(&mut self, key: &K) -> (usize, u32, Vec<usize>) {
+    /// Evictions per batch: `capacity / 64`, at least one.
+    fn batch(&self) -> usize {
+        (self.capacity / 64).max(1)
+    }
+
+    /// Slot for `key`, marking it used. Evicted slots are appended to
+    /// `evicted`; the caller must clear them from every level before using the
+    /// returned slot.
+    fn touch(&mut self, key: &K, evicted: &mut Vec<usize>) -> (usize, u32) {
         self.use_clock += 1;
         if let Some(&slot) = self.index.get(key) {
             self.slots[slot].last_used = self.use_clock;
-            return (slot, self.slots[slot].generation, Vec::new());
+            return (slot, self.slots[slot].generation);
         }
-        let mut evicted = Vec::new();
         if self.index.len() >= self.capacity {
-            evicted = self.evict_batch();
+            self.evict_batch(evicted);
         }
         let slot = match self.free.pop() {
             Some(slot) => slot,
@@ -693,16 +841,15 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
         self.slots[slot].occupied = true;
         self.slots[slot].last_used = self.use_clock;
         self.index.insert(key.clone(), slot);
-        (slot, self.slots[slot].generation, evicted)
+        (slot, self.slots[slot].generation)
     }
 
-    /// Evict the least-recently-used `capacity / 64` (at least one) peers.
+    /// Evict the least-recently-used batch of peers.
     ///
     /// A batch, not one: the scan is linear in the capacity, and on a node whose
     /// churn keeps the table full, one eviction per new peer would be a scan
     /// per event.
-    fn evict_batch(&mut self) -> Vec<usize> {
-        let batch = (self.capacity / 64).max(1);
+    fn evict_batch(&mut self, evicted: &mut Vec<usize>) {
         let mut occupied: Vec<(u64, usize)> = self
             .slots
             .iter()
@@ -710,15 +857,14 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
             .filter(|(_, slot)| slot.occupied)
             .map(|(index, slot)| (slot.last_used, index))
             .collect();
-        let batch = batch.min(occupied.len());
+        let batch = self.batch().min(occupied.len());
         if batch == 0 {
-            return Vec::new();
+            return;
         }
         if batch < occupied.len() {
             occupied.select_nth_unstable(batch - 1);
         }
-        let victims: Vec<usize> = occupied[..batch].iter().map(|&(_, slot)| slot).collect();
-        for &slot in &victims {
+        for &(_, slot) in &occupied[..batch] {
             if let Some(key) = self.keys[slot].take() {
                 self.index.remove(&key);
             }
@@ -726,9 +872,9 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
             entry.occupied = false;
             entry.generation = entry.generation.wrapping_add(1);
             self.free.push(slot);
+            evicted.push(slot);
         }
-        self.evictions += victims.len() as u64;
-        victims
+        self.evictions += batch as u64;
     }
 }
 
@@ -765,7 +911,7 @@ fn band_of(contract_location: f64) -> usize {
 
 /// A windowed event reduced to what a hierarchy rebuild needs.
 #[derive(Debug, Clone, Copy)]
-struct Prepared {
+pub(crate) struct Prepared {
     residual: f64,
     time: f64,
     /// Scratch: the epoch-scaled weight at the level being rebuilt.
@@ -774,6 +920,14 @@ struct Prepared {
     /// index: slots are bounded by the peer table's capacity.
     slot: u32,
     band: u8,
+}
+
+/// Buffers a refit needs, owned once and shared by every stage so no stage
+/// keeps a window-sized allocation of its own between refits.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Scratch {
+    prepared: Vec<Prepared>,
+    evicted: Vec<usize>,
 }
 
 /// How a level weights prepared events during a rebuild.
@@ -797,11 +951,22 @@ fn integer_rate_ratio(slower_hours: f64, faster_hours: f64) -> Option<i32> {
     ((ratio - rounded).abs() < 1e-9 && (2.0..=16.0).contains(&rounded)).then_some(rounded as i32)
 }
 
+/// A stage's forecast on its own scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Forecast {
+    /// Probability, or the log-scale location `mu`.
+    pub value: f64,
+    /// Predictive variance of a single log observation, `sigma2 + v_post`.
+    /// Zero for the failure stage, which does not use it.
+    pub spread: f64,
+}
+
 /// Read-only state of a stage, for the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StageDiagnostics {
     pub window_events: usize,
     pub peers: usize,
+    pub peer_capacity: usize,
     pub peer_evictions: u64,
     pub refits: u64,
     /// Inputs refused as non-finite or out of range, never learned.
@@ -827,44 +992,48 @@ pub(crate) struct Stage<K> {
     next_seq: u64,
     since_refit: usize,
     curve: Option<Curve>,
+    /// Smallest and largest target in the window at the last refit.
+    observed_range: (f64, f64),
     peers: PeerTable<K>,
-    levels: Vec<Level>,
+    levels: [Level; HORIZONS],
     /// Decayed prequential squared loss per horizon.
-    loss: Vec<f64>,
+    loss: [f64; HORIZONS],
     loss_time: Option<f64>,
-    /// Latest time seen. Time never runs backwards inside a stage: a wall clock
-    /// that steps back is read as "no time has passed".
+    /// Latest time seen. Time never runs backwards inside a stage: a clock that
+    /// steps back is read as "no time has passed".
     clock: f64,
     refits: u64,
     rejected: u64,
     orphaned_at_last_refit: usize,
-    /// Reused rebuild buffer, so a refit allocates nothing in steady state.
-    prepared: Vec<Prepared>,
 }
 
 impl<K: Hash + Eq + Clone> Stage<K> {
-    pub(crate) fn new(target: Target) -> Self {
-        Self::with_limits(target, WINDOW_EVENTS, MAX_PEERS)
+    pub(crate) fn new(target: Target, peer_capacity: usize) -> Self {
+        Self::with_limits(target, WINDOW_EVENTS, peer_capacity)
     }
 
-    pub(crate) fn with_limits(target: Target, window_capacity: usize, max_peers: usize) -> Self {
+    pub(crate) fn with_limits(
+        target: Target,
+        window_capacity: usize,
+        peer_capacity: usize,
+    ) -> Self {
         Stage {
             target,
-            window_capacity: window_capacity.max(MIN_CURVE_POINTS),
+            window_capacity: window_capacity.max(target.min_curve_points()),
             sorted: Vec::new(),
             fresh: Vec::new(),
             next_seq: 0,
             since_refit: 0,
             curve: None,
-            peers: PeerTable::new(max_peers),
-            levels: HORIZONS_HOURS.iter().map(|&h| Level::new(h)).collect(),
-            loss: vec![0.0; HORIZONS_HOURS.len()],
+            observed_range: (f64::NEG_INFINITY, f64::INFINITY),
+            peers: PeerTable::new(peer_capacity),
+            levels: HORIZONS_HOURS.map(Level::new),
+            loss: [0.0; HORIZONS],
             loss_time: None,
             clock: f64::NEG_INFINITY,
             refits: 0,
             rejected: 0,
             orphaned_at_last_refit: 0,
-            prepared: Vec::new(),
         }
     }
 
@@ -883,7 +1052,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
     /// decayed by the same factor, so comparing stored sums is exact.
     fn selected(&self) -> usize {
         let mut best = 0;
-        for index in 1..self.loss.len() {
+        for index in 1..HORIZONS {
             if self.loss[index] < self.loss[best] {
                 best = index;
             }
@@ -891,28 +1060,46 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         best
     }
 
-    /// Prior curve value and per-horizon residuals at a query, before
-    /// finishing. `None` without a curve.
-    fn components_at(
-        &self,
-        peer: &K,
-        contract_location: f64,
-        distance: f64,
-        now: f64,
-    ) -> Option<(f64, Vec<f64>)> {
-        let prior = self.target.finish(self.curve.as_ref()?.value(distance)?);
-        let slot = self.peers.lookup(peer);
-        let band = band_of(contract_location);
-        let residuals = self
-            .levels
-            .iter()
-            .map(|level| level.residual(slot, band, now))
-            .collect();
-        Some((prior, residuals))
+    /// Map a composed value onto the target's range.
+    fn bound(&self, value: f64) -> f64 {
+        match self.target {
+            Target::Failure => value.clamp(0.0, 1.0),
+            Target::LogResponseTime | Target::LogTransferSpeed => {
+                let (low, high) = self.observed_range;
+                value.clamp(low - LOG_PREDICTION_MARGIN, high + LOG_PREDICTION_MARGIN)
+            }
+        }
     }
 
-    /// Prediction on the target's scale (probability, or log seconds / log
-    /// bytes per second). `None` until the stage has a curve.
+    fn prior(&self, distance: f64) -> Option<f64> {
+        Some(self.bound(self.curve.as_ref()?.value(distance)?))
+    }
+
+    /// The forecast one horizon makes at a query, given the prior.
+    fn forecast_with(
+        &self,
+        level: usize,
+        slot: Option<usize>,
+        band: usize,
+        prior: f64,
+    ) -> Forecast {
+        let posterior = self.levels[level].residual(slot, band);
+        let value = self.bound(prior + posterior.map_or(0.0, |p| p.mean));
+        let spread = match self.target {
+            Target::Failure => 0.0,
+            Target::LogResponseTime | Target::LogTransferSpeed => {
+                let sigma2 = self.levels[level]
+                    .components
+                    .map(|c| c.sigma2)
+                    .or(self.curve.as_ref().and_then(|c| c.within_variance))
+                    .unwrap_or(0.0);
+                sigma2 + posterior.map_or(0.0, |p| p.variance)
+            }
+        };
+        Forecast { value, spread }
+    }
+
+    /// Forecast on the target's scale. `None` until the stage has a curve.
     ///
     /// `O(1)` in the window: one hash lookup, one binary search over the
     /// curve's blocks, and the selected horizon's arithmetic.
@@ -921,57 +1108,56 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         peer: &K,
         contract_location: f64,
         distance: f64,
-        now: f64,
-    ) -> Option<f64> {
-        let now = self.effective_time(now);
-        let prior = self.target.finish(self.curve.as_ref()?.value(distance)?);
-        let slot = self.peers.lookup(peer);
-        let band = band_of(contract_location);
-        let residual = self.levels[self.selected()].residual(slot, band, now);
-        let value = self.target.finish(prior + residual);
-        value.is_finite().then_some(value)
+    ) -> Option<Forecast> {
+        let prior = self.prior(distance)?;
+        let forecast = self.forecast_with(
+            self.selected(),
+            self.peers.lookup(peer),
+            band_of(contract_location),
+            prior,
+        );
+        (forecast.value.is_finite() && forecast.spread.is_finite()).then_some(forecast)
     }
 
     /// Learn one outcome, returning the forecast made for it BEFORE learning
     /// it. Every horizon is scored on that same pre-learning state.
     pub(crate) fn observe(
         &mut self,
+        scratch: &mut Scratch,
         peer: &K,
         contract_location: f64,
         distance: f64,
         y: f64,
         now: f64,
-    ) -> Option<f64> {
-        let valid_y = match self.target {
-            Target::Failure => (0.0..=1.0).contains(&y),
-            Target::LogResponseTime | Target::LogTransferSpeed => y.is_finite(),
-        };
-        if !valid_y || !distance.is_finite() {
+    ) -> Option<Forecast> {
+        if !self.target.valid(y) || !distance.is_finite() {
             self.rejected += 1;
             return None;
         }
         let now = self.effective_time(now);
         self.clock = now;
+        let band = band_of(contract_location);
 
         let mut forecast = None;
-        let mut prior_used = None;
-        if let Some((prior, residuals)) = self.components_at(peer, contract_location, distance, now)
-        {
-            let selected = residuals[self.selected()];
-            let value = self.target.finish(prior + selected);
-            forecast = value.is_finite().then_some(value);
-            self.score(&residuals, y - prior, now);
-            prior_used = Some(prior);
+        let prior = self.prior(distance);
+        if let Some(prior) = prior {
+            let slot = self.peers.lookup(peer);
+            let forecasts: [Forecast; HORIZONS] =
+                std::array::from_fn(|level| self.forecast_with(level, slot, band, prior));
+            let selected = forecasts[self.selected()];
+            forecast =
+                (selected.value.is_finite() && selected.spread.is_finite()).then_some(selected);
+            self.score(&forecasts, y, now);
         }
 
-        let (slot, generation, evicted) = self.peers.touch(peer);
-        for victim in evicted {
+        scratch.evicted.clear();
+        let (slot, generation) = self.peers.touch(peer, &mut scratch.evicted);
+        for &victim in &scratch.evicted {
             for level in &mut self.levels {
                 level.evict(victim);
             }
         }
-        let band = band_of(contract_location);
-        let event = Event {
+        self.fresh.push(Event {
             distance,
             y,
             time: now,
@@ -979,19 +1165,16 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             slot: slot as u32,
             generation,
             band: band as u8,
-        };
+        });
         self.next_seq += 1;
-        self.fresh.push(event);
         self.since_refit += 1;
 
         let mut must_rebase = false;
-        if let Some(prior) = prior_used {
-            for level in &mut self.levels {
-                if level.exponent(now) > REBASE_EXPONENT {
-                    must_rebase = true;
-                    break;
-                }
-            }
+        if let Some(prior) = prior {
+            must_rebase = self
+                .levels
+                .iter()
+                .any(|level| level.exponent(now) > REBASE_EXPONENT);
             if !must_rebase {
                 for level in &mut self.levels {
                     let weight = level.weight(now);
@@ -1001,18 +1184,23 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         }
 
         let windowed = self.sorted.len() + self.fresh.len();
-        if windowed < EAGER_REFIT_BELOW || self.since_refit >= REFIT_EVERY || must_rebase {
-            self.refit(now);
+        if windowed < EAGER_REFIT_BELOW
+            || self.since_refit >= refit_interval(self.window_capacity, windowed)
+            || must_rebase
+        {
+            self.refit(scratch, now);
         }
         forecast
     }
 
-    fn score(&mut self, residuals: &[f64], actual_residual: f64, now: f64) {
+    /// Score every horizon's FINISHED forecast, i.e. the clamped value the
+    /// router would act on, not the unclamped residual.
+    fn score(&mut self, forecasts: &[Forecast; HORIZONS], y: f64, now: f64) {
         let factor = self.loss_time.map_or(1.0, |then| {
             (-(now - then).max(0.0) / SELECTOR_FORGETTING_HOURS).exp()
         });
-        for (loss, predicted) in self.loss.iter_mut().zip(residuals) {
-            let error = (predicted - actual_residual).powi(2);
+        for (loss, forecast) in self.loss.iter_mut().zip(forecasts) {
+            let error = (forecast.value - y).powi(2);
             if error.is_finite() {
                 *loss = *loss * factor + error;
             } else {
@@ -1024,19 +1212,26 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 
     /// Merge fresh events into the sorted window, drop expired ones, refit the
     /// curve, and rebuild every hierarchy against it. Linear in the window.
-    fn refit(&mut self, now: f64) {
+    fn refit(&mut self, scratch: &mut Scratch, now: f64) {
         self.refits += 1;
         self.since_refit = 0;
         self.merge_fresh();
-        if let Some(curve) = Curve::fit_shrunk(&self.sorted, self.target.ascending()) {
+        if let Some(curve) = Curve::fit_shrunk(&self.sorted, self.target) {
             self.curve = Some(curve);
         }
+        self.observed_range = self
+            .sorted
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), event| {
+                (low.min(event.y), high.max(event.y))
+            });
         for level in &mut self.levels {
             level.reset(now);
         }
-        if self.prepare() {
-            self.rebuild_levels(now);
+        if self.prepare(&mut scratch.prepared) {
+            self.rebuild_levels(&mut scratch.prepared, now);
         }
+        scratch.prepared.clear();
     }
 
     /// Fold events learned since the last refit into the sorted window and drop
@@ -1070,21 +1265,16 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         }
     }
 
-    /// Re-anchor every windowed residual on the current curve. `false` without
-    /// a curve.
-    fn prepare(&mut self) -> bool {
+    /// Re-anchor every windowed residual on the current curve, linearly, since
+    /// the window is sorted by distance. `false` without a curve.
+    fn prepare(&mut self, prepared: &mut Vec<Prepared>) -> bool {
         let Some(curve) = self.curve.as_ref() else {
             return false;
         };
-        // One pass to re-anchor every residual on the new curve (linear, since
-        // the window is sorted by distance), then one tight pass per level.
-        // Level-at-a-time keeps each level's node table hot in cache, and lets
-        // a faster horizon's weight be an integer power of the slower one's
-        // (24h -> 6h -> 1.5h are powers of four) rather than a fresh `exp`.
         let mut orphaned = 0;
         let mut cursor = 0;
-        self.prepared.clear();
-        self.prepared.reserve_exact(self.sorted.len());
+        prepared.clear();
+        prepared.reserve_exact(self.sorted.len());
         for event in &self.sorted {
             let Some(value) = curve.value_sorted(event.distance, &mut cursor) else {
                 continue;
@@ -1093,8 +1283,8 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             if !live {
                 orphaned += 1;
             }
-            self.prepared.push(Prepared {
-                residual: event.y - self.target.finish(value),
+            prepared.push(Prepared {
+                residual: event.y - self.bound(value),
                 time: event.time,
                 weight: 1.0,
                 slot: if live { event.slot } else { u32::MAX },
@@ -1102,13 +1292,14 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             });
         }
         self.orphaned_at_last_refit = orphaned;
-
         true
     }
 
     /// Accumulate the prepared window into every (already reset) level and
-    /// recompute its variance components.
-    fn rebuild_levels(&mut self, now: f64) {
+    /// recompute its variance components. One tight pass per level keeps each
+    /// level's node table hot in cache, and lets a faster horizon's weight be an
+    /// integer power of the slower one's (24h -> 6h -> 1.5h are powers of four).
+    fn rebuild_levels(&mut self, prepared: &mut [Prepared], now: f64) {
         let slots = self.peers.slots.len();
         let mut previous_hours: Option<f64> = None;
         for level in &mut self.levels {
@@ -1127,7 +1318,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                     weighting
                 }
             };
-            level.rebuild(&mut self.prepared, weighting);
+            level.rebuild(prepared, weighting);
         }
         for level in &mut self.levels {
             level.recount_squares();
@@ -1139,6 +1330,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         StageDiagnostics {
             window_events: self.sorted.len() + self.fresh.len(),
             peers: self.peers.index.len(),
+            peer_capacity: self.peers.capacity,
             peer_evictions: self.peers.evictions,
             refits: self.refits,
             rejected: self.rejected,
@@ -1157,29 +1349,40 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Observed {
     pub failure: Option<f64>,
-    /// Forecast of `ln(seconds)` to response start, made for every event
-    /// whether or not it turned out to be timed, so timing can be evaluated
-    /// offline against the timed subset.
+    /// Log-scale location `mu` of the response-time forecast, in log seconds,
+    /// made for every event whether or not it turned out to be timed, so timing
+    /// can be evaluated offline against the timed subset.
     pub log_response_time: Option<f64>,
 }
 
-/// A routing estimate on the router's own units.
+/// A routing estimate in the router's own units.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Estimate {
     pub failure_probability: Option<f64>,
+    /// Expected time to response start, `E[T]`, in seconds.
     pub time_to_response_start_secs: Option<f64>,
+    /// Effective transfer speed in bytes/s: the reciprocal of `E[1/speed]`, so
+    /// that `bytes / speed` is the expected transfer time.
     pub transfer_speed_bps: Option<f64>,
 }
 
-/// The estimator for all three router stages, on a shared relative clock.
+/// Minimum estimator hours between two saturation log lines.
+const SATURATION_LOG_INTERVAL_HOURS: f64 = 1.0;
+
+/// The estimator for all three router stages.
 #[derive(Clone)]
 pub(crate) struct HierarchicalRouting {
     failure: Stage<PeerKeyLocation>,
     response_time: Stage<PeerKeyLocation>,
     transfer_speed: Stage<PeerKeyLocation>,
-    /// Wall-clock hours at construction; times are relative to this, following
-    /// the Renegade predictor's convention.
-    reference_time_hours: f64,
+    scratch: Scratch,
+    /// Timed successes whose response time was floored to [`MIN_RESPONSE_SECS`].
+    floored_response_times: u64,
+    /// Successes that carried no transfer-speed sample (zero payload or zero
+    /// duration). Not rejections: there was nothing to learn.
+    non_speed_samples: u64,
+    last_saturation_log: Option<f64>,
+    evictions_at_last_log: u64,
 }
 
 impl std::fmt::Debug for HierarchicalRouting {
@@ -1193,21 +1396,23 @@ impl std::fmt::Debug for HierarchicalRouting {
 }
 
 impl HierarchicalRouting {
-    pub(crate) fn new() -> Self {
+    /// An estimator whose peer tables hold [`peer_capacity`]`(max_connections)`.
+    pub(crate) fn new(max_connections: usize) -> Self {
+        let capacity = peer_capacity(max_connections);
         HierarchicalRouting {
-            failure: Stage::new(Target::Failure),
-            response_time: Stage::new(Target::LogResponseTime),
-            transfer_speed: Stage::new(Target::LogTransferSpeed),
-            reference_time_hours: wall_clock_hours(),
+            failure: Stage::new(Target::Failure, capacity),
+            response_time: Stage::new(Target::LogResponseTime, capacity),
+            transfer_speed: Stage::new(Target::LogTransferSpeed, capacity),
+            scratch: Scratch::default(),
+            floored_response_times: 0,
+            non_speed_samples: 0,
+            last_saturation_log: None,
+            evictions_at_last_log: 0,
         }
     }
 
-    /// Estimator time for a wall-clock reading in hours.
-    pub(crate) fn time_at(&self, wall_clock_hours: f64) -> f64 {
-        wall_clock_hours - self.reference_time_hours
-    }
-
-    /// Learn one routing outcome, returning the forecasts made before it.
+    /// Learn one routing outcome at estimator time `time` (hours), returning
+    /// the forecasts made before it.
     pub(crate) fn observe_at(
         &mut self,
         peer: &PeerKeyLocation,
@@ -1217,56 +1422,118 @@ impl HierarchicalRouting {
         time: f64,
     ) -> Observed {
         let contract = contract_location.as_f64();
-        let log_response_time = self.response_time.predict(peer, contract, distance, time);
-        let failure = self.failure.observe(
-            peer,
-            contract,
-            distance,
-            if outcome.success { 0.0 } else { 1.0 },
-            time,
-        );
+        let log_response_time = self
+            .response_time
+            .predict(peer, contract, distance)
+            .map(|forecast| forecast.value);
+        let failure = self
+            .failure
+            .observe(
+                &mut self.scratch,
+                peer,
+                contract,
+                distance,
+                if outcome.success { 0.0 } else { 1.0 },
+                time,
+            )
+            .map(|forecast| forecast.value);
         if let Some(seconds) = outcome.time_to_response_start_secs {
-            // `ln` of zero or a negative is not a learnable time; `observe`
-            // counts the non-finite result as rejected.
-            let log = if seconds > 0.0 {
-                seconds.ln()
+            let seconds = if (0.0..MIN_RESPONSE_SECS).contains(&seconds) {
+                self.floored_response_times += 1;
+                MIN_RESPONSE_SECS
             } else {
-                f64::NAN
+                seconds
             };
-            self.response_time
-                .observe(peer, contract, distance, log, time);
+            // Negative or non-finite times are refused and counted by `observe`.
+            self.response_time.observe(
+                &mut self.scratch,
+                peer,
+                contract,
+                distance,
+                seconds.ln(),
+                time,
+            );
         }
-        if let Some(speed) = outcome.transfer_speed_bps {
-            let log = if speed > 0.0 { speed.ln() } else { f64::NAN };
-            self.transfer_speed
-                .observe(peer, contract, distance, log, time);
+        match outcome.transfer_speed_bps {
+            // A zero speed is a zero-byte payload (SUBSCRIBE), which legacy also
+            // skips: not a sample, so not a rejection either.
+            Some(speed) if speed > 0.0 => {
+                self.transfer_speed.observe(
+                    &mut self.scratch,
+                    peer,
+                    contract,
+                    distance,
+                    speed.ln(),
+                    time,
+                );
+            }
+            Some(_) => self.non_speed_samples += 1,
+            None => {
+                if outcome.time_to_response_start_secs.is_some() {
+                    self.non_speed_samples += 1;
+                }
+            }
         }
+        self.log_saturation(time);
         Observed {
             failure,
             log_response_time,
         }
     }
 
-    pub(crate) fn estimate_at(
+    /// Info-level, rate-limited notice that the peer tables are evicting live
+    /// entries. Evictions are the signal that `max_connections` headroom is too
+    /// small for this node's churn.
+    fn log_saturation(&mut self, time: f64) {
+        let evictions = self.total_evictions();
+        if evictions == self.evictions_at_last_log {
+            return;
+        }
+        let due = self
+            .last_saturation_log
+            .is_none_or(|then| time - then >= SATURATION_LOG_INTERVAL_HOURS);
+        if !due {
+            return;
+        }
+        tracing::info!(
+            evictions_total = evictions,
+            evictions_since_last_notice = evictions - self.evictions_at_last_log,
+            peer_capacity = self.failure.peers.capacity,
+            "hierarchical routing estimator: peer table full, evicting least-recently-used peers"
+        );
+        self.last_saturation_log = Some(time);
+        self.evictions_at_last_log = evictions;
+    }
+
+    pub(crate) fn total_evictions(&self) -> u64 {
+        self.failure.peers.evictions
+            + self.response_time.peers.evictions
+            + self.transfer_speed.peers.evictions
+    }
+
+    /// Estimate every stage in router units.
+    pub(crate) fn estimate(
         &self,
         peer: &PeerKeyLocation,
         contract_location: Location,
         distance: f64,
-        time: f64,
     ) -> Estimate {
         let contract = contract_location.as_f64();
         Estimate {
-            failure_probability: self.failure.predict(peer, contract, distance, time),
+            failure_probability: self
+                .failure
+                .predict(peer, contract, distance)
+                .map(|forecast| forecast.value),
             time_to_response_start_secs: self
                 .response_time
-                .predict(peer, contract, distance, time)
-                .map(f64::exp)
+                .predict(peer, contract, distance)
+                .map(|f| (f.value + f.spread / 2.0).exp())
                 .filter(|seconds| seconds.is_finite()),
             transfer_speed_bps: self
                 .transfer_speed
-                .predict(peer, contract, distance, time)
-                .map(f64::exp)
-                .filter(|speed| speed.is_finite()),
+                .predict(peer, contract, distance)
+                .map(|f| (f.value - f.spread / 2.0).exp())
+                .filter(|speed| speed.is_finite() && *speed > 0.0),
         }
     }
 
@@ -1276,6 +1543,14 @@ impl HierarchicalRouting {
             self.response_time.diagnostics(),
             self.transfer_speed.diagnostics(),
         ]
+    }
+
+    pub(crate) fn non_speed_samples(&self) -> u64 {
+        self.non_speed_samples
+    }
+
+    pub(crate) fn floored_response_times(&self) -> u64 {
+        self.floored_response_times
     }
 }
 

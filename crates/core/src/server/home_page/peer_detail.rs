@@ -33,6 +33,28 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
+/// What the hierarchical rows show when the estimator is not being computed,
+/// so an empty reading is not mistaken for a model with nothing to say.
+const NOT_COMPUTED: &str =
+    "&mdash; not computed (set FREENET_ROUTING_HIERARCHICAL or FREENET_ROUTING_DATASET)";
+
+/// Render the hierarchical peer-table eviction count against its capacity.
+///
+/// Evictions mean churn is exceeding the headroom derived from
+/// `max_connections`, which an operator can act on, so a non-zero count says so.
+fn fmt_evictions(computed: bool, evictions: u64, capacity: usize) -> String {
+    if !computed {
+        return NOT_COMPUTED.to_string();
+    }
+    if evictions == 0 {
+        format!("0 (capacity {capacity} per stage)")
+    } else {
+        format!(
+            "{evictions} (capacity {capacity} per stage) &mdash; churn exceeds the table's headroom"
+        )
+    }
+}
+
 /// Render the hierarchical estimator's selected forgetting horizon.
 ///
 /// `None` means two different things depending on whether the stage has any
@@ -185,7 +207,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The first rows are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the end points, not the rows in order.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, a peer seen thousands of times moves it fully. It replaces all of the above rather than adding to any of them. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It replaces all of the above rather than adding to any of them, and is planned to replace them for good once it has proven itself. It is only computed while it routes or while the routing dataset is being recorded. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
                 <div class="info-grid">
                     <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
                     <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
@@ -195,6 +217,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
                     <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
                     <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
+                    <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -252,17 +275,32 @@ pub fn peer_detail_html(address_str: &str) -> String {
             } else {
                 " &mdash; measured, not applied"
             },
-            skill_hierarchical = fmt_skill(rs.failure_skill_hierarchical),
+            skill_hierarchical = if rs.hierarchical_computed {
+                fmt_skill(rs.failure_skill_hierarchical)
+            } else {
+                NOT_COMPUTED.to_string()
+            },
             hierarchical_note = if rs.hierarchical_routing_enabled {
                 " &mdash; in use"
-            } else {
+            } else if rs.hierarchical_computed {
                 " &mdash; measured, not applied"
+            } else {
+                " &mdash; off"
             },
-            hierarchical_eval = rs.hierarchical_failure_evaluated,
-            hierarchical_horizon = fmt_horizon(
-                rs.hierarchical_failure_events,
-                rs.hierarchical_failure_horizon_hours
+            hierarchical_evictions = fmt_evictions(
+                rs.hierarchical_computed,
+                rs.hierarchical_peer_evictions,
+                rs.hierarchical_peer_capacity
             ),
+            hierarchical_eval = rs.hierarchical_failure_evaluated,
+            hierarchical_horizon = if rs.hierarchical_computed {
+                fmt_horizon(
+                    rs.hierarchical_failure_events,
+                    rs.hierarchical_failure_horizon_hours,
+                )
+            } else {
+                NOT_COMPUTED.to_string()
+            },
             layers_eval = rs.failure_layers_evaluated,
             corr_enabled = if rs.residual_correction_enabled {
                 "Yes"
@@ -657,6 +695,30 @@ mod tests {
     }
 
     #[test]
+    fn eviction_rendering_flags_churn_and_says_when_not_computed() {
+        assert_eq!(fmt_evictions(true, 0, 400), "0 (capacity 400 per stage)");
+        let churning = fmt_evictions(true, 12, 400);
+        assert!(
+            churning.contains("12") && churning.contains("headroom"),
+            "{churning}"
+        );
+        assert!(fmt_evictions(false, 0, 400).contains("not computed"));
+    }
+
+    /// The layer copy must not promise that evidence alone moves the estimate:
+    /// with no measured between-peer spread, a peer seen thousands of times
+    /// does not move it at all.
+    #[test]
+    fn layer_panel_does_not_overstate_what_evidence_buys() {
+        let source = include_str!("peer_detail.rs");
+        let start = source.find("pub fn peer_detail_html").unwrap();
+        let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
+        let render = &source[start..end];
+        assert!(!render.contains("moves it fully"));
+        assert!(render.contains("if peers turn out not to differ, not at all"));
+    }
+
+    #[test]
     fn horizon_rendering_distinguishes_no_events_from_no_forgetting() {
         assert!(fmt_horizon(0, None).contains("no events yet"));
         assert!(fmt_horizon(0, Some(6.0)).contains("no events yet"));
@@ -756,9 +818,27 @@ mod tests {
             panel.contains("two routes from the same starting point"),
             "the panel must say the rows are alternative routes, not a running total"
         );
+        // Scoped to the correction's own paragraph: the hierarchical paragraph
+        // also says "replaces", which would satisfy a panel-wide search even if
+        // the correction's wording regressed.
+        let routes_start = panel
+            .find("two routes from the same starting point")
+            .expect("the routes paragraph exists");
+        let paragraph_start = panel[..routes_start]
+            .rfind("<p")
+            .expect("the routes sentence sits in a paragraph");
+        let paragraph_end = panel[routes_start..]
+            .find("</p>")
+            .map(|offset| routes_start + offset)
+            .expect("the routes paragraph closes");
+        let correction_paragraph = &panel[paragraph_start..paragraph_end];
         assert!(
-            panel.contains("replaces"),
-            "the panel must say the correction REPLACES the per-peer offset"
+            correction_paragraph.contains("<strong>replaces</strong> the per-peer offset"),
+            "the correction paragraph must say the correction REPLACES the per-peer offset"
+        );
+        assert!(
+            !correction_paragraph.contains("hierarchical"),
+            "the correction paragraph must be its own paragraph"
         );
         assert!(
             panel.contains("separate, self-contained model")
