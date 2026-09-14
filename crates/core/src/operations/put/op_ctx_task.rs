@@ -659,6 +659,10 @@ async fn drive_client_put_inner(
                     .as_ref()
                     .is_some_and(|p| p.handle().local_store_committed()),
             );
+            // Intended (#5657): the attempts' Timeout labels stand even when
+            // this reports a local success. A router label says whether the
+            // hop replied within the budget, not what the client was told, and
+            // the hop did not reply.
             if locally_stored {
                 tracing::info!(
                     tx = %client_tx,

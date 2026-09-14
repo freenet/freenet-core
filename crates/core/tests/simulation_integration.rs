@@ -9033,8 +9033,9 @@ fn test_relay_route_events_multihop() {
 /// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
 /// originators recorded only their final success, so a production gateway saw
 /// 2 failures in 361 route events. Now timeouts and dropped connections are
-/// failures, a `NotFound` is a failure only when a later attempt in the SAME
-/// operation found the contract, and ambiguous `NotFound`s are not trained.
+/// failures, a `NotFound` is a failure only when a later reply in the SAME
+/// operation delivered state that passed validation, and ambiguous
+/// `NotFound`s are not trained.
 ///
 /// Two runs on the same 13-node topology and seed:
 ///
@@ -9263,6 +9264,18 @@ fn test_router_receives_failures_for_dead_end_gets() {
     );
     let (all_failures, all_successes) = evidence.aggregate_route_outcome_totals();
     assert!(all_successes > 0, "routers must receive success labels");
+    // A NotFound is labelled only with existence proof: a later reply's state
+    // stored and validated in the same GET. The GETs after the PUT must
+    // produce some.
+    let not_found_labels: u64 = per_node
+        .iter()
+        .map(|(_, (not_found, _, _), _)| not_found)
+        .sum();
+    assert!(
+        not_found_labels > 0,
+        "some GET must label a NotFound hop a failure once a later reply's state \
+         passed validation; per node={per_node:?}"
+    );
     // Per node: of the nodes that were neither crashed nor #5654's node (see
     // the spacing comment), at least MIN_NODES_WITH_TIMEOUT_LABELS must have
     // fed their OWN router a timeout or send-failure label.

@@ -520,7 +520,7 @@ async fn drive_client_get_inner(
                     // phase for an envelope-bundled payload).
                     payload_size =
                         state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
-                    cache_contract_locally(
+                    let validated_store = cache_contract_locally(
                         op_manager,
                         *key,
                         state.clone(),
@@ -529,6 +529,7 @@ async fn drive_client_get_inner(
                         crate::ring::HostingCause::ClientGet,
                     )
                     .await;
+                    driver.note_validated_state(key, validated_store);
                     *key
                 }
                 Terminal::Streaming {
@@ -1012,6 +1013,22 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
     }
 }
 
+impl GetRetryDriver<'_> {
+    /// Existence proof for this operation's routing labels (#5657): the
+    /// terminal's state was stored here and passed validation
+    /// (`validated_store`), it came from a remote peer this operation
+    /// contacted (a recorded hop), and it is for the requested contract.
+    /// Anything less proves nothing.
+    fn note_validated_state(&mut self, key: &ContractKey, validated_store: bool) {
+        if validated_store
+            && self.terminal_hop.is_some()
+            && is_existence_proof(&self.instance_id, key, None)
+        {
+            self.recorder.contract_exists();
+        }
+    }
+}
+
 impl RetryDriver for GetRetryDriver<'_> {
     type Terminal = Terminal;
 
@@ -1148,6 +1165,9 @@ struct AssemblyOutcome {
 struct StreamProgress {
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
+    /// The assembled state was stored and passed validation
+    /// (`cache_contract_locally`'s result).
+    validated_store: bool,
 }
 
 /// Structured streaming-assembly failure (#4345 telemetry). `message` is the
@@ -1157,6 +1177,11 @@ struct StreamProgress {
 struct AssemblyFailure {
     message: String,
     cause: StreamAbortCause,
+    /// Whether the failure is attributable to the peer that sent the header.
+    /// False for a cancelled stream (which also covers this node tearing the
+    /// connection or stream down) and for a claim waiter dropped on this
+    /// node; only attributable failures are labelled (#5657).
+    peer_caused: bool,
     fragments_received: Option<u32>,
     total_fragments: Option<u32>,
 }
@@ -1218,24 +1243,6 @@ async fn drive_get_with_assembly_retry(
 
     let outcome = loop {
         let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
-
-        // A Found or a streaming header from a REMOTE peer this operation
-        // actually contacted proves the contract exists, so any earlier
-        // `NotFound` attempt in this operation was a genuine routing failure.
-        // A local completion, or a terminal with no recorded hop (the loopback
-        // relay answered from this node's own copy), proves nothing.
-        let is_proof = match &result {
-            RetryLoopOutcome::Done(
-                Terminal::InlineFound { key, .. } | Terminal::Streaming { key, .. },
-            ) => is_existence_proof(&driver.instance_id, key, None),
-            RetryLoopOutcome::Done(Terminal::LocalCompletion)
-            | RetryLoopOutcome::Exhausted(_)
-            | RetryLoopOutcome::Unexpected
-            | RetryLoopOutcome::InfraError(_) => false,
-        };
-        if is_proof && driver.terminal_hop.is_some() {
-            driver.recorder.contract_exists();
-        }
 
         // Only a streaming terminal has a post-loop assembly step;
         // everything else passes through unchanged. Match by reference
@@ -1330,6 +1337,7 @@ async fn drive_get_with_assembly_retry(
         .await
         {
             Ok(progress) => {
+                driver.note_validated_state(&key, progress.validated_store);
                 assembly.transfer_duration = Some(stream_start.elapsed());
                 assembly.error = None;
                 assembly.fragments_received = progress.fragments_received;
@@ -1352,10 +1360,14 @@ async fn drive_get_with_assembly_retry(
                     .terminal_hop
                     .clone()
                     .filter(|hop| hop.socket_addr() == Some(peer_addr));
+                // Only a failure the peer caused is labelled (see
+                // `AssemblyFailure::peer_caused`). A rejected local store is
+                // not an assembly failure at all: `cache_contract_locally`
+                // reports it as `validated_store`.
                 driver.recorder.record_attempt(
                     failed_hop.as_ref(),
                     AttemptFailure::SendFailure,
-                    true,
+                    e.peer_caused,
                 );
                 // Capture the structured progress/cause for the terminal
                 // telemetry event BEFORE `e.message` is moved into
@@ -1463,28 +1475,40 @@ pub mod assembly_fault_injection {
     /// before/after to prove the retry path genuinely fired.
     pub static ASSEMBLY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    fn budgets() -> &'static Mutex<HashMap<ContractKey, usize>> {
-        static BUDGETS: OnceLock<Mutex<HashMap<ContractKey, usize>>> = OnceLock::new();
+    type Budget = (usize, super::StreamAbortCause);
+
+    fn budgets() -> &'static Mutex<HashMap<ContractKey, Budget>> {
+        static BUDGETS: OnceLock<Mutex<HashMap<ContractKey, Budget>>> = OnceLock::new();
         BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Arm `n` injected assembly failures for `key`.
+    /// Arm `n` injected assembly failures for `key`, as claim timeouts.
     pub fn inject_failures(key: ContractKey, n: usize) {
-        budgets().lock().expect("poisoned").insert(key, n);
+        inject_failures_with_cause(key, n, super::StreamAbortCause::ClaimTimeout);
     }
 
-    /// Consume one injected failure for `key`, if armed.
-    pub(crate) fn consume(key: &ContractKey) -> bool {
+    /// Arm `n` injected assembly failures for `key` with `cause`.
+    pub(crate) fn inject_failures_with_cause(
+        key: ContractKey,
+        n: usize,
+        cause: super::StreamAbortCause,
+    ) {
+        budgets().lock().expect("poisoned").insert(key, (n, cause));
+    }
+
+    /// Consume one injected failure for `key`, if armed, returning its cause.
+    pub(crate) fn consume(key: &ContractKey) -> Option<super::StreamAbortCause> {
         let mut map = budgets().lock().expect("poisoned");
         match map.get_mut(key) {
-            Some(n) if *n > 0 => {
+            Some((n, cause)) if *n > 0 => {
+                let cause = *cause;
                 *n -= 1;
                 if *n == 0 {
                     map.remove(key);
                 }
-                true
+                Some(cause)
             }
-            _ => false,
+            _ => None,
         }
     }
 }
@@ -1841,12 +1865,14 @@ async fn assemble_and_cache_stream(
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
     // stream is left orphaned for GC), so the retry path is exercised
-    // end-to-end; classify it as ClaimTimeout for the terminal event.
+    // end-to-end; classify it with the armed cause (ClaimTimeout unless a test
+    // chose another) for the terminal event.
     #[cfg(any(test, feature = "testing"))]
-    if assembly_fault_injection::consume(&expected_key) {
+    if let Some(cause) = assembly_fault_injection::consume(&expected_key) {
         return Err(AssemblyFailure {
             message: "injected stream assembly failure (assembly_fault_injection test hook)".into(),
-            cause: StreamAbortCause::ClaimTimeout,
+            peer_caused: !matches!(cause, StreamAbortCause::Cancelled),
+            cause,
             fragments_received: None,
             total_fragments: None,
         });
@@ -1875,6 +1901,7 @@ async fn assemble_and_cache_stream(
             return Err(AssemblyFailure {
                 message: format!("claim_or_wait: {e}"),
                 cause: StreamAbortCause::ClaimTimeout,
+                peer_caused: !matches!(e, OrphanStreamError::WaiterCancelled),
                 fragments_received: None,
                 total_fragments: None,
             });
@@ -1899,6 +1926,7 @@ async fn assemble_and_cache_stream(
             };
             return Err(AssemblyFailure {
                 message: format!("stream assembly: {e}"),
+                peer_caused: !matches!(cause, StreamAbortCause::Cancelled),
                 cause,
                 fragments_received,
                 total_fragments,
@@ -1920,6 +1948,7 @@ async fn assemble_and_cache_stream(
             return Err(AssemblyFailure {
                 message: format!("deserialize: {e}"),
                 cause: StreamAbortCause::Deserialize,
+                peer_caused: true,
                 fragments_received,
                 total_fragments,
             });
@@ -1937,6 +1966,7 @@ async fn assemble_and_cache_stream(
                 payload.key
             ),
             cause: StreamAbortCause::PayloadInvalid,
+            peer_caused: true,
             fragments_received,
             total_fragments,
         });
@@ -1950,6 +1980,7 @@ async fn assemble_and_cache_stream(
         return Err(AssemblyFailure {
             message: "stream payload has no state".into(),
             cause: StreamAbortCause::PayloadInvalid,
+            peer_caused: true,
             fragments_received,
             total_fragments,
         });
@@ -1966,10 +1997,12 @@ async fn assemble_and_cache_stream(
     // but it uses its own inline assemble+cache with `local_client_access =
     // false`; this path is the originator, which IS the client requester, so
     // the sticky `local_client_access` flag applies here.
-    cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
+    let validated_store =
+        cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
+        validated_store,
     })
 }
 
@@ -3969,12 +4002,7 @@ where
                 // Router. Without this hook, only originator-side successes
                 // train the failure-probability model and per-peer dashboard
                 // panels stay empty on relay-heavy nodes. In-memory only,
-                // safe to run before forwarding. A Found also proves the
-                // contract exists, which settles earlier NotFounds as
-                // failures.
-                if is_existence_proof(&instance_id, &key, reply_instance_id.as_ref()) {
-                    recorder.contract_exists();
-                }
+                // safe to run before forwarding.
                 crate::operations::record_relay_route_event(
                     op_manager,
                     peer.clone(),
@@ -4021,6 +4049,13 @@ where
                 let state_present =
                     cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
                         .await;
+                // Existence proof (#5657) only once the Found's state passed
+                // validation here; it settles earlier NotFounds as failures.
+                if state_present
+                    && is_existence_proof(&instance_id, &key, reply_instance_id.as_ref())
+                {
+                    recorder.contract_exists();
+                }
                 send_result?;
 
                 // Register the requester as a downstream subscriber (subscribe
@@ -4067,12 +4102,6 @@ where
                 // AFTER initiating the pipe. Mirrors
                 // `drive_relay_put_streaming`.
                 let own_addr = op_manager.ring.connection_manager.get_own_addr();
-
-                // A streaming header proves the contract exists, whether or
-                // not its stream is then delivered.
-                if is_existence_proof(&instance_id, &key, reply_instance_id.as_ref()) {
-                    recorder.contract_exists();
-                }
 
                 tracing::info!(
                     tx = %incoming_tx,
@@ -4155,7 +4184,7 @@ where
                                     } else {
                                         None
                                     };
-                                    cache_contract_locally(
+                                    let stored = cache_contract_locally(
                                         op_manager,
                                         payload.key,
                                         state,
@@ -4164,6 +4193,17 @@ where
                                         hosting_cause,
                                     )
                                     .await;
+                                    // Existence proof (#5657) only once the
+                                    // streamed state passed validation here.
+                                    if stored
+                                        && is_existence_proof(
+                                            &instance_id,
+                                            &payload.key,
+                                            reply_instance_id.as_ref(),
+                                        )
+                                    {
+                                        recorder.contract_exists();
+                                    }
                                     // Loopback delivery succeeded (state cached
                                     // locally): a consulted advertised host
                                     // closed the dead-end.
@@ -4291,7 +4331,7 @@ where
                                 } else {
                                     None
                                 };
-                                cache_contract_locally(
+                                let stored = cache_contract_locally(
                                     op_manager,
                                     payload.key,
                                     state,
@@ -4299,7 +4339,19 @@ where
                                     false,
                                     hosting_cause,
                                 )
-                                .await
+                                .await;
+                                // Existence proof (#5657) only once the
+                                // streamed state passed validation here.
+                                if stored
+                                    && is_existence_proof(
+                                        &instance_id,
+                                        &payload.key,
+                                        reply_instance_id.as_ref(),
+                                    )
+                                {
+                                    recorder.contract_exists();
+                                }
+                                stored
                             } else {
                                 tracing::warn!(
                                     tx = %incoming_tx,
@@ -6023,15 +6075,15 @@ mod tests {
         );
 
         // Unarmed keys never fail.
-        assert!(!assembly_fault_injection::consume(&key_b));
+        assert!(assembly_fault_injection::consume(&key_b).is_none());
 
         assembly_fault_injection::inject_failures(key_a, 2);
-        assert!(assembly_fault_injection::consume(&key_a));
+        assert!(assembly_fault_injection::consume(&key_a).is_some());
         // Other keys are unaffected while a budget is armed.
-        assert!(!assembly_fault_injection::consume(&key_b));
-        assert!(assembly_fault_injection::consume(&key_a));
+        assert!(assembly_fault_injection::consume(&key_b).is_none());
+        assert!(assembly_fault_injection::consume(&key_a).is_some());
         // Budget exhausted → assembly succeeds again.
-        assert!(!assembly_fault_injection::consume(&key_a));
+        assert!(assembly_fault_injection::consume(&key_a).is_none());
     }
 
     /// Pure-data regression test for the streaming payload shape the
@@ -7762,38 +7814,51 @@ mod tests {
             );
         }
 
-        // The InlineFound success arm must record SuccessUntimed and settle
-        // the search's pending NotFounds as failures (the contract exists).
-        let pos = body.unwrap_or_default_pos("downstream returned Found");
-        let after = &body[pos..pos + 1500.min(body.len() - pos)];
+        // Read with comments stripped, so neither a comment nor commented-out
+        // code satisfies (or trips) the pins below.
+        let code = crate::operations::route_attempt::driver_test_support::strip_comments(body);
+        // The InlineFound success arm records SuccessUntimed, and settles the
+        // search's pending NotFounds as failures only after the Found's state
+        // passed validation in `cache_contract_locally` (#5657).
+        let found_arm = &code[code
+            .find("downstream returned Found")
+            .expect("InlineFound arm")..];
+        let found_arm = &found_arm[..found_arm
+            .find("return Ok(());")
+            .expect("InlineFound arm returns")];
         assert!(
-            after.contains("record_relay_route_event")
-                && after.contains("RouteOutcome::SuccessUntimed"),
+            found_arm.contains("record_relay_route_event")
+                && found_arm.contains("RouteOutcome::SuccessUntimed"),
             "drive_relay_get_inner InlineFound arm must call \
              record_relay_route_event with RouteOutcome::SuccessUntimed."
         );
+        let cache = found_arm
+            .find("cache_contract_locally(")
+            .expect("InlineFound arm caches");
+        let proof = found_arm
+            .find("recorder.contract_exists();")
+            .expect("InlineFound arm settles pending NotFounds");
         assert!(
-            after.contains("recorder.contract_exists();"),
-            "drive_relay_get_inner InlineFound arm must call \
-             recorder.contract_exists() so an earlier NotFound in the same \
-             search is labelled a failure."
+            cache < proof && found_arm[cache..proof].contains("if state_present"),
+            "existence proof requires state that passed validation: \
+             contract_exists() must follow the store and be gated on it"
         );
-        let streaming = body
+        // A streaming header alone is not proof: the arm may settle pending
+        // NotFounds only after a validated store of the streamed state.
+        let streaming_arm = &code[code
             .find("AttemptOutcome::Terminal(Terminal::Streaming {")
-            .expect("streaming arm");
-        let claim = body[streaming..]
-            .find("claim_or_wait(")
-            .expect("streaming arm claims the stream")
-            + streaming;
+            .expect("streaming arm")..];
+        let first_store = streaming_arm
+            .find("cache_contract_locally(")
+            .expect("streaming arm stores the streamed state");
         assert!(
-            body[streaming..claim].contains("recorder.contract_exists();"),
-            "a streaming header proves the contract exists; the streaming arm \
-             must call recorder.contract_exists() before its claim can fail"
+            !streaming_arm[..first_store].contains("recorder.contract_exists();"),
+            "a streaming header is not existence proof; only a validated store \
+             of its state is"
         );
-        let fallback = body
+        let fallback_arm = &code[code
             .find("local_fallback.take()")
-            .expect("local fallback arm");
-        let fallback_arm = &body[fallback..];
+            .expect("local fallback arm")..];
         let fallback_arm = &fallback_arm[..fallback_arm
             .find("return Ok(());")
             .expect("fallback arm returns")];
@@ -7932,7 +7997,8 @@ mod route_attempt_driver_tests {
     use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
         Answer, Step, failed_addrs, failure_window, health_inputs, op_manager_with_peers,
-        op_manager_with_peers_and_store, recorded_sources, route_log, serve_attempts,
+        op_manager_with_peers_and_store, recorded_sources, reject_stores, route_log,
+        serve_attempts,
     };
     use crate::router::dataset::RouteSource;
     use std::sync::atomic::Ordering;
@@ -7959,6 +8025,23 @@ mod route_attempt_driver_tests {
                 value: StoreResponse {
                     state: Some(WrappedState::new(vec![1, 2, 3])),
                     contract: None,
+                },
+            },
+            hop_count: 1,
+        })
+    }
+
+    /// [`found`] carrying contract code, so the receiving node's store can
+    /// validate it (the stub handler accepts it unless `reject_stores`).
+    fn found_with_code(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
+        NetMessage::from(GetMsg::Response {
+            id: *msg.id(),
+            instance_id,
+            result: GetMsgResult::Found {
+                key: key_for(instance_id),
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![1, 2, 3])),
+                    contract: Some(crate::operations::test_utils::make_test_contract(&[9u8; 8])),
                 },
             },
             hop_count: 1,
@@ -8038,8 +8121,9 @@ mod route_attempt_driver_tests {
     }
 
     /// NotFound from the hop the loopback relay really forwarded to, then a
-    /// Found: the NotFound peer is labelled a Failure (the contract exists),
-    /// exactly once, and NOT the driver's own `current_target` guess.
+    /// Found whose state passes validation here: the NotFound peer is labelled
+    /// a Failure (the contract exists), exactly once, and NOT the driver's own
+    /// `current_target` guess; the success is credited to the delivering hop.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn not_found_then_found_blames_the_forwarded_not_found_hop() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-nf-then-found", 3).await;
@@ -8049,39 +8133,49 @@ mod route_attempt_driver_tests {
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
-            move |i, msg, _| match i {
-                0 => Step {
-                    hop: Some(hop_nf.clone()),
-                    answer: Answer::Reply(not_found(msg, instance_id)),
-                },
-                _ => Step {
-                    hop: Some(hop_found.clone()),
-                    answer: Answer::Reply(found(msg, instance_id)),
-                },
+            move |i, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                if i == 0 {
+                    Step {
+                        hop: Some(hop_nf.clone()),
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    }
+                } else {
+                    Step {
+                        hop: Some(hop_found.clone()),
+                        answer: Answer::Reply(found_with_code(msg, instance_id)),
+                    }
+                }
             },
         );
 
-        let client_tx = Transaction::new::<GetMsg>();
-        let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
-        assert!(matches!(
-            outcome,
-            RetryLoopOutcome::Done(Terminal::InlineFound { .. })
-        ));
-        assert_eq!(failed_addrs(&op_manager), vec![addr(&peers[2])]);
+        let outcome = drive_client_get_inner(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))));
         assert_eq!(
-            driver.terminal_hop.as_ref().map(addr),
-            Some(addr(&peers[1])),
-            "the terminal hop is the peer that delivered, not current_target"
+            failure_window(&op_manager),
+            vec![(peers[2].socket_addr(), 1.0), (peers[1].socket_addr(), 0.0)],
+            "the NotFound hop is labelled once; the delivering hop, not \
+             current_target, is credited"
         );
-        drop(driver);
-        assert_eq!(failed_addrs(&op_manager).len(), 1, "labelled once");
         assert_eq!(op_manager.attempt_hop_registry().len(), 0);
         let sources = recorded_sources(&op_manager);
-        assert_eq!(
-            sources,
-            vec![(Some(addr(&peers[2])), RouteSource::Originator)],
-            "a client GET's labels are originator observations"
+        assert!(
+            sources.iter().all(|(_, s)| *s == RouteSource::Originator),
+            "a client GET's labels are originator observations: {sources:?}"
         );
     }
 
@@ -8255,9 +8349,9 @@ mod route_attempt_driver_tests {
             matches!(outcome, DriverOutcome::Publish(Err(_))),
             "a proven-existing contract whose stream failed is an operation error"
         );
-        // The header proved the contract exists, so the later NotFounds are
-        // genuine failures too. Every peer appears once; the header hop is
-        // NOT counted a second time by the re-surfaced terminal.
+        // A header is not existence proof (no state from it was stored), so
+        // the later NotFounds stay untrained. The header hop is labelled once
+        // and NOT a second time by the re-surfaced terminal.
         let window = failure_window(&op_manager);
         assert!(window.iter().all(|(_, r)| *r == 1.0), "{window:?}");
         let header_labels = window
@@ -8274,9 +8368,10 @@ mod route_attempt_driver_tests {
             window.len(),
             "one failure per peer: {window:?}"
         );
-        assert!(
-            window.len() >= 2,
-            "the NotFound peers after the proof: {window:?}"
+        assert_eq!(
+            window.len(),
+            1,
+            "only the failed stream is labelled: {window:?}"
         );
         // The ROUTER label is the recorder's one Failure above; peer_health
         // and telemetry keep their pre-#5657 input for a stream that never
@@ -8407,13 +8502,16 @@ mod route_attempt_driver_tests {
         assert!(failure_window(&op_manager).is_empty());
     }
 
-    /// The sub-op GET driver deliberately does not feed the router.
+    /// The sub-op GET driver deliberately does not feed the router. Driven
+    /// through `drive_sub_op_get` itself, so this fails if that driver wires a
+    /// live recorder: every attempt times out on a recorded hop, which a live
+    /// recorder would label.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sub_op_recorder_records_nothing() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-subop", 3).await;
         let instance_id = ContractInstanceId::new([45u8; 32]);
         let hops = peers.clone();
-        serve_attempts(
+        let served = serve_attempts(
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
@@ -8422,20 +8520,26 @@ mod route_attempt_driver_tests {
                 answer: Answer::Never,
             },
         );
-        let tx = Transaction::new::<GetMsg>();
-        let mut driver = client_driver(&op_manager, tx, instance_id, peers[0].clone());
-        driver.recorder =
-            RouteAttemptRecorder::disabled(instance_id, crate::node::network_status::OpType::Get);
-        let _ = run(&op_manager, tx, &mut driver).await;
-        drop(driver);
+        let _outcome = drive_sub_op_get(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            Some(peers[0].clone()),
+        )
+        .await;
+        assert!(
+            served.load(Ordering::SeqCst) >= 1,
+            "the sub-op attempted a hop"
+        );
         assert!(failure_window(&op_manager).is_empty());
     }
 
     /// Driver-level relay test: `drive_relay_get_inner` forwards to its greedy
     /// candidate, which answers NotFound, then consults an advertised host,
     /// which answers Found. The relay node's OWN router must get exactly one
-    /// Failure for the NotFound peer (the Found proved existence in this
-    /// search) and one success for the host.
+    /// Failure for the NotFound peer (the Found's state passed validation
+    /// here, proving existence in this search) and one success for the host.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_not_found_then_consulted_found_labels_both_peers_once() {
         let (op_manager, rx, peers, _guards, _store) =
@@ -8482,7 +8586,7 @@ mod route_attempt_driver_tests {
                 let answer = if target == Some(greedy_addr) {
                     Answer::Reply(not_found(msg, instance_id))
                 } else if target == Some(host_addr) {
-                    Answer::Reply(found(msg, instance_id))
+                    Answer::Reply(found_with_code(msg, instance_id))
                 } else {
                     Answer::Never
                 };
@@ -8509,10 +8613,19 @@ mod route_attempt_driver_tests {
             vec![Some(greedy_addr), Some(host_addr)],
             "greedy forward, then the consulted host"
         );
+        // Compared by peer, not order: the host's success is recorded before
+        // the store whose validated state then settles the greedy NotFound.
         assert_eq!(
-            failure_window(&op_manager),
-            vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)],
+            by_peer(failure_window(&op_manager)),
+            by_peer(vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)]),
         );
+    }
+
+    /// `entries` sorted by peer address, for assertions about which peers got
+    /// which label regardless of the order they were recorded in.
+    fn by_peer<T>(mut entries: Vec<(Option<SocketAddr>, T)>) -> Vec<(Option<SocketAddr>, T)> {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// #5657 item 2: the peer_health inputs that existed before #5657 still
@@ -8759,17 +8872,22 @@ mod route_attempt_driver_tests {
                     },
                     _ => Step {
                         hop: Some(found_hop.clone()),
-                        answer: Answer::Reply(found(
+                        answer: Answer::Reply(found_with_code(
                             msg,
                             if proof { instance_id } else { non_proof },
                         )),
                     },
                 },
             );
-            let client_tx = Transaction::new::<GetMsg>();
-            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-            let _outcome = run(&op_manager, client_tx, &mut driver).await;
-            drop(driver);
+            let _outcome = drive_client_get_inner(
+                &op_manager,
+                Transaction::new::<GetMsg>(),
+                instance_id,
+                false,
+                false,
+                false,
+            )
+            .await;
             let expected = if proof { vec![addr(&peers[2])] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
@@ -8795,7 +8913,10 @@ mod route_attempt_driver_tests {
                     } else if target == Some(greedy_addr) {
                         Answer::Reply(not_found(msg, instance_id))
                     } else if target == Some(host_addr) {
-                        Answer::Reply(found(msg, if proof { instance_id } else { non_proof }))
+                        Answer::Reply(found_with_code(
+                            msg,
+                            if proof { instance_id } else { non_proof },
+                        ))
                     } else {
                         Answer::Never
                     };
@@ -8804,6 +8925,213 @@ mod route_attempt_driver_tests {
             );
             run_relay(&op_manager, &upstream).await;
             let expected = if proof { vec![greedy_addr] } else { vec![] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// Existence proof requires state that passed validation (#5657): a
+    /// NotFound hop is labelled only once a later reply's state was stored
+    /// here. A reply for the requested contract whose store is rejected, or
+    /// that carries no contract code to store with, proves nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn unvalidated_reply_is_not_existence_proof() {
+        for (label, with_code, rejected, proof) in [
+            ("get-state-validated", true, false, true),
+            ("get-state-rejected", true, true, false),
+            ("get-state-no-code", false, false, false),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            if rejected {
+                reject_stores(label);
+            }
+            let instance_id = ContractInstanceId::new([65u8; 32]);
+            let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    if i == 0 {
+                        Step {
+                            hop: Some(nf_hop.clone()),
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        }
+                    } else {
+                        Step {
+                            hop: Some(found_hop.clone()),
+                            answer: Answer::Reply(if with_code {
+                                found_with_code(msg, instance_id)
+                            } else {
+                                found(msg, instance_id)
+                            }),
+                        }
+                    }
+                },
+            );
+            let _outcome = drive_client_get_inner(
+                &op_manager,
+                Transaction::new::<GetMsg>(),
+                instance_id,
+                false,
+                false,
+                false,
+            )
+            .await;
+            let expected = if proof { vec![addr(&peers[2])] } else { vec![] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// Relay side of the same rule: the greedy hop's NotFound is settled as a
+    /// failure only once the consulted host's state passed validation here.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_unvalidated_reply_is_not_existence_proof() {
+        for (label, rejected) in [
+            ("get-relay-state-validated", false),
+            ("get-relay-state-rejected", true),
+        ] {
+            let (op_manager, rx, _store, upstream, greedy, host, _guards) =
+                relay_fixture(label, true).await;
+            if rejected {
+                reject_stores(label);
+            }
+            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, target| {
+                    let answer = if !is_request(msg) {
+                        Answer::DropWaiter
+                    } else if target == Some(greedy_addr) {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else if target == Some(host_addr) {
+                        Answer::Reply(found_with_code(msg, instance_id))
+                    } else {
+                        Answer::Never
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            run_relay(&op_manager, &upstream).await;
+            let expected = if rejected { vec![] } else { vec![greedy_addr] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// A timeout is blamed on the recorded hop only if the hop had a meaningful
+    /// share of the attempt (#5657): forwarded to early, it is labelled;
+    /// forwarded to just before the deadline (an overloaded originator), not.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn late_hop_is_not_blamed_for_the_attempt_timeout() {
+        let budget = crate::config::OPERATION_TTL;
+        for (label, delay, blamed) in [
+            ("get-hop-early", std::time::Duration::from_secs(1), true),
+            (
+                "get-hop-late",
+                budget - std::time::Duration::from_secs(1),
+                false,
+            ),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([67u8; 32]);
+            let late_hop = peers[1].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if i == 0 {
+                        Step {
+                            hop: None,
+                            answer: Answer::NeverWithHopAfter(delay, late_hop.clone()),
+                        }
+                    } else {
+                        Step {
+                            hop: None,
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        }
+                    }
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let _outcome = run(&op_manager, client_tx, &mut driver).await;
+            drop(driver);
+            let expected = if blamed {
+                vec![addr(&peers[1])]
+            } else {
+                vec![]
+            };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// An assembly failure is labelled against the hop only when the peer
+    /// caused it (#5657): a cancelled stream, which also covers this node
+    /// tearing it down itself, blames nobody; a claim timeout blames the hop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelled_stream_is_not_labelled_against_the_hop() {
+        for (label, seed, cause, blamed) in [
+            (
+                "get-stream-claim-timeout",
+                68u8,
+                StreamAbortCause::ClaimTimeout,
+                true,
+            ),
+            (
+                "get-stream-cancelled",
+                69u8,
+                StreamAbortCause::Cancelled,
+                false,
+            ),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([seed; 32]);
+            assembly_fault_injection::inject_failures_with_cause(key_for(instance_id), 1, cause);
+            let header_hop = peers[0].clone();
+            let stream_id = StreamId::next_operations();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if i == 0 {
+                        Step {
+                            hop: Some(header_hop.clone()),
+                            answer: Answer::Reply(streaming_header(
+                                msg,
+                                instance_id,
+                                stream_id,
+                                64,
+                            )),
+                        }
+                    } else {
+                        Step {
+                            hop: None,
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        }
+                    }
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            // The stream is claimed from `current_target`, which is the
+            // header's hop here, so only the cause decides the label.
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let _outcome = run(&op_manager, client_tx, &mut driver).await;
+            drop(driver);
+            let expected = if blamed {
+                vec![addr(&peers[0])]
+            } else {
+                vec![]
+            };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
     }
@@ -8980,7 +9308,7 @@ mod route_attempt_driver_tests {
                     } else if target == Some(greedy_addr) {
                         Answer::Reply(not_found(msg, instance_id))
                     } else if target == Some(host_addr) {
-                        Answer::Reply(found(msg, instance_id))
+                        Answer::Reply(found_with_code(msg, instance_id))
                     } else {
                         Answer::Never
                     };
@@ -8992,17 +9320,22 @@ mod route_attempt_driver_tests {
                 LabelMode::Current => 1.0,
                 LabelMode::Legacy => 0.0,
             };
+            // Compared by peer, not order: under the current rules the greedy
+            // NotFound is settled only after the host's state is stored.
             assert_eq!(
-                failure_window(&op_manager),
-                vec![(Some(greedy_addr), greedy_label), (Some(host_addr), 0.0)],
+                by_peer(failure_window(&op_manager)),
+                by_peer(vec![
+                    (Some(greedy_addr), greedy_label),
+                    (Some(host_addr), 0.0)
+                ]),
                 "{mode:?}"
             );
             assert_eq!(
-                recorded_sources(&op_manager),
-                vec![
+                by_peer(recorded_sources(&op_manager)),
+                by_peer(vec![
                     (Some(greedy_addr), RouteSource::Relay),
                     (Some(host_addr), RouteSource::Relay),
-                ],
+                ]),
                 "{mode:?}: relay labels are relay observations in both modes"
             );
         }
