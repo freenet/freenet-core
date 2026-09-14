@@ -11981,7 +11981,7 @@ fn test_hop_count_populated_on_terminal_get_events() {
 /// `test_contract_stays_off_close_cluster_without_migration`, runs the same
 /// helper, seed and topology with ONLY the migration flag flipped.
 #[test_log::test]
-fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
+fn test_contract_migrates_to_close_cluster_without_any_get() {
     const NETWORK_NAME: &str = "get-placement-deadend";
     let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, true, false);
 
@@ -12151,11 +12151,10 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
 /// The one host of a contract sits at the key and is the requester's first
 /// hop. It is crashed (messages silently dropped) when the GET starts and
 /// recovered moments later, so the GET's first attempt times out. GET retries
-/// exclude only peers that answered NotFound from later attempts; a peer that
-/// timed out stays reachable, so the retry reaches the recovered host and the
-/// GET succeeds. Carrying timed-out peers into the attempt's visited bloom
-/// (which travels the whole forward path) would make the only host unreachable
-/// for the rest of the operation and fail this GET.
+/// avoid, as a first hop, only peers that answered NotFound; a peer that timed
+/// out stays eligible, so the retry reaches the recovered host and the GET
+/// succeeds. Excluding timed-out peers too would leave this GET no route to its
+/// only host.
 #[test_log::test]
 fn test_get_retry_reaches_single_host_after_one_timeout() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
@@ -12265,6 +12264,29 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
         result.is_node_hosting(&host, &contract_key),
         "the host still holds the seeded contract"
     );
+
+    // Preconditions. Without them the outcome below says nothing about a
+    // timed-out hop: this test once passed because the first attempt never
+    // timed out at all. The requester is connected to the host, which sits at
+    // the key, so the host is its closest candidate and its first hop; and its
+    // router holds a timeout label, so an attempt really timed out against
+    // the hop it was forwarded to.
+    let host_loc = node_locations[0];
+    let neighbors = result.node_neighbor_locations(&requester);
+    assert!(
+        neighbors.iter().any(|loc| (loc - host_loc).abs() < 1e-9),
+        "precondition: the requester must be connected to the host (host at {host_loc}, \
+         requester neighbors {neighbors:?})"
+    );
+    let (_, timeouts, _) = result
+        .node_route_failure_causes(&requester)
+        .expect("the requester published its ring");
+    assert!(
+        timeouts >= 1,
+        "precondition: an attempt of the requester's GET must have timed out against its \
+         first hop (timeout labels: {timeouts})"
+    );
+
     let requester_has_state = result
         .node_storages
         .get(&requester)
@@ -12405,7 +12427,7 @@ fn close_cluster_hosts(
         .collect()
 }
 
-/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
+/// Negative control for `test_contract_migrates_to_close_cluster_without_any_get`.
 ///
 /// The same `run_close_cluster_placement` call as the positive test, same seed
 /// and topology, no client GET in either, and ONLY the migration flag flipped.
@@ -12416,13 +12438,12 @@ fn close_cluster_hosts(
 /// Why there is no client GET (#5660): this control used to issue the
 /// requester's GET and assert it dead-ends at the non-hosting cluster, a
 /// premise that held only while every retry re-asked the same first hop. With
-/// retry diversity a retry skips the peers that answered NotFound, reaches the
-/// far host, and the return path caches the contract at the cluster peers it
-/// crosses: a legitimate resolution that is not migration. That behaviour is
-/// pinned by `test_get_retries_resolve_close_cluster_dead_end_without_migration`.
+/// retry diversity the GET resolves without migration, so that scenario now
+/// lives, under its original network name, in
+/// `test_get_retries_resolve_close_cluster_dead_end_without_migration`.
 #[test_log::test]
 fn test_contract_stays_off_close_cluster_without_migration() {
-    const NETWORK_NAME: &str = "get-placement-deadend-control";
+    const NETWORK_NAME: &str = "get-placement-migration-control";
     let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, false);
 
     assert!(
@@ -12442,36 +12463,38 @@ fn test_contract_stays_off_close_cluster_without_migration() {
 
 /// Retry diversity (#5660) resolves the close-cluster dead-end on its own.
 ///
-/// The original control scenario, migration pinned OFF: a far requester GETs a
+/// The original negative-control scenario, run under its original network
+/// name, so main's history of this exact run dead-ending is evidence that the
+/// fix changes the outcome. Migration is pinned OFF: a far requester GETs a
 /// contract held only by a far host (node 7), and the peers closest to the key
-/// do not hold it. Before retry diversity every retry re-picked the same
-/// keyward first hop and the GET dead-ended at the cluster. Now a retry
-/// excludes the hops that answered NotFound, reaches the host, and the
-/// requester gets the state; the return path caches the contract at the cluster
-/// peers it crosses, through the normal relay caching, not migration.
+/// do not hold it. Before retry diversity every retry re-picked the same first
+/// hop and the GET dead-ended at the cluster. Now each retry starts from a
+/// first hop that has not answered NotFound, and the requester gets the state.
+///
+/// Mechanism: the requester's router labels each peer that answered NotFound at
+/// most once per operation, so two or more NotFound labels means two or more
+/// distinct first hops. MARGIN_TBD
 #[test_log::test]
 fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
-    const NETWORK_NAME: &str = "get-placement-retry-diversity";
+    const NETWORK_NAME: &str = "get-placement-deadend-control";
     let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, true);
+    let requester = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 8);
 
     let requester_has_state = result
         .node_storages
-        .get(&freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 8))
+        .get(&requester)
         .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
     assert!(
         requester_has_state,
-        "with retry diversity the requester GET must resolve without migration: a retry \
-         skips the NotFound hops and reaches the far host"
+        "with retry diversity the requester GET must resolve without migration"
     );
-    let cached = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
+    let (not_found, _, _) = result
+        .node_route_failure_causes(&requester)
+        .expect("the requester published its ring");
     assert!(
-        !cached.is_empty(),
-        "the resolved GET's return path must cache the contract at the close-cluster \
-         peers it crosses"
-    );
-    tracing::info!(
-        ?cached,
-        "close-cluster peers cached the contract on the return path"
+        not_found >= 2,
+        "mechanism: the GET's retries must have started from distinct first hops, so at \
+         least two different peers answered NotFound (NotFound labels: {not_found})"
     );
 }
 
@@ -12488,16 +12511,16 @@ fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
 ///     advertise its hosting to it;
 ///   - a far requester issues a GET.
 ///
-/// Placement migration is disabled, so the ONLY mechanism that can carry the
-/// state to the requester is the terminal consult. GET is single-path greedy
+/// Placement migration is disabled. GET is single-path greedy
 /// (relay `MAX_RELAY_RETRIES = 1`): a relay forwards to its single closest
 /// neighbor toward the key and bubbles NotFound without trying its other
 /// neighbors — so the advertised host, being a non-closest neighbor of the
 /// terminus, is exactly the "one hop off the routing path" case. WITHOUT the
-/// consult this dead-ends (proven by
-/// `test_get_dead_ends_at_close_cluster_without_migration`, whose host is too
-/// far to be a terminus neighbor); WITH it, the terminus consults the host
-/// advertisement it received and forwards there, closing the dead-end.
+/// consult a single attempt dead-ends here; WITH it, the terminus consults the
+/// host advertisement it received and forwards there, closing the dead-end.
+/// Since #5660 a GET's retries can also resolve such a dead-end by starting
+/// from a different first hop, so the requester's state alone would not prove
+/// the consult worked.
 ///
 /// The proof is the consult telemetry: `terminal_consult_resolved_found() > 0`
 /// is recorded ONLY when a consulted advertised host returns Found, so with

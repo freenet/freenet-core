@@ -451,6 +451,7 @@ async fn drive_client_get_inner(
         ),
         terminal_hop: None,
         not_found_hops: Vec::new(),
+        asked_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -900,14 +901,19 @@ struct GetRetryDriver<'a> {
     /// The peer the most recent `Terminal` attempt was actually forwarded to,
     /// as recorded by the originator-loopback relay. `None` when the reply was
     /// produced locally. The only peer a terminal router label may credit or
-    /// blame; `current_target` is this driver's own guess (and, as before
-    /// #5657, the address a streamed reply is claimed from).
+    /// blame, and the address a streamed reply is claimed from.
+    /// `current_target` is this driver's own guess, used for the claim only
+    /// when no hop was recorded.
     terminal_hop: Option<PeerKeyLocation>,
     /// Every peer an attempt of this GET was actually forwarded to that
-    /// answered `NotFound`. Carried into each later attempt's visited bloom
-    /// (see `new_attempt_tx`) so the loopback relay stops re-picking a peer
-    /// that is a known dead end for this operation.
+    /// answered `NotFound`. Handed to the loopback relay as first-hop
+    /// exclusions (see `first_hop_exclusions`), so a retry starts from a
+    /// different peer.
     not_found_hops: Vec<SocketAddr>,
+    /// Every peer an attempt of this GET was actually forwarded to, whatever
+    /// the outcome. `advance` falls back to a candidate outside this set when
+    /// its own `tried` guesses run out.
+    asked_hops: Vec<SocketAddr>,
 }
 
 /// Terminal value for the GET driver.
@@ -1071,28 +1077,9 @@ impl RetryDriver for GetRetryDriver<'_> {
                 self.current_target.socket_addr(),
             );
         }
-        // Retry diversity on a non-empty ring. The loopback relay picks this
-        // attempt's first hop from the visited bloom alone, so without this
-        // every retry re-picked the same best candidate after it answered
-        // NotFound, and the retry budget was spent re-asking a dead end.
-        //
-        // ONLY hops that answered NotFound are carried. The bloom travels the
-        // whole forward path, so a carried peer is unreachable at every hop of
-        // this attempt: acceptable for a peer whose search already dead-ended
-        // for this contract, but a peer that merely timed out or disconnected
-        // may be the only host, and excluding it after one stall would lose the
-        // contract for the rest of the operation.
-        //
-        // The client's own `current_target` is never carried, the same rule
-        // `carry_tried_into_visited` applies to `tried`: if the driver's pick
-        // coincides with a NotFound hop, excluding it would leave the relay
-        // with no route to the peer the client chose.
-        let current_target_addr = self.current_target.socket_addr();
-        for addr in &self.not_found_hops {
-            if Some(*addr) != current_target_addr {
-                self.attempt_visited.mark_visited(*addr);
-            }
-        }
+        // Retry diversity (#5660) deliberately does NOT use this bloom: it
+        // travels the whole forward path, and a peer excluded here would be
+        // unroutable at every hop. See `first_hop_exclusions`.
         tx
     }
 
@@ -1145,6 +1132,32 @@ impl RetryDriver for GetRetryDriver<'_> {
                 AdvanceOutcome::Next
             }
             Err(reason) => {
+                // `tried` holds this driver's own guesses, not the hops the
+                // loopback relay actually asked, and after a timeout the two
+                // diverge: the relay may re-ask the stalled peer while the
+                // guess moves on. So the guesses can run out while a ring peer
+                // was never asked. Fall back to the closest such peer, spending
+                // the retry `advance_to_next_peer` already counted. This only
+                // changes anything where the driver would otherwise give up.
+                if matches!(
+                    reason,
+                    crate::tracing::GetExhaustionReason::NoRoutingCandidates
+                ) {
+                    let mut asked = self.asked_hops.clone();
+                    asked.extend(self.op_manager.ring.connection_manager.get_own_addr());
+                    let unasked = self
+                        .op_manager
+                        .ring
+                        .k_closest_potentially_hosting(&self.instance_id, asked.as_slice(), 1)
+                        .into_iter()
+                        .next()
+                        .and_then(|peer| peer.socket_addr().map(|addr| (peer, addr)));
+                    if let Some((peer, addr)) = unasked {
+                        self.tried.push(addr);
+                        self.current_target = peer;
+                        return AdvanceOutcome::Next;
+                    }
+                }
                 self.exhaustion_reason = Some(reason);
                 AdvanceOutcome::Exhausted
             }
@@ -1165,6 +1178,24 @@ impl RetryDriver for GetRetryDriver<'_> {
                 self.not_found_hops.push(addr);
             }
         }
+    }
+
+    fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {
+        if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
+            if !self.asked_hops.contains(&addr) {
+                self.asked_hops.push(addr);
+            }
+        }
+    }
+
+    // Retry diversity (#5660). The loopback relay picks each attempt's first
+    // hop itself, so without this every retry re-picked the same best
+    // candidate after it answered NotFound. Every NotFound hop is excluded,
+    // `current_target` included: on a non-empty ring the client's pick never
+    // reaches the wire, so exempting it would only let the relay re-ask a
+    // peer that already answered NotFound. Timed-out hops are not excluded.
+    fn first_hop_exclusions(&self) -> Vec<SocketAddr> {
+        self.not_found_hops.clone()
     }
 }
 
@@ -1487,7 +1518,7 @@ async fn drive_get_with_assembly_retry(
                             error = %e.message,
                             retries = driver.retries,
                             "get: stream assembly failed; \
-                             retrying against next candidate (#4345)"
+                             retrying the GET (#4345)"
                         );
                         // Penalize the failed candidate so the router
                         // learns (mirrors the relay driver's
@@ -2577,6 +2608,7 @@ async fn drive_sub_op_get(
         ),
         terminal_hop: None,
         not_found_hops: Vec::new(),
+        asked_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -3110,6 +3142,7 @@ fn relay_advance_to_next_peer(
     tried: &mut Vec<SocketAddr>,
     retries: &mut usize,
     new_visited: &VisitedPeers,
+    first_hop_exclusions: &[SocketAddr],
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
     // Legacy relay does NOT retry alternative peers at each hop — it
     // forwards once and bubbles back whatever downstream returned. The
@@ -3128,13 +3161,27 @@ fn relay_advance_to_next_peer(
     *retries += 1;
 
     // Use new_visited as the skip list so upstream's visited set and our own
-    // marks are both respected.
-    let peer = match op_manager
-        .ring
-        .k_closest_potentially_hosting(instance_id, new_visited.clone(), 1)
-        .into_iter()
-        .next()
-    {
+    // marks are both respected. On the originator's own loopback,
+    // `first_hop_exclusions` (#5660) is skipped too, in a local copy that is
+    // never forwarded. If it leaves no candidate it is ignored: re-asking a
+    // peer that answered NotFound once beats failing the attempt locally.
+    let closest = |skip: VisitedPeers| {
+        op_manager
+            .ring
+            .k_closest_potentially_hosting(instance_id, skip, 1)
+            .into_iter()
+            .next()
+    };
+    let excluding = if first_hop_exclusions.is_empty() {
+        None
+    } else {
+        let mut skip = new_visited.clone();
+        for addr in first_hop_exclusions {
+            skip.mark_visited(*addr);
+        }
+        closest(skip)
+    };
+    let peer = match excluding.or_else(|| closest(new_visited.clone())) {
         Some(peer) => peer,
         None => {
             // Bootstrap fallback (#4361): empty ring → forward via a
@@ -3696,6 +3743,18 @@ where
     // routing forward to have occurred.
     let mut did_forward = false;
 
+    // Retry diversity (#5660): on the originator's own loopback, the peers its
+    // retry loop asked this relay not to pick as the attempt's first hop.
+    // Applied to that pick only; `new_visited`, which is forwarded, never
+    // carries them.
+    let first_hop_exclusions = if Some(upstream_addr) == own_addr {
+        op_manager
+            .attempt_hop_registry()
+            .first_hop_exclusions(&incoming_tx)
+    } else {
+        Vec::new()
+    };
+
     loop {
         // Pick next downstream peer.
         let (peer, peer_addr) = match relay_advance_to_next_peer(
@@ -3704,6 +3763,7 @@ where
             &mut tried,
             &mut retries,
             &new_visited,
+            &first_hop_exclusions,
         ) {
             Some(p) => {
                 consult_active = false;
@@ -5368,6 +5428,7 @@ mod tests {
             ),
             terminal_hop: None,
             not_found_hops: Vec::new(),
+            asked_hops: Vec::new(),
         };
 
         assert!(
@@ -8270,6 +8331,7 @@ mod route_attempt_driver_tests {
             ),
             terminal_hop: None,
             not_found_hops: Vec::new(),
+            asked_hops: Vec::new(),
         }
     }
 
@@ -9994,7 +10056,9 @@ mod route_attempt_driver_tests {
 
     /// Pick an attempt's first hop exactly as the originator-loopback relay
     /// does: `relay_advance_to_next_peer` over the request's own visited bloom
-    /// plus this node and the upstream (itself). `None` = no candidate.
+    /// plus this node and the upstream (itself), skipping the first-hop
+    /// exclusions the retry loop registered for the attempt. `None` = no
+    /// candidate.
     fn loopback_relay_pick(
         op_manager: &OpManager,
         msg: &NetMessage,
@@ -10013,13 +10077,24 @@ mod route_attempt_driver_tests {
         relay_visited.mark_visited(own);
         let mut tried = vec![own];
         let mut retries = 0;
+        let exclusions = op_manager.attempt_hop_registry().first_hop_exclusions(id);
         relay_advance_to_next_peer(
             op_manager,
             instance_id,
             &mut tried,
             &mut retries,
             &relay_visited,
+            &exclusions,
         )
+    }
+
+    /// Whether the visited bloom of an attempt's request, which the loopback
+    /// relay forwards on to later relays, marks `peer`.
+    fn request_bloom_marks(msg: &NetMessage, peer: SocketAddr) -> bool {
+        let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { id, visited, .. })) = msg else {
+            panic!("expected a GET request");
+        };
+        visited.clone().with_transaction(id).probably_visited(peer)
     }
 
     /// A client driver starting exactly as `drive_client_get_inner` does: its
@@ -10081,9 +10156,8 @@ mod route_attempt_driver_tests {
         );
     }
 
-    /// A hop that TIMED OUT is not excluded: it may be the only host, and the
-    /// bloom would make it unreachable at every hop. The retry re-picks it and
-    /// succeeds when it answers.
+    /// A hop that TIMED OUT is not excluded: it may be the only host. The
+    /// retry re-picks it and succeeds when it answers.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_timed_out_hop_is_retried_not_excluded() {
         let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-timeout-retry", 5).await;
@@ -10121,12 +10195,11 @@ mod route_attempt_driver_tests {
         );
     }
 
-    /// A small non-empty ring exhausts cleanly: once both ring peers answered
-    /// NotFound the relay has no candidate, the gateway fallback (no
-    /// configured gateways here) does not invent one, and no attempt goes
-    /// anywhere but the two ring peers.
+    /// A small non-empty ring: each ring peer is asked exactly once, then the
+    /// GET exhausts. (Whether the empty-ring gateway fallback could misfire is
+    /// not observable here: it is off whenever the ring is non-empty.)
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn small_ring_exhausts_without_gateway_fallback() {
+    async fn small_ring_asks_each_peer_once_then_exhausts() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-small-ring", 2).await;
         let instance_id = ContractInstanceId::new([72u8; 32]);
         let view = op_manager.clone();
@@ -10159,41 +10232,271 @@ mod route_attempt_driver_tests {
         let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
         let picks = picks.lock().clone();
-        let ring: Vec<_> = peers.iter().map(|p| Some(addr(p))).collect();
-        let remote: Vec<_> = picks.iter().filter(|p| p.is_some()).collect();
+        let ring: std::collections::HashSet<_> = peers.iter().map(|p| Some(addr(p))).collect();
+        let remote: Vec<_> = picks.iter().filter(|p| p.is_some()).cloned().collect();
+        let asked: std::collections::HashSet<_> = remote.iter().cloned().collect();
         assert_eq!(
             remote.len(),
             2,
-            "each ring peer is asked exactly once: {picks:?}"
+            "two remote attempts, one per ring peer: {picks:?}"
         );
-        assert!(
-            remote.iter().all(|p| ring.contains(p)),
-            "no attempt may leave the ring: {picks:?}"
+        assert_eq!(
+            asked, ring,
+            "each ring peer is asked exactly once: {picks:?}"
         );
     }
 
-    /// The client's own `current_target` is never carried, even when it
-    /// answered NotFound earlier: excluding it would leave the relay with no
-    /// route to the peer the client chose. Other NotFound hops are carried.
+    /// A peer that answered NotFound is not re-asked when the driver's own
+    /// guess lands on it: on a non-empty ring the client's `current_target`
+    /// never reaches the wire, so it gets no exemption from the exclusions.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn current_target_is_not_carried_into_the_bloom() {
-        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("get-carry-rule", 3).await;
+    async fn a_not_found_hop_is_not_re_asked_when_it_is_the_current_target() {
+        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-no-exemption", 4).await;
         let instance_id = ContractInstanceId::new([73u8; 32]);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let closest = |skip: &[SocketAddr]| {
+            op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, skip, 1)
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        let best = closest(&[own]);
+        let second = closest(&[own, addr(&best)]);
+        let view = op_manager.clone();
+        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = hops.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                seen.lock().push(peer_addr);
+                Step {
+                    hop: Some(peer),
+                    answer: if i == 0 {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else {
+                        Answer::Reply(found(msg, instance_id))
+                    },
+                }
+            },
+        );
+        // Start the driver on the SECOND candidate, so its first `advance()`
+        // lands on the best one: the peer the relay asked first, which
+        // answered NotFound.
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, second.clone());
+        driver.tried.insert(0, own);
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(outcome, RetryLoopOutcome::Done(_)));
+        let hops = hops.lock().clone();
+        assert_eq!(
+            hops[0],
+            addr(&best),
+            "precondition: the relay first asks the best candidate: {hops:?}"
+        );
+        assert_eq!(
+            driver.current_target.socket_addr(),
+            Some(addr(&best)),
+            "precondition: the driver's guess moved onto the NotFound peer"
+        );
+        assert_ne!(
+            hops[1], hops[0],
+            "the peer that answered NotFound must not be asked again: {hops:?}"
+        );
+    }
+
+    /// A peer that answered NotFound is avoided as a later attempt's FIRST hop
+    /// only. The request's visited bloom, which relays forward, does not mark
+    /// it, so relays further along can still route through it. That matters
+    /// because a relay also answers NotFound when its own forward failed, so
+    /// the peer may be the only way to the host. Scripted here: the retry's
+    /// first hop reaches the host only through the peer that answered
+    /// NotFound, which it can do only if the request's bloom leaves it out.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_not_found_hop_stays_routable_beyond_the_first_hop() {
+        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-choke-point", 4).await;
+        let instance_id = ContractInstanceId::new([74u8; 32]);
+        let view = op_manager.clone();
+        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = hops.clone();
+        let mut choke_point: Option<SocketAddr> = None;
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                seen.lock().push(peer_addr);
+                let answer = match choke_point {
+                    // The choke point: its own forward to the host failed.
+                    None => {
+                        choke_point = Some(peer_addr);
+                        Answer::Reply(not_found(msg, instance_id))
+                    }
+                    Some(choke) if request_bloom_marks(msg, choke) => {
+                        Answer::Reply(not_found(msg, instance_id))
+                    }
+                    Some(_) => Answer::Reply(found(msg, instance_id)),
+                };
+                Step {
+                    hop: Some(peer),
+                    answer,
+                }
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        let hops = hops.lock().clone();
+        assert!(hops.len() >= 2, "{hops:?}");
+        assert_ne!(
+            hops[1], hops[0],
+            "the retry starts from a different first hop: {hops:?}"
+        );
+        assert!(
+            matches!(outcome, RetryLoopOutcome::Done(_)),
+            "the retry must still reach the host through the peer that answered \
+             NotFound: {hops:?}"
+        );
+    }
+
+    /// When the first-hop exclusions cover every candidate, the loopback relay
+    /// picks as if there were none, rather than failing the attempt locally.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn first_hop_exclusions_are_ignored_when_they_cover_every_candidate() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("get-readmit", 2).await;
+        let instance_id = ContractInstanceId::new([75u8; 32]);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let tx = Transaction::new::<GetMsg>();
+        let mut visited = VisitedPeers::new(&tx);
+        visited.mark_visited(own);
+        let pick = |exclusions: &[SocketAddr]| {
+            let mut tried = vec![own];
+            let mut retries = 0;
+            relay_advance_to_next_peer(
+                &op_manager,
+                &instance_id,
+                &mut tried,
+                &mut retries,
+                &visited,
+                exclusions,
+            )
+            .map(|(_, addr)| addr)
+        };
+        let unrestricted = pick(&[]).expect("the ring has candidates");
+        let other = pick(&[unrestricted]).expect("one exclusion leaves a candidate");
+        assert_ne!(other, unrestricted, "a single exclusion is honoured");
+        let every_peer: Vec<_> = peers.iter().map(addr).collect();
+        assert_eq!(
+            pick(&every_peer),
+            Some(unrestricted),
+            "with every candidate excluded, the relay picks as if none were"
+        );
+    }
+
+    /// The driver gives up only once every ring peer was actually asked, not
+    /// when its own guesses run out. After a timeout the relay re-asks the
+    /// stalled peer while the driver's guess moves on, so on a three-peer ring
+    /// the guesses were spent after three attempts with one peer never asked.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retries_reach_the_peer_the_guesses_skipped_after_a_timeout() {
+        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-unasked", 3).await;
+        let instance_id = ContractInstanceId::new([76u8; 32]);
+        let view = op_manager.clone();
+        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = hops.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                seen.lock().push(peer_addr);
+                Step {
+                    hop: Some(peer),
+                    answer: match i {
+                        0 => Answer::Never,
+                        1 | 2 => Answer::Reply(not_found(msg, instance_id)),
+                        _ => Answer::Reply(found(msg, instance_id)),
+                    },
+                }
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        let hops = hops.lock().clone();
+        assert_eq!(
+            hops.first(),
+            hops.get(1),
+            "precondition: the relay re-asks the stalled peer: {hops:?}"
+        );
+        let distinct: std::collections::HashSet<_> = hops.iter().collect();
+        assert_eq!(distinct.len(), 3, "every ring peer is asked: {hops:?}");
+        assert!(
+            matches!(outcome, RetryLoopOutcome::Done(_)),
+            "the last ring peer answers: {hops:?}"
+        );
+    }
+
+    /// A streamed reply with no recorded hop is claimed from `current_target`,
+    /// the fallback in the claim. The stream is registered at `current_target`
+    /// only, so without the fallback there is no address to claim from and
+    /// the assembly fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streamed_reply_without_a_recorded_hop_is_claimed_from_current_target() {
+        let (op_manager, rx, peers, _guards) =
+            op_manager_with_peers("get-stream-claim-fallback", 3).await;
+        let instance_id = ContractInstanceId::new([77u8; 32]);
+        let stream_id = StreamId::next_operations();
+        let payload = bincode::serialize(&GetStreamingPayload {
+            key: key_for(instance_id),
+            value: StoreResponse {
+                state: Some(WrappedState::new(vec![8, 9])),
+                contract: None,
+            },
+        })
+        .unwrap();
+        let total = payload.len() as u64;
+        let handle =
+            crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, total);
+        handle
+            .push_fragment(1, bytes::Bytes::from(payload))
+            .expect("fragment accepted");
+        op_manager
+            .orphan_stream_registry()
+            .register_orphan(addr(&peers[0]), stream_id, handle);
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| Step {
+                hop: None,
+                answer: if i == 0 {
+                    Answer::Reply(streaming_header(msg, instance_id, stream_id, total))
+                } else {
+                    Answer::Reply(not_found(msg, instance_id))
+                },
+            },
+        );
         let client_tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        driver.not_found_hops = vec![addr(&peers[0]), addr(&peers[1])];
-        let _tx = driver.new_attempt_tx();
+        let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(
+            outcome,
+            RetryLoopOutcome::Done(Terminal::Streaming { .. })
+        ));
         assert!(
-            !driver.attempt_visited.probably_visited(addr(&peers[0])),
-            "current_target must stay reachable"
-        );
-        assert!(
-            driver.attempt_visited.probably_visited(addr(&peers[1])),
-            "another NotFound hop is excluded"
-        );
-        assert!(
-            !driver.attempt_visited.probably_visited(addr(&peers[2])),
-            "a peer that never answered NotFound is not excluded"
+            assembly.error.is_none(),
+            "with no recorded hop the stream is claimed from current_target: {:?}",
+            assembly.error
         );
     }
 

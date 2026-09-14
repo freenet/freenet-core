@@ -505,13 +505,27 @@ pub(crate) trait RetryDriver {
 
     /// Called when an attempt was answered [`AttemptOutcome::Retry`] (a
     /// `NotFound`), with the peer that attempt was actually forwarded to
-    /// (`None` when none was recorded), before `advance()`. A `NotFound` is a
-    /// deterministic dead end for this operation, so a driver whose loopback
-    /// relay picks the wire hop may exclude that peer from later attempts.
-    /// Timeouts and disconnects are deliberately NOT reported here: excluding
-    /// a peer that stalled once would make it unreachable at every hop for the
-    /// rest of the operation. Default: ignore.
+    /// (`None` when none was recorded), before `advance()`. A driver may avoid
+    /// that peer as a later attempt's FIRST hop (see
+    /// [`Self::first_hop_exclusions`]), and nowhere else: a relay also answers
+    /// `NotFound` when its own downstream send failed or its connection
+    /// dropped, so the peer may still be the only route to a host. Timeouts
+    /// and disconnects are not reported here. Default: ignore.
     fn on_not_found_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Called once per attempt, before its outcome is handled, with the peer
+    /// the attempt was actually forwarded to (`None` when none was recorded).
+    /// Default: ignore.
+    fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Peers the originator-loopback relay should not pick as this attempt's
+    /// first hop, handed to it through
+    /// [`crate::operations::route_attempt::AttemptHopRegistry`] and applied to
+    /// that one pick only. They are never put in the request's visited bloom,
+    /// so relays further along may still route through them. Default: none.
+    fn first_hop_exclusions(&self) -> Vec<std::net::SocketAddr> {
+        Vec::new()
+    }
 }
 
 /// Report one non-terminal attempt outcome to the driver's recorder, if any.
@@ -736,7 +750,9 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         // picks the real first hop may run before `send_and_await` returns.
         // Dropped at the end of this iteration on every path, so a `continue`
         // or `return` cannot leak it.
-        let hop_slot = op_manager.attempt_hop_registry().register(attempt_tx);
+        let hop_slot = op_manager
+            .attempt_hop_registry()
+            .register_excluding(attempt_tx, driver.first_hop_exclusions());
         let attempt_started = tokio::time::Instant::now();
 
         let attempt_timeout = driver.attempt_timeout();
@@ -779,6 +795,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let attempt_resolved = tokio::time::Instant::now();
         let hop_record = hop_slot.hop_record();
         let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
+        driver.on_attempt_hop(attempt_hop.as_ref());
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the

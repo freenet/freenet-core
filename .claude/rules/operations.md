@@ -107,6 +107,14 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     labelling, so it does not follow the kill switch: with retry diversity
     (#5660) the loopback relay's pick often differs from `current_target`, and
     the stream is registered under the hop it actually came from.
+  → GET retry diversity (#5660): the peers that answered NotFound in this
+    operation are excluded from the originator-loopback relay's own
+    first-hop pick only, handed over through `AttemptHopRegistry`, and are
+    never carried in the forwarded visited bloom. A relay also answers
+    NotFound when its own downstream send fails or its connection drops, so a
+    whole-path exclusion could cut a single-host contract off behind one
+    flapping peer. If the exclusions leave no candidate, the relay ignores
+    them.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,
