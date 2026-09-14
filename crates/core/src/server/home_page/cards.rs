@@ -1682,6 +1682,38 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         _ => MEASURING.to_string(),
     };
 
+    // The state-byte tile was labelled "RAM used" until 2026-09. It is not RAM:
+    // `used_bytes` is `HostingCacheStats::current_bytes`, the tracked contract
+    // STATE bytes, and `budget_bytes` is a ceiling on that STATE — most of which
+    // lives on disk. Reading it as resident memory produced a real support
+    // thread: an operator saw a 4 GB node "near full" while the process used
+    // well under 1 GB, and the node's home page was the reason. The node's
+    // actual RSS is the `memory_rss_bytes` / `memory_limit_bytes` pair from
+    // `node::resource_metrics`, which is exported to telemetry and is NOT
+    // rendered anywhere on this page — so the tooltip must not send an operator
+    // looking for it here. Same failure the slot tile below already fixed; do
+    // NOT re-label this as memory.
+    //
+    // The ceiling is NOT simply "RAM/8". `budget_bytes` is documented as "the
+    // RAM-scaled default, OR THE OPERATOR OVERRIDE" (`HostingCacheStats`), and
+    // `HostingManager::recompute_effective_budget` installs `ram.min(disk_budget)`
+    // on every 60s recompute. Stating the default as though it were the only path
+    // contradicts the disk tooltip on this very card, which already says
+    // `min(RAM budget, disk budget)` — and a confidently wrong explanation inside
+    // the fix for a wrong label is the same defect one layer out.
+    let state_tooltip = format!(
+        "Contract STATE bytes, not the node's resident memory. The node tracks \
+         {used} of stored contract state against a {budget} ceiling. That ceiling is \
+         whatever max-hosting-storage is set to, or by default one eighth of system \
+         RAM (clamped between 128 MB and 1 GB), tightened to the disk budget when \
+         that is smaller. Either way what it bounds is stored state, most of which \
+         lives on disk, so this filling up does not mean the process is using that \
+         much memory. The node's own resident memory is a separate measurement and \
+         is not shown on this page.",
+        used = format_bytes(h.used_bytes),
+        budget = format_bytes(h.budget_bytes),
+    );
+
     // The tile shows slots because that is the unit the ceiling constrains;
     // the tooltip keeps the RAM derivation available, so an operator who wants
     // to know WHY the ceiling is where it is can still get there. Estimated,
@@ -1716,7 +1748,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             {binding}
             <div class="g-verdict-row">
                 <div class="g-norms">
-                    <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
+                    <div class="g-norm" title="{state_tooltip}"><div class="g-norm-label">Contract state</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
@@ -1746,6 +1778,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             {footer}
         </div>"##,
         binding = binding,
+        state_tooltip = html_escape(&state_tooltip),
         used = format_bytes(h.used_bytes),
         budget = format_bytes(h.budget_bytes),
         pct = used_pct,
