@@ -38,10 +38,17 @@
 //! subsets, and expectation timing assumes approximately lognormal residuals,
 //! which [`ResidualShape`] exposes for checking on real traffic.
 //!
-//! Not covered by that re-validation: the transfer-speed stage (the bake-off
-//! had no speed target), the live root squared-count sums described below, and
-//! a 10k-event window refit every 100 events once full (the bake-off's windows
-//! and cadence were smaller).
+//! A second re-validation, **`exp/estimator-bakeoff` commit 5d86af8a2**
+//! (`revalidate_live_sums_guard_and_speed{,_confirmation_seeds}` and
+//! `live_root_sums_match_frozen_at_refit_and_diverge_after`), covers the parts
+//! row 7 did not: live root squared-count sums (row 7b) and live sums plus the
+//! leave-one-out cancellation guard (row 7c) both match row 7, worst ratio
+//! 1.002 / 0.971, including quiet-node (6 events/h) and long-window runs at
+//! production cadence (10k window, refit every `max(50, window/100)`). The
+//! transfer-speed stage, with ties pooled by PAV direction, gave expected
+//! transfer times 0.05-0.51x legacy's. Caveats that remain: the 1.002 parity
+//! case, the drifted-peer subset of `pt.drift` (1.23 / 1.16), and tie
+//! pooling's own effect, which was not isolated.
 //!
 //! Deliberate differences from that reference, each from the review brief:
 //! the horizon selector scores the clamped forecast (identical for the log
@@ -124,9 +131,9 @@
 //!   treated as absent, so predictions take the query time too.
 //! - **Variance components are frozen between refits**, exactly as stale as the
 //!   curve they describe. Node means stay live, and so do the squared-count
-//!   sums in the root's noise: the reference froze those at refit along with
-//!   the components. Live sums are consistent with the live root mean they
-//!   describe; the difference is being re-validated separately.
+//!   sums in the root's noise: row 7 froze those at refit along with the
+//!   components. Live sums are consistent with the live root mean they
+//!   describe, and re-validated as row 7b (5d86af8a2) with no loss.
 //! - **Leave-one-out rests are summed, not subtracted.** A cell's rest is the
 //!   sum of its peer's other cells, and a peer holding all but a millionth of
 //!   the root is skipped, because under decay the reference's subtraction
