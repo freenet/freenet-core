@@ -5,8 +5,27 @@
 //! enough. A peer that cannot join the ring still routes through its gateway
 //! transport, so that transport is judged by how recently its remote sent a
 //! request over it instead ([`TransportActivity::idle`]). Transports kept only
-//! for that reason are capped per remote IP and globally, and the oldest are
-//! evicted first when a cap is exceeded.
+//! for that reason are capped per remote IP (IPv6: per /64) and globally, and
+//! the oldest are evicted first when a cap is exceeded.
+//!
+//! What this does not cover, deliberately:
+//!
+//! - Only transports whose remote sent a request within `3 × transient_ttl`
+//!   (90s by default) are exempt. An unjoined peer that stays quiet longer than
+//!   that is collected by age as before, and its next request can still go
+//!   into a dead link until its own 120s idle timeout fires. #5654 is fixed for
+//!   unjoined peers that keep sending requests.
+//! - A third or later exempt transport from one IP (or one IPv6 /64), or any
+//!   beyond the global cap, gets the age rule as before.
+//!
+//! Nothing relies on this sweep to close a transport that was removed from the
+//! ring but left open: every `Ring::prune_connection` caller also removes or
+//! replaces the transport's `connections` entry (`drop_connection_by_addr`,
+//! `drop_zombie_connection`, `TransportClosed`, the replaced-connection path in
+//! `handle_successful_connection`, and event-loop channel-closure teardown), and
+//! topology and health evictions go through `NodeEvent::DropConnection`. So a
+//! transport never loses ring membership while staying open, and never becomes
+//! exempt that way.
 
 use super::*;
 use crate::operations::connect::ConnectMsg;
@@ -432,10 +451,17 @@ pub(super) struct ZombieSlice {
 /// Transports kept for recent requests are admitted youngest first: at most
 /// `per_ip_cap` per [`link_use_exemption_key`], then at most `global_cap` in
 /// total. Anything beyond a cap falls back to the age rule and is reaped, the
-/// oldest first. A newcomer is therefore never refused the exemption; it is the
-/// longest-held exemptions that give way, so no remote holds one indefinitely by
-/// arriving early and staying active (`.claude/rules/code-style.md`, entries
-/// refreshed on every use).
+/// oldest first.
+///
+/// The order is by transport AGE, not by how recently the remote sent a
+/// request. `.claude/rules/code-style.md` asks refresh-on-use collections to
+/// evict rather than refuse, and names least-recently-used as the usual way.
+/// Here every exempt transport has sent a request within the last 90s, and
+/// recency is refreshed by the remote's own traffic, so an LRU order would let
+/// incumbents that keep sending requests keep their slots while newer
+/// transports were the ones evicted. Age cannot be refreshed, so exemptions
+/// rotate: a newcomer is always admitted, and it is the longest-held exemptions
+/// that give way.
 pub(super) fn plan_zombie_sweep(
     candidates: impl IntoIterator<Item = SweepCandidate>,
     per_ip_cap: usize,
@@ -1211,6 +1237,45 @@ mod tests {
         assert_eq!(slices, vec![MAX_ZOMBIE_CLEANUP_PER_CYCLE, 6]);
         assert!(connections.is_empty());
         assert!(!state.backlog_slice_due(t + Duration::from_secs(3600)));
+    }
+
+    /// The restamp must actually be called from `handle_transport_event`'s
+    /// inbound-message arm. Behaviourally this is covered by the simulation
+    /// test `test_gateway_zombie_sweep_keeps_unjoined_peers_live_link` (it fails
+    /// with the call removed); this pin is the fast local signal. A unit test
+    /// through `handle_transport_event` itself would need a `P2pConnManager`,
+    /// which is only constructed by the full node `build` path.
+    ///
+    /// The scrape is cross-file, so it cannot be satisfied by this test's own
+    /// literals, and it requires the call at statement position, so a
+    /// commented-out call fails it.
+    #[test]
+    fn handle_transport_event_restamps_inbound_requests() {
+        const SRC: &str = include_str!("connection_lifecycle.rs");
+        const ARM: &str = "Some(ConnEvent::InboundMessage(mut inbound)) => {";
+        const NEXT_ARM: &str = "Some(ConnEvent::TransportClosed {";
+        const CALL: &str = "zombie_sweep::record_link_use_request(";
+        let start = SRC.find(ARM).expect("inbound-message arm must exist");
+        let len = SRC[start..]
+            .find(NEXT_ARM)
+            .expect("the arm must be followed by the TransportClosed arm");
+        let arm = &SRC[start..start + len];
+        assert_eq!(SRC.matches(ARM).count(), 1, "the arm anchor must be unique");
+        let at_statement_position = arm.match_indices(CALL).any(|(i, _)| {
+            let line_start = arm[..i].rfind('\n').map_or(0, |n| n + 1);
+            arm[line_start..i].trim().is_empty()
+        });
+        assert!(
+            at_statement_position,
+            "handle_transport_event's inbound-message arm must call {CALL}...) (#5654)"
+        );
+        let call = arm.find(CALL).unwrap();
+        let args_len = arm[call..].find(");").expect("call must be closed");
+        let args = &arm[call..call + args_len];
+        assert!(
+            args.contains("inbound.remote_addr") && args.contains("&inbound.msg"),
+            "the restamp must be given the inbound message and its remote address"
+        );
     }
 
     // ---- request classification ----
