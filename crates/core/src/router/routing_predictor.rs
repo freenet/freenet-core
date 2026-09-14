@@ -2128,10 +2128,12 @@ mod recoverability {
     /// `add_points` / `remove_points`, which corrupted the fit between refits and
     /// inflated the untargeted error to `sd ~ 0.13`, capping `captured` near
     /// 0.45. With the fit exact, and the targeted/untargeted split measured
-    /// rather than assumed, the floor is sd 0.093 and the implied ceiling is
-    /// 0.714 on the mean over seeds but 0.58-0.85 per seed: the floor rules the
-    /// target out on the mean, with no margin, and on one seed not at all. The
-    /// measured score rose from 0.055 to 0.270. What now separates the measurement from the target
+    /// rather than assumed, the floor is sd 0.093 and the implied ceiling's
+    /// point estimate is 0.714 over the five seeds, 0.58-0.85 per seed. That is
+    /// only about 1.7-1.9 standard errors below 0.8, so the floor no longer
+    /// rules the target out: the base-floor test's `ceiling < 0.8` is a
+    /// tripwire on the point estimate, not proof. The measured score rose from
+    /// 0.055 to 0.270. What now separates the measurement from the target
     /// is mostly the correction, not the base. The 0.8 question is back open on
     /// #4485.
     ///
@@ -2293,15 +2295,25 @@ mod recoverability {
     ///
     /// # What is asserted now, and why these thresholds
     ///
-    /// Both bounds are the boundaries of the claims the docs make, not margins
+    /// The bounds are the boundaries of the claims the docs make, not margins
     /// tuned to the measurement:
     ///
-    /// - `ceiling < 0.8`: the base floor alone still rules out the published
-    ///   target. It does so only on the mean over seeds (0.714; per seed
-    ///   0.58-0.85, so on one seed the floor alone does not rule 0.8 out), and
-    ///   the harness is seeded, so this cannot flake run to run; it goes red only if the base
-    ///   improves further, at which point the floor no longer rules 0.8 out and
-    ///   the docs saying it does become false.
+    /// - `ceiling < 0.8`, on the MEAN over seeds, because the published target
+    ///   is itself a mean over these seeds: if every seed's `captured` is at
+    ///   most that seed's ceiling (the next bullet), the mean `captured` is at
+    ///   most the mean ceiling. The point estimate is 0.714, per seed
+    ///   0.58-0.85, which is about 1.7-1.9 standard errors below 0.8. So this is
+    ///   a tripwire that fires when the point estimate itself reaches 0.8, not
+    ///   proof that the floor rules 0.8 out. The harness is seeded, so it cannot
+    ///   flake run to run; but a change in how many `GlobalRng` draws the
+    ///   harness makes redraws all five scenarios and can move the estimate by
+    ///   roughly 0.05 with no change to the model being judged.
+    /// - Per seed, `captured <= ceiling`: the premise the mean argument rests
+    ///   on, and the "estimate, not a bound" caveat below made checkable.
+    ///   Margins today are 0.29-0.53. If a change let the correction repair
+    ///   untargeted misfit as well, `captured` could pass the ceiling and the
+    ///   argument above would stop holding without this test noticing; this
+    ///   assertion is what notices.
     /// - `base mse > Var(p*)`: the base is worse than a climatology forecast,
     ///   the premise the targeted-recovery docs rest on ("dig out of someone
     ///   else's hole"). Measured 0.0316 vs 0.0276.
@@ -2313,7 +2325,7 @@ mod recoverability {
     /// (`targeted_mse_base`). Until round 3 of #5662 both were assumed: a
     /// fraction of exactly 1/12 and an error of exactly the 0.55² penalty. It is
     /// an estimate of where the floor bites, not a bound the correction provably
-    /// cannot beat.
+    /// cannot beat; the per-seed assertion is what reports it if it ever does.
     #[test]
     fn the_base_models_own_error_floor_is_what_caps_recovery() {
         // Run the harness once per seed and derive everything from those runs,
@@ -2361,18 +2373,50 @@ mod recoverability {
             targeted_error.sqrt()
         );
 
+        // Per seed, so the split behind a failure can be read straight off the
+        // test output rather than reconstructed.
+        let per_seed: Vec<String> = SEEDS
+            .iter()
+            .zip(&runs)
+            .zip(&ceilings)
+            .map(|((seed, &r), ceiling)| {
+                let (fraction, targeted, untargeted, _) = split(r);
+                format!(
+                    "seed {seed:#x}: targeted fraction {fraction:.4}, base targeted mse \
+                     {targeted:.4}, untargeted mse {untargeted:.5}, base mse {:.5} vs \
+                     Var(p*) {:.5}, ceiling {ceiling:.3}, captured {:.3}",
+                    r.mse_base, r.var_p_star, r.captured_corrected
+                )
+            })
+            .collect();
+        let per_seed = per_seed.join("\n  ");
+        eprintln!("#4485 base error floor, per seed:\n  {per_seed}");
+
+        for ((seed, r), &seed_ceiling) in SEEDS.iter().zip(&runs).zip(&ceilings) {
+            assert!(
+                r.captured_corrected <= seed_ceiling,
+                "seed {seed:#x}: the correction captured {:.3}, above the {seed_ceiling:.3} \
+                 its base's untargeted floor allows. It is now repairing untargeted \
+                 misfit too, so the premise behind comparing the mean ceiling with \
+                 0.8 no longer holds; revisit this test and #4485.\n  {per_seed}",
+                r.captured_corrected
+            );
+        }
         assert!(
             ceiling < 0.8,
-            "the base's untargeted error floor no longer rules out the published \
-             captured >= 0.8 target: implied ceiling {ceiling:.3} (untargeted sd \
-             {untargeted_sd:.3}). The docs on this test and on \
-             `recovered_structure_beats_assuming_the_base_rate` say it does; \
-             update them and #4485."
+            "the implied captured ceiling's point estimate over the seeds reached \
+             the published 0.8 target: mean {ceiling:.3}, per seed {ceilings:.3?} \
+             (untargeted sd {untargeted_sd:.3}; base mse {base_mse:.5} vs Var(p*) \
+             {var_p_star:.5}). This was a tripwire about 1.7-1.9 standard errors \
+             below 0.8, not proof that the floor rules 0.8 out; update the docs on \
+             this test and on `recovered_structure_beats_assuming_the_base_rate`, \
+             and #4485.\n  {per_seed}"
         );
         assert!(
             base_mse > var_p_star,
             "the base must be worse than a climatology forecast for the floor \
-             argument to hold; base mse {base_mse:.5} vs Var(p*) {var_p_star:.5}"
+             argument to hold; base mse {base_mse:.5} vs Var(p*) {var_p_star:.5}\n  \
+             {per_seed}"
         );
     }
 

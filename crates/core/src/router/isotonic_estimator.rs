@@ -65,6 +65,16 @@ const EWMA_ALPHA: f64 = 0.1;
 /// only affects the degenerate `global <= 0` region.
 const MULTIPLICATIVE_MIN_BASE: f64 = 1e-9;
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds only: whether this thread expects `resync_window` to run.
+    /// Unset, a resync panics, so that any test in the crate that drives a
+    /// window out of step fails loudly, as the `debug_assert!` the resync
+    /// replaced used to make it fail. A test that corrupts a window on purpose
+    /// sets it.
+    static RESYNC_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// `IsotonicEstimator` provides outcome estimation for a given action, such as
 /// retrieving the state of a contract, based on the distance between the peer
 /// and the contract. It uses an isotonic regression model from the `pav.rs`
@@ -77,13 +87,15 @@ const MULTIPLICATIVE_MIN_BASE: f64 = 1e-9;
 /// fit is rebuilt over the window. Per-peer adjustments use an
 /// exponentially-weighted moving average (EWMA) so recent events have more
 /// influence than old ones.
-
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct IsotonicEstimator {
     /// The fit over the window, kept current on every event under
     /// [`FitPolicy::EveryEvent`]. Under [`FitPolicy::OnRead`] it is never built
     /// and stays empty. Private so that nothing outside this module can read it
-    /// directly and get that empty fit: every reader goes through [`Self::fit`].
+    /// directly and get that empty fit: every reader goes through
+    /// [`Self::current_fit`]. `Serialize` writes it as it stands, so an OnRead
+    /// estimator would serialize an empty fit; nothing serializes an estimator
+    /// today.
     global_regression: IsotonicRegression<f64>,
     pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
     /// When the global fit is built. See [`FitPolicy`].
@@ -112,7 +124,7 @@ pub(crate) struct IsotonicEstimator {
     /// The `(distance, result)` points of `raw_events`, kept in the order
     /// `pav_regression` sorts its input. Under [`FitPolicy::EveryEvent`],
     /// `global_regression` is rebuilt from this on every event; under
-    /// [`FitPolicy::OnRead`], [`Self::fit`] builds from it when read.
+    /// [`FitPolicy::OnRead`], [`Self::current_fit`] builds from it when read.
     ///
     /// WHY NOT `add_points` / `remove_points` (#5658). `pav_regression` 0.7.0's
     /// incremental maintenance is approximate, and not slightly: `remove_points`
@@ -146,9 +158,9 @@ pub(crate) struct IsotonicEstimator {
 /// The fit is a full PAV rebuild over the window (see [`SortedWindow`]), and it
 /// runs inside `Router::add_event`, under `ring.router.write()`. Six estimators
 /// can take one route event, but routing only reads three of them. The other
-/// three (`Router::per_op_*`) feed the dashboard snapshot, which is built every
-/// five minutes, so rebuilding them on every event was paying for a fit that
-/// was almost never read.
+/// three (`Router::per_op_*`) feed the dashboard snapshot, which is built on
+/// the five-minute telemetry cadence and on each load of a peer-detail page, so
+/// rebuilding them on every event paid for a fit that was rarely read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum FitPolicy {
     /// Rebuild the fit and update the per-peer EWMA on every event, and refit
@@ -157,7 +169,7 @@ pub(crate) enum FitPolicy {
     #[default]
     EveryEvent,
     /// Keep only the window; fit it when a reader asks (see
-    /// [`IsotonicEstimator::fit`]). The fit is the same exact batch fit over the
+    /// [`IsotonicEstimator::current_fit`]). The fit is the same exact batch fit over the
     /// same window, so readers see the identical curve. There are no per-peer
     /// adjustments: the EWMA is trained against the fit as it stood at each
     /// event, which this policy never builds. For estimators nothing routes on.
@@ -165,6 +177,8 @@ pub(crate) enum FitPolicy {
     /// Reading computes a fresh fit and caches nothing, so it needs only
     /// `&self`. That keeps the dashboard snapshot on `ring.router.read()` with
     /// no interior mutability to reason about, at the cost of one fit per read.
+    /// [`IsotonicEstimator::sampled_curve_and_range`] keeps the snapshot to one
+    /// fit per estimator.
     OnRead,
 }
 
@@ -535,8 +549,10 @@ impl IsotonicEstimator {
     /// `Router::add_event` feeds this to its three routing estimators (its
     /// three per-operation dashboard estimators fit on read), under
     /// `ring.router.write()`. On a saturated router the whole `add_event`
-    /// measured 2.8-4.7ms per event in release on the same machine, of which
-    /// the isotonic estimators took under 2%. Nearly all of the rest is the
+    /// measured 2.0-8.7ms per event across passes in release on the same
+    /// machine, and within every pass the isotonic estimators took under 2% of
+    /// it. (The ranges come from different passes, so they are not to be divided
+    /// into each other.) Nearly all of the rest is the
     /// Renegade predictor: in a perf profile about 22% of samples were under
     /// `PredictionStage::train` (renegade's `get_optimal_k`) and about 11% in
     /// its kNN sort, with no isotonic function above 3% (#5662).
@@ -603,7 +619,8 @@ impl IsotonicEstimator {
                     .remove(oldest.route_distance().as_f64(), oldest.result);
             }
         }
-        if !evicted_in_step || self.sorted_points.len() != self.raw_events.len() {
+        let resynced = !evicted_in_step || self.sorted_points.len() != self.raw_events.len();
+        if resynced {
             self.resync_window();
         }
 
@@ -647,6 +664,14 @@ impl IsotonicEstimator {
                     .add(delta);
             }
         }
+
+        // After a resync the EWMAs had been trained against fits over the wrong
+        // window for as long as the desync lasted. Re-anchor them to the repaired
+        // fit now, not at the next scheduled refit, so a detected bookkeeping bug
+        // leaves no residue.
+        if resynced {
+            self.refit();
+        }
     }
 
     pub fn estimate_retrieval_time(
@@ -654,7 +679,7 @@ impl IsotonicEstimator {
         peer: &PeerKeyLocation,
         contract_location: Location,
     ) -> Result<f64, EstimationError> {
-        let fit = self.fit();
+        let fit = self.current_fit();
         if fit.len() < MIN_POINTS_FOR_REGRESSION {
             return Err(EstimationError::InsufficientData);
         }
@@ -715,7 +740,11 @@ impl IsotonicEstimator {
     /// window, and owned by the caller: the same exact batch fit, computed when
     /// asked for rather than on every event. Nothing is cached, so this takes
     /// `&self` and a reader holding only `ring.router.read()` can call it.
-    fn fit(&self) -> Cow<'_, IsotonicRegression<f64>> {
+    ///
+    /// Named `current_fit`, not `fit`: until #5662 `fit` was the refit that
+    /// rebuilt the peer adjustments, and an old reference to that should not
+    /// silently resolve to this.
+    fn current_fit(&self) -> Cow<'_, IsotonicRegression<f64>> {
         match self.fit_policy {
             FitPolicy::EveryEvent => Cow::Borrowed(&self.global_regression),
             FitPolicy::OnRead => {
@@ -740,8 +769,22 @@ impl IsotonicEstimator {
     /// `window_resyncs` records that it happened so tests can require zero.
     ///
     /// The warn cannot flood: a resync restores the invariant, so a second one
-    /// needs a second bookkeeping bug.
+    /// needs a second bookkeeping bug. For an EveryEvent estimator,
+    /// `add_event_incremental` then re-anchors the peer adjustments.
+    ///
+    /// In test builds it panics unless the thread set `RESYNC_EXPECTED`, so a
+    /// bookkeeping bug fails every test that reaches it, not just the ones that
+    /// read `window_resyncs`.
     fn resync_window(&mut self) {
+        #[cfg(test)]
+        assert!(
+            RESYNC_EXPECTED.with(std::cell::Cell::get),
+            "isotonic sorted window out of step with its events (window {}, sorted {}): \
+             a bookkeeping bug. A test that corrupts a window on purpose must set \
+             RESYNC_EXPECTED.",
+            self.raw_events.len(),
+            self.sorted_points.len()
+        );
         self.window_resyncs += 1;
         tracing::warn!(
             window = self.raw_events.len(),
@@ -779,7 +822,7 @@ impl IsotonicEstimator {
         peer: &PeerKeyLocation,
         contract_location: Location,
     ) -> Result<f64, EstimationError> {
-        let fit = self.fit();
+        let fit = self.current_fit();
         if fit.len() < MIN_POINTS_FOR_REGRESSION {
             return Err(EstimationError::InsufficientData);
         }
@@ -793,11 +836,15 @@ impl IsotonicEstimator {
 
     /// Return the x-range of actual regression data points, or (0, 0) if empty.
     pub(crate) fn data_x_range(&self) -> (f64, f64) {
-        let sorted = self.fit().get_points_sorted();
-        if sorted.is_empty() {
-            return (0.0, 0.0);
+        Self::fit_x_range(&self.current_fit())
+    }
+
+    fn fit_x_range(fit: &IsotonicRegression<f64>) -> (f64, f64) {
+        let sorted = fit.get_points_sorted();
+        match (sorted.first(), sorted.last()) {
+            (Some(first), Some(last)) => (*first.x(), *last.x()),
+            _ => (0.0, 0.0),
         }
-        (*sorted.first().unwrap().x(), *sorted.last().unwrap().x())
     }
 
     /// Sample the regression's `interpolate()` across the full distance range [0, 0.5],
@@ -818,20 +865,44 @@ impl IsotonicEstimator {
         if num_samples < 2 {
             return Vec::new();
         }
-        let fit = self.fit();
-        if fit.get_points().is_empty() {
+        Self::sample_fit(&self.current_fit(), y_clamp_min, y_clamp_max, num_samples)
+    }
+
+    /// [`Self::sampled_curve`] and [`Self::data_x_range`] from ONE fit.
+    ///
+    /// Under [`FitPolicy::OnRead`] each of those builds its own fit, so a caller
+    /// that wants both would pay for two. The router's dashboard snapshot wants
+    /// both for every per-operation estimator, under `ring.router.read()`, on
+    /// the telemetry cadence and on every peer-detail page load.
+    pub(crate) fn sampled_curve_and_range(
+        &self,
+        y_clamp_min: f64,
+        y_clamp_max: f64,
+        num_samples: usize,
+    ) -> (Vec<(f64, f64)>, (f64, f64)) {
+        let fit = self.current_fit();
+        (
+            Self::sample_fit(&fit, y_clamp_min, y_clamp_max, num_samples),
+            Self::fit_x_range(&fit),
+        )
+    }
+
+    fn sample_fit(
+        fit: &IsotonicRegression<f64>,
+        y_clamp_min: f64,
+        y_clamp_max: f64,
+        num_samples: usize,
+    ) -> Vec<(f64, f64)> {
+        if num_samples < 2 || fit.get_points().is_empty() {
             return Vec::new();
         }
-
-        let mut points = Vec::with_capacity(num_samples);
-        for i in 0..num_samples {
-            let x = (i as f64 / (num_samples - 1) as f64) * 0.5;
-            if let Some(y) = fit.interpolate(x) {
-                points.push((x, y.clamp(y_clamp_min, y_clamp_max)));
-            }
-        }
-
-        points
+        (0..num_samples)
+            .filter_map(|i| {
+                let x = (i as f64 / (num_samples - 1) as f64) * 0.5;
+                fit.interpolate(x)
+                    .map(|y| (x, y.clamp(y_clamp_min, y_clamp_max)))
+            })
+            .collect()
     }
 
     /// Downsampled raw `(distance, outcome)` observations for visualization, in
@@ -2130,23 +2201,32 @@ mod tests {
     /// A window that has fallen out of step with `raw_events` is rebuilt from
     /// it on the next event, rather than carrying the error forever.
     ///
-    /// Two ways in, one per case, each produced by corrupting the window
-    /// directly, since correct bookkeeping cannot produce either:
+    /// Three corruptions, each made directly, since correct bookkeeping cannot
+    /// produce any of them. Each is caught by a different part of the check:
     ///
     /// - A point replaced: the window is the right size but holds a point
     ///   `raw_events` does not. Nothing looks wrong until that point's event is
-    ///   evicted and its removal misses, which is what the test drives.
+    ///   evicted and its removal misses. A miss leaves the window one point
+    ///   long, so the length comparison fires as well.
+    /// - A point replaced and another dropped: the missed removal leaves the
+    ///   lengths EQUAL, so only the miss itself can notice. Without this case
+    ///   the `!evicted_in_step` half of the check could be deleted unnoticed.
     /// - A point too many, below capacity: no eviction happens at all, so only
     ///   the length comparison can notice.
     ///
-    /// (A miss always leaves the window one point long, so in the first case
-    /// the length comparison fires too; checking the miss as well keeps the
-    /// heal from depending on that arithmetic.)
+    /// After the rebuild, the EWMAs, trained against fits over the wrong window,
+    /// must be re-anchored to the repaired fit.
     ///
-    /// Mutation check: without the `resync_window()` call the stray point stays
-    /// in the window and in the fit, and both cases fail.
+    /// The test sets `RESYNC_EXPECTED`; any other test that drives a window out
+    /// of step panics instead (see `resync_window`).
+    ///
+    /// Mutation checks: without the `resync_window()` call the stray point stays
+    /// in the window and in the fit, and every case fails; without the miss
+    /// check the second case fails; without the re-anchor the EWMA assertions
+    /// fail.
     #[test]
     fn a_desynced_sorted_window_is_rebuilt_from_its_events() {
+        RESYNC_EXPECTED.with(|expected| expected.set(true));
         let peer = PeerKeyLocation::random();
         // Every distance distinct, so removing the oldest point cannot be
         // satisfied by a duplicate of it elsewhere in the window.
@@ -2157,7 +2237,7 @@ mod tests {
         const STRAY: (f64, f64) = (0.499_9, 99.0);
 
         type Corruption = fn(&mut IsotonicEstimator);
-        let cases: [(&str, usize, Corruption); 2] = [
+        let cases: [(&str, usize, Corruption); 3] = [
             (
                 "point replaced, caught at its eviction",
                 MAX_REGRESSION_POINTS,
@@ -2172,6 +2252,26 @@ mod tests {
                             .sorted_points
                             .remove(oldest.route_distance().as_f64(), oldest.result)
                     );
+                    estimator.sorted_points.insert(STRAY.0, STRAY.1);
+                },
+            ),
+            (
+                "point replaced and another dropped, so only the miss shows",
+                MAX_REGRESSION_POINTS,
+                |estimator| {
+                    let oldest = estimator
+                        .raw_events
+                        .front()
+                        .expect("window is full")
+                        .clone();
+                    let newest = estimator.raw_events.back().expect("window is full").clone();
+                    for event in [&oldest, &newest] {
+                        assert!(
+                            estimator
+                                .sorted_points
+                                .remove(event.route_distance().as_f64(), event.result)
+                        );
+                    }
                     estimator.sorted_points.insert(STRAY.0, STRAY.1);
                 },
             ),
@@ -2217,6 +2317,31 @@ mod tests {
                     .iter()
                     .all(|point| *point.y() <= 1.0),
                 "{label}: the stray point must be gone from the fit"
+            );
+
+            // The EWMAs were trained against fits over the wrong window while it
+            // was out of step: the resync must re-anchor them to the repaired fit.
+            assert_eq!(
+                estimator.events_since_refit, 0,
+                "{label}: the resync must re-anchor the peer adjustments"
+            );
+            let anchored = IsotonicEstimator::anchor_peer_adjustments(
+                &estimator.raw_events,
+                &estimator.global_regression,
+                estimator.adjustment_mode,
+            );
+            let summary = |adjustments: &HashMap<PeerKeyLocation, Adjustment>| {
+                let mut rows: Vec<(String, f64, f64)> = adjustments
+                    .iter()
+                    .map(|(peer, a)| (format!("{peer:?}"), a.smoothed, a.effective_count))
+                    .collect();
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                rows
+            };
+            assert_eq!(
+                summary(&estimator.peer_adjustments),
+                summary(&anchored),
+                "{label}: the peer adjustments must be the ones anchored to the repaired fit"
             );
 
             // Back in step: the next event must not resync again.
@@ -2275,6 +2400,11 @@ mod tests {
                         on_read.estimate_global(&peer, contract),
                         every.estimate_global(&peer, contract),
                         "{label}: global estimate"
+                    );
+                    assert_eq!(
+                        on_read.sampled_curve_and_range(0.0, 1.0, 50),
+                        (every.sampled_curve(0.0, 1.0, 50), every.data_x_range()),
+                        "{label}: curve and range from one fit"
                     );
                 }
             }

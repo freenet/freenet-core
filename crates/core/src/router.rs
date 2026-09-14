@@ -2427,23 +2427,23 @@ impl Router {
                 for ot in op_types {
                     let mut c = PerOpCurves::default();
                     if let Some(est) = self.per_op_failure.get(&ot) {
-                        let p = est.sampled_curve(0.0, 1.0, 50);
-                        c.failure_curve = p;
-                        c.failure_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.failure_curve, c.failure_data_range) =
+                            est.sampled_curve_and_range(0.0, 1.0, 50);
                         c.failure_events = est.len();
                         c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.response_time_curve = p;
-                        c.response_time_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.response_time_curve, c.response_time_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.response_time_events = est.len();
                         c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.transfer_rate_curve = p;
-                        c.transfer_rate_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.transfer_rate_curve, c.transfer_rate_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.transfer_rate_events = est.len();
                         c.transfer_rate_points = est.sampled_raw_points(100);
                     }
@@ -3104,6 +3104,51 @@ mod tests {
                 );
             }
         }
+
+        // `Router::new` builds the estimators from history by a separate path
+        // from `add_event`'s lazy inserts, so pin that path too.
+        let op_event = |outcome| RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome,
+            op_type: Some(OpType::Get),
+        };
+        let from_history = Router::new(&[
+            op_event(RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            }),
+            op_event(RouteOutcome::Failure),
+        ]);
+        for (label, est) in [
+            (
+                "response_start_time",
+                &from_history.response_start_time_estimator,
+            ),
+            ("transfer_rate", &from_history.transfer_rate_estimator),
+            ("failure", &from_history.failure_estimator),
+        ] {
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::EveryEvent,
+                "{label} built from history: routing reads it, so it must fit on every event"
+            );
+        }
+        for (label, per_op) in [
+            ("per_op_failure", &from_history.per_op_failure),
+            ("per_op_response_time", &from_history.per_op_response_time),
+            ("per_op_transfer_rate", &from_history.per_op_transfer_rate),
+        ] {
+            let est = per_op
+                .get(&OpType::Get)
+                .unwrap_or_else(|| panic!("sanity: the history must populate {label}"));
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::OnRead,
+                "{label} built from history is dashboard-only and must fit on read"
+            );
+        }
     }
 
     /// Drive a peer that fails ONLY for one contract region, and assert the
@@ -3121,9 +3166,18 @@ mod tests {
     /// parallel tests neither disturb this one nor are disturbed by it. The
     /// guard must stay the first statement: `PeerKeyLocation::random` caches a
     /// keypair per thread on first use, and generating it consumes draws.
+    ///
+    /// The seed is one that FAILS on the pre-fix code, so this is also a
+    /// regression test for #5658 rather than only a behaviour pin. On the
+    /// merge base (3884adcf) seeds 0..80 failed 3 times (33, 39, 79). Seed 39
+    /// failed there with enabled 0.749 against disabled 1.000: the corrupted
+    /// curve pinned the legacy blend at 1.0, as in #5658. It passes with the
+    /// exact fit. Any seed that passes on both is useless here, so do not
+    /// change it without re-running that search; the exactness itself is pinned
+    /// by `incremental_fit_matches_batch_after_every_event`.
     #[test]
     fn enabled_correction_changes_the_estimate_the_router_acts_on() {
-        let _guard = crate::config::GlobalRng::seed_guard(0x5658_F1A7);
+        let _guard = crate::config::GlobalRng::seed_guard(39);
         let targeted_peer = PeerKeyLocation::random();
         let peer_location = targeted_peer
             .location()
@@ -5646,9 +5700,16 @@ mod tests {
         assert!(get_curves.failure_events > 0);
         assert!(get_curves.response_time_events > 0);
         assert!(get_curves.transfer_rate_events > 0);
+        // These curves come from a fit built inside `snapshot()`, because the
+        // per-op estimators fit on read (#5662): non-empty shows that path works
+        // end to end, which the event counts above (read without fitting) do not.
+        assert!(!get_curves.failure_curve.is_empty());
+        assert!(!get_curves.response_time_curve.is_empty());
+        assert!(!get_curves.transfer_rate_curve.is_empty());
 
         let put_curves = &snap.per_op_curves["PUT"];
         assert!(put_curves.failure_events > 0);
+        assert!(!put_curves.failure_curve.is_empty());
         assert_eq!(put_curves.response_time_events, 0);
         assert_eq!(put_curves.transfer_rate_events, 0);
     }
