@@ -50,10 +50,11 @@ impl TransportActivity {
 /// minutes as it did when the sweep judged by age alone.
 const ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE: u32 = 120;
 
-/// Most transports from one remote IP that may be kept alive by recent requests
-/// alone (see [`link_use_exemption_key`]). Two rather than one so that two
-/// peers behind one household NAT, or a peer and its own restarted process, are
-/// both served.
+/// Most transports from one remote address group (an IPv4 address or an IPv6
+/// /64, see [`link_use_exemption_key`]) that may be kept alive by recent
+/// requests alone. Two rather than one so that two peers behind one household
+/// NAT, or a peer and its own restarted process, are both served. A third or
+/// later transport from the same group gets the age rule, as before #5654.
 pub(super) const LINK_USE_EXEMPT_PER_IP_CAP: usize = 2;
 
 /// Divisor of `max_connections` giving the most transports, across all remotes,
@@ -88,16 +89,30 @@ pub(super) fn link_use_exempt_global_cap(max_connections: usize) -> usize {
     (max_connections / LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR).max(LINK_USE_EXEMPT_PER_IP_CAP)
 }
 
-/// The key the per-IP cap counts under: the remote IP, except for loopback
-/// remotes, which are keyed by full address so several local nodes on one host
-/// (every simulation and local test network) are not collapsed into one.
-/// This mirrors the loopback rule in `Location::from_address`.
+/// The key the per-IP cap counts under.
+///
+/// - IPv4 remotes (including IPv4-mapped IPv6) are grouped by address.
+/// - IPv6 remotes are grouped by /64, the prefix conventionally assigned to a
+///   single subscriber network.
+/// - Loopback remotes are keyed by full socket address, so several local nodes
+///   on one host (every simulation and local test network) are not collapsed
+///   into one. This mirrors the loopback rule in `Location::from_address`.
+///
+/// `Location::from_address` masks differently (/24 and /48) because it groups
+/// peers for ring placement; this key only has to group one subscriber's
+/// transports, so it uses the narrower per-subscriber grouping.
 pub(super) fn link_use_exemption_key(addr: SocketAddr) -> (IpAddr, u16) {
     let ip = addr.ip().to_canonical();
     if ip.is_loopback() {
-        (ip, addr.port())
-    } else {
-        (ip, 0)
+        return (ip, addr.port());
+    }
+    match ip {
+        IpAddr::V4(_) => (ip, 0),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let prefix = std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            (IpAddr::V6(prefix), 0)
+        }
     }
 }
 
@@ -774,6 +789,55 @@ mod tests {
         );
         assert_eq!(plan.over_per_ip_cap, 2);
         assert_eq!(plan.over_global_cap, 0);
+    }
+
+    /// IPv6 remotes in one /64 share a key; different /64s do not. The port
+    /// never matters outside loopback.
+    #[test]
+    fn exemption_key_groups_ipv6_by_64() {
+        let same_64 = [
+            "[2001:db8:1:2::1]:1000",
+            "[2001:db8:1:2:ffff:ffff:ffff:ffff]:2000",
+            "[2001:db8:1:2:abcd::9]:3000",
+        ];
+        let key = link_use_exemption_key(addr(same_64[0]));
+        for a in same_64 {
+            assert_eq!(
+                link_use_exemption_key(addr(a)),
+                key,
+                "{a} is in the same /64"
+            );
+        }
+        for other in ["[2001:db8:1:3::1]:1000", "[2001:db8:2:2::1]:1000"] {
+            assert_ne!(
+                link_use_exemption_key(addr(other)),
+                key,
+                "{other} is in a different /64"
+            );
+        }
+        assert_ne!(
+            link_use_exemption_key(addr("203.0.113.7:1")),
+            link_use_exemption_key(addr("203.0.113.8:1")),
+            "IPv4 remotes are grouped by full address"
+        );
+    }
+
+    /// The per-IP cap counts an IPv6 /64 as one group.
+    #[test]
+    fn per_ip_cap_applies_across_one_ipv6_64() {
+        let plan = plan_zombie_sweep(
+            [
+                exempt("[2001:db8:1:2::1]:1", 100),
+                exempt("[2001:db8:1:2::2]:1", 200),
+                exempt("[2001:db8:1:2::3]:1", 300),
+                exempt("[2001:db8:1:3::1]:1", 400),
+            ],
+            2,
+            100,
+        );
+        assert_eq!(plan.over_cap, vec![addr("[2001:db8:1:2::3]:1")]);
+        assert_eq!(plan.over_per_ip_cap, 1);
+        assert_eq!(plan.kept_for_link_use.len(), 3);
     }
 
     /// IPv4-mapped IPv6 counts as the same remote IP; loopback is keyed by full

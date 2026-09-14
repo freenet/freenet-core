@@ -751,8 +751,6 @@ impl ControlledSimulationResult {
         self.summarize_wasm_calls.values().copied().sum()
     }
 
-    /// The single peer's peak WASM-summarize count — the worst per-node
-    /// summarize load any peer bore during the run.
     /// How many times `sweeper`'s zombie sweep found the transport from `remote`
     /// never promoted to its ring and old enough to be a zombie by age, and how
     /// many of those times it kept the transport because `remote` had sent a
@@ -768,6 +766,8 @@ impl ControlledSimulationResult {
             .unwrap_or((0, 0))
     }
 
+    /// The single peer's peak WASM-summarize count — the worst per-node
+    /// summarize load any peer bore during the run.
     pub fn max_summarize_wasm_calls(&self) -> u64 {
         self.summarize_wasm_calls
             .values()
