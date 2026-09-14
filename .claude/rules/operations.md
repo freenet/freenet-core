@@ -69,12 +69,14 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
   → A timeout is blamed on the recorded hop only if the hop had at least
     half of the attempt (`route_attempt::hop_had_budget_share`), counted
     from when the loopback relay's dispatch returned (`touch_hop`): a hop
-    reached near the deadline did not stall it.
-  → A failed GET stream claim or assembly is labelled per
-    `stream_failure_is_peer_caused`, which the client, the relay and the
-    test hook share: every assembly failure (a cancellation does not record
-    which side ended it) and a claim timeout blame the hop; a claim waiter
-    dropped on this node does not.
+    reached near the deadline did not stall it, and an attempt whose
+    dispatch had not returned by the deadline blames nobody.
+  → A failed GET stream is labelled per `stream_failure_is_peer_caused`,
+    used by the client (claim and assembly), the relay's claim arm and the
+    test hook: every assembly failure (a cancellation does not record which
+    side ended it) and a claim timeout blame the hop; a claim waiter dropped
+    on this node does not. The relay's failures after a successful claim
+    label nothing, as before #5657.
   → Never treat local evidence or later evidence as proof. This node's own
     (possibly stale) copy, a local completion, or a terminal with no recorded
     hop proves nothing about a remote peer. "The contract exists now" is not

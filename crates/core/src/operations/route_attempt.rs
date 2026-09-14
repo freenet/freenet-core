@@ -511,8 +511,9 @@ pub(crate) struct AttemptHopRegistry {
 
 #[derive(Default)]
 struct AttemptSlot {
-    /// The peer the loopback relay forwarded the attempt to, and when.
-    hop: Option<(PeerKeyLocation, tokio::time::Instant)>,
+    /// The peer the loopback relay forwarded the attempt to, and when its
+    /// local dispatch returned (`None` until it has).
+    hop: Option<(PeerKeyLocation, Option<tokio::time::Instant>)>,
     /// Peers the loopback relay must not pick as the attempt's first hop.
     /// Local to this node: never put in the forwarded request's visited bloom.
     first_hop_exclusions: Vec<std::net::SocketAddr>,
@@ -560,16 +561,20 @@ impl AttemptHopRegistry {
     /// Called by the originator-loopback relay immediately before it dispatches
     /// the request to `peer`. A no-op when no attempt is registered for `tx`
     /// (a relay hop for a remote upstream, or an attempt already resolved).
+    /// Its local dispatch has not returned yet, so the dispatch time stays
+    /// unset until [`touch_hop`](Self::touch_hop).
     pub(crate) fn record_hop(&self, tx: &Transaction, peer: &PeerKeyLocation) {
         if let Some(mut slot) = self.slots.get_mut(tx) {
-            slot.hop = Some((peer.clone(), tokio::time::Instant::now()));
+            slot.hop = Some((peer.clone(), None));
         }
     }
 
-    /// Re-stamp the recorded hop's time to now, keeping its peer. The loopback
-    /// relay calls it once its dispatch has returned, so time this node spent
-    /// waiting to dispatch does not count as the hop's share of the attempt
-    /// (#5657). A no-op when no hop is recorded.
+    /// Stamp the recorded hop's dispatch time as now, keeping its peer. The
+    /// loopback relay calls it once its local dispatch (the hand-off to this
+    /// node's event loop) has returned: the hop's share of the attempt is
+    /// counted from then, and an attempt whose local dispatch never returned
+    /// blames nobody for its timeout (#5657). A no-op when no hop is
+    /// recorded.
     pub(crate) fn touch_hop(&self, tx: &Transaction) {
         if let Some((_, recorded_at)) = self
             .slots
@@ -577,7 +582,7 @@ impl AttemptHopRegistry {
             .as_deref_mut()
             .and_then(|slot| slot.hop.as_mut())
         {
-            *recorded_at = tokio::time::Instant::now();
+            *recorded_at = Some(tokio::time::Instant::now());
         }
     }
 
@@ -608,9 +613,9 @@ impl AttemptHopGuard {
         self.hop_record().map(|(hop, _)| hop)
     }
 
-    /// The peer the attempt was forwarded to and when the loopback relay
-    /// recorded it, if it did.
-    pub(crate) fn hop_record(&self) -> Option<(PeerKeyLocation, tokio::time::Instant)> {
+    /// The peer the attempt was forwarded to, if the loopback relay recorded
+    /// one, and when its local dispatch returned (`None` while it has not).
+    pub(crate) fn hop_record(&self) -> Option<(PeerKeyLocation, Option<tokio::time::Instant>)> {
         self.registry
             .slots
             .get(&self.tx)
@@ -626,22 +631,27 @@ impl Drop for AttemptHopGuard {
 
 /// The smallest share of an attempt's elapsed time the recorded hop must have
 /// had for the attempt's timeout to be blamed on it (#5657). The loopback relay
-/// stamps the hop once its dispatch returns, which on an overloaded originator
+/// stamps the hop once its local dispatch returns, which on an overloaded originator
 /// can be late in the attempt: a hop forwarded to at 59 s of a 60 s budget did not
 /// stall the attempt, the originator did. At one half, a hop is blamed when it
 /// had at least as long as the originator took to reach it.
 pub(crate) const MIN_HOP_SHARE_FOR_TIMEOUT_BLAME: f64 = 0.5;
 
-/// Whether a hop recorded at `hop_recorded_at` had enough of an attempt that
-/// started at `attempt_started` and timed out at `timed_out_at` to be blamed
-/// for the timeout. See [`MIN_HOP_SHARE_FOR_TIMEOUT_BLAME`].
+/// Whether the hop of an attempt that started at `attempt_started` and timed
+/// out at `timed_out_at` had enough of it to be blamed for the timeout. The
+/// share runs from `dispatched_at`, when the loopback relay's local dispatch
+/// (the hand-off to this node's event loop) returned; `None` means it never
+/// returned, and nobody is blamed. See [`MIN_HOP_SHARE_FOR_TIMEOUT_BLAME`].
 pub(crate) fn hop_had_budget_share(
     attempt_started: tokio::time::Instant,
-    hop_recorded_at: tokio::time::Instant,
+    dispatched_at: Option<tokio::time::Instant>,
     timed_out_at: tokio::time::Instant,
 ) -> bool {
+    let Some(dispatched_at) = dispatched_at else {
+        return false;
+    };
     let attempt = timed_out_at.saturating_duration_since(attempt_started);
-    let hop = timed_out_at.saturating_duration_since(hop_recorded_at);
+    let hop = timed_out_at.saturating_duration_since(dispatched_at);
     hop.as_secs_f64() >= attempt.as_secs_f64() * MIN_HOP_SHARE_FOR_TIMEOUT_BLAME
 }
 
@@ -790,6 +800,10 @@ pub(crate) mod driver_test_support {
         /// Never answer, and record the hop only after the delay: the loopback
         /// relay forwarded late in the attempt. Use with `Step::hop: None`.
         NeverWithHopAfter(std::time::Duration, PeerKeyLocation),
+        /// Never answer, and record the hop without its local dispatch ever
+        /// returning: the dispatch is still blocked on this node at the
+        /// deadline. Use with `Step::hop: None`.
+        NeverDispatched(PeerKeyLocation),
     }
 
     /// What the stub contract handler answers to a `GetQuery`: `None` = the
@@ -990,6 +1004,8 @@ pub(crate) mod driver_test_support {
                     op_manager
                         .attempt_hop_registry()
                         .record_hop(outbound.id(), hop);
+                    // The loopback relay's local dispatch returned at once.
+                    op_manager.attempt_hop_registry().touch_hop(outbound.id());
                 }
                 match step.answer {
                     Answer::Reply(reply) => {
@@ -1020,7 +1036,14 @@ pub(crate) mod driver_test_support {
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
                             registry.record_hop(&tx, &hop);
+                            registry.touch_hop(&tx);
                         });
+                        held_open.push(reply_tx);
+                    }
+                    Answer::NeverDispatched(hop) => {
+                        op_manager
+                            .attempt_hop_registry()
+                            .record_hop(outbound.id(), &hop);
                         held_open.push(reply_tx);
                     }
                 }
@@ -1500,20 +1523,24 @@ mod tests {
         use std::time::Duration;
         let start = tokio::time::Instant::now();
         let end = start + Duration::from_secs(60);
-        assert!(hop_had_budget_share(start, start, end));
+        assert!(hop_had_budget_share(start, Some(start), end));
+        assert!(
+            !hop_had_budget_share(start, None, end),
+            "no blame while the local dispatch has not returned"
+        );
         assert!(hop_had_budget_share(
             start,
-            start + Duration::from_secs(30),
+            Some(start + Duration::from_secs(30)),
             end
         ));
         assert!(!hop_had_budget_share(
             start,
-            start + Duration::from_secs(31),
+            Some(start + Duration::from_secs(31)),
             end
         ));
         assert!(!hop_had_budget_share(
             start,
-            start + Duration::from_secs(59),
+            Some(start + Duration::from_secs(59)),
             end
         ));
     }
@@ -1528,12 +1555,17 @@ mod tests {
         let guard = registry.register(tx);
         registry.touch_hop(&tx);
         assert!(guard.hop_record().is_none(), "no hop to re-stamp");
+        let recorded = tokio::time::Instant::now();
         registry.record_hop(&tx, &a);
-        let (_, recorded) = guard.hop_record().expect("hop recorded");
+        let (_, dispatched) = guard.hop_record().expect("hop recorded");
+        assert!(dispatched.is_none(), "recorded, but not dispatched yet");
         tokio::time::advance(std::time::Duration::from_secs(40)).await;
         registry.touch_hop(&tx);
-        let (hop, touched) = guard.hop_record().expect("hop kept");
+        let (hop, dispatched) = guard.hop_record().expect("hop kept");
         assert_eq!(addr(&hop), addr(&a), "the peer is kept");
-        assert_eq!(touched - recorded, std::time::Duration::from_secs(40));
+        assert_eq!(
+            dispatched,
+            Some(recorded + std::time::Duration::from_secs(40))
+        );
     }
 }
