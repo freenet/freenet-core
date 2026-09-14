@@ -96,8 +96,9 @@ pub(crate) struct IsotonicEstimator {
     /// pruned from `peer_adjustments`.
     #[serde(skip)]
     raw_events: VecDeque<IsotonicEvent>,
-    /// The `(distance, result)` points of `raw_events`, kept sorted by distance.
-    /// `global_regression` is rebuilt from this on every event.
+    /// The `(distance, result)` points of `raw_events`, kept in the order
+    /// `pav_regression` sorts its input. `global_regression` is rebuilt from
+    /// this on every event.
     ///
     /// WHY NOT `add_points` / `remove_points` (#5658). `pav_regression` 0.7.0's
     /// incremental maintenance is approximate, and not slightly: `remove_points`
@@ -109,13 +110,13 @@ pub(crate) struct IsotonicEstimator {
     /// events until the next refit. Measured on failure-shaped data (binary
     /// outcomes, 500-point window, refit every 51st event): 19% of states held an
     /// out-of-range aggregate, and interpolation was off by as much as 2.16.
+    /// `add_points` is not exact on its own either: it re-pools the already
+    /// pooled blocks, so its result depends on insertion order.
     ///
-    /// Kept sorted so the rebuild does not pay for sorting shuffled input. In
-    /// isolation (release, 500-point window, `pav_regression` 0.7.0) the rebuild
-    /// costs ~9us per event against ~0.6us for the incremental pair, and ~40us
-    /// for a rebuild from unsorted points.
+    /// For the cost of the rebuild, and why the ordering matters to it, see
+    /// [`SortedWindow`].
     #[serde(skip)]
-    sorted_points: Vec<Point<f64>>,
+    sorted_points: SortedWindow,
     /// Monotonic direction of the fit, retained so [`Self::refit`] can rebuild
     /// the same way [`Self::new_with_mode`] built it.
     #[serde(skip)]
@@ -238,17 +239,11 @@ impl IsotonicEstimator {
         }
 
         let raw_events: VecDeque<IsotonicEvent> = all_events.into();
-        let (global_regression, peer_adjustments) =
-            Self::fit(&raw_events, estimator_type, adjustment_mode)
-                .expect("Failed to create isotonic regression");
-
-        let mut sorted_points: Vec<Point<f64>> = Vec::with_capacity(raw_events.len() + 1);
-        for event in &raw_events {
-            insert_sorted(
-                &mut sorted_points,
-                Point::new(event.route_distance().as_f64(), event.result),
-            );
-        }
+        let sorted_points = SortedWindow::from_events(&raw_events);
+        let global_regression = Self::fit_points(sorted_points.as_slice(), estimator_type)
+            .expect("Failed to create isotonic regression");
+        let peer_adjustments =
+            Self::anchor_peer_adjustments(&raw_events, &global_regression, adjustment_mode);
 
         IsotonicEstimator {
             global_regression,
@@ -273,38 +268,24 @@ impl IsotonicEstimator {
         }
     }
 
-    /// Fit `events` from scratch: the global isotonic regression, plus every
-    /// peer's adjustment re-anchored to that fit.
+    /// Every peer's adjustment in `events`, re-derived from scratch against
+    /// `global_regression`.
     ///
-    /// Shared by [`Self::new_with_mode`] and [`Self::refit`] so that a refit is a
-    /// TRUE batch rebuild rather than a partial one. Both halves must be rebuilt
-    /// together: a peer's `Adjustment` is an EWMA of residuals measured AGAINST
-    /// the global curve (see [`AdjustmentMode::residual`]), so refitting the
-    /// curve without re-deriving the residuals would leave every peer corrected
-    /// relative to a curve that no longer exists. Rebuilding from `events` also
-    /// bounds `peer_adjustments` to peers present in the current window —
-    /// without that, the map would grow one entry per peer ever seen (an
-    /// unbounded per-key collection driven by remote peers) and a returning peer
-    /// would have its stale adjustment applied at full weight, since
+    /// Shared by [`Self::new_with_mode`] and [`Self::refit`]. A peer's
+    /// `Adjustment` is an EWMA of residuals measured AGAINST the global curve
+    /// (see [`AdjustmentMode::residual`]), so once the curve has moved the
+    /// residuals must be re-derived, or every peer is corrected relative to a
+    /// curve that no longer exists. Rebuilding from `events` also bounds
+    /// `peer_adjustments` to peers present in the current window — without
+    /// that, the map would grow one entry per peer ever seen (an unbounded
+    /// per-key collection driven by remote peers) and a returning peer would
+    /// have its stale adjustment applied at full weight, since
     /// `Adjustment::effective_count` has no time decay.
-    fn fit(
+    fn anchor_peer_adjustments(
         events: &VecDeque<IsotonicEvent>,
-        estimator_type: EstimatorType,
+        global_regression: &IsotonicRegression<f64>,
         adjustment_mode: AdjustmentMode,
-    ) -> Result<
-        (
-            IsotonicRegression<f64>,
-            HashMap<PeerKeyLocation, Adjustment>,
-        ),
-        pav_regression::isotonic_regression::IsotonicRegressionError,
-    > {
-        let points: Vec<Point<f64>> = events
-            .iter()
-            .map(|event| Point::new(event.route_distance().as_f64(), event.result))
-            .collect();
-
-        let global_regression = Self::fit_points(&points, estimator_type)?;
-
+    ) -> HashMap<PeerKeyLocation, Adjustment> {
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
         if global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize {
@@ -331,12 +312,12 @@ impl IsotonicEstimator {
             }
         }
 
-        Ok((global_regression, peer_adjustments))
+        peer_adjustments
     }
 
-    /// Refit `global_regression` from scratch over `raw_points`, but only once
-    /// more than `REFIT_STALENESS_NUMERATOR/REFIT_STALENESS_DENOMINATOR` of the
-    /// window has turned over since the last refit. Returns whether a refit ran.
+    /// Re-anchor every peer's adjustment to the current curve, but only once
+    /// more than `REFIT_STALENESS_PERCENT` percent of the window has turned
+    /// over since the last refit. Returns whether a refit ran.
     ///
     /// WHY THIS EXISTS: `add_event` keeps the global curve exact (#5658), but it
     /// updates each peer's EWMA only with the residual against the curve AS IT
@@ -357,12 +338,12 @@ impl IsotonicEstimator {
     /// that log never receives relay-recorded events
     /// (`operations::record_relay_route_event` feeds the in-memory router only),
     /// so the rebuild silently discarded them and reset the model faster than it
-    /// could learn. `raw_points` is the complete corpus by construction: every
+    /// could learn. `raw_events` is the complete corpus by construction: every
     /// `add_event` lands here regardless of whether it came from an originator
     /// or a relay hop. See issue #4808.
     ///
-    /// Rebuilds BOTH halves of the estimator — see [`Self::fit`] for why the
-    /// global curve and the per-peer adjustments cannot be refit independently.
+    /// The curve itself is already exact when this runs; see
+    /// [`Self::anchor_peer_adjustments`] for why the adjustments must follow it.
     ///
     /// Called from [`Self::add_event`] only. It is deliberately NOT public: a
     /// caller polling it could never observe a stale estimator, because
@@ -372,7 +353,8 @@ impl IsotonicEstimator {
         if !self.refit_due() {
             return false;
         }
-        self.refit()
+        self.refit();
+        true
     }
 
     /// Test-only view of [`Self::refit_due`], for guards in other modules
@@ -398,50 +380,28 @@ impl IsotonicEstimator {
         self.events_since_refit * 100 > self.raw_events.len() * REFIT_STALENESS_PERCENT
     }
 
-    /// Unconditionally rebuild the estimator from `raw_events`. Returns whether
-    /// the rebuild succeeded.
+    /// Unconditionally re-derive every peer's adjustment from `raw_events`
+    /// against the current global curve, and prune peers no longer in the
+    /// window.
+    ///
+    /// The curve is NOT re-fitted here. `add_event_incremental` rebuilds it
+    /// from the window on every event, so it is already the batch fit over
+    /// `raw_events`, and re-fitting would reproduce it for nothing. Anchoring to
+    /// the curve routing actually reads is also the right semantics even in the
+    /// unreachable case where that rebuild failed and kept a previous fit: the
+    /// adjustments must correct the curve `estimate_retrieval_time` uses.
     ///
     /// Equivalent to constructing a fresh estimator over the current window —
     /// which is exactly what the pre-#4808 periodic `Router::new(&history)`
     /// rebuild achieved, except that it read an on-disk log missing every
     /// relay-recorded event, whereas `raw_events` is complete by construction.
-    fn refit(&mut self) -> bool {
-        match Self::fit(&self.raw_events, self.estimator_type, self.adjustment_mode) {
-            Ok((global_regression, peer_adjustments)) => {
-                self.global_regression = global_regression;
-                self.peer_adjustments = peer_adjustments;
-                self.events_since_refit = 0;
-                true
-            }
-            Err(error) => {
-                // Unreachable today: `new_ascending`/`new_descending` pass
-                // `intersect_origin: false`, and the sole error variant
-                // (`NegativePointWithIntersectOrigin`) is only produced when that
-                // flag is true. Empty input succeeds. Handled rather than
-                // `.expect()`-ed so that a future pav_regression change cannot
-                // turn a fit failure into a dead routing path — a slightly
-                // drifted regression beats a panicking node.
-                //
-                // `events_since_refit` is deliberately NOT reset, so the next
-                // `add_event` retries rather than waiting for another full
-                // turnover. Note the cadence that implies now that the refit is
-                // on the write path: a PERSISTENTLY failing fit retries (and
-                // warns) on every subsequent event, not every 5 minutes as under
-                // the old polled task. That is acceptable only because this arm
-                // is unreachable in practice — `NegativePointWithIntersectOrigin`
-                // requires `intersect_origin: true` and both constructors pass
-                // `false`. If a reachable error variant is ever added here, reset
-                // the counter or rate-limit the warn before doing so; otherwise
-                // this becomes a ~150us refit attempt plus a log line per event
-                // on the relay hot path.
-                tracing::warn!(
-                    %error,
-                    events = self.raw_events.len(),
-                    "Isotonic refit failed; keeping previous fit"
-                );
-                false
-            }
-        }
+    fn refit(&mut self) {
+        self.peer_adjustments = Self::anchor_peer_adjustments(
+            &self.raw_events,
+            &self.global_regression,
+            self.adjustment_mode,
+        );
+        self.events_since_refit = 0;
     }
 
     /// Adds a new event to the estimator, refitting it if this event pushes the
@@ -469,43 +429,45 @@ impl IsotonicEstimator {
     /// - It kept a `task_monitor`-registered (hence node-fatal) task alive to
     ///   poll an in-memory counter.
     ///
-    /// COST. The refit is amortised over the events that earn it: one O(n log n)
-    /// batch fit per ~51 events on a saturated window. The figures below predate
-    /// #5658, when each call patched the fit with `add_points` / `remove_points`;
-    /// each call now rebuilds the global regression from the sorted window
-    /// instead, ~9µs in isolation against ~0.6µs for that pair (see
-    /// `sorted_points`). Measured on this estimator at a saturated
-    /// 500-point window (release build, 20-50 distinct peers — a realistic
-    /// neighbour set): one refit costs ~150µs, `add_event` costs ~39µs without it,
-    /// and the amortised overhead is ~1.5-5.7µs/event, i.e. **+4-14% on a call
-    /// that was already the expensive part**. Note #4808's oft-quoted "~27µs per
-    /// saturated refit" does not reproduce — it is ~5x optimistic — but the
-    /// conclusion it supported survives the correction, because what lands on the
-    /// hot path is the amortised few µs, not the whole fit.
+    /// COST. Every call rebuilds the global regression from the sorted window
+    /// (see `sorted_points` and [`SortedWindow`]), and every ~51st call on a
+    /// saturated window also re-anchors the peer adjustments. Measured with
+    /// `sorted_window_rebuild_cost_by_shape` in a release build, 500-point
+    /// window, 32 peers, refit amortised in, on a shared 16-core machine at load
+    /// average 20-30 (so treat these as upper-ish figures): **12-18µs per call**,
+    /// for both all-distinct and 20 repeated distances. The pre-#5658 path,
+    /// `add_points` / `remove_points` with no rebuild, measured 3-4µs in the
+    /// same run, and additionally paid a full curve fit on every refit. The
+    /// rebuild is the price of a fit that is exact on every event rather than
+    /// repaired every 51.
     ///
-    /// LOCK SAFETY. The fit itself takes no locks and does no I/O — it is pure
+    /// The figures this paragraph used to quote (~39µs per `add_event`, ~150µs
+    /// per refit, from #4811) no longer reproduce on this build and have been
+    /// dropped rather than carried forward.
+    ///
+    /// LOCK SAFETY. The fit takes no locks and does no I/O — it is pure
     /// computation over `self` — so it cannot deadlock or re-enter a caller that
     /// already holds one (`Router::add_event` is called under
     /// `ring.router.write()`; `ConnectForwardEstimator::record` under its own
     /// `RwLock`). It only extends a critical section the caller already holds.
     ///
-    /// Precisely: that "no locks" claim covers `fit`, not every line reachable
-    /// from the refit. `refit`'s error arm calls `tracing::warn!`, and in release
-    /// builds the per-callsite rate limiter (`util/rate_limit_layer.rs`) does a
-    /// DashMap lookup, whose shard guard is a real `parking_lot` lock (it is
-    /// compiled out under `cfg(test)`, so no test would surface it). That is not
-    /// a deadlock risk — nothing reachable from that shard guard takes
-    /// `ring.router` or `connect_forward_estimator` back, so there is no cycle —
-    /// and it is inert today because the error arm is unreachable (see `refit`).
-    /// Anyone making that arm reachable must re-check this paragraph, not just
-    /// the retry cadence noted there.
+    /// Precisely: that "no locks" claim covers the fit, not every line
+    /// reachable from `add_event`. The rebuild's error arm in
+    /// `add_event_incremental` calls `tracing::warn!`, and in release builds the
+    /// per-callsite rate limiter (`util/rate_limit_layer.rs`) does a DashMap
+    /// lookup, whose shard guard is a real `parking_lot` lock (it is compiled out
+    /// under `cfg(test)`, so no test would surface it). That is not a deadlock
+    /// risk — nothing reachable from that shard guard takes `ring.router` or
+    /// `connect_forward_estimator` back, so there is no cycle — and it is inert
+    /// today because the error arm is unreachable (see there). Anyone making
+    /// that arm reachable must re-check this paragraph.
     pub fn add_event(&mut self, event: IsotonicEvent) {
         self.add_event_incremental(event);
 
         // Re-anchor the peer adjustments once this event has turned over enough
         // of the window. Runs last so the incremental state above is complete on
         // the ~50/51 events that do not earn a refit; on the one that does,
-        // `refit` rebuilds both halves from `raw_events` and supersedes it.
+        // `refit` re-derives every peer's adjustment from `raw_events`.
         self.refit_if_stale();
     }
 
@@ -522,30 +484,34 @@ impl IsotonicEstimator {
     /// refits as it goes, which is the point of #4811.
     fn add_event_incremental(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
-        let point = Point::new(route_distance.as_f64(), event.result);
 
         // Extend the window by one point, evict the oldest if it is full, and
         // rebuild the global fit from the window. The rebuild is what keeps the
         // fit exact: see `sorted_points` for why the library's incremental
         // `add_points` / `remove_points` cannot be used here (#5658).
-        insert_sorted(&mut self.sorted_points, point);
+        self.sorted_points
+            .insert(route_distance.as_f64(), event.result);
         self.raw_events.push_back(event.clone());
         self.events_since_refit += 1;
 
         if self.raw_events.len() > MAX_REGRESSION_POINTS {
             if let Some(oldest) = self.raw_events.pop_front() {
-                remove_sorted(
-                    &mut self.sorted_points,
-                    Point::new(oldest.route_distance().as_f64(), oldest.result),
-                );
+                self.sorted_points
+                    .remove(oldest.route_distance().as_f64(), oldest.result);
             }
         }
 
-        match Self::fit_points(&self.sorted_points, self.estimator_type) {
+        match Self::fit_points(self.sorted_points.as_slice(), self.estimator_type) {
             Ok(regression) => self.global_regression = regression,
-            // Unreachable for the same reason as in `refit`: the only error
-            // variant requires `intersect_origin`, which is never set. Keeping
-            // the previous fit beats panicking on the relay hot path.
+            // Unreachable today: `new_ascending`/`new_descending` pass
+            // `intersect_origin: false`, and the sole error variant
+            // (`NegativePointWithIntersectOrigin`) is only produced when that
+            // flag is true. Empty input succeeds. Handled rather than
+            // `.expect()`-ed so that a future pav_regression change cannot turn
+            // a fit failure into a panic on the relay hot path; a fit one event
+            // stale beats a dead node. If a reachable error variant is ever
+            // added, rate-limit this warn: as written it would fire on every
+            // event.
             Err(error) => tracing::warn!(
                 %error,
                 events = self.raw_events.len(),
@@ -720,29 +686,92 @@ impl IsotonicEstimator {
     }
 }
 
-/// Insert `point` into `points`, keeping them ordered by x.
-fn insert_sorted(points: &mut Vec<Point<f64>>, point: Point<f64>) {
-    let index = points.partition_point(|existing| existing.x().total_cmp(point.x()).is_le());
-    points.insert(index, point);
+/// The global regression's input window, held in exactly the order
+/// `pav_regression` sorts its input: distance ascending, then result
+/// DESCENDING among equal distances (see `isotonic()` in pav_regression 0.7.0,
+/// which does this for both directions).
+///
+/// # Why the order must match the library's, not just be "sorted by distance"
+///
+/// `IsotonicRegression::new_*` sorts whatever it is given, with a stable sort.
+/// Handing it input already in its own order lets that sort finish in one
+/// linear pass; handing it input sorted by distance alone does not whenever
+/// distances repeat, and repeated distances are the normal case here — every
+/// event for the same peer and contract lands at the same distance. Measured
+/// in isolation (release, 500-point window, 20 distinct distances): 28.5µs per
+/// rebuild ordered by distance alone, 10.3µs in the library's order.
+///
+/// # Signed zeros
+///
+/// Coordinates are stored with `-0.0` normalised to `+0.0`, in both `insert`
+/// and `remove`. The library compares with `partial_cmp`, under which the two
+/// are equal; `total_cmp`, used here so the order is total, puts `-0.0` first.
+/// Normalising makes the two comparisons agree on every non-NaN value, so this
+/// window stays in the library's order, and makes `remove` find a point
+/// whichever zero it was written with. A route distance is an `abs()` or
+/// `1.0 - abs()`, so `-0.0` should not arrive in practice; this is cheap
+/// insurance rather than a known path.
+#[derive(Debug, Clone, Default)]
+struct SortedWindow {
+    points: Vec<Point<f64>>,
 }
 
-/// Remove one point equal to `point` (same x and y) from x-ordered `points`.
-///
-/// Points with equal coordinates are interchangeable to the fit, so which of
-/// several duplicates goes does not matter. A missing point is a bookkeeping
-/// bug in the caller rather than a runtime condition, hence the debug assertion.
-fn remove_sorted(points: &mut Vec<Point<f64>>, point: Point<f64>) {
-    let start = points.partition_point(|existing| existing.x().total_cmp(point.x()).is_lt());
-    let found = points[start..]
-        .iter()
-        .take_while(|existing| existing.x().total_cmp(point.x()).is_eq())
-        .position(|existing| existing.y().total_cmp(point.y()).is_eq());
-    match found {
-        Some(offset) => {
-            points.remove(start + offset);
-        }
-        None => debug_assert!(false, "evicted point missing from the sorted window"),
+impl SortedWindow {
+    /// Build a window from `events`, sorting once.
+    fn from_events<'a>(events: impl IntoIterator<Item = &'a IsotonicEvent>) -> Self {
+        let mut points: Vec<Point<f64>> = events
+            .into_iter()
+            .map(|event| canonical_point(event.route_distance().as_f64(), event.result))
+            .collect();
+        points.sort_by(library_order);
+        SortedWindow { points }
     }
+
+    /// Insert `(x, y)`, after any points it compares equal to.
+    fn insert(&mut self, x: f64, y: f64) {
+        let point = canonical_point(x, y);
+        let index = self
+            .points
+            .partition_point(|existing| library_order(existing, &point).is_le());
+        self.points.insert(index, point);
+    }
+
+    /// Remove one point equal to `(x, y)`.
+    ///
+    /// Points with identical coordinates are interchangeable to the fit, so
+    /// which of several duplicates goes does not matter. A missing point is a
+    /// bookkeeping bug in the caller rather than a runtime condition, hence the
+    /// debug assertion.
+    fn remove(&mut self, x: f64, y: f64) {
+        let point = canonical_point(x, y);
+        let index = self
+            .points
+            .partition_point(|existing| library_order(existing, &point).is_lt());
+        match self.points.get(index) {
+            Some(existing) if library_order(existing, &point).is_eq() => {
+                self.points.remove(index);
+            }
+            _ => debug_assert!(false, "evicted point missing from the sorted window"),
+        }
+    }
+
+    fn as_slice(&self) -> &[Point<f64>] {
+        &self.points
+    }
+}
+
+/// `(x, y)` with each `-0.0` replaced by `+0.0`. See [`SortedWindow`].
+fn canonical_point(x: f64, y: f64) -> Point<f64> {
+    // IEEE 754: -0.0 + 0.0 == +0.0 under round-to-nearest; every other value,
+    // NaN included, is unchanged.
+    Point::new(x + 0.0, y + 0.0)
+}
+
+/// `pav_regression`'s input order: x ascending, then y descending. Total
+/// (`total_cmp`) so that sorting and binary search are well defined; agrees
+/// with the library's `partial_cmp` on canonical, non-NaN points.
+fn library_order(a: &Point<f64>, b: &Point<f64>) -> std::cmp::Ordering {
+    a.x().total_cmp(b.x()).then_with(|| b.y().total_cmp(a.y()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1458,7 +1487,7 @@ mod tests {
         for event in seed.iter().cloned() {
             incremental.add_event(event);
         }
-        assert!(incremental.refit(), "refit must succeed");
+        incremental.refit();
 
         let batch = IsotonicEstimator::new(seed.clone(), EstimatorType::Positive);
 
@@ -1518,7 +1547,7 @@ mod tests {
             estimator.peer_adjustments.len()
         );
 
-        assert!(estimator.refit(), "refit must succeed");
+        estimator.refit();
         assert!(
             estimator.peer_adjustments.len() <= MAX_REGRESSION_POINTS,
             "a refit must bound peer_adjustments to peers in the current window \
@@ -1587,29 +1616,32 @@ mod tests {
     /// aggregate by x, which need not be the aggregate it was pooled into. Once
     /// it lands in the wrong one, the subtraction yields an aggregate no data
     /// could produce — observed while diagnosing the #5658 flaky router test, a
-    /// failure-probability curve
-    /// holding the point `(distance = -0.062, failure = -5.0)`, and a peer EWMA
-    /// of +18 learned against it. The periodic refit repaired that only every
-    /// 51st event, and routing read the corrupted fit in between: on
-    /// failure-shaped data like the stream below, roughly one state in five
-    /// carried an out-of-range aggregate, with interpolation errors up to 2.16
-    /// in probability units.
+    /// failure-probability curve holding the point `(distance = -0.062,
+    /// failure = -5.0)`, and a peer EWMA of +18 learned against it. The periodic
+    /// refit repaired that only every 51st event, and routing read the corrupted
+    /// fit in between: on failure-shaped data like the first stream below,
+    /// roughly one state in five carried an out-of-range aggregate, with
+    /// interpolation errors up to 2.16 in probability units.
     ///
     /// The previous version of this test asserted the OPPOSITE (that the
     /// incremental fit drifts, as a tripwire for the refit's existence) and
     /// checked only `drift > 1e-9`, so it never measured how large the drift was.
+    ///
+    /// Streams cover both directions, and the two shapes where the window's
+    /// bookkeeping is easiest to get wrong: many points at one distance with
+    /// different results (so removing "a point at that distance" is not the
+    /// same as removing THE point), and a window where every distance is equal.
     #[test]
     fn incremental_fit_matches_batch_after_every_event() {
         let peer = PeerKeyLocation::random();
 
-        // Two shapes, both driven well past MAX_REGRESSION_POINTS so eviction
-        // is exercised in steady state:
-        //  - failure-shaped: binary outcomes whose rate rises with distance,
-        //    the shape the router's failure estimator actually sees, and the
-        //    one that produced the out-of-range aggregates;
-        //  - adversarially non-monotonic, so PAV must pool heavily.
         // Deterministic arithmetic rather than an RNG, so a failure reproduces.
-        let failure_shaped: Vec<(f64, f64)> = (0..(MAX_REGRESSION_POINTS * 3))
+        // Every stream runs well past MAX_REGRESSION_POINTS so eviction is
+        // exercised in steady state.
+        let long = MAX_REGRESSION_POINTS * 3;
+        // Binary outcomes whose rate rises with distance: the shape the router's
+        // failure estimator sees, and the one that produced the corrupt aggregates.
+        let failure_shaped: Vec<(f64, f64)> = (0..long)
             .map(|i| {
                 let x = ((i * 7919) % 500) as f64 / 1000.0; // [0.0, 0.499]
                 let threshold = 1 + (x * 10.0) as usize; // failure rate 10%..60%
@@ -1617,6 +1649,7 @@ mod tests {
                 (x, y)
             })
             .collect();
+        // Adversarially non-monotonic, so PAV must pool heavily.
         let non_monotonic: Vec<(f64, f64)> = (0..(MAX_REGRESSION_POINTS + 200))
             .map(|i| {
                 let x = (i % 50) as f64 / 100.0;
@@ -1624,26 +1657,86 @@ mod tests {
                 (x, y)
             })
             .collect();
+        // A rate that falls with distance, noisy enough to pool: the
+        // transfer-rate estimator's shape, for the Negative direction.
+        let falling: Vec<(f64, f64)> = (0..long)
+            .map(|i| {
+                let x = ((i * 3571) % 500) as f64 / 1000.0;
+                let noise = ((i * 17) % 11) as f64 * 40.0;
+                (x, 1000.0 - 1500.0 * x + noise)
+            })
+            .collect();
+        // Twenty distances, each carrying several different results.
+        let repeated_distance: Vec<(f64, f64)> = (0..long)
+            .map(|i| {
+                let x = ((i * 7) % 20) as f64 / 40.0; // [0.0, 0.475]
+                let y = ((i * 13) % 7) as f64 / 6.0;
+                (x, y)
+            })
+            .collect();
+        // One distance for the entire window.
+        let single_distance: Vec<(f64, f64)> = (0..long)
+            .map(|i| (0.25, ((i * 13) % 7) as f64 / 6.0))
+            .collect();
 
-        for (label, stream) in [
-            ("failure-shaped", failure_shaped),
-            ("non-monotonic", non_monotonic),
-        ] {
+        let cases = [
+            ("failure-shaped", EstimatorType::Positive, &failure_shaped),
+            ("non-monotonic", EstimatorType::Positive, &non_monotonic),
+            ("falling", EstimatorType::Negative, &falling),
+            (
+                "repeated-distance/asc",
+                EstimatorType::Positive,
+                &repeated_distance,
+            ),
+            (
+                "repeated-distance/desc",
+                EstimatorType::Negative,
+                &repeated_distance,
+            ),
+            (
+                "single-distance/asc",
+                EstimatorType::Positive,
+                &single_distance,
+            ),
+            (
+                "single-distance/desc",
+                EstimatorType::Negative,
+                &single_distance,
+            ),
+        ];
+
+        for (label, estimator_type, stream) in cases {
+            let (y_min, y_max) = stream
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &(_, y)| {
+                    (lo.min(y), hi.max(y))
+                });
             // Through `add_event_incremental`, NOT `add_event`: the latter also
             // refits every 51st event, which would mask exactly the between-refit
             // states this pins.
-            let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+            let mut estimator = IsotonicEstimator::new(std::iter::empty(), estimator_type);
             let mut window: VecDeque<Point<f64>> = VecDeque::new();
             let mut worst = 0.0f64;
             for (index, &(x, y)) in stream.iter().enumerate() {
-                estimator.add_event_incremental(event_at_distance(&peer, x, y));
-                window.push_back(Point::new(x, y));
+                let event = event_at_distance(&peer, x, y);
+                // The reference is built from the distance the estimator will
+                // compute, not from `x`: placing a contract at a ring offset
+                // round-trips through floating point.
+                window.push_back(Point::new(event.route_distance().as_f64(), y));
                 if window.len() > MAX_REGRESSION_POINTS {
                     window.pop_front();
                 }
+                estimator.add_event_incremental(event);
 
-                let batch = IsotonicRegression::new_ascending(window.make_contiguous())
-                    .expect("ascending fit without intersect_origin cannot fail");
+                let batch = match estimator_type {
+                    EstimatorType::Positive => {
+                        IsotonicRegression::new_ascending(window.make_contiguous())
+                    }
+                    EstimatorType::Negative => {
+                        IsotonicRegression::new_descending(window.make_contiguous())
+                    }
+                }
+                .expect("a fit without intersect_origin cannot fail");
                 for step in 0..=50 {
                     let at = step as f64 / 100.0;
                     let got = estimator
@@ -1655,7 +1748,7 @@ mod tests {
                 }
                 for point in estimator.global_regression.get_points() {
                     assert!(
-                        (0.0..=0.5).contains(point.x()) && (0.0..=1.0).contains(point.y()),
+                        (0.0..=0.5).contains(point.x()) && (y_min..=y_max).contains(point.y()),
                         "{label}: after event {index} the fit holds the aggregate \
                          ({}, {}), which no point in the window could produce",
                         point.x(),
@@ -1669,24 +1762,155 @@ mod tests {
                  window by up to {worst}; routing reads this fit between refits"
             );
             assert_eq!(estimator.raw_events.len(), MAX_REGRESSION_POINTS);
+            assert_eq!(
+                estimator.sorted_points.as_slice().len(),
+                MAX_REGRESSION_POINTS,
+                "{label}: the sorted window must track raw_events exactly"
+            );
         }
     }
 
+    /// The window's two bookkeeping invariants, checked directly rather than
+    /// through a fit that might happen to mask them.
+    ///
+    /// 1. Order is `pav_regression`'s own: distance ascending, result DESCENDING
+    ///    among equal distances. This is spelled out here independently of
+    ///    `library_order`, so changing that function to (say) distance-only
+    ///    order fails the test instead of redefining what it checks. Getting it
+    ///    wrong costs no correctness, only the linear-time sort, which is why
+    ///    nothing else would notice.
+    /// 2. `-0.0` and `+0.0` are one value: a point inserted with either zero is
+    ///    stored as `+0.0` and removed by either spelling.
     #[test]
-    fn refit_respects_descending_estimator_direction() {
-        // A refit must rebuild with the SAME monotonic direction it was created
-        // with: rebuilding a Negative (transfer-rate) estimator as ascending would
-        // silently invert every estimate.
-        //
-        // NOTE ON THE ASSERTION. The obvious check — `near >= far` — is VACUOUS
-        // and was proven so in review: PAV over data that violates its assumed
-        // direction at every pair pools everything into ONE aggregate, i.e. a flat
-        // line, and a flat line satisfies `near >= far` by equality. Fitting these
-        // points ascending yields exactly that, so the weak assertion passes on
-        // the very bug it is meant to catch.
-        //
-        // So assert a STRICT decrease AND that the fit did not collapse to a
-        // single block. Both fail if the direction is wrong.
+    fn sorted_window_keeps_library_order_and_normalises_signed_zero() {
+        fn in_library_order(points: &[Point<f64>]) -> bool {
+            points.windows(2).all(|pair| {
+                let (a, b) = (&pair[0], &pair[1]);
+                a.x() < b.x() || (a.x() == b.x() && a.y() >= b.y())
+            })
+        }
+
+        let mut window = SortedWindow::default();
+        let inserted: Vec<(f64, f64)> = vec![
+            (0.2, 0.0),
+            (0.1, 1.0),
+            (0.2, 1.0),
+            (-0.0, 0.5),
+            (0.0, 0.25),
+            (0.2, 0.5),
+            (0.0, -0.0),
+            (-0.0, 1.0),
+            (0.1, 0.0),
+            (0.2, 1.0),
+        ];
+        for &(x, y) in &inserted {
+            window.insert(x, y);
+            assert!(
+                in_library_order(window.as_slice()),
+                "after inserting ({x}, {y}) the window left pav_regression's order: {:?}",
+                window.as_slice()
+            );
+        }
+        for point in window.as_slice() {
+            assert!(
+                !point.x().is_sign_negative() && !point.y().is_sign_negative(),
+                "signed zero must be normalised on insert, found ({}, {})",
+                point.x(),
+                point.y()
+            );
+        }
+
+        // Remove with the OPPOSITE zero to the one each point was inserted with,
+        // in an order unrelated to insertion. A debug assertion fires if any
+        // removal misses.
+        let flip = |v: f64| if v == 0.0 { -v } else { v };
+        for &(x, y) in inserted.iter().rev() {
+            window.remove(flip(x), flip(y));
+            assert!(in_library_order(window.as_slice()));
+        }
+        assert!(
+            window.as_slice().is_empty(),
+            "every inserted point must be removable, left {:?}",
+            window.as_slice()
+        );
+
+        // Removing among duplicates at one distance must take the matching
+        // result, not merely the first point at that distance.
+        let mut window = SortedWindow::default();
+        for y in [1.0, 0.0, 0.5] {
+            window.insert(0.3, y);
+        }
+        window.remove(0.3, 0.0);
+        let remaining: Vec<f64> = window.as_slice().iter().map(|p| *p.y()).collect();
+        assert_eq!(remaining, vec![1.0, 0.5]);
+    }
+
+    /// Prints the per-event cost of `add_event` on a saturated window for the
+    /// two shapes that matter to the rebuild: all-distinct distances, and the
+    /// repeated distances real traffic produces (one peer, one contract, one
+    /// distance). Not an assertion — timings in a debug test binary say little
+    /// about a release node — but it keeps the comparison one command away:
+    /// `cargo test -p freenet --lib --release sorted_window_rebuild_cost -- --nocapture`.
+    ///
+    /// The deterministic half of the property it reports on, that the window
+    /// stays in the order that makes the rebuild's sort linear, is pinned by
+    /// `sorted_window_keeps_library_order_and_normalises_signed_zero`.
+    #[test]
+    fn sorted_window_rebuild_cost_by_shape() {
+        let peers: Vec<PeerKeyLocation> = (0..32).map(|_| PeerKeyLocation::random()).collect();
+        let measured = 5 * MAX_REGRESSION_POINTS;
+        for (label, distinct_distances) in [("distinct distances", 0usize), ("20 distances", 20)] {
+            let event = |i: usize| {
+                let x = if distinct_distances == 0 {
+                    ((i * 7919) % 100_000) as f64 / 200_000.0
+                } else {
+                    (i % distinct_distances) as f64 / (2 * distinct_distances) as f64
+                };
+                let y = if (i * 31) % 10 < 2 { 1.0 } else { 0.0 };
+                event_at_distance(&peers[i % peers.len()], x, y)
+            };
+            let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+            for i in 0..MAX_REGRESSION_POINTS {
+                estimator.add_event(event(i));
+            }
+            let events: Vec<IsotonicEvent> = (MAX_REGRESSION_POINTS
+                ..MAX_REGRESSION_POINTS + measured)
+                .map(event)
+                .collect();
+            let start = std::time::Instant::now();
+            for event in events {
+                estimator.add_event(event);
+            }
+            let per_event = start.elapsed().as_secs_f64() * 1e6 / measured as f64;
+            eprintln!(
+                "isotonic add_event, saturated {MAX_REGRESSION_POINTS}-point window, \
+                 {label}: {per_event:.1}us/event (refit amortised in)"
+            );
+            assert_eq!(
+                estimator.sorted_points.as_slice().len(),
+                MAX_REGRESSION_POINTS
+            );
+        }
+    }
+
+    /// Both places the regression is built — the constructor and the per-event
+    /// rebuild — must use the estimator's direction: fitting a Negative
+    /// (transfer-rate) estimator as ascending would silently invert every
+    /// estimate.
+    ///
+    /// NOTE ON THE ASSERTION. The obvious check — `near >= far` — is VACUOUS
+    /// and was proven so in review: PAV over data that violates its assumed
+    /// direction at every pair pools everything into ONE aggregate, i.e. a flat
+    /// line, and a flat line satisfies `near >= far` by equality. Fitting these
+    /// points ascending yields exactly that, so the weak assertion passes on
+    /// the very bug it is meant to catch. So assert a STRICT decrease AND that
+    /// the fit did not collapse to a single block. Both fail if the direction
+    /// is wrong.
+    ///
+    /// Until #5658 this was `refit_respects_descending_estimator_direction`;
+    /// the refit no longer builds the curve.
+    #[test]
+    fn fit_respects_descending_estimator_direction() {
         let peer = PeerKeyLocation::random();
         let events: Vec<IsotonicEvent> = (0..120)
             .map(|i| {
@@ -1694,28 +1918,34 @@ mod tests {
                 event_at_distance(&peer, x, 1.0 - x) // strictly decreasing in distance
             })
             .collect();
-        let mut estimator = IsotonicEstimator::new(events, EstimatorType::Negative);
-        assert!(estimator.refit(), "refit must succeed");
 
-        let near = estimator
-            .global_regression
-            .interpolate(0.05)
-            .expect("fit must estimate within its data range");
-        let far = estimator
-            .global_regression
-            .interpolate(0.35)
-            .expect("fit must estimate within its data range");
-        assert!(
-            near > far + 1e-6,
-            "a descending fit must STRICTLY decrease with distance after refit \
-             (near={near}, far={far}); equality means PAV pooled everything into \
-             one flat aggregate, which is what fitting the wrong direction does"
-        );
-        assert!(
-            estimator.global_regression.get_points().len() > 1,
-            "the fit collapsed to a single aggregate — the hallmark of PAV run \
-             against its data's actual direction"
-        );
+        let constructed = IsotonicEstimator::new(events.clone(), EstimatorType::Negative);
+        let mut incremental = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Negative);
+        for event in events {
+            incremental.add_event_incremental(event);
+        }
+
+        for (label, estimator) in [("constructor", &constructed), ("per-event", &incremental)] {
+            let near = estimator
+                .global_regression
+                .interpolate(0.05)
+                .expect("fit must estimate within its data range");
+            let far = estimator
+                .global_regression
+                .interpolate(0.35)
+                .expect("fit must estimate within its data range");
+            assert!(
+                near > far + 1e-6,
+                "{label}: a descending fit must STRICTLY decrease with distance \
+                 (near={near}, far={far}); equality means PAV pooled everything \
+                 into one flat aggregate, which is what fitting the wrong direction does"
+            );
+            assert!(
+                estimator.global_regression.get_points().len() > 1,
+                "{label}: the fit collapsed to a single aggregate — the hallmark of \
+                 PAV run against its data's actual direction"
+            );
+        }
     }
 
     fn simulate_positive_request(
