@@ -65,15 +65,31 @@ const LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR: usize = 4;
 /// Most zombie transports dropped in one sweep slice. Each drop involves
 /// topology pruning and orphaned-transaction handling, and can wait up to 100ms
 /// on a full per-connection channel, so this bounds event-loop latency per
-/// slice (64 × 100ms = ~6.4s worst case). When more are due, the sweep runs
-/// again after [`ZOMBIE_BACKLOG_SWEEP_INTERVAL`] instead of waiting for the
-/// next stats tick.
+/// slice (64 × 100ms = ~6.4s worst case), exactly as on the 30s stats tick
+/// before #5654.
 pub(super) const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
 
-/// Delay before the next sweep slice while zombies are still due. Short, so a
-/// backlog (and in particular transports over a link-use cap, which are dropped
-/// first) drains in seconds rather than one 64-transport slice per 30s tick.
+/// Minimum delay between the end of one sweep slice and the start of a backlog
+/// slice. See [`backlog_sweep_delay`].
 pub(super) const ZOMBIE_BACKLOG_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A backlog slice waits at least this many times as long as the previous
+/// slice took. See [`backlog_sweep_delay`].
+const ZOMBIE_BACKLOG_IDLE_FACTOR: u32 = 4;
+
+/// How long to wait after a slice that took `last_slice_took` before running a
+/// backlog slice: the longer of [`ZOMBIE_BACKLOG_SWEEP_INTERVAL`] and
+/// [`ZOMBIE_BACKLOG_IDLE_FACTOR`] × `last_slice_took`.
+///
+/// The budget: while a backlog persists, backlog slices occupy at most one
+/// fifth of the event loop's time. That is the same fraction as the worst case
+/// of the 30s stats-tick sweep (a 6.4s slice every 30s is about 21%). When drops
+/// are quick the delay is 1s, so a backlog drains at up to 64 transports per
+/// second instead of 64 per 30s; when every drop takes the full 100ms the delay
+/// stretches to 25.6s and the drain rate falls back to roughly the stats tick's.
+pub(super) fn backlog_sweep_delay(last_slice_took: Duration) -> Duration {
+    ZOMBIE_BACKLOG_SWEEP_INTERVAL.max(last_slice_took.saturating_mul(ZOMBIE_BACKLOG_IDLE_FACTOR))
+}
 
 /// The most transports, across all remotes, that may be kept alive by recent
 /// requests alone: a quarter of `max_connections`, and never fewer than
@@ -382,13 +398,33 @@ impl ZombieSweepPlan {
         self.over_cap.len() + self.zombies.len()
     }
 
-    /// The transports one slice drops (at most `max`, over-cap first), and
-    /// whether any remain due after it.
-    pub(super) fn slice(&self, max: usize) -> (Vec<SocketAddr>, bool) {
+    /// The transports one slice drops: at most `max`, over-cap first.
+    pub(super) fn slice(&self, max: usize) -> ZombieSlice {
         let reap: Vec<SocketAddr> = self.reap_order().take(max).collect();
+        let over_cap_dropped = reap
+            .iter()
+            .filter(|addr| self.over_cap.contains(addr))
+            .count();
         let backlog = self.due() > reap.len();
-        (reap, backlog)
+        ZombieSlice {
+            reap,
+            over_cap_dropped,
+            backlog,
+        }
     }
+}
+
+/// The transports one sweep slice drops.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ZombieSlice {
+    /// Transports to drop, over-cap evictions first.
+    pub(super) reap: Vec<SocketAddr>,
+    /// How many of `reap` are over-cap evictions. Counted from what this slice
+    /// drops, not from the plan, so an eviction deferred to a later slice is
+    /// counted once, when it is dropped.
+    pub(super) over_cap_dropped: usize,
+    /// Whether transports remain due after this slice.
+    pub(super) backlog: bool,
 }
 
 /// Apply the link-use caps to one sweep's verdicts.
@@ -442,19 +478,93 @@ pub(super) fn plan_zombie_sweep(
     plan
 }
 
-/// Cumulative sweep counters for one event loop, reported at info level so they
-/// are visible in release builds.
-#[derive(Debug, Default)]
-pub(super) struct ZombieSweepStats {
-    /// Transports dropped because a link-use cap was exceeded, since start.
+/// Classify every transport in `connections` and apply the link-use caps
+/// derived from `connection_manager`, as of `now`. Everything the sweep decides
+/// happens here, without awaiting, so it is tested directly; the event loop
+/// only drops what the returned plan says.
+pub(super) fn plan_sweep(
+    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
+    gateways: &[PeerKeyLocation],
+    connection_manager: &crate::ring::ConnectionManager,
+    now: Instant,
+) -> (Vec<SweepCandidate>, ZombieSweepPlan) {
+    let transient_ttl = connection_manager.transient_ttl();
+    let candidates: Vec<SweepCandidate> = connections
+        .iter()
+        .map(|(addr, entry)| {
+            let is_gateway = gateways.iter().any(|gw| gw.socket_addr() == Some(*addr));
+            let age = now.saturating_duration_since(entry.created_at);
+            let verdict = zombie_verdict(
+                TransportActivity {
+                    age,
+                    idle: now.saturating_duration_since(entry.last_link_use_at),
+                },
+                connection_manager.is_in_ring(*addr),
+                connection_manager.has_connection_or_pending(*addr),
+                is_gateway,
+                transient_ttl,
+            );
+            SweepCandidate {
+                addr: *addr,
+                age,
+                verdict,
+            }
+        })
+        .collect();
+    let plan = plan_zombie_sweep(
+        candidates.iter().copied(),
+        LINK_USE_EXEMPT_PER_IP_CAP,
+        link_use_exempt_global_cap(connection_manager.max_connections),
+    );
+    (candidates, plan)
+}
+
+/// Zombie sweep state for one event loop: when the next backlog slice may run,
+/// and a cumulative counter reported at info level so it is visible in release
+/// builds.
+#[derive(Debug)]
+pub(super) struct ZombieSweepState {
+    /// Over-cap transports actually dropped, since the event loop started.
     pub(super) cap_evictions_total: u64,
+    backlog: bool,
+    last_slice_end: Instant,
+    last_slice_took: Duration,
+}
+
+impl ZombieSweepState {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            cap_evictions_total: 0,
+            backlog: false,
+            last_slice_end: now,
+            last_slice_took: Duration::ZERO,
+        }
+    }
+
+    /// Record a slice that ran from `started` to `ended`.
+    pub(super) fn record_slice(&mut self, started: Instant, ended: Instant, slice: &ZombieSlice) {
+        self.cap_evictions_total = self
+            .cap_evictions_total
+            .saturating_add(slice.over_cap_dropped as u64);
+        self.backlog = slice.backlog;
+        self.last_slice_took = ended.saturating_duration_since(started);
+        self.last_slice_end = ended;
+    }
+
+    /// Whether the event loop should run a backlog slice now: transports remain
+    /// due, and [`backlog_sweep_delay`] has passed since the last slice ended.
+    pub(super) fn backlog_slice_due(&self, now: Instant) -> bool {
+        self.backlog
+            && now.saturating_duration_since(self.last_slice_end)
+                > backlog_sweep_delay(self.last_slice_took)
+    }
 }
 
 impl P2pConnManager {
-    /// Run one zombie sweep slice: classify every transport, apply the link-use
-    /// caps, and drop at most [`MAX_ZOMBIE_CLEANUP_PER_CYCLE`] transports,
-    /// over-cap evictions first. Returns `true` when more remain due, so the
-    /// caller runs another slice after [`ZOMBIE_BACKLOG_SWEEP_INTERVAL`].
+    /// Run one zombie sweep slice: plan it with [`plan_sweep`], drop at most
+    /// [`MAX_ZOMBIE_CLEANUP_PER_CYCLE`] transports (over-cap evictions first),
+    /// and record the slice in `state` so the event loop knows whether and when
+    /// to run a backlog slice ([`ZombieSweepState::backlog_slice_due`]).
     ///
     /// Uses `drop_zombie_connection` (non-blocking `try_send`) rather than
     /// `drop_connection_by_addr` to avoid a circular deadlock with the handshake
@@ -462,88 +572,58 @@ impl P2pConnManager {
     pub(super) async fn sweep_zombie_transports(
         &mut self,
         handshake_cmd_sender: &HandshakeCommandSender,
-        stats: &mut ZombieSweepStats,
-    ) -> bool {
+        state: &mut ZombieSweepState,
+    ) {
+        let started = Instant::now();
         let op_manager = self.bridge.op_manager.clone();
         let connection_manager = &op_manager.ring.connection_manager;
-        let transient_ttl = connection_manager.transient_ttl();
-        let own_addr = connection_manager.get_own_addr();
-
-        let candidates: Vec<SweepCandidate> = self
-            .connections
-            .iter()
-            .map(|(addr, entry)| {
-                let is_gateway = self
-                    .gateways
-                    .iter()
-                    .any(|gw| gw.socket_addr() == Some(*addr));
-                let age = entry.created_at.elapsed();
-                let verdict = zombie_verdict(
-                    TransportActivity {
-                        age,
-                        idle: entry.last_link_use_at.elapsed(),
-                    },
-                    connection_manager.is_in_ring(*addr),
-                    connection_manager.has_connection_or_pending(*addr),
-                    is_gateway,
-                    transient_ttl,
-                );
-                SweepCandidate {
-                    addr: *addr,
-                    age,
-                    verdict,
-                }
-            })
-            .collect();
-
-        let global_cap = link_use_exempt_global_cap(connection_manager.max_connections);
-        let plan = plan_zombie_sweep(
-            candidates.iter().copied(),
-            LINK_USE_EXEMPT_PER_IP_CAP,
-            global_cap,
+        let (candidates, plan) = plan_sweep(
+            &self.connections,
+            &self.gateways,
+            connection_manager,
+            started,
         );
 
-        if let Some(own_addr) = own_addr {
-            for candidate in &candidates {
-                if candidate.verdict != ZombieVerdict::Keep {
-                    crate::ring::topology_registry::record_zombie_sweep_verdict(
-                        own_addr,
-                        candidate.addr,
-                        plan.kept_for_link_use.contains(&candidate.addr),
-                    );
-                }
-            }
-        }
-
-        stats.cap_evictions_total = stats
-            .cap_evictions_total
-            .saturating_add(plan.over_cap.len() as u64);
-        if !plan.kept_for_link_use.is_empty() || !plan.over_cap.is_empty() {
-            tracing::info!(
-                link_use_exempt = plan.kept_for_link_use.len(),
-                link_use_exempt_global_cap = global_cap,
-                link_use_exempt_per_ip_cap = LINK_USE_EXEMPT_PER_IP_CAP,
-                over_per_ip_cap = plan.over_per_ip_cap,
-                over_global_cap = plan.over_global_cap,
-                cap_evictions_total = stats.cap_evictions_total,
-                "Zombie sweep: transports kept alive by recent requests"
+        if let Some(own_addr) = connection_manager.get_own_addr() {
+            // Lazy: on a production node the registry never iterates this.
+            crate::ring::topology_registry::record_zombie_sweep_verdicts(
+                own_addr,
+                candidates
+                    .iter()
+                    .filter(|c| c.verdict != ZombieVerdict::Keep)
+                    .map(|c| (c.addr, plan.kept_for_link_use.contains(&c.addr))),
             );
         }
 
-        let (reap, backlog) = plan.slice(MAX_ZOMBIE_CLEANUP_PER_CYCLE);
-        if !reap.is_empty() {
-            tracing::info!(
-                zombie_count = reap.len(),
-                zombies_due = plan.due(),
-                over_cap = plan.over_cap.len(),
-                "Cleaning up zombie transports (not promoted to ring)"
-            );
-        }
-        for addr in &reap {
+        let slice = plan.slice(MAX_ZOMBIE_CLEANUP_PER_CYCLE);
+        for addr in &slice.reap {
             self.drop_zombie_connection(*addr, handshake_cmd_sender)
                 .await;
         }
-        backlog
+        state.record_slice(started, Instant::now(), &slice);
+
+        if !plan.kept_for_link_use.is_empty() || !plan.over_cap.is_empty() {
+            tracing::info!(
+                link_use_exempt = plan.kept_for_link_use.len(),
+                link_use_exempt_global_cap =
+                    link_use_exempt_global_cap(connection_manager.max_connections),
+                link_use_exempt_per_ip_cap = LINK_USE_EXEMPT_PER_IP_CAP,
+                over_per_ip_cap = plan.over_per_ip_cap,
+                over_global_cap = plan.over_global_cap,
+                over_cap_dropped = slice.over_cap_dropped,
+                cap_evictions_total = state.cap_evictions_total,
+                "Zombie sweep: transports kept alive by recent requests"
+            );
+        }
+        if !slice.reap.is_empty() {
+            tracing::info!(
+                zombie_count = slice.reap.len(),
+                zombies_due = plan.due(),
+                over_cap = plan.over_cap.len(),
+                backlog = slice.backlog,
+                "Cleaning up zombie transports (not promoted to ring)"
+            );
+        }
     }
 }
 
@@ -899,18 +979,238 @@ mod tests {
         let plan = plan_zombie_sweep(candidates, 2, 1);
         assert_eq!(plan.due(), 4);
 
-        let (reap, backlog) = plan.slice(2);
-        assert_eq!(reap.len(), 2);
-        assert_eq!(reap[0], addr("198.51.100.1:1"), "over-cap goes first");
-        assert!(backlog, "two remain due");
+        let slice = plan.slice(2);
+        assert_eq!(slice.reap.len(), 2);
+        assert_eq!(slice.reap[0], addr("198.51.100.1:1"), "over-cap goes first");
+        assert!(slice.backlog, "two remain due");
 
-        let (reap, backlog) = plan.slice(4);
-        assert_eq!(reap.len(), 4);
-        assert!(!backlog, "nothing remains due");
+        let slice = plan.slice(4);
+        assert_eq!(slice.reap.len(), 4);
+        assert!(!slice.backlog, "nothing remains due");
 
-        let (reap, backlog) = plan_zombie_sweep(Vec::new(), 2, 1).slice(64);
-        assert!(reap.is_empty());
-        assert!(!backlog);
+        let slice = plan_zombie_sweep(Vec::new(), 2, 1).slice(64);
+        assert!(slice.reap.is_empty());
+        assert!(!slice.backlog);
+    }
+
+    /// `over_cap_dropped` counts only the over-cap transports a slice actually
+    /// drops, so one deferred by the slice bound is counted once, when dropped.
+    #[test]
+    fn over_cap_dropped_counts_what_the_slice_drops() {
+        let candidates: Vec<SweepCandidate> = (0..5u8)
+            .map(|i| exempt(&format!("198.51.100.{}:1", i + 1), 100 + u64::from(i)))
+            .collect();
+        // Global cap 1: four transports are over cap.
+        let plan = plan_zombie_sweep(candidates, 2, 1);
+        assert_eq!(plan.over_cap.len(), 4);
+
+        let first = plan.slice(3);
+        assert_eq!(first.over_cap_dropped, 3, "only three fit in this slice");
+        let mut state = ZombieSweepState::new(Instant::now());
+        let t = Instant::now();
+        state.record_slice(t, t, &first);
+        assert_eq!(state.cap_evictions_total, 3);
+
+        // Next sweep: the three dropped are gone; the fourth is still over cap.
+        let remaining: Vec<SweepCandidate> = (0..5u8)
+            .map(|i| exempt(&format!("198.51.100.{}:1", i + 1), 100 + u64::from(i)))
+            .filter(|c| !first.reap.contains(&c.addr))
+            .collect();
+        let second = plan_zombie_sweep(remaining, 2, 1).slice(3);
+        assert_eq!(second.over_cap_dropped, 1);
+        state.record_slice(t, t, &second);
+        assert_eq!(
+            state.cap_evictions_total, 4,
+            "four transports were evicted over cap, each counted once"
+        );
+
+        // Ordinary zombies in the slice are not counted.
+        let mixed = plan_zombie_sweep(
+            [
+                SweepCandidate {
+                    addr: addr("192.0.2.1:1"),
+                    age: Duration::from_secs(900),
+                    verdict: ZombieVerdict::Reap,
+                },
+                exempt("198.51.100.1:1", 100),
+            ],
+            2,
+            2,
+        )
+        .slice(64);
+        assert_eq!(mixed.reap.len(), 1);
+        assert_eq!(mixed.over_cap_dropped, 0);
+    }
+
+    // ---- backlog scheduling ----
+
+    #[test]
+    fn backlog_delay_bounds_the_sweep_duty_cycle() {
+        assert_eq!(
+            backlog_sweep_delay(Duration::ZERO),
+            ZOMBIE_BACKLOG_SWEEP_INTERVAL
+        );
+        assert_eq!(
+            backlog_sweep_delay(Duration::from_millis(250)),
+            ZOMBIE_BACKLOG_SWEEP_INTERVAL,
+            "a quick slice waits the minimum interval"
+        );
+        assert_eq!(
+            backlog_sweep_delay(Duration::from_secs(3)),
+            Duration::from_secs(12),
+            "a slow slice waits four times as long as it took"
+        );
+        assert_eq!(
+            backlog_sweep_delay(Duration::from_millis(6400)),
+            Duration::from_millis(25_600),
+            "a worst-case 64 × 100ms slice waits 25.6s"
+        );
+    }
+
+    #[test]
+    fn backlog_slice_due_only_with_backlog_and_after_the_delay() {
+        let t0 = Instant::now();
+        let mut state = ZombieSweepState::new(t0);
+        assert!(
+            !state.backlog_slice_due(t0 + Duration::from_secs(60)),
+            "no backlog, no backlog slice"
+        );
+
+        let backlog = ZombieSlice {
+            reap: vec![addr("192.0.2.1:1")],
+            over_cap_dropped: 0,
+            backlog: true,
+        };
+        // A quick slice: due just after the 1s minimum.
+        let end = t0 + Duration::from_millis(50);
+        state.record_slice(t0, end, &backlog);
+        assert!(!state.backlog_slice_due(end + Duration::from_millis(1000)));
+        assert!(state.backlog_slice_due(end + Duration::from_millis(1001)));
+
+        // A slow slice: due only after four times its duration.
+        let start = end + Duration::from_secs(2);
+        let end = start + Duration::from_secs(3);
+        state.record_slice(start, end, &backlog);
+        assert!(!state.backlog_slice_due(end + Duration::from_secs(12)));
+        assert!(state.backlog_slice_due(end + Duration::from_millis(12_001)));
+
+        // A slice that clears the backlog stops further backlog slices.
+        let cleared = ZombieSlice {
+            reap: vec![],
+            over_cap_dropped: 0,
+            backlog: false,
+        };
+        state.record_slice(end, end, &cleared);
+        assert!(!state.backlog_slice_due(end + Duration::from_secs(3600)));
+    }
+
+    // ---- plan_sweep over real connection entries ----
+
+    /// A transport that is `age_secs` old at `now`, last used `idle_secs` ago.
+    fn entry_at(now: Instant, age_secs: u64, idle_secs: u64) -> ConnectionEntry {
+        let (sender, _rx) = mpsc::channel(1);
+        ConnectionEntry {
+            sender,
+            pub_key: None,
+            connection_id: 1,
+            created_at: now - Duration::from_secs(age_secs),
+            last_link_use_at: now - Duration::from_secs(idle_secs),
+            remote_version: None,
+        }
+    }
+
+    /// The caps `plan_sweep` applies come from the connection manager: with
+    /// `max_connections` 8 the global cap is 2, and the per-IP cap is 2. This
+    /// fails if `plan_sweep` stops passing either cap.
+    #[test]
+    fn plan_sweep_applies_both_caps_from_the_connection_manager() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let mut cm = crate::ring::ConnectionManager::test_default();
+        // test_default: transient_ttl 60s, so a zombie by age after 180s.
+        cm.max_connections = 8;
+
+        let mut connections = BTreeMap::new();
+        // Three young transports from one IP, all in use and past the 180s age
+        // threshold.
+        for (port, age) in [(1, 200), (2, 210), (3, 220)] {
+            connections.insert(
+                SocketAddr::from(([203, 0, 113, 7], port)),
+                entry_at(now, age, 10),
+            );
+        }
+        // Two older ones from other IPs, in use.
+        connections.insert(addr("198.51.100.1:1"), entry_at(now, 300, 10));
+        connections.insert(addr("198.51.100.2:1"), entry_at(now, 350, 10));
+        // One idle zombie and one young transport.
+        connections.insert(addr("192.0.2.1:1"), entry_at(now, 400, 400));
+        connections.insert(addr("192.0.2.2:1"), entry_at(now, 30, 30));
+
+        let (candidates, plan) = plan_sweep(&connections, &[], &cm, now);
+        assert_eq!(candidates.len(), connections.len());
+        assert_eq!(plan.zombies, vec![addr("192.0.2.1:1")]);
+        assert_eq!(
+            plan.kept_for_link_use,
+            vec![
+                SocketAddr::from(([203, 0, 113, 7], 1)),
+                SocketAddr::from(([203, 0, 113, 7], 2)),
+            ],
+            "the two youngest fill both the per-IP cap and the global cap of 2"
+        );
+        assert_eq!(plan.over_per_ip_cap, 1, "the third transport from one IP");
+        assert_eq!(plan.over_global_cap, 2, "the two from other IPs");
+        assert_eq!(
+            plan.over_cap,
+            vec![
+                addr("198.51.100.2:1"),
+                addr("198.51.100.1:1"),
+                SocketAddr::from(([203, 0, 113, 7], 3)),
+            ],
+            "over-cap transports are ordered oldest first"
+        );
+    }
+
+    /// More zombies than one slice holds are drained by successive slices, each
+    /// bounded, until the backlog clears and backlog slices stop.
+    #[test]
+    fn backlog_drains_across_slices() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let cm = crate::ring::ConnectionManager::test_default();
+        let total = MAX_ZOMBIE_CLEANUP_PER_CYCLE + 6;
+        let mut connections = BTreeMap::new();
+        for i in 0..total {
+            let port = u16::try_from(i + 1).unwrap();
+            connections.insert(
+                SocketAddr::from(([192, 0, 2, 1], port)),
+                entry_at(now, 400, 400),
+            );
+        }
+
+        let mut state = ZombieSweepState::new(now);
+        let mut t = now;
+        let mut slices = Vec::new();
+        loop {
+            let (_, plan) = plan_sweep(&connections, &[], &cm, t);
+            let slice = plan.slice(MAX_ZOMBIE_CLEANUP_PER_CYCLE);
+            for addr in &slice.reap {
+                connections.remove(addr);
+            }
+            let end = t + Duration::from_millis(10);
+            state.record_slice(t, end, &slice);
+            slices.push(slice.reap.len());
+            if !slice.backlog {
+                break;
+            }
+            assert!(
+                !state.backlog_slice_due(end + ZOMBIE_BACKLOG_SWEEP_INTERVAL),
+                "a backlog slice waits the minimum interval"
+            );
+            t = end + ZOMBIE_BACKLOG_SWEEP_INTERVAL + Duration::from_millis(1);
+            assert!(state.backlog_slice_due(t), "then it is due");
+            assert!(slices.len() < 10, "the backlog must clear");
+        }
+        assert_eq!(slices, vec![MAX_ZOMBIE_CLEANUP_PER_CYCLE, 6]);
+        assert!(connections.is_empty());
+        assert!(!state.backlog_slice_due(t + Duration::from_secs(3600)));
     }
 
     // ---- request classification ----

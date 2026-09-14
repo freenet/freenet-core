@@ -55,9 +55,9 @@ mod dispatch;
 mod migration;
 mod zombie_sweep;
 
+use zombie_sweep::ZombieSweepState;
 #[cfg(test)]
 use zombie_sweep::{TransportActivity, is_zombie};
-use zombie_sweep::{ZOMBIE_BACKLOG_SWEEP_INTERVAL, ZombieSweepStats};
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -1460,9 +1460,7 @@ impl P2pConnManager {
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
-        let mut zombie_sweep_stats = ZombieSweepStats::default();
-        let mut zombie_backlog = false;
-        let mut last_zombie_sweep = Instant::now();
+        let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
         // Monitor both the event stream AND the UDP listen task.
@@ -1578,11 +1576,10 @@ impl P2pConnManager {
 
                 // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
                 // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports; when more are due,
-                // further slices run every ZOMBIE_BACKLOG_SWEEP_INTERVAL below.
-                zombie_backlog = ctx
-                    .sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_stats)
+                // backlog slices run below on the schedule in
+                // `ZombieSweepState::backlog_slice_due`.
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
                     .await;
-                last_zombie_sweep = Instant::now();
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1610,12 +1607,9 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
-            } else if zombie_backlog && last_zombie_sweep.elapsed() > ZOMBIE_BACKLOG_SWEEP_INTERVAL
-            {
-                zombie_backlog = ctx
-                    .sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_stats)
+            } else if zombie_sweep_state.backlog_slice_due(Instant::now()) {
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state)
                     .await;
-                last_zombie_sweep = Instant::now();
             }
 
             match event {

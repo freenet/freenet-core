@@ -404,17 +404,20 @@ static ZOMBIE_SWEEP_REGISTRY: LazyLock<
     DashMap<(String, SocketAddr, SocketAddr), ZombieSweepObservation>,
 > = LazyLock::new(DashMap::new);
 
-/// Record one sweep verdict for a transport that was a zombie by age. No-op
-/// outside a simulation context (no current network name), so it costs one
-/// thread-local read on production nodes, and only for such transports.
-pub fn record_zombie_sweep_verdict(
+/// Record one sweep's verdicts for transports that were zombies by age, as
+/// `(remote, kept_for_link_use)` pairs. The network name is read once, and on a
+/// production node (no current network name) `verdicts` is never iterated, so
+/// nothing the caller computes lazily inside it runs.
+pub fn record_zombie_sweep_verdicts(
     sweeper: SocketAddr,
-    remote: SocketAddr,
-    kept_for_link_use: bool,
+    verdicts: impl IntoIterator<Item = (SocketAddr, bool)>,
 ) {
-    if let Some(network_name) = get_current_network_name() {
+    let Some(network_name) = get_current_network_name() else {
+        return;
+    };
+    for (remote, kept_for_link_use) in verdicts {
         let mut entry = ZOMBIE_SWEEP_REGISTRY
-            .entry((network_name, sweeper, remote))
+            .entry((network_name.clone(), sweeper, remote))
             .or_default();
         entry.past_age_threshold += 1;
         if kept_for_link_use {
