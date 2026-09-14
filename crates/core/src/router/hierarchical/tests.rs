@@ -593,13 +593,17 @@ fn eviction_folds_the_evicted_peer_into_orphans_before_the_next_refit() {
     );
 }
 
-/// A peer holding all but a sliver of the root's weight leaves a leave-one-out
-/// rest that is cancellation noise. At a 1.5h horizon one active peer's events
-/// weigh ~1 while every other peer's are 30 hours stale (~2e-9 each), so the
-/// rest is ~1e-9 of the root. Without `ROOT_REST_FLOOR` that peer's contrast is
-/// read from the noise and `tau2_peer` comes out far from its truth of zero.
+/// A peer holding all but a sliver of the root's weight must be left out of
+/// `tau2_peer`. At a 1.5h horizon one active peer's events weigh ~1 while the
+/// only other peer's three events are 30 hours stale (~2e-9 each), so the rest
+/// is ~1e-9 of the root, and `root.w2 - peer.w2` and `sq_peers - peer.n^2`
+/// cancel to zero: that contrast would lose its noise term entirely.
+///
+/// Pinned exactly: with the dominant peer skipped, `tau2_peer` is the stale
+/// peer's contrast alone, computed here from the level's own moments. Counting
+/// the dominant peer adds a second, noise-free contrast and changes the value.
 #[test]
-fn a_dominant_peer_does_not_read_cancellation_noise_into_tau2_peer() {
+fn a_dominant_peer_is_left_out_of_tau2_peer() {
     let _guard = GlobalRng::seed_guard(0x4485_f100);
     let (horizon, now) = (1.5, 30.0);
     let mut level = Level::new(Some(horizon));
@@ -607,26 +611,39 @@ fn a_dominant_peer_does_not_read_cancellation_noise_into_tau2_peer() {
     for band in 0..BANDS {
         for _ in 0..200 {
             let t = now - uniform() * 0.5;
-            level.add(Some(0), band, level.weight(t), 5.0 + normal());
+            level.add(Some(0), band, level.weight(t), normal());
         }
     }
-    for slot in 1..40 {
-        for band in 0..BANDS {
-            for _ in 0..5 {
-                level.add(Some(slot), band, level.weight(0.0), 5.0 + normal());
-            }
-        }
+    for _ in 0..3 {
+        // A real effect of +3, stale.
+        level.add(Some(1), 0, level.weight(0.0), 3.0 + 0.1 * normal());
     }
     level.recount_squares();
-    let dominant = level.nodes[0].peer;
+    let (root, dominant, stale) = (level.root, level.nodes[0].peer, level.nodes[1]);
     assert!(
-        level.root.n - dominant.n < ROOT_REST_FLOOR * level.root.n,
-        "the scenario must put the rest under the floor, or this test proves nothing"
+        root.n - dominant.n < ROOT_REST_FLOOR * root.n && root.n - dominant.n > NODE_MIN,
+        "the scenario must put the rest under the floor but above NODE_MIN"
     );
+    assert!(stale.peer.replicated());
     let c = level.compute_components().expect("components exist");
+
+    let peer = stale.peer;
+    let rest = root.n - peer.n;
+    let rest_w2 = (root.w2 - peer.w2).max(0.0);
+    let contrast = peer.mean() - (root.sum - peer.sum) / rest;
+    let noise = c.tau2_cell
+        * (stale.sq_cells / (peer.n * peer.n)
+            + (level.sq_cells - stale.sq_cells).max(0.0) / (rest * rest))
+        + c.sigma2 * (peer.mean_variance_factor() + rest_w2 / (rest * rest));
+    let den = 1.0 + (level.sq_peers - peer.n * peer.n).max(0.0) / (rest * rest);
+    let expected = ((contrast * contrast - noise) / den).max(0.0);
     assert!(
-        c.tau2_peer < 0.05,
-        "no peer effect exists; a dominant peer must not create one, got {}",
+        expected > 1.0,
+        "the stale peer's own contrast must carry signal: {expected}"
+    );
+    assert!(
+        (c.tau2_peer - expected).abs() <= 1e-9 * expected,
+        "tau2_peer {} must be the stale peer's contrast alone, {expected}",
         c.tau2_peer
     );
 }
