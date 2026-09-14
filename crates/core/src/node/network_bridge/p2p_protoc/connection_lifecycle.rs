@@ -1051,6 +1051,7 @@ impl P2pConnManager {
             "[CONN_TRACK] INSERT: adding connection to HashMap"
         );
         let now = Instant::now();
+        let link_use = zombie_sweep::LinkUseStamp::new(now);
         self.connections.insert(
             peer_addr,
             ConnectionEntry {
@@ -1060,7 +1061,7 @@ impl P2pConnManager {
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
                 created_at: now,
-                last_link_use_at: now,
+                link_use: link_use.clone(),
                 remote_version,
             },
         );
@@ -1109,6 +1110,7 @@ impl P2pConnManager {
                 conn_events,
                 conn_id,
                 outbound_mix,
+                link_use,
             )
             .await;
         });
@@ -1386,15 +1388,6 @@ impl P2pConnManager {
         match event {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
-
-                // A request from the remote keeps this transport out of the zombie
-                // sweep while it is in use (#5654). See `zombie_sweep`.
-                zombie_sweep::record_link_use_request(
-                    &mut self.connections,
-                    inbound.remote_addr,
-                    &inbound.msg,
-                    Instant::now(),
-                );
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {

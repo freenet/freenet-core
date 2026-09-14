@@ -526,12 +526,13 @@ struct ConnectionEntry {
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
     /// When the remote last sent a request over this transport (see
-    /// `zombie_sweep::is_link_use_request`); equal to `created_at` until it
-    /// does. The zombie sweep judges a transport that was never promoted to the
-    /// ring by this rather than by `created_at`, so a link the remote is still
+    /// `zombie_sweep::is_link_use_request`), shared with the transport's
+    /// `peer_connection_listener`, which stamps each request as it receives it.
+    /// The zombie sweep judges a transport that was never promoted to the ring
+    /// by this rather than by `created_at`, so a link the remote is still
     /// sending requests over is not collected out from under it (#5654), within
     /// the per-IP and global caps in `zombie_sweep`.
-    last_link_use_at: Instant,
+    link_use: zombie_sweep::LinkUseStamp,
     /// The remote peer's negotiated protocol version, if known.
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
@@ -3323,6 +3324,7 @@ async fn peer_connection_listener(
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
+    link_use: zombie_sweep::LinkUseStamp,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3463,6 +3465,10 @@ async fn peer_connection_listener(
                                 msg_type = %net_message,
                                 "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
                             );
+                            // Stamp a request BEFORE queueing it: the event loop
+                            // may not dequeue it for a while, and the zombie sweep
+                            // must already see this transport as in use (#5654).
+                            zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -4354,7 +4360,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
-                last_link_use_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4366,7 +4372,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
-                last_link_use_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );

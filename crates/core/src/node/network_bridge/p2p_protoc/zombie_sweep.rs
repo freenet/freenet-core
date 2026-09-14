@@ -189,8 +189,9 @@ pub(super) fn link_use_exemption_key(addr: SocketAddr) -> (IpAddr, u16) {
 ///
 /// Keepalives never reach this layer (they are transport-level `Ping`/`Pong`).
 ///
-/// This runs in `handle_transport_event`, before the dispatch in
-/// `node::handle_pure_network_message_v1` decides whether to start a driver.
+/// This runs in `peer_connection_listener` as each message is received, before
+/// the event loop dispatches it through `node::handle_pure_network_message_v1`,
+/// which decides whether to start a driver.
 /// That dispatch runs on a spawned task and can still drop a request (a
 /// banned contract, a duplicate CONNECT transaction, the UPDATE rate limiter);
 /// reporting its decision back to the event-loop-owned connection map would
@@ -250,34 +251,70 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
     }
 }
 
-/// Restamp `last_link_use_at` on the transport `remote` arrived over when `msg`
-/// is a request from that remote ([`is_link_use_request`]). Returns whether it
-/// restamped. Never inserts: a message for an address with no transport entry
-/// changes nothing.
+/// When the remote last sent a request over one transport, shared between the
+/// transport's listener task (which writes it) and the event loop's zombie sweep
+/// (which reads it).
 ///
-/// `now` is passed in so tests control the clock. The stamp is a
-/// `tokio::time::Instant`, carried forward from `created_at` so the sweep
-/// compares two readings of one clock; under the simulation's paused tokio
-/// runtime it is virtual time.
+/// The listener stamps a request as it receives and decodes it, BEFORE queueing
+/// it for the event loop. Stamping when the event loop dequeues the message was
+/// too late: on a busy node the loop can keep serving higher-priority work while
+/// the request waits in the queue, and a sweep planned in that window saw a
+/// stale stamp and reaped a transport with a request already waiting (#5654).
+///
+/// Stored as microseconds after `base` (the transport's `created_at`, so both
+/// are readings of the same `tokio::time::Instant` clock; virtual time under
+/// the simulation's paused runtime). Zero means no request yet. Writes use
+/// `fetch_max`, so the stamp never moves backwards. A request costs one
+/// classification match, one clock read and one atomic write.
+#[derive(Clone, Debug)]
+pub(super) struct LinkUseStamp {
+    base: Instant,
+    micros_since_base: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl LinkUseStamp {
+    pub(super) fn new(base: Instant) -> Self {
+        Self {
+            base,
+            micros_since_base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn record(&self, now: Instant) {
+        let micros =
+            u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX);
+        self.micros_since_base
+            .fetch_max(micros, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The instant of the most recent request, or `base` if there has been none.
+    /// An unrepresentable instant reads as `base`, the most idle value, so it
+    /// can only make a transport look less in use, never more.
+    pub(super) fn last_use(&self) -> Instant {
+        let micros = self
+            .micros_since_base
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.base
+            .checked_add(Duration::from_micros(micros))
+            .unwrap_or(self.base)
+    }
+}
+
+/// Stamp `stamp` with `now` when `msg` is a request from the remote
+/// ([`is_link_use_request`]). Returns whether it stamped. Called by
+/// `peer_connection_listener` for each decoded inbound message, before the
+/// message is queued for the event loop. `now` is passed in so tests control
+/// the clock.
 pub(super) fn record_link_use_request(
-    connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
-    remote: Option<SocketAddr>,
+    stamp: &LinkUseStamp,
     msg: &NetMessage,
     now: Instant,
 ) -> bool {
-    let Some(remote) = remote else {
-        return false;
-    };
     if !is_link_use_request(msg) {
         return false;
     }
-    match connections.get_mut(&remote) {
-        Some(entry) => {
-            entry.last_link_use_at = now;
-            true
-        }
-        None => false,
-    }
+    stamp.record(now);
+    true
 }
 
 /// Check whether a transport connection is a zombie, before the link-use caps.
@@ -549,7 +586,7 @@ pub(super) fn plan_sweep(
         .map(|(addr, entry)| {
             let is_gateway = gateways.iter().any(|gw| gw.socket_addr() == Some(*addr));
             let age = now.saturating_duration_since(entry.created_at);
-            let idle = now.saturating_duration_since(entry.last_link_use_at);
+            let idle = now.saturating_duration_since(entry.link_use.last_use());
             let verdict = zombie_verdict(
                 TransportActivity { age, idle },
                 connection_manager.is_in_ring(*addr),
@@ -1601,7 +1638,7 @@ mod tests {
                     pub_key: None,
                     connection_id: 1,
                     created_at: created,
-                    last_link_use_at: created,
+                    link_use: LinkUseStamp::new(created),
                     remote_version: None,
                 },
             );
@@ -1658,12 +1695,17 @@ mod tests {
     /// A transport that is `age_secs` old at `now`, last used `idle_secs` ago.
     fn entry_at(now: Instant, age_secs: u64, idle_secs: u64) -> ConnectionEntry {
         let (sender, _rx) = mpsc::channel(1);
+        let created_at = now - Duration::from_secs(age_secs);
+        let link_use = LinkUseStamp::new(created_at);
+        if idle_secs < age_secs {
+            link_use.record(now - Duration::from_secs(idle_secs));
+        }
         ConnectionEntry {
             sender,
             pub_key: None,
             connection_id: 1,
-            created_at: now - Duration::from_secs(age_secs),
-            last_link_use_at: now - Duration::from_secs(idle_secs),
+            created_at,
+            link_use,
             remote_version: None,
         }
     }
@@ -1768,42 +1810,61 @@ mod tests {
         assert!(!state.slice_due(t + Duration::from_secs(3600), false));
     }
 
-    /// The restamp must actually be called from `handle_transport_event`'s
-    /// inbound-message arm. Behaviourally this is covered by the simulation
-    /// test `test_gateway_zombie_sweep_keeps_unjoined_peers_live_link` (it fails
-    /// with the call removed); this pin is the fast local signal. A unit test
-    /// through `handle_transport_event` itself would need a `P2pConnManager`,
-    /// which is only constructed by the full node `build` path.
-    ///
-    /// The scrape is cross-file, so it cannot be satisfied by this test's own
-    /// literals, and it requires the call at statement position, so a
-    /// commented-out call fails it.
+    /// The listener must stamp a request before it queues the message for the
+    /// event loop, and the connection entry the sweep reads must share that
+    /// stamp. Behaviourally this is covered by
+    /// `request_waiting_in_the_event_queue_protects_its_transport` and the
+    /// simulation test `test_gateway_zombie_sweep_keeps_unjoined_peers_live_link`;
+    /// this pin checks the wiring in `handle_successful_connection`, which only
+    /// the full node build runs. Cross-file scrapes, with the stamp call required
+    /// at statement position so a commented-out call fails.
     #[test]
-    fn handle_transport_event_restamps_inbound_requests() {
-        const SRC: &str = include_str!("connection_lifecycle.rs");
-        const ARM: &str = "Some(ConnEvent::InboundMessage(mut inbound)) => {";
-        const NEXT_ARM: &str = "Some(ConnEvent::TransportClosed {";
+    fn listener_stamps_requests_before_queueing_them() {
+        const PROTOC: &str = include_str!("../p2p_protoc.rs");
+        const LIFECYCLE: &str = include_str!("connection_lifecycle.rs");
         const CALL: &str = "zombie_sweep::record_link_use_request(";
-        let start = SRC.find(ARM).expect("inbound-message arm must exist");
-        let len = SRC[start..]
-            .find(NEXT_ARM)
-            .expect("the arm must be followed by the TransportClosed arm");
-        let arm = &SRC[start..start + len];
-        assert_eq!(SRC.matches(ARM).count(), 1, "the arm anchor must be unique");
-        let at_statement_position = arm.match_indices(CALL).any(|(i, _)| {
-            let line_start = arm[..i].rfind('\n').map_or(0, |n| n + 1);
-            arm[line_start..i].trim().is_empty()
-        });
+
+        let listener_at = find_unique(PROTOC, "async fn peer_connection_listener(");
+        let (open, close) = block_span(PROTOC, listener_at);
+        let listener = &PROTOC[open..close];
+        let stamp_at = listener
+            .match_indices(CALL)
+            .find(|(i, _)| {
+                let line_start = listener[..*i].rfind('\n').map_or(0, |n| n + 1);
+                listener[line_start..*i].trim().is_empty()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| panic!("peer_connection_listener must call {CALL}..) (#5654)"));
+        let queue_at = listener
+            .find("ConnEvent::InboundMessage(IncomingMessage::with_remote(")
+            .expect("the listener must queue inbound messages");
         assert!(
-            at_statement_position,
-            "handle_transport_event's inbound-message arm must call {CALL}...) (#5654)"
+            stamp_at < queue_at,
+            "the request must be stamped before it is queued for the event loop"
         );
-        let call = arm.find(CALL).unwrap();
-        let args_len = arm[call..].find(");").expect("call must be closed");
-        let args = &arm[call..call + args_len];
         assert!(
-            args.contains("inbound.remote_addr") && args.contains("&inbound.msg"),
-            "the restamp must be given the inbound message and its remote address"
+            squash(&listener[stamp_at..queue_at]).starts_with(
+                "zombie_sweep::record_link_use_request(&link_use,&net_message,Instant::now())"
+            ),
+            "the stamp must record the decoded message on the listener's own stamp"
+        );
+
+        let squashed = squash(LIFECYCLE);
+        assert!(
+            squashed.contains("letlink_use=zombie_sweep::LinkUseStamp::new(now);"),
+            "the connection's stamp must be based on its created_at"
+        );
+        assert!(
+            squashed.contains("created_at:now,link_use:link_use.clone(),"),
+            "the connection entry must hold the stamp"
+        );
+        assert!(
+            squashed.contains("conn_id,outbound_mix,link_use)"),
+            "the listener must be given the same stamp"
+        );
+        assert!(
+            !LIFECYCLE.contains(CALL),
+            "stamping at dequeue in handle_transport_event is replaced by the listener"
         );
     }
 
@@ -2306,24 +2367,11 @@ mod tests {
 
     // ---- restamp wiring ----
 
-    fn entry(now: Instant) -> ConnectionEntry {
-        let (sender, _rx) = mpsc::channel(1);
-        ConnectionEntry {
-            sender,
-            pub_key: None,
-            connection_id: 1,
-            created_at: now,
-            last_link_use_at: now,
-            remote_version: None,
-        }
-    }
-
     #[test]
-    fn record_link_use_request_restamps_only_requests() {
-        let remote = addr("198.51.100.9:4000");
+    fn record_link_use_request_stamps_only_requests() {
         let t0 = Instant::now();
-        let mut connections = BTreeMap::new();
-        connections.insert(remote, entry(t0));
+        let stamp = LinkUseStamp::new(t0);
+        assert_eq!(stamp.last_use(), t0, "a new stamp reads as its base");
 
         let table = every_variant();
         let find = |name: &str| {
@@ -2344,41 +2392,165 @@ mod tests {
             "InterestSync",
         ] {
             assert!(
-                !record_link_use_request(&mut connections, Some(remote), &find(name), t1),
-                "{name} must not restamp"
+                !record_link_use_request(&stamp, &find(name), t1),
+                "{name} must not stamp"
             );
-            assert_eq!(connections[&remote].last_link_use_at, t0, "{name}");
+            assert_eq!(stamp.last_use(), t0, "{name}");
         }
 
-        // A request restamps.
-        assert!(record_link_use_request(
-            &mut connections,
-            Some(remote),
-            &find("Get::Request"),
-            t1
-        ));
-        assert_eq!(connections[&remote].last_link_use_at, t1);
-        assert_eq!(
-            connections[&remote].created_at, t0,
-            "restamping must not touch created_at"
+        // A request stamps, through every clone of the stamp.
+        let reader = stamp.clone();
+        assert!(record_link_use_request(&stamp, &find("Get::Request"), t1));
+        assert_eq!(reader.last_use(), t1);
+
+        // The stamp never moves backwards.
+        assert!(record_link_use_request(&stamp, &find("Get::Request"), t0));
+        assert_eq!(reader.last_use(), t1);
+        let t2 = t1 + Duration::from_millis(1500);
+        assert!(record_link_use_request(&stamp, &find("Put::Request"), t2));
+        assert_eq!(reader.last_use(), t2);
+    }
+
+    /// A connection whose `recv` yields queued bytes, then waits forever.
+    struct QueuedConnection {
+        addr: SocketAddr,
+        inbound: mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl PeerConnectionApi for QueuedConnection {
+        fn remote_addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_message(
+            &mut self,
+            _msg: NetMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+            Box::pin(async move {
+                match self.inbound.recv().await {
+                    Some(bytes) => Ok(bytes),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+
+        fn set_orphan_stream_registry(
+            &mut self,
+            _registry: Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
+            >,
+            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: StreamId,
+            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A request that the transport's listener has received and queued for the
+    /// event loop, but that the loop has not yet dequeued (it is busy with
+    /// higher-priority work), must already protect its transport from a sweep
+    /// planned in between. Runs the real `peer_connection_listener`, holds the
+    /// event queue undrained, and plans a sweep over the connection map.
+    #[tokio::test(start_paused = true)]
+    async fn request_waiting_in_the_event_queue_protects_its_transport() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let remote = addr("198.51.100.9:4000");
+        let created = Instant::now();
+        let link_use = LinkUseStamp::new(created);
+        let (sender, commands_rx) = mpsc::channel(10);
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            remote,
+            ConnectionEntry {
+                sender,
+                pub_key: None,
+                connection_id: 7,
+                created_at: created,
+                link_use: link_use.clone(),
+                remote_version: None,
+            },
         );
 
-        // No remote, or an address without a transport: nothing changes and
-        // nothing is inserted.
-        let t2 = t1 + Duration::from_secs(10);
-        assert!(!record_link_use_request(
-            &mut connections,
-            None,
-            &find("Get::Request"),
-            t2
+        // test_default's transient_ttl is 60s: a zombie by age after 180s.
+        tokio::time::advance(Duration::from_secs(400)).await;
+        let (_, plan) = plan_sweep(&connections, &[], &cm, Instant::now());
+        assert_eq!(plan.zombies, vec![remote], "no request yet: a zombie");
+
+        let (bytes_tx, bytes_rx) = mpsc::channel(4);
+        // Capacity 1 and never read: the request stays queued.
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let listener = tokio::spawn(super::super::peer_connection_listener(
+            commands_rx,
+            Box::new(QueuedConnection {
+                addr: remote,
+                inbound: bytes_rx,
+            }),
+            remote,
+            events_tx,
+            7,
+            Arc::new(crate::node::network_bridge::outbound_message_mix::OutboundMix::new()),
+            link_use,
         ));
-        assert!(!record_link_use_request(
-            &mut connections,
-            Some(addr("198.51.100.10:4000")),
-            &find("Get::Request"),
-            t2
-        ));
-        assert_eq!(connections.len(), 1);
-        assert_eq!(connections[&remote].last_link_use_at, t1);
+
+        let request = every_variant()
+            .into_iter()
+            .find(|(name, _, _)| *name == "Get::Request")
+            .map(|(_, msg, _)| msg)
+            .unwrap();
+        bytes_tx
+            .send(bincode::serialize(&request).unwrap())
+            .await
+            .unwrap();
+        for _ in 0..10_000 {
+            if events_rx.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            events_rx.len(),
+            1,
+            "the listener must have queued the request for the event loop"
+        );
+
+        let (candidates, plan) = plan_sweep(&connections, &[], &cm, Instant::now());
+        assert_eq!(
+            candidates[0].verdict,
+            ZombieVerdict::KeepForLinkUse,
+            "a queued, not yet dequeued request must count as link use"
+        );
+        assert!(plan.zombies.is_empty());
+        assert_eq!(plan.kept_for_link_use, vec![remote]);
+
+        listener.abort();
+        drop(events_rx);
     }
 }
