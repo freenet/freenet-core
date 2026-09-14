@@ -562,37 +562,41 @@ async fn drive_client_put_inner(
             // Response. Without this, the router's prediction model never
             // receives PUT success feedback and simulation tests that check
             // route_outcome telemetry fail.
-            //
-            // Credited to the hop the successful attempt was actually
-            // forwarded to (#5657), and ONLY when one was recorded: a local
-            // completion, or a loopback relay that finalized the PUT locally
-            // after a failed dispatch, contacted no peer and credits nobody.
-            // Under `LabelMode::Legacy` the pre-#5657 attribution to
-            // `current_target` is restored.
-            let credited = match driver.recorder.mode() {
-                crate::operations::route_attempt::LabelMode::Legacy => {
-                    Some(driver.current_target.clone())
-                }
-                crate::operations::route_attempt::LabelMode::Current => driver.terminal_hop.clone(),
+            let contract_location = Location::from(&reply_key);
+            let route_event = RouteEvent {
+                peer: driver.current_target.clone(),
+                contract_location,
+                outcome: RouteOutcome::SuccessUntimed,
+                op_type: Some(crate::node::network_status::OpType::Put),
             };
-            if let Some(hop) = credited {
-                let route_event = RouteEvent {
-                    peer: hop,
-                    contract_location: Location::from(&reply_key),
-                    outcome: RouteOutcome::SuccessUntimed,
-                    op_type: Some(crate::node::network_status::OpType::Put),
-                };
-                if let Some(log_event) = crate::tracing::NetEventLog::route_event(
-                    &client_tx,
-                    &op_manager.ring,
-                    &route_event,
-                ) {
-                    op_manager
-                        .ring
-                        .register_events(either::Either::Left(log_event))
-                        .await;
+            // Router label (#5657): credited to the hop the successful
+            // attempt was actually forwarded to, and ONLY when one was
+            // recorded: a local completion, or a loopback relay that finalized
+            // the PUT locally after a failed dispatch, contacted no peer.
+            let mode = driver.recorder.mode();
+            let hop_credit = match mode {
+                crate::operations::route_attempt::LabelMode::Current => {
+                    driver.terminal_hop.clone().map(|hop| RouteEvent {
+                        peer: hop,
+                        ..route_event.clone()
+                    })
                 }
-                op_manager.ring.routing_finished(route_event);
+                crate::operations::route_attempt::LabelMode::Legacy => None,
+            };
+            // Telemetry, peer_health and topology get the pre-#5657 event
+            // unchanged, in both modes (and the router under the legacy switch).
+            crate::operations::route_attempt::report_originator_route_outcome(
+                op_manager,
+                &client_tx,
+                route_event,
+                mode,
+            )
+            .await;
+            if let Some(event) = hop_credit {
+                op_manager.ring.record_route_event_router_only(
+                    event,
+                    crate::router::dataset::RouteSource::Originator,
+                );
             }
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
@@ -7976,7 +7980,8 @@ mod route_attempt_driver_tests {
     use super::*;
     use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
-        Answer, Step, failed_addrs, failure_window, op_manager_with_peers, serve_attempts,
+        Answer, Step, failed_addrs, failure_window, health_inputs, op_manager_with_peers,
+        route_log, serve_attempts,
     };
     use std::sync::atomic::Ordering;
 
@@ -8086,10 +8091,12 @@ mod route_attempt_driver_tests {
         use crate::operations::route_attempt::{LabelMode, force_label_mode};
         for mode in [LabelMode::Current, LabelMode::Legacy] {
             let _mode = force_label_mode(mode);
-            let (op_manager, rx, _peers, _guards) =
-                op_manager_with_peers(&format!("put-local-success-{mode:?}"), 3).await;
+            let label = format!("put-local-success-{mode:?}");
+            let (op_manager, rx, _peers, _guards) = op_manager_with_peers(&label, 3).await;
             let contract = contract();
             let key = contract.key();
+            let initial = initial_target(&op_manager, &key);
+            let before = health_inputs(&op_manager, &initial);
             serve_attempts(
                 op_manager.clone(),
                 rx,
@@ -8101,6 +8108,20 @@ mod route_attempt_driver_tests {
             );
             let outcome = put(&op_manager, contract).await;
             assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))), "{mode:?}");
+            // Health, topology and telemetry are main's in both modes: the
+            // success counts for `current_target` even though no hop was
+            // recorded.
+            let ((s, f), o) = before;
+            assert_eq!(
+                health_inputs(&op_manager, &initial),
+                ((s + 1, f), o + 1),
+                "{mode:?}"
+            );
+            assert_eq!(
+                route_log(&label),
+                vec![(initial.socket_addr(), false)],
+                "{mode:?}"
+            );
             let window = failure_window(&op_manager);
             match mode {
                 LabelMode::Current => assert!(
@@ -8116,6 +8137,56 @@ mod route_attempt_driver_tests {
                 ),
             }
         }
+    }
+
+    /// The driver's pre-selected `current_target`, as `drive_client_put_inner`
+    /// computes it.
+    fn initial_target(op_manager: &OpManager, key: &ContractKey) -> PeerKeyLocation {
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        op_manager
+            .ring
+            .closest_potentially_hosting(key, [own].as_slice())
+            .expect("a ring candidate")
+    }
+
+    /// A success through a hop that is NOT `current_target`: the router
+    /// credits the hop, while peer_health, topology and telemetry keep main's
+    /// input for `current_target` and give the hop nothing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hop_success_keeps_health_inputs_on_current_target() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("put-hop-success", 4).await;
+        let contract = contract();
+        let key = contract.key();
+        let initial = initial_target(&op_manager, &key);
+        let hop = peers
+            .iter()
+            .find(|p| p.socket_addr() != initial.socket_addr())
+            .unwrap()
+            .clone();
+        let (target_before, hop_before) = (
+            health_inputs(&op_manager, &initial),
+            health_inputs(&op_manager, &hop),
+        );
+        let served_hop = hop.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Put,
+            move |_, msg, _| Step {
+                hop: Some(served_hop.clone()),
+                answer: Answer::Reply(stored(msg, key)),
+            },
+        );
+        let outcome = put(&op_manager, contract).await;
+        assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))));
+        assert_eq!(failure_window(&op_manager), vec![(hop.socket_addr(), 0.0)]);
+        let ((s, f), o) = target_before;
+        assert_eq!(health_inputs(&op_manager, &initial), ((s + 1, f), o + 1));
+        assert_eq!(health_inputs(&op_manager, &hop), hop_before);
+        assert_eq!(
+            route_log("put-hop-success"),
+            vec![(initial.socket_addr(), false)]
+        );
     }
 
     /// Attempts the loopback relay never forwarded blame nobody.

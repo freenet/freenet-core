@@ -253,6 +253,8 @@ pub(crate) struct AddConnectionOutcome {
 /// [`Ring::route_failure_cause_counts`].
 #[derive(Default)]
 struct RouteFailureCauseCounts {
+    /// Ambiguous NotFounds dropped untrained (no proof the contract exists).
+    untrained_not_found: std::sync::atomic::AtomicU64,
     not_found: std::sync::atomic::AtomicU64,
     timeout: std::sync::atomic::AtomicU64,
     send_failure: std::sync::atomic::AtomicU64,
@@ -4229,6 +4231,21 @@ impl Ring {
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.report_route_outcome_to_health(&event);
+        self.router.write().add_event(event);
+    }
+
+    /// Everything [`Self::routing_finished`] does except feed the router: the
+    /// topology manager's outbound-request accounting and the `peer_health`
+    /// success or failure. `routing_finished` is exactly this plus
+    /// `Router::add_event`, so the two cannot drift.
+    ///
+    /// #5657 labels the ROUTER against the hop an attempt was actually
+    /// forwarded to. Peer health and topology keep their pre-#5657 inputs
+    /// unchanged (the originator's `current_target`, the same events, the same
+    /// conditions): changing them would change health-based eviction and the
+    /// request-density model, which #5657 does not set out to do.
+    pub(crate) fn report_route_outcome_to_health(&self, event: &crate::router::RouteEvent) {
         self.connection_manager
             .topology_manager
             .write()
@@ -4247,8 +4264,6 @@ impl Ring {
                 }
             }
         }
-
-        self.router.write().add_event(event);
     }
 
     /// Feed a route event to the routing model ONLY, bypassing the
@@ -4321,34 +4336,26 @@ impl Ring {
         self.record_route_event_router_only(event, source);
     }
 
-    /// Everything [`Self::routing_finished`] does for a FAILURE except feed the
-    /// router: the topology manager's outbound-request accounting and a
-    /// `peer_health` failure.
-    ///
-    /// #5657 keeps router labels out of `peer_health`, but two failure inputs
-    /// `peer_health` has always had (a GET stream that never arrived, and a
-    /// client GET whose delivery failed) must keep reaching it, or nothing in
-    /// production would call `record_failure` and health-based eviction could
-    /// never fire.
-    pub(crate) fn report_route_failure_to_peer_health(
-        &self,
-        peer: &PeerKeyLocation,
-        contract_location: Location,
-    ) {
-        self.connection_manager
-            .topology_manager
-            .write()
-            .report_outbound_request(peer.clone(), contract_location);
-        if let Some(addr) = peer.socket_addr() {
-            self.connection_manager
-                .peer_health
-                .lock()
-                .record_failure(addr);
-        }
+    /// Count ambiguous `NotFound`s an operation dropped untrained (#5657).
+    /// Never trained on; lets a test prove NotFounds actually occurred.
+    pub(crate) fn record_untrained_not_founds(&self, count: u64) {
+        self.route_failure_causes
+            .untrained_not_found
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ambiguous `NotFound`s dropped untrained on this node (#5657).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn untrained_not_found_count(&self) -> u64 {
+        self.route_failure_causes
+            .untrained_not_found
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drain the per-peer timeout-label window into its histogram (#5657).
-    /// Called once per router snapshot.
+    /// Called once per router snapshot, which is its only consumer: the
+    /// window is a drain, so no second reader (a local dashboard) can share
+    /// it without stealing labels from the telemetry export.
     pub(crate) fn take_timeout_label_histogram(&self) -> TimeoutLabelHistogram {
         self.timeout_label_window.lock().take_histogram()
     }

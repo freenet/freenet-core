@@ -9159,6 +9159,25 @@ fn test_router_receives_failures_for_dead_end_gets() {
         "a contract that never exists proves nothing about any peer: no node may \
          train a NotFound failure. Offending nodes (index, causes): {trained_not_found:?}"
     );
+    // Non-vacuous: the GETs must actually have met NotFounds (dropped
+    // untrained), or the assertion above proves nothing.
+    let untrained_not_founds: u64 = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            absent
+                .node_untrained_not_founds(&label)
+                .expect("every node publishes its Ring")
+        })
+        .sum();
+    assert!(
+        untrained_not_founds > 0,
+        "the absent-contract GETs must meet NotFounds for the assertion above to \
+         mean anything; none were observed"
+    );
 
     // ── evidence ────────────────────────────────────────────────────────────
     const EVIDENCE: &str = "route-failures-evidence";
@@ -9210,7 +9229,9 @@ fn test_router_receives_failures_for_dead_end_gets() {
          rate must not regress); nodes without state: {nodes_without_state:?}"
     );
 
-    let per_node: Vec<(usize, (u64, u64, u64), (u64, u64))> = (1..=num_nodes)
+    /// `(node, (not_found, timeout, send_failure), (failures, successes))`.
+    type NodeLabels = (usize, (u64, u64, u64), (u64, u64));
+    let per_node: Vec<NodeLabels> = (1..=num_nodes)
         .map(|i| {
             let label = NodeLabel::node(EVIDENCE, i);
             (

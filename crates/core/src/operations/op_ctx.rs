@@ -772,6 +772,11 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             }
         };
 
+        // The hop this attempt was forwarded to, read NOW (#5657): a loopback
+        // `record_hop` landing during the release await below would otherwise
+        // be blamed for a timeout that fired before the request left.
+        let attempt_hop = hop_slot.hop();
+
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
         // 60s periodic sweep.
@@ -825,7 +830,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // to it. A `NotificationError` that outlived the infra-retry
                 // budget is a local callback drop, and a disconnect of some
                 // other peer is not this hop's doing.
-                let hop = hop_slot.hop();
+                let hop = attempt_hop;
                 let blame = match (&err, hop.as_ref().and_then(|h| h.socket_addr())) {
                     (OpError::PeerDisconnected { peer }, Some(hop_addr)) => *peer == hop_addr,
                     _ => false,
@@ -860,7 +865,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 );
                 record_attempt_failure(
                     driver,
-                    hop_slot.hop(),
+                    attempt_hop,
                     crate::operations::route_attempt::AttemptFailure::Timeout,
                 );
                 match driver.advance() {
@@ -878,7 +883,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         match driver.classify(reply) {
             AttemptOutcome::Terminal(value) => {
-                driver.on_terminal_hop(hop_slot.hop());
+                driver.on_terminal_hop(attempt_hop);
                 return RetryLoopOutcome::Done(value);
             }
             AttemptOutcome::Retry => {
@@ -892,11 +897,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // `Retry` means the peer answered but could not serve the
                 // contract: GET's `NotFound` is its only producer, and PUT
                 // never returns it.
-                let hop = hop_slot.hop();
-                driver.on_not_found_hop(hop.as_ref());
+                driver.on_not_found_hop(attempt_hop.as_ref());
                 record_attempt_failure(
                     driver,
-                    hop,
+                    attempt_hop,
                     crate::operations::route_attempt::AttemptFailure::NotFound,
                 );
                 match driver.advance() {
@@ -945,6 +949,33 @@ mod tests {
     use crate::node::{EventLoopNotificationsReceiver, event_loop_notification_channel};
     use crate::operations::connect::ConnectMsg;
     use tokio::time::{Duration, timeout};
+
+    /// #5657 L2: the attempt's hop is read BEFORE the pending-slot release
+    /// await, and never re-read after it. A loopback `record_hop` landing
+    /// during that await must not be blamed for a timeout that fired before
+    /// the request left.
+    #[test]
+    fn attempt_hop_is_read_before_the_release_await() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let body = production_fn_body(
+            include_str!("op_ctx.rs"),
+            "pub(crate) async fn drive_retry_loop<D: RetryDriver>(",
+        );
+        let read = body
+            .find("let attempt_hop = hop_slot.hop();")
+            .expect("the hop must be read once, into attempt_hop");
+        let release = body
+            .find("op_manager.release_pending_op_slot(attempt_tx).await;")
+            .expect("the retry loop releases the pending slot");
+        assert!(
+            read < release,
+            "the hop must be read before the release await"
+        );
+        assert!(
+            !body[release..].contains("hop_slot.hop()"),
+            "no hop read may follow the release await"
+        );
+    }
 
     /// Behavioural pin on `drive_retry_loop`'s `AttemptOutcome::Terminal`
     /// arm: it MUST return `RetryLoopOutcome::Done(value)` synchronously,

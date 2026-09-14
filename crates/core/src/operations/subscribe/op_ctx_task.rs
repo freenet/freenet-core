@@ -1087,9 +1087,25 @@ async fn drive_client_subscribe_inner(
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
                 // peer dashboard's Response Time chart populates again.
-                // The subscription proves the contract exists: every earlier
-                // NotFound in this subscribe was a routing failure.
-                recorder.contract_exists();
+                // A subscription to THIS contract proves it exists: every
+                // earlier NotFound in this subscribe was a routing failure.
+                let reply_instance_id =
+                    if let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                        instance_id,
+                        ..
+                    })) = &reply
+                    {
+                        Some(*instance_id)
+                    } else {
+                        None
+                    };
+                if crate::operations::route_attempt::reply_names_contract(
+                    &instance_id,
+                    &key,
+                    reply_instance_id.as_ref(),
+                ) {
+                    recorder.contract_exists();
+                }
                 let contract_location = crate::ring::Location::from(&key);
                 let route_event = crate::router::RouteEvent {
                     peer: current_target.clone(),
@@ -2196,6 +2212,7 @@ async fn relay_subscribe_forward_once(
 
     match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+            instance_id: reply_instance_id,
             result: SubscribeMsgResult::Subscribed { key },
             hop_count: downstream_hop_count,
             ..
@@ -2216,10 +2233,16 @@ async fn relay_subscribe_forward_once(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
             );
-            // A subscription proves the contract exists: an earlier NotFound
-            // in this relay's search (the greedy hop, before a consult) was a
-            // routing failure.
-            recorder.contract_exists();
+            // A subscription to THIS contract proves it exists: an earlier
+            // NotFound in this relay's search (the greedy hop, before a
+            // consult) was a routing failure.
+            if crate::operations::route_attempt::reply_names_contract(
+                &instance_id,
+                &key,
+                Some(&reply_instance_id),
+            ) {
+                recorder.contract_exists();
+            }
             crate::operations::record_relay_route_event(
                 op_manager,
                 next_hop.clone(),
@@ -4172,6 +4195,132 @@ mod route_attempt_driver_tests {
             targets[1..2].to_vec(),
             "only the attempt whose own target disconnected is labelled"
         );
+    }
+
+    /// Only a reply naming the requested contract counts as existence proof
+    /// for routing labels, at the originator: the control (naming the
+    /// requested contract) labels the NotFound target, the other does not.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn only_a_reply_naming_the_requested_contract_is_proof() {
+        for (label, same_contract) in [("sub-proof-same", true), ("sub-proof-other", false)] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([55u8; 32]);
+            let other = ContractInstanceId::new([56u8; 32]);
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let seen = targets.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |i, msg, target| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    seen.lock().push(target);
+                    Step {
+                        hop: None,
+                        answer: Answer::Reply(if i == 0 {
+                            not_found(msg, instance_id)
+                        } else {
+                            subscribed(msg, if same_contract { instance_id } else { other })
+                        }),
+                    }
+                },
+            );
+            let _outcome = run_subscribe(&op_manager, instance_id, false, peers[0].clone())
+                .await
+                .expect("driver returns an outcome");
+            let first_target = targets.lock()[0].expect("subscribe attempts carry a target");
+            let expected = if same_contract {
+                vec![first_target]
+            } else {
+                vec![]
+            };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// Relay side: the greedy hop's NotFound is settled as a failure only by a
+    /// consulted reply naming the requested contract.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_only_a_reply_naming_the_requested_contract_is_proof() {
+        for (label, same_contract) in [
+            ("sub-relay-proof-same", true),
+            ("sub-relay-proof-other", false),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 4).await;
+            let instance_id = ContractInstanceId::new([57u8; 32]);
+            let other = ContractInstanceId::new([58u8; 32]);
+            let upstream = peers[0].socket_addr().unwrap();
+            let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+            let greedy = op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, [own, upstream].as_slice(), 1)
+                .into_iter()
+                .next()
+                .expect("a greedy candidate");
+            let host = peers[1..]
+                .iter()
+                .find(|p| p.socket_addr() != greedy.socket_addr())
+                .unwrap()
+                .clone();
+            op_manager.neighbor_hosting.handle_message(
+                host.pub_key(),
+                crate::message::NeighborHostingMessage::HostingAnnounce {
+                    added: vec![instance_id],
+                    removed: vec![],
+                    is_response: true,
+                },
+            );
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let seen = targets.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |_, msg, target| {
+                    if !is_request(msg) || target == Some(upstream) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    let mut seen = seen.lock();
+                    seen.push(target);
+                    let answer = if seen.len() == 1 {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else {
+                        Answer::Reply(subscribed(
+                            msg,
+                            if same_contract { instance_id } else { other },
+                        ))
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            let _relay_result = drive_relay_subscribe(
+                &op_manager,
+                Transaction::new::<SubscribeMsg>(),
+                instance_id,
+                3,
+                VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+                false,
+                upstream,
+            )
+            .await;
+            let targets = targets.lock().clone();
+            assert_eq!(
+                targets.len(),
+                2,
+                "{label}: greedy then consult: {targets:?}"
+            );
+            let first = targets[0].expect("relay forwards carry a target");
+            let expected = if same_contract { vec![first] } else { vec![] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
     }
 
     fn subscribed(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {

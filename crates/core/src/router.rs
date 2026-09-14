@@ -463,6 +463,12 @@ pub(crate) struct RouterSnapshotInfo {
     /// labels in the window, the most any single peer collected, and how many
     /// labels landed on peers beyond the tracking cap. Populated by `Ring`.
     ///
+    /// Each window is one snapshot interval. The first runs from `Ring`
+    /// construction to the first snapshot (the loop skips its immediate first
+    /// tick), so it is the same length but covers the node's start-up routing.
+    /// Telemetry-only: there is no local dashboard view, because the window is
+    /// drained by the snapshot and a second reader would steal its labels.
+    ///
     /// Soak signal for CHAIN BLAME: an originator timeout is labelled against
     /// the first hop although the stall may be anywhere down the chain. One
     /// stuck host behind a popular key shows up here as a tail of first hops

@@ -85,11 +85,14 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     forwarding a renewal still labels a timeout: it waited the full
     OPERATION_TTL for its hop.
   → Router labels are router-only (`Ring::record_route_failure`): a NotFound
-    or an end-to-end timeout is not a reason to evict a connection. But keep
-    `peer_health`'s pre-existing failure inputs (a GET stream that never
-    arrived, a client GET whose delivery failed) via
-    `Ring::report_route_failure_to_peer_health`, or health-based eviction can
-    never fire.
+    or an end-to-end timeout is not a reason to evict a connection.
+  → Originator peer_health, topology and `NetEventLog::route_event` inputs are
+    EXACTLY main's: the same event against `current_target`, at the same sites
+    and conditions, hop-less successes included, in both label modes
+    (`route_attempt::report_originator_route_outcome`). Only the router label
+    uses the recorded hop. Never move a health input to the hop.
+  → The GET stream claim stays on `current_target` here; claiming from the
+    recorded hop is a delivery fix that belongs with retry diversity (#5660).
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,
@@ -97,7 +100,9 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     `add_event`. `Ring::record_route_event_router_only` takes the source.
   → Chain blame is accepted for router-only labels: an originator timeout is
     labelled against the first hop although the stall may be further down
-    the chain. Watch it with the `timeout_label_*` router-snapshot histogram.
+    the chain. Watch it with the `timeout_label_*` router-snapshot histogram
+    (telemetry-only: the window is drained per snapshot, so no local
+    dashboard reads it).
   → NOT YET MIGRATED: PUT relay's downstream forwarding still labels its own
     send/timeout failures with `record_relay_route_event` (router-only too),
     outside the recorder. Those failures are not in the per-cause counters.
