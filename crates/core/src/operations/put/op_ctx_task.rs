@@ -2250,8 +2250,8 @@ where
                 )
                 .await;
             }
-            // Re-stamp now the request has left (the payload follows): time this
-            // node spent waiting to dispatch is not the hop's share (#5657).
+            // The local dispatch has returned (the payload follows): stamp it;
+            // the hop's share of the attempt is counted from here (#5657).
             op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
             // Originator loopback: the retry-loop task (Task A) registered a
             // stream-progress handle keyed by `incoming_tx` before sending. We
@@ -2323,7 +2323,7 @@ where
                 )
                 .await;
             }
-            // Re-stamp now the request has left (#5657).
+            // The local dispatch has returned: stamp it (#5657).
             op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
         }
         // Originator is awaiting the Response on its own callback —
@@ -8221,6 +8221,118 @@ mod route_attempt_driver_tests {
         assert!(failure_window(&op_manager).is_empty());
     }
 
+    /// An attempt whose loopback relay's local dispatch had not returned when
+    /// it timed out blames nobody (#5657); the same timeout after a returned
+    /// dispatch blames the hop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn put_timeout_while_the_dispatch_is_blocked_blames_nobody() {
+        for (label, dispatched) in [
+            ("put-dispatch-returned", true),
+            ("put-dispatch-blocked", false),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let hop = peers[1].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Put,
+                move |i, _, _| match (i, dispatched) {
+                    (0, true) => Step {
+                        hop: Some(hop.clone()),
+                        answer: Answer::Never,
+                    },
+                    (0, false) => Step {
+                        hop: None,
+                        answer: Answer::NeverDispatched(hop.clone()),
+                    },
+                    _ => Step {
+                        hop: None,
+                        answer: Answer::Never,
+                    },
+                },
+            );
+            let _outcome = put(&op_manager, contract()).await;
+            let expected = if dispatched {
+                vec![peers[1].socket_addr().unwrap()]
+            } else {
+                vec![]
+            };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// The real originator-loopback PUT relay stamps its hop's dispatch time
+    /// only once its local dispatch returns (#5657): held up 40 s on a full
+    /// event-loop channel, the hop has no dispatch time until then.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loopback_put_hop_is_stamped_after_its_dispatch() {
+        use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store_on;
+        let (op_manager, mut rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store_on("put-slow-dispatch", 3, Some(1)).await;
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let start = tokio::time::Instant::now();
+        let tx = Transaction::new::<PutMsg>();
+        let slot = op_manager.attempt_hop_registry().register(tx);
+        // Fill the one-slot channel (unless the ring's own traffic already
+        // did), so the relay's dispatch has to wait for it to drain.
+        let filler_tx = Transaction::new::<PutMsg>();
+        let filler = NetMessage::from(PutMsg::Request {
+            id: filler_tx,
+            contract: contract(),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![1]),
+            htl: 1,
+            skip_list: HashSet::new(),
+        });
+        let mut filler_ctx = op_manager.op_ctx(filler_tx);
+        let _filled = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            filler_ctx.send_fire_and_forget(own, filler),
+        )
+        .await;
+        let relay_manager = op_manager.clone();
+        let relay = tokio::spawn(async move {
+            let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+            drive_relay_put(
+                &relay_manager,
+                &conn_manager,
+                tx,
+                contract(),
+                RelatedContracts::default(),
+                WrappedState::new(vec![7, 7, 7]),
+                3,
+                HashSet::new(),
+                own,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        let (_, dispatched) = slot
+            .hop_record()
+            .expect("the hop is recorded before the dispatch");
+        assert!(
+            dispatched.is_none(),
+            "while the local dispatch is blocked the hop has no dispatch time"
+        );
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply, _, _)) = rx.recv().await {
+                held.push(reply);
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(120), relay)
+            .await
+            .expect("the relay finishes once the channel drains")
+            .expect("relay task")
+            .expect("the loopback dispatch succeeds");
+        let (_, dispatched) = slot.hop_record().expect("the hop is still recorded");
+        let dispatched = dispatched.expect("the returned dispatch stamps the hop");
+        assert!(
+            dispatched >= start + std::time::Duration::from_secs(40),
+            "the hop must be stamped when its dispatch returned, not before it waited"
+        );
+    }
+
     /// Source pin: the originator-loopback PUT relay reports its hop before
     /// dispatching and clears it on each local dispatch failure.
     #[test]
@@ -8258,23 +8370,45 @@ mod route_attempt_driver_tests {
             failures, clears,
             "every local dispatch failure in the loopback branch must clear the hop"
         );
-        // Both loopback dispatches (the streaming metadata and the plain
-        // forward) re-stamp the hop once they return (#5657).
+        // Each loopback dispatch is followed, in its own branch and after its
+        // failure arm, by exactly one stamp of its local dispatch (#5657).
+        // The streaming branch: metadata dispatch, failure arm, stamp, then
+        // the payload. The plain branch: forward dispatch, failure arm, stamp.
         let code = crate::contract::source_pin_util::strip_comments(&body[loopback..loopback_end]);
-        let touches: Vec<usize> = code
-            .match_indices(".touch_hop(&incoming_tx);")
-            .map(|(at, _)| at)
-            .collect();
-        assert_eq!(touches.len(), 2, "one re-stamp per loopback dispatch");
-        for at in touches {
-            let dispatch = code[..at]
-                .rfind("send_fire_and_forget(next_addr")
-                .expect("a re-stamp follows a dispatch");
-            assert!(
-                code[dispatch..at].contains("return relay_put_finalize_local("),
-                "the re-stamp follows the dispatch's failure arm, so it runs only \
-                 once the dispatch has returned successfully"
+        let once = |needle: &str| {
+            let found: Vec<usize> = code.match_indices(needle).map(|(i, _)| i).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "`{needle}` must appear once in the loopback branch"
             );
-        }
+            found[0]
+        };
+        let stamps: Vec<usize> = code
+            .match_indices(".touch_hop(&incoming_tx);")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(stamps.len(), 2, "one stamp per loopback dispatch");
+        let metadata = once("send_fire_and_forget(next_addr, metadata_msg)");
+        let payload = once(".send_stream_with_progress(");
+        let plain = once("send_fire_and_forget(next_addr, forward)");
+        let branch_split = metadata
+            + code[metadata..plain]
+                .rfind("} else {")
+                .expect("the plain branch follows the streaming one");
+        let fails_between =
+            |from: usize, to: usize| code[from..to].contains("return relay_put_finalize_local(");
+        assert!(
+            metadata < stamps[0]
+                && stamps[0] < payload
+                && payload < branch_split
+                && fails_between(metadata, stamps[0]),
+            "the streaming branch stamps once its metadata dispatch returned, \
+             before the payload"
+        );
+        assert!(
+            branch_split < plain && plain < stamps[1] && fails_between(plain, stamps[1]),
+            "the plain branch stamps once its forward dispatch returned"
+        );
     }
 }

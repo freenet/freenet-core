@@ -765,7 +765,8 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         // The hop this attempt was forwarded to and when, read NOW (#5657): a
         // loopback `record_hop` landing during the release await below would
-        // otherwise be blamed for a timeout that fired before the request left.
+        // otherwise be blamed for a timeout that fired before the relay
+        // forwarded the request.
         let attempt_resolved = tokio::time::Instant::now();
         let hop_record = hop_slot.hop_record();
         let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
@@ -856,14 +857,15 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
-                // Blame the hop only if it had a meaningful share of the
-                // attempt: one the loopback relay forwarded to near the
-                // deadline did not stall it (#5657).
+                // Blame the hop only if the loopback relay's local dispatch
+                // returned with a meaningful share of the attempt still to
+                // run: a hop dispatched near the deadline, or whose dispatch
+                // had not returned, did not stall it (#5657).
                 let blamed = hop_record
-                    .filter(|(_, recorded_at)| {
+                    .filter(|(_, dispatched_at)| {
                         crate::operations::route_attempt::hop_had_budget_share(
                             attempt_started,
-                            *recorded_at,
+                            *dispatched_at,
                             attempt_resolved,
                         )
                     })
@@ -957,7 +959,7 @@ mod tests {
     /// #5657 L2: the attempt's hop is read BEFORE the pending-slot release
     /// await, and never re-read after it. A loopback `record_hop` landing
     /// during that await must not be blamed for a timeout that fired before
-    /// the request left.
+    /// the relay forwarded the request.
     #[test]
     fn attempt_hop_is_read_before_the_release_await() {
         use crate::operations::route_attempt::driver_test_support::production_fn_body;

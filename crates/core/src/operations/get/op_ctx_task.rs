@@ -660,7 +660,7 @@ async fn drive_client_get_inner(
             // loopback relay serving its own copy) contacted no peer. A failed
             // delivery gets no router label here: a stream that never arrived
             // was labelled against its hop by `drive_get_with_assembly_retry`,
-            // and a local store/validation failure after an inline Found is not
+            // and a local store failure after an inline Found is not
             // the peer's doing.
             let hop_credit = match driver.recorder.mode() {
                 LabelMode::Current if host_result.is_ok() => {
@@ -1223,8 +1223,10 @@ pub(crate) enum StreamFailure {
 }
 
 /// Whether a failed stream claim or assembly is attributed to the peer the
-/// stream was claimed from (#5657): the one classification the GET client,
-/// the GET relay and the assembly test hook share.
+/// stream was claimed from (#5657): the one classification the GET client
+/// (claim and assembly), the GET relay's claim arm and the assembly test hook
+/// share. The relay's failures after a successful claim (assembling for the
+/// loopback delivery or for its own copy) label nothing, as before #5657.
 ///
 /// Every assembly failure is attributed, as before #5657. A stream is
 /// cancelled when the connection it arrives on closes, from either side, or
@@ -3958,8 +3960,8 @@ where
                 // owns the retry decision.
                 return Err(err);
             }
-            // Re-stamp now the request has left: time this node spent waiting
-            // to dispatch is not the hop's share of the attempt (#5657).
+            // The local dispatch has returned: stamp it; the hop's share of
+            // the attempt is counted from here (#5657).
             op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
             // Exit driver: client driver owns the response handling.
             return Ok(());
@@ -9555,9 +9557,16 @@ mod route_attempt_driver_tests {
         });
         // The dispatch waits 40 s for the channel.
         tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        let (_, dispatched) = slot
+            .hop_record()
+            .expect("the hop is recorded before the dispatch");
         assert!(
-            slot.hop_record().is_some(),
-            "the hop is recorded before the dispatch"
+            dispatched.is_none(),
+            "while the local dispatch is blocked the hop has no dispatch time"
+        );
+        assert!(
+            !hop_had_budget_share(start, dispatched, start + crate::config::OPERATION_TTL),
+            "a timeout during the stall blames nobody"
         );
         tokio::spawn(async move {
             let mut held = Vec::new();
@@ -9569,15 +9578,118 @@ mod route_attempt_driver_tests {
             .await
             .expect("relay task")
             .expect("the loopback dispatch succeeds");
-        let (_, stamped) = slot.hop_record().expect("the hop is still recorded");
+        let (_, dispatched) = slot.hop_record().expect("the hop is still recorded");
+        let dispatched = dispatched.expect("the returned dispatch stamps the hop");
         assert!(
-            stamped >= start + std::time::Duration::from_secs(40),
+            dispatched >= start + std::time::Duration::from_secs(40),
             "the hop must be stamped when its dispatch returned, not before it waited"
         );
         assert!(
-            !hop_had_budget_share(start, stamped, start + crate::config::OPERATION_TTL),
+            !hop_had_budget_share(
+                start,
+                Some(dispatched),
+                start + crate::config::OPERATION_TTL
+            ),
             "a hop reached 40 s into a 60 s attempt did not have half of it"
         );
+    }
+
+    /// An attempt whose loopback relay's local dispatch had not returned when
+    /// it timed out blames nobody (#5657); the same timeout after a returned
+    /// dispatch blames the hop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timeout_while_the_dispatch_is_blocked_blames_nobody() {
+        for (label, dispatched) in [
+            ("get-dispatch-returned", true),
+            ("get-dispatch-blocked", false),
+        ] {
+            let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
+            let instance_id = ContractInstanceId::new([78u8; 32]);
+            let hop = peers[1].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| {
+                    if i > 0 {
+                        return Step {
+                            hop: None,
+                            answer: Answer::Reply(not_found(msg, instance_id)),
+                        };
+                    }
+                    if dispatched {
+                        Step {
+                            hop: Some(hop.clone()),
+                            answer: Answer::Never,
+                        }
+                    } else {
+                        Step {
+                            hop: None,
+                            answer: Answer::NeverDispatched(hop.clone()),
+                        }
+                    }
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let _outcome = run(&op_manager, client_tx, &mut driver).await;
+            drop(driver);
+            let expected = if dispatched {
+                vec![addr(&peers[1])]
+            } else {
+                vec![]
+            };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
+    }
+
+    /// The relay's claim arm uses the shared classification (#5657): a claim
+    /// that times out labels the consulted host; a claim whose waiter this
+    /// node dropped labels nobody.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_claim_failures_follow_the_shared_classification() {
+        for (label, drop_waiter, blamed) in [
+            ("get-relay-claim-timeout", false, true),
+            ("get-relay-claim-waiter-dropped", true, false),
+        ] {
+            let (op_manager, rx, _store, upstream, greedy, host, _guards) =
+                relay_fixture(label, true).await;
+            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+            let stream_id = StreamId::next_operations();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, target| {
+                    let answer = if !is_request(msg) {
+                        Answer::DropWaiter
+                    } else if target == Some(greedy_addr) {
+                        Answer::Reply(not_found(msg, instance_id))
+                    } else if target == Some(host_addr) {
+                        // A header whose stream never arrives.
+                        Answer::Reply(streaming_header(msg, instance_id, stream_id, 64))
+                    } else {
+                        Answer::Never
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            let relay_manager = op_manager.clone();
+            let relay = tokio::spawn(async move { run_relay(&relay_manager, &upstream).await });
+            if drop_waiter {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                assert_eq!(
+                    op_manager.orphan_stream_registry().waiter_count(),
+                    1,
+                    "{label}: the relay is waiting on its claim"
+                );
+                op_manager.orphan_stream_registry().drop_waiters();
+            }
+            relay.await.expect("relay task");
+            let expected = if blamed { vec![host_addr] } else { vec![] };
+            assert_eq!(failed_addrs(&op_manager), expected, "{label}");
+        }
     }
 
     /// Relay scenario shared by the relay tests: the relay's greedy candidate
