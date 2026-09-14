@@ -2127,10 +2127,11 @@ mod recoverability {
     /// window was maintained with `pav_regression`'s approximate
     /// `add_points` / `remove_points`, which corrupted the fit between refits and
     /// inflated the untargeted error to `sd ~ 0.13`, capping `captured` near
-    /// 0.45. With the fit exact the floor is sd 0.084, the implied ceiling is
-    /// 0.768 — just under 0.8, so the floor no longer rules the target out with
-    /// any margin — and the measured score rose from
-    /// 0.055 to 0.270. What now separates the measurement from the target
+    /// 0.45. With the fit exact, and the targeted/untargeted split measured
+    /// rather than assumed, the floor is sd 0.093 and the implied ceiling is
+    /// 0.714 on the mean over seeds but 0.58-0.85 per seed: the floor rules the
+    /// target out on the mean, with no margin, and on one seed not at all. The
+    /// measured score rose from 0.055 to 0.270. What now separates the measurement from the target
     /// is mostly the correction, not the base. The 0.8 question is back open on
     /// #4485.
     ///
@@ -2287,7 +2288,8 @@ mod recoverability {
     /// meant the 0.8 question should be reopened. #5658 made the base fit exact
     /// and the floor dropped from sd 0.129 to sd 0.084, so the question is
     /// reopened (on #4485). The ceiling the floor implies moved from ~0.45 to
-    /// 0.768.
+    /// 0.768 with the split assumed, and is 0.714 on the mean over seeds
+    /// (0.58-0.85 per seed) with it measured, as below.
     ///
     /// # What is asserted now, and why these thresholds
     ///
@@ -2295,40 +2297,68 @@ mod recoverability {
     /// tuned to the measurement:
     ///
     /// - `ceiling < 0.8`: the base floor alone still rules out the published
-    ///   target. It does so only narrowly (0.768), and the harness is
-    ///   seeded, so this cannot flake run to run; it goes red only if the base
+    ///   target. It does so only on the mean over seeds (0.714; per seed
+    ///   0.58-0.85, so on one seed the floor alone does not rule 0.8 out), and
+    ///   the harness is seeded, so this cannot flake run to run; it goes red only if the base
     ///   improves further, at which point the floor no longer rules 0.8 out and
     ///   the docs saying it does become false.
     /// - `base mse > Var(p*)`: the base is worse than a climatology forecast,
     ///   the premise the targeted-recovery docs rest on ("dig out of someone
-    ///   else's hole"). Measured 0.0316 vs 0.0277.
+    ///   else's hole"). Measured 0.0316 vs 0.0276.
     ///
     /// The ceiling assumes the correction repairs the targeted events completely
-    /// and the untargeted ones not at all, and that the base's error on a
-    /// targeted event is the full 0.55 penalty. It is an estimate of where the
-    /// floor bites, not a bound the correction provably cannot beat.
+    /// and the untargeted ones not at all. The split between the two is
+    /// measured per seed from the harness's own counts (`targeted_scored` of
+    /// `scored`) and the base's own error on the targeted events
+    /// (`targeted_mse_base`). Until round 3 of #5662 both were assumed: a
+    /// fraction of exactly 1/12 and an error of exactly the 0.55² penalty. It is
+    /// an estimate of where the floor bites, not a bound the correction provably
+    /// cannot beat.
     #[test]
     fn the_base_models_own_error_floor_is_what_caps_recovery() {
-        let base_mse = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_base);
-        let var_p_star = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| {
-            r.var_p_star
-        });
+        // Run the harness once per seed and derive everything from those runs,
+        // so every figure below describes the same runs.
+        let runs: Vec<Recovery> = SEEDS
+            .iter()
+            .map(|&seed| run(Model::PeerContract, RECOVERY_BUDGET_EVENTS, seed))
+            .collect();
+        let mean = |f: &dyn Fn(Recovery) -> f64| {
+            runs.iter().map(|&r| f(r)).sum::<f64>() / runs.len() as f64
+        };
+        let base_mse = mean(&|r| r.mse_base);
+        let var_p_star = mean(&|r| r.var_p_star);
 
-        // Share of base error attributable to the targeted events themselves,
-        // which the correction CAN address; the remainder sits on the 91.7% of
-        // events where the base is simply misfitted, which it largely cannot.
-        let targeted_fraction = 1.0 / 12.0;
-        let targeted_contribution = targeted_fraction * 0.55f64.powi(2);
-        let untargeted_error =
-            ((base_mse - targeted_contribution) / (1.0 - targeted_fraction)).max(0.0);
+        // Split the base's error into the targeted events, which the correction
+        // CAN address, and the rest, where the base is simply misfitted and the
+        // correction largely cannot help. Both the targeted share of events and
+        // the base's error on them are measured, not assumed.
+        //
+        // Per seed, so the split uses each run's own counts, then averaged.
+        // With `f` the targeted fraction and `t` the base's targeted error, the
+        // untargeted error is `(mse_base - f·t) / (1 - f)`, and the best
+        // `captured` reachable if every targeted event were predicted perfectly
+        // and every untargeted one kept the base's error is
+        // `1 - (1 - f)·untargeted / Var(p*) = 1 - (mse_base - f·t) / Var(p*)`.
+        let split = |r: Recovery| {
+            let fraction = r.targeted_scored as f64 / r.scored.max(1) as f64;
+            let untargeted =
+                ((r.mse_base - fraction * r.targeted_mse_base) / (1.0 - fraction)).max(0.0);
+            let ceiling = 1.0 - (1.0 - fraction) * untargeted / r.var_p_star;
+            (fraction, r.targeted_mse_base, untargeted, ceiling)
+        };
+        let targeted_fraction = mean(&|r| split(r).0);
+        let targeted_error = mean(&|r| split(r).1);
+        let untargeted_error = mean(&|r| split(r).2);
         let untargeted_sd = untargeted_error.sqrt();
-        // Best `captured` reachable if every targeted event were predicted
-        // perfectly and every untargeted one kept the base's error.
-        let ceiling = 1.0 - (1.0 - targeted_fraction) * untargeted_error / var_p_star;
+        let ceilings: Vec<f64> = runs.iter().map(|&r| split(r).3).collect();
+        let ceiling = ceilings.iter().sum::<f64>() / ceilings.len() as f64;
 
         eprintln!(
             "#4485 base error floor: base mse {base_mse:.5}, Var(p*) {var_p_star:.5}, \
-             untargeted sd {untargeted_sd:.3}, implied captured ceiling {ceiling:.3}"
+             targeted fraction {targeted_fraction:.4}, base targeted mse \
+             {targeted_error:.4} (sd {:.3}), untargeted sd {untargeted_sd:.3}, \
+             implied captured ceiling {ceiling:.3} (per seed {ceilings:.3?})",
+            targeted_error.sqrt()
         );
 
         assert!(
@@ -2349,7 +2379,7 @@ mod recoverability {
     /// The no-regression gate: where there is no peer×contract structure, the
     /// correction must not make the estimate materially worse.
     ///
-    /// # The bound, derived before measuring
+    /// # The reference scale, derived before measuring
     ///
     /// Squared error against `p*` is exactly the excess Brier score over the
     /// Bayes floor `B = E[p*(1 - p*)]`, so `mse_corrected - mse_base` is the
@@ -2357,15 +2387,22 @@ mod recoverability {
     /// it can add is estimation noise. A kernel mean of residuals with evidence
     /// mass `n_eff` has variance at most `B / n_eff` (kernel weights are <= 1,
     /// and a residual `y - base` has variance about `B`), and shrinkage scales it
-    /// by `λ² = (n / (n + κ))²`. The added error is therefore at most
-    /// `B·n / (n + κ)²`, which peaks at `n = κ` at `B / (4κ)`. The selector picks
-    /// `κ` by prequential loss, so it should do no worse than its most
-    /// conservative candidate, `κ_max = 32`: `B / (4·κ_max) = B / 128`, about
-    /// 0.0014 here. That is the bound, applied to the WORST seed, because a mean
-    /// hides the one scenario that regresses.
+    /// by `λ² = (n / (n + κ))²`. For a FIXED `κ` the added error is therefore at
+    /// most `B·n / (n + κ)²`, which peaks at `n = κ` at `B / (4κ)`.
     ///
-    /// Selection noise can in principle push a seed past it; that would be a
-    /// real finding about the selector, not a threshold to relax.
+    /// That bounds one candidate, not the selector. The selector picks among 7
+    /// values of `κ` and 6 bandwidths by prequential loss, and nothing here
+    /// proves its choice does as well as its most conservative candidate,
+    /// `κ_max = 32`. So `B / (4·κ_max) = B / 128`, about 0.0014 here, is a
+    /// reference scale for "noise of the size shrinkage should allow", chosen
+    /// before measuring, not a proof that the correction stays under it. It is
+    /// applied to the WORST seed, because a mean hides the one scenario that
+    /// regresses.
+    ///
+    /// A seed past it means the selector let in more noise than its most
+    /// conservative candidate would have. That is worth investigating before
+    /// moving the threshold, but it is an empirical question about selection,
+    /// not a contradiction of anything proved here.
     ///
     /// # Why it replaced `mean(mse_corrected / mse_base) <= 1.05` (#5658)
     ///
@@ -2400,9 +2437,10 @@ mod recoverability {
         );
         assert!(
             worst <= 1.0,
-            "with nothing to learn the correction must not add more error than its \
-             most conservative shrinkage candidate is bounded to, B/(4*kappa_max); \
-             per seed as a fraction of that bound: {per_seed:.3?}"
+            "with nothing to learn the correction added more error than the \
+             reference scale B/(4*kappa_max), the bound for its most conservative \
+             shrinkage candidate. Investigate what the selector chose before moving \
+             the threshold; per seed as a fraction of that scale: {per_seed:.3?}"
         );
     }
 
