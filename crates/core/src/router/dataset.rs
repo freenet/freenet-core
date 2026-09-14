@@ -162,6 +162,11 @@ pub(crate) struct FailureForecasts {
     pub n_eff: Option<f64>,
     /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
     pub hierarchical: Option<f64>,
+    /// FLOORED AT 1 ms: every `log_response_time_*` field is `ln(max(t, 0.001))`,
+    /// while routing acts on the unfloored value and `time_to_response_start_s`
+    /// is recorded raw. Floor `time_to_response_start_s` the same way before any
+    /// log-scale scoring against these, or a 0 s outcome becomes `-inf`.
+    ///
     /// `ln(seconds)` to response start the legacy stack would act on (including
     /// the residual correction when that flag is on), forecast for every event
     /// whether or not it turns out to be timed, so timing can be scored offline
@@ -621,6 +626,18 @@ pub(crate) fn global() -> Option<&'static RoutingDataset> {
 #[cfg(test)]
 pub(crate) fn global() -> Option<&'static RoutingDataset> {
     None
+}
+
+/// Whether `FREENET_ROUTING_DATASET` is set, so a missing recorder means it
+/// failed to open rather than was never asked for.
+#[cfg(not(test))]
+pub(crate) fn configured() -> bool {
+    std::env::var_os(DATASET_PATH_ENV).is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn configured() -> bool {
+    false
 }
 
 /// Read a recording once the asynchronous writer has produced what `want`

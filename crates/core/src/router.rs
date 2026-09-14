@@ -1063,6 +1063,10 @@ pub(crate) struct RouterSnapshotInfo {
     /// write error), which is why the estimator is not being computed.
     #[serde(default)]
     pub routing_dataset_stopped: bool,
+    /// `FREENET_ROUTING_DATASET` is set but the recorder could not be opened
+    /// (see the node log), so there is no recorder to compute for.
+    #[serde(default)]
+    pub routing_dataset_open_failed: bool,
     /// Timed successes whose response time was floored to 1 ms before the log.
     #[serde(default)]
     pub hierarchical_floored_response_times: u64,
@@ -1075,9 +1079,18 @@ pub(crate) struct RouterSnapshotInfo {
     /// clipped to 10x that event's own outcome (1 ms floor) and the mean
     /// exponentially forgotten over 24 estimator hours. `response_time_scored`
     /// counts events ever scored; `response_time_weight` is the forgotten
-    /// weight behind the current means, which is what a verdict needs. This measures CALIBRATION of the absolute estimate, not the
-    /// candidate ranking routing uses; see the promotion gate in
-    /// `.claude/rules/ring.md` for how it is meant to be read.
+    /// weight behind the current means as of the snapshot's own time, which is
+    /// what a verdict needs. This measures CALIBRATION of the absolute
+    /// estimate, not the candidate ranking routing uses; see the promotion gate
+    /// in `.claude/rules/ring.md` for how it is meant to be read.
+    ///
+    /// The clip is ONE-SIDED in practice: forecasts are non-negative, so an
+    /// under-forecast's error is at most the outcome and is never clipped, and
+    /// only over-forecasts are trimmed. Under heavy-tailed outcomes that favours
+    /// the higher forecaster (on lognormal outcomes at sigma 1.5, 20% of events
+    /// clip at the mean forecast, and the clipped-error minimiser is 1.3x the
+    /// mean). These live figures are dashboard evidence only; offline gate (a)
+    /// uses the dataset's unclipped values.
     #[serde(default)]
     pub response_time_rmse_secs_legacy: Option<f64>,
     #[serde(default)]
@@ -1089,7 +1102,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// The same for transfer time, `payload bytes / forecast speed`, over real
     /// payload transfers. Not a like-for-like contest: the hierarchical model
     /// targets `E[bytes / V]` while legacy estimates `bytes / E[V]`, so wherever
-    /// speeds vary the hierarchical model is favoured by Jensen's inequality.
+    /// speeds vary the hierarchical model is favoured by Jensen's inequality. The
+    /// one-sided clip (above) compounds that: it favours the higher forecast,
+    /// and `E[bytes / V]` is the higher of the two.
     #[serde(default)]
     pub transfer_time_rmse_secs_legacy: Option<f64>,
     #[serde(default)]
@@ -2660,18 +2675,11 @@ impl Router {
             queries,
             residual_correction_enabled(),
         );
-        // Availability as `predict_routing_outcome` treats it: a stage the
-        // isotonic estimator cannot estimate is unknown to the cost formula.
-        LegacyTimingForecast {
-            // Zero is kept, as routing keeps it (`corrected >= 0.0`); the
-            // scoring floors both models' times alike rather than dropping it.
-            time_to_response_start_secs: time_estimate
-                .map(|_| legacy.time_to_response_start)
-                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0),
-            transfer_speed_bps: transfer_estimate
-                .map(|_| legacy.xfer_speed)
-                .filter(|speed| speed.is_finite() && *speed > 0.0),
-        }
+        LegacyTimingForecast::acted_on(
+            time_estimate.is_some(),
+            transfer_estimate.is_some(),
+            &legacy,
+        )
     }
 
     fn predict_routing_outcome(
@@ -2964,6 +2972,7 @@ impl Router {
     fn snapshot_with(&self, dataset: Option<&dataset::RoutingDataset>) -> RouterSnapshotInfo {
         let shrinkage = self.renegade_predictor.shrinkage_diagnostics();
         let hierarchical = self.hierarchical.diagnostics();
+        let estimator_hours = self.estimator_clock.hours();
         RouterSnapshotInfo {
             network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
@@ -3262,16 +3271,17 @@ impl Router {
             hierarchical_computed: hierarchical_computed(dataset),
             hierarchical_failure_active: hierarchical[0].active,
             routing_dataset_stopped: dataset.is_some_and(|dataset| !dataset.is_recording()),
+            routing_dataset_open_failed: dataset.is_none() && dataset::configured(),
             hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
             hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
             response_time_rmse_secs_legacy: self.response_time_error.rmse().map(|(l, _)| l),
             response_time_rmse_secs_hierarchical: self.response_time_error.rmse().map(|(_, h)| h),
             response_time_scored: self.response_time_error.count,
-            response_time_weight: self.response_time_error.weight,
+            response_time_weight: self.response_time_error.weight_at(estimator_hours),
             transfer_time_rmse_secs_legacy: self.transfer_time_error.rmse().map(|(l, _)| l),
             transfer_time_rmse_secs_hierarchical: self.transfer_time_error.rmse().map(|(_, h)| h),
             transfer_time_scored: self.transfer_time_error.count,
-            transfer_time_weight: self.transfer_time_error.weight,
+            transfer_time_weight: self.transfer_time_error.weight_at(estimator_hours),
             hierarchical_response_time_log_shape: hierarchical[1].into(),
             hierarchical_transfer_speed_log_shape: hierarchical[2].into(),
             failure_brier_blended: self.failure_skill_blended.brier(),
@@ -3349,6 +3359,26 @@ struct LegacyQueries {
 struct LegacyTimingForecast {
     time_to_response_start_secs: Option<f64>,
     transfer_speed_bps: Option<f64>,
+}
+
+impl LegacyTimingForecast {
+    /// The timing and speed routing would act on, given which isotonic stages
+    /// can estimate (a stage that cannot is unknown to the cost formula, as in
+    /// `predict_routing_outcome`).
+    fn acted_on(
+        time_available: bool,
+        transfer_available: bool,
+        legacy: &LegacyStageEstimates,
+    ) -> Self {
+        LegacyTimingForecast {
+            // Zero is kept, as routing keeps it (`corrected >= 0.0`); the
+            // scoring floors both models' times alike rather than dropping it.
+            time_to_response_start_secs: Some(legacy.time_to_response_start)
+                .filter(|seconds| time_available && seconds.is_finite() && *seconds >= 0.0),
+            transfer_speed_bps: Some(legacy.xfer_speed)
+                .filter(|speed| transfer_available && speed.is_finite() && *speed > 0.0),
+        }
+    }
 }
 
 /// The timing measurements an event carries.
@@ -3446,6 +3476,21 @@ impl PairedErrorTracker {
             self.last_hours
                 .map_or(now_hours, |then| then.max(now_hours)),
         );
+    }
+
+    /// The forgotten weight as of `now_hours`, not as of the last scored event.
+    ///
+    /// The stored sums decay only when an event is recorded, so after a quiet
+    /// or failure-only stretch the stored weight would still read as recent.
+    /// The means need no such correction: decay scales both sums and the
+    /// weight alike, so it cancels in [`Self::rmse`].
+    fn weight_at(&self, now_hours: f64) -> f64 {
+        match self.last_hours {
+            Some(then) if now_hours.is_finite() => {
+                self.weight * (-(now_hours - then).max(0.0) / ERROR_FORGETTING_HOURS).exp()
+            }
+            _ => self.weight,
+        }
     }
 
     /// `(legacy, hierarchical)` RMS error in seconds.
@@ -3995,6 +4040,63 @@ mod tests {
             tracker.weight < 2_000.0 && tracker.weight > 100.0,
             "the verdict's weight is forgotten, not the lifetime count: {}",
             tracker.weight
+        );
+    }
+
+    /// The published weight decays to the snapshot's own time: after 48 quiet
+    /// hours, 500 events scored before them are not "recent" evidence.
+    #[test]
+    fn published_seconds_error_weight_decays_at_read_time() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let clock = SharedMockTimeSource::new();
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(clock.clone()));
+        for _ in 0..500 {
+            router.response_time_error.record(0.1, 0.1, 0.1, 0.0);
+            router.transfer_time_error.record(0.1, 0.1, 0.1, 0.0);
+        }
+        let fresh = router.snapshot();
+        assert!(fresh.response_time_weight >= MIN_WEIGHT_FOR_VERDICT);
+        clock.advance_time(Duration::from_secs(48 * 3600));
+        let stale = router.snapshot();
+        assert!(
+            stale.response_time_weight < MIN_WEIGHT_FOR_VERDICT
+                && stale.transfer_time_weight < MIN_WEIGHT_FOR_VERDICT,
+            "48 quiet hours must leave too little recent weight for a verdict: {} / {}",
+            stale.response_time_weight,
+            stale.transfer_time_weight
+        );
+        assert_eq!(
+            stale.response_time_rmse_secs_legacy, fresh.response_time_rmse_secs_legacy,
+            "read-time decay changes the weight, not the means"
+        );
+    }
+
+    /// Routing acts on a 0 s legacy response-time estimate (the correction's
+    /// `corrected >= 0.0`), so the timing comparison must receive it rather than
+    /// filter it out. The isotonic path floors its estimates above zero, so the
+    /// filter is pinned directly on the acted-on values.
+    #[test]
+    fn legacy_timing_forecast_keeps_a_zero_second_estimate() {
+        let legacy = LegacyStageEstimates {
+            failure: 0.1,
+            renegade_failure_adjustment: None,
+            time_to_response_start: 0.0,
+            xfer_speed: 0.0,
+        };
+        let forecast = LegacyTimingForecast::acted_on(true, true, &legacy);
+        assert_eq!(
+            forecast.time_to_response_start_secs,
+            Some(0.0),
+            "a 0 s estimate is one routing acts on and must be kept"
+        );
+        assert_eq!(
+            forecast.transfer_speed_bps, None,
+            "a zero speed is not a speed"
+        );
+        assert_eq!(
+            LegacyTimingForecast::acted_on(false, true, &legacy).time_to_response_start_secs,
+            None,
+            "an unavailable stage is unknown, not zero"
         );
     }
 

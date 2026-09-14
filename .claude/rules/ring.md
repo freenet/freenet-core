@@ -235,10 +235,14 @@ labels) is deployed:
       the other model would have chosen would have fared is unobserved.
       Offline ranking evaluation would need a per-decision candidate log
       with exploration (future work).
-  (b) ON-FIELD A/B between gateways over the same window: gateway-2 with
-      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, comparing
-      GET success rate, latency, and chosen-peer failure rate from the nodes'
-      telemetry.
+  (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
+      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
+      which gateway has the flag halfway through the window. The two gateways
+      differ in connection population (address age, bootstrap-list position),
+      so a one-gateway-per-arm comparison is confounded by gateway identity;
+      compare WITHIN-gateway differences (flag on vs off on the same gateway)
+      in GET success rate, latency, and chosen-peer failure rate from the
+      nodes' telemetry.
 Live instruments behind (a):
   - hierarchical_* failure skill (same events as the legacy layers)
   - response_time_rmse_secs_* / transfer_time_rmse_secs_* (paired, each error
@@ -246,7 +250,12 @@ Live instruments behind (a):
     "insufficient recent data" below forgotten weight 100). On transfer they
     are not like-for-like: hierarchical targets E[bytes/V], legacy
     bytes/E[V], so wherever speeds vary Jensen's inequality favours
-    hierarchical by construction.
+    hierarchical by construction. The clip is also ONE-SIDED: forecasts are
+    non-negative, so only over-forecasts are ever trimmed, which under
+    heavy-tailed outcomes favours the higher forecaster (lognormal sigma 1.5:
+    20% of events clip at the mean forecast; the clipped-error minimiser is
+    1.3x the mean) and compounds the Jensen advantage. Gate (a) uses the
+    dataset's UNCLIPPED values and is unaffected.
   - hierarchical_*_log_shape (the lognormal assumption behind E[T])
 REPLAY CAVEAT: dataset forecasts are recorded at completion time on the
 estimator state then; routing acts on an estimate only once

@@ -45,6 +45,11 @@ const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARC
 const RECORDER_STOPPED_EMPTY: &str = "&mdash; not computed (the routing dataset recorder stopped \
      before the estimator saw any event)";
 
+/// What the hierarchical rows show when `FREENET_ROUTING_DATASET` is set but
+/// the recorder could not be opened.
+const RECORDER_OPEN_FAILED: &str =
+    "&mdash; not computed (the routing dataset could not be opened; see the node log)";
+
 /// Whether the hierarchical readings are live, frozen, or absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Computation {
@@ -58,6 +63,8 @@ enum Computation {
     Never,
     /// A recorder was configured but stopped before any event was learned.
     RecorderStoppedEmpty,
+    /// `FREENET_ROUTING_DATASET` is set but the recorder failed to open.
+    RecorderOpenFailed,
 }
 
 impl Computation {
@@ -68,6 +75,8 @@ impl Computation {
             Computation::Frozen
         } else if rs.routing_dataset_stopped {
             Computation::RecorderStoppedEmpty
+        } else if rs.routing_dataset_open_failed {
+            Computation::RecorderOpenFailed
         } else {
             Computation::Never
         }
@@ -81,6 +90,7 @@ fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> St
         Computation::Frozen => format!("frozen when computation stopped: {}", live()),
         Computation::Never => NOT_COMPUTED.to_string(),
         Computation::RecorderStoppedEmpty => RECORDER_STOPPED_EMPTY.to_string(),
+        Computation::RecorderOpenFailed => RECORDER_OPEN_FAILED.to_string(),
     }
 }
 
@@ -422,6 +432,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 match state {
                     Computation::Live => " &mdash; measured, not applied",
                     Computation::Frozen | Computation::RecorderStoppedEmpty => " &mdash; stopped",
+                    Computation::RecorderOpenFailed => " &mdash; recorder failed to open",
                     Computation::Never => " &mdash; off",
                 }
             },
@@ -952,6 +963,8 @@ mod tests {
         assert!(stopped.contains("stopped") && !stopped.contains("set FREENET_ROUTING_DATASET"));
         let never = hierarchical_reading(Computation::Never, || "x".to_string());
         assert!(never.contains("FREENET_ROUTING_DATASET"));
+        let failed = hierarchical_reading(Computation::RecorderOpenFailed, || "x".to_string());
+        assert!(failed.contains("could not be opened") && !failed.contains("set FREENET"));
     }
 
     #[test]
