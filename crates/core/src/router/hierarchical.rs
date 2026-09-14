@@ -1051,6 +1051,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let incoming = self.fresh.len();
         if incoming > 0 {
             let filler = self.fresh[0];
+            // Exact, so the window's allocation tops out at its bound instead of
+            // the next power of two (16k slots for a 10k window).
+            self.sorted.reserve_exact(incoming);
             self.sorted.resize(existing + incoming, filler);
             let (mut i, mut j, mut write) = (existing, incoming, existing + incoming);
             while j > 0 {
@@ -1081,6 +1084,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let mut orphaned = 0;
         let mut cursor = 0;
         self.prepared.clear();
+        self.prepared.reserve_exact(self.sorted.len());
         for event in &self.sorted {
             let Some(value) = curve.value_sorted(event.distance, &mut cursor) else {
                 continue;

@@ -554,6 +554,14 @@ fn window_stays_bounded_and_sorted() {
     seqs.sort_unstable();
     let expected: Vec<u64> = (total - capacity as u64..total).collect();
     assert_eq!(seqs, expected, "window must hold exactly the newest events");
+    assert!(
+        stage.sorted.capacity() <= capacity + REFIT_EVERY
+            && stage.prepared.capacity() <= capacity + REFIT_EVERY,
+        "the window's allocation must stay at its bound, not round up: sorted {}, \
+         prepared {}",
+        stage.sorted.capacity(),
+        stage.prepared.capacity()
+    );
 }
 
 /// Peers churn: the table is bounded, newcomers are admitted by evicting the
@@ -900,7 +908,12 @@ fn routing_estimate_cost_per_candidate() {
     let per_candidate = start.elapsed() / queries as u32;
     eprintln!(
         "#4485 hierarchical estimate (3 stages, PeerKeyLocation keys): \
-         {per_candidate:?} per candidate"
+         {per_candidate:?} per candidate; sizes: Event {} B, Prepared {} B, \
+         PeerNode {} B, PeerKeyLocation {} B",
+        std::mem::size_of::<Event>(),
+        std::mem::size_of::<Prepared>(),
+        std::mem::size_of::<PeerNode>(),
+        std::mem::size_of::<PeerKeyLocation>(),
     );
     assert_eq!(
         available, queries,
