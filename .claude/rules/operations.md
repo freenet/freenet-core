@@ -90,6 +90,11 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     arrived, a client GET whose delivery failed) via
     `Ring::report_route_failure_to_peer_health`, or health-based eviction can
     never fire.
+  → Every router label carries its routing-dataset source (#5648): the
+    recorder passes its `AttemptOrigin` to the sink, and relay-observed
+    events (recorder relay labels, legacy relay `SuccessUntimed`,
+    `record_relay_route_event`) must reach `Router::add_relay_event`, never
+    `add_event`. `Ring::record_route_event_router_only` takes the source.
   → Chain blame is accepted for router-only labels: an originator timeout is
     labelled against the first hop although the stall may be further down
     the chain. Watch it with the `timeout_label_*` router-snapshot histogram.

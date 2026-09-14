@@ -7949,8 +7949,9 @@ mod route_attempt_driver_tests {
     use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
         Answer, Step, failed_addrs, failure_window, op_manager_with_peers,
-        op_manager_with_peers_and_store, serve_attempts,
+        op_manager_with_peers_and_store, recorded_sources, serve_attempts,
     };
+    use crate::router::dataset::RouteSource;
     use std::sync::atomic::Ordering;
 
     fn not_found(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
@@ -8093,6 +8094,12 @@ mod route_attempt_driver_tests {
         drop(driver);
         assert_eq!(failed_addrs(&op_manager).len(), 1, "labelled once");
         assert_eq!(op_manager.attempt_hop_registry().len(), 0);
+        let sources = recorded_sources(&op_manager);
+        assert_eq!(
+            sources,
+            vec![(Some(addr(&peers[2])), RouteSource::Originator)],
+            "a client GET's labels are originator observations"
+        );
     }
 
     /// A timed-out attempt and an attempt whose connection to ITS hop dropped
@@ -8887,6 +8894,16 @@ mod route_attempt_driver_tests {
                 vec![]
             };
             assert_eq!(failure_window(&op_manager), expected, "{label}");
+            let expected_sources = if case == 2 {
+                vec![(Some(greedy_addr), RouteSource::Relay)]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                recorded_sources(&op_manager),
+                expected_sources,
+                "{label}: a relay's labels are relay observations"
+            );
         }
     }
 
@@ -8929,6 +8946,14 @@ mod route_attempt_driver_tests {
                 failure_window(&op_manager),
                 vec![(Some(greedy_addr), greedy_label), (Some(host_addr), 0.0)],
                 "{mode:?}"
+            );
+            assert_eq!(
+                recorded_sources(&op_manager),
+                vec![
+                    (Some(greedy_addr), RouteSource::Relay),
+                    (Some(host_addr), RouteSource::Relay),
+                ],
+                "{mode:?}: relay labels are relay observations in both modes"
             );
         }
     }

@@ -115,21 +115,68 @@ pub struct ConfigArgs {
 
     /// Budget in bytes for hosted contract state. Once it is exceeded,
     /// contracts are evicted (least valuable first) and their on-disk state is
-    /// reclaimed. This counts contract state only; WASM code blobs and database
-    /// overhead are extra. Default: 1 GiB.
+    /// reclaimed. This counts contract state only, which is kept on disk (only
+    /// memory-bounded caches of it are held in RAM); WASM code blobs and
+    /// database overhead are extra. Default: one eighth of the memory available
+    /// to the node (system RAM, or the cgroup limit if lower), clamped to
+    /// 128 MiB - 1 GiB.
+    ///
+    /// Set it higher to contribute more disk to the network, but keep it a
+    /// few GiB BELOW the disk budget. The disk budget is the smaller of
+    /// `--hosting-disk-pct` of the space available to Freenet (Freenet's own
+    /// usage plus free space) and `--max-hosting-disk` (default 32 GiB), and it
+    /// counts WASM code and the compile cache (up to about 512 MiB) as well as
+    /// state, so the headroom is for those. If this value is not at least that
+    /// far below the disk budget, the node can stop accepting new contracts
+    /// and state growth instead of evicting to make room. For example, with
+    /// 40 GiB available and default settings the disk budget is
+    /// min(0.5 x 40 GiB, 32 GiB) = 20 GiB, so set this to about 17 GiB; on a
+    /// larger disk the 32 GiB cap binds unless `--max-hosting-disk` is raised
+    /// too. Allow more headroom if the node hosts many contracts with distinct
+    /// code, since WASM grows with those. The number of contracts hosted is
+    /// limited separately by available memory, so raising this does not make a
+    /// node take on more contracts than its memory can hold.
+    // Internal: the explicit value is passed to `HostingManager` unclamped;
+    // only the DEFAULT is RAM-scaled. (One exception: a config.toml value of
+    // exactly 1 GiB is the legacy flat-default sentinel and re-derives from RAM,
+    // see `ConfigArgs::build`; a CLI or env value of 1 GiB still wins.) The
+    // resident-overhead (contract-count) budget derives from
+    // `budget_for_ram(total_ram)`, not from this value, so an override cannot
+    // move it. Pinned by `explicit_state_budget_above_ram_clamp_survives_recompute`.
+    //
+    // The "keep this below the disk budget" advice exists because eviction
+    // compares STATE bytes against `min(this, disk_budget)` while the admission
+    // gates (`admit_state_write` / `admit_state_update` / `admit_wasm_write`)
+    // refuse against `disk_budget` using state + WASM + compile cache. Whenever
+    // this value is within (WASM + compile cache) of disk_budget, or above it,
+    // there is a band — state in (disk_budget - WASM - cache, min(this,
+    // disk_budget)] — where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
+    // `--max-hosting-disk` flag, because `disk_budget = min(pct * (freenet_used
+    // + free), cap)`: an operator giving "half the disk" at the default pct hits
+    // the band via the pct term no matter how high the cap is set.
+    // That mismatch is a code gap (#5652); until it is fixed the help text must
+    // steer operators away from it.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
-    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (`used +
-    /// free` on the data-dir mount) used to size the disk budget. Hosting
-    /// eviction uses whichever budget is smaller, memory or disk. Default: 0.5.
+    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (Freenet's
+    /// own usage plus the free space on the data-dir mount) used to size the
+    /// disk budget. The disk budget bounds contract state, WASM code and the
+    /// compile cache together (database overhead is extra), and also caps
+    /// `--max-hosting-storage`, which should be kept a few GiB below it.
+    /// Default: 0.5.
     // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
     #[arg(long, env = "HOSTING_DISK_PCT")]
     pub hosting_disk_pct: Option<f64>,
 
     /// Upper limit in bytes on the disk budget, so a host with a very large
-    /// data disk does not get an unbounded budget. This is the disk equivalent
-    /// of `--max-hosting-storage`. Default: 32 GiB.
+    /// data disk does not get an unbounded budget. It bounds contract state,
+    /// WASM code and the compile cache together (database overhead is extra).
+    /// To contribute more than about 32 GiB of state, raise this so the disk
+    /// budget stays a few GiB above `--max-hosting-storage`. Raising it has no
+    /// effect if `--hosting-disk-pct` of the available disk space is already the
+    /// smaller limit; raise that instead, leaving room for database overhead
+    /// and anything else on the disk. Default: 32 GiB.
     // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,

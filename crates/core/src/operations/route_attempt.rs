@@ -194,19 +194,41 @@ impl Drop for LabelModeGuard {
 /// tests substitute a recording sink. `cause` is what the recorder was told
 /// about the attempt; it is counted, not trained on.
 pub(crate) trait RouteFailureSink: Send + Sync {
-    fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure);
+    /// `origin` tags the event `Originator` or `Relay` in the routing
+    /// dataset (#5648).
+    fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure, origin: AttemptOrigin);
     /// A non-failure event under [`LabelMode::Legacy`] (a relay's downstream
-    /// `NotFound` labelled `SuccessUntimed`). Router only.
+    /// `NotFound` labelled `SuccessUntimed`). Router only; always a relay
+    /// observation.
     fn record_legacy_route_event(&self, event: RouteEvent);
 }
 
+impl AttemptOrigin {
+    /// The routing-dataset tag for events this origin records.
+    pub(crate) fn route_source(self) -> crate::router::dataset::RouteSource {
+        match self {
+            AttemptOrigin::Originator => crate::router::dataset::RouteSource::Originator,
+            AttemptOrigin::Relay => crate::router::dataset::RouteSource::Relay,
+        }
+    }
+}
+
 impl RouteFailureSink for crate::ring::Ring {
-    fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
-        crate::ring::Ring::record_route_failure(self, event, cause);
+    fn record_route_failure(
+        &self,
+        event: RouteEvent,
+        cause: AttemptFailure,
+        origin: AttemptOrigin,
+    ) {
+        crate::ring::Ring::record_route_failure(self, event, cause, origin.route_source());
     }
 
     fn record_legacy_route_event(&self, event: RouteEvent) {
-        crate::ring::Ring::record_route_event_router_only(self, event);
+        crate::ring::Ring::record_route_event_router_only(
+            self,
+            event,
+            crate::router::dataset::RouteSource::Relay,
+        );
     }
 }
 
@@ -395,6 +417,7 @@ impl RouteAttemptRecorder {
                 op_type: Some(self.op_type),
             },
             cause,
+            self.origin,
         );
     }
 }
@@ -742,6 +765,14 @@ pub(crate) mod driver_test_support {
         op_manager.ring.router.read().failure_window_for_test()
     }
 
+    /// `(peer address, routing-dataset source)` of every event the node's
+    /// router ingested, in order.
+    pub(crate) fn recorded_sources(
+        op_manager: &OpManager,
+    ) -> Vec<(Option<SocketAddr>, crate::router::dataset::RouteSource)> {
+        op_manager.ring.router.read().recorded_sources_for_test()
+    }
+
     /// Addresses blamed with a Failure, in order.
     pub(crate) fn failed_addrs(op_manager: &OpManager) -> Vec<SocketAddr> {
         failure_window(op_manager)
@@ -762,13 +793,18 @@ mod tests {
     /// Records what the recorder asked of the sink.
     #[derive(Default)]
     struct VecSink {
-        failures: Mutex<Vec<(RouteEvent, AttemptFailure)>>,
+        failures: Mutex<Vec<(RouteEvent, AttemptFailure, AttemptOrigin)>>,
         legacy: Mutex<Vec<RouteEvent>>,
     }
 
     impl RouteFailureSink for VecSink {
-        fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
-            self.failures.lock().push((event, cause));
+        fn record_route_failure(
+            &self,
+            event: RouteEvent,
+            cause: AttemptFailure,
+            origin: AttemptOrigin,
+        ) {
+            self.failures.lock().push((event, cause, origin));
         }
         fn record_legacy_route_event(&self, event: RouteEvent) {
             self.legacy.lock().push(event);
@@ -780,14 +816,14 @@ mod tests {
             self.failures
                 .lock()
                 .iter()
-                .map(|(e, _)| {
+                .map(|(e, _, _)| {
                     assert!(matches!(e.outcome, RouteOutcome::Failure));
                     e.peer.socket_addr().expect("test peers have addresses")
                 })
                 .collect()
         }
         fn causes(&self) -> Vec<AttemptFailure> {
-            self.failures.lock().iter().map(|(_, c)| *c).collect()
+            self.failures.lock().iter().map(|(_, c, _)| *c).collect()
         }
         fn legacy_successes(&self) -> Vec<std::net::SocketAddr> {
             self.legacy
@@ -894,6 +930,32 @@ mod tests {
             sink.causes(),
             vec![AttemptFailure::Timeout, AttemptFailure::SendFailure]
         );
+    }
+
+    /// Every failure carries the recorder's origin to the sink, which is what
+    /// tags it `originator` or `relay` in the routing dataset (#5648).
+    #[test]
+    fn failures_carry_the_recorder_origin() {
+        use crate::router::dataset::RouteSource;
+        for (origin, source) in [
+            (AttemptOrigin::Originator, RouteSource::Originator),
+            (AttemptOrigin::Relay, RouteSource::Relay),
+        ] {
+            assert_eq!(origin.route_source(), source);
+            let sink = Arc::new(VecSink::default());
+            let mut rec = recorder_with(
+                &sink,
+                origin,
+                AmbiguousNotFoundPolicy::Untrained,
+                LabelMode::Current,
+            );
+            rec.record_attempt(Some(&peer(1)), AttemptFailure::Timeout, true);
+            rec.record_attempt(Some(&peer(2)), AttemptFailure::NotFound, true);
+            rec.contract_exists();
+            drop(rec);
+            let origins: Vec<_> = sink.failures.lock().iter().map(|(_, _, o)| *o).collect();
+            assert_eq!(origins, vec![origin, origin], "{origin:?}");
+        }
     }
 
     #[test]

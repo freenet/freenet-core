@@ -1,3 +1,4 @@
+pub(crate) mod dataset;
 mod isotonic_estimator;
 mod residual;
 mod routing_predictor;
@@ -581,6 +582,44 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
+    /// Resident-overhead pressure axis (#5325), populated by `Ring` from the
+    /// `HostingManager` on the snapshot cadence. This is the SECOND, independent
+    /// eviction pressure: `hosting_budget_bytes` / `hosting_current_bytes` above
+    /// bound contract STATE bytes only, while this axis bounds the per-contract
+    /// resident bookkeeping that scales with hosted-contract COUNT, and either
+    /// can trigger a sweep on its own. Without these four, a node evicting
+    /// purely under slot pressure looks idle in telemetry — its state-byte
+    /// occupancy can sit at 13% while `hosting_resident_overhead_evictions_total`
+    /// climbs, which is exactly the confusion the fleet audit hit.
+    ///
+    /// `hosting_resident_overhead_budget_bytes` is the RAM-scaled ceiling;
+    /// `hosting_estimated_resident_overhead_bytes` is `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Treat that pair as a
+    /// contract-COUNT ceiling wearing memory units, NOT as measured RAM: the
+    /// "used" side is a count multiplied by a flat estimate, so a collector that
+    /// renders it as memory will mislead (the node's own dashboard renders
+    /// `hosting_contract_slot_budget` — the same budget expressed as the slot
+    /// count it really bounds — for that reason).
+    /// `hosting_resident_overhead_evictions_total` is a monotonic counter the
+    /// collector differences to get a slot-pressure eviction rate; it may overlap
+    /// with `hosting_budget_evictions_total`. `None` until the ring is built.
+    /// Per-node aggregate scalars.
+    ///
+    /// The budget is ALSO a moving target, which matters more to a collector than
+    /// to this node. `ring::hosting::cache::resident_overhead_budget_for` derives
+    /// it as a structural RESIDUAL (total RAM, less the baseline reservation, less
+    /// every declared cache ceiling, less the state-byte budget) and then mins it
+    /// against live memory signals, recomputed every 60s sweep — a known
+    /// limitation, #5334, deferred pending exactly this telemetry. So
+    /// `estimated / budget` graphed as a utilization ratio has a NON-STATIONARY
+    /// DENOMINATOR that moves with unrelated system memory pressure: a rise in
+    /// that ratio does not by itself mean the node took on more contracts. Graph
+    /// the numerator and denominator separately before reading a trend into the
+    /// ratio.
+    pub hosting_resident_overhead_budget_bytes: Option<u64>,
+    pub hosting_estimated_resident_overhead_bytes: Option<u64>,
+    pub hosting_contract_slot_budget: Option<u64>,
+    pub hosting_resident_overhead_evictions_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -1096,6 +1135,11 @@ pub(crate) struct Router {
     /// windowed. See [`RouteOutcomeTotals`].
     #[serde(skip)]
     outcome_totals: RouteOutcomeTotals,
+    /// Test-only: `(peer address, source)` of every ingested event, so driver
+    /// tests can assert which dataset tag an outcome was recorded under.
+    #[cfg(test)]
+    #[serde(skip)]
+    recorded_sources: Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)>,
 }
 
 /// Cumulative success / failure counts of the route events this router has
@@ -1151,6 +1195,8 @@ impl Clone for Router {
             failure_skill_corrected: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
             outcome_totals: self.outcome_totals,
+            #[cfg(test)]
+            recorded_sources: self.recorded_sources.clone(),
         }
     }
 }
@@ -1588,6 +1634,8 @@ impl Router {
             failure_skill_corrected: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
             outcome_totals: RouteOutcomeTotals::default(),
+            #[cfg(test)]
+            recorded_sources: Vec::new(),
         }
     }
 
@@ -1598,8 +1646,31 @@ impl Router {
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Originator, dataset::global());
+    }
+
+    /// [`Self::add_event`] for an outcome observed by a relay hop about its
+    /// downstream peer. Identical for the model; distinguished only in the
+    /// routing dataset, because relays record outcomes under their own
+    /// conventions (see `record_relay_route_event`).
+    pub(crate) fn add_relay_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Relay, dataset::global());
+    }
+
+    /// [`Self::add_event`], recording the event into `dataset` when one is
+    /// given. Split out so tests can supply a recorder without the
+    /// process-wide environment switch.
+    fn add_event_recording(
+        &mut self,
+        event: RouteEvent,
+        source: dataset::RouteSource,
+        dataset: Option<&dataset::RoutingDataset>,
+    ) {
         let was_below_threshold = !self.has_sufficient_routing_events();
         let op_type = event.op_type;
+        #[cfg(test)]
+        self.recorded_sources
+            .push((event.peer.socket_addr(), source));
         match event.outcome {
             RouteOutcome::Failure => self.outcome_totals.failures += 1,
             RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => {
@@ -1620,11 +1691,14 @@ impl Router {
         // right now — before the isotonic estimators below ingest this event.
         let residuals =
             self.stage_residuals(&event.peer, event.contract_location, &renegade_outcome);
-        self.score_failure_layers(
+        let forecasts = self.score_failure_layers(
             &event.peer,
             event.contract_location,
             if renegade_outcome.success { 0.0 } else { 1.0 },
         );
+        if let Some(dataset) = dataset.filter(|dataset| dataset.is_recording()) {
+            dataset.record_route(self.route_record(&event, source, forecasts));
+        }
         self.renegade_predictor.record(
             &event.peer,
             event.contract_location,
@@ -1749,6 +1823,13 @@ impl Router {
     /// estimator's rolling window, in insertion order (`1.0` = failure,
     /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
     /// route event blamed.
+    #[cfg(test)]
+    pub(crate) fn recorded_sources_for_test(
+        &self,
+    ) -> Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)> {
+        self.recorded_sources.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn failure_window_for_test(&self) -> Vec<(Option<std::net::SocketAddr>, f64)> {
         self.failure_estimator
@@ -1907,6 +1988,48 @@ impl Router {
         }
     }
 
+    /// The dataset record for one event, built from the state the forecasts
+    /// were made in — i.e. before the event is ingested.
+    fn route_record(
+        &self,
+        event: &RouteEvent,
+        source: dataset::RouteSource,
+        forecasts: Option<dataset::FailureForecasts>,
+    ) -> dataset::RouteRecord {
+        let (outcome, time_to_response_start_s, payload_bytes, payload_transfer_s) =
+            match &event.outcome {
+                RouteOutcome::Success {
+                    time_to_response_start,
+                    payload_size,
+                    payload_transfer_time,
+                } => (
+                    "success",
+                    Some(time_to_response_start.as_secs_f64()),
+                    Some(*payload_size),
+                    Some(payload_transfer_time.as_secs_f64()),
+                ),
+                RouteOutcome::SuccessUntimed => ("success_untimed", None, None, None),
+                RouteOutcome::Failure => ("failure", None, None, None),
+            };
+        let peer_location = event.peer.location();
+        dataset::RouteRecord {
+            t_ms: dataset::now_ms(),
+            source,
+            peer: dataset::peer_hash(&event.peer),
+            peer_location: peer_location.map(|location| location.as_f64()),
+            contract_location: event.contract_location.as_f64(),
+            distance: peer_location
+                .map(|location| event.contract_location.distance(location).as_f64()),
+            op: event.op_type.map(|op| op.as_str()),
+            outcome,
+            time_to_response_start_s,
+            payload_bytes,
+            payload_transfer_s,
+            prior_failure_events: self.failure_estimator.len(),
+            forecasts,
+        }
+    }
+
     /// Score every failure-prediction layer against what actually happened.
     ///
     /// MUST be called before the isotonic estimators ingest the event, for the
@@ -1917,14 +2040,14 @@ impl Router {
         peer: &PeerKeyLocation,
         contract_location: Location,
         actual_failure: f64,
-    ) {
+    ) -> Option<dataset::FailureForecasts> {
         let (Ok(global), Ok(adjusted)) = (
             self.failure_estimator
                 .estimate_global(peer, contract_location),
             self.failure_estimator
                 .estimate_retrieval_time(peer, contract_location),
         ) else {
-            return;
+            return None;
         };
         let global = global.clamp(0.0, 1.0);
         let adjusted = adjusted.clamp(0.0, 1.0);
@@ -1963,6 +2086,15 @@ impl Router {
         self.failure_skill_blended.record(blended, actual_failure);
         self.failure_skill_corrected
             .record(corrected, actual_failure);
+
+        Some(dataset::FailureForecasts {
+            global,
+            adjusted,
+            blended,
+            corrected,
+            lambda: corrections.failure.map(|correction| correction.lambda),
+            n_eff: corrections.failure.map(|correction| correction.n_eff),
+        })
     }
 
     fn predict_routing_outcome(
@@ -2407,6 +2539,10 @@ impl Router {
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
+            hosting_resident_overhead_budget_bytes: None,
+            hosting_estimated_resident_overhead_bytes: None,
+            hosting_contract_slot_budget: None,
+            hosting_resident_overhead_evictions_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,
@@ -2779,6 +2915,127 @@ mod tests {
                 op_type: Some(OpType::Get),
             });
         }
+    }
+
+    /// The routing dataset exists to let predictors be replayed and compared
+    /// offline, so a record is only useful if its forecasts are the ones made
+    /// BEFORE the outcome was ingested — a forecast that has already seen its own
+    /// outcome would make every layer look better than it is.
+    #[test]
+    fn dataset_records_pre_ingestion_forecasts_and_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let recorder = dataset::RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+
+        let mut router = Router::new(&[]);
+        // A key of its own: `PeerKeyLocation::random()` reuses one key per
+        // thread, which would make the peer-hash assertion below vacuous.
+        let peer = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.10:31337".parse().unwrap(),
+        );
+        let contract = Location::new(0.5);
+
+        // Cold: nothing to forecast with yet, which the record must say rather
+        // than inventing numbers.
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Put),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+
+        add_relay_recorded_successes(&mut router, 120);
+        for _ in 0..30 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let expected_global = router
+            .failure_estimator
+            .estimate_global(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let expected_adjusted = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let events_before = router.failure_estimator.len();
+
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(250),
+                    payload_size: 4096,
+                    payload_transfer_time: Duration::from_millis(125),
+                },
+                op_type: Some(OpType::Get),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+        let adjusted_after = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        assert_ne!(
+            adjusted_after, expected_adjusted,
+            "sanity: ingesting the success must move the peer's estimate, or this \
+             test cannot tell pre- from post-ingestion forecasts"
+        );
+        drop(recorder);
+
+        let lines = dataset::lines_eventually(&path, |lines| {
+            lines.iter().filter(|line| line["kind"] == "route").count() == 2
+        });
+        let routes: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "route")
+            .collect();
+
+        let cold = routes[0];
+        assert_eq!(cold["outcome"], "failure");
+        assert_eq!(cold["op"], "PUT");
+        assert_eq!(cold["prior_failure_events"], 0);
+        assert!(
+            cold["forecasts"].is_null(),
+            "a cold router forecasts nothing: {cold}"
+        );
+
+        let warm = routes[1];
+        assert_eq!(warm["peer"], dataset::peer_hash(&peer));
+        assert_eq!(warm["source"], "originator");
+        let expected_distance = contract.distance(peer.location().unwrap()).as_f64();
+        assert!((warm["distance"].as_f64().unwrap() - expected_distance).abs() < 1e-12);
+        assert_eq!(warm["contract_location"], 0.5);
+        assert_eq!(warm["outcome"], "success");
+        assert_eq!(warm["time_to_response_start_s"], 0.25);
+        assert_eq!(warm["payload_bytes"], 4096);
+        assert_eq!(warm["payload_transfer_s"], 0.125);
+        assert_eq!(warm["prior_failure_events"], events_before);
+        // Within 1e-12, not bit-exact: serde_json's default float parser does not
+        // guarantee a lossless round trip, and which values it misses by an ulp
+        // depends on the randomly drawn peers.
+        let recorded = |field: &str| warm["forecasts"][field].as_f64().unwrap();
+        assert!((recorded("global") - expected_global).abs() < 1e-12);
+        assert!(
+            (recorded("adjusted") - expected_adjusted).abs() < 1e-12,
+            "the recorded forecast must be the pre-ingestion one: recorded {}, \
+             pre-ingestion {expected_adjusted}, post-ingestion {adjusted_after}",
+            recorded("adjusted")
+        );
     }
 
     #[test]
