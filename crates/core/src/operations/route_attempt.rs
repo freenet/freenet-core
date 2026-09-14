@@ -34,12 +34,11 @@
 //! whose delivery failed) are kept separately; see
 //! [`crate::ring::Ring::report_route_outcome_to_health`].
 //!
-//! Existence proof requires state that passed validation: state for the
-//! requested contract, from a peer this operation contacted, that this node
-//! then stored (the executor accepted it, or it equals this node's own
-//! validated copy). A reply whose state has not passed validation, this
-//! node's own copy, a local completion or later evidence proves nothing. A
-//! SUBSCRIBE carries no state, so it never has existence proof.
+//! Existence proof requires state this node stored: state for the requested
+//! contract, from a peer this operation contacted, that this node's store
+//! accepted or already held. This node's own copy, a local completion or
+//! later evidence proves nothing. A SUBSCRIBE reply carries no state, so a
+//! SUBSCRIBE never has existence proof and its `NotFound`s are never trained.
 //!
 //! `FREENET_ROUTING_LEGACY_LABELS=1` restores the pre-#5657 labels exactly
 //! ([`label_mode`]).
@@ -243,8 +242,8 @@ impl RouteFailureSink for crate::ring::Ring {
 }
 
 /// The reply-side condition for existence proof for this operation's routing
-/// labels; callers also require that the reply's state passed validation
-/// (see the module docs).
+/// labels; callers also require that this node stored the reply's state (see
+/// the module docs).
 pub(crate) fn is_existence_proof(
     requested: &ContractInstanceId,
     key: &freenet_stdlib::prelude::ContractKey,
@@ -431,10 +430,10 @@ impl RouteAttemptRecorder {
     }
 
     /// Evidence from THIS operation that the contract exists: state from a
-    /// REMOTE peer this operation actually contacted that then passed
-    /// validation here (see the module docs). A local copy or a local
-    /// completion is not proof (the copy may be stale or held by this node
-    /// alone). Every pending `NotFound` in this operation
+    /// REMOTE peer this operation actually contacted that this node then
+    /// stored (see the module docs). A local copy or a local completion is
+    /// not proof (the copy may be stale or held by this node alone). Every
+    /// pending `NotFound` in this operation
     /// is then a genuine routing failure; later ones are labelled immediately.
     /// Idempotent. Has no effect under [`LabelMode::Legacy`], which never
     /// holds pending `NotFound`s and never reads the flag.
@@ -529,6 +528,21 @@ impl AttemptHopRegistry {
         }
     }
 
+    /// Re-stamp the recorded hop's time to now, keeping its peer. The loopback
+    /// relay calls it once its dispatch has returned, so time this node spent
+    /// waiting to dispatch does not count as the hop's share of the attempt
+    /// (#5657). A no-op when no hop is recorded.
+    pub(crate) fn touch_hop(&self, tx: &Transaction) {
+        if let Some((_, recorded_at)) = self
+            .slots
+            .get_mut(tx)
+            .as_deref_mut()
+            .and_then(Option::as_mut)
+        {
+            *recorded_at = tokio::time::Instant::now();
+        }
+    }
+
     /// Undo [`record_hop`](Self::record_hop) when the dispatch failed locally,
     /// so the attempt is not blamed on a peer that never saw the request.
     pub(crate) fn clear_hop(&self, tx: &Transaction) {
@@ -574,8 +588,8 @@ impl Drop for AttemptHopGuard {
 
 /// The smallest share of an attempt's elapsed time the recorded hop must have
 /// had for the attempt's timeout to be blamed on it (#5657). The loopback relay
-/// records the hop when it forwards, which on an overloaded originator can be
-/// late in the attempt: a hop forwarded to at 59 s of a 60 s budget did not
+/// stamps the hop once its dispatch returns, which on an overloaded originator
+/// can be late in the attempt: a hop forwarded to at 59 s of a 60 s budget did not
 /// stall the attempt, the originator did. At one half, a hop is blamed when it
 /// had at least as long as the originator took to reach it.
 pub(crate) const MIN_HOP_SHARE_FOR_TIMEOUT_BLAME: f64 = 0.5;
@@ -590,8 +604,7 @@ pub(crate) fn hop_had_budget_share(
 ) -> bool {
     let attempt = timed_out_at.saturating_duration_since(attempt_started);
     let hop = timed_out_at.saturating_duration_since(hop_recorded_at);
-    attempt.is_zero()
-        || hop.as_secs_f64() >= attempt.as_secs_f64() * MIN_HOP_SHARE_FOR_TIMEOUT_BLAME
+    hop.as_secs_f64() >= attempt.as_secs_f64() * MIN_HOP_SHARE_FOR_TIMEOUT_BLAME
 }
 
 /// Shared harness for the per-op driver tests: a real `OpManager` whose event
@@ -677,8 +690,8 @@ pub(crate) mod driver_test_support {
         REJECTIONS.get_or_init(dashmap::DashSet::new)
     }
 
-    /// Make the stub contract handler of the test node built with `id` reject
-    /// every store, as an executor does for state that fails validation.
+    /// Make the stub contract handler of the test node built with `id` refuse
+    /// every store, answering as an executor that refuses the state.
     pub(crate) fn reject_stores(id: &str) {
         store_rejections().insert(id.to_string());
     }
@@ -766,12 +779,29 @@ pub(crate) mod driver_test_support {
     /// [`op_manager_with_peers`] plus a stub contract handler: a `GetQuery` is
     /// answered from the returned [`LocalStore`], every other event is dropped
     /// unanswered (the caller sees a handler error).
-    // The stub contract handler answers two events and leaves every other
-    // variant unanswered on purpose, so its wildcard arm is the point.
-    #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) async fn op_manager_with_peers_and_store(
         id: &str,
         peers: usize,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Vec<PeerKeyLocation>,
+        Box<dyn std::any::Any>,
+        LocalStore,
+    ) {
+        op_manager_with_peers_and_store_on(id, peers, None).await
+    }
+
+    /// [`op_manager_with_peers_and_store`], with the event-loop channels
+    /// sized `channel_capacity` (`None`: the default). A small capacity lets
+    /// a test hold a dispatch up.
+    // The stub contract handler answers two events and leaves every other
+    // variant unanswered on purpose, so its wildcard arm is the point.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub(crate) async fn op_manager_with_peers_and_store_on(
+        id: &str,
+        peers: usize,
+        channel_capacity: Option<usize>,
     ) -> (
         Arc<OpManager>,
         tokio::sync::mpsc::Receiver<OpExecutionPayload>,
@@ -788,7 +818,10 @@ pub(crate) mod driver_test_support {
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
-        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (notification_rx, notification_tx) = match channel_capacity {
+            Some(capacity) => crate::node::event_loop_notification_channel_with_capacity(capacity),
+            None => crate::node::event_loop_notification_channel(),
+        };
         let crate::node::EventLoopNotificationsReceiver {
             notifications_receiver,
             op_execution_receiver,
@@ -815,25 +848,32 @@ pub(crate) mod driver_test_support {
                         };
                         let _answered = ch_channel.send_to_sender(id, response).await;
                     }
-                    // A store carrying contract code passes validation unless
-                    // the test rejects this node's stores; a rejected store, or
-                    // one without code, gets no answer, which the caller sees as
-                    // a failed store.
+                    // A store carrying contract code is accepted, unless the
+                    // test made this node refuse stores: then it is answered
+                    // the way an executor refusing the state answers.
                     ContractHandlerEvent::PutQuery {
                         key,
                         state,
                         contract: Some(_),
                         ..
-                    } if !rejects_stores(&node_id) => {
-                        *handler_store.lock() = Some((key, state.clone()));
+                    } => {
+                        let refused = rejects_stores(&node_id);
+                        let new_value = if refused {
+                            Err(crate::contract::ExecutorError::other(anyhow::anyhow!(
+                                "store refused by the test"
+                            )))
+                        } else {
+                            *handler_store.lock() = Some((key, state.clone()));
+                            Ok(state)
+                        };
                         let response = ContractHandlerEvent::PutResponse {
-                            new_value: Ok(state),
-                            state_changed: true,
+                            new_value,
+                            state_changed: !refused,
                         };
                         let _answered = ch_channel.send_to_sender(id, response).await;
                     }
-                    // Every other event (and a refused store) is deliberately
-                    // left unanswered, whatever its variant.
+                    // Every other event is deliberately left unanswered,
+                    // whatever its variant.
                     _ => ch_channel.drop_waiting_response(id),
                 }
             }
@@ -949,18 +989,6 @@ pub(crate) mod driver_test_support {
             }
         });
         served
-    }
-
-    /// `source` with every `//` comment removed, whole-line and trailing, so a
-    /// source pin is satisfied neither by a comment nor by commented-out code.
-    /// Naive: a `//` inside a string literal also ends the line, so do not
-    /// anchor a pin on such a literal.
-    pub(crate) fn strip_comments(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// The body of the PRODUCTION function whose signature starts with
@@ -1450,9 +1478,24 @@ mod tests {
             start + Duration::from_secs(59),
             end
         ));
-        assert!(
-            hop_had_budget_share(start, start, start),
-            "a zero-length attempt keeps its hop's blame"
-        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touch_hop_restamps_only_a_recorded_hop() {
+        let registry = Arc::new(AttemptHopRegistry::new());
+        let tx = Transaction::new::<GetMsg>();
+        let a = peer(1);
+        registry.touch_hop(&tx);
+        assert_eq!(registry.len(), 0, "touch never inserts a slot");
+        let guard = registry.register(tx);
+        registry.touch_hop(&tx);
+        assert!(guard.hop_record().is_none(), "no hop to re-stamp");
+        registry.record_hop(&tx, &a);
+        let (_, recorded) = guard.hop_record().expect("hop recorded");
+        tokio::time::advance(std::time::Duration::from_secs(40)).await;
+        registry.touch_hop(&tx);
+        let (hop, touched) = guard.hop_record().expect("hop kept");
+        assert_eq!(addr(&hop), addr(&a), "the peer is kept");
+        assert_eq!(touched - recorded, std::time::Duration::from_secs(40));
     }
 }

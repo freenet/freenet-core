@@ -2250,6 +2250,9 @@ where
                 )
                 .await;
             }
+            // Re-stamp now the request has left (the payload follows): time this
+            // node spent waiting to dispatch is not the hop's share (#5657).
+            op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
             // Originator loopback: the retry-loop task (Task A) registered a
             // stream-progress handle keyed by `incoming_tx` before sending. We
             // (Task B) look it up and thread it into the transport so each
@@ -2320,6 +2323,8 @@ where
                 )
                 .await;
             }
+            // Re-stamp now the request has left (#5657).
+            op_manager.attempt_hop_registry().touch_hop(&incoming_tx);
         }
         // Originator is awaiting the Response on its own callback —
         // exit the driver here. No bubble-up, no release_pending_op_slot
@@ -8253,5 +8258,23 @@ mod route_attempt_driver_tests {
             failures, clears,
             "every local dispatch failure in the loopback branch must clear the hop"
         );
+        // Both loopback dispatches (the streaming metadata and the plain
+        // forward) re-stamp the hop once they return (#5657).
+        let code = crate::contract::source_pin_util::strip_comments(&body[loopback..loopback_end]);
+        let touches: Vec<usize> = code
+            .match_indices(".touch_hop(&incoming_tx);")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(touches.len(), 2, "one re-stamp per loopback dispatch");
+        for at in touches {
+            let dispatch = code[..at]
+                .rfind("send_fire_and_forget(next_addr")
+                .expect("a re-stamp follows a dispatch");
+            assert!(
+                code[dispatch..at].contains("return relay_put_finalize_local("),
+                "the re-stamp follows the dispatch's failure arm, so it runs only \
+                 once the dispatch has returned successfully"
+            );
+        }
     }
 }
