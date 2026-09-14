@@ -883,18 +883,8 @@ impl RoutingPredictor {
         self.transfer_speed_residual_stage.train();
     }
 
-    /// Kernel-weighted, shrunk corrections for each stage at the current time.
-    pub(crate) fn predict_corrections(
-        &self,
-        peer: &PeerKeyLocation,
-        contract_location: Location,
-        distance: f64,
-        modes: StageModes,
-    ) -> RoutingCorrections {
-        let time = wall_clock_hours() - self.reference_time_hours;
-        self.predict_corrections_at_time(peer, contract_location, distance, modes, time)
-    }
-
+    /// Kernel-weighted, shrunk corrections for each stage at predictor time
+    /// `time` (see [`Self::time_at`]).
     pub(crate) fn predict_corrections_at_time(
         &self,
         peer: &PeerKeyLocation,
@@ -903,6 +893,8 @@ impl RoutingPredictor {
         modes: StageModes,
         time: f64,
     ) -> RoutingCorrections {
+        #[cfg(test)]
+        count_query();
         let query = self.make_observation_immutable(peer, contract_location, distance, time);
         RoutingCorrections {
             failure: shrink(
@@ -946,19 +938,8 @@ impl RoutingPredictor {
         }
     }
 
-    /// Predict routing outcomes (immutable — training happens during record()).
-    pub fn predict(
-        &self,
-        peer: &PeerKeyLocation,
-        contract_location: Location,
-        distance: f64,
-    ) -> RoutingPredictionResult {
-        let time = wall_clock_hours() - self.reference_time_hours;
-        self.predict_at_time(peer, contract_location, distance, time)
-    }
-
-    /// Predictor time for a wall-clock reading in hours since the epoch, i.e.
-    /// exactly what [`Self::predict`] computes from the current clock.
+    /// Predictor time for a wall-clock reading in hours since the epoch. Every
+    /// query takes its time from this, so a caller reads the clock once.
     pub(crate) fn time_at(&self, wall_clock_hours: f64) -> f64 {
         wall_clock_hours - self.reference_time_hours
     }
@@ -971,6 +952,8 @@ impl RoutingPredictor {
         distance: f64,
         time: f64,
     ) -> RoutingPredictionResult {
+        #[cfg(test)]
+        count_query();
         let query = self.make_observation_immutable(peer, contract_location, distance, time);
 
         RoutingPredictionResult {
@@ -1118,6 +1101,24 @@ impl RoutingPredictor {
             id
         }
     }
+}
+
+// Test-only count of prediction and correction queries on this thread, so the
+// router can prove it does not repeat per-event k-NN work.
+#[cfg(test)]
+thread_local! {
+    static QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_query() {
+    QUERIES.with(|count| count.set(count.get() + 1));
+}
+
+/// Prediction and correction queries run on this thread so far.
+#[cfg(test)]
+pub(crate) fn queries_on_this_thread() -> u64 {
+    QUERIES.with(|count| count.get())
 }
 
 /// Wall-clock time in hours since epoch. Used for the time feature.

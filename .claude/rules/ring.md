@@ -225,13 +225,23 @@ WHEN touching either stack:
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
 
-PROMOTION GATE: flipping the default needs field data from a gateway soak
-collected AFTER #5653 (failure labels) is live, showing the hierarchical
-layer's prequential skill (dashboard / routing dataset) at least matching
-legacy for failure, and not worse in SECONDS for timing and transfer (the
-snapshot's response_time_rmse_secs_* / transfer_time_rmse_secs_*, scored on
-the values each model would route on), with the lognormality check
-(hierarchical_*_log_shape) not contradicting expectation timing.
+PROMOTION GATE: flipping the default is decided OFFLINE on the routing
+dataset, collected after #5653 (failure labels) is live: the hierarchical
+failure forecast's Brier score against legacy's, and the outcomes of the
+peers each model would have chosen, on real traffic. The live instruments
+are supporting evidence, not the gate:
+  - hierarchical_* failure skill (same events as the legacy layers)
+  - response_time_rmse_secs_* / transfer_time_rmse_secs_* (paired, clipped to
+    10x the largest outcome, forgotten over 24h; "insufficient data" below
+    100 events). These measure CALIBRATION of the absolute estimate, not the
+    candidate RANKING routing uses. On transfer they are not like-for-like:
+    hierarchical targets E[bytes/V], legacy bytes/E[V], so wherever speeds
+    vary Jensen's inequality favours hierarchical by construction.
+  - hierarchical_*_log_shape (the lognormal assumption behind E[T])
+REPLAY CAVEAT: dataset forecasts are recorded at completion time on the
+estimator state then; routing acts on an estimate only once
+has_sufficient_routing_events() holds and the flag is on. Filter offline
+analysis on prior_failure_events accordingly.
 
 REMOVAL PLAN: once promoted, a separate PR deletes Renegade, the per-peer
 EWMA adjustment path, the fixed blend and the residual correction. Do not

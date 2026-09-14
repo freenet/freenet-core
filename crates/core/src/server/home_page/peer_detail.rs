@@ -33,11 +33,45 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
-/// What the hierarchical rows show when the estimator is not being computed
-/// now, so an empty reading is not mistaken for a model with nothing to say,
-/// and a count frozen when computation stopped (a routing dataset that hit its
-/// byte cap) is not mistaken for a live one.
-const NOT_COMPUTED: &str = "&mdash; not computed now (set FREENET_ROUTING_HIERARCHICAL, or      record FREENET_ROUTING_DATASET; readings stop when the recorder does)";
+/// What the hierarchical rows show when the estimator has never been computed
+/// in this process, so an empty reading is not mistaken for a model with
+/// nothing to say.
+const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARCHICAL, or set \
+     FREENET_ROUTING_DATASET to record a routing dataset)";
+
+/// Whether the hierarchical readings are live, frozen, or absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Computation {
+    /// Being computed now.
+    Live,
+    /// Computed earlier, stopped since (a routing dataset that hit its byte cap
+    /// or failed to write). The readings are the soak's final numbers: worth
+    /// showing, but never as if they were still moving.
+    Frozen,
+    /// Never computed in this process.
+    Never,
+}
+
+impl Computation {
+    fn of(rs: &crate::router::RouterSnapshotInfo) -> Self {
+        if rs.hierarchical_computed {
+            Computation::Live
+        } else if rs.hierarchical_failure_events > 0 || rs.hierarchical_failure_evaluated > 0 {
+            Computation::Frozen
+        } else {
+            Computation::Never
+        }
+    }
+}
+
+/// Render one hierarchical reading according to whether it is live.
+fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> String {
+    match state {
+        Computation::Live => live(),
+        Computation::Frozen => format!("frozen when computation stopped: {}", live()),
+        Computation::Never => NOT_COMPUTED.to_string(),
+    }
+}
 
 /// The legacy rows' note when the hierarchical estimator routes. "Superseded"
 /// is a node-wide setting, not a per-query fact: a stage whose hierarchical
@@ -45,38 +79,58 @@ const NOT_COMPUTED: &str = "&mdash; not computed now (set FREENET_ROUTING_HIERAR
 const SUPERSEDED_BY_HIERARCHICAL: &str =
     " &mdash; superseded (except where a hierarchical stage is not yet warm)";
 
+/// The blend row's note when the hierarchical estimator routes AND the residual
+/// correction is on: a cold hierarchical stage falls back to the correction, so
+/// the blend is not what the fallback uses either.
+const SUPERSEDED_BY_BOTH: &str = " &mdash; superseded (a cold hierarchical stage falls back to \
+     the correction, not to this blend)";
+
+/// A duration readable at any scale: µs below a millisecond, ms below a second.
+fn fmt_duration_secs(seconds: f64) -> String {
+    if seconds < 1e-3 {
+        format!("{:.0} &micro;s", seconds * 1e6)
+    } else if seconds < 1.0 {
+        format!("{:.1} ms", seconds * 1e3)
+    } else {
+        format!("{seconds:.2} s")
+    }
+}
+
 /// Render both models' RMS error in seconds on the same events.
 ///
 /// This is the instrument for the promotion gate's "not worse in seconds", so
 /// it names which model is ahead rather than leaving two bare numbers.
-fn fmt_seconds_error(
-    computed: bool,
-    legacy: Option<f64>,
-    hierarchical: Option<f64>,
-    scored: u64,
-) -> String {
-    if !computed {
-        return NOT_COMPUTED.to_string();
-    }
+///
+/// Below [`MIN_SCORED_FOR_VERDICT`] events it says so instead of naming a
+/// winner: a handful of timed events settles nothing.
+fn fmt_seconds_error(legacy: Option<f64>, hierarchical: Option<f64>, scored: u64) -> String {
     let (Some(legacy), Some(hierarchical)) = (legacy, hierarchical) else {
         return "&mdash; no event both models forecast yet".to_string();
     };
+    let numbers = format!(
+        "legacy {}, hierarchical {} (n={scored})",
+        fmt_duration_secs(legacy),
+        fmt_duration_secs(hierarchical)
+    );
+    if scored < crate::router::MIN_SCORED_FOR_VERDICT {
+        return format!(
+            "{numbers} &mdash; insufficient data (needs {})",
+            crate::router::MIN_SCORED_FOR_VERDICT
+        );
+    }
     let verdict = if hierarchical <= legacy {
         "hierarchical no worse"
     } else {
         "hierarchical worse"
     };
-    format!("legacy {legacy:.4}, hierarchical {hierarchical:.4} (n={scored}) &mdash; {verdict}")
+    format!("{numbers} &mdash; {verdict}")
 }
 
 /// Render the hierarchical peer-table eviction count against its capacity.
 ///
 /// Evictions mean churn is exceeding the headroom derived from
 /// `max_connections`, which an operator can act on, so a non-zero count says so.
-fn fmt_evictions(computed: bool, evictions: u64, capacity: usize) -> String {
-    if !computed {
-        return NOT_COMPUTED.to_string();
-    }
+fn fmt_evictions(evictions: u64, capacity: usize) -> String {
     if evictions == 0 {
         format!("0 (capacity {capacity} per stage)")
     } else {
@@ -95,10 +149,7 @@ const LOG_SHAPE_WARNING: f64 = 1.0;
 ///
 /// Expectation timing is exact only for normal log residuals, so the reading an
 /// operator needs is whether that holds, said in words, with the numbers.
-fn fmt_log_shape(computed: bool, shape: &crate::router::LogResidualShape) -> String {
-    if !computed {
-        return NOT_COMPUTED.to_string();
-    }
+fn fmt_log_shape(shape: &crate::router::LogResidualShape) -> String {
     let (Some(sigma2), Some(skew), Some(kurtosis)) =
         (shape.sigma2, shape.skewness, shape.excess_kurtosis)
     else {
@@ -229,6 +280,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
     // Build routing model status card
     let model_card = if let Some(ref rs) = router_snapshot {
+        let state = Computation::of(rs);
         let total_events = rs.failure_events + rs.success_events;
         let peer_failure_events = peer_routing
             .as_ref()
@@ -327,7 +379,9 @@ pub fn peer_detail_html(address_str: &str) -> String {
             skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
             skill_blended = fmt_skill(rs.failure_skill_blended),
             skill_corrected = fmt_skill(rs.failure_skill_corrected),
-            blend_note = if rs.hierarchical_routing_enabled {
+            blend_note = if rs.hierarchical_routing_enabled && rs.residual_correction_enabled {
+                SUPERSEDED_BY_BOTH
+            } else if rs.hierarchical_routing_enabled {
                 SUPERSEDED_BY_HIERARCHICAL
             } else if rs.residual_correction_enabled {
                 " &mdash; superseded"
@@ -341,56 +395,45 @@ pub fn peer_detail_html(address_str: &str) -> String {
             } else {
                 " &mdash; measured, not applied"
             },
-            skill_hierarchical = if rs.hierarchical_computed {
-                fmt_skill(rs.failure_skill_hierarchical)
-            } else {
-                NOT_COMPUTED.to_string()
-            },
+            skill_hierarchical =
+                hierarchical_reading(state, || fmt_skill(rs.failure_skill_hierarchical)),
             hierarchical_note = if rs.hierarchical_routing_enabled {
                 " &mdash; in use"
-            } else if rs.hierarchical_computed {
-                " &mdash; measured, not applied"
             } else {
-                " &mdash; off"
+                match state {
+                    Computation::Live => " &mdash; measured, not applied",
+                    Computation::Frozen => " &mdash; stopped",
+                    Computation::Never => " &mdash; off",
+                }
             },
-            shape_response = fmt_log_shape(
-                rs.hierarchical_computed,
-                &rs.hierarchical_response_time_log_shape
-            ),
-            shape_transfer = fmt_log_shape(
-                rs.hierarchical_computed,
-                &rs.hierarchical_transfer_speed_log_shape
-            ),
-            hierarchical_evictions = fmt_evictions(
-                rs.hierarchical_computed,
-                rs.hierarchical_peer_evictions,
-                rs.hierarchical_peer_capacity
-            ),
-            hierarchical_eval = if rs.hierarchical_computed {
-                rs.hierarchical_failure_evaluated.to_string()
-            } else {
-                NOT_COMPUTED.to_string()
-            },
-            timing_error = fmt_seconds_error(
-                rs.hierarchical_computed,
+            shape_response = hierarchical_reading(state, || {
+                fmt_log_shape(&rs.hierarchical_response_time_log_shape)
+            }),
+            shape_transfer = hierarchical_reading(state, || {
+                fmt_log_shape(&rs.hierarchical_transfer_speed_log_shape)
+            }),
+            hierarchical_evictions = hierarchical_reading(state, || {
+                fmt_evictions(
+                    rs.hierarchical_peer_evictions,
+                    rs.hierarchical_peer_capacity,
+                )
+            }),
+            hierarchical_eval =
+                hierarchical_reading(state, || { rs.hierarchical_failure_evaluated.to_string() }),
+            timing_error = hierarchical_reading(state, || fmt_seconds_error(
                 rs.response_time_rmse_secs_legacy,
                 rs.response_time_rmse_secs_hierarchical,
                 rs.response_time_scored
-            ),
-            transfer_error = fmt_seconds_error(
-                rs.hierarchical_computed,
+            )),
+            transfer_error = hierarchical_reading(state, || fmt_seconds_error(
                 rs.transfer_time_rmse_secs_legacy,
                 rs.transfer_time_rmse_secs_hierarchical,
                 rs.transfer_time_scored
-            ),
-            hierarchical_horizon = if rs.hierarchical_computed {
-                fmt_horizon(
-                    rs.hierarchical_failure_events,
-                    rs.hierarchical_failure_horizon_hours,
-                )
-            } else {
-                NOT_COMPUTED.to_string()
-            },
+            )),
+            hierarchical_horizon = hierarchical_reading(state, || fmt_horizon(
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_horizon_hours,
+            )),
             layers_eval = rs.failure_layers_evaluated,
             corr_enabled = if rs.residual_correction_enabled {
                 "Yes"
@@ -786,13 +829,12 @@ mod tests {
 
     #[test]
     fn eviction_rendering_flags_churn_and_says_when_not_computed() {
-        assert_eq!(fmt_evictions(true, 0, 400), "0 (capacity 400 per stage)");
-        let churning = fmt_evictions(true, 12, 400);
+        assert_eq!(fmt_evictions(0, 400), "0 (capacity 400 per stage)");
+        let churning = fmt_evictions(12, 400);
         assert!(
             churning.contains("12") && churning.contains("headroom"),
             "{churning}"
         );
-        assert!(fmt_evictions(false, 0, 400).contains("not computed"));
     }
 
     /// The layer copy must not promise that evidence alone moves the estimate:
@@ -809,19 +851,11 @@ mod tests {
     }
 
     #[test]
-    fn seconds_error_rendering_names_the_verdict_and_hides_frozen_readings() {
-        assert!(
-            fmt_seconds_error(true, Some(0.2), Some(0.1), 40).contains("hierarchical no worse")
-        );
-        assert!(
-            fmt_seconds_error(true, Some(0.2), Some(0.2), 40).contains("hierarchical no worse")
-        );
-        assert!(fmt_seconds_error(true, Some(0.1), Some(0.2), 40).contains("hierarchical worse"));
-        assert!(fmt_seconds_error(true, None, Some(0.2), 0).contains("no event"));
-        assert!(
-            fmt_seconds_error(false, Some(0.1), Some(0.2), 40).contains("not computed"),
-            "a reading frozen when computation stopped must not render as live"
-        );
+    fn seconds_error_rendering_names_the_verdict() {
+        assert!(fmt_seconds_error(Some(0.2), Some(0.1), 400).contains("hierarchical no worse"));
+        assert!(fmt_seconds_error(Some(0.2), Some(0.2), 400).contains("hierarchical no worse"));
+        assert!(fmt_seconds_error(Some(0.1), Some(0.2), 400).contains("hierarchical worse"));
+        assert!(fmt_seconds_error(None, Some(0.2), 0).contains("no event"));
     }
 
     /// Every hierarchical reading in the layer panel must go through the
@@ -849,10 +883,49 @@ mod tests {
                 .find(" = ")
                 .map_or(render.len(), |offset| at + binding.len() + offset);
             assert!(
-                render[at..next].contains("hierarchical_computed"),
-                "{binding} must check rs.hierarchical_computed"
+                render[at..next].contains("hierarchical_reading(state"),
+                "{binding} must render through hierarchical_reading"
             );
         }
+    }
+
+    #[test]
+    fn hierarchical_readings_are_labelled_live_frozen_or_absent() {
+        let live = || "0.123".to_string();
+        assert_eq!(hierarchical_reading(Computation::Live, live), "0.123");
+        let frozen = hierarchical_reading(Computation::Frozen, live);
+        assert!(
+            frozen.contains("frozen") && frozen.contains("0.123"),
+            "a stopped soak's final numbers must stay visible, labelled: {frozen}"
+        );
+        let never = hierarchical_reading(Computation::Never, live);
+        assert!(never.contains("not computed") && !never.contains("0.123"));
+        assert!(
+            !NOT_COMPUTED.contains("  "),
+            "no runs of spaces in the copy"
+        );
+    }
+
+    #[test]
+    fn seconds_error_needs_enough_events_for_a_verdict() {
+        let few = fmt_seconds_error(
+            Some(0.2),
+            Some(0.1),
+            crate::router::MIN_SCORED_FOR_VERDICT - 1,
+        );
+        assert!(
+            few.contains("insufficient data") && !few.contains("no worse"),
+            "{few}"
+        );
+        let enough = fmt_seconds_error(Some(0.2), Some(0.1), crate::router::MIN_SCORED_FOR_VERDICT);
+        assert!(enough.contains("hierarchical no worse"), "{enough}");
+    }
+
+    #[test]
+    fn durations_render_at_a_readable_scale() {
+        assert_eq!(fmt_duration_secs(0.000_42), "420 &micro;s");
+        assert_eq!(fmt_duration_secs(0.042), "42.0 ms");
+        assert_eq!(fmt_duration_secs(4.2), "4.20 s");
     }
 
     #[test]
@@ -864,13 +937,12 @@ mod tests {
             excess_kurtosis: Some(kurtosis),
             events: 400,
         };
-        assert!(fmt_log_shape(true, &shape(0.1, -0.2)).contains("consistent with lognormal"));
-        assert!(fmt_log_shape(true, &shape(0.99, 0.99)).contains("consistent with lognormal"));
-        assert!(fmt_log_shape(true, &shape(1.01, 0.0)).contains("not lognormal"));
-        assert!(fmt_log_shape(true, &shape(0.0, 1.01)).contains("not lognormal"));
-        assert!(fmt_log_shape(true, &shape(-1.5, 0.0)).contains("not lognormal"));
-        assert!(fmt_log_shape(true, &LogResidualShape::default()).contains("not enough data"));
-        assert!(fmt_log_shape(false, &shape(0.0, 0.0)).contains("not computed"));
+        assert!(fmt_log_shape(&shape(0.1, -0.2)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(&shape(0.99, 0.99)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(&shape(1.01, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(&shape(0.0, 1.01)).contains("not lognormal"));
+        assert!(fmt_log_shape(&shape(-1.5, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(&LogResidualShape::default()).contains("not enough data"));
     }
 
     #[test]
