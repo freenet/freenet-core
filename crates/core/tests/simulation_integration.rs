@@ -12060,6 +12060,104 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
     );
 }
 
+/// Retry diversity must not cost a single-host contract its only host.
+///
+/// The one host of a contract sits at the key and is the requester's first
+/// hop. It is crashed (messages silently dropped) when the GET starts and
+/// recovered moments later, so the GET's first attempt times out. GET retries
+/// exclude only peers that answered NotFound from later attempts; a peer that
+/// timed out stays reachable, so the retry reaches the recovered host and the
+/// GET succeeds. Carrying timed-out peers into the attempt's visited bloom
+/// (which travels the whole forward path) would make the only host unreachable
+/// for the rest of the operation and fail this GET.
+#[test_log::test]
+fn test_get_retry_reaches_single_host_after_one_timeout() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x5657_0002_0001;
+    const NETWORK_NAME: &str = "get-retry-single-host-timeout";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0x57);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    // Node 1 is the single host, AT the key; the others are spread out so the
+    // host is every node's closest candidate for the key.
+    let node_locations: Vec<f64> = [0.0, 0.30, 0.45, 0.60, 0.75]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            6,
+            4,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+
+    let host = NodeLabel::node(NETWORK_NAME, 1);
+    let requester = NodeLabel::node(NETWORK_NAME, 3);
+    let operations = vec![
+        ScheduledOperation::new(
+            host.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![5, 6, 5, 7],
+            },
+        ),
+        ScheduledOperation::new(host.clone(), SimOperation::CrashNode),
+        ScheduledOperation::new(
+            requester.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+        // Recovered well inside the first attempt's 60 s deadline: that
+        // attempt's request was already dropped, so it times out, and the
+        // retry must be able to reach the host again.
+        ScheduledOperation::new(host.clone(), SimOperation::RecoverNode),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(400),
+        Duration::from_secs(240),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.is_node_hosting(&host, &contract_key),
+        "the host still holds the seeded contract"
+    );
+    let requester_has_state = result
+        .node_storages
+        .get(&requester)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        requester_has_state,
+        "after one timeout the GET's retry must reach the recovered single host"
+    );
+}
+
 /// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
 ///
 /// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the

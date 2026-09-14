@@ -502,6 +502,16 @@ pub(crate) trait RetryDriver {
     /// driver attribute its terminal success event to the real hop rather than
     /// its own `current_target` guess. Default: ignore.
     fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
+
+    /// Called when an attempt was answered [`AttemptOutcome::Retry`] (a
+    /// `NotFound`), with the peer that attempt was actually forwarded to
+    /// (`None` when none was recorded), before `advance()`. A `NotFound` is a
+    /// deterministic dead end for this operation, so a driver whose loopback
+    /// relay picks the wire hop may exclude that peer from later attempts.
+    /// Timeouts and disconnects are deliberately NOT reported here: excluding
+    /// a peer that stalled once would make it unreachable at every hop for the
+    /// rest of the operation. Default: ignore.
+    fn on_not_found_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 }
 
 /// Report one non-terminal attempt outcome to the driver's recorder, if any.
@@ -882,9 +892,11 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // `Retry` means the peer answered but could not serve the
                 // contract: GET's `NotFound` is its only producer, and PUT
                 // never returns it.
+                let hop = hop_slot.hop();
+                driver.on_not_found_hop(hop.as_ref());
                 record_attempt_failure(
                     driver,
-                    hop_slot.hop(),
+                    hop,
                     crate::operations::route_attempt::AttemptFailure::NotFound,
                 );
                 match driver.advance() {
