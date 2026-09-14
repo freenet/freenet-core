@@ -366,6 +366,14 @@ impl ZombieSweepPlan {
     pub(super) fn due(&self) -> usize {
         self.over_cap.len() + self.zombies.len()
     }
+
+    /// The transports one slice drops (at most `max`, over-cap first), and
+    /// whether any remain due after it.
+    pub(super) fn slice(&self, max: usize) -> (Vec<SocketAddr>, bool) {
+        let reap: Vec<SocketAddr> = self.reap_order().take(max).collect();
+        let backlog = self.due() > reap.len();
+        (reap, backlog)
+    }
 }
 
 /// Apply the link-use caps to one sweep's verdicts.
@@ -507,15 +515,11 @@ impl P2pConnManager {
             );
         }
 
-        let due = plan.due();
-        let reap: Vec<SocketAddr> = plan
-            .reap_order()
-            .take(MAX_ZOMBIE_CLEANUP_PER_CYCLE)
-            .collect();
+        let (reap, backlog) = plan.slice(MAX_ZOMBIE_CLEANUP_PER_CYCLE);
         if !reap.is_empty() {
             tracing::info!(
                 zombie_count = reap.len(),
-                zombies_due = due,
+                zombies_due = plan.due(),
                 over_cap = plan.over_cap.len(),
                 "Cleaning up zombie transports (not promoted to ring)"
             );
@@ -524,7 +528,7 @@ impl P2pConnManager {
             self.drop_zombie_connection(*addr, handshake_cmd_sender)
                 .await;
         }
-        due > reap.len()
+        backlog
     }
 }
 
@@ -813,6 +817,36 @@ mod tests {
         );
         assert_eq!(plan.due(), 2);
         assert_eq!(plan.kept_for_link_use, vec![addr("198.51.100.2:1")]);
+    }
+
+    /// A slice drops at most `max` transports, over-cap evictions first, and
+    /// reports a backlog exactly when some remain due.
+    #[test]
+    fn slice_bounds_drops_and_reports_backlog() {
+        let mut candidates: Vec<SweepCandidate> = (0..3u16)
+            .map(|i| SweepCandidate {
+                addr: SocketAddr::from(([192, 0, 2, 1], i + 1)),
+                age: Duration::from_secs(1000),
+                verdict: ZombieVerdict::Reap,
+            })
+            .collect();
+        candidates.push(exempt("198.51.100.1:1", 500));
+        candidates.push(exempt("198.51.100.2:1", 100));
+        let plan = plan_zombie_sweep(candidates, 2, 1);
+        assert_eq!(plan.due(), 4);
+
+        let (reap, backlog) = plan.slice(2);
+        assert_eq!(reap.len(), 2);
+        assert_eq!(reap[0], addr("198.51.100.1:1"), "over-cap goes first");
+        assert!(backlog, "two remain due");
+
+        let (reap, backlog) = plan.slice(4);
+        assert_eq!(reap.len(), 4);
+        assert!(!backlog, "nothing remains due");
+
+        let (reap, backlog) = plan_zombie_sweep(Vec::new(), 2, 1).slice(64);
+        assert!(reap.is_empty());
+        assert!(!backlog);
     }
 
     // ---- request classification ----
