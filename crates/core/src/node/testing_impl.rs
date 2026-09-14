@@ -1817,6 +1817,24 @@ impl SimNetwork {
         seed ^= seed >> 33;
         seed
     }
+
+    /// Makes this network's injected crashes and partitions REAL packet
+    /// drops: installs the fault-injection delivery callback for this network
+    /// only, and opts its fault injector in via `enforce_fault_drops`.
+    ///
+    /// The callback is keyed by this network's name and removed by
+    /// `SimNetwork::Drop`, so another simulation in the same process can
+    /// neither replace it nor clear it (#5673).
+    #[cfg(any(test, feature = "testing"))]
+    fn enable_fault_drop_enforcement(&self) {
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            &self.name,
+            Some(Arc::new(fault_injection_delivery_decision)),
+        );
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+            injector.lock().unwrap().enforce_fault_drops = true;
+        }
+    }
 }
 
 impl SimNetwork {
@@ -4782,21 +4800,11 @@ impl SimNetwork {
         // Save network name for topology retrieval after simulation
         let network_name = self.name.clone();
 
-        // Make `SimOperation::CrashNode` a REAL crash: install the global
-        // packet-delivery callback that consults each network's fault injector
-        // and DROPS every packet to/from a crashed node, then opt THIS network
-        // in via `enforce_fault_drops`. The callback is per-network aware (keyed
-        // on the network name it is handed) and inert for any network that did
-        // not opt in, so the direct-runner churn driver's crash semantics stay
-        // unchanged. `SimNetwork::Drop` clears the callback. Without this, a
-        // "crashed" node kept exchanging packets and piece-F crash tests were
+        // Make `SimOperation::CrashNode` a REAL crash: DROP every packet
+        // to/from a crashed node of this network. Without this, a "crashed"
+        // node kept exchanging packets and piece-F crash tests were
         // false-green (#4642 piece F).
-        crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
-            std::sync::Arc::new(fault_injection_delivery_decision),
-        ));
-        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&network_name) {
-            injector.lock().unwrap().enforce_fault_drops = true;
-        }
+        self.enable_fault_drop_enforcement();
 
         // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
@@ -5752,8 +5760,8 @@ impl SimNetwork {
         // Make direct-runner ChurnConfig crashes REAL packet drops (#4694).
         //
         // The chaos driver below marks nodes crashed in this network's fault
-        // injector, but a crash only drops packets if the global packet-delivery
-        // callback is installed AND this network opted in via
+        // injector, but a crash only drops packets if this network's
+        // packet-delivery callback is installed AND it opted in via
         // `enforce_fault_drops`. Neither happened on the direct runner, so churn
         // faults were inert: a "crashed" node kept exchanging packets and every
         // near-K churn / partition validation on this runner was false-green
@@ -5763,14 +5771,8 @@ impl SimNetwork {
         // byte-for-byte unchanged (the callback is inert unless a node is
         // actually crashed/partitioned, but gating keeps the change surgical and
         // makes the wiring impossible to miss when churn IS configured).
-        // `SimNetwork::Drop` clears the global callback.
         if self.churn_config.is_some() {
-            crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
-                std::sync::Arc::new(fault_injection_delivery_decision),
-            ));
-            if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
-                injector.lock().unwrap().enforce_fault_drops = true;
-            }
+            self.enable_fault_drop_enforcement();
         }
 
         // Single-threaded runtime with paused time for deterministic execution
@@ -6556,10 +6558,11 @@ impl Drop for SimNetwork {
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 
-        // Clear global callbacks to prevent stale references between
-        // sequential simulation runs (e.g., determinism tests).
-        set_packet_delivery_callback(None);
-        set_queue_packet_callback(None);
+        // Remove only THIS network's callbacks. Clearing a process-global slot
+        // here turned off crash enforcement for every other simulation still
+        // running in the same process (#5673).
+        set_packet_delivery_callback(&self.name, None);
+        set_queue_packet_callback(&self.name, None);
 
         // Thread-local cleanup
         clear_current_network_name();
@@ -6795,6 +6798,88 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for #5673: one simulation finishing (dropping its
+    /// `SimNetwork`) must not switch off crash enforcement for another
+    /// simulation still running in the same process.
+    ///
+    /// Network B stays alive on this thread with a crashed node. Network A is
+    /// built, enabled and dropped on a second thread, which is what happens
+    /// when plain `cargo test` runs two simulations as threads of one process
+    /// and A finishes first. B's crashed node must still drop packets
+    /// afterwards. Before the fix the callback was one process-global slot, so
+    /// A's `Drop` cleared it and B's "crashed" node was delivered to again.
+    #[test]
+    fn dropping_one_network_keeps_crash_enforcement_of_another() {
+        use crate::node::network_bridge::get_fault_injector;
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, check_packet_delivery, has_packet_delivery_callback,
+        };
+
+        const NET_A: &str = "crash-enforcement-finishes-first-5673";
+        const NET_B: &str = "crash-enforcement-still-running-5673";
+
+        let build = move |name: &'static str, seed: u64| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(SimNetwork::new(name, 1, 2, 7, 3, 6, 2, seed))
+        };
+        let is_drop = |d: PacketDeliveryDecision| matches!(d, PacketDeliveryDecision::Drop);
+
+        let b = build(NET_B, 0x5673_000B);
+        b.enable_fault_drop_enforcement();
+        let mut addrs: Vec<SocketAddr> = b.all_node_addresses().values().copied().collect();
+        addrs.sort();
+        let (crashed, live_x, live_y) = (addrs[0], addrs[1], addrs[2]);
+        get_fault_injector(NET_B)
+            .expect("SimNetwork::new registers a fault injector")
+            .lock()
+            .unwrap()
+            .config
+            .crash_node(crashed);
+        assert!(
+            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            "precondition: B's crashed node drops packets before A exists"
+        );
+
+        std::thread::spawn(move || {
+            let a = build(NET_A, 0x5673_000A);
+            a.enable_fault_drop_enforcement();
+            assert!(has_packet_delivery_callback(NET_A));
+            drop(a);
+        })
+        .join()
+        .expect("network A's thread panicked");
+
+        assert!(
+            !has_packet_delivery_callback(NET_A),
+            "dropping A must remove A's own callback"
+        );
+        assert!(
+            has_packet_delivery_callback(NET_B),
+            "dropping A must not remove B's callback"
+        );
+        assert!(
+            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            "after A dropped, packets TO B's crashed node must still be dropped"
+        );
+        assert!(
+            is_drop(check_packet_delivery(NET_B, crashed, live_x)),
+            "after A dropped, packets FROM B's crashed node must still be dropped"
+        );
+        assert!(
+            !is_drop(check_packet_delivery(NET_B, live_x, live_y)),
+            "B's healthy nodes must still reach each other"
+        );
+
+        drop(b);
+        assert!(
+            !has_packet_delivery_callback(NET_B),
+            "dropping B must remove B's own callback"
+        );
+    }
 
     /// Unit test for the fault-injection delivery decision (#4694 / #4642 piece F).
     ///
