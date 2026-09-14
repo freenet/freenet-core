@@ -11772,175 +11772,51 @@ fn test_hop_count_populated_on_terminal_get_events() {
 
 /// Verifies the contract-placement migration (#4404): a contract held only by a
 /// peer FAR from its key migrates onto the cluster of peers CLOSEST to the key,
-/// resolving the GET dead-end.
+/// which is what resolves the GET dead-end.
 ///
-/// Setup (peer ring locations controlled via `new_with_node_locations`):
-///   - a dense cluster of peers sits right on the contract's key location;
-///   - exactly one peer, far from the key, initially hosts the contract (seeded
-///     into its store AND Ring hosting manager, with no network propagation);
-///   - a requester, also far from the key, issues a GET.
+/// Setup (`run_close_cluster_placement`): a dense cluster of peers sits right
+/// on the contract's key location, and exactly one peer, far from the key,
+/// hosts the contract (seeded into its store AND Ring hosting manager, with no
+/// network propagation). GET is single-path greedy (k=1), so a key-routed GET
+/// lands on the cluster; without migration the cluster lacks the state and that
+/// attempt dead-ends with NotFound, the placement gap #4404 describes. The
+/// migration nudges the contract toward the key: each hosting peer, on gaining
+/// a connected neighbor strictly closer to the key, sends a `SubscribeHint` so
+/// that neighbor directed-subscribes through the holder and begins hosting.
 ///
-/// GET is single-path greedy (k=1), so it routes toward the key and reaches the
-/// close cluster. WITHOUT the migration that cluster lacks the state, so the GET
-/// dead-ends with NotFound (the far host is never on the greedy path toward the
-/// key) — that is the placement gap #4404 describes. The migration nudges the
-/// contract from the far host toward the key: each hosting peer, on gaining a
-/// connected neighbor strictly closer to the key, sends a `SubscribeHint` so
-/// that neighbor directed-subscribes through the holder and begins hosting. The
-/// contract therefore climbs onto the close cluster, and a key-routed GET now
-/// lands on a host. (The dead-end itself is not asserted separately here; the
-/// migration trigger is always-on, so this test pins the resolved state.)
-///
-/// Asserts the migration outcome directly via each node's live Ring: the far
-/// host still hosts the contract, and at least one close-cluster peer (the peers
-/// a key-routed GET actually reaches) ends up hosting it via migration.
+/// No client GET is issued. Since #5660 a GET's retries skip the peers that
+/// answered NotFound and reach the far host, and the return path caches the
+/// contract at the cluster peers it crosses, so a GET in this run could put the
+/// contract on the cluster with no migration at all and the assertion would not
+/// isolate the cascade. The paired control,
+/// `test_contract_stays_off_close_cluster_without_migration`, runs the same
+/// helper, seed and topology with ONLY the migration flag flipped.
 #[test_log::test]
 fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
-    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
-
-    const SEED: u64 = 0xDEAD_F00D_0001;
     const NETWORK_NAME: &str = "get-placement-deadend";
-    setup_deterministic_state(SEED);
-
-    // Pick a contract and read its ring location; place peers relative to it.
-    let contract = SimOperation::create_test_contract(0xBE);
-    let contract_id = *contract.key().id();
-    let contract_key = contract.key();
-    let key_loc = Location::from(&contract_key).as_f64();
-
-    // Six peers clustered tightly around the key (none will host it), then one
-    // far host (seeded) and one far requester. `rem_euclid` wraps onto the ring.
-    let wrap = |x: f64| x.rem_euclid(1.0);
-    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
-        .iter()
-        .map(|o| wrap(key_loc + o))
-        .collect();
-    let host_loc = wrap(key_loc + 0.40); // far from the key
-    let requester_loc = wrap(key_loc + 0.70); // far from the key, other side
-    let mut node_locations = cluster.clone();
-    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
-    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
-    let num_nodes = node_locations.len(); // 8
-
-    let rt = create_runtime();
-    let mut sim = rt.block_on(async {
-        SimNetwork::new_with_node_locations(
-            NETWORK_NAME,
-            1,         // 1 gateway
-            num_nodes, // 8 regular nodes
-            10,        // ring_max_htl
-            7,         // rnd_if_htl_above
-            8,         // max_connections
-            3,         // min_connections
-            SEED,
-            &node_locations,
-        )
-        .await
-    });
-    // Opt this simulation into the placement-migration cascade (off by default in
-    // sim so it can't perturb unrelated tests, e.g. the streaming assembly-retry
-    // test). This lowers the per-node SubscribeHint version floor to (0,0,0).
-    sim.enable_placement_migration();
-
-    // Regular nodes are node_no = 1..=8 (gateway is node 0); node_locations[i]
-    // maps to node_no i+1.
-    let host_label = NodeLabel::node(NETWORK_NAME, 7); // host_loc
-    let requester_label = NodeLabel::node(NETWORK_NAME, 8); // requester_loc
-
-    // Setup sanity: a cluster node must be strictly closer to the key than the
-    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
-    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
-    let locs = sim.get_peer_locations();
-    let ring_dist = |a: f64, b: f64| {
-        let d = (a - b).abs();
-        d.min(1.0 - d)
-    };
-    let host_dist = ring_dist(locs[7], key_loc);
-    let cluster_min = (1..=6)
-        .map(|i| ring_dist(locs[i], key_loc))
-        .fold(f64::INFINITY, f64::min);
-    assert!(
-        cluster_min < host_dist,
-        "scenario setup wrong: a cluster node must be closer to the key than the host \
-         (cluster_min={cluster_min}, host_dist={host_dist})"
-    );
-
-    let operations = vec![
-        // Only the far host holds the contract initially — seeded into both its
-        // store and Ring hosting manager (no network propagation), so it is a
-        // genuine migration source (`ring.is_hosting_contract` is true).
-        ScheduledOperation::new(
-            host_label.clone(),
-            SimOperation::SeedHostedContract {
-                contract: contract.clone(),
-                state: vec![10, 20, 30, 40],
-            },
-        ),
-        // The far requester asks for it (greedy GET toward the key).
-        ScheduledOperation::new(
-            requester_label.clone(),
-            SimOperation::Get {
-                contract_id,
-                return_contract_code: true,
-                subscribe: false,
-            },
-        ),
-    ];
-
-    let result = sim.run_controlled_simulation(
-        SEED,
-        operations,
-        Duration::from_secs(180),
-        Duration::from_secs(60),
-    );
-    assert!(
-        result.turmoil_result.is_ok(),
-        "simulation failed: {:?}",
-        result.turmoil_result.err()
-    );
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, true, false);
 
     // The far host still hosts the seeded contract (it remains a source).
     assert!(
-        result.is_node_hosting(&host_label, &contract_key),
+        result.is_node_hosting(
+            &freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 7),
+            &contract_key
+        ),
         "host should still host the seeded contract after the simulation"
     );
 
-    // CORE OF THE FIX: the contract migrated onto the close cluster. At least
-    // one of the peers a key-routed GET actually reaches (node_no 1..=6) now
-    // hosts it. Before the migration NONE of them did — this test previously
-    // asserted exactly that dead-end (see git history). With the contract now
-    // present on a peer the greedy path lands on, the dead-end is resolved.
-    let migrated: Vec<usize> = (1..=6usize)
-        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
-        .collect();
-    let requester_has_state = result
-        .node_storages
-        .get(&requester_label)
-        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    // CORE OF THE FIX: with nobody asking for it, the contract still reached
+    // the peers a key-routed GET actually lands on (node_no 1..=6).
+    let migrated = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
     assert!(
         !migrated.is_empty(),
         "placement migration FAILED: no close-cluster peer (node_no 1..=6) hosts the \
          contract after the simulation. The contract never migrated from the far host \
-         toward the key, so a key-routed GET would still dead-end. \
-         host_hosting={}, requester_has_state={requester_has_state}",
-        result.is_node_hosting(&host_label, &contract_key),
-    );
-
-    // End-to-end payoff: with the contract migrated onto the close cluster, the
-    // requester's greedy GET toward the key now lands on a host instead of
-    // dead-ending, so it obtains the state. This is the user-visible symptom
-    // from the original telemetry (a web GET that needed several retries before
-    // the contract had migrated onto the key-close peers).
-    assert!(
-        requester_has_state,
-        "requester GET should now succeed: with the contract migrated onto the close \
-         cluster, the greedy GET toward the key lands on a host instead of dead-ending \
-         (migrated cluster nodes: {migrated:?})"
+         toward the key, so a key-routed GET's first attempt would still dead-end."
     );
 
     tracing::info!(
         migrated_cluster_nodes = ?migrated,
-        requester_has_state,
         "placement migration converged onto the close cluster"
     );
 }
@@ -12210,20 +12086,25 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     );
 }
 
-/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
-///
-/// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the
-/// SubscribeHint cascade stays off (sim peers report a build version below the
-/// production floor). This reproduces the #4404 dead-end and, paired with the
-/// positive test, proves that the migration cascade (not some incidental GET
-/// caching path) is what makes the close cluster host the contract: same seed,
-/// same topology, the ONLY difference is whether migration is enabled.
-#[test_log::test]
-fn test_get_dead_ends_at_close_cluster_without_migration() {
+/// A finished close-cluster run and the contract it placed.
+type CloseClusterRun = (
+    freenet::dev_tool::ControlledSimulationResult,
+    freenet_stdlib::prelude::ContractKey,
+);
+
+/// Close-cluster placement scenario shared by the migration and retry tests:
+/// six peers tightly around the contract's key, one far host (node 7, seeded)
+/// and one far requester (node 8), which GETs the contract when `client_get`.
+/// Same seed and topology in every caller, so callers differ only in the two
+/// flags.
+fn run_close_cluster_placement(
+    network_name: &'static str,
+    migration: bool,
+    client_get: bool,
+) -> CloseClusterRun {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
 
     const SEED: u64 = 0xDEAD_F00D_0001;
-    const NETWORK_NAME: &str = "get-placement-deadend-control";
     setup_deterministic_state(SEED);
 
     let contract = SimOperation::create_test_contract(0xBE);
@@ -12246,7 +12127,7 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
     let rt = create_runtime();
     let mut sim = rt.block_on(async {
         SimNetwork::new_with_node_locations(
-            NETWORK_NAME,
+            network_name,
             1,
             num_nodes,
             10,
@@ -12258,35 +12139,52 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
         )
         .await
     });
-    // This control asserts the GET dead-ends *because migration is off* — it
-    // deliberately does NOT call `enable_placement_migration()`. But "off by
-    // default" only holds on a build below the production
-    // SUBSCRIBE_HINT_MIN_VERSION floor; on the v0.2.73 release branch (#4404
-    // ships active) the default flips to ON and this control would falsely
-    // fail. Pin migration OFF explicitly so the control's premise holds at any
-    // build version — do not rely on build-version gating.
-    sim.disable_placement_migration();
 
-    let host_label = NodeLabel::node(NETWORK_NAME, 7);
-    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+    // Setup sanity: a cluster node must be strictly closer to the key than the
+    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
+    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster node must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
 
-    let operations = vec![
-        ScheduledOperation::new(
-            host_label.clone(),
-            SimOperation::SeedHostedContract {
-                contract: contract.clone(),
-                state: vec![10, 20, 30, 40],
-            },
-        ),
-        ScheduledOperation::new(
-            requester_label.clone(),
+    // Pin migration explicitly either way: "off by default" only holds on a
+    // build below the production SUBSCRIBE_HINT_MIN_VERSION floor.
+    if migration {
+        sim.enable_placement_migration();
+    } else {
+        sim.disable_placement_migration();
+    }
+
+    let host_label = NodeLabel::node(network_name, 7);
+    let requester_label = NodeLabel::node(network_name, 8);
+    let mut operations = vec![ScheduledOperation::new(
+        host_label,
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: vec![10, 20, 30, 40],
+        },
+    )];
+    if client_get {
+        operations.push(ScheduledOperation::new(
+            requester_label,
             SimOperation::Get {
                 contract_id,
                 return_contract_code: true,
                 subscribe: false,
             },
-        ),
-    ];
+        ));
+    }
 
     let result = sim.run_controlled_simulation(
         SEED,
@@ -12299,31 +12197,92 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
         "simulation failed: {:?}",
         result.turmoil_result.err()
     );
+    (result, contract_key)
+}
 
-    // The far host still hosts the seeded contract.
+/// Close-cluster peers (node 1..=6) hosting the contract at the end of a run.
+fn close_cluster_hosts(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    network_name: &str,
+    contract_key: &freenet_stdlib::prelude::ContractKey,
+) -> Vec<usize> {
+    (1..=6usize)
+        .filter(|n| {
+            result.is_node_hosting(
+                &freenet::dev_tool::NodeLabel::node(network_name, *n),
+                contract_key,
+            )
+        })
+        .collect()
+}
+
+/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
+///
+/// The same `run_close_cluster_placement` call as the positive test, same seed
+/// and topology, no client GET in either, and ONLY the migration flag flipped.
+/// The positive test asserts that run places the contract on the close
+/// cluster; this one asserts it does not without migration, so the pair shows
+/// migration is what places it, and this assertion is not vacuous.
+///
+/// Why there is no client GET (#5660): this control used to issue the
+/// requester's GET and assert it dead-ends at the non-hosting cluster, a
+/// premise that held only while every retry re-asked the same first hop. With
+/// retry diversity a retry skips the peers that answered NotFound, reaches the
+/// far host, and the return path caches the contract at the cluster peers it
+/// crosses: a legitimate resolution that is not migration. That behaviour is
+/// pinned by `test_get_retries_resolve_close_cluster_dead_end_without_migration`.
+#[test_log::test]
+fn test_contract_stays_off_close_cluster_without_migration() {
+    const NETWORK_NAME: &str = "get-placement-deadend-control";
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, false);
+
     assert!(
-        result.is_node_hosting(&host_label, &contract_key),
+        result.is_node_hosting(
+            &freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 7),
+            &contract_key
+        ),
         "host should hold the seeded contract"
     );
-
-    // DEAD-END (expected without migration): no close-cluster peer hosts the
-    // contract, so a key-routed GET dead-ends and the requester gets nothing.
-    let migrated: Vec<usize> = (1..=6usize)
-        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
-        .collect();
+    let placed = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
     assert!(
-        migrated.is_empty(),
-        "without migration, no close-cluster peer should host the contract, but these do: \
-         {migrated:?} (cascade leaked into a migration-disabled sim?)"
+        placed.is_empty(),
+        "without migration and without any GET, no close-cluster peer may host the \
+         contract, but these do: {placed:?} (cascade leaked into a migration-disabled sim?)"
     );
+}
+
+/// Retry diversity (#5660) resolves the close-cluster dead-end on its own.
+///
+/// The original control scenario, migration pinned OFF: a far requester GETs a
+/// contract held only by a far host (node 7), and the peers closest to the key
+/// do not hold it. Before retry diversity every retry re-picked the same
+/// keyward first hop and the GET dead-ended at the cluster. Now a retry
+/// excludes the hops that answered NotFound, reaches the host, and the
+/// requester gets the state; the return path caches the contract at the cluster
+/// peers it crosses, through the normal relay caching, not migration.
+#[test_log::test]
+fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
+    const NETWORK_NAME: &str = "get-placement-retry-diversity";
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, true);
+
     let requester_has_state = result
         .node_storages
-        .get(&requester_label)
+        .get(&freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 8))
         .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
     assert!(
-        !requester_has_state,
-        "without migration the requester GET must dead-end at the close non-hosting cluster \
-         and obtain NO state (the far host is off the greedy path toward the key)"
+        requester_has_state,
+        "with retry diversity the requester GET must resolve without migration: a retry \
+         skips the NotFound hops and reaches the far host"
+    );
+    let cached = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
+    assert!(
+        !cached.is_empty(),
+        "the resolved GET's return path must cache the contract at the close-cluster \
+         peers it crosses"
+    );
+    tracing::info!(
+        ?cached,
+        "close-cluster peers cached the contract on the return path"
     );
 }
 
