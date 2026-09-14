@@ -279,7 +279,10 @@ enum Line<'a> {
 }
 
 enum Record {
-    Route(RouteRecord),
+    // Boxed: the forecasts make a route record several times the size of a
+    // peers record, and every slot of the bounded channel is sized to the
+    // largest variant.
+    Route(Box<RouteRecord>),
     Peers {
         t_ms: u64,
         peers: Vec<PeerAttributes>,
@@ -338,7 +341,7 @@ impl RoutingDataset {
     }
 
     pub(crate) fn record_route(&self, record: RouteRecord) {
-        self.send(Record::Route(record));
+        self.send(Record::Route(Box::new(record)));
     }
 
     pub(crate) fn record_peers(&self, t_ms: u64, peers: Vec<PeerAttributes>) {
