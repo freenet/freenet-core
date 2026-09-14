@@ -737,6 +737,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         // Dropped at the end of this iteration on every path, so a `continue`
         // or `return` cannot leak it.
         let hop_slot = op_manager.attempt_hop_registry().register(attempt_tx);
+        let attempt_started = tokio::time::Instant::now();
 
         let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
@@ -772,10 +773,12 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             }
         };
 
-        // The hop this attempt was forwarded to, read NOW (#5657): a loopback
-        // `record_hop` landing during the release await below would otherwise
-        // be blamed for a timeout that fired before the request left.
-        let attempt_hop = hop_slot.hop();
+        // The hop this attempt was forwarded to and when, read NOW (#5657): a
+        // loopback `record_hop` landing during the release await below would
+        // otherwise be blamed for a timeout that fired before the request left.
+        let attempt_resolved = tokio::time::Instant::now();
+        let hop_record = hop_slot.hop_record();
+        let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -863,9 +866,21 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
+                // Blame the hop only if it had a meaningful share of the
+                // attempt: one the loopback relay forwarded to near the
+                // deadline did not stall it (#5657).
+                let blamed = hop_record
+                    .filter(|(_, recorded_at)| {
+                        crate::operations::route_attempt::hop_had_budget_share(
+                            attempt_started,
+                            *recorded_at,
+                            attempt_resolved,
+                        )
+                    })
+                    .map(|(hop, _)| hop);
                 record_attempt_failure(
                     driver,
-                    attempt_hop,
+                    blamed,
                     crate::operations::route_attempt::AttemptFailure::Timeout,
                 );
                 match driver.advance() {
@@ -962,8 +977,8 @@ mod tests {
             "pub(crate) async fn drive_retry_loop<D: RetryDriver>(",
         );
         let read = body
-            .find("let attempt_hop = hop_slot.hop();")
-            .expect("the hop must be read once, into attempt_hop");
+            .find("let hop_record = hop_slot.hop_record();")
+            .expect("the hop must be read once, into hop_record");
         let release = body
             .find("op_manager.release_pending_op_slot(attempt_tx).await;")
             .expect("the retry loop releases the pending slot");
@@ -972,7 +987,7 @@ mod tests {
             "the hop must be read before the release await"
         );
         assert!(
-            !body[release..].contains("hop_slot.hop()"),
+            !body[release..].contains("hop_slot.hop"),
             "no hop read may follow the release await"
         );
     }

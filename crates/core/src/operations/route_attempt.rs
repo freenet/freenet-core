@@ -34,9 +34,12 @@
 //! whose delivery failed) are kept separately; see
 //! [`crate::ring::Ring::report_route_outcome_to_health`].
 //!
-//! Only a REMOTE reply is proof that the contract exists: a Found or a
-//! streaming header from a peer this operation contacted. This node's own
-//! copy, a local completion or later evidence proves nothing.
+//! Existence proof requires state that passed validation: state for the
+//! requested contract, from a peer this operation contacted, that this node
+//! then stored (the executor accepted it, or it equals this node's own
+//! validated copy). A reply whose state has not passed validation, this
+//! node's own copy, a local completion or later evidence proves nothing. A
+//! SUBSCRIBE carries no state, so it never has existence proof.
 //!
 //! `FREENET_ROUTING_LEGACY_LABELS=1` restores the pre-#5657 labels exactly
 //! ([`label_mode`]).
@@ -239,8 +242,9 @@ impl RouteFailureSink for crate::ring::Ring {
     }
 }
 
-/// Whether a reply counts as existence proof for this operation's routing
-/// labels (see the module docs).
+/// The reply-side condition for existence proof for this operation's routing
+/// labels; callers also require that the reply's state passed validation
+/// (see the module docs).
 pub(crate) fn is_existence_proof(
     requested: &ContractInstanceId,
     key: &freenet_stdlib::prelude::ContractKey,
@@ -426,10 +430,11 @@ impl RouteAttemptRecorder {
         }
     }
 
-    /// Evidence from THIS operation that the contract exists: a Found reply or
-    /// a streaming header from a REMOTE peer this operation actually contacted.
-    /// A local copy or a local completion is not proof (the copy may be stale
-    /// or held by this node alone). Every pending `NotFound` in this operation
+    /// Evidence from THIS operation that the contract exists: state from a
+    /// REMOTE peer this operation actually contacted that then passed
+    /// validation here (see the module docs). A local copy or a local
+    /// completion is not proof (the copy may be stale or held by this node
+    /// alone). Every pending `NotFound` in this operation
     /// is then a genuine routing failure; later ones are labelled immediately.
     /// Idempotent. Has no effect under [`LabelMode::Legacy`], which never
     /// holds pending `NotFound`s and never reads the flag.
@@ -499,7 +504,7 @@ impl Drop for RouteAttemptRecorder {
 /// entry: the registry holds at most one entry per in-flight attempt.
 #[derive(Default)]
 pub(crate) struct AttemptHopRegistry {
-    slots: DashMap<Transaction, Option<PeerKeyLocation>>,
+    slots: DashMap<Transaction, Option<(PeerKeyLocation, tokio::time::Instant)>>,
 }
 
 impl AttemptHopRegistry {
@@ -520,7 +525,7 @@ impl AttemptHopRegistry {
     /// (a relay hop for a remote upstream, or an attempt already resolved).
     pub(crate) fn record_hop(&self, tx: &Transaction, peer: &PeerKeyLocation) {
         if let Some(mut slot) = self.slots.get_mut(tx) {
-            *slot = Some(peer.clone());
+            *slot = Some((peer.clone(), tokio::time::Instant::now()));
         }
     }
 
@@ -546,7 +551,14 @@ pub(crate) struct AttemptHopGuard {
 
 impl AttemptHopGuard {
     /// The peer the attempt was forwarded to, if the loopback relay recorded one.
+    #[cfg(test)]
     pub(crate) fn hop(&self) -> Option<PeerKeyLocation> {
+        self.hop_record().map(|(hop, _)| hop)
+    }
+
+    /// The peer the attempt was forwarded to and when the loopback relay
+    /// recorded it, if it did.
+    pub(crate) fn hop_record(&self) -> Option<(PeerKeyLocation, tokio::time::Instant)> {
         self.registry
             .slots
             .get(&self.tx)
@@ -558,6 +570,28 @@ impl Drop for AttemptHopGuard {
     fn drop(&mut self) {
         self.registry.slots.remove(&self.tx);
     }
+}
+
+/// The smallest share of an attempt's elapsed time the recorded hop must have
+/// had for the attempt's timeout to be blamed on it (#5657). The loopback relay
+/// records the hop when it forwards, which on an overloaded originator can be
+/// late in the attempt: a hop forwarded to at 59 s of a 60 s budget did not
+/// stall the attempt, the originator did. At one half, a hop is blamed when it
+/// had at least as long as the originator took to reach it.
+pub(crate) const MIN_HOP_SHARE_FOR_TIMEOUT_BLAME: f64 = 0.5;
+
+/// Whether a hop recorded at `hop_recorded_at` had enough of an attempt that
+/// started at `attempt_started` and timed out at `timed_out_at` to be blamed
+/// for the timeout. See [`MIN_HOP_SHARE_FOR_TIMEOUT_BLAME`].
+pub(crate) fn hop_had_budget_share(
+    attempt_started: tokio::time::Instant,
+    hop_recorded_at: tokio::time::Instant,
+    timed_out_at: tokio::time::Instant,
+) -> bool {
+    let attempt = timed_out_at.saturating_duration_since(attempt_started);
+    let hop = timed_out_at.saturating_duration_since(hop_recorded_at);
+    attempt.is_zero()
+        || hop.as_secs_f64() >= attempt.as_secs_f64() * MIN_HOP_SHARE_FOR_TIMEOUT_BLAME
 }
 
 /// Shared harness for the per-op driver tests: a real `OpManager` whose event
@@ -637,6 +671,22 @@ pub(crate) mod driver_test_support {
             .unwrap_or_default()
     }
 
+    fn store_rejections() -> &'static dashmap::DashSet<String> {
+        static REJECTIONS: std::sync::OnceLock<dashmap::DashSet<String>> =
+            std::sync::OnceLock::new();
+        REJECTIONS.get_or_init(dashmap::DashSet::new)
+    }
+
+    /// Make the stub contract handler of the test node built with `id` reject
+    /// every store, as an executor does for state that fails validation.
+    pub(crate) fn reject_stores(id: &str) {
+        store_rejections().insert(id.to_string());
+    }
+
+    fn rejects_stores(id: &str) -> bool {
+        store_rejections().contains(id)
+    }
+
     /// The pre-#5657 non-router inputs for `peer`: its `peer_health`
     /// `(successes, failures)` and the topology manager's outbound-request
     /// count.
@@ -686,6 +736,9 @@ pub(crate) mod driver_test_support {
         /// Drop the waiter without an answer: the driver sees a local
         /// `NotificationError`, which is not the peer's doing.
         DropWaiter,
+        /// Never answer, and record the hop only after the delay: the loopback
+        /// relay forwarded late in the attempt. Use with `Step::hop: None`.
+        NeverWithHopAfter(std::time::Duration, PeerKeyLocation),
     }
 
     /// What the stub contract handler answers to a `GetQuery`: `None` = the
@@ -713,6 +766,9 @@ pub(crate) mod driver_test_support {
     /// [`op_manager_with_peers`] plus a stub contract handler: a `GetQuery` is
     /// answered from the returned [`LocalStore`], every other event is dropped
     /// unanswered (the caller sees a handler error).
+    // The stub contract handler answers two events and leaves every other
+    // variant unanswered on purpose, so its wildcard arm is the point.
+    #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) async fn op_manager_with_peers_and_store(
         id: &str,
         peers: usize,
@@ -741,23 +797,44 @@ pub(crate) mod driver_test_support {
             crate::contract::contract_handler_channel();
         let store: LocalStore = Arc::new(parking_lot::Mutex::new(None));
         let handler_store = store.clone();
+        let node_id = id.to_string();
         tokio::spawn(async move {
             while let Ok((id, event, _priority)) = ch_channel.recv_from_sender().await {
-                if let ContractHandlerEvent::GetQuery { instance_id, .. } = event {
-                    let stored = handler_store
-                        .lock()
-                        .clone()
-                        .filter(|(key, _)| *key.id() == instance_id);
-                    let response = ContractHandlerEvent::GetResponse {
-                        key: stored.as_ref().map(|(key, _)| *key),
-                        response: Ok(StoreResponse {
-                            state: stored.map(|(_, state)| state),
-                            contract: None,
-                        }),
-                    };
-                    let _answered = ch_channel.send_to_sender(id, response).await;
-                } else {
-                    ch_channel.drop_waiting_response(id);
+                match event {
+                    ContractHandlerEvent::GetQuery { instance_id, .. } => {
+                        let stored = handler_store
+                            .lock()
+                            .clone()
+                            .filter(|(key, _)| *key.id() == instance_id);
+                        let response = ContractHandlerEvent::GetResponse {
+                            key: stored.as_ref().map(|(key, _)| *key),
+                            response: Ok(StoreResponse {
+                                state: stored.map(|(_, state)| state),
+                                contract: None,
+                            }),
+                        };
+                        let _answered = ch_channel.send_to_sender(id, response).await;
+                    }
+                    // A store carrying contract code passes validation unless
+                    // the test rejects this node's stores; a rejected store, or
+                    // one without code, gets no answer, which the caller sees as
+                    // a failed store.
+                    ContractHandlerEvent::PutQuery {
+                        key,
+                        state,
+                        contract: Some(_),
+                        ..
+                    } if !rejects_stores(&node_id) => {
+                        *handler_store.lock() = Some((key, state.clone()));
+                        let response = ContractHandlerEvent::PutResponse {
+                            new_value: Ok(state),
+                            state_changed: true,
+                        };
+                        let _answered = ch_channel.send_to_sender(id, response).await;
+                    }
+                    // Every other event (and a refused store) is deliberately
+                    // left unanswered, whatever its variant.
+                    _ => ch_channel.drop_waiting_response(id),
                 }
             }
         });
@@ -859,10 +936,31 @@ pub(crate) mod driver_test_support {
                     }
                     Answer::Never => held_open.push(reply_tx),
                     Answer::DropWaiter => drop(reply_tx),
+                    Answer::NeverWithHopAfter(delay, hop) => {
+                        let registry = op_manager.attempt_hop_registry().clone();
+                        let tx = *outbound.id();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            registry.record_hop(&tx, &hop);
+                        });
+                        held_open.push(reply_tx);
+                    }
                 }
             }
         });
         served
+    }
+
+    /// `source` with every `//` comment removed, whole-line and trailing, so a
+    /// source pin is satisfied neither by a comment nor by commented-out code.
+    /// Naive: a `//` inside a string literal also ends the line, so do not
+    /// anchor a pin on such a literal.
+    pub(crate) fn strip_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The body of the PRODUCTION function whose signature starts with
@@ -1290,15 +1388,6 @@ mod tests {
     }
 
     #[test]
-    fn disabled_recorder_records_nothing() {
-        let mut rec = RouteAttemptRecorder::disabled(id(), OpType::Get);
-        let a = peer(1);
-        rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
-        rec.contract_exists();
-    }
-
-    #[test]
     fn events_carry_contract_location_and_op_type() {
         let sink = Arc::new(VecSink::default());
         let a = peer(1);
@@ -1338,5 +1427,32 @@ mod tests {
 
         registry.record_hop(&tx, &a);
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn hop_budget_share_threshold() {
+        use std::time::Duration;
+        let start = tokio::time::Instant::now();
+        let end = start + Duration::from_secs(60);
+        assert!(hop_had_budget_share(start, start, end));
+        assert!(hop_had_budget_share(
+            start,
+            start + Duration::from_secs(30),
+            end
+        ));
+        assert!(!hop_had_budget_share(
+            start,
+            start + Duration::from_secs(31),
+            end
+        ));
+        assert!(!hop_had_budget_share(
+            start,
+            start + Duration::from_secs(59),
+            end
+        ));
+        assert!(
+            hop_had_budget_share(start, start, start),
+            "a zero-length attempt keeps its hop's blame"
+        );
     }
 }
