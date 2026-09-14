@@ -3499,11 +3499,10 @@ mod tests {
         );
     }
 
-    /// Pin: the manually-mirrored `router_snapshot` OTLP body
-    /// (`event_kind_to_json`) must forward the node-health gauges. The body is a
-    /// hand-written `json!` block, so a new `RouterSnapshotInfo` field is
-    /// silently dropped from central telemetry unless it is added there too
-    /// (the #4009/#4010 manually-mirrored-telemetry footgun). See #4440.
+    /// Pin: the chain-blame timeout-label histogram (#5657) must reach the
+    /// hand-mirrored `router_snapshot` OTLP body, like every other
+    /// `RouterSnapshotInfo` field (the #4009/#4010 manually-mirrored-telemetry
+    /// footgun).
     #[test]
     fn router_snapshot_json_includes_timeout_label_histogram() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -3529,6 +3528,11 @@ mod tests {
         }
     }
 
+    /// Pin: the manually-mirrored `router_snapshot` OTLP body
+    /// (`event_kind_to_json`) must forward the node-health gauges. The body is a
+    /// hand-written `json!` block, so a new `RouterSnapshotInfo` field is
+    /// silently dropped from central telemetry unless it is added there too
+    /// (the #4009/#4010 manually-mirrored-telemetry footgun). See #4440.
     #[test]
     fn router_snapshot_json_includes_fd_gauges() {
         use arbitrary::{Arbitrary, Unstructured};

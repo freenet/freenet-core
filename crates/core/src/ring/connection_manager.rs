@@ -345,12 +345,6 @@ impl PeerHealthTracker {
         );
     }
 
-    /// `(successes, failures)` recorded for `addr`, if tracked. Test-only.
-    #[cfg(test)]
-    pub(crate) fn counts_for_test(&self, addr: SocketAddr) -> Option<(u64, u64)> {
-        self.stats.get(&addr).map(|s| (s.successes, s.failures))
-    }
-
     /// Remove health tracking for a pruned peer.
     pub fn remove_peer(&mut self, addr: SocketAddr) {
         self.stats.remove(&addr);
@@ -1871,6 +1865,14 @@ impl ConnectionManager {
             new_addr = %addr,
             "set_own_addr called"
         );
+    }
+
+    /// Outbound requests the topology manager recorded for `peer`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn outbound_request_count_for_test(&self, peer: &PeerKeyLocation) -> usize {
+        self.topology_manager
+            .read()
+            .outbound_request_count_for_test(peer)
     }
 
     /// Set only the local `own_addr`, WITHOUT mirroring to the process-global

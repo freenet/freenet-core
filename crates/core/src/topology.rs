@@ -355,6 +355,12 @@ impl TopologyManager {
         self.meter.report(attribution, resource, amount, at_time);
     }
 
+    /// Outbound requests recorded for `peer` in the counter's window. Test-only.
+    #[cfg(test)]
+    pub(crate) fn outbound_request_count_for_test(&self, peer: &PeerKeyLocation) -> usize {
+        self.outbound_request_counter.get_request_count(peer)
+    }
+
     /// Record an outbound request to a peer, along with the target Location of that request
     pub(crate) fn report_outbound_request(&mut self, peer: PeerKeyLocation, target: Location) {
         self.request_density_tracker.sample(target);

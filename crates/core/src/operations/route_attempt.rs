@@ -201,6 +201,9 @@ pub(crate) trait RouteFailureSink: Send + Sync {
     /// `NotFound` labelled `SuccessUntimed`). Router only; always a relay
     /// observation.
     fn record_legacy_route_event(&self, event: RouteEvent);
+    /// `count` ambiguous `NotFound`s were dropped untrained when an operation
+    /// ended without proof the contract exists. Counted, never trained on.
+    fn record_untrained_not_founds(&self, count: u64);
 }
 
 impl AttemptOrigin {
@@ -229,6 +232,49 @@ impl RouteFailureSink for crate::ring::Ring {
             event,
             crate::router::dataset::RouteSource::Relay,
         );
+    }
+
+    fn record_untrained_not_founds(&self, count: u64) {
+        crate::ring::Ring::record_untrained_not_founds(self, count);
+    }
+}
+
+/// Whether a reply counts as existence proof for this operation's routing
+/// labels: only a reply naming the requested contract does. Its contract key,
+/// and its envelope `instance_id` where the caller has one, must both name
+/// that contract.
+pub(crate) fn reply_names_contract(
+    requested: &ContractInstanceId,
+    key: &freenet_stdlib::prelude::ContractKey,
+    envelope_instance_id: Option<&ContractInstanceId>,
+) -> bool {
+    key.id() == requested && envelope_instance_id.is_none_or(|id| id == requested)
+}
+
+/// An originator's route outcome for telemetry, `peer_health` and the
+/// topology manager, reported exactly as before #5657: the same event (against
+/// the driver's `current_target`), at the same sites, under the same
+/// conditions. `NetEventLog::route_event` is emitted in both label modes, so
+/// the collector's `route_success` / `route_failure` series do not move with the
+/// labelling. Under [`LabelMode::Legacy`] the router gets this event too
+/// (`routing_finished`); under [`LabelMode::Current`] the caller feeds the
+/// router separately, against the recorded hop.
+pub(crate) async fn report_originator_route_outcome(
+    op_manager: &crate::node::OpManager,
+    tx: &Transaction,
+    event: RouteEvent,
+    mode: LabelMode,
+) {
+    if let Some(log_event) = crate::tracing::NetEventLog::route_event(tx, &op_manager.ring, &event)
+    {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(log_event))
+            .await;
+    }
+    match mode {
+        LabelMode::Legacy => op_manager.ring.routing_finished(event),
+        LabelMode::Current => op_manager.ring.report_route_outcome_to_health(&event),
     }
 }
 
@@ -311,11 +357,6 @@ impl RouteAttemptRecorder {
         self.mode
     }
 
-    /// Whether this recorder feeds a router at all (false for sub-op GETs).
-    pub(crate) fn feeds_router(&self) -> bool {
-        self.sink.is_some()
-    }
-
     /// Record a non-success outcome of one attempt.
     ///
     /// `peer` is the peer the request was ACTUALLY sent to. `None` means no
@@ -367,8 +408,10 @@ impl RouteAttemptRecorder {
             return;
         }
         match outcome {
+            // Every failure, like `record_relay_route_event` did before #5657:
+            // no per-peer deduplication in legacy mode.
             AttemptFailure::Timeout | AttemptFailure::SendFailure => {
-                self.emit_failure(peer.clone(), outcome);
+                self.send_failure(peer.clone(), outcome);
             }
             AttemptFailure::NotFound => {
                 let Some(sink) = &self.sink else {
@@ -399,13 +442,20 @@ impl RouteAttemptRecorder {
         }
     }
 
+    /// A Failure label under the current rules: at most once per peer per
+    /// operation.
     fn emit_failure(&mut self, peer: PeerKeyLocation, cause: AttemptFailure) {
+        if self.sink.is_none() || !self.failed.insert(peer.clone()) {
+            return;
+        }
+        self.send_failure(peer, cause);
+    }
+
+    /// Hand one Failure label to the sink, with no deduplication.
+    fn send_failure(&self, peer: PeerKeyLocation, cause: AttemptFailure) {
         let Some(sink) = &self.sink else {
             return;
         };
-        if !self.failed.insert(peer.clone()) {
-            return;
-        }
         if self.origin == AttemptOrigin::Relay {
             crate::operations::count_relay_route_event(self.op_type);
         }
@@ -431,7 +481,11 @@ impl Drop for RouteAttemptRecorder {
                     self.emit_failure(peer, AttemptFailure::NotFound);
                 }
             }
-            AmbiguousNotFoundPolicy::Untrained => {}
+            AmbiguousNotFoundPolicy::Untrained => {
+                if let (Some(sink), false) = (&self.sink, pending.is_empty()) {
+                    sink.record_untrained_not_founds(pending.len() as u64);
+                }
+            }
         }
     }
 }
@@ -523,6 +577,92 @@ pub(crate) mod driver_test_support {
     use crate::message::{MessageStats, NetMessage};
     use crate::node::{OpExecutionPayload, OpManager, WaiterReply};
     use crate::ring::{Location, PeerKeyLocation};
+
+    /// `(peer address, outcome is a Failure)` for every `EventKind::Route`
+    /// telemetry event a test node emitted, in order.
+    type RouteLogEntries = Arc<parking_lot::Mutex<Vec<(Option<SocketAddr>, bool)>>>;
+
+    fn route_logs() -> &'static dashmap::DashMap<String, RouteLogEntries> {
+        static LOGS: std::sync::OnceLock<dashmap::DashMap<String, RouteLogEntries>> =
+            std::sync::OnceLock::new();
+        LOGS.get_or_init(dashmap::DashMap::new)
+    }
+
+    /// Captures the `NetEventLog::route_event`s a test node registers, which
+    /// is what the telemetry collector turns into `route_success` /
+    /// `route_failure`.
+    #[derive(Clone, Default)]
+    struct RouteLog(RouteLogEntries);
+
+    impl crate::tracing::NetEventRegister for RouteLog {
+        fn register_events<'a>(
+            &'a self,
+            events: either::Either<
+                crate::tracing::NetEventLog<'a>,
+                Vec<crate::tracing::NetEventLog<'a>>,
+            >,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            let logs = match events {
+                either::Either::Left(log) => vec![log],
+                either::Either::Right(logs) => logs,
+            };
+            for log in logs {
+                if let crate::tracing::EventKind::Route(event) = &log.kind {
+                    self.0.lock().push((
+                        event.peer.socket_addr(),
+                        matches!(event.outcome, crate::router::RouteOutcome::Failure),
+                    ));
+                }
+            }
+            Box::pin(async {})
+        }
+
+        fn notify_of_time_out(
+            &mut self,
+            _tx: crate::message::Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn trait_clone(&self) -> Box<dyn crate::tracing::NetEventRegister> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// The route telemetry events of the test node built with `id`.
+    pub(crate) fn route_log(id: &str) -> Vec<(Option<SocketAddr>, bool)> {
+        route_logs()
+            .get(id)
+            .map(|log| log.lock().clone())
+            .unwrap_or_default()
+    }
+
+    /// The pre-#5657 non-router inputs for `peer`: its `peer_health`
+    /// `(successes, failures)` and the topology manager's outbound-request
+    /// count.
+    pub(crate) fn health_inputs(
+        op_manager: &OpManager,
+        peer: &PeerKeyLocation,
+    ) -> ((u64, u64), usize) {
+        let counts = peer
+            .socket_addr()
+            .and_then(|addr| {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .peer_health
+                    .lock()
+                    .counts(&addr)
+            })
+            .unwrap_or((0, 0));
+        let outbound = op_manager
+            .ring
+            .connection_manager
+            .outbound_request_count_for_test(peer);
+        (counts, outbound)
+    }
 
     /// What the scripted event loop does with one outbound attempt.
     pub(crate) struct Step {
@@ -626,12 +766,14 @@ pub(crate) mod driver_test_support {
         let connection_manager = crate::ring::ConnectionManager::new(&node_config);
         let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
         let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let route_log = RouteLog::default();
+        route_logs().insert(id.to_string(), route_log.0.clone());
         let op_manager = Arc::new(
             OpManager::new(
                 notification_tx,
                 ops_ch_channel,
                 &node_config,
-                crate::tracing::DynamicRegister::new(vec![]),
+                crate::tracing::DynamicRegister::new(vec![Box::new(route_log)]),
                 connection_manager,
                 result_router_tx,
                 &task_monitor,
@@ -795,6 +937,7 @@ mod tests {
     struct VecSink {
         failures: Mutex<Vec<(RouteEvent, AttemptFailure, AttemptOrigin)>>,
         legacy: Mutex<Vec<RouteEvent>>,
+        untrained: Mutex<Vec<u64>>,
     }
 
     impl RouteFailureSink for VecSink {
@@ -808,6 +951,9 @@ mod tests {
         }
         fn record_legacy_route_event(&self, event: RouteEvent) {
             self.legacy.lock().push(event);
+        }
+        fn record_untrained_not_founds(&self, count: u64) {
+            self.untrained.lock().push(count);
         }
     }
 
@@ -1012,11 +1158,17 @@ mod tests {
         let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Untrained);
         rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);
         rec.record_attempt(Some(&b), AttemptFailure::Timeout, true);
+        rec.record_attempt(Some(&b), AttemptFailure::NotFound, true);
         drop(rec);
         assert_eq!(
             sink.failed_peers(),
             vec![addr(&b)],
             "only the timeout trains"
+        );
+        assert_eq!(
+            *sink.untrained.lock(),
+            vec![2],
+            "the dropped NotFounds are counted, once, at settle"
         );
     }
 
@@ -1104,6 +1256,7 @@ mod tests {
         rec.record_attempt(Some(&b), AttemptFailure::NotFound, false);
         rec.record_attempt(Some(&c), AttemptFailure::SendFailure, false);
         rec.record_attempt(Some(&d), AttemptFailure::Timeout, true);
+        rec.record_attempt(Some(&d), AttemptFailure::Timeout, true);
         rec.contract_exists();
         rec.record_attempt(Some(&e), AttemptFailure::NotFound, true);
         drop(rec);
@@ -1112,7 +1265,15 @@ mod tests {
             vec![addr(&a), addr(&b), addr(&e)],
             "every relay NotFound is a legacy SuccessUntimed"
         );
-        assert_eq!(sink.failed_peers(), vec![addr(&c), addr(&d)]);
+        assert_eq!(
+            sink.failed_peers(),
+            vec![addr(&c), addr(&d), addr(&d)],
+            "legacy relays record every failure, like main: no deduplication"
+        );
+        assert!(
+            sink.untrained.lock().is_empty(),
+            "legacy mode holds no pending NotFound"
+        );
     }
 
     #[test]
@@ -1133,7 +1294,6 @@ mod tests {
     #[test]
     fn disabled_recorder_records_nothing() {
         let mut rec = RouteAttemptRecorder::disabled(id(), OpType::Get);
-        assert!(!rec.feeds_router());
         let a = peer(1);
         rec.record_attempt(Some(&a), AttemptFailure::Timeout, true);
         rec.record_attempt(Some(&a), AttemptFailure::NotFound, true);

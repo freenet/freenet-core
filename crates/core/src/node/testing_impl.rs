@@ -562,6 +562,14 @@ impl ControlledSimulationResult {
             .map(|ring| ring.route_failure_cause_counts())
     }
 
+    /// Ambiguous NotFounds `label`'s node dropped untrained, or `None` if the
+    /// node never published its Ring (#5657).
+    pub fn node_untrained_not_founds(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.untrained_not_found_count())
+    }
+
     /// `(failures, successes)` route events summed over every node's router
     /// (#5657). See [`Self::node_route_outcome_totals`].
     pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {

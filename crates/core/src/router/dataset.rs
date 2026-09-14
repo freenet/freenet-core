@@ -141,7 +141,9 @@ pub(crate) fn peer_hash(peer: &PeerKeyLocation) -> String {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RouteSource {
-    /// The node that started the operation (`Ring::routing_finished`).
+    /// The node that started the operation: `Ring::routing_finished`, and
+    /// since #5657 also the originator's per-attempt labels and hop-credited
+    /// successes (`Ring::record_route_event_router_only`).
     Originator,
     /// A relay hop observing its downstream peer (`record_relay_route_event`).
     Relay,
