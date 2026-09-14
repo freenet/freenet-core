@@ -4287,7 +4287,7 @@ mod route_attempt_driver_tests {
         };
         gated(
             "AttemptFailure::SendFailure",
-            "if matches!(&err, OpError::PeerDisconnected { peer } if *peer == current_target_addr) {",
+            "OpError::PeerDisconnected { peer } if *peer == current_target_addr)",
         );
         gated(
             "AttemptFailure::Timeout",
