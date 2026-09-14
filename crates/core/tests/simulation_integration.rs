@@ -12271,10 +12271,16 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     // the key, so the host is its closest candidate and its first hop; and its
     // router holds a timeout label, so an attempt really timed out against
     // the hop it was forwarded to.
+    // A node's live location can differ from the configured one in the last
+    // digits, and every other node sits at least 0.30 from the host.
     let host_loc = node_locations[0];
     let neighbors = result.node_neighbor_locations(&requester);
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
     assert!(
-        neighbors.iter().any(|loc| (loc - host_loc).abs() < 1e-9),
+        neighbors.iter().any(|loc| ring_dist(*loc, host_loc) < 0.05),
         "precondition: the requester must be connected to the host (host at {host_loc}, \
          requester neighbors {neighbors:?})"
     );
