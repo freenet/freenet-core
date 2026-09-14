@@ -141,12 +141,10 @@ fn emit_build_metadata() {
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");
 
-    // Rerun only when the commit or the working tree described above changes
-    // (see `build/git_watch.rs`, #5667). Without git, emit nothing and let
-    // cargo fall back to rerunning when any file in the package changes.
+    // Rerun only when the package sources, or the commit or working tree
+    // described above, change (see `build/git_watch.rs`, #5667).
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let paths = git_watch::rerun_if_changed_paths(std::path::Path::new(&manifest_dir));
-        for path in paths.into_iter().flatten() {
+        for path in git_watch::rerun_if_changed_paths(std::path::Path::new(&manifest_dir)) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
