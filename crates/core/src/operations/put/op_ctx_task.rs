@@ -396,10 +396,6 @@ async fn drive_client_put_inner(
         /// driver-side bookkeeping (see the note at its initialisation), so the
         /// success route event prefers this when present.
         terminal_hop: Option<PeerKeyLocation>,
-        /// Every peer an attempt of this PUT was actually forwarded to.
-        /// Carried in each later attempt's `skip_list` so the loopback relay
-        /// does not re-pick a peer that already timed out or disconnected.
-        attempted_hops: Vec<std::net::SocketAddr>,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -420,18 +416,15 @@ async fn drive_client_put_inner(
                 related_contracts: self.related.clone(),
                 value: self.value.clone(),
                 htl: self.htl,
-                // own_addr plus every peer an EARLIER attempt was actually
-                // forwarded to (#4485). `tried` holds only this driver's own
-                // guesses, which the relay never used, so it stays out. Without
-                // the forwarded hops the loopback relay re-picked the same
-                // closest peer on every retry.
+                // Only include own_addr in skip_list (matching legacy request_put).
+                // `tried` contains driver-side routing state (peers the driver
+                // selected); process_message makes its own forwarding decisions.
                 skip_list: self
                     .op_manager
                     .ring
                     .connection_manager
                     .get_own_addr()
                     .into_iter()
-                    .chain(self.attempted_hops.iter().copied())
                     .collect::<HashSet<_>>(),
             })
         }
@@ -483,14 +476,6 @@ async fn drive_client_put_inner(
 
         fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
             self.terminal_hop = hop;
-        }
-
-        fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {
-            if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
-                if !self.attempted_hops.contains(&addr) {
-                    self.attempted_hops.push(addr);
-                }
-            }
         }
     }
 
@@ -561,7 +546,6 @@ async fn drive_client_put_inner(
             crate::operations::route_attempt::AttemptOrigin::Originator,
         ),
         terminal_hop: None,
-        attempted_hops: Vec::new(),
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -8110,43 +8094,6 @@ mod route_attempt_driver_tests {
             "no peer was contacted, so no success may be credited: {:?}",
             failure_window(&op_manager)
         );
-    }
-
-    /// #4485 D: each retry's `skip_list` carries every hop an earlier attempt
-    /// was actually forwarded to, so the loopback relay cannot re-pick it.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn retries_skip_every_previously_forwarded_hop() {
-        let (op_manager, rx, peers, _guards) = op_manager_with_peers("put-skip-hops", 5).await;
-        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
-        let hops = peers.clone();
-        let skip_lists = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let seen = skip_lists.clone();
-        serve_attempts(
-            op_manager.clone(),
-            rx,
-            crate::message::TransactionType::Put,
-            move |i, msg, _| {
-                let NetMessage::V1(NetMessageV1::Put(PutMsg::Request { skip_list, .. })) = msg
-                else {
-                    panic!("expected a PUT request");
-                };
-                seen.lock().push(skip_list.clone());
-                Step {
-                    hop: Some(hops[i % hops.len()].clone()),
-                    answer: Answer::Never,
-                }
-            },
-        );
-        let _ = put(&op_manager, contract()).await;
-        let skip_lists = skip_lists.lock().clone();
-        assert!(skip_lists.len() >= 3, "{skip_lists:?}");
-        for (i, skip) in skip_lists.iter().enumerate() {
-            let mut expected: HashSet<SocketAddr> = (0..i)
-                .map(|j| peers[j % peers.len()].socket_addr().unwrap())
-                .collect();
-            expected.insert(own);
-            assert_eq!(*skip, expected, "attempt {i}");
-        }
     }
 
     /// Attempts the loopback relay never forwarded blame nobody.

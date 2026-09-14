@@ -502,13 +502,6 @@ pub(crate) trait RetryDriver {
     /// driver attribute its terminal success event to the real hop rather than
     /// its own `current_target` guess. Default: ignore.
     fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
-
-    /// Called once for EVERY attempt that resolved (terminal or not, before
-    /// `advance()`), with the peer that attempt was actually forwarded to.
-    /// Drivers whose loopback relay picks the wire hop use it to exclude the
-    /// hops already tried from the next attempt, so retries reach different
-    /// peers instead of re-picking the same best candidate. Default: ignore.
-    fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 }
 
 /// Report one non-terminal attempt outcome to the driver's recorder, if any.
@@ -519,7 +512,6 @@ fn record_attempt_failure<D: RetryDriver>(
     hop: Option<crate::ring::PeerKeyLocation>,
     failure: crate::operations::route_attempt::AttemptFailure,
 ) {
-    driver.on_attempt_hop(hop.as_ref());
     if let Some(recorder) = driver.attempt_recorder() {
         recorder.record_attempt(hop.as_ref(), failure);
     }
@@ -834,8 +826,6 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                         hop,
                         crate::operations::route_attempt::AttemptFailure::SendFailure,
                     );
-                } else {
-                    driver.on_attempt_hop(hop.as_ref());
                 }
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -878,9 +868,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         match driver.classify(reply) {
             AttemptOutcome::Terminal(value) => {
-                let hop = hop_slot.hop();
-                driver.on_attempt_hop(hop.as_ref());
-                driver.on_terminal_hop(hop);
+                driver.on_terminal_hop(hop_slot.hop());
                 return RetryLoopOutcome::Done(value);
             }
             AttemptOutcome::Retry => {

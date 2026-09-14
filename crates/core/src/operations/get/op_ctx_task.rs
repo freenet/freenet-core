@@ -446,7 +446,6 @@ async fn drive_client_get_inner(
             AttemptOrigin::Originator,
         ),
         terminal_hop: None,
-        attempted_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -884,10 +883,6 @@ struct GetRetryDriver<'a> {
     /// blame, and the address a streamed reply is claimed from;
     /// `current_target` is this driver's own guess.
     terminal_hop: Option<PeerKeyLocation>,
-    /// Every peer an attempt of this operation was actually forwarded to.
-    /// Carried into each new attempt's visited bloom so the loopback relay
-    /// does not re-pick a peer this operation already tried.
-    attempted_hops: Vec<std::net::SocketAddr>,
 }
 
 /// Terminal value for the GET driver.
@@ -1016,29 +1011,25 @@ impl RetryDriver for GetRetryDriver<'_> {
         // IS this attempt's intended destination) so the relay's fallback
         // skips gateways that already failed and converges on the same
         // gateway the client driver selected. (Stream claims and route
-        // events use the hop the loopback relay actually recorded, not
+        // labels use the hop the loopback relay actually recorded, not
         // `current_target`; see `AttemptHopRegistry`.)
         //
         // The carried bloom travels the attempt's entire forward path, so
-        // a failed peer is excluded at every hop of that attempt, not only
-        // at the loopback relay — bounded (<= MAX_RETRIES attempts) and
-        // re-keyed each retry.
+        // a failed gateway is excluded at every hop of that attempt, not
+        // only at the loopback relay — bounded (empty-ring originators,
+        // <= MAX_RETRIES attempts) and re-keyed each retry.
         //
-        // Not gated on the empty ring (#4485). On a non-empty ring the
-        // loopback relay's `relay_advance_to_next_peer` builds its candidate
-        // set from this bloom alone, so without the carry every retry
-        // re-picked the SAME best candidate while `current_target` moved on:
-        // the retry budget was spent re-asking a peer that had just answered
-        // NotFound or timed out. Also carry every hop an earlier attempt was
-        // actually forwarded to, which may differ from the client's `tried`
-        // guesses.
-        carry_tried_into_visited(
-            &mut self.attempt_visited,
-            &self.tried,
-            self.current_target.socket_addr(),
-        );
-        for hop in &self.attempted_hops {
-            self.attempt_visited.mark_visited(*hop);
+        // Gated on the empty-ring case so normal-path retry routing
+        // semantics are unchanged. The gate re-reads `connection_count()`
+        // and can race ring promotion between attempts; both directions
+        // degrade to a single wasted or spuriously-failed attempt (never
+        // a loop or hang) — see the #4364 review for the trace.
+        if self.op_manager.ring.connection_manager.connection_count() == 0 {
+            carry_tried_into_visited(
+                &mut self.attempt_visited,
+                &self.tried,
+                self.current_target.socket_addr(),
+            );
         }
         tx
     }
@@ -1104,14 +1095,6 @@ impl RetryDriver for GetRetryDriver<'_> {
 
     fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
         self.terminal_hop = hop;
-    }
-
-    fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {
-        if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
-            if !self.attempted_hops.contains(&addr) {
-                self.attempted_hops.push(addr);
-            }
-        }
     }
 }
 
@@ -2383,7 +2366,6 @@ async fn drive_sub_op_get(
             crate::node::network_status::OpType::Get,
         ),
         terminal_hop: None,
-        attempted_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -4450,21 +4432,10 @@ mod tests {
              the fresh attempt_visited bloom so gateway failover reaches \
              the wire (#4361 / #4364 H1)"
         );
-        // Superseded by #4485: the carry used to be gated on the empty ring
-        // (#4364) to leave normal-path retries unchanged, but on a non-empty
-        // ring that made every retry re-pick the same best candidate. It now
-        // applies on every ring, and also carries each forwarded hop;
-        // behaviourally pinned by
-        // `route_attempt_driver_tests::retries_reach_distinct_peers_via_the_relay_selection`.
         assert!(
-            !nat_body.contains("connection_count()"),
-            "the retry carry must NOT be gated on the empty ring (#4485): \
-             gated, a non-empty-ring GET re-asks the same first hop every retry"
-        );
-        assert!(
-            nat_body.contains("self.attempted_hops"),
-            "new_attempt_tx must also exclude every hop an earlier attempt \
-             was actually forwarded to (#4485)"
+            nat_body.contains("connection_count()"),
+            "the failover carry must stay gated on the empty-ring case so \
+             normal-path retry routing semantics are unchanged (#4364)"
         );
     }
 
@@ -5131,7 +5102,6 @@ mod tests {
                 crate::node::network_status::OpType::Get,
             ),
             terminal_hop: None,
-            attempted_hops: Vec::new(),
         };
 
         assert!(
@@ -7900,7 +7870,6 @@ mod route_attempt_driver_tests {
                 AttemptOrigin::Originator,
             ),
             terminal_hop: None,
-            attempted_hops: Vec::new(),
         }
     }
 
@@ -8065,73 +8034,6 @@ mod route_attempt_driver_tests {
         // NotFounds and must not train them either.
         op_manager.ring.commit_state_write(&key_for(instance_id), 3);
         assert!(failure_window(&op_manager).is_empty());
-    }
-
-    /// #4485 D: on a non-empty ring, each retry must reach a DIFFERENT peer.
-    /// The script picks every attempt's hop with the real relay selection
-    /// (`relay_advance_to_next_peer` over the request's own visited bloom,
-    /// exactly as the originator-loopback relay does). Before the fix the bloom
-    /// did not carry the tried peers, so every retry re-picked the same best
-    /// candidate.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn retries_reach_distinct_peers_via_the_relay_selection() {
-        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-diversify", 6).await;
-        let instance_id = ContractInstanceId::new([49u8; 32]);
-        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
-        let relay_view = op_manager.clone();
-        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let seen = hops.clone();
-        let served = serve_attempts(
-            op_manager.clone(),
-            rx,
-            crate::message::TransactionType::Get,
-            move |_, msg, _| {
-                let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { id, visited, .. })) = msg
-                else {
-                    panic!("expected a GET request");
-                };
-                let mut relay_visited = visited.clone().with_transaction(id);
-                relay_visited.mark_visited(own);
-                let mut tried = vec![own];
-                let mut retries = 0;
-                let (peer, peer_addr) = relay_advance_to_next_peer(
-                    &relay_view,
-                    &instance_id,
-                    &mut tried,
-                    &mut retries,
-                    &relay_visited,
-                )
-                .expect("the relay finds a candidate");
-                seen.lock().push(peer_addr);
-                Step {
-                    hop: Some(peer),
-                    answer: Answer::Reply(not_found(msg, instance_id)),
-                }
-            },
-        );
-
-        // Start exactly as the client driver does: the initial target is the
-        // ring's best candidate.
-        let client_tx = Transaction::new::<GetMsg>();
-        let initial = op_manager
-            .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
-            .into_iter()
-            .next()
-            .unwrap();
-        let mut driver = client_driver(&op_manager, client_tx, instance_id, initial);
-        driver.tried.insert(0, own);
-        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
-        assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
-        let hops = hops.lock().clone();
-        assert_eq!(hops.len(), served.load(Ordering::SeqCst));
-        assert!(hops.len() >= 3, "several attempts: {hops:?}");
-        let distinct: std::collections::HashSet<_> = hops.iter().collect();
-        assert_eq!(
-            distinct.len(),
-            hops.len(),
-            "every retry must reach a peer not tried earlier in this GET: {hops:?}"
-        );
     }
 
     /// #4485 E: a streamed reply is claimed from the hop the attempt was
