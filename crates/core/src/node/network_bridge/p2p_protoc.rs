@@ -53,6 +53,11 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
+mod zombie_sweep;
+
+use zombie_sweep::ZombieSweepState;
+#[cfg(test)]
+use zombie_sweep::{TransportActivity, is_zombie};
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -520,67 +525,18 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
+    /// When the remote last sent a request over this transport (see
+    /// `zombie_sweep::is_link_use_request`), shared with the transport's
+    /// `peer_connection_listener`, which stamps each request as it receives it.
+    /// The zombie sweep judges a transport that was never promoted to the ring
+    /// by this rather than by `created_at`, so a link the remote is still
+    /// sending requests over is not collected out from under it (#5654), within
+    /// the per-IP and global caps in `zombie_sweep`.
+    link_use: zombie_sweep::LinkUseStamp,
     /// The remote peer's negotiated protocol version, if known.
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
-}
-
-/// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring, not pending reservation, and not a gateway.
-///
-/// Gateway connections are exempt below a 1-hour absolute cap because they
-/// are intentionally transient (never promoted to ring) but actively needed
-/// for routing (#3595).
-///
-/// Two thresholds for non-gateway connections:
-/// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
-///
-/// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
-///   reservation. Must be greater than `PENDING_RESERVATION_TTL` (60s) so that a
-///   connection isn't immediately killed after its reservation expires. Previous
-///   hardcoded value of 300s caused gateways to accumulate ~250 zombie transports,
-///   overwhelming the packet processing channel and dropping keepalive packets.
-/// - `absolute_zombie_threshold` = `transient_ttl * 6`: overrides `has_pending` to
-///   break the refresh cycle where `connection_maintenance()` perpetually renews
-///   pending reservations on gateway transports. Previous hardcoded value of 600s
-///   allowed zombie transports to linger far too long.
-fn is_zombie(
-    created_at_elapsed: Duration,
-    in_ring: bool,
-    has_pending: bool,
-    is_gateway: bool,
-    transient_ttl: Duration,
-) -> bool {
-    let zombie_threshold = transient_ttl * 3;
-    let absolute_zombie_threshold = transient_ttl * 6;
-
-    if in_ring {
-        return false;
-    }
-    // Gateway transient connections are intentionally not promoted to ring,
-    // but the node needs them for routing. Without this exemption, gateways
-    // enter a zombie→prune→reconnect→zombie death spiral that breaks all
-    // streaming transfers (#3595).
-    //
-    // The exemption is time-bounded: truly dead gateway connections (no
-    // traffic for 1 hour) are still cleaned up. The transport-level idle
-    // timeout is the primary backstop, but this ensures no permanent leaks.
-    /// Gateway connections get a generous exemption window (1 hour) because they
-    /// are intentionally transient but needed for routing. The transport-level
-    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
-    /// gateways; this threshold is the safety net.
-    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
-    if is_gateway && created_at_elapsed < GATEWAY_ZOMBIE_EXEMPTION {
-        return false;
-    }
-    if created_at_elapsed > zombie_threshold && !has_pending {
-        return true;
-    }
-    if created_at_elapsed > absolute_zombie_threshold {
-        return true;
-    }
-    false
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -1505,6 +1461,7 @@ impl P2pConnManager {
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
         // Monitor both the event stream AND the UDP listen task.
@@ -1539,43 +1496,52 @@ impl P2pConnManager {
                     ));
                 },
 
-                maybe_result = StreamExt::next(&mut select_stream) => {
-                    let Some(result) = maybe_result else {
-                        break;
-                    };
-                    result
+                // Also wakes for a zombie sweep backlog deadline, so a backlog
+                // drains on a quiet node (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                    match wake {
+                        zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
+                        zombie_sweep::LoopWake::Event(None) => break,
+                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                    }
                 },
             };
 
-            loop_iteration_count += 1;
+            let event = if let Some(result) = result {
+                loop_iteration_count += 1;
 
-            let event_type = match &result {
-                priority_select::SelectResult::Notification(_) => "notification",
-                priority_select::SelectResult::OpExecution(_) => "op_execution",
-                priority_select::SelectResult::PeerConnection(_) => "peer_connection",
-                priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
-                priority_select::SelectResult::Handshake(_) => "handshake",
-                priority_select::SelectResult::NodeController(_) => "node_controller",
-                priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
-                priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                let event_type = match &result {
+                    priority_select::SelectResult::Notification(_) => "notification",
+                    priority_select::SelectResult::OpExecution(_) => "op_execution",
+                    priority_select::SelectResult::PeerConnection(_) => "peer_connection",
+                    priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
+                    priority_select::SelectResult::Handshake(_) => "handshake",
+                    priority_select::SelectResult::NodeController(_) => "node_controller",
+                    priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
+                    priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                };
+
+                let process_start = Instant::now();
+
+                // Process the result using the existing handler
+                let event = ctx
+                    .process_select_result(result, &mut state, &handshake_cmd_sender)
+                    .await?;
+
+                let elapsed = process_start.elapsed();
+                if elapsed > SLOW_EVENT_THRESHOLD {
+                    slow_event_count += 1;
+                    tracing::warn!(
+                        event_type,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Slow event loop iteration"
+                    );
+                }
+                event
+            } else {
+                // Woken only for a zombie sweep backlog slice; it runs below.
+                EventResult::Continue
             };
-
-            let process_start = Instant::now();
-
-            // Process the result using the existing handler
-            let event = ctx
-                .process_select_result(result, &mut state, &handshake_cmd_sender)
-                .await?;
-
-            let elapsed = process_start.elapsed();
-            if elapsed > SLOW_EVENT_THRESHOLD {
-                slow_event_count += 1;
-                tracing::warn!(
-                    event_type,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Slow event loop iteration"
-                );
-            }
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
@@ -1618,52 +1584,19 @@ impl P2pConnManager {
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
 
-                // Zombie transport cleanup: remove connections older than 3× transient_ttl
-                // that haven't been promoted to ring and have no pending reservation.
-                // An absolute threshold of 6× transient_ttl overrides pending reservations
-                // to catch gateway transports stuck in a pending-refresh cycle.
-                //
-                // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
-                // instead of drop_connection_by_addr to avoid a circular deadlock
-                // with the handshake driver (#3519). We also cap the batch size to
-                // limit event loop latency — each zombie cleanup involves topology
-                // pruning and orphaned transaction handling. With a 100ms timeout
-                // per zombie, 64 zombies = ~6.4s worst case per cycle.
-                // Remaining zombies will be cleaned up in the next 30s cycle.
-                const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
-                let transient_ttl = op_manager.ring.connection_manager.transient_ttl();
-                let zombie_addrs: Vec<SocketAddr> = ctx
-                    .connections
-                    .iter()
-                    .filter(|(addr, entry)| {
-                        let is_gateway = ctx
-                            .gateways
-                            .iter()
-                            .any(|gw| gw.socket_addr() == Some(**addr));
-                        is_zombie(
-                            entry.created_at.elapsed(),
-                            op_manager.ring.connection_manager.is_in_ring(**addr),
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .has_connection_or_pending(**addr),
-                            is_gateway,
-                            transient_ttl,
-                        )
-                    })
-                    .map(|(addr, _)| *addr)
-                    .take(MAX_ZOMBIE_CLEANUP_PER_CYCLE)
-                    .collect();
-                if !zombie_addrs.is_empty() {
-                    tracing::info!(
-                        zombie_count = zombie_addrs.len(),
-                        "Cleaning up zombie transports (not promoted to ring)"
-                    );
+                // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
+                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports. Both this tick and
+                // the backlog check below use `ZombieSweepState::slice_due`, so no
+                // slice starts within the required spacing of the previous one.
+                if zombie_sweep_state.slice_due(Instant::now(), true) {
+                    ctx.sweep_zombie_transports(
+                        &handshake_cmd_sender,
+                        &mut zombie_sweep_state,
+                        true,
+                    )
+                    .await;
                 }
-                for addr in &zombie_addrs {
-                    ctx.drop_zombie_connection(*addr, &handshake_cmd_sender)
-                        .await;
-                }
+                zombie_sweep_state.report(Instant::now());
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1691,6 +1624,9 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
+            } else if zombie_sweep_state.slice_due(Instant::now(), false) {
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
+                    .await;
             }
 
             match event {
@@ -3388,6 +3324,7 @@ async fn peer_connection_listener(
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
+    link_use: zombie_sweep::LinkUseStamp,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3528,6 +3465,10 @@ async fn peer_connection_listener(
                                 msg_type = %net_message,
                                 "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
                             );
+                            // Stamp a request BEFORE queueing it: the event loop
+                            // may not dequeue it for a while, and the zombie sweep
+                            // must already see this transport as in use (#5654).
+                            zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -4419,6 +4360,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4430,6 +4372,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4450,12 +4393,20 @@ pub(crate) mod tests {
     const TEST_TRANSIENT_TTL: Duration = Duration::from_secs(30);
     // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s
 
+    /// A transport whose remote has sent no request since it was established.
+    /// Every test below uses this, so each keeps its pre-#5654 meaning: for such
+    /// a transport the idle-time thresholds are exactly the old age thresholds.
+    /// The #5654 behaviour is tested in `zombie_sweep::tests`.
+    fn never_used(age: Duration) -> super::TransportActivity {
+        super::TransportActivity::never_used(age)
+    }
+
     #[test]
     fn test_zombie_detection_ignores_young_connections() {
         // Connection younger than zombie threshold (90s) should never be a zombie
         let elapsed = Duration::from_secs(60);
         assert!(
-            !super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Young connection should not be zombie"
         );
     }
@@ -4465,7 +4416,7 @@ pub(crate) mod tests {
         // In-ring connection should never be a zombie regardless of age
         let elapsed = Duration::from_secs(400);
         assert!(
-            !super::is_zombie(elapsed, true, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, false, false, TEST_TRANSIENT_TTL),
             "Ring connection should not be zombie"
         );
     }
@@ -4475,7 +4426,7 @@ pub(crate) mod tests {
         // Old connection that isn't in ring, no pending → zombie
         let elapsed = Duration::from_secs(91); // > 90s
         assert!(
-            super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Old unpromoted connection should be zombie"
         );
     }
@@ -4485,7 +4436,7 @@ pub(crate) mod tests {
         // Old connection not in ring, but has pending reservation → not zombie (under absolute)
         let elapsed = Duration::from_secs(120); // > 90s but < 180s
         assert!(
-            !super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Connection with pending reservation below absolute threshold should not be zombie"
         );
     }
@@ -4496,7 +4447,7 @@ pub(crate) mod tests {
         // The absolute threshold (180s) overrides has_pending
         let elapsed = Duration::from_secs(181);
         assert!(
-            super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Absolute threshold should override has_pending"
         );
     }
@@ -4506,7 +4457,7 @@ pub(crate) mod tests {
         // Connection 181s old, in_ring=true → NOT zombie
         let elapsed = Duration::from_secs(181);
         assert!(
-            !super::is_zombie(elapsed, true, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, true, false, TEST_TRANSIENT_TTL),
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
@@ -4515,7 +4466,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_threshold() {
         // Exactly 90s, no pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(90),
+            never_used(Duration::from_secs(90)),
             false,
             false,
             false,
@@ -4527,7 +4478,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_absolute() {
         // Exactly 180s, has_pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(180),
+            never_used(Duration::from_secs(180)),
             false,
             true,
             false,
@@ -4541,14 +4492,14 @@ pub(crate) mod tests {
         // classified as zombies within the 1-hour gateway exemption (#3595).
         let elapsed = Duration::from_secs(400); // Well past normal absolute threshold (180s)
         assert!(
-            !super::is_zombie(elapsed, false, false, true, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection should not be zombie within exemption window"
         );
 
         // But truly stale gateway connections (>1 hour) ARE cleaned up.
         let stale = Duration::from_secs(3601);
         assert!(
-            super::is_zombie(stale, false, false, true, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(stale), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection past 1-hour cap should be zombie"
         );
     }
@@ -4560,7 +4511,7 @@ pub(crate) mod tests {
         let large_ttl = Duration::from_secs(120);
         // 200s: not zombie even without pending (< 360s)
         assert!(!super::is_zombie(
-            Duration::from_secs(200),
+            never_used(Duration::from_secs(200)),
             false,
             false,
             false,
@@ -4568,7 +4519,7 @@ pub(crate) mod tests {
         ));
         // 400s: zombie without pending (> 360s)
         assert!(super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             false,
             false,
@@ -4576,7 +4527,7 @@ pub(crate) mod tests {
         ));
         // 400s with pending: not zombie (< 720s)
         assert!(!super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             true,
             false,
@@ -4584,7 +4535,7 @@ pub(crate) mod tests {
         ));
         // 721s: zombie even with pending (> 720s)
         assert!(super::is_zombie(
-            Duration::from_secs(721),
+            never_used(Duration::from_secs(721)),
             false,
             true,
             false,

@@ -1050,6 +1050,8 @@ impl P2pConnManager {
             conn_map_size = self.connections.len(),
             "[CONN_TRACK] INSERT: adding connection to HashMap"
         );
+        let now = Instant::now();
+        let link_use = zombie_sweep::LinkUseStamp::new(now);
         self.connections.insert(
             peer_addr,
             ConnectionEntry {
@@ -1058,7 +1060,8 @@ impl P2pConnManager {
                 // when the peer sends its first message (e.g., ConnectRequest)
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
-                created_at: Instant::now(),
+                created_at: now,
+                link_use: link_use.clone(),
                 remote_version,
             },
         );
@@ -1107,6 +1110,7 @@ impl P2pConnManager {
                 conn_events,
                 conn_id,
                 outbound_mix,
+                link_use,
             )
             .await;
         });
