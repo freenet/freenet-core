@@ -162,6 +162,12 @@ pub mod dev_tool {
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
+    // Deterministic streaming PUT relay stream-failure injection, and the
+    // count of relay failures reported upstream (#5671).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_FAILURES_REPORTED;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::relay_stream_fault_injection as put_relay_stream_fault_injection;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 
