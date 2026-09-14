@@ -721,9 +721,6 @@ impl Ring {
         // refits inline once its window has turned over (#4811). There is no periodic
         // refit task — `refit_router_periodically` was deleted with this change,
         // because polling was the only thing it did.
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-        crate::node::network_status::set_router(router.clone());
-
         // Interval for topology snapshot registration (1 second in test mode)
         // Registers subscription topology with the global registry for validation
         #[cfg(any(test, feature = "testing"))]
@@ -756,6 +753,17 @@ impl Ring {
         // immediate upstream hop, so its map is sized from this node's
         // OWN connection cap rather than a hardcoded default.
         let max_connections = connection_manager.max_connections;
+        // Built here, after the time source and the connection cap it depends
+        // on: the hierarchical routing estimator's horizons run on the ring's
+        // `InstantTimeSrc`, which reads tokio's clock (so they advance under a
+        // paused tokio runtime, but do NOT follow a hosting-only time override),
+        // and its peer tables are sized from this node's own `max_connections`.
+        let router = Arc::new(RwLock::new(
+            Router::new(&[])
+                .with_time_source(time_source.clone())
+                .with_max_connections(max_connections),
+        ));
+        crate::node::network_status::set_router(router.clone());
         let ring = Ring {
             max_hops_to_live,
             router,
