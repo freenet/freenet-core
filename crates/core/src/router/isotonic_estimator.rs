@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 const MIN_POINTS_FOR_REGRESSION: usize = 5;
 
 /// Maximum number of raw data points retained by the global regression.
-/// Once reached, each new point evicts the oldest via `remove_points`.
+/// Once reached, each new point evicts the oldest.
 const MAX_REGRESSION_POINTS: usize = 500;
 
 /// Percentage of the current window that must turn over before
@@ -16,9 +16,13 @@ const MAX_REGRESSION_POINTS: usize = 500;
 /// Compared as `events_since_refit * 100 > len * REFIT_STALENESS_PERCENT` — a
 /// multiplication rather than a division, so the threshold is exact with no
 /// truncation. Over a saturated window (`MAX_REGRESSION_POINTS`) this earns a
-/// refit every 51st event: frequent enough that incremental PAV drift stays
-/// small, rare enough that the O(n log n) refit amortises to a handful of
-/// operations per event.
+/// refit every 51st event, rare enough that the O(n log n) refit amortises to a
+/// handful of operations per event.
+///
+/// Since #5658 the refit no longer repairs the GLOBAL curve, which is rebuilt
+/// exactly on every event (see `IsotonicEstimator::sorted_points`). What it still
+/// does is re-anchor every peer's EWMA to the current curve and prune peers that
+/// left the window; see [`IsotonicEstimator::refit_if_stale`].
 ///
 /// This is the WHOLE cadence, not a lower bound on it. [`IsotonicEstimator::add_event`]
 /// evaluates the trigger inline, and it is the only writer of both
@@ -41,9 +45,9 @@ const MAX_REGRESSION_POINTS: usize = 500;
 /// minutes" to zero. Nothing that used to be refit no longer is.
 ///
 /// That the timer was never the real trigger is also why dropping it costs no
-/// accuracy: drift is produced by `add_event`'s incremental fitting, so an
-/// estimator receiving no events is not drifting, and refitting it on a timer
-/// would rebuild an identical fit from identical data.
+/// accuracy: staleness is produced by `add_event`, so an estimator receiving no
+/// events is not going stale, and refitting it on a timer would rebuild an
+/// identical fit from identical data.
 const REFIT_STALENESS_PERCENT: usize = 10;
 
 /// EWMA smoothing factor for per-peer adjustments.
@@ -68,9 +72,10 @@ const MULTIPLICATIVE_MIN_BASE: f64 = 1e-9;
 /// outcome of the peer's previous requests.
 ///
 /// The global regression uses a rolling window: once `MAX_REGRESSION_POINTS`
-/// raw points have been accumulated, each new point evicts the oldest via
-/// `remove_points`. Per-peer adjustments use an exponentially-weighted moving
-/// average (EWMA) so recent events have more influence than old ones.
+/// raw points have been accumulated, each new point evicts the oldest and the
+/// fit is rebuilt over the window. Per-peer adjustments use an
+/// exponentially-weighted moving average (EWMA) so recent events have more
+/// influence than old ones.
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct IsotonicEstimator {
@@ -81,7 +86,7 @@ pub(crate) struct IsotonicEstimator {
     #[serde(skip)]
     adjustment_mode: AdjustmentMode,
     /// Raw input events in insertion order. When len exceeds
-    /// `MAX_REGRESSION_POINTS`, the oldest is evicted via `remove_points`.
+    /// `MAX_REGRESSION_POINTS`, the oldest is evicted.
     ///
     /// Retains the whole [`IsotonicEvent`], not just its `(distance, result)`
     /// point, because [`Self::refit`] must rebuild `peer_adjustments` too — and
@@ -91,6 +96,26 @@ pub(crate) struct IsotonicEstimator {
     /// pruned from `peer_adjustments`.
     #[serde(skip)]
     raw_events: VecDeque<IsotonicEvent>,
+    /// The `(distance, result)` points of `raw_events`, kept sorted by distance.
+    /// `global_regression` is rebuilt from this on every event.
+    ///
+    /// WHY NOT `add_points` / `remove_points` (#5658). `pav_regression` 0.7.0's
+    /// incremental maintenance is approximate, and not slightly: `remove_points`
+    /// subtracts the evicted point from the CLOSEST pooled aggregate by x, which
+    /// need not be the aggregate that point was pooled into. When it is the wrong
+    /// one, the subtraction produces an aggregate no data could — observed on a
+    /// failure-probability fit as `(distance = -0.062, failure = -5.0)`. Routing
+    /// read that fit, and every peer's EWMA was trained against it, for up to 50
+    /// events until the next refit. Measured on failure-shaped data (binary
+    /// outcomes, 500-point window, refit every 51st event): 19% of states held an
+    /// out-of-range aggregate, and interpolation was off by as much as 2.16.
+    ///
+    /// Kept sorted so the rebuild does not pay for sorting shuffled input. In
+    /// isolation (release, 500-point window, `pav_regression` 0.7.0) the rebuild
+    /// costs ~9us per event against ~0.6us for the incremental pair, and ~40us
+    /// for a rebuild from unsorted points.
+    #[serde(skip)]
+    sorted_points: Vec<Point<f64>>,
     /// Monotonic direction of the fit, retained so [`Self::refit`] can rebuild
     /// the same way [`Self::new_with_mode`] built it.
     #[serde(skip)]
@@ -217,13 +242,34 @@ impl IsotonicEstimator {
             Self::fit(&raw_events, estimator_type, adjustment_mode)
                 .expect("Failed to create isotonic regression");
 
+        let mut sorted_points: Vec<Point<f64>> = Vec::with_capacity(raw_events.len() + 1);
+        for event in &raw_events {
+            insert_sorted(
+                &mut sorted_points,
+                Point::new(event.route_distance().as_f64(), event.result),
+            );
+        }
+
         IsotonicEstimator {
             global_regression,
             peer_adjustments,
             adjustment_mode,
             raw_events,
+            sorted_points,
             estimator_type,
             events_since_refit: 0,
+        }
+    }
+
+    /// Build the global regression over `points`, in this estimator's direction.
+    fn fit_points(
+        points: &[Point<f64>],
+        estimator_type: EstimatorType,
+    ) -> Result<IsotonicRegression<f64>, pav_regression::isotonic_regression::IsotonicRegressionError>
+    {
+        match estimator_type {
+            EstimatorType::Positive => IsotonicRegression::new_ascending(points),
+            EstimatorType::Negative => IsotonicRegression::new_descending(points),
         }
     }
 
@@ -257,10 +303,7 @@ impl IsotonicEstimator {
             .map(|event| Point::new(event.route_distance().as_f64(), event.result))
             .collect();
 
-        let global_regression = match estimator_type {
-            EstimatorType::Positive => IsotonicRegression::new_ascending(&points),
-            EstimatorType::Negative => IsotonicRegression::new_descending(&points),
-        }?;
+        let global_regression = Self::fit_points(&points, estimator_type)?;
 
         let mut peer_adjustments: HashMap<PeerKeyLocation, Adjustment> = HashMap::new();
 
@@ -295,11 +338,17 @@ impl IsotonicEstimator {
     /// more than `REFIT_STALENESS_NUMERATOR/REFIT_STALENESS_DENOMINATOR` of the
     /// window has turned over since the last refit. Returns whether a refit ran.
     ///
-    /// WHY THIS EXISTS: `add_event` maintains the fit incrementally
-    /// (`add_points` / `remove_points`). Incremental pool-adjacent-violators
-    /// maintenance is an approximation — the pooled blocks it leaves depend on
-    /// insertion order, so the fit drifts from the one a batch PAV pass over the
-    /// same points would produce. Refitting restores the exact fit.
+    /// WHY THIS EXISTS: `add_event` keeps the global curve exact (#5658), but it
+    /// updates each peer's EWMA only with the residual against the curve AS IT
+    /// STOOD at that event, and never removes a peer. As the window turns over
+    /// the curve moves under those residuals, and peers that left the window
+    /// keep their entries. Refitting re-derives every peer's adjustment against
+    /// the current curve and bounds the map to the window.
+    ///
+    /// Until #5658 this was also what repaired the global curve itself, which
+    /// was maintained with `pav_regression`'s approximate `add_points` /
+    /// `remove_points` and could be badly wrong between refits — see
+    /// `sorted_points`.
     ///
     /// It is deliberately driven by DATA TURNOVER rather than a timer: a refit
     /// on an idle router is pure waste (nothing changed), while a busy router
@@ -421,9 +470,11 @@ impl IsotonicEstimator {
     ///   poll an in-memory counter.
     ///
     /// COST. The refit is amortised over the events that earn it: one O(n log n)
-    /// batch fit per ~51 events on a saturated window, on a path that already
-    /// pays O(k log k) twice per call (`add_points` and `remove_points` each
-    /// clone, sort, and re-run PAV). Measured on this estimator at a saturated
+    /// batch fit per ~51 events on a saturated window. The figures below predate
+    /// #5658, when each call patched the fit with `add_points` / `remove_points`;
+    /// each call now rebuilds the global regression from the sorted window
+    /// instead, ~9µs in isolation against ~0.6µs for that pair (see
+    /// `sorted_points`). Measured on this estimator at a saturated
     /// 500-point window (release build, 20-50 distinct peers — a realistic
     /// neighbour set): one refit costs ~150µs, `add_event` costs ~39µs without it,
     /// and the amortised overhead is ~1.5-5.7µs/event, i.e. **+4-14% on a call
@@ -451,40 +502,55 @@ impl IsotonicEstimator {
     pub fn add_event(&mut self, event: IsotonicEvent) {
         self.add_event_incremental(event);
 
-        // Restore the exact batch fit once this event has turned over enough of
-        // the window. Runs last so the incremental state above is complete and
-        // correct on the ~50/51 events that do not earn a refit; on the one that
-        // does, `refit` rebuilds both halves from `raw_events` and supersedes it.
+        // Re-anchor the peer adjustments once this event has turned over enough
+        // of the window. Runs last so the incremental state above is complete on
+        // the ~50/51 events that do not earn a refit; on the one that does,
+        // `refit` rebuilds both halves from `raw_events` and supersedes it.
         self.refit_if_stale();
     }
 
     /// The incremental half of [`Self::add_event`]: extend the window by one
-    /// event and patch the existing fit in place, WITHOUT considering a refit.
+    /// event, rebuild the global fit over it, and update this peer's EWMA,
+    /// WITHOUT considering a refit.
     ///
-    /// Split out because this is the half that DRIFTS. Keeping it callable on its
-    /// own is what lets `incremental_fit_drifts_from_batch_and_refit_repairs_it`
-    /// and `refit_prunes_peers_that_fell_out_of_the_window` build a genuinely
-    /// refit-free fit to measure against a batch build — the tripwire that
-    /// justifies the refit existing at all, and the proof that pruning is needed.
-    /// Through `add_event` they no longer can: it repairs the drift as it goes,
-    /// which is the entire point of #4811.
+    /// Split out so tests can observe the states BETWEEN refits, which is what
+    /// routing reads on ~50 of every 51 events.
+    /// `incremental_fit_matches_batch_after_every_event` pins that the global
+    /// curve is exact in those states (#5658), and
+    /// `refit_prunes_peers_that_fell_out_of_the_window` that the peer map is not
+    /// bounded without a refit. Through `add_event` neither could be seen: it
+    /// refits as it goes, which is the point of #4811.
     fn add_event_incremental(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
         let point = Point::new(route_distance.as_f64(), event.result);
 
-        // Add the new point to the regression and the raw-event FIFO. This keeps
-        // the fit usable immediately; `refit_if_stale` later restores the exact
-        // batch fit once enough of the window has turned over.
-        self.global_regression.add_points(&[point]);
+        // Extend the window by one point, evict the oldest if it is full, and
+        // rebuild the global fit from the window. The rebuild is what keeps the
+        // fit exact: see `sorted_points` for why the library's incremental
+        // `add_points` / `remove_points` cannot be used here (#5658).
+        insert_sorted(&mut self.sorted_points, point);
         self.raw_events.push_back(event.clone());
         self.events_since_refit += 1;
 
-        // Evict the oldest event if the window is full.
         if self.raw_events.len() > MAX_REGRESSION_POINTS {
             if let Some(oldest) = self.raw_events.pop_front() {
-                let oldest_point = Point::new(oldest.route_distance().as_f64(), oldest.result);
-                self.global_regression.remove_points(&[oldest_point]);
+                remove_sorted(
+                    &mut self.sorted_points,
+                    Point::new(oldest.route_distance().as_f64(), oldest.result),
+                );
             }
+        }
+
+        match Self::fit_points(&self.sorted_points, self.estimator_type) {
+            Ok(regression) => self.global_regression = regression,
+            // Unreachable for the same reason as in `refit`: the only error
+            // variant requires `intersect_origin`, which is never set. Keeping
+            // the previous fit beats panicking on the relay hot path.
+            Err(error) => tracing::warn!(
+                %error,
+                events = self.raw_events.len(),
+                "Isotonic fit failed; keeping previous fit"
+            ),
         }
 
         if self.global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize {
@@ -651,6 +717,31 @@ impl IsotonicEstimator {
                 (event.route_distance().as_f64(), event.result)
             })
             .collect()
+    }
+}
+
+/// Insert `point` into `points`, keeping them ordered by x.
+fn insert_sorted(points: &mut Vec<Point<f64>>, point: Point<f64>) {
+    let index = points.partition_point(|existing| existing.x().total_cmp(point.x()).is_le());
+    points.insert(index, point);
+}
+
+/// Remove one point equal to `point` (same x and y) from x-ordered `points`.
+///
+/// Points with equal coordinates are interchangeable to the fit, so which of
+/// several duplicates goes does not matter. A missing point is a bookkeeping
+/// bug in the caller rather than a runtime condition, hence the debug assertion.
+fn remove_sorted(points: &mut Vec<Point<f64>>, point: Point<f64>) {
+    let start = points.partition_point(|existing| existing.x().total_cmp(point.x()).is_lt());
+    let found = points[start..]
+        .iter()
+        .take_while(|existing| existing.x().total_cmp(point.x()).is_eq())
+        .position(|existing| existing.y().total_cmp(point.y()).is_eq());
+    match found {
+        Some(offset) => {
+            points.remove(start + offset);
+        }
+        None => debug_assert!(false, "evicted point missing from the sorted window"),
     }
 }
 
@@ -1487,85 +1578,98 @@ mod tests {
         );
     }
 
+    /// Regression test for #5658: the global fit must equal a batch fit over the
+    /// current window after EVERY event, including every eviction.
+    ///
+    /// Until #5658 the window was maintained with `pav_regression`'s
+    /// `add_points` / `remove_points`, which are approximate (0.7.0):
+    /// `remove_points` subtracts the evicted point from the CLOSEST pooled
+    /// aggregate by x, which need not be the aggregate it was pooled into. Once
+    /// it lands in the wrong one, the subtraction yields an aggregate no data
+    /// could produce — observed while diagnosing the #5658 flaky router test, a
+    /// failure-probability curve
+    /// holding the point `(distance = -0.062, failure = -5.0)`, and a peer EWMA
+    /// of +18 learned against it. The periodic refit repaired that only every
+    /// 51st event, and routing read the corrupted fit in between: on
+    /// failure-shaped data like the stream below, roughly one state in five
+    /// carried an out-of-range aggregate, with interpolation errors up to 2.16
+    /// in probability units.
+    ///
+    /// The previous version of this test asserted the OPPOSITE (that the
+    /// incremental fit drifts, as a tripwire for the refit's existence) and
+    /// checked only `drift > 1e-9`, so it never measured how large the drift was.
     #[test]
-    fn incremental_fit_drifts_from_batch_and_refit_repairs_it() {
-        // This test justifies the refit's existence, and is a tripwire: if
-        // `pav_regression` ever makes the incremental path exact, the first
-        // assertion fails and `refit_if_stale` can be deleted.
-        //
-        // Why drift happens (pav_regression 0.7.0):
-        //   - `add_points` re-runs `isotonic()` over `self.points`, which are the
-        //     already-POOLED blocks, not the raw inputs. Pooling is lossy, so the
-        //     result depends on insertion order.
-        //   - `remove_points` is explicitly approximate: it subtracts the evicted
-        //     point's influence from the CLOSEST aggregate by x, which need not be
-        //     the aggregate that point actually contributed to.
-        // Eviction is the worse of the two, so drive the window past
-        // MAX_REGRESSION_POINTS to exercise it — the steady state of a busy peer.
-        //
-        // The regression's x-axis is controlled exactly via `event_at_distance`
-        // (see its docs): the contract is placed at ring offset x FROM the peer,
-        // so `route_distance() == x` whatever the random peer location is. Without
-        // that, `Location::distance`'s fold turns the intended geometry into a
-        // peer-dependent tent transform and the data below is not what it reads as.
+    fn incremental_fit_matches_batch_after_every_event() {
         let peer = PeerKeyLocation::random();
-        let make = |x: f64, y: f64| event_at_distance(&peer, x, y);
 
-        // Deliberately non-monotonic in y so PAV must pool, with enough points to
-        // force eviction of the oldest.
-        let events: Vec<IsotonicEvent> = (0..(MAX_REGRESSION_POINTS + 200))
+        // Two shapes, both driven well past MAX_REGRESSION_POINTS so eviction
+        // is exercised in steady state:
+        //  - failure-shaped: binary outcomes whose rate rises with distance,
+        //    the shape the router's failure estimator actually sees, and the
+        //    one that produced the out-of-range aggregates;
+        //  - adversarially non-monotonic, so PAV must pool heavily.
+        // Deterministic arithmetic rather than an RNG, so a failure reproduces.
+        let failure_shaped: Vec<(f64, f64)> = (0..(MAX_REGRESSION_POINTS * 3))
             .map(|i| {
-                let x = (i % 50) as f64 / 100.0; // spread over [0.0, 0.49]
-                let y = if i % 3 == 0 { 1.0 - x } else { x }; // violates monotonicity
-                make(x, y)
+                let x = ((i * 7919) % 500) as f64 / 1000.0; // [0.0, 0.499]
+                let threshold = 1 + (x * 10.0) as usize; // failure rate 10%..60%
+                let y = if (i * 31) % 10 < threshold { 1.0 } else { 0.0 };
+                (x, y)
+            })
+            .collect();
+        let non_monotonic: Vec<(f64, f64)> = (0..(MAX_REGRESSION_POINTS + 200))
+            .map(|i| {
+                let x = (i % 50) as f64 / 100.0;
+                let y = if i % 3 == 0 { 1.0 - x } else { x };
+                (x, y)
             })
             .collect();
 
-        // Fed through `add_event_incremental`, NOT `add_event`: since #4811 the
-        // latter refits inline, so it cannot produce the un-repaired fit this test
-        // needs to measure drift against. That is the fix working, not a reason to
-        // weaken the tripwire — the incremental path is still what runs between
-        // refits, and it is still what drifts.
-        let mut incremental = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
-        for event in events.iter().cloned() {
-            incremental.add_event_incremental(event);
+        for (label, stream) in [
+            ("failure-shaped", failure_shaped),
+            ("non-monotonic", non_monotonic),
+        ] {
+            // Through `add_event_incremental`, NOT `add_event`: the latter also
+            // refits every 51st event, which would mask exactly the between-refit
+            // states this pins.
+            let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+            let mut window: VecDeque<Point<f64>> = VecDeque::new();
+            let mut worst = 0.0f64;
+            for (index, &(x, y)) in stream.iter().enumerate() {
+                estimator.add_event_incremental(event_at_distance(&peer, x, y));
+                window.push_back(Point::new(x, y));
+                if window.len() > MAX_REGRESSION_POINTS {
+                    window.pop_front();
+                }
+
+                let batch = IsotonicRegression::new_ascending(window.make_contiguous())
+                    .expect("ascending fit without intersect_origin cannot fail");
+                for step in 0..=50 {
+                    let at = step as f64 / 100.0;
+                    let got = estimator
+                        .global_regression
+                        .interpolate(at)
+                        .expect("non-empty fit interpolates");
+                    let want = batch.interpolate(at).expect("non-empty fit interpolates");
+                    worst = worst.max((got - want).abs());
+                }
+                for point in estimator.global_regression.get_points() {
+                    assert!(
+                        (0.0..=0.5).contains(point.x()) && (0.0..=1.0).contains(point.y()),
+                        "{label}: after event {index} the fit holds the aggregate \
+                         ({}, {}), which no point in the window could produce",
+                        point.x(),
+                        point.y()
+                    );
+                }
+            }
+            assert!(
+                worst < 1e-9,
+                "{label}: the incremental fit diverged from a batch fit over the same \
+                 window by up to {worst}; routing reads this fit between refits"
+            );
+            assert_eq!(estimator.raw_events.len(), MAX_REGRESSION_POINTS);
         }
-
-        // The batch reference: exactly what the estimator's own constructor builds
-        // from the same windowed corpus.
-        let batch = IsotonicEstimator::new(events, EstimatorType::Positive);
-
-        let sample = |est: &IsotonicEstimator| -> Vec<f64> {
-            (0..=49)
-                .map(|s| {
-                    est.global_regression
-                        .interpolate(s as f64 / 100.0)
-                        .unwrap_or(f64::NAN)
-                })
-                .collect()
-        };
-
-        let drift: f64 = sample(&incremental)
-            .iter()
-            .zip(sample(&batch).iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(
-            drift > 1e-9,
-            "expected the incremental fit to drift from batch (drift={drift}); if this \
-             now holds exactly, pav_regression became exact and refit_if_stale is dead code"
-        );
-
-        incremental.refit();
-        let repaired: f64 = sample(&incremental)
-            .iter()
-            .zip(sample(&batch).iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(
-            repaired < 1e-9,
-            "refit must restore the exact batch fit (residual={repaired}, was {drift})"
-        );
     }
 
     #[test]
