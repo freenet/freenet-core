@@ -9325,17 +9325,29 @@ fn test_router_receives_failures_for_dead_end_gets() {
     );
     // Non-vacuous: the GETs must actually have met NotFounds (dropped
     // untrained), or the assertion above proves nothing.
-    let untrained_not_founds: u64 = (0..=num_nodes)
+    let untrained_per_node: Vec<(usize, Option<u64>)> = (0..=num_nodes)
         .map(|i| {
             let label = if i == 0 {
                 NodeLabel::gateway(ABSENT, 0)
             } else {
                 NodeLabel::node(ABSENT, i)
             };
-            absent
-                .node_untrained_not_founds(&label)
-                .expect("every node publishes its Ring")
+            (i, absent.node_untrained_not_founds(&label))
         })
+        .collect();
+    let unpublished: Vec<usize> = untrained_per_node
+        .iter()
+        .filter(|(_, count)| count.is_none())
+        .map(|(i, _)| *i)
+        .collect();
+    assert!(
+        unpublished.is_empty(),
+        "every node must publish its Ring's untrained-NotFound count; \
+         missing for node indices {unpublished:?}"
+    );
+    let untrained_not_founds: u64 = untrained_per_node
+        .iter()
+        .filter_map(|(_, count)| *count)
         .sum();
     assert!(
         untrained_not_founds > 0,

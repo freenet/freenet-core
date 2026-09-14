@@ -32,7 +32,7 @@
 //! the `timeout_label_*` histogram on the router snapshot. The failure inputs
 //! `peer_health` always had (a GET stream that never arrived, a client GET
 //! whose delivery failed) are kept separately; see
-//! [`crate::ring::Ring::report_route_failure_to_peer_health`].
+//! [`crate::ring::Ring::report_route_outcome_to_health`].
 //!
 //! Only a REMOTE reply is proof that the contract exists: a Found or a
 //! streaming header from a peer this operation contacted. This node's own
@@ -133,7 +133,7 @@ pub(crate) enum LabelMode {
     /// `FREENET_ROUTING_LEGACY_LABELS=1`: originators label no attempt (only
     /// their final outcome, against `current_target`), relays label a
     /// downstream `NotFound` as `SuccessUntimed` and every transport failure
-    /// as `Failure`, and stream claims use `current_target`.
+    /// as `Failure`.
     Legacy,
 }
 
@@ -240,10 +240,8 @@ impl RouteFailureSink for crate::ring::Ring {
 }
 
 /// Whether a reply counts as existence proof for this operation's routing
-/// labels: only a reply naming the requested contract does. Its contract key,
-/// and its envelope `instance_id` where the caller has one, must both name
-/// that contract.
-pub(crate) fn reply_names_contract(
+/// labels (see the module docs).
+pub(crate) fn is_existence_proof(
     requested: &ContractInstanceId,
     key: &freenet_stdlib::prelude::ContractKey,
     envelope_instance_id: Option<&ContractInstanceId>,
@@ -351,7 +349,7 @@ impl RouteAttemptRecorder {
     }
 
     /// The labelling rules this recorder applies. Driver code that owns a
-    /// label outside the recorder (a terminal success, a stream claim) must
+    /// label outside the recorder (a terminal success, a failed stream) must
     /// follow the same mode.
     pub(crate) fn mode(&self) -> LabelMode {
         self.mode

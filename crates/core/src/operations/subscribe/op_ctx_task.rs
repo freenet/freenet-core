@@ -1087,8 +1087,8 @@ async fn drive_client_subscribe_inner(
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
                 // peer dashboard's Response Time chart populates again.
-                // A subscription to THIS contract proves it exists: every
-                // earlier NotFound in this subscribe was a routing failure.
+                // A subscription proves the contract exists: every earlier
+                // NotFound in this subscribe was a routing failure.
                 let reply_instance_id =
                     if let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
                         instance_id,
@@ -1099,7 +1099,7 @@ async fn drive_client_subscribe_inner(
                     } else {
                         None
                     };
-                if crate::operations::route_attempt::reply_names_contract(
+                if crate::operations::route_attempt::is_existence_proof(
                     &instance_id,
                     &key,
                     reply_instance_id.as_ref(),
@@ -2233,10 +2233,10 @@ async fn relay_subscribe_forward_once(
                 phase = "relay_subscribe_bubble",
                 "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
             );
-            // A subscription to THIS contract proves it exists: an earlier
+            // A subscription proves the contract exists: an earlier
             // NotFound in this relay's search (the greedy hop, before a
             // consult) was a routing failure.
-            if crate::operations::route_attempt::reply_names_contract(
+            if crate::operations::route_attempt::is_existence_proof(
                 &instance_id,
                 &key,
                 Some(&reply_instance_id),
@@ -4197,15 +4197,15 @@ mod route_attempt_driver_tests {
         );
     }
 
-    /// Only a reply naming the requested contract counts as existence proof
-    /// for routing labels, at the originator: the control (naming the
-    /// requested contract) labels the NotFound target, the other does not.
+    /// A NotFound is labelled only with existence proof from the same
+    /// operation, at the originator: with proof the NotFound target is
+    /// labelled, and without it nothing is.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn only_a_reply_naming_the_requested_contract_is_proof() {
-        for (label, same_contract) in [("sub-proof-same", true), ("sub-proof-other", false)] {
+    async fn not_found_is_trained_only_with_existence_proof() {
+        for (label, proof) in [("sub-proof", true), ("sub-no-proof", false)] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             let instance_id = ContractInstanceId::new([55u8; 32]);
-            let other = ContractInstanceId::new([56u8; 32]);
+            let non_proof = ContractInstanceId::new([56u8; 32]);
             let targets = Arc::new(Mutex::new(Vec::new()));
             let seen = targets.clone();
             serve_attempts(
@@ -4225,7 +4225,7 @@ mod route_attempt_driver_tests {
                         answer: Answer::Reply(if i == 0 {
                             not_found(msg, instance_id)
                         } else {
-                            subscribed(msg, if same_contract { instance_id } else { other })
+                            subscribed(msg, if proof { instance_id } else { non_proof })
                         }),
                     }
                 },
@@ -4234,26 +4234,19 @@ mod route_attempt_driver_tests {
                 .await
                 .expect("driver returns an outcome");
             let first_target = targets.lock()[0].expect("subscribe attempts carry a target");
-            let expected = if same_contract {
-                vec![first_target]
-            } else {
-                vec![]
-            };
+            let expected = if proof { vec![first_target] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
     }
 
-    /// Relay side: the greedy hop's NotFound is settled as a failure only by a
-    /// consulted reply naming the requested contract.
+    /// Relay side: the greedy hop's NotFound is settled as a failure only by
+    /// existence proof from a consulted reply.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn relay_only_a_reply_naming_the_requested_contract_is_proof() {
-        for (label, same_contract) in [
-            ("sub-relay-proof-same", true),
-            ("sub-relay-proof-other", false),
-        ] {
+    async fn relay_not_found_is_trained_only_with_existence_proof() {
+        for (label, proof) in [("sub-relay-proof", true), ("sub-relay-no-proof", false)] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 4).await;
             let instance_id = ContractInstanceId::new([57u8; 32]);
-            let other = ContractInstanceId::new([58u8; 32]);
+            let non_proof = ContractInstanceId::new([58u8; 32]);
             let upstream = peers[0].socket_addr().unwrap();
             let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
             let greedy = op_manager
@@ -4293,10 +4286,7 @@ mod route_attempt_driver_tests {
                     let answer = if seen.len() == 1 {
                         Answer::Reply(not_found(msg, instance_id))
                     } else {
-                        Answer::Reply(subscribed(
-                            msg,
-                            if same_contract { instance_id } else { other },
-                        ))
+                        Answer::Reply(subscribed(msg, if proof { instance_id } else { non_proof }))
                     };
                     Step { hop: None, answer }
                 },
@@ -4318,7 +4308,7 @@ mod route_attempt_driver_tests {
                 "{label}: greedy then consult: {targets:?}"
             );
             let first = targets[0].expect("relay forwards carry a target");
-            let expected = if same_contract { vec![first] } else { vec![] };
+            let expected = if proof { vec![first] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
     }

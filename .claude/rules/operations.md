@@ -68,15 +68,15 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     (possibly stale) copy, a local completion, or a terminal with no recorded
     hop proves nothing about a remote peer. "The contract exists now" is not
     "it existed when the NotFound was returned": a GET before a PUT gets
-    correct NotFounds from exactly the peers the PUT then stores at, and a
-    store keyed on later evidence is a poisoning primitive (GET K through a
-    relay, then PUT K). Naive training on ambiguous NotFounds measurably
-    degraded the model (exp/estimator-bakeoff e26a92c1d).
+    correct NotFounds from exactly the peers the PUT then stores at, so
+    labelling them from later evidence would train on correct answers. Naive
+    training on ambiguous NotFounds measurably degraded the model
+    (exp/estimator-bakeoff e26a92c1d).
   → Blame or credit only the peer the request ACTUALLY went to. GET/PUT
     originators send to their own loopback relay, which picks the real hop;
     read it from the per-attempt `AttemptHopRegistry` slot (the loopback relay
     fills it). No recorded hop → no event, success or failure. The driver's
-    `current_target` is a guess. Claim a streamed reply from the same hop.
+    `current_target` is a guess.
   → A local callback drop (`NotificationError`), a disconnect of some other
     peer, and an unexpected reply blame nobody — on originators AND relays.
   → SUBSCRIBE renewals: the originator labels neither its timeouts (its

@@ -54,7 +54,7 @@ use crate::operations::OpError;
 use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::operations::route_attempt::{
-    AttemptFailure, AttemptOrigin, LabelMode, RouteAttemptRecorder, reply_names_contract,
+    AttemptFailure, AttemptOrigin, LabelMode, RouteAttemptRecorder, is_existence_proof,
     report_originator_route_outcome,
 };
 use crate::ring::{Location, PeerKeyLocation};
@@ -898,9 +898,9 @@ struct GetRetryDriver<'a> {
     recorder: RouteAttemptRecorder,
     /// The peer the most recent `Terminal` attempt was actually forwarded to,
     /// as recorded by the originator-loopback relay. `None` when the reply was
-    /// produced locally. The only peer a terminal route event may credit or
-    /// blame, and the address a streamed reply is claimed from;
-    /// `current_target` is this driver's own guess.
+    /// produced locally. The only peer a terminal router label may credit or
+    /// blame; `current_target` is this driver's own guess (and, as before
+    /// #5657, the address a streamed reply is claimed from).
     terminal_hop: Option<PeerKeyLocation>,
     /// Every peer an attempt of this GET was actually forwarded to that
     /// answered `NotFound`. Carried into each later attempt's visited bloom
@@ -1034,9 +1034,9 @@ impl RetryDriver for GetRetryDriver<'_> {
         // bookkeeping only. Carry `tried` minus the current target (which
         // IS this attempt's intended destination) so the relay's fallback
         // skips gateways that already failed and converges on the same
-        // gateway the client driver selected. (Stream claims and route
-        // labels use the hop the loopback relay actually recorded, not
-        // `current_target`; see `AttemptHopRegistry`.)
+        // gateway the client driver selected. (Router labels use the hop the
+        // loopback relay actually recorded, not `current_target`; see
+        // `AttemptHopRegistry`.)
         //
         // The carried bloom travels the attempt's entire forward path, so
         // a failed gateway is excluded at every hop of that attempt, not
@@ -1258,19 +1258,18 @@ async fn drive_get_with_assembly_retry(
         // A Found or a streaming header from a REMOTE peer this operation
         // actually contacted proves the contract exists, so any earlier
         // `NotFound` attempt in this operation was a genuine routing failure.
-        // Only a reply naming the requested contract counts as proof. A local
-        // completion, or a terminal with no recorded hop (the loopback relay
-        // answered from this node's own copy), proves nothing.
-        let names_requested_contract = match &result {
+        // A local completion, or a terminal with no recorded hop (the loopback
+        // relay answered from this node's own copy), proves nothing.
+        let is_proof = match &result {
             RetryLoopOutcome::Done(
                 Terminal::InlineFound { key, .. } | Terminal::Streaming { key, .. },
-            ) => reply_names_contract(&driver.instance_id, key, None),
+            ) => is_existence_proof(&driver.instance_id, key, None),
             RetryLoopOutcome::Done(Terminal::LocalCompletion)
             | RetryLoopOutcome::Exhausted(_)
             | RetryLoopOutcome::Unexpected
             | RetryLoopOutcome::InfraError(_) => false,
         };
-        if names_requested_contract && driver.terminal_hop.is_some() {
+        if is_proof && driver.terminal_hop.is_some() {
             driver.recorder.contract_exists();
         }
 
@@ -3975,8 +3974,8 @@ where
         // how the reply classifies below.
         last_forward_failed = false;
 
-        // The contract the reply's envelope names, for the existence-proof
-        // identity check below (#5657).
+        // The reply envelope's instance id, for the existence-proof check
+        // below (#5657).
         let reply_instance_id = if let NetMessage::V1(NetMessageV1::Get(
             GetMsg::Response { instance_id, .. } | GetMsg::ResponseStreaming { instance_id, .. },
         )) = &reply
@@ -4016,10 +4015,10 @@ where
                 // Router. Without this hook, only originator-side successes
                 // train the failure-probability model and per-peer dashboard
                 // panels stay empty on relay-heavy nodes. In-memory only,
-                // safe to run before forwarding. A Found for THIS contract
-                // also proves it exists, which settles earlier NotFounds as
+                // safe to run before forwarding. A Found also proves the
+                // contract exists, which settles earlier NotFounds as
                 // failures.
-                if reply_names_contract(&instance_id, &key, reply_instance_id.as_ref()) {
+                if is_existence_proof(&instance_id, &key, reply_instance_id.as_ref()) {
                     recorder.contract_exists();
                 }
                 crate::operations::record_relay_route_event(
@@ -4115,9 +4114,9 @@ where
                 // `drive_relay_put_streaming`.
                 let own_addr = op_manager.ring.connection_manager.get_own_addr();
 
-                // A streaming header for THIS contract proves it exists,
-                // whether or not its stream is then delivered.
-                if reply_names_contract(&instance_id, &key, reply_instance_id.as_ref()) {
+                // A streaming header proves the contract exists, whether or
+                // not its stream is then delivered.
+                if is_existence_proof(&instance_id, &key, reply_instance_id.as_ref()) {
                     recorder.contract_exists();
                 }
 
@@ -8849,16 +8848,15 @@ mod route_attempt_driver_tests {
         }
     }
 
-    /// Only a reply naming the requested contract counts as existence proof
-    /// for routing labels: a NotFound followed by a reply naming another
-    /// contract labels nothing, while the control (naming the requested
-    /// contract) labels the NotFound hop.
+    /// A NotFound is labelled only with existence proof from the same
+    /// operation: with proof the NotFound hop is labelled, and the same script
+    /// with a reply that is not existence proof labels nothing.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn only_a_reply_naming_the_requested_contract_is_proof() {
-        for (label, same_contract) in [("get-proof-same", true), ("get-proof-other", false)] {
+    async fn not_found_is_trained_only_with_existence_proof() {
+        for (label, proof) in [("get-proof", true), ("get-no-proof", false)] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             let instance_id = ContractInstanceId::new([63u8; 32]);
-            let other = ContractInstanceId::new([64u8; 32]);
+            let non_proof = ContractInstanceId::new([64u8; 32]);
             let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
             serve_attempts(
                 op_manager.clone(),
@@ -8873,7 +8871,7 @@ mod route_attempt_driver_tests {
                         hop: Some(found_hop.clone()),
                         answer: Answer::Reply(found(
                             msg,
-                            if same_contract { instance_id } else { other },
+                            if proof { instance_id } else { non_proof },
                         )),
                     },
                 },
@@ -8882,27 +8880,20 @@ mod route_attempt_driver_tests {
             let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
             let _outcome = run(&op_manager, client_tx, &mut driver).await;
             drop(driver);
-            let expected = if same_contract {
-                vec![addr(&peers[2])]
-            } else {
-                vec![]
-            };
+            let expected = if proof { vec![addr(&peers[2])] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
     }
 
-    /// Relay side: the greedy hop's NotFound is settled as a failure only by a
-    /// consulted reply naming the requested contract.
+    /// Relay side: the greedy hop's NotFound is settled as a failure only by
+    /// existence proof from a consulted reply.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn relay_only_a_reply_naming_the_requested_contract_is_proof() {
-        for (label, same_contract) in [
-            ("get-relay-proof-same", true),
-            ("get-relay-proof-other", false),
-        ] {
+    async fn relay_not_found_is_trained_only_with_existence_proof() {
+        for (label, proof) in [("get-relay-proof", true), ("get-relay-no-proof", false)] {
             let (op_manager, rx, _store, upstream, greedy, host, _guards) =
                 relay_fixture(label, true).await;
             let instance_id = ContractInstanceId::new([53u8; 32]);
-            let other = ContractInstanceId::new([54u8; 32]);
+            let non_proof = ContractInstanceId::new([54u8; 32]);
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             serve_attempts(
                 op_manager.clone(),
@@ -8914,7 +8905,7 @@ mod route_attempt_driver_tests {
                     } else if target == Some(greedy_addr) {
                         Answer::Reply(not_found(msg, instance_id))
                     } else if target == Some(host_addr) {
-                        Answer::Reply(found(msg, if same_contract { instance_id } else { other }))
+                        Answer::Reply(found(msg, if proof { instance_id } else { non_proof }))
                     } else {
                         Answer::Never
                     };
@@ -8922,11 +8913,7 @@ mod route_attempt_driver_tests {
                 },
             );
             run_relay(&op_manager, &upstream).await;
-            let expected = if same_contract {
-                vec![greedy_addr]
-            } else {
-                vec![]
-            };
+            let expected = if proof { vec![greedy_addr] } else { vec![] };
             assert_eq!(failed_addrs(&op_manager), expected, "{label}");
         }
     }
