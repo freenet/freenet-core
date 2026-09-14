@@ -1851,15 +1851,22 @@ impl Router {
         // assuming nothing and better than it for the first time. See #4485.
         //
         // Three different quantities get called "captured" around here, and a
-        // reviewer who ran the test read the wrong one off it, so naming them:
+        // reviewer who ran the test read the wrong one off it, so naming them
+        // (all measured before #5658; see below for today's):
         //   -0.438  the global curve UNCORRECTED — what the harness prints as
-        //           `base`, and what you will see if you run it today
+        //           `base`
         //   -0.302  the CORRECTED estimate composing with the PEER-ADJUSTED
         //           base, i.e. the design this comment argues against. Not
         //           reproducible from the tree: that configuration is gone
         //   +0.055  the CORRECTED estimate composing with the global curve,
         //           i.e. what the code now does
         // The comparison that settles B5 is the second against the third.
+        //
+        // #5658 made the isotonic base exact (its rolling window had been
+        // corrupted between refits), which moved the two reproducible figures:
+        // the harness now prints `base` -0.133 and corrected +0.270. The -0.302
+        // was measured against the corrupted base and has not been re-measured,
+        // so the B5 comparison stands on pre-#5658 numbers.
         let failure = self
             .failure_estimator
             .estimate_global(peer, contract_location)

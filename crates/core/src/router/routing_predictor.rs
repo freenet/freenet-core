@@ -2117,12 +2117,22 @@ mod recoverability {
     /// The design proposal on #4485 published `captured >= 0.8` as the gate.
     /// **That figure was set from intuition and is not achievable in this
     /// scenario**, for a reason the harness itself measures: the global isotonic
-    /// base is off by `sd ~ 0.13` on the 91.7% of events that are untargeted —
-    /// partly because the 8.3% of events carrying a +0.55 penalty bend the fit,
-    /// partly because the fit is over binary draws. That error floor dominates
-    /// the achievable ceiling regardless of how good the correction is, so 0.8
-    /// was never reachable here and the number should not have been published
-    /// without this decomposition behind it.
+    /// base is misfitted on the 91.7% of events that are untargeted — partly
+    /// because the 8.3% of events carrying a +0.55 penalty bend the fit, partly
+    /// because the fit is over binary draws — and the correction cannot repair
+    /// that. See `the_base_models_own_error_floor_is_what_caps_recovery` for the
+    /// decomposition and the ceiling it implies.
+    ///
+    /// **That argument was reopened by #5658.** Until then the base's rolling
+    /// window was maintained with `pav_regression`'s approximate
+    /// `add_points` / `remove_points`, which corrupted the fit between refits and
+    /// inflated the untargeted error to `sd ~ 0.13`, capping `captured` near
+    /// 0.45. With the fit exact the floor is sd 0.084, the implied ceiling is
+    /// 0.768 — just under 0.8, so the floor no longer rules the target out with
+    /// any margin — and the measured score rose from
+    /// 0.055 to 0.270. What now separates the measurement from the target
+    /// is mostly the correction, not the base. The 0.8 question is back open on
+    /// #4485.
     ///
     /// What IS asserted is the property that actually matters and was genuinely
     /// in doubt: **the corrected estimate beats assuming the base rate.** Before
@@ -2132,7 +2142,8 @@ mod recoverability {
     /// That -0.30 is the CORRECTED estimate under the superseded
     /// peer-adjusted-base design, and is not reproducible from this tree — the
     /// configuration no longer exists. It is NOT the `base` figure this test
-    /// prints (currently ~-0.44), which is the global curve uncorrected. The
+    /// prints (-0.13 since #5658; -0.44 before it), which is the
+    /// global curve uncorrected. The
     /// two were confused once in review, which is reason enough to say so here.
     ///
     /// The measured figure is printed on every run so the gap stays visible
@@ -2214,8 +2225,10 @@ mod recoverability {
             "the targeted subset must be large enough to mean something, got {samples:.0}"
         );
         // Thresholds set clear of the SPREAD, not of the mean. Measured 0.583
-        // mean over per-seed [0.44, 0.29, 0.77, 0.48, 0.80]. The mean is
-        // deterministic so this cannot flake run-to-run, but a bar at 0.5 sits
+        // mean over per-seed [0.44, 0.29, 0.77, 0.48, 0.80] when they were set;
+        // 0.597 over [0.42, 0.50, 0.72, 0.54, 0.78] since #5658 made the base
+        // fit exact, so both bars keep their headroom. The mean is
+        // deterministic so this cannot flake run-to-run, but a bar at 0.5 sat
         // 0.08 from the measurement and an unrelated change could cross it
         // without the correction having regressed — the marginal-threshold trap
         // this repo's testing rules name. 0.4 keeps a substantive claim with
@@ -2258,16 +2271,42 @@ mod recoverability {
         );
     }
 
-    /// Pins the error floor that explains why `captured >= 0.8` is unreachable
-    /// in this scenario.
+    /// Pins the error floor that bounds `captured` in this scenario, and the
+    /// ceiling it implies.
     ///
     /// That claim is load-bearing — it is the whole reason the headline test
     /// asserts "beats climatology" instead of the published target — and this
     /// repo has a documented history of load-bearing justifications rotting
     /// into prose that nobody re-checks (see
     /// `.claude/rules/bug-prevention-patterns.md`). So it is measured here
-    /// rather than asserted in a comment: if the base model's error floor ever
-    /// drops, this goes red and the 0.8 question should be reopened.
+    /// rather than asserted in a comment.
+    ///
+    /// # This test's reopen condition fired in #5658
+    ///
+    /// It used to assert `untargeted sd > 0.08`, with the note that a drop
+    /// meant the 0.8 question should be reopened. #5658 made the base fit exact
+    /// and the floor dropped from sd 0.129 to sd 0.084, so the question is
+    /// reopened (on #4485). The ceiling the floor implies moved from ~0.45 to
+    /// 0.768.
+    ///
+    /// # What is asserted now, and why these thresholds
+    ///
+    /// Both bounds are the boundaries of the claims the docs make, not margins
+    /// tuned to the measurement:
+    ///
+    /// - `ceiling < 0.8`: the base floor alone still rules out the published
+    ///   target. It does so only narrowly (0.768), and the harness is
+    ///   seeded, so this cannot flake run to run; it goes red only if the base
+    ///   improves further, at which point the floor no longer rules 0.8 out and
+    ///   the docs saying it does become false.
+    /// - `base mse > Var(p*)`: the base is worse than a climatology forecast,
+    ///   the premise the targeted-recovery docs rest on ("dig out of someone
+    ///   else's hole"). Measured 0.0316 vs 0.0277.
+    ///
+    /// The ceiling assumes the correction repairs the targeted events completely
+    /// and the untargeted ones not at all, and that the base's error on a
+    /// targeted event is the full 0.55 penalty. It is an estimate of where the
+    /// floor bites, not a bound the correction provably cannot beat.
     #[test]
     fn the_base_models_own_error_floor_is_what_caps_recovery() {
         let base_mse = over_seeds(Model::PeerContract, RECOVERY_BUDGET_EVENTS, |r| r.mse_base);
@@ -2280,21 +2319,25 @@ mod recoverability {
         // events where the base is simply misfitted, which it largely cannot.
         let targeted_fraction = 1.0 / 12.0;
         let targeted_contribution = targeted_fraction * 0.55f64.powi(2);
-        let untargeted_error = (base_mse - targeted_contribution) / (1.0 - targeted_fraction);
-        let untargeted_sd = untargeted_error.max(0.0).sqrt();
+        let untargeted_error =
+            ((base_mse - targeted_contribution) / (1.0 - targeted_fraction)).max(0.0);
+        let untargeted_sd = untargeted_error.sqrt();
+        // Best `captured` reachable if every targeted event were predicted
+        // perfectly and every untargeted one kept the base's error.
+        let ceiling = 1.0 - (1.0 - targeted_fraction) * untargeted_error / var_p_star;
 
         eprintln!(
             "#4485 base error floor: base mse {base_mse:.5}, Var(p*) {var_p_star:.5}, \
-             untargeted sd {untargeted_sd:.3}"
+             untargeted sd {untargeted_sd:.3}, implied captured ceiling {ceiling:.3}"
         );
 
         assert!(
-            untargeted_sd > 0.08,
-            "the stated reason the 0.8 target is unreachable is that the global \
-             isotonic base is badly misfitted on untargeted events (sd ~ 0.13). \
-             Measured sd {untargeted_sd:.3}. If this has dropped, the base model \
-             improved and the 0.8 question should be REOPENED rather than left \
-             documented as unachievable."
+            ceiling < 0.8,
+            "the base's untargeted error floor no longer rules out the published \
+             captured >= 0.8 target: implied ceiling {ceiling:.3} (untargeted sd \
+             {untargeted_sd:.3}). The docs on this test and on \
+             `recovered_structure_beats_assuming_the_base_rate` say it does; \
+             update them and #4485."
         );
         assert!(
             base_mse > var_p_star,
@@ -2306,39 +2349,60 @@ mod recoverability {
     /// The no-regression gate: where there is no peer×contract structure, the
     /// correction must not make the estimate materially worse.
     ///
-    /// # Why the bound is 1.15, not the original 1.05 (#5658)
+    /// # The bound, derived before measuring
     ///
-    /// The 1.05 bound was calibrated against a base that was itself broken. The
-    /// isotonic base's rolling window was maintained with `pav_regression`'s
-    /// approximate `add_points` / `remove_points`, which left the curve badly
-    /// wrong between refits. The correction, trained on residuals against that
-    /// curve, was partly learning to undo the base's own drift — real work, so
-    /// it came in under 1.0 on four of five seeds (mean 0.975).
+    /// Squared error against `p*` is exactly the excess Brier score over the
+    /// Bayes floor `B = E[p*(1 - p*)]`, so `mse_corrected - mse_base` is the
+    /// Brier score the correction costs the router. With nothing to learn, all
+    /// it can add is estimation noise. A kernel mean of residuals with evidence
+    /// mass `n_eff` has variance at most `B / n_eff` (kernel weights are <= 1,
+    /// and a residual `y - base` has variance about `B`), and shrinkage scales it
+    /// by `λ² = (n / (n + κ))²`. The added error is therefore at most
+    /// `B·n / (n + κ)²`, which peaks at `n = κ` at `B / (4κ)`. The selector picks
+    /// `κ` by prequential loss, so it should do no worse than its most
+    /// conservative candidate, `κ_max = 32`: `B / (4·κ_max) = B / 128`, about
+    /// 0.0014 here. That is the bound, applied to the WORST seed, because a mean
+    /// hides the one scenario that regresses.
     ///
-    /// With the base exact, that work disappears and what remains is the
-    /// correction's estimation noise on data with nothing to learn. Measured on
-    /// these seeds, before -> after the fix:
+    /// Selection noise can in principle push a seed past it; that would be a
+    /// real finding about the selector, not a threshold to relax.
     ///
-    /// | | base mse | corrected mse | ratio |
-    /// |---|---|---|---|
-    /// | before | 0.00750 | 0.00736 | 0.975 |
-    /// | after  | 0.00444 | 0.00483 | 1.094 |
+    /// # Why it replaced `mean(mse_corrected / mse_base) <= 1.05` (#5658)
     ///
-    /// Both errors fell; only the ratio rose, because its denominator improved
-    /// more. Every seed's corrected error is lower than before. Holding 1.05
-    /// would have meant keeping the base bug. The bound stays a real gate: it
-    /// still fails if the correction adds more than 15% error where it has
-    /// nothing to find, and the 9% it does add is an input to #4485's decision
-    /// on whether to enable the correction by default.
+    /// That ratio was met only while the base was broken. The base's rolling
+    /// window was maintained with `pav_regression`'s approximate
+    /// `add_points` / `remove_points`, which corrupted the fit between refits,
+    /// and the correction was partly learning to undo that (ratio 0.975). With
+    /// the base exact both errors fell (base 0.0075 -> 0.0044, corrected
+    /// 0.0074 -> 0.0048) but the ratio rose to 1.094, with seeds spread from 1.04
+    /// to 1.19. A ratio's denominator is the base's own error, so it penalises
+    /// the correction for the base getting better, and the spread put one seed
+    /// past any bound tight enough to mean something.
+    ///
+    /// Measured against the new bound: worst seed 0.56 of `B/128`.
+    /// Mutation-checked: with shrinkage removed (`λ = 1`) every seed exceeds it,
+    /// by 5.6x to 90x.
     #[test]
     fn distance_only_structure_is_not_degraded_by_the_correction() {
-        let ratio = over_seeds(Model::DistanceOnly, RECOVERY_BUDGET_EVENTS, |r| {
-            r.mse_corrected / r.mse_base.max(f64::MIN_POSITIVE)
+        let kappa_max = super::residual::KAPPA_GRID
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let per_seed = per_seed(Model::DistanceOnly, RECOVERY_BUDGET_EVENTS, |r| {
+            let excess = r.mse_corrected - r.mse_base;
+            let bound = r.bayes_floor / (4.0 * kappa_max);
+            excess / bound
         });
+        let worst = per_seed.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!(
+            "#4485 distance-only added error per seed, as a fraction of B/(4*kappa_max): \
+             {per_seed:.3?} (worst {worst:.3})"
+        );
         assert!(
-            ratio <= 1.15,
-            "with nothing to learn the correction must not degrade the base \
-             estimate; error ratio {ratio:.3}"
+            worst <= 1.0,
+            "with nothing to learn the correction must not add more error than its \
+             most conservative shrinkage candidate is bounded to, B/(4*kappa_max); \
+             per seed as a fraction of that bound: {per_seed:.3?}"
         );
     }
 

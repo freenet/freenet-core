@@ -50,7 +50,7 @@
 
 /// Candidate `κ` values. Spans "trust a single nearby observation" (0.5) to
 /// "demand tens of observations before correcting much" (32).
-const KAPPA_GRID: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+pub(crate) const KAPPA_GRID: [f64; 7] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 
 /// Multiple of the residual standard deviation at which a multiplicative
 /// (log-space) correction is clamped. `exp()` is unbounded, so an unclamped
