@@ -901,18 +901,39 @@ fn clock_steps_and_long_gaps_stay_finite() {
 fn log_predictions_are_bounded_by_the_observed_range() {
     let _guard = GlobalRng::seed_guard(0x4485_b0b0);
     let mut stage: Stage<u32> = Stage::new(Target::LogResponseTime, 64);
-    for i in 0..3_000u32 {
-        let peer = i % 10;
-        // Peer 0 is far slower than everyone else, but only near distance 0.
-        let y = if peer == 0 {
-            3.0
+    for i in 0..4_000u32 {
+        let peer = i % 20;
+        // Everyone rises with distance, 0 to 2. Peer 0 is only ever seen close
+        // in, where it is 2 slower than the curve, so its residual carried to
+        // the far end of the curve would compose to about 4: far past anything
+        // observed.
+        let (distance, y) = if peer == 0 {
+            let d = uniform() * 0.05;
+            (d, 4.0 * d + 2.0)
         } else {
-            (0.05f64).ln() + 0.1 * normal()
+            let d = uniform() * 0.5;
+            (d, 4.0 * d + 0.05 * normal())
         };
-        observe(&mut stage, &peer, 0.3, uniform() * 0.1, y, 0.0);
+        observe(&mut stage, &peer, 0.3, distance, y, 0.0);
     }
     let (low, high) = stage.observed_range;
-    for (peer, distance) in [(0, 0.5), (0, 0.0), (7, 0.5), (99, 0.45)] {
+    let far = predict(&stage, &0, 0.3, 0.49).unwrap();
+    let unclamped = stage.curve.as_ref().unwrap().value(0.49).unwrap()
+        + stage.levels[stage.selected()]
+            .residual(stage.peers.lookup(&0), band_of(0.3), 0.0)
+            .unwrap()
+            .mean;
+    assert!(
+        unclamped > high + LOG_PREDICTION_MARGIN,
+        "the scenario must actually push past the bound, or this test proves nothing: \
+         unclamped {unclamped}, high {high}"
+    );
+    assert_eq!(
+        far,
+        high + LOG_PREDICTION_MARGIN,
+        "the prediction must sit on the bound"
+    );
+    for (peer, distance) in [(0, 0.0), (7, 0.5), (99, 0.45)] {
         let value = predict(&stage, &peer, 0.3, distance).unwrap();
         assert!(
             value >= low - LOG_PREDICTION_MARGIN && value <= high + LOG_PREDICTION_MARGIN,
