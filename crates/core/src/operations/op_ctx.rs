@@ -502,16 +502,24 @@ pub(crate) trait RetryDriver {
     /// driver attribute its terminal success event to the real hop rather than
     /// its own `current_target` guess. Default: ignore.
     fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
+
+    /// Called once for EVERY attempt that resolved (terminal or not, before
+    /// `advance()`), with the peer that attempt was actually forwarded to.
+    /// Drivers whose loopback relay picks the wire hop use it to exclude the
+    /// hops already tried from the next attempt, so retries reach different
+    /// peers instead of re-picking the same best candidate. Default: ignore.
+    fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 }
 
 /// Report one non-terminal attempt outcome to the driver's recorder, if any.
-/// The ONLY place [`drive_retry_loop`] labels an attempt; every resolution arm
-/// calls it.
+/// The ONLY place [`drive_retry_loop`] labels an attempt; every non-terminal
+/// resolution arm calls it.
 fn record_attempt_failure<D: RetryDriver>(
     driver: &mut D,
     hop: Option<crate::ring::PeerKeyLocation>,
     failure: crate::operations::route_attempt::AttemptFailure,
 ) {
+    driver.on_attempt_hop(hop.as_ref());
     if let Some(recorder) = driver.attempt_recorder() {
         recorder.record_attempt(hop.as_ref(), failure);
     }
@@ -811,15 +819,23 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     error = %err,
                     "{op_label}: send_and_await failed; advancing"
                 );
-                // Only a dropped connection is attributable to the peer. A
-                // `NotificationError` that outlived the infra-retry budget is a
-                // local callback drop, not something the peer did.
-                if matches!(err, OpError::PeerDisconnected { .. }) {
+                // Only a dropped connection TO THE ATTEMPTED HOP is attributable
+                // to it. A `NotificationError` that outlived the infra-retry
+                // budget is a local callback drop, and a disconnect of some
+                // other peer is not this hop's doing.
+                let hop = hop_slot.hop();
+                let blame = match (&err, hop.as_ref().and_then(|h| h.socket_addr())) {
+                    (OpError::PeerDisconnected { peer }, Some(hop_addr)) => *peer == hop_addr,
+                    _ => false,
+                };
+                if blame {
                     record_attempt_failure(
                         driver,
-                        hop_slot.hop(),
+                        hop,
                         crate::operations::route_attempt::AttemptFailure::SendFailure,
                     );
+                } else {
+                    driver.on_attempt_hop(hop.as_ref());
                 }
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -862,7 +878,9 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         match driver.classify(reply) {
             AttemptOutcome::Terminal(value) => {
-                driver.on_terminal_hop(hop_slot.hop());
+                let hop = hop_slot.hop();
+                driver.on_attempt_hop(hop.as_ref());
+                driver.on_terminal_hop(hop);
                 return RetryLoopOutcome::Done(value);
             }
             AttemptOutcome::Retry => {

@@ -446,6 +446,7 @@ async fn drive_client_get_inner(
             AttemptOrigin::Originator,
         ),
         terminal_hop: None,
+        attempted_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -453,7 +454,6 @@ async fn drive_client_get_inner(
         client_tx,
         "get",
         &mut driver,
-        /* emit_route_failure_on_retry */ true,
         crate::ring::HostingCause::ClientGet,
     )
     .await;
@@ -640,22 +640,20 @@ async fn drive_client_get_inner(
                 }
             };
             //
-            // Attributed to the hop the winning attempt was actually forwarded
-            // to (#4485), falling back to `current_target` only when no hop was
-            // recorded. Skipped when the terminal is a streaming header that
-            // the assembly wrapper re-surfaced after a later wire exhaustion:
-            // that header's peer was already charged a Failure when its stream
-            // failed, and every later attempt was labelled as it resolved, so a
-            // final event here would count one of them twice.
-            if !streaming_assembly.terminal_route_event_already_recorded {
+            // Credited to the hop the winning attempt was actually forwarded
+            // to (#4485). Recorded ONLY for a delivered success from a
+            // recorded hop: a reply produced locally (local completion, a
+            // loopback relay serving its own copy) contacted no peer, so it
+            // must credit nobody. A failed delivery records nothing here: a
+            // stream that never arrived was already labelled against its hop
+            // by `drive_get_with_assembly_retry` (router only, once per peer),
+            // and a local store/validation failure after an inline Found is
+            // not attributable to the peer.
+            if let (true, Some(hop)) = (host_result.is_ok(), driver.terminal_hop.clone()) {
                 let route_event = RouteEvent {
-                    peer: driver.terminal_route_peer(),
+                    peer: hop,
                     contract_location,
-                    outcome: if host_result.is_ok() {
-                        timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed)
-                    } else {
-                        RouteOutcome::Failure
-                    },
+                    outcome: timed_outcome.unwrap_or(RouteOutcome::SuccessUntimed),
                     op_type: Some(crate::node::network_status::OpType::Get),
                 };
                 if let Some(log_event) = crate::tracing::NetEventLog::route_event(
@@ -882,21 +880,14 @@ struct GetRetryDriver<'a> {
     recorder: RouteAttemptRecorder,
     /// The peer the most recent `Terminal` attempt was actually forwarded to,
     /// as recorded by the originator-loopback relay. `None` when the reply was
-    /// produced locally. Terminal route events prefer it over
-    /// `current_target`, which is only this driver's own guess.
+    /// produced locally. The only peer a terminal route event may credit or
+    /// blame, and the address a streamed reply is claimed from;
+    /// `current_target` is this driver's own guess.
     terminal_hop: Option<PeerKeyLocation>,
-}
-
-impl GetRetryDriver<'_> {
-    /// The peer a terminal route event for the current terminal should blame
-    /// or credit: the real forwarded hop when known, otherwise the pre-#4485
-    /// attribution (`current_target`), kept so terminal events that were
-    /// recorded before are still recorded.
-    fn terminal_route_peer(&self) -> PeerKeyLocation {
-        self.terminal_hop
-            .clone()
-            .unwrap_or_else(|| self.current_target.clone())
-    }
+    /// Every peer an attempt of this operation was actually forwarded to.
+    /// Carried into each new attempt's visited bloom so the loopback relay
+    /// does not re-pick a peer this operation already tried.
+    attempted_hops: Vec<std::net::SocketAddr>,
 }
 
 /// Terminal value for the GET driver.
@@ -1033,17 +1024,21 @@ impl RetryDriver for GetRetryDriver<'_> {
         // only at the loopback relay — bounded (empty-ring originators,
         // <= MAX_RETRIES attempts) and re-keyed each retry.
         //
-        // Gated on the empty-ring case so normal-path retry routing
-        // semantics are unchanged. The gate re-reads `connection_count()`
-        // and can race ring promotion between attempts; both directions
-        // degrade to a single wasted or spuriously-failed attempt (never
-        // a loop or hang) — see the #4364 review for the trace.
-        if self.op_manager.ring.connection_manager.connection_count() == 0 {
-            carry_tried_into_visited(
-                &mut self.attempt_visited,
-                &self.tried,
-                self.current_target.socket_addr(),
-            );
+        // Not gated on the empty ring (#4485). On a non-empty ring the
+        // loopback relay's `relay_advance_to_next_peer` builds its candidate
+        // set from this bloom alone, so without the carry every retry
+        // re-picked the SAME best candidate while `current_target` moved on:
+        // the retry budget was spent re-asking a peer that had just answered
+        // NotFound or timed out. Also carry every hop an earlier attempt was
+        // actually forwarded to, which may differ from the client's `tried`
+        // guesses.
+        carry_tried_into_visited(
+            &mut self.attempt_visited,
+            &self.tried,
+            self.current_target.socket_addr(),
+        );
+        for hop in &self.attempted_hops {
+            self.attempt_visited.mark_visited(*hop);
         }
         tx
     }
@@ -1110,6 +1105,14 @@ impl RetryDriver for GetRetryDriver<'_> {
     fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
         self.terminal_hop = hop;
     }
+
+    fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {
+        if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
+            if !self.attempted_hops.contains(&addr) {
+                self.attempted_hops.push(addr);
+            }
+        }
+    }
 }
 
 // --- Assembly-retry wrapper (#4345) ---
@@ -1136,12 +1139,6 @@ struct AssemblyOutcome {
     total_fragments: Option<u32>,
     /// Classified cause of a streaming assembly failure; `None` on success.
     abort_cause: Option<StreamAbortCause>,
-    /// True when the returned `Done(Streaming)` is a remembered header
-    /// re-surfaced after the re-entered loop exhausted on the wire. Its peer
-    /// was already charged a route Failure when its stream failed, and each
-    /// later attempt was labelled when it resolved, so the caller must NOT
-    /// emit its usual terminal route event (#4485: no double counting).
-    terminal_route_event_already_recorded: bool,
 }
 
 /// Fragment progress from a streaming GET assembly attempt (#4345 telemetry),
@@ -1199,7 +1196,6 @@ async fn drive_get_with_assembly_retry(
     first_tx: Transaction,
     op_label: &str,
     driver: &mut GetRetryDriver<'_>,
-    emit_route_failure_on_retry: bool,
     // Hosting attribution for the streamed store this wrapper performs. Both the
     // client driver and the sub-op driver use this wrapper, and the stream store
     // is unconditionally `is_client_requester = true`, so the flag cannot tell
@@ -1270,7 +1266,6 @@ async fn drive_get_with_assembly_retry(
                     // timed-outcome capture falls through to None.
                     driver.request_sent_at = None;
                     driver.response_received_at = None;
-                    assembly.terminal_route_event_already_recorded = true;
                     break RetryLoopOutcome::Done(Terminal::Streaming {
                         key,
                         stream_id,
@@ -1283,14 +1278,22 @@ async fn drive_get_with_assembly_retry(
             RetryLoopOutcome::Unexpected | RetryLoopOutcome::InfraError(_) => break result,
         };
 
-        // Uses `current_target` as the sender address — accurate for
-        // the single-hop response case where the responder equals the
-        // selected target; relays pipe the stream hop-by-hop so the
-        // fragments arrive from the adjacent hop either way.
-        let Some(peer_addr) = driver.current_target.socket_addr() else {
+        // Claim from the hop this attempt was actually forwarded to (#4485):
+        // relays pipe the stream hop-by-hop, so the fragments arrive from
+        // that adjacent peer, and it is also the peer blamed if the stream
+        // never arrives. `current_target` is only this driver's guess and
+        // differed from the real hop on retries. It is used only when the
+        // loopback relay recorded no hop (unreachable for a remote streaming
+        // reply today), and then nobody is blamed.
+        let claim_from = driver
+            .terminal_hop
+            .as_ref()
+            .and_then(|h| h.socket_addr())
+            .or_else(|| driver.current_target.socket_addr());
+        let Some(peer_addr) = claim_from else {
             tracing::warn!(
                 %key,
-                "get: current_target has no socket_addr; \
+                "get: no socket address for the streaming responder; \
                  cannot claim orphan stream"
             );
             // Reset the whole assembly outcome (not just `error`): a prior
@@ -1330,11 +1333,17 @@ async fn drive_get_with_assembly_retry(
                 break result;
             }
             Err(e) => {
-                // Capture the failing peer BEFORE advance() replaces
-                // `current_target` — the routing penalty must land on
-                // the candidate whose header never became a stream: the hop
-                // that attempt was actually forwarded to, when recorded.
-                let failed_target = driver.terminal_route_peer();
+                // Blame the hop whose header never became a stream, BEFORE
+                // advance() starts the next attempt: the hop this attempt was
+                // actually forwarded to (nobody when none was recorded).
+                // Router only, and at most once per peer per operation (the
+                // recorder deduplicates), so the budget-exhausted path and a
+                // header re-surfaced after a later wire exhaustion cannot
+                // count it twice.
+                let failed_hop = driver.terminal_hop.clone();
+                driver
+                    .recorder
+                    .record_attempt(failed_hop.as_ref(), AttemptFailure::SendFailure);
                 // Capture the structured progress/cause for the terminal
                 // telemetry event BEFORE `e.message` is moved into
                 // `assembly.error`, so the emitted `get_terminal` carries WHERE
@@ -1351,18 +1360,6 @@ async fn drive_get_with_assembly_retry(
                             "get: stream assembly failed; \
                              retrying against next candidate (#4345)"
                         );
-                        // Penalize the failed candidate so the router
-                        // learns (mirrors the relay driver's
-                        // claim-failure handling). Only on the
-                        // advancing path: when the budget is
-                        // exhausted, the caller's final route event
-                        // (driven by the failed host_result) already
-                        // records the Failure for the last target —
-                        // emitting here too would double-count it.
-                        if emit_route_failure_on_retry {
-                            emit_get_route_failure(op_manager, attempt_tx, &failed_target, &key)
-                                .await;
-                        }
                         #[cfg(any(test, feature = "testing"))]
                         assembly_fault_injection::ASSEMBLY_RETRY_COUNT
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1390,32 +1387,6 @@ async fn drive_get_with_assembly_retry(
     };
 
     (outcome, assembly)
-}
-
-/// Emit a routing-failure observation for a candidate whose streaming
-/// header never became a completed stream. Mirrors the route-event
-/// emission in `drive_client_get_inner`'s final outcome block.
-async fn emit_get_route_failure(
-    op_manager: &OpManager,
-    tx: Transaction,
-    peer: &PeerKeyLocation,
-    key: &ContractKey,
-) {
-    let route_event = RouteEvent {
-        peer: peer.clone(),
-        contract_location: Location::from(key),
-        outcome: RouteOutcome::Failure,
-        op_type: Some(crate::node::network_status::OpType::Get),
-    };
-    if let Some(log_event) =
-        crate::tracing::NetEventLog::route_event(&tx, &op_manager.ring, &route_event)
-    {
-        op_manager
-            .ring
-            .register_events(either::Either::Left(log_event))
-            .await;
-    }
-    op_manager.ring.routing_finished(route_event);
 }
 
 /// Test-only fault injection for `assemble_and_cache_stream` (#4345).
@@ -2412,6 +2383,7 @@ async fn drive_sub_op_get(
             crate::node::network_status::OpType::Get,
         ),
         terminal_hop: None,
+        attempted_hops: Vec::new(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -2419,10 +2391,6 @@ async fn drive_sub_op_get(
         tx,
         "get-subop",
         &mut driver,
-        // Sub-op GETs don't feed the router (no RouteEvent is emitted
-        // on the sub-op path), so skip the per-retry failure events.
-        /* emit_route_failure_on_retry */
-        false,
         crate::ring::HostingCause::SubOpGet,
     )
     .await;
@@ -3496,8 +3464,8 @@ where
     // A downstream NotFound is held until this search resolves: a later
     // Found (or a local fallback copy) proves the contract exists and turns it
     // into a Failure; otherwise dropping the recorder at return applies
-    // `ambiguous_not_found_policy`. Timeouts and send failures are labelled
-    // immediately.
+    // `ambiguous_not_found_policy` (not trained). Timeouts and send failures
+    // are labelled immediately. Each peer at most once.
     let mut recorder = RouteAttemptRecorder::new(
         op_manager.ring.clone(),
         instance_id,
@@ -5152,6 +5120,7 @@ mod tests {
                 crate::node::network_status::OpType::Get,
             ),
             terminal_hop: None,
+            attempted_hops: Vec::new(),
         };
 
         assert!(
@@ -5807,20 +5776,17 @@ mod tests {
             .expect("wrapper must handle assembly Err");
         let err_body = &body[err_arm..];
 
-        // The routing penalty must land on the candidate whose header
-        // never became a stream — capture it BEFORE advance() mutates
-        // `current_target`.
+        // The routing penalty must land on the hop whose header never
+        // became a stream, recorded BEFORE advance() starts the next attempt.
         let capture_pos = err_body
-            .find("let failed_target = driver.terminal_route_peer()")
-            .expect("Err arm must capture the failing target");
+            .find(".record_attempt(failed_hop.as_ref(), AttemptFailure::SendFailure);")
+            .expect("Err arm must label the failing hop");
         let advance_pos = err_body
             .find("driver.advance()")
             .expect("Err arm must call driver.advance()");
         assert!(
             capture_pos < advance_pos,
-            "failed_target must be captured BEFORE driver.advance() — \
-             advance() replaces current_target, so capturing after \
-             penalizes the wrong (fresh) candidate."
+            "the failing hop must be labelled BEFORE driver.advance()"
         );
 
         // Re-entry must use a fresh attempt tx: reusing the previous tx
@@ -5832,9 +5798,7 @@ mod tests {
              attempt tx via driver.new_attempt_tx()"
         );
 
-        // The advancing path must penalize the failed candidate (the
-        // router only learns about header-without-stream peers from
-        // this call) and must remember the header for the
+        // The advancing path must remember the header for the
         // wire-exhaustion conversion below.
         let next_arm = err_body
             .find("AdvanceOutcome::Next =>")
@@ -5843,11 +5807,6 @@ mod tests {
             ..err_body
                 .find("AdvanceOutcome::Exhausted =>")
                 .expect("Err arm must handle Exhausted")];
-        assert!(
-            next_body.contains("emit_get_route_failure("),
-            "the advancing path must emit a route failure for the \
-             failed candidate (gated on emit_route_failure_on_retry)"
-        );
         assert!(
             next_body
                 .contains("failed_header = Some((key, stream_id, includes_contract, total_size))"),
@@ -5875,17 +5834,6 @@ mod tests {
             "exhausted assembly retries must not be converted into \
              RetryLoopOutcome::Exhausted"
         );
-        // ...and the budget-exhausted path must NOT emit a route
-        // failure: the caller's final route event (driven by the
-        // failed host_result) already records the Failure for the
-        // last target — emitting here too would double-count it.
-        assert!(
-            !exhausted_body.contains("emit_get_route_failure("),
-            "the budget-exhausted path must not emit a per-retry route \
-             failure — the caller's final Failure event covers the last \
-             target (double-count otherwise)"
-        );
-
         // Wire exhaustion AFTER a failed assembly must convert back to
         // the remembered Done(Streaming): a header proved the contract
         // exists, so RetryLoopOutcome::Exhausted (mapped to NotFound by
@@ -7850,16 +7798,17 @@ mod tests {
     }
 }
 
-/// Driver-level tests for the originator GET's per-attempt route labelling
-/// (#4485). They run the real `drive_get_with_assembly_retry` /
-/// `drive_retry_loop` / `GetRetryDriver` against a scripted event loop that
-/// plays the originator-loopback relay, and read the real Router afterwards.
+/// Driver-level tests for GET per-attempt route labelling (#4485). They run the
+/// real drivers (`drive_client_get_inner`, `drive_get_with_assembly_retry`,
+/// `drive_relay_get_inner`) against a scripted event loop that plays the
+/// originator-loopback relay and the network, then read the real Router.
 #[cfg(test)]
 mod route_attempt_driver_tests {
     use super::*;
     use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
-        Answer, Step, failed_addrs, failure_window, op_manager_with_peers, serve_attempts,
+        Answer, Step, failed_addrs, failure_window, op_manager_with_peers,
+        op_manager_with_peers_and_store, serve_attempts,
     };
     use std::sync::atomic::Ordering;
 
@@ -7872,12 +7821,16 @@ mod route_attempt_driver_tests {
         })
     }
 
+    fn key_for(instance_id: ContractInstanceId) -> ContractKey {
+        ContractKey::from_id_and_code(instance_id, CodeHash::new([9u8; 32]))
+    }
+
     fn found(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {
         NetMessage::from(GetMsg::Response {
             id: *msg.id(),
             instance_id,
             result: GetMsgResult::Found {
-                key: ContractKey::from_id_and_code(instance_id, CodeHash::new([9u8; 32])),
+                key: key_for(instance_id),
                 value: StoreResponse {
                     state: Some(WrappedState::new(vec![1, 2, 3])),
                     contract: None,
@@ -7885,6 +7838,29 @@ mod route_attempt_driver_tests {
             },
             hop_count: 1,
         })
+    }
+
+    fn streaming_header(
+        msg: &NetMessage,
+        instance_id: ContractInstanceId,
+        stream_id: StreamId,
+        total_size: u64,
+    ) -> NetMessage {
+        NetMessage::from(GetMsg::ResponseStreaming {
+            id: *msg.id(),
+            instance_id,
+            stream_id,
+            key: key_for(instance_id),
+            total_size,
+            includes_contract: false,
+        })
+    }
+
+    fn is_request(msg: &NetMessage) -> bool {
+        matches!(
+            msg,
+            NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. }))
+        )
     }
 
     fn client_driver<'a>(
@@ -7913,6 +7889,7 @@ mod route_attempt_driver_tests {
                 AttemptOrigin::Originator,
             ),
             terminal_hop: None,
+            attempted_hops: Vec::new(),
         }
     }
 
@@ -7920,29 +7897,28 @@ mod route_attempt_driver_tests {
         op_manager: &OpManager,
         client_tx: Transaction,
         driver: &mut GetRetryDriver<'_>,
-    ) -> RetryLoopOutcome<Terminal> {
+    ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
         drive_get_with_assembly_retry(
             op_manager,
             client_tx,
             "get-test",
             driver,
-            true,
             crate::ring::HostingCause::ClientGet,
         )
         .await
-        .0
+    }
+
+    fn addr(p: &PeerKeyLocation) -> SocketAddr {
+        p.socket_addr().unwrap()
     }
 
     /// NotFound from the hop the loopback relay really forwarded to, then a
     /// Found: the NotFound peer is labelled a Failure (the contract exists),
-    /// exactly once, and NOT the driver's own `current_target` guess. The
-    /// winning hop is carried out for the success event.
+    /// exactly once, and NOT the driver's own `current_target` guess.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn not_found_then_found_blames_the_forwarded_not_found_hop() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-nf-then-found", 3).await;
         let instance_id = ContractInstanceId::new([41u8; 32]);
-        // The relay forwards to peers[2] then peers[1]; the driver believes it
-        // is targeting peers[0].
         let (hop_nf, hop_found) = (peers[2].clone(), peers[1].clone());
         serve_attempts(
             op_manager.clone(),
@@ -7962,38 +7938,29 @@ mod route_attempt_driver_tests {
 
         let client_tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let outcome = run(&op_manager, client_tx, &mut driver).await;
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(
             outcome,
             RetryLoopOutcome::Done(Terminal::InlineFound { .. })
         ));
+        assert_eq!(failed_addrs(&op_manager), vec![addr(&peers[2])]);
         assert_eq!(
-            failed_addrs(&op_manager),
-            vec![peers[2].socket_addr().unwrap()],
-            "the NotFound hop must be blamed as soon as the Found proves the \
-             contract exists"
-        );
-        assert_eq!(
-            driver.terminal_route_peer().socket_addr(),
-            peers[1].socket_addr(),
-            "the terminal event must credit the hop that delivered, not \
-             current_target"
+            driver.terminal_hop.as_ref().map(addr),
+            Some(addr(&peers[1])),
+            "the terminal hop is the peer that delivered, not current_target"
         );
         drop(driver);
-        assert_eq!(
-            failed_addrs(&op_manager).len(),
-            1,
-            "settling the recorder must not label the NotFound twice"
-        );
+        assert_eq!(failed_addrs(&op_manager).len(), 1, "labelled once");
         assert_eq!(op_manager.attempt_hop_registry().len(), 0);
     }
 
-    /// A timed-out attempt and an attempt whose connection dropped are each
-    /// labelled a Failure against their forwarded hop immediately; the later
-    /// success adds no failure.
+    /// A timed-out attempt and an attempt whose connection to ITS hop dropped
+    /// are each labelled a Failure immediately; a disconnect reported for a
+    /// DIFFERENT peer blames nobody (#4485 G); the later success adds no
+    /// failure.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn timeout_and_disconnect_blame_the_forwarded_hop_immediately() {
-        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-timeout", 3).await;
+    async fn timeout_and_own_hop_disconnect_blame_the_hop_other_disconnect_does_not() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-timeout", 5).await;
         let instance_id = ContractInstanceId::new([42u8; 32]);
         let hops = peers.clone();
         serve_attempts(
@@ -8009,6 +7976,11 @@ mod route_attempt_driver_tests {
                     hop: Some(hops[0].clone()),
                     answer: Answer::PeerDisconnected,
                 },
+                2 => Step {
+                    hop: Some(hops[3].clone()),
+                    // The waiter is woken for a peer that is not this hop.
+                    answer: Answer::PeerDisconnectedFor(addr(&hops[4])),
+                },
                 _ => Step {
                     hop: Some(hops[2].clone()),
                     answer: Answer::Reply(found(msg, instance_id)),
@@ -8018,24 +7990,46 @@ mod route_attempt_driver_tests {
 
         let client_tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let outcome = run(&op_manager, client_tx, &mut driver).await;
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(outcome, RetryLoopOutcome::Done(_)));
         drop(driver);
         assert_eq!(
             failure_window(&op_manager),
             vec![(peers[1].socket_addr(), 1.0), (peers[0].socket_addr(), 1.0)],
-            "exactly the timeout and the disconnect, each against its own hop"
+            "exactly the timeout and the own-hop disconnect"
         );
     }
 
-    /// Every attempt answers NotFound and the retry budget exhausts. The
-    /// NotFounds are ambiguous (the contract may not exist), so under the
-    /// delayed policy nothing is trained: each attempted hop is parked once,
-    /// with no extra exhaustion event. Later evidence that the contract exists
-    /// (this node storing its state) releases exactly those attempts as
-    /// failures, once.
+    /// A hop that times out on several attempts of one operation is labelled
+    /// a failure ONCE (#4485 C).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn exhausted_all_not_found_parks_each_hop_until_evidence() {
+    async fn repeated_timeouts_of_one_hop_are_labelled_once() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-dedup", 5).await;
+        let instance_id = ContractInstanceId::new([48u8; 32]);
+        let same = peers[3].clone();
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, _, _| Step {
+                hop: Some(same.clone()),
+                answer: Answer::Never,
+            },
+        );
+        let client_tx = Transaction::new::<GetMsg>();
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
+        drop(driver);
+        assert!(served.load(Ordering::SeqCst) >= 2);
+        assert_eq!(failed_addrs(&op_manager), vec![addr(&peers[3])]);
+    }
+
+    /// Every attempt answers NotFound and the retry budget exhausts: the
+    /// NotFounds are ambiguous (the contract may not exist, or not yet), so
+    /// nothing is trained (#4485 A).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn exhausted_all_not_found_trains_nothing() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-exhausted", 5).await;
         let instance_id = ContractInstanceId::new([43u8; 32]);
         let hops = peers.clone();
@@ -8051,69 +8045,281 @@ mod route_attempt_driver_tests {
 
         let client_tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let outcome = run(&op_manager, client_tx, &mut driver).await;
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
         drop(driver);
-
-        let attempts = served.load(Ordering::SeqCst);
-        assert!(attempts >= 2, "the budget must allow several attempts");
-        assert!(
-            failure_window(&op_manager).is_empty(),
-            "an ambiguous NotFound must not be trained when the op exhausts"
-        );
-        let stats = op_manager.ring.parked_not_found_stats();
-        assert_eq!(
-            (stats.parked, stats.live),
-            (attempts as u64, attempts as u64),
-            "one parked attempt per attempted hop, no extra exhaustion entry"
-        );
-
-        // Evidence: this node stores state for the contract.
-        let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([9u8; 32]));
-        op_manager.ring.commit_state_write(&key, 3);
-        let expected: Vec<_> = (0..attempts)
-            .map(|i| peers[i % peers.len()].socket_addr().unwrap())
-            .collect();
-        assert_eq!(failed_addrs(&op_manager), expected);
-        op_manager.ring.commit_state_write(&key, 3);
-        assert_eq!(
-            failure_window(&op_manager).len(),
-            attempts,
-            "released attempts must not be trained twice"
-        );
-        let stats = op_manager.ring.parked_not_found_stats();
-        assert_eq!((stats.released, stats.live), (attempts as u64, 0));
+        assert!(served.load(Ordering::SeqCst) >= 2);
+        assert!(failure_window(&op_manager).is_empty());
+        // A later store of the contract proves nothing about the past
+        // NotFounds and must not train them either.
+        op_manager.ring.commit_state_write(&key_for(instance_id), 3);
+        assert!(failure_window(&op_manager).is_empty());
     }
 
-    /// Parked attempts belong to their contract: evidence for a DIFFERENT
-    /// contract releases nothing.
+    /// #4485 D: on a non-empty ring, each retry must reach a DIFFERENT peer.
+    /// The script picks every attempt's hop with the real relay selection
+    /// (`relay_advance_to_next_peer` over the request's own visited bloom,
+    /// exactly as the originator-loopback relay does). Before the fix the bloom
+    /// did not carry the tried peers, so every retry re-picked the same best
+    /// candidate.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn evidence_for_another_contract_releases_nothing() {
-        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-other-key", 3).await;
-        let instance_id = ContractInstanceId::new([46u8; 32]);
+    async fn retries_reach_distinct_peers_via_the_relay_selection() {
+        let (op_manager, rx, _peers, _guards) = op_manager_with_peers("get-diversify", 6).await;
+        let instance_id = ContractInstanceId::new([49u8; 32]);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let relay_view = op_manager.clone();
+        let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = hops.clone();
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { id, visited, .. })) = msg
+                else {
+                    panic!("expected a GET request");
+                };
+                let mut relay_visited = visited.clone().with_transaction(id);
+                relay_visited.mark_visited(own);
+                let mut tried = vec![own];
+                let mut retries = 0;
+                let (peer, peer_addr) = relay_advance_to_next_peer(
+                    &relay_view,
+                    &instance_id,
+                    &mut tried,
+                    &mut retries,
+                    &relay_visited,
+                )
+                .expect("the relay finds a candidate");
+                seen.lock().push(peer_addr);
+                Step {
+                    hop: Some(peer),
+                    answer: Answer::Reply(not_found(msg, instance_id)),
+                }
+            },
+        );
+
+        // Start exactly as the client driver does: the initial target is the
+        // ring's best candidate.
+        let client_tx = Transaction::new::<GetMsg>();
+        let initial = op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, initial);
+        driver.tried.insert(0, own);
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
+        let hops = hops.lock().clone();
+        assert_eq!(hops.len(), served.load(Ordering::SeqCst));
+        assert!(hops.len() >= 3, "several attempts: {hops:?}");
+        let distinct: std::collections::HashSet<_> = hops.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            hops.len(),
+            "every retry must reach a peer not tried earlier in this GET: {hops:?}"
+        );
+    }
+
+    /// #4485 E: a streamed reply is claimed from the hop the attempt was
+    /// actually forwarded to. The stream is registered at that hop's address
+    /// only, so claiming from `current_target` would time out and fail the
+    /// assembly.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streamed_reply_is_claimed_from_the_forwarded_hop() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-stream-claim", 3).await;
+        let instance_id = ContractInstanceId::new([50u8; 32]);
+        let stream_id = StreamId::next_operations();
+        let payload = bincode::serialize(&GetStreamingPayload {
+            key: key_for(instance_id),
+            value: StoreResponse {
+                state: Some(WrappedState::new(vec![5, 6, 7])),
+                contract: None,
+            },
+        })
+        .unwrap();
+        let total = payload.len() as u64;
+        let handle =
+            crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, total);
+        handle
+            .push_fragment(1, bytes::Bytes::from(payload))
+            .expect("fragment accepted");
+        op_manager
+            .orphan_stream_registry()
+            .register_orphan(addr(&peers[2]), stream_id, handle);
+
+        let hop = peers[2].clone();
         serve_attempts(
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
-            move |_, msg, _| Step {
-                hop: Some(peers[1].clone()),
-                answer: Answer::Reply(not_found(msg, instance_id)),
+            move |i, msg, _| Step {
+                hop: Some(hop.clone()),
+                answer: if i == 0 {
+                    Answer::Reply(streaming_header(msg, instance_id, stream_id, total))
+                } else {
+                    Answer::Reply(not_found(msg, instance_id))
+                },
             },
         );
         let client_tx = Transaction::new::<GetMsg>();
-        let own = op_manager.ring.connection_manager.own_location();
-        let mut driver = client_driver(&op_manager, client_tx, instance_id, own);
-        let _ = run(&op_manager, client_tx, &mut driver).await;
-        drop(driver);
-        assert!(op_manager.ring.parked_not_found_stats().live > 0);
-
-        let other = ContractKey::from_id_and_code(
-            ContractInstanceId::new([47u8; 32]),
-            CodeHash::new([9u8; 32]),
+        let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+        let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
+        assert!(matches!(
+            outcome,
+            RetryLoopOutcome::Done(Terminal::Streaming { .. })
+        ));
+        assert!(
+            assembly.error.is_none(),
+            "the stream must be claimed from the forwarded hop: {:?}",
+            assembly.error
         );
-        op_manager.ring.commit_state_write(&other, 3);
+        drop(driver);
         assert!(failure_window(&op_manager).is_empty());
-        assert_eq!(op_manager.ring.parked_not_found_stats().released, 0);
+    }
+
+    /// #4485 E + no double counting: a streaming header whose stream never
+    /// arrives is labelled once against the hop that sent it, router only
+    /// (never peer_health), and when the retries then exhaust on the wire and
+    /// the header is re-surfaced as the terminal, the client driver's final
+    /// outcome adds no second failure. Later NotFounds stay untrained.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_stream_is_labelled_once_router_only_through_the_client_driver() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("get-stream-fail", 5).await;
+        let instance_id = ContractInstanceId::new([51u8; 32]);
+        let key = key_for(instance_id);
+        assembly_fault_injection::inject_failures(key, 1);
+        let health_before = op_manager
+            .ring
+            .connection_manager
+            .peer_health
+            .lock()
+            .counts_for_test(addr(&peers[2]));
+        let hops = peers.clone();
+        let stream_id = StreamId::next_operations();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                if i == 0 {
+                    Step {
+                        hop: Some(hops[2].clone()),
+                        answer: Answer::Reply(streaming_header(msg, instance_id, stream_id, 64)),
+                    }
+                } else {
+                    Step {
+                        hop: Some(hops[(i % 2) + 3].clone()),
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    }
+                }
+            },
+        );
+
+        let outcome = drive_client_get_inner(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Err(_))),
+            "a proven-existing contract whose stream failed is an operation error"
+        );
+        // The header proved the contract exists, so the later NotFounds are
+        // genuine failures too. Every peer appears once; the header hop is
+        // NOT counted a second time by the re-surfaced terminal.
+        let window = failure_window(&op_manager);
+        assert!(window.iter().all(|(_, r)| *r == 1.0), "{window:?}");
+        let header_hop = window
+            .iter()
+            .filter(|(a, _)| *a == peers[2].socket_addr())
+            .count();
+        assert_eq!(
+            header_hop, 1,
+            "header hop labelled exactly once: {window:?}"
+        );
+        let distinct: std::collections::HashSet<_> = window.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            distinct.len(),
+            window.len(),
+            "one failure per peer: {window:?}"
+        );
+        assert!(
+            window.len() >= 2,
+            "the NotFound peers after the proof: {window:?}"
+        );
+        assert_eq!(
+            op_manager
+                .ring
+                .connection_manager
+                .peer_health
+                .lock()
+                .counts_for_test(addr(&peers[2])),
+            health_before,
+            "a route failure must never reach peer_health"
+        );
+    }
+
+    /// #4485 H: a success produced locally (the loopback relay served its own
+    /// copy, so no hop was recorded) credits nobody; the same success through a
+    /// recorded hop credits exactly that hop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn success_credits_only_a_recorded_hop() {
+        for (label, with_hop) in [("get-local-success", false), ("get-hop-success", true)] {
+            let (op_manager, rx, peers, _guards, store) =
+                op_manager_with_peers_and_store(label, 3).await;
+            let instance_id = ContractInstanceId::new([52u8; 32]);
+            *store.lock() = Some((key_for(instance_id), WrappedState::new(vec![1, 2, 3])));
+            let hop = with_hop.then(|| peers[1].clone());
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, _| {
+                    if !is_request(msg) {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    }
+                    Step {
+                        hop: hop.clone(),
+                        answer: Answer::Reply(found(msg, instance_id)),
+                    }
+                },
+            );
+            let outcome = drive_client_get_inner(
+                &op_manager,
+                Transaction::new::<GetMsg>(),
+                instance_id,
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("driver returns an outcome");
+            assert!(matches!(outcome, DriverOutcome::Publish(Ok(_))), "{label}");
+            let expected = if with_hop {
+                vec![(peers[1].socket_addr(), 0.0)]
+            } else {
+                vec![]
+            };
+            assert_eq!(failure_window(&op_manager), expected, "{label}");
+        }
     }
 
     /// An attempt the loopback relay never forwarded (no routing candidate,
@@ -8129,7 +8335,6 @@ mod route_attempt_driver_tests {
             crate::message::TransactionType::Get,
             move |i, msg, _| Step {
                 hop: None,
-                // Mix a timeout in: it is just as unattributable without a hop.
                 answer: match i {
                     1 => Answer::Never,
                     2 => Answer::PeerDisconnected,
@@ -8140,20 +8345,11 @@ mod route_attempt_driver_tests {
 
         let client_tx = Transaction::new::<GetMsg>();
         let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
-        let outcome = run(&op_manager, client_tx, &mut driver).await;
+        let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         assert!(matches!(outcome, RetryLoopOutcome::Exhausted(_)));
         drop(driver);
         assert!(served.load(Ordering::SeqCst) >= 2);
-        assert!(
-            failure_window(&op_manager).is_empty(),
-            "no forwarded hop means no route event: {:?}",
-            failure_window(&op_manager)
-        );
-        assert_eq!(
-            op_manager.ring.parked_not_found_stats().parked,
-            0,
-            "no forwarded hop means nothing to park"
-        );
+        assert!(failure_window(&op_manager).is_empty());
     }
 
     /// The sub-op GET driver deliberately does not feed the router.
@@ -8166,9 +8362,9 @@ mod route_attempt_driver_tests {
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
-            move |i, msg, _| Step {
-                hop: Some(hops[i % hops.len()].clone()),
-                answer: Answer::Reply(not_found(msg, instance_id)),
+            move |_, _, _| Step {
+                hop: Some(hops[1].clone()),
+                answer: Answer::Never,
             },
         );
         let tx = Transaction::new::<GetMsg>();
@@ -8178,45 +8374,90 @@ mod route_attempt_driver_tests {
         let _ = run(&op_manager, tx, &mut driver).await;
         drop(driver);
         assert!(failure_window(&op_manager).is_empty());
-        assert_eq!(op_manager.ring.parked_not_found_stats().parked, 0);
     }
 
-    /// Source pin: a streaming header re-surfaced after a later wire
-    /// exhaustion must not get a second terminal Failure. Its peer was charged
-    /// when its stream failed (`emit_get_route_failure`), and every later
-    /// attempt was labelled as it resolved. The conversion sets the flag and the
-    /// client driver's terminal route event is gated on it.
-    #[test]
-    fn resurfaced_streaming_header_does_not_double_count() {
-        let src = include_str!("op_ctx_task.rs");
-        let body = |sig: &str| -> String {
-            let start = src.find(sig).expect("signature present");
-            let test_mod = src.find("#[cfg(test)]\nmod tests {").expect("test module");
-            assert!(start < test_mod, "`{sig}` matched inside the test module");
-            let end = src[start..].find("\n}\n").expect("fn end") + start;
-            src[start..end].to_string()
-        };
-        let wrapper = body("async fn drive_get_with_assembly_retry(");
-        let exhausted = wrapper
-            .find("RetryLoopOutcome::Exhausted(cause) => {")
-            .expect("exhausted arm");
-        let flag = wrapper[exhausted..]
-            .find("assembly.terminal_route_event_already_recorded = true;")
-            .expect("conversion must set the flag")
-            + exhausted;
-        let convert = wrapper[exhausted..]
-            .find("break RetryLoopOutcome::Done(Terminal::Streaming {")
-            .expect("conversion")
-            + exhausted;
-        assert!(flag < convert);
-        let client = body("async fn drive_client_get_inner(");
-        let gate = client
-            .find("if !streaming_assembly.terminal_route_event_already_recorded {")
-            .expect("terminal route event must be gated on the flag");
-        let event = client
-            .find("op_manager.ring.routing_finished(route_event);")
-            .expect("terminal route event");
-        assert!(gate < event);
+    /// Driver-level relay test: `drive_relay_get_inner` forwards to its greedy
+    /// candidate, which answers NotFound, then consults an advertised host,
+    /// which answers Found. The relay node's OWN router must get exactly one
+    /// Failure for the NotFound peer (the Found proved existence in this
+    /// search) and one success for the host.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_not_found_then_consulted_found_labels_both_peers_once() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("get-relay", 4).await;
+        let instance_id = ContractInstanceId::new([53u8; 32]);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let upstream = peers[0].clone();
+        let greedy = op_manager
+            .ring
+            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .into_iter()
+            .next()
+            .expect("a greedy candidate");
+        let host = peers[1..]
+            .iter()
+            .find(|p| addr(p) != addr(&greedy))
+            .unwrap()
+            .clone();
+        op_manager.neighbor_hosting.handle_message(
+            host.pub_key(),
+            crate::message::NeighborHostingMessage::HostingAnnounce {
+                added: vec![instance_id],
+                removed: vec![],
+                is_response: true,
+            },
+        );
+
+        let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+        let targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, target| {
+                if !is_request(msg) {
+                    // The relay's fire-and-forget reply upstream.
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                seen.lock().push(target);
+                let answer = if target == Some(greedy_addr) {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else if target == Some(host_addr) {
+                    Answer::Reply(found(msg, instance_id))
+                } else {
+                    Answer::Never
+                };
+                Step { hop: None, answer }
+            },
+        );
+
+        let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+        let result = drive_relay_get_inner(
+            &op_manager,
+            &conn_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            3,
+            addr(&upstream),
+            VisitedPeers::new(&Transaction::new::<GetMsg>()),
+            false,
+            false,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            targets.lock().clone(),
+            vec![Some(greedy_addr), Some(host_addr)],
+            "greedy forward, then the consulted host"
+        );
+        assert_eq!(
+            failure_window(&op_manager),
+            vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)],
+        );
     }
 
     /// Source pin: the client GET driver gets a live recorder, the sub-op
@@ -8234,7 +8475,6 @@ mod route_attempt_driver_tests {
         };
         let client = body("async fn drive_client_get_inner(");
         assert!(client.contains("recorder: RouteAttemptRecorder::new("));
-        assert!(client.contains("peer: driver.terminal_route_peer(),"));
         let sub_op = body("async fn drive_sub_op_get(");
         assert!(sub_op.contains("recorder: RouteAttemptRecorder::disabled("));
         let relay = body("async fn drive_relay_get_inner<CB>(");

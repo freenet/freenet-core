@@ -890,13 +890,15 @@ pub(crate) fn streaming_aware_attempt_timeout(
 ///
 /// # Outcome attribution
 ///
-/// A downstream `NotFound` is a `RouteOutcome::Failure` for routing purposes:
-/// the model asks "will routing via this peer deliver this contract?", and a
-/// `NotFound` means it did not. It is NOT a peer-health signal, which is why
-/// relay events (like every recorder event) feed the router only. How an
-/// ambiguous `NotFound` is labelled (one from a search that never proved the
-/// contract exists) is decided by
-/// [`route_attempt::ambiguous_not_found_policy`].
+/// A downstream `NotFound` is a `RouteOutcome::Failure` for routing purposes
+/// only when the same search then proves the contract exists (a later Found):
+/// the model asks "will routing via this peer deliver this contract?", and
+/// only then do we know it would have been deliverable. A `NotFound` from a
+/// search that never proves existence is ambiguous (the contract may not
+/// exist, or not yet) and is handled by
+/// [`route_attempt::ambiguous_not_found_policy`], which does not train it.
+/// Neither is ever a peer-health signal, which is why relay events (like every
+/// recorder event) feed the router only.
 ///
 /// `LocalCompletion` and unexpected-reply variants are NOT recorded: whether
 /// they indicate a local bug or peer misbehaviour is unknown, and the invariant

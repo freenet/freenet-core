@@ -15,11 +15,14 @@
 //!
 //! # Labels
 //!
-//! | Attempt outcome | Label | When |
-//! |---|---|---|
-//! | timeout, peer disconnected / send failure | `Failure` | immediately |
-//! | `NotFound`, later reply in the same op proved the contract exists | `Failure` | when existence is proven |
-//! | `NotFound`, op ended without proving existence | [`ambiguous_not_found_policy`] | when the recorder is dropped |
+//! | Attempt outcome | Label |
+//! |---|---|
+//! | timeout, send failure, connection to the attempted peer dropped | `Failure`, immediately |
+//! | `NotFound`, and a later reply in the SAME operation proves the contract exists | `Failure`, when existence is proven |
+//! | `NotFound`, operation ends without that proof | [`ambiguous_not_found_policy`] (default: not trained) |
+//!
+//! Each peer is labelled a failure at most ONCE per operation, however many
+//! times it timed out or answered `NotFound` within it.
 //!
 //! Failures here feed the router ONLY — never `peer_health` (whose 90 %
 //! failure-rate / zero-success criteria evict connections) and never the
@@ -33,15 +36,14 @@
 //! GET and PUT originators send each attempt to their OWN node
 //! (`OpCtx::send_and_await`), where the originator-loopback relay driver picks
 //! the real first hop and fire-and-forgets the request to it. The client
-//! driver's `current_target` is only its own guess (PUT picks it with a
-//! different function, and GET retries re-pick it from a `tried` set the
-//! loopback relay never sees), so it cannot be used to blame a peer. The retry
-//! loop therefore registers a slot per attempt transaction, the loopback relay
-//! fills it with the peer it actually forwarded to, and the loop reads it back
-//! when the attempt resolves. An empty slot means no remote peer was attempted
-//! (local completion, no routing candidates, dispatch failure) and nothing is
-//! recorded.
+//! driver's `current_target` is only its own guess, so it must not be blamed
+//! or credited. The retry loop registers a slot per attempt transaction, the
+//! loopback relay fills it with the peer it actually forwarded to, and the
+//! loop reads it back when the attempt resolves. An empty slot means no remote
+//! peer was attempted (local completion, no routing candidates, dispatch
+//! failure) and nothing is recorded, success or failure.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -57,40 +59,37 @@ use crate::router::{RouteEvent, RouteOutcome};
 ///
 /// Such a `NotFound` is ambiguous: either the contract exists and routing
 /// dead-ended (a real routing failure of that peer), or the contract does not
-/// exist at all (no information about the peer). The two cannot be told apart
-/// when the operation ends.
+/// exist, or did not exist YET (no information about the peer). The two cannot
+/// be told apart locally, not even later: a contract that exists now may not
+/// have existed when the `NotFound` was returned (a GET before its PUT gets
+/// correct `NotFound`s from exactly the peers the PUT then stores at).
 ///
-/// Training on them anyway ([`Self::Naive`]) assumes requests for absent
-/// contracts wash out. A synthetic bake-off (branch `exp/estimator-bakeoff`,
-/// commit e26a92c1d) tested that directly with absent keys spread UNIFORMLY
-/// around the ring, the most favourable case for the assumption: naive
-/// labelling still raised model error 1.5-1.8x at 5 % absent requests and
-/// 6-9x at 20 %, and cut how often the truly best of the 10 nearest candidates
-/// was picked by 7-11 points versus delayed labelling at equal data. Clustered
-/// hot missing keys and exhaustion depth (lower-ranked candidates are only
-/// tried after the better ones fail) can only make it worse.
+/// Training on them ([`Self::Naive`]) assumes requests for absent contracts
+/// wash out. A synthetic bake-off (branch `exp/estimator-bakeoff`, commit
+/// e26a92c1d) tested that with absent keys spread UNIFORMLY around the ring,
+/// the most favourable case: naive labelling still raised model error
+/// 1.5-1.8x at 5 % absent requests and 6-9x at 20 %, and cut how often the
+/// truly best of the 10 nearest candidates was picked by 7-11 points.
 ///
-/// [`Self::Delayed`] parks the attempts and trains on them only if this node
-/// later sees evidence the contract exists; see
-/// [`crate::ring::parked_not_found`]. Residual bias it accepts: a dead-end on
-/// an existing contract that this node never sees confirmed within the TTL is
-/// never learned.
+/// [`Self::Untrained`] drops them. Residual bias it accepts: a dead-end on a
+/// contract that does exist, in an operation that never found it, is never
+/// learned; the router learns about that peer only from timeouts and from
+/// operations that later found the contract elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AmbiguousNotFoundPolicy {
-    /// Label every ambiguous `NotFound` attempt as `RouteOutcome::Failure` when
+    /// Label every ambiguous `NotFound` attempt `RouteOutcome::Failure` when
     /// the operation ends.
     // Not selected in production; kept as the swap seam and exercised by tests.
     #[cfg_attr(not(test), allow(dead_code))]
     Naive,
-    /// Park ambiguous `NotFound` attempts; label them `Failure` only on later
-    /// evidence the contract exists, and drop them untrained on expiry.
-    Delayed,
+    /// Never train on an ambiguous `NotFound` attempt.
+    Untrained,
 }
 
 /// The one place that decides how ambiguous `NotFound` attempts are labelled.
 /// See [`AmbiguousNotFoundPolicy`] for the evidence behind the choice.
 pub(crate) const fn ambiguous_not_found_policy() -> AmbiguousNotFoundPolicy {
-    AmbiguousNotFoundPolicy::Delayed
+    AmbiguousNotFoundPolicy::Untrained
 }
 
 /// A non-success outcome of one attempt against one peer.
@@ -100,8 +99,9 @@ pub(crate) enum AttemptFailure {
     NotFound,
     /// No terminal reply arrived within the attempt deadline.
     Timeout,
-    /// The request could not be delivered, or the connection to the peer was
-    /// dropped while awaiting the reply.
+    /// The request could not be delivered, the connection to the attempted
+    /// peer was dropped while awaiting the reply, or the peer announced a
+    /// streamed reply that never arrived.
     SendFailure,
 }
 
@@ -114,39 +114,16 @@ pub(crate) enum AttemptOrigin {
     Relay,
 }
 
-/// Where labels go. Implemented by [`crate::ring::Ring`] (router only, plus the
-/// parked-`NotFound` store); unit tests substitute a recording sink.
+/// Where failure labels go. Implemented by [`crate::ring::Ring`] (router
+/// only); unit tests substitute a recording sink. `cause` is what the
+/// recorder was told about the attempt; it is counted, not trained on.
 pub(crate) trait RouteFailureSink: Send + Sync {
-    /// Feed one `Failure` label to the router.
-    fn record_route_failure(&self, event: RouteEvent);
-    /// Park ambiguous `NotFound` attempts for `instance_id` until evidence the
-    /// contract exists arrives, or they expire.
-    fn park_ambiguous_not_found(
-        &self,
-        instance_id: ContractInstanceId,
-        op_type: OpType,
-        peers: Vec<PeerKeyLocation>,
-    );
-    /// Evidence that `instance_id` exists: label its parked attempts `Failure`.
-    fn release_parked_not_found(&self, instance_id: &ContractInstanceId);
+    fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure);
 }
 
 impl RouteFailureSink for crate::ring::Ring {
-    fn record_route_failure(&self, event: RouteEvent) {
-        crate::ring::Ring::record_route_failure(self, event);
-    }
-
-    fn park_ambiguous_not_found(
-        &self,
-        instance_id: ContractInstanceId,
-        op_type: OpType,
-        peers: Vec<PeerKeyLocation>,
-    ) {
-        crate::ring::Ring::park_ambiguous_not_found(self, instance_id, op_type, peers);
-    }
-
-    fn release_parked_not_found(&self, instance_id: &ContractInstanceId) {
-        crate::ring::Ring::release_parked_not_found(self, instance_id);
+    fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
+        crate::ring::Ring::record_route_failure(self, event, cause);
     }
 }
 
@@ -164,6 +141,9 @@ pub(crate) struct RouteAttemptRecorder {
     origin: AttemptOrigin,
     policy: AmbiguousNotFoundPolicy,
     pending_not_found: Vec<PeerKeyLocation>,
+    /// Peers already labelled a failure in this operation. A peer is labelled
+    /// at most once per operation.
+    failed: HashSet<PeerKeyLocation>,
     contract_known_to_exist: bool,
 }
 
@@ -209,6 +189,7 @@ impl RouteAttemptRecorder {
             origin,
             policy,
             pending_not_found: Vec::new(),
+            failed: HashSet::new(),
             contract_known_to_exist: false,
         }
     }
@@ -228,66 +209,62 @@ impl RouteAttemptRecorder {
         };
         match outcome {
             AttemptFailure::Timeout | AttemptFailure::SendFailure => {
-                self.emit_failure(peer.clone());
+                self.emit_failure(peer.clone(), outcome);
             }
             AttemptFailure::NotFound if self.contract_known_to_exist => {
-                self.emit_failure(peer.clone());
+                self.emit_failure(peer.clone(), outcome);
             }
-            AttemptFailure::NotFound => self.pending_not_found.push(peer.clone()),
+            AttemptFailure::NotFound => {
+                if !self.pending_not_found.contains(peer) {
+                    self.pending_not_found.push(peer.clone());
+                }
+            }
         }
     }
 
     /// Evidence from THIS operation that the contract exists (a found reply, a
     /// streaming header, a subscription, a local copy). Every pending
-    /// `NotFound` is a genuine routing failure, and so is every attempt other
-    /// operations parked for this contract; later `NotFound`s in this operation
+    /// `NotFound` in this operation is a genuine routing failure; later ones
     /// are labelled immediately. Idempotent.
     pub(crate) fn contract_exists(&mut self) {
-        if self.contract_known_to_exist {
-            return;
-        }
         self.contract_known_to_exist = true;
         for peer in std::mem::take(&mut self.pending_not_found) {
-            self.emit_failure(peer);
-        }
-        if let Some(sink) = &self.sink {
-            sink.release_parked_not_found(&self.instance_id);
+            self.emit_failure(peer, AttemptFailure::NotFound);
         }
     }
 
-    fn emit_failure(&self, peer: PeerKeyLocation) {
+    fn emit_failure(&mut self, peer: PeerKeyLocation, cause: AttemptFailure) {
         let Some(sink) = &self.sink else {
             return;
         };
+        if !self.failed.insert(peer.clone()) {
+            return;
+        }
         if self.origin == AttemptOrigin::Relay {
             crate::operations::count_relay_route_event(self.op_type);
         }
-        sink.record_route_failure(RouteEvent {
-            peer,
-            contract_location: Location::from(&self.instance_id),
-            outcome: RouteOutcome::Failure,
-            op_type: Some(self.op_type),
-        });
+        sink.record_route_failure(
+            RouteEvent {
+                peer,
+                contract_location: Location::from(&self.instance_id),
+                outcome: RouteOutcome::Failure,
+                op_type: Some(self.op_type),
+            },
+            cause,
+        );
     }
 }
 
 impl Drop for RouteAttemptRecorder {
     fn drop(&mut self) {
         let pending = std::mem::take(&mut self.pending_not_found);
-        if pending.is_empty() {
-            return;
-        }
         match self.policy {
             AmbiguousNotFoundPolicy::Naive => {
                 for peer in pending {
-                    self.emit_failure(peer);
+                    self.emit_failure(peer, AttemptFailure::NotFound);
                 }
             }
-            AmbiguousNotFoundPolicy::Delayed => {
-                if let Some(sink) = &self.sink {
-                    sink.park_ambiguous_not_found(self.instance_id, self.op_type, pending);
-                }
-            }
+            AmbiguousNotFoundPolicy::Untrained => {}
         }
     }
 }
@@ -373,6 +350,9 @@ pub(crate) mod driver_test_support {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use freenet_stdlib::prelude::WrappedState;
+
+    use crate::contract::{ContractHandlerEvent, StoreResponse};
     use crate::message::{MessageStats, NetMessage};
     use crate::node::{OpExecutionPayload, OpManager, WaiterReply};
     use crate::ring::{Location, PeerKeyLocation};
@@ -394,12 +374,19 @@ pub(crate) mod driver_test_support {
         /// Wake the waiter with `PeerDisconnected` for the hop (the connection
         /// was pruned mid-flight, #4313).
         PeerDisconnected,
+        /// Wake the waiter with `PeerDisconnected` for some OTHER peer.
+        PeerDisconnectedFor(SocketAddr),
         /// Never answer, so the attempt times out.
         Never,
         /// Drop the waiter without an answer: the driver sees a local
         /// `NotificationError`, which is not the peer's doing.
         DropWaiter,
     }
+
+    /// What the stub contract handler answers to a `GetQuery`: `None` = the
+    /// contract is not stored locally.
+    pub(crate) type LocalStore =
+        Arc<parking_lot::Mutex<Option<(freenet_stdlib::prelude::ContractKey, WrappedState)>>>;
 
     /// Build a Local-mode `OpManager` with a known own address and `peers`
     /// ring connections, returning the op-execution receiver the drivers send
@@ -412,6 +399,24 @@ pub(crate) mod driver_test_support {
         tokio::sync::mpsc::Receiver<OpExecutionPayload>,
         Vec<PeerKeyLocation>,
         Box<dyn std::any::Any>,
+    ) {
+        let (op_manager, rx, peers, guards, _store) =
+            op_manager_with_peers_and_store(id, peers).await;
+        (op_manager, rx, peers, guards)
+    }
+
+    /// [`op_manager_with_peers`] plus a stub contract handler: a `GetQuery` is
+    /// answered from the returned [`LocalStore`], every other event is dropped
+    /// unanswered (the caller sees a handler error).
+    pub(crate) async fn op_manager_with_peers_and_store(
+        id: &str,
+        peers: usize,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Vec<PeerKeyLocation>,
+        Box<dyn std::any::Any>,
+        LocalStore,
     ) {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
@@ -427,8 +432,30 @@ pub(crate) mod driver_test_support {
             notifications_receiver,
             op_execution_receiver,
         } = notification_rx;
-        let (ops_ch_channel, ch_channel, wait_for_event) =
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
             crate::contract::contract_handler_channel();
+        let store: LocalStore = Arc::new(parking_lot::Mutex::new(None));
+        let handler_store = store.clone();
+        tokio::spawn(async move {
+            while let Ok((id, event, _priority)) = ch_channel.recv_from_sender().await {
+                if let ContractHandlerEvent::GetQuery { instance_id, .. } = event {
+                    let stored = handler_store
+                        .lock()
+                        .clone()
+                        .filter(|(key, _)| *key.id() == instance_id);
+                    let response = ContractHandlerEvent::GetResponse {
+                        key: stored.as_ref().map(|(key, _)| *key),
+                        response: Ok(StoreResponse {
+                            state: stored.map(|(_, state)| state),
+                            contract: None,
+                        }),
+                    };
+                    let _answered = ch_channel.send_to_sender(id, response).await;
+                } else {
+                    ch_channel.drop_waiting_response(id);
+                }
+            }
+        });
         let connection_manager = crate::ring::ConnectionManager::new(&node_config);
         let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
         let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
@@ -455,7 +482,7 @@ pub(crate) mod driver_test_support {
             let kp = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = format!("127.0.0.1:{}", 30000 + i).parse().unwrap();
             assert!(op_manager.ring.connection_manager.add_connection(
-                Location::new(0.1 + 0.2 * i as f64),
+                Location::new((0.05 + 0.13 * i as f64) % 1.0),
                 addr,
                 kp.public().clone(),
                 false,
@@ -464,12 +491,11 @@ pub(crate) mod driver_test_support {
         }
         let guards: Box<dyn std::any::Any> = Box::new((
             notifications_receiver,
-            ch_channel,
             wait_for_event,
             result_router_rx,
             task_monitor,
         ));
-        (op_manager, op_execution_receiver, added, guards)
+        (op_manager, op_execution_receiver, added, guards, store)
     }
 
     /// Serve outbound attempts of type `op` from `rx` with
@@ -519,6 +545,11 @@ pub(crate) mod driver_test_support {
                             .try_send(WaiterReply::PeerDisconnected { peer })
                             .expect("the attempt's waiter accepts the disconnect");
                     }
+                    Answer::PeerDisconnectedFor(peer) => {
+                        reply_tx
+                            .try_send(WaiterReply::PeerDisconnected { peer })
+                            .expect("the attempt's waiter accepts the disconnect");
+                    }
                     Answer::Never => held_open.push(reply_tx),
                     Answer::DropWaiter => drop(reply_tx),
                 }
@@ -553,25 +584,12 @@ mod tests {
     /// Records what the recorder asked of the sink.
     #[derive(Default)]
     struct VecSink {
-        failures: Mutex<Vec<RouteEvent>>,
-        parked: Mutex<Vec<(ContractInstanceId, OpType, Vec<PeerKeyLocation>)>>,
-        released: Mutex<Vec<ContractInstanceId>>,
+        failures: Mutex<Vec<(RouteEvent, AttemptFailure)>>,
     }
 
     impl RouteFailureSink for VecSink {
-        fn record_route_failure(&self, event: RouteEvent) {
-            self.failures.lock().push(event);
-        }
-        fn park_ambiguous_not_found(
-            &self,
-            instance_id: ContractInstanceId,
-            op_type: OpType,
-            peers: Vec<PeerKeyLocation>,
-        ) {
-            self.parked.lock().push((instance_id, op_type, peers));
-        }
-        fn release_parked_not_found(&self, instance_id: &ContractInstanceId) {
-            self.released.lock().push(*instance_id);
+        fn record_route_failure(&self, event: RouteEvent, cause: AttemptFailure) {
+            self.failures.lock().push((event, cause));
         }
     }
 
@@ -580,18 +598,14 @@ mod tests {
             self.failures
                 .lock()
                 .iter()
-                .map(|e| {
+                .map(|(e, _)| {
                     assert!(matches!(e.outcome, RouteOutcome::Failure));
                     e.peer.socket_addr().expect("test peers have addresses")
                 })
                 .collect()
         }
-        fn parked_peers(&self) -> Vec<std::net::SocketAddr> {
-            self.parked
-                .lock()
-                .iter()
-                .flat_map(|(_, _, peers)| peers.iter().map(|p| p.socket_addr().unwrap()))
-                .collect()
+        fn causes(&self) -> Vec<AttemptFailure> {
+            self.failures.lock().iter().map(|(_, c)| *c).collect()
         }
     }
 
@@ -619,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn production_policy_is_delayed() {
+    fn production_policy_is_untrained() {
         assert_eq!(
             ambiguous_not_found_policy(),
-            AmbiguousNotFoundPolicy::Delayed
+            AmbiguousNotFoundPolicy::Untrained
         );
     }
 
@@ -630,20 +644,23 @@ mod tests {
     fn timeout_and_send_failure_are_labelled_immediately() {
         let sink = Arc::new(VecSink::default());
         let (a, b) = (peer(1), peer(2));
-        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Delayed);
+        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Untrained);
         rec.record_attempt(Some(&a), AttemptFailure::Timeout);
         assert_eq!(sink.failed_peers(), vec![addr(&a)]);
         rec.record_attempt(Some(&b), AttemptFailure::SendFailure);
         assert_eq!(sink.failed_peers(), vec![addr(&a), addr(&b)]);
         drop(rec);
         assert_eq!(sink.failed_peers().len(), 2, "drop must not re-emit");
-        assert!(sink.parked.lock().is_empty(), "timeouts are never parked");
+        assert_eq!(
+            sink.causes(),
+            vec![AttemptFailure::Timeout, AttemptFailure::SendFailure]
+        );
     }
 
     #[test]
     fn not_found_then_success_labels_each_not_found_peer_exactly_once() {
         for policy in [
-            AmbiguousNotFoundPolicy::Delayed,
+            AmbiguousNotFoundPolicy::Untrained,
             AmbiguousNotFoundPolicy::Naive,
         ] {
             let sink = Arc::new(VecSink::default());
@@ -651,14 +668,9 @@ mod tests {
             let mut rec = recorder(&sink, policy);
             rec.record_attempt(Some(&a), AttemptFailure::NotFound);
             rec.record_attempt(Some(&b), AttemptFailure::NotFound);
-            assert!(
-                sink.failed_peers().is_empty(),
-                "{policy:?}: not yet resolved"
-            );
+            assert!(sink.failed_peers().is_empty(), "{policy:?}: not yet proven");
             rec.contract_exists();
             assert_eq!(sink.failed_peers(), vec![addr(&a), addr(&b)], "{policy:?}");
-            // Same-op evidence also releases what OTHER ops parked, once.
-            assert_eq!(*sink.released.lock(), vec![id()], "{policy:?}");
             // A NotFound after existence was proven is labelled immediately.
             rec.record_attempt(Some(&c), AttemptFailure::NotFound);
             rec.contract_exists();
@@ -668,37 +680,23 @@ mod tests {
                 vec![addr(&a), addr(&b), addr(&c)],
                 "{policy:?}"
             );
-            assert_eq!(sink.released.lock().len(), 1, "{policy:?}: idempotent");
-            assert!(
-                sink.parked.lock().is_empty(),
-                "{policy:?}: nothing ambiguous"
-            );
+            assert!(sink.causes().iter().all(|c| *c == AttemptFailure::NotFound));
         }
     }
 
     #[test]
-    fn delayed_policy_parks_ambiguous_not_found_at_settle_without_training() {
+    fn untrained_policy_drops_ambiguous_not_found() {
         let sink = Arc::new(VecSink::default());
         let (a, b) = (peer(1), peer(2));
-        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Delayed);
+        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Untrained);
         rec.record_attempt(Some(&a), AttemptFailure::NotFound);
         rec.record_attempt(Some(&b), AttemptFailure::Timeout);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-        assert!(
-            sink.parked.lock().is_empty(),
-            "parked only when the op settles"
-        );
         drop(rec);
         assert_eq!(
             sink.failed_peers(),
             vec![addr(&b)],
             "only the timeout trains"
         );
-        assert_eq!(sink.parked_peers(), vec![addr(&a), addr(&a)]);
-        let parked = sink.parked.lock();
-        assert_eq!(parked.len(), 1, "one park call per operation");
-        assert_eq!((parked[0].0, parked[0].1), (id(), OpType::Get));
-        assert!(sink.released.lock().is_empty());
     }
 
     #[test]
@@ -711,23 +709,58 @@ mod tests {
         assert_eq!(sink.failed_peers(), vec![addr(&b)]);
         drop(rec);
         assert_eq!(sink.failed_peers(), vec![addr(&b), addr(&a)]);
-        assert!(sink.parked.lock().is_empty());
+    }
+
+    /// A peer that fails several times in one operation (repeated timeouts,
+    /// repeated NotFounds, or a mix) is labelled a failure exactly once.
+    #[test]
+    fn a_peer_is_labelled_at_most_once_per_operation() {
+        for policy in [
+            AmbiguousNotFoundPolicy::Untrained,
+            AmbiguousNotFoundPolicy::Naive,
+        ] {
+            let sink = Arc::new(VecSink::default());
+            let (a, b) = (peer(1), peer(2));
+            let mut rec = recorder(&sink, policy);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+            rec.record_attempt(Some(&a), AttemptFailure::SendFailure);
+            rec.record_attempt(Some(&a), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
+            rec.contract_exists();
+            rec.record_attempt(Some(&b), AttemptFailure::NotFound);
+            rec.record_attempt(Some(&a), AttemptFailure::Timeout);
+            drop(rec);
+            assert_eq!(
+                sink.failed_peers(),
+                vec![addr(&a), addr(&b)],
+                "{policy:?}: one failure per peer per operation"
+            );
+        }
+        // And for ambiguous NotFounds settled by the Naive policy.
+        let sink = Arc::new(VecSink::default());
+        let a = peer(1);
+        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
+        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
+        drop(rec);
+        assert_eq!(sink.failed_peers(), vec![addr(&a)]);
     }
 
     #[test]
     fn unattributable_attempt_and_zero_attempts_record_nothing() {
         let sink = Arc::new(VecSink::default());
         {
-            let _untouched = recorder(&sink, AmbiguousNotFoundPolicy::Delayed);
+            let _untouched = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
         }
-        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Delayed);
+        let mut rec = recorder(&sink, AmbiguousNotFoundPolicy::Naive);
         rec.record_attempt(None, AttemptFailure::NotFound);
         rec.record_attempt(None, AttemptFailure::Timeout);
         rec.record_attempt(None, AttemptFailure::SendFailure);
+        rec.contract_exists();
         drop(rec);
         assert!(sink.failed_peers().is_empty());
-        assert!(sink.parked.lock().is_empty(), "an empty op parks nothing");
-        assert!(sink.released.lock().is_empty());
     }
 
     #[test]
@@ -736,11 +769,8 @@ mod tests {
         let a = peer(1);
         rec.record_attempt(Some(&a), AttemptFailure::Timeout);
         rec.record_attempt(Some(&a), AttemptFailure::NotFound);
-        drop(rec);
-        let mut rec = RouteAttemptRecorder::disabled(id(), OpType::Get);
-        rec.record_attempt(Some(&a), AttemptFailure::NotFound);
         rec.contract_exists();
-        // No sink to observe: this pins that neither path panics without one.
+        // No sink to observe: this pins that no path panics without one.
     }
 
     #[test]
@@ -752,13 +782,13 @@ mod tests {
             id(),
             OpType::Subscribe,
             AttemptOrigin::Originator,
-            AmbiguousNotFoundPolicy::Delayed,
+            AmbiguousNotFoundPolicy::Untrained,
         );
         rec.record_attempt(Some(&a), AttemptFailure::Timeout);
         let events = sink.failures.lock();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].contract_location, Location::from(&id()));
-        assert_eq!(events[0].op_type, Some(OpType::Subscribe));
+        assert_eq!(events[0].0.contract_location, Location::from(&id()));
+        assert_eq!(events[0].0.op_type, Some(OpType::Subscribe));
     }
 
     #[test]

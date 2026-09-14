@@ -9028,35 +9028,39 @@ fn test_relay_route_events_multihop() {
     );
 }
 
-/// #4485: dead-end route attempts must reach the router's failure model, but
-/// only once something proves the contract exists.
+/// #4485: route attempts feed the router the right labels, per node.
 ///
 /// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
 /// originators recorded only their final success, so a production gateway saw
-/// 2 failures in 361 route events. Under the delayed policy an operation that
-/// exhausts on `NotFound`s parks those attempts (they may be requests for a
-/// contract that does not exist) and trains them as failures only when this
-/// node later stores the contract's state.
+/// 2 failures in 361 route events. Now timeouts and dropped connections are
+/// failures, a `NotFound` is a failure only when a later attempt in the SAME
+/// operation found the contract, and ambiguous `NotFound`s are not trained.
 ///
-/// The same 13-node topology (same seed) runs twice. Every node GETs a
-/// contract that has not been PUT (every search dead-ends and parks), then
-/// GETs it again:
+/// Two runs on the same 13-node topology and seed:
 ///
-/// * **evidence** — the gateway PUTs the contract between the two rounds, so
-///   the second round resolves, each node stores the state, and its parked
-///   attempts are released as failures. This run is also the GET health
-///   baseline: every second-round GET must resolve.
-/// * **no evidence** — the contract is never PUT. Nothing may be released.
+/// * **absent** — every node GETs a contract that is never PUT. Every search
+///   dead-ends, nothing can prove the contract exists, so NO node may feed its
+///   router a single `NotFound` failure label.
+/// * **evidence** — every node GETs a contract before it is PUT (correct
+///   `NotFound`s that must not be trained later), the gateway PUTs it, every
+///   node GETs it again (GET health: all must resolve), then the gateway PUTs
+///   a second contract, three nodes are crashed, and the remaining nodes GET
+///   the second contract. Attempts forwarded into a crashed (or otherwise
+///   silent) peer time out, and those timeouts must reach the routers as
+///   failures. Observed at this seed: timeouts at several nodes, and one
+///   NotFound label (node 9) from an operation that later found the contract.
 ///
-/// Counts are read from each node's parked store and Router, not a proxy.
+/// Labels are read per node from each Ring's per-cause failure counters and
+/// Router totals, not from a proxy.
 #[test_log::test]
 fn test_router_receives_failures_for_dead_end_gets() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x4485_0000_0001;
     let num_nodes = 12;
+    let crashed = 1..=3;
 
-    let run = |network_name: &'static str, put_between_rounds: bool| {
+    let run = |network_name: &'static str, operations: &dyn Fn(&mut Vec<ScheduledOperation>)| {
         setup_deterministic_state(SEED);
         let rt = create_runtime();
         let mut sim = rt.block_on(async {
@@ -9072,47 +9076,23 @@ fn test_router_receives_failures_for_dead_end_gets() {
             )
             .await
         });
-        // 15 s between operations: long enough that a node's first-round GET
-        // has finished before its second-round GET starts (at 5 s the last
-        // node's two GETs overlap and its second one never stores the state,
-        // which reproduces on the pre-#4485 base too), and short enough that
-        // the second round lands inside the parked-NotFound TTL (5 min).
+        // 15 s between operations. With 5 s the last node's second-round GET
+        // fails to store the state, which is NOT this change and not GET
+        // overlap: that node never joins the ring (every CONNECT is rejected),
+        // the gateway's zombie sweep silently drops its only connection after
+        // 90 s with no close message, and the node keeps sending GETs into the
+        // dead link until its 120 s idle timeout (#5654). The spacing only
+        // decides which of its GETs lands in that dead window; at 15 s it is a
+        // first-round GET, which this test does not require to resolve. Its
+        // first-round timeouts are genuine routing failures caused by that bug,
+        // so the timeout assertion below excludes the node.
         sim.with_controlled_op_interval(Duration::from_secs(15));
-
-        let contract = SimOperation::create_test_contract(0x85);
-        let contract_id = *contract.key().id();
-        register_crdt_contract(contract_id);
-
-        let get_round = |ops: &mut Vec<ScheduledOperation>| {
-            for i in 1..=num_nodes {
-                ops.push(ScheduledOperation::new(
-                    NodeLabel::node(network_name, i),
-                    SimOperation::Get {
-                        contract_id,
-                        return_contract_code: true,
-                        subscribe: false,
-                    },
-                ));
-            }
-        };
-        let mut operations = Vec::new();
-        get_round(&mut operations);
-        if put_between_rounds {
-            operations.push(ScheduledOperation::new(
-                NodeLabel::gateway(network_name, 0),
-                SimOperation::Put {
-                    contract: contract.clone(),
-                    state: SimOperation::create_crdt_state(1, 0x85),
-                    subscribe: true,
-                },
-            ));
-        }
-        get_round(&mut operations);
-
+        let mut ops = Vec::new();
+        operations(&mut ops);
         let result = sim.run_controlled_simulation(
             SEED,
-            operations,
-            Duration::from_secs(900),
+            ops,
+            Duration::from_secs(1200),
             Duration::from_secs(180),
         );
         assert!(
@@ -9120,77 +9100,144 @@ fn test_router_receives_failures_for_dead_end_gets() {
             "{network_name}: simulation failed: {:?}",
             result.turmoil_result.err()
         );
-        (result, contract.key())
+        result
     };
 
+    let first = SimOperation::create_test_contract(0x85);
+    let first_id = *first.key().id();
+    register_crdt_contract(first_id);
+    let second = SimOperation::create_test_contract(0x86);
+    let second_id = *second.key().id();
+    register_crdt_contract(second_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>,
+                     network: &'static str,
+                     contract_id,
+                     nodes: &mut dyn Iterator<Item = usize>| {
+        for i in nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+
+    // ── absent ──────────────────────────────────────────────────────────────
+    const ABSENT: &str = "route-failures-absent";
+    let absent = run(ABSENT, &|ops| {
+        get_round(ops, ABSENT, first_id, &mut (1..=num_nodes))
+    });
+    let absent_labels: Vec<(usize, (u64, u64, u64))> = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            (
+                i,
+                absent.node_route_failure_causes(&label).unwrap_or_default(),
+            )
+        })
+        .collect();
+    tracing::info!(
+        ?absent_labels,
+        "absent run: (not_found, timeout, send_failure) per node"
+    );
+    let trained_not_found: Vec<_> = absent_labels
+        .iter()
+        .filter(|(_, (not_found, _, _))| *not_found > 0)
+        .collect();
+    assert!(
+        trained_not_found.is_empty(),
+        "a contract that never exists proves nothing about any peer: no node may \
+         train a NotFound failure. Offending nodes (index, causes): {trained_not_found:?}"
+    );
+
     // ── evidence ────────────────────────────────────────────────────────────
-    let (with_evidence, key) = run("route-failures-evidence", true);
+    const EVIDENCE: &str = "route-failures-evidence";
+    let evidence = run(EVIDENCE, &|ops| {
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: first.clone(),
+                state: SimOperation::create_crdt_state(1, 0x85),
+                subscribe: true,
+            },
+        ));
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: second.clone(),
+                state: SimOperation::create_crdt_state(1, 0x86),
+                subscribe: true,
+            },
+        ));
+        for i in crashed.clone() {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(EVIDENCE, i),
+                SimOperation::CrashNode,
+            ));
+        }
+        get_round(
+            ops,
+            EVIDENCE,
+            second_id,
+            &mut ((crashed.end() + 1)..=num_nodes),
+        );
+    });
+
+    let first_key = first.key();
     let nodes_without_state: Vec<usize> = (1..=num_nodes)
         .filter(|i| {
-            with_evidence
+            evidence
                 .node_storages
-                .get(&NodeLabel::node("route-failures-evidence", *i))
-                .is_none_or(|s| s.get_stored_state(&key).is_none())
+                .get(&NodeLabel::node(EVIDENCE, *i))
+                .is_none_or(|s| s.get_stored_state(&first_key).is_none())
         })
         .collect();
     assert!(
         nodes_without_state.is_empty(),
-        "every GET for a PUT contract must still resolve (GET success rate \
-         must not regress); nodes without state: {nodes_without_state:?}"
+        "every second-round GET for a PUT contract must resolve (GET success \
+         rate must not regress); nodes without state: {nodes_without_state:?}"
     );
-    let (ev_parked, ev_released, ev_expired, ev_rejected) =
-        with_evidence.aggregate_parked_not_found_stats();
-    let (ev_failures, ev_successes) = with_evidence.aggregate_route_outcome_totals();
 
-    // ── no evidence ─────────────────────────────────────────────────────────
-    let (without_evidence, _) = run("route-failures-no-evidence", false);
-    let (no_parked, no_released, no_expired, no_rejected) =
-        without_evidence.aggregate_parked_not_found_stats();
-    let (no_failures, no_successes) = without_evidence.aggregate_route_outcome_totals();
-
+    let per_node: Vec<(usize, (u64, u64, u64), (u64, u64))> = (1..=num_nodes)
+        .map(|i| {
+            let label = NodeLabel::node(EVIDENCE, i);
+            (
+                i,
+                evidence
+                    .node_route_failure_causes(&label)
+                    .unwrap_or_default(),
+                evidence
+                    .node_route_outcome_totals(&label)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
     tracing::info!(
-        ev_parked,
-        ev_released,
-        ev_expired,
-        ev_rejected,
-        ev_failures,
-        ev_successes,
-        no_parked,
-        no_released,
-        no_expired,
-        no_rejected,
-        no_failures,
-        no_successes,
-        "parked NotFound and route outcome totals"
+        ?per_node,
+        "evidence run: (node, (not_found, timeout, send_failure), (failures, successes))"
     );
-
+    let (all_failures, all_successes) = evidence.aggregate_route_outcome_totals();
+    assert!(all_successes > 0, "routers must receive success labels");
+    // #5654's node (see the spacing comment) times out for its own reasons.
+    let crash_timeouts: u64 = per_node
+        .iter()
+        .filter(|(i, _, _)| !crashed.contains(i) && *i != num_nodes)
+        .map(|(_, (_, timeout, send_failure), _)| timeout + send_failure)
+        .sum();
     assert!(
-        no_parked > 0,
-        "dead-end GETs must park their ambiguous NotFound attempts \
-         (parked={no_parked})"
-    );
-    assert_eq!(
-        no_released, 0,
-        "with no evidence the contract exists, no parked attempt may be trained"
-    );
-    assert!(
-        ev_released > 0,
-        "storing the contract after it was PUT must release the attempts parked \
-         by the first-round dead-ends (parked={ev_parked}, released={ev_released})"
-    );
-    assert!(
-        ev_released <= ev_parked,
-        "a parked attempt is released at most once \
-         (parked={ev_parked}, released={ev_released})"
-    );
-    // `*_rejected` is NOT asserted to be zero: every dead-end GET in this run
-    // targets the same absent key, so hub relays legitimately hit the
-    // per-contract cap. That is the cap doing its job (one hot missing key may
-    // not hold the store); a rejected attempt is simply never trained.
-    assert!(
-        ev_failures >= ev_released,
-        "every released attempt must reach a router as a failure: \
-         failures={ev_failures}, released={ev_released}"
+        crash_timeouts > 0,
+        "GETs forwarded into crashed peers must reach the routers as timeout \
+         failures (failures={all_failures}, per node={per_node:?})"
     );
 }
 

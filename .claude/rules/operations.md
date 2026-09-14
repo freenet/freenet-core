@@ -58,21 +58,33 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
 (reply classified, timeout, send failure) on an originator or relay driver:
   → Label non-success outcomes through the op's
     `operations::route_attempt::RouteAttemptRecorder` (one per operation),
-    never a hand-inlined RouteEvent. Timeout / PeerDisconnected → Failure now;
-    NotFound → held until the op resolves; `contract_exists()` on any reply
-    that proves the contract exists; the recorder's Drop applies
-    `ambiguous_not_found_policy()` to the rest (default Delayed: park in
-    `ring::parked_not_found`, train only on later evidence the contract
-    exists, never on expiry — naive training measurably degraded the model).
-  → Blame the peer the request ACTUALLY went to. GET/PUT originators send to
-    their own loopback relay, which picks the real hop; read it from the
-    per-attempt `AttemptHopRegistry` slot (the loopback relay fills it). The
-    driver's `current_target` is a guess and must not be blamed.
+    never a hand-inlined RouteEvent. Timeout / send failure / disconnect of
+    the attempted peer → Failure now; NotFound → Failure ONLY when a later
+    reply in the same op proves the contract exists (`contract_exists()`);
+    otherwise `ambiguous_not_found_policy()` (default Untrained: dropped).
+    A peer is labelled at most once per operation.
+  → Never train a NotFound on evidence from OUTSIDE the op. "The contract
+    exists now" is not "it existed when the NotFound was returned": a GET
+    before a PUT gets correct NotFounds from exactly the peers the PUT then
+    stores at, and a store keyed on later evidence is a poisoning primitive
+    (GET K through a relay, then PUT K). Naive training on ambiguous
+    NotFounds measurably degraded the model (exp/estimator-bakeoff e26a92c1d).
+  → Blame or credit only the peer the request ACTUALLY went to. GET/PUT
+    originators send to their own loopback relay, which picks the real hop;
+    read it from the per-attempt `AttemptHopRegistry` slot (the loopback relay
+    fills it). No recorded hop → no event, success or failure. The driver's
+    `current_target` is a guess. Claim a streamed reply from the same hop.
+  → Carry the hops already tried into the next attempt's visited bloom /
+    skip list, or the loopback relay re-picks the same best candidate.
   → Failures feed the router only (`Ring::record_route_failure`), never
     `peer_health`: a NotFound or an end-to-end timeout is not a reason to
-    evict a connection.
-  → A local callback drop (`NotificationError`) and an unexpected reply blame
-    nobody.
+    evict a connection. (PUT relay's own send/timeout failures still use
+    `record_relay_route_event`, which is router-only too.)
+  → A local callback drop (`NotificationError`), a disconnect of some other
+    peer, and an unexpected reply blame nobody.
+  → SUBSCRIBE renewals label neither timeouts (the renewal's clamped budget,
+    not the peer) nor NotFounds (structural: the renewer hosts the contract
+    and sits in the visited bloom).
 ```
 
 ## Wire-variant dispatch

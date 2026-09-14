@@ -166,7 +166,6 @@ pub mod interest;
 mod live_tx;
 mod location;
 pub(crate) mod merge_backoff;
-pub(crate) mod parked_not_found;
 pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
@@ -247,14 +246,22 @@ pub(crate) struct AddConnectionOutcome {
     pub just_became_ready: bool,
 }
 
+/// Per-cause counts of route failure labels (#4485). See
+/// [`Ring::route_failure_cause_counts`].
+#[derive(Default)]
+struct RouteFailureCauseCounts {
+    not_found: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    send_failure: std::sync::atomic::AtomicU64,
+}
+
 pub(crate) struct Ring {
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
-    /// Ambiguous `NotFound` route attempts waiting for evidence their contract
-    /// exists before they are trained as failures (#4485). See
-    /// [`parked_not_found`].
-    parked_not_found: parked_not_found::ParkedNotFoundStore,
+    /// Route failure labels fed to the router, by the attempt outcome that
+    /// produced them (#4485). Diagnostics only.
+    route_failure_causes: RouteFailureCauseCounts,
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
     /// Per-contract record of detected CRDT-invariant violations (e.g. a
@@ -695,7 +702,7 @@ impl Ring {
         let ring = Ring {
             max_hops_to_live,
             router,
-            parked_not_found: parked_not_found::ParkedNotFoundStore::new(),
+            route_failure_causes: RouteFailureCauseCounts::default(),
             connection_manager,
             // Production passes the Ring's default `Arc<InstantTimeSrc>`
             // (wall clock). Simulation tests can inject a controllable clock via
@@ -4090,51 +4097,37 @@ impl Ring {
 
     /// Record a routing FAILURE label for one attempt. Router only; see
     /// [`Self::record_route_event_router_only`]. The sole production sink of
-    /// [`crate::operations::route_attempt::RouteAttemptRecorder`].
-    pub(crate) fn record_route_failure(&self, event: crate::router::RouteEvent) {
+    /// [`crate::operations::route_attempt::RouteAttemptRecorder`]; `cause` is
+    /// counted in [`Self::route_failure_cause_counts`].
+    pub(crate) fn record_route_failure(
+        &self,
+        event: crate::router::RouteEvent,
+        cause: crate::operations::route_attempt::AttemptFailure,
+    ) {
+        use crate::operations::route_attempt::AttemptFailure;
         debug_assert!(
             matches!(event.outcome, crate::router::RouteOutcome::Failure),
             "record_route_failure called with a non-failure outcome"
         );
+        let counter = match cause {
+            AttemptFailure::NotFound => &self.route_failure_causes.not_found,
+            AttemptFailure::Timeout => &self.route_failure_causes.timeout,
+            AttemptFailure::SendFailure => &self.route_failure_causes.send_failure,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.record_route_event_router_only(event);
     }
 
-    /// Park the ambiguous `NotFound` attempts of one exhausted operation until
-    /// evidence the contract exists arrives (#4485). See [`parked_not_found`].
-    pub(crate) fn park_ambiguous_not_found(
-        &self,
-        instance_id: ContractInstanceId,
-        op_type: crate::node::network_status::OpType,
-        peers: Vec<PeerKeyLocation>,
-    ) {
-        self.parked_not_found
-            .park(instance_id, op_type, peers, self.time_source.now());
-    }
-
-    /// Evidence that `instance_id` exists: train every unexpired parked
-    /// `NotFound` attempt for it as a routing failure (router only).
-    ///
-    /// Called from two places. `commit_state_write` (this node stored state for
-    /// the contract: a GET or PUT cached it, an UPDATE applied, a subscription
-    /// fetched the body) is the broad, cheap hook. `RouteAttemptRecorder::
-    /// contract_exists` covers a reply that proved existence without a local
-    /// store (e.g. a relay forwarding a streamed Found whose cache step failed).
-    /// What neither sees: a contract that exists but that this node neither
-    /// stores nor sees a found reply for within the TTL. Those dead-ends are
-    /// never learned.
-    pub(crate) fn release_parked_not_found(&self, instance_id: &ContractInstanceId) {
-        for event in self
-            .parked_not_found
-            .release(instance_id, self.time_source.now())
-        {
-            self.record_route_failure(event);
-        }
-    }
-
-    /// Outcome counters of the parked-`NotFound` store.
+    /// `(not_found, timeout, send_failure)` failure labels this node has fed
+    /// its router, by cause (#4485).
     #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
-    pub(crate) fn parked_not_found_stats(&self) -> parked_not_found::ParkedNotFoundStats {
-        self.parked_not_found.stats()
+    pub(crate) fn route_failure_cause_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.route_failure_causes.not_found.load(Relaxed),
+            self.route_failure_causes.timeout.load(Relaxed),
+            self.route_failure_causes.send_failure.load(Relaxed),
+        )
     }
 
     // ==================== Subscription Management (Lease-Based) ====================
@@ -4422,9 +4415,6 @@ impl Ring {
     }
 
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
-        // Stored state proves the contract exists: NotFound attempts other
-        // operations parked for it were real routing failures (#4485).
-        self.release_parked_not_found(contract.id());
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen);
@@ -5504,7 +5494,6 @@ impl Ring {
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = self.time_source.now();
         let mut last_health_check = self.time_source.now();
-        let mut last_parked_not_found_stats = parked_not_found::ParkedNotFoundStats::default();
         let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         // How often to snapshot the peer cache to disk.
@@ -5857,22 +5846,6 @@ impl Ring {
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
                 last_health_check = self.time_source.now();
 
-                // Expire parked ambiguous NotFounds that saw no evidence, and
-                // report the store's outcomes at info level so its behaviour
-                // (and any cap saturation) is visible in release builds.
-                self.parked_not_found.purge_expired(last_health_check);
-                let parked = self.parked_not_found.stats();
-                if parked != last_parked_not_found_stats {
-                    tracing::info!(
-                        parked = parked.parked,
-                        released = parked.released,
-                        expired = parked.expired,
-                        rejected_at_cap = parked.rejected,
-                        live = parked.live,
-                        "Parked ambiguous NotFound route attempts (cumulative)"
-                    );
-                    last_parked_not_found_stats = parked;
-                }
                 let current_ring = self.connection_manager.connection_count();
                 let unhealthy = self
                     .connection_manager
