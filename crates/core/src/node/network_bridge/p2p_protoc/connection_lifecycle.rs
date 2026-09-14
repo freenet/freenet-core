@@ -1387,15 +1387,14 @@ impl P2pConnManager {
             Some(ConnEvent::InboundMessage(mut inbound)) => {
                 let tx = *inbound.msg.id();
 
-                // Record that the remote is still routing through this transport,
-                // so the zombie sweep does not collect a link in use (#5654).
-                if let Some(remote_addr) = inbound.remote_addr {
-                    if counts_as_link_use(&inbound.msg) {
-                        if let Some(entry) = self.connections.get_mut(&remote_addr) {
-                            entry.last_link_use_at = Instant::now();
-                        }
-                    }
-                }
+                // A request from the remote keeps this transport out of the zombie
+                // sweep while it is in use (#5654). See `zombie_sweep`.
+                zombie_sweep::record_link_use_request(
+                    &mut self.connections,
+                    inbound.remote_addr,
+                    &inbound.msg,
+                    Instant::now(),
+                );
 
                 if let Some(remote_addr) = inbound.remote_addr {
                     if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {

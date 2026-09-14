@@ -53,6 +53,11 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
+mod zombie_sweep;
+
+#[cfg(test)]
+use zombie_sweep::{TransportActivity, is_zombie};
+use zombie_sweep::{ZOMBIE_BACKLOG_SWEEP_INTERVAL, ZombieSweepStats};
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -520,156 +525,17 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
-    /// When the remote last sent this node an operation message over this
-    /// transport (see [`counts_as_link_use`]); equal to `created_at` until it
-    /// does. Zombie detection judges an unpromoted transport by this, not by
-    /// `created_at`, so a link the remote is still routing through is not
-    /// collected out from under it (#5654). Keepalives never reach this layer
-    /// (they are transport-level `Ping`/`Pong`), and fan-out broadcasts are
-    /// deliberately excluded by `counts_as_link_use`.
+    /// When the remote last sent a request over this transport (see
+    /// `zombie_sweep::is_link_use_request`); equal to `created_at` until it
+    /// does. The zombie sweep judges a transport that was never promoted to the
+    /// ring by this rather than by `created_at`, so a link the remote is still
+    /// sending requests over is not collected out from under it (#5654), within
+    /// the per-IP and global caps in `zombie_sweep`.
     last_link_use_at: Instant,
     /// The remote peer's negotiated protocol version, if known.
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
-}
-
-/// How long a transport has existed, and how long since its remote last used it.
-///
-/// Two `Duration`s side by side are easy to swap at a call site, so they travel
-/// named.
-#[derive(Clone, Copy, Debug)]
-struct TransportActivity {
-    /// Time since the transport was established.
-    age: Duration,
-    /// Time since the remote last sent an operation message over it (see
-    /// [`counts_as_link_use`]), or since establishment if it never has.
-    idle: Duration,
-}
-
-/// Multiple of `transient_ttl` after which an unpromoted, non-gateway transport
-/// is collected even if its remote is still using it. 120 × the 30s default is
-/// one hour, the same window a node grants its OWN gateway links in
-/// [`is_zombie`].
-///
-/// Why a bound exists at all: an exemption from garbage collection that
-/// ordinary use refreshes must be time-bounded (AGENTS.md), or a remote that
-/// never joins the ring holds the entry forever.
-///
-/// Why it is this long: collecting a link the remote is still using is exactly
-/// the #5654 failure. The transport has no close message, so the remote keeps
-/// sending into the dead link until its 120s idle timeout fires, and its
-/// operations time out meanwhile. At one hour an unjoined peer pays that
-/// ~2-minute outage at most once an hour, instead of every ~3.5 minutes as it
-/// did when the sweep judged by age alone. The bound is per transport, and
-/// establishing a new one still passes the handshake's own admission limits
-/// (per-IP intro rate limit, gateway ramp-up), which this does not change.
-const ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE: u32 = 120;
-
-/// Whether an inbound message shows that the remote is using this transport as
-/// a route, which is what exempts an unpromoted transport from zombie cleanup.
-///
-/// Only operation traffic counts. The broadcast-style messages are sent by a
-/// peer to EVERY transport it holds, whether or not it routes anything through
-/// it (`handle_hosting_broadcast`, `handle_broadcast_change_interests` and
-/// `handle_broadcast_ready_state` all fan out over `connections.keys()`), so
-/// counting them would let a peer that joined the ring elsewhere keep a stale
-/// transport alive until the age bound, and the sweep would stop bounding the
-/// unpromoted transports it exists to bound (#3267, #3543). `SubscribeHint` is
-/// an unsolicited nudge, not use. Keepalives never reach this layer. Keep this
-/// match exhaustive so a new variant has to be classified here.
-fn counts_as_link_use(msg: &NetMessage) -> bool {
-    match msg {
-        NetMessage::V1(v1) => match v1 {
-            NetMessageV1::Connect(_)
-            | NetMessageV1::Put(_)
-            | NetMessageV1::Get(_)
-            | NetMessageV1::Subscribe(_)
-            | NetMessageV1::Update(_) => true,
-            NetMessageV1::Aborted(_)
-            | NetMessageV1::NeighborHosting { .. }
-            | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. }
-            | NetMessageV1::SubscribeHint(_) => false,
-        },
-    }
-}
-
-/// Check whether a transport connection is a zombie: not promoted to ring, not
-/// a gateway, and either unused by its remote for too long or past an absolute
-/// age bound.
-///
-/// Gateway connections are exempt below a 1-hour absolute cap because they
-/// are intentionally transient (never promoted to ring) but actively needed
-/// for routing (#3595).
-///
-/// For non-gateway connections the thresholds below apply to how long the
-/// remote has left the transport UNUSED ([`TransportActivity::idle`]), not to
-/// its age. A peer that cannot join the ring keeps its gateway transport as its
-/// only route, and the gateway never promotes it; judging that transport by age
-/// dropped it silently while the peer was still routing through it (#5654). A
-/// transport whose remote never uses it has `idle == age`, so for it these are
-/// exactly the original age thresholds.
-///
-/// Thresholds, derived from `transient_ttl` (configurable, default 30s):
-///
-/// - `zombie_threshold` = `transient_ttl * 3` unused: catches connections with no
-///   pending reservation. Must be greater than `PENDING_RESERVATION_TTL` (60s) so
-///   that a connection isn't immediately killed after its reservation expires.
-///   Previous hardcoded value of 300s caused gateways to accumulate ~250 zombie
-///   transports, overwhelming the packet processing channel and dropping
-///   keepalive packets.
-/// - `absolute_zombie_threshold` = `transient_ttl * 6` unused: overrides
-///   `has_pending` to break the refresh cycle where `connection_maintenance()`
-///   perpetually renews pending reservations on gateway transports. Previous
-///   hardcoded value of 600s allowed zombie transports to linger far too long.
-/// - `active_max_age` = `transient_ttl * ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE`
-///   of AGE: the time bound on the in-use exemption, so a remote that keeps using
-///   a transport without ever being promoted cannot hold it forever. See
-///   [`ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE`].
-fn is_zombie(
-    activity: TransportActivity,
-    in_ring: bool,
-    has_pending: bool,
-    is_gateway: bool,
-    transient_ttl: Duration,
-) -> bool {
-    let zombie_threshold = transient_ttl * 3;
-    let absolute_zombie_threshold = transient_ttl * 6;
-    let active_max_age = transient_ttl * ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE;
-    let TransportActivity { age, idle } = activity;
-    // A transport cannot have been unused for longer than it has existed.
-    let idle = idle.min(age);
-
-    if in_ring {
-        return false;
-    }
-    // Gateway transient connections are intentionally not promoted to ring,
-    // but the node needs them for routing. Without this exemption, gateways
-    // enter a zombie→prune→reconnect→zombie death spiral that breaks all
-    // streaming transfers (#3595).
-    //
-    // The exemption is time-bounded: truly dead gateway connections (no
-    // traffic for 1 hour) are still cleaned up. The transport-level idle
-    // timeout is the primary backstop, but this ensures no permanent leaks.
-    /// Gateway connections get a generous exemption window (1 hour) because they
-    /// are intentionally transient but needed for routing. The transport-level
-    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
-    /// gateways; this threshold is the safety net.
-    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
-    if is_gateway && age < GATEWAY_ZOMBIE_EXEMPTION {
-        return false;
-    }
-    if age > active_max_age {
-        return true;
-    }
-    if idle > zombie_threshold && !has_pending {
-        return true;
-    }
-    if idle > absolute_zombie_threshold {
-        return true;
-    }
-    false
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -1594,6 +1460,9 @@ impl P2pConnManager {
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        let mut zombie_sweep_stats = ZombieSweepStats::default();
+        let mut zombie_backlog = false;
+        let mut last_zombie_sweep = Instant::now();
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
         // Monitor both the event stream AND the UDP listen task.
@@ -1707,57 +1576,13 @@ impl P2pConnManager {
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
 
-                // Zombie transport cleanup: remove connections their remote has not
-                // used for 3× transient_ttl that haven't been promoted to ring and have
-                // no pending reservation. 6× transient_ttl unused overrides pending
-                // reservations to catch gateway transports stuck in a pending-refresh
-                // cycle, and an absolute age bound collects a transport that is still
-                // in use but never promoted (see `is_zombie`, #5654).
-                //
-                // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
-                // instead of drop_connection_by_addr to avoid a circular deadlock
-                // with the handshake driver (#3519). We also cap the batch size to
-                // limit event loop latency — each zombie cleanup involves topology
-                // pruning and orphaned transaction handling. With a 100ms timeout
-                // per zombie, 64 zombies = ~6.4s worst case per cycle.
-                // Remaining zombies will be cleaned up in the next 30s cycle.
-                const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
-                let transient_ttl = op_manager.ring.connection_manager.transient_ttl();
-                let zombie_addrs: Vec<SocketAddr> = ctx
-                    .connections
-                    .iter()
-                    .filter(|(addr, entry)| {
-                        let is_gateway = ctx
-                            .gateways
-                            .iter()
-                            .any(|gw| gw.socket_addr() == Some(**addr));
-                        is_zombie(
-                            TransportActivity {
-                                age: entry.created_at.elapsed(),
-                                idle: entry.last_link_use_at.elapsed(),
-                            },
-                            op_manager.ring.connection_manager.is_in_ring(**addr),
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .has_connection_or_pending(**addr),
-                            is_gateway,
-                            transient_ttl,
-                        )
-                    })
-                    .map(|(addr, _)| *addr)
-                    .take(MAX_ZOMBIE_CLEANUP_PER_CYCLE)
-                    .collect();
-                if !zombie_addrs.is_empty() {
-                    tracing::info!(
-                        zombie_count = zombie_addrs.len(),
-                        "Cleaning up zombie transports (not promoted to ring)"
-                    );
-                }
-                for addr in &zombie_addrs {
-                    ctx.drop_zombie_connection(*addr, &handshake_cmd_sender)
-                        .await;
-                }
+                // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
+                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports; when more are due,
+                // further slices run every ZOMBIE_BACKLOG_SWEEP_INTERVAL below.
+                zombie_backlog = ctx
+                    .sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_stats)
+                    .await;
+                last_zombie_sweep = Instant::now();
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1785,6 +1610,12 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
+            } else if zombie_backlog && last_zombie_sweep.elapsed() > ZOMBIE_BACKLOG_SWEEP_INTERVAL
+            {
+                zombie_backlog = ctx
+                    .sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_stats)
+                    .await;
+                last_zombie_sweep = Instant::now();
             }
 
             match event {
@@ -4544,183 +4375,14 @@ pub(crate) mod tests {
     // ============ Zombie detection tests ============
 
     const TEST_TRANSIENT_TTL: Duration = Duration::from_secs(30);
-    // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s,
-    // active_max_age=3600s.
+    // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s
 
-    /// A transport whose remote has never sent an operation message over it,
-    /// so it has been unused for its whole life. Every pre-#5654 zombie test
-    /// below uses this, which keeps each one's original meaning: for such a
-    /// transport the unused-time thresholds are exactly the old age thresholds.
+    /// A transport whose remote has sent no request since it was established.
+    /// Every test below uses this, so each keeps its pre-#5654 meaning: for such
+    /// a transport the idle-time thresholds are exactly the old age thresholds.
+    /// The #5654 behaviour is tested in `zombie_sweep::tests`.
     fn never_used(age: Duration) -> super::TransportActivity {
-        super::TransportActivity { age, idle: age }
-    }
-
-    fn used(age_secs: u64, idle_secs: u64) -> super::TransportActivity {
-        super::TransportActivity {
-            age: Duration::from_secs(age_secs),
-            idle: Duration::from_secs(idle_secs),
-        }
-    }
-
-    /// #5654: a peer that cannot join the ring keeps routing through its
-    /// gateway transport, which the gateway never promotes. Past the old 90s
-    /// age threshold that transport must survive as long as the peer uses it.
-    #[test]
-    fn test_zombie_detection_keeps_unpromoted_transport_in_use() {
-        for (age, idle) in [(91, 0), (400, 10), (400, 90), (3000, 5)] {
-            assert!(
-                !super::is_zombie(used(age, idle), false, false, false, TEST_TRANSIENT_TTL),
-                "unpromoted transport used {idle}s ago (age {age}s) must not be a zombie"
-            );
-        }
-    }
-
-    /// The original purpose survives: an unpromoted transport its remote stopped
-    /// using is still collected, however recently it was last used before that.
-    #[test]
-    fn test_zombie_detection_reaps_unpromoted_transport_left_unused() {
-        assert!(
-            super::is_zombie(used(400, 91), false, false, false, TEST_TRANSIENT_TTL),
-            "unpromoted transport unused for 91s (> 90s) must be a zombie"
-        );
-        assert!(
-            !super::is_zombie(used(400, 90), false, false, false, TEST_TRANSIENT_TTL),
-            "unused for exactly 90s is not past the threshold (uses > not >=)"
-        );
-    }
-
-    /// With a pending reservation the 6×TTL override is also measured on unused
-    /// time: a transport in use is kept, one unused past 180s is collected.
-    #[test]
-    fn test_zombie_pending_override_uses_unused_time() {
-        assert!(
-            !super::is_zombie(used(1000, 120), false, true, false, TEST_TRANSIENT_TTL),
-            "pending transport used 120s ago must not be a zombie"
-        );
-        assert!(
-            !super::is_zombie(used(1000, 180), false, true, false, TEST_TRANSIENT_TTL),
-            "pending transport unused for exactly 180s is not past the override"
-        );
-        assert!(
-            super::is_zombie(used(1000, 181), false, true, false, TEST_TRANSIENT_TTL),
-            "pending transport unused for 181s must be a zombie"
-        );
-    }
-
-    /// The in-use exemption is time-bounded (AGENTS.md: cleanup exemptions must
-    /// be): a remote that keeps using an unpromoted transport is still collected
-    /// once the transport is older than `active_max_age`, pending or not.
-    #[test]
-    fn test_zombie_in_use_exemption_is_time_bounded() {
-        assert!(
-            !super::is_zombie(used(3600, 0), false, false, false, TEST_TRANSIENT_TTL),
-            "exactly at the age bound is not past it (uses > not >=)"
-        );
-        assert!(
-            super::is_zombie(used(3601, 0), false, false, false, TEST_TRANSIENT_TTL),
-            "a transport in use but never promoted must be collected past 1 hour"
-        );
-        assert!(
-            super::is_zombie(used(3601, 0), false, true, false, TEST_TRANSIENT_TTL),
-            "a pending reservation does not extend the age bound"
-        );
-    }
-
-    #[test]
-    fn test_zombie_in_use_age_bound_scales_with_ttl() {
-        // TTL=120s: active_max_age = 120 * 120s = 4h.
-        let large_ttl = Duration::from_secs(120);
-        assert!(!super::is_zombie(
-            used(3601, 0),
-            false,
-            false,
-            false,
-            large_ttl
-        ));
-        assert!(!super::is_zombie(
-            used(14_400, 0),
-            false,
-            false,
-            false,
-            large_ttl
-        ));
-        assert!(super::is_zombie(
-            used(14_401, 0),
-            false,
-            false,
-            false,
-            large_ttl
-        ));
-    }
-
-    /// Activity changes nothing for in-ring and gateway transports.
-    #[test]
-    fn test_zombie_in_ring_and_gateway_unaffected_by_activity() {
-        for (age, idle) in [(100_000, 100_000), (100_000, 0)] {
-            assert!(
-                !super::is_zombie(used(age, idle), true, false, false, TEST_TRANSIENT_TTL),
-                "ring connection must never be a zombie (age {age}s, unused {idle}s)"
-            );
-        }
-        assert!(
-            !super::is_zombie(used(400, 400), false, false, true, TEST_TRANSIENT_TTL),
-            "unused gateway transport inside the 1-hour exemption is not a zombie"
-        );
-        assert!(
-            super::is_zombie(used(3601, 3601), false, false, true, TEST_TRANSIENT_TTL),
-            "unused gateway transport past the 1-hour exemption is a zombie"
-        );
-    }
-
-    /// Unused time can never exceed age; an inconsistent input is read as the
-    /// transport's age rather than as a longer idle period.
-    #[test]
-    fn test_zombie_unused_time_is_capped_at_age() {
-        assert!(
-            !super::is_zombie(used(60, 500), false, false, false, TEST_TRANSIENT_TTL),
-            "a 60s-old transport cannot have been unused for 500s"
-        );
-    }
-
-    /// Only operation traffic marks a transport as in use. Fan-out broadcasts
-    /// reach every transport a peer holds whether or not it routes through it,
-    /// so counting them would let a stale transport live until the age bound.
-    #[test]
-    fn test_counts_as_link_use_only_for_operation_traffic() {
-        use crate::message::{
-            InterestMessage, NeighborHostingMessage, NetMessage, NetMessageV1, Transaction,
-        };
-        use crate::operations::get::GetMsg;
-
-        let get = NetMessage::V1(NetMessageV1::Get(GetMsg::ForwardingAck {
-            id: Transaction::new::<GetMsg>(),
-            instance_id: freenet_stdlib::prelude::ContractInstanceId::new([7u8; 32]),
-        }));
-        assert!(super::counts_as_link_use(&get), "a GET message is link use");
-
-        let broadcasts = [
-            NetMessage::V1(NetMessageV1::ReadyState { ready: true }),
-            NetMessage::V1(NetMessageV1::InterestSync {
-                message: InterestMessage::ChangeInterests {
-                    added: vec![1],
-                    removed: vec![],
-                },
-            }),
-            NetMessage::V1(NetMessageV1::NeighborHosting {
-                message: NeighborHostingMessage::HostingAnnounce {
-                    added: vec![],
-                    removed: vec![],
-                    is_response: false,
-                },
-            }),
-            NetMessage::V1(NetMessageV1::Aborted(Transaction::new::<GetMsg>())),
-        ];
-        for msg in &broadcasts {
-            assert!(
-                !super::counts_as_link_use(msg),
-                "{msg} must not count as link use"
-            );
-        }
+        super::TransportActivity::never_used(age)
     }
 
     #[test]
