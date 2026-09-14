@@ -12100,24 +12100,39 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
             6,
             4,
             8,
-            3,
+            5,
             SEED,
             &node_locations,
         )
         .await
     });
     sim.disable_placement_migration();
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+    sim.with_controlled_op_interval(Duration::from_secs(5));
 
     let host = NodeLabel::node(NETWORK_NAME, 1);
     let requester = NodeLabel::node(NETWORK_NAME, 3);
-    let operations = vec![
-        ScheduledOperation::new(
-            host.clone(),
-            SimOperation::SeedHostedContract {
-                contract: contract.clone(),
-                state: vec![5, 6, 5, 7],
+    let mut operations = vec![ScheduledOperation::new(
+        host.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: vec![5, 6, 5, 7],
+        },
+    )];
+    // Let the small ring fill in (about 2 virtual minutes) so the requester
+    // is connected to the host, using GETs for a contract nobody has.
+    let filler = *SimOperation::create_test_contract(0x58).key().id();
+    for _ in 0..24 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Get {
+                contract_id: filler,
+                return_contract_code: false,
+                subscribe: false,
             },
-        ),
+        ));
+    }
+    operations.extend([
         ScheduledOperation::new(host.clone(), SimOperation::CrashNode),
         ScheduledOperation::new(
             requester.clone(),
@@ -12127,16 +12142,32 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
                 subscribe: false,
             },
         ),
-        // Recovered well inside the first attempt's 60 s deadline: that
-        // attempt's request was already dropped, so it times out, and the
-        // retry must be able to reach the host again.
-        ScheduledOperation::new(host.clone(), SimOperation::RecoverNode),
-    ];
+        // Stay crashed for ~75 virtual seconds (15 fillers at 5 s): past the
+        // first attempt's 60 s deadline, so that attempt TIMES OUT (the
+        // transport keeps retransmitting into the silent host), but inside
+        // the 120 s connection idle timeout, so the host is still a routing
+        // candidate when the retry is sent. The retry reaches it once it
+        // recovers.
+    ]);
+    for _ in 0..15 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Get {
+                contract_id: filler,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::RecoverNode,
+    ));
 
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(400),
+        Duration::from_secs(600),
         Duration::from_secs(240),
     );
     assert!(
