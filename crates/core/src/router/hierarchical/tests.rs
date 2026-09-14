@@ -756,8 +756,10 @@ fn refit_and_prediction_cost_at_a_full_window() {
     assert_eq!(stage.sorted.len(), WINDOW_EVENTS);
 
     // Phase-by-phase, mirroring `Stage::refit`, so a regression can be located.
-    let rounds = 20u32;
-    let mut phases = [std::time::Duration::ZERO; 4];
+    let rounds = 40u32;
+    // Minimum over rounds, not mean: this runs on shared machines, and the
+    // minimum is the least contaminated estimate of the work itself.
+    let mut phases = [std::time::Duration::MAX; 4];
     for round in 0..rounds {
         for i in 0..REFIT_EVERY {
             stage.fresh.push(Event {
@@ -773,7 +775,7 @@ fn refit_and_prediction_cost_at_a_full_window() {
         }
         let mut lap = std::time::Instant::now();
         let mut mark = |phase: usize| {
-            phases[phase] += lap.elapsed();
+            phases[phase] = phases[phase].min(lap.elapsed());
             lap = std::time::Instant::now();
         };
         stage.merge_fresh();
@@ -788,7 +790,7 @@ fn refit_and_prediction_cost_at_a_full_window() {
         stage.rebuild_levels(now);
         mark(3);
     }
-    let [merge, curve, prepare, levels] = phases.map(|phase| phase / rounds);
+    let [merge, curve, prepare, levels] = phases;
     let per_refit = merge + curve + prepare + levels;
 
     let queries = 25 * 3 * 1_000;
@@ -857,4 +859,51 @@ fn routing_bundle_feeds_each_stage_from_its_own_outcomes() {
     assert!((seconds - 0.25).abs() < 1e-6, "seconds {seconds}");
     let speed = estimate.transfer_speed_bps.unwrap();
     assert!((speed - 50_000.0).abs() < 1e-3, "speed {speed}");
+}
+
+/// Per-candidate cost of a full three-stage estimate with real peer keys, the
+/// figure that matters for a routing decision (about 25 candidates). Printed,
+/// not asserted, for the reason given on the refit cost test.
+#[test]
+fn routing_estimate_cost_per_candidate() {
+    let _guard = GlobalRng::seed_guard(0x4485_ca4d);
+    let peers: Vec<PeerKeyLocation> = (0..200).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new();
+    for i in 0..WINDOW_EVENTS {
+        let peer = &peers[GlobalRng::random_range(0..peers.len())];
+        let outcome = RoutingOutcome {
+            success: uniform() > 0.05,
+            time_to_response_start_secs: Some(0.05 + uniform()),
+            transfer_speed_bps: Some(1_000.0 + 50_000.0 * uniform()),
+        };
+        routing.observe_at(
+            peer,
+            Location::new(uniform()),
+            uniform() * 0.5,
+            &outcome,
+            i as f64 / 600.0,
+        );
+    }
+    let now = WINDOW_EVENTS as f64 / 600.0;
+    let queries = 25_000;
+    let start = std::time::Instant::now();
+    let mut available = 0;
+    for q in 0..queries {
+        let estimate = routing.estimate_at(
+            &peers[q % peers.len()],
+            Location::new((q % 997) as f64 / 997.0),
+            (q % 500) as f64 / 1000.0,
+            now,
+        );
+        available += usize::from(estimate.transfer_speed_bps.is_some());
+    }
+    let per_candidate = start.elapsed() / queries as u32;
+    eprintln!(
+        "#4485 hierarchical estimate (3 stages, PeerKeyLocation keys): \
+         {per_candidate:?} per candidate"
+    );
+    assert_eq!(
+        available, queries,
+        "every stage must be active after a full window"
+    );
 }
