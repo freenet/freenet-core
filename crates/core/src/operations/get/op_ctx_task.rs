@@ -1328,11 +1328,20 @@ async fn drive_get_with_assembly_retry(
             RetryLoopOutcome::Unexpected | RetryLoopOutcome::InfraError(_) => break result,
         };
 
-        // Uses `current_target` as the sender address — accurate for
-        // the single-hop response case where the responder equals the
-        // selected target; relays pipe the stream hop-by-hop so the
-        // fragments arrive from the adjacent hop either way.
-        let Some(peer_addr) = driver.current_target.socket_addr() else {
+        // Claim from the hop this attempt was actually forwarded to: relays
+        // pipe the stream hop-by-hop, so the fragments arrive from that
+        // adjacent peer. `current_target` is only this driver's guess, and
+        // with retry diversity the loopback relay's pick often differs from
+        // it, so a claim there would wait on a stream that is registered
+        // under another address and fail the assembly. Delivery behaviour,
+        // independent of the labelling kill switch. `current_target` is used
+        // only when no hop was recorded.
+        let claim_from = driver
+            .terminal_hop
+            .as_ref()
+            .and_then(|hop| hop.socket_addr())
+            .or_else(|| driver.current_target.socket_addr());
+        let Some(peer_addr) = claim_from else {
             tracing::warn!(
                 %key,
                 "get: no socket address for the streaming responder; \
@@ -8225,6 +8234,68 @@ mod route_attempt_driver_tests {
         // NotFounds and must not train them either.
         op_manager.ring.commit_state_write(&key_for(instance_id), 3);
         assert!(failure_window(&op_manager).is_empty());
+    }
+
+    /// A streamed reply is claimed from the hop the attempt was actually
+    /// forwarded to, in both label modes. The stream is registered at that
+    /// hop's address only, so claiming from `current_target` would time out
+    /// and fail the assembly.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streamed_reply_is_claimed_from_the_forwarded_hop() {
+        use crate::operations::route_attempt::{LabelMode, force_label_mode};
+        for mode in [LabelMode::Current, LabelMode::Legacy] {
+            let _mode = force_label_mode(mode);
+            let (op_manager, rx, peers, _guards) =
+                op_manager_with_peers(&format!("get-stream-claim-{mode:?}"), 3).await;
+            let instance_id = ContractInstanceId::new([50u8; 32]);
+            let stream_id = StreamId::next_operations();
+            let payload = bincode::serialize(&GetStreamingPayload {
+                key: key_for(instance_id),
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![5, 6, 7])),
+                    contract: None,
+                },
+            })
+            .unwrap();
+            let total = payload.len() as u64;
+            let handle =
+                crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, total);
+            handle
+                .push_fragment(1, bytes::Bytes::from(payload))
+                .expect("fragment accepted");
+            op_manager
+                .orphan_stream_registry()
+                .register_orphan(addr(&peers[2]), stream_id, handle);
+
+            let hop = peers[2].clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |i, msg, _| Step {
+                    hop: Some(hop.clone()),
+                    answer: if i == 0 {
+                        Answer::Reply(streaming_header(msg, instance_id, stream_id, total))
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    },
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = client_driver(&op_manager, client_tx, instance_id, peers[0].clone());
+            let (outcome, assembly) = run(&op_manager, client_tx, &mut driver).await;
+            assert!(
+                matches!(outcome, RetryLoopOutcome::Done(Terminal::Streaming { .. })),
+                "{mode:?}"
+            );
+            assert!(
+                assembly.error.is_none(),
+                "{mode:?}: the stream must be claimed from the forwarded hop: {:?}",
+                assembly.error
+            );
+            drop(driver);
+            assert!(failure_window(&op_manager).is_empty(), "{mode:?}");
+        }
     }
 
     /// E + no double counting (#5657): a streaming header whose stream never
