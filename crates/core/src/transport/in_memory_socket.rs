@@ -80,7 +80,11 @@ fn get_address_network(addr: &SocketAddr) -> Option<String> {
     ADDRESS_NETWORKS.get(addr).map(|r| r.value().clone())
 }
 
-/// Clears all address-network mappings. Useful for test cleanup.
+/// Clears all address-network mappings, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use clear_network_address_mappings"
+)]
 pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
 }
@@ -91,7 +95,11 @@ pub fn clear_network_address_mappings(network_name: &str) {
     ADDRESS_NETWORKS.retain(|_, v| v != network_name);
 }
 
-/// Clears all network time sources. Useful for test cleanup.
+/// Clears all network time sources, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use unregister_network_time_source"
+)]
 pub fn clear_all_network_time_sources() {
     NETWORK_TIME_SOURCES.clear();
 }
@@ -410,7 +418,11 @@ pub fn remove_network_socket_registry(network_name: &str) {
     SOCKET_REGISTRIES.remove(network_name);
 }
 
-/// Clears all socket registries (useful between test runs).
+/// Clears all socket registries, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use remove_network_socket_registry"
+)]
 pub fn clear_all_socket_registries() {
     SOCKET_REGISTRIES.clear();
 }
@@ -732,6 +744,23 @@ mod tests {
             !is_drop(check_packet_delivery(net_a, from, to)),
             "a network with no callback delivers everything"
         );
+
+        // The queue callback has the same per-network scoping.
+        let queued_on = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = |log: Arc<std::sync::Mutex<Vec<String>>>| -> QueuePacketCallback {
+            Arc::new(move |net: &str, _, _, _, _| log.lock().unwrap().push(net.to_string()))
+        };
+        set_queue_packet_callback(net_a, Some(record(queued_on.clone())));
+        set_queue_packet_callback(net_b, Some(record(queued_on.clone())));
+        set_queue_packet_callback(net_b, None);
+        queue_packet_for_delivery(net_a, 0, vec![1], from, to);
+        queue_packet_for_delivery(net_b, 0, vec![2], from, to);
+        assert_eq!(
+            *queued_on.lock().unwrap(),
+            vec![net_a.to_string()],
+            "removing network B's queue callback must leave network A's in force"
+        );
+        set_queue_packet_callback(net_a, None);
     }
 
     #[tokio::test]

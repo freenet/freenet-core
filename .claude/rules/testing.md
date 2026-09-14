@@ -218,7 +218,19 @@ WHEN adding or changing a test:
     occur at all depends on what else happens to be running. See
     `crate::util::test_log_capture` for a worked example, including asserting
     the child actually ran a test so a rename fails closed.
+  → Alternative when the test can build every competitor itself: run them on
+    two threads inside ONE test. The interfering population is then fixed by
+    the test rather than by what else is running, so it fails under nextest
+    too. Worked example (#5673): `node::testing_impl::tests::
+    dropping_one_network_keeps_crash_enforcement_of_another`.
 ```
+
+A second instance, with the opposite trigger: #5673's packet-delivery
+callback (what makes `SimOperation::CrashNode` drop packets) was one
+process-global slot that every `SimNetwork::Drop` cleared. So under plain
+`cargo test` the first simulation to *finish* disabled crashes for every
+other one. Harness state belongs in a registry keyed by the network that
+owns it, and teardown removes only its own entry.
 
 The fix shape for the `tracing` instance is non-obvious enough to record:
 keep **two** permanently-registered dispatchers alive (`tracing_core`'s

@@ -434,7 +434,7 @@ impl ScheduledOperation {
 }
 
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
-/// global delivery callback installed by `run_controlled_simulation` and
+/// per-network delivery callback installed by `run_controlled_simulation` and
 /// `run_simulation_direct`) so an injected node crash or partition actually
 /// drops packets instead of being a silent no-op.
 ///
@@ -6809,6 +6809,11 @@ mod tests {
     /// and A finishes first. B's crashed node must still drop packets
     /// afterwards. Before the fix the callback was one process-global slot, so
     /// A's `Drop` cleared it and B's "crashed" node was delivered to again.
+    ///
+    /// Scope: this checks the per-network callback map, calling
+    /// `check_packet_delivery` with B's name exactly as B's sockets do. It does
+    /// not cover how a socket learns its network name from its address at bind
+    /// time (`ADDRESS_NETWORKS`), which has its own cross-network hazard: #5676.
     #[test]
     fn dropping_one_network_keeps_crash_enforcement_of_another() {
         use crate::node::network_bridge::get_fault_injector;

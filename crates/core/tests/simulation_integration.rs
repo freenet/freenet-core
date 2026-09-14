@@ -7771,7 +7771,7 @@ fn test_direct_runner_churn() {
 /// Regression test for #4694: direct-runner `ChurnConfig` crashes must actually
 /// DROP packets, not merely set fault config.
 ///
-/// Before the fix, `run_simulation_direct` never installed the global
+/// Before the fix, `run_simulation_direct` never installed the
 /// packet-delivery callback and never set `enforce_fault_drops`, so the chaos
 /// driver's `crash_node()` calls were inert: a "crashed" node kept exchanging
 /// packets. Any near-K churn / partition validation on the direct runner was
