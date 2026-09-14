@@ -3098,6 +3098,22 @@ mod tests {
             .unwrap()
             .clamp(0.0, 1.0);
         let events_before = router.failure_estimator.len();
+        let hierarchical_distance = contract.distance(peer.location().unwrap()).as_f64();
+        let hierarchical_estimate = |router: &Router| {
+            router
+                .hierarchical
+                .estimate_at(
+                    &peer,
+                    contract,
+                    hierarchical_distance,
+                    router
+                        .hierarchical
+                        .time_at(routing_predictor::wall_clock_hours()),
+                )
+                .failure_probability
+                .expect("the hierarchical failure stage is warm")
+        };
+        let expected_hierarchical = hierarchical_estimate(&router);
 
         router.add_event_recording(
             RouteEvent {
@@ -3122,6 +3138,12 @@ mod tests {
             adjusted_after, expected_adjusted,
             "sanity: ingesting the success must move the peer's estimate, or this \
              test cannot tell pre- from post-ingestion forecasts"
+        );
+        let hierarchical_after = hierarchical_estimate(&router);
+        assert!(
+            (hierarchical_after - expected_hierarchical).abs() > 1e-4,
+            "sanity: the success must move the hierarchical estimate too: \
+             {expected_hierarchical} -> {hierarchical_after}"
         );
         drop(recorder);
 
@@ -3164,6 +3186,24 @@ mod tests {
              pre-ingestion {expected_adjusted}, post-ingestion {adjusted_after}",
             recorded("adjusted")
         );
+        // Tolerance rather than 1e-12: the estimate decays in wall-clock time,
+        // which moves between the call above and the one inside `add_event`.
+        assert!(
+            (recorded("hierarchical") - expected_hierarchical).abs() < 1e-6,
+            "the recorded hierarchical forecast must be the pre-ingestion one: \
+             recorded {}, pre-ingestion {expected_hierarchical}, post-ingestion \
+             {hierarchical_after}",
+            recorded("hierarchical")
+        );
+        // The only timed traffic so far took 100 ms, so both timing forecasts
+        // must sit near ln(0.1) — in log seconds, not milliseconds or seconds.
+        for field in ["log_response_time_legacy", "log_response_time_hierarchical"] {
+            let value = recorded(field);
+            assert!(
+                (value - 0.1f64.ln()).abs() < 0.2,
+                "{field} must be a log-seconds forecast near ln(0.1), got {value}"
+            );
+        }
     }
 
     #[test]
