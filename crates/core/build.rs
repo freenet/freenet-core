@@ -1,5 +1,9 @@
 use std::process::Command;
 
+// Unit-tested from the library via a `#[cfg(test)]` module in `src/lib.rs`.
+#[path = "build/git_watch.rs"]
+mod git_watch;
+
 fn main() {
     // Emit build metadata for startup logging
     emit_build_metadata();
@@ -119,9 +123,13 @@ fn emit_build_metadata() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
 
-    // Git dirty flag
+    // Git dirty flag. `GIT_OPTIONAL_LOCKS=0` stops `git status` from
+    // rewriting the index to refresh stat info: the index is one of the
+    // files watched below, so a write here would make the next build rerun
+    // this script for nothing.
     let git_dirty = Command::new("git")
         .args(["status", "--porcelain"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())
@@ -133,7 +141,13 @@ fn emit_build_metadata() {
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");
 
-    // Rebuild if git HEAD changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // Rerun only when the commit or the working tree described above changes
+    // (see `build/git_watch.rs`, #5667). Without git, emit nothing and let
+    // cargo fall back to rerunning when any file in the package changes.
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let paths = git_watch::rerun_if_changed_paths(std::path::Path::new(&manifest_dir));
+        for path in paths.into_iter().flatten() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
