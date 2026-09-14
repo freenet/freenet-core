@@ -3175,13 +3175,31 @@ mod tests {
     /// exact fit. Any seed that passes on both is useless here, so do not
     /// change it without re-running that search; the exactness itself is pinned
     /// by `incremental_fit_matches_batch_after_every_event`.
+    ///
+    /// Seed 39 fails pre-fix only because of the exact scenario it builds, and
+    /// changing how many `GlobalRng` draws the generators consume (the
+    /// keypair-cache fix #5663 would) silently swaps in a different scenario,
+    /// which most likely passes on the pre-fix code too. So the scenario is
+    /// pinned: `SCENARIO_FINGERPRINT` hashes every location the test draws, and
+    /// the test fails with instructions when it changes.
     #[test]
     fn enabled_correction_changes_the_estimate_the_router_acts_on() {
         let _guard = crate::config::GlobalRng::seed_guard(39);
+        // FNV-1a over the bits of every location the scenario draws. Fixed
+        // arithmetic, so the recorded value cannot drift with the Rust version
+        // the way `DefaultHasher`'s could.
+        fn record(fingerprint: &mut u64, location: Location) {
+            for byte in location.as_f64().to_bits().to_le_bytes() {
+                *fingerprint ^= u64::from(byte);
+                *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         let targeted_peer = PeerKeyLocation::random();
         let peer_location = targeted_peer
             .location()
             .expect("random peer has a location");
+        record(&mut fingerprint, peer_location);
         // A contract region close to this peer, so the distance-based model
         // expects it to do WELL there — the correction has to overcome the base.
         let targeted_contract =
@@ -3193,6 +3211,11 @@ mod tests {
         for index in 0..400 {
             let peer = PeerKeyLocation::random();
             let contract = Location::random();
+            record(
+                &mut fingerprint,
+                peer.location().expect("random peer has a location"),
+            );
+            record(&mut fingerprint, contract);
             let succeeded = index % 10 != 0;
             router.add_event(RouteEvent {
                 peer,
@@ -3217,9 +3240,13 @@ mod tests {
                 outcome: RouteOutcome::Failure,
                 op_type: Some(OpType::Get),
             });
+            // Drawn at the same point in the sequence as when it was written
+            // inline in the event below.
+            let elsewhere = Location::random();
+            record(&mut fingerprint, elsewhere);
             router.add_event(RouteEvent {
                 peer: targeted_peer.clone(),
-                contract_location: Location::random(),
+                contract_location: elsewhere,
                 outcome: RouteOutcome::Success {
                     time_to_response_start: Duration::from_millis(100),
                     payload_size: 5000,
@@ -3228,6 +3255,16 @@ mod tests {
                 op_type: Some(OpType::Get),
             });
         }
+
+        // Checked before the outcome, so a changed draw sequence reports itself
+        // rather than as a pass or fail of the behaviour under test.
+        const SCENARIO_FINGERPRINT: u64 = 0x6584_8286_03be_bd44;
+        assert_eq!(
+            fingerprint, SCENARIO_FINGERPRINT,
+            "the RNG draw sequence changed (e.g. #5663): seed 39 no longer builds the \
+             scenario that fails on the pre-fix code (fingerprint now {fingerprint:#018x}). \
+             Re-pick a seed that fails on the pre-fix code; see this test's doc"
+        );
 
         let disabled = {
             let _guard = force_residual_correction(false);

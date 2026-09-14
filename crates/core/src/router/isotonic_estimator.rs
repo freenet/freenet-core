@@ -68,10 +68,13 @@ const MULTIPLICATIVE_MIN_BASE: f64 = 1e-9;
 #[cfg(test)]
 thread_local! {
     /// Test builds only: whether this thread expects `resync_window` to run.
-    /// Unset, a resync panics, so that any test in the crate that drives a
-    /// window out of step fails loudly, as the `debug_assert!` the resync
-    /// replaced used to make it fail. A test that corrupts a window on purpose
-    /// sets it.
+    /// Unset, a resync panics. That covers this crate's lib unit tests, on the
+    /// thread that reaches the resync. It does not cover the integration tests
+    /// under `crates/core/tests` (the simulations link the library without
+    /// `cfg(test)`, so there a resync only warns), nor a resync inside a
+    /// spawned task whose `JoinHandle` nothing checks. That is narrower than
+    /// the `debug_assert!` it replaced, which fired in every debug build. A
+    /// test that corrupts a window on purpose sets it.
     static RESYNC_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -585,13 +588,17 @@ impl IsotonicEstimator {
         // Re-anchor the peer adjustments once this event has turned over enough
         // of the window. Runs last so the incremental state above is complete on
         // the ~50/51 events that do not earn a refit; on the one that does,
-        // `refit` re-derives every peer's adjustment from `raw_events`.
+        // `refit` re-derives every peer's adjustment from `raw_events`. (After
+        // a resync, `add_event_incremental` has already refitted, which leaves
+        // nothing stale for this check.)
         self.refit_if_stale();
     }
 
     /// The incremental half of [`Self::add_event`]: extend the window by one
     /// event, rebuild the global fit over it, and update this peer's EWMA,
-    /// WITHOUT considering a refit.
+    /// WITHOUT considering a scheduled refit. The one refit it does make is
+    /// after a resync: it re-anchors the peer adjustments to the repaired fit
+    /// at once (the end of the body), which also resets `events_since_refit`.
     ///
     /// Split out so tests can observe the states BETWEEN refits, which is what
     /// routing reads on ~50 of every 51 events.
@@ -772,9 +779,10 @@ impl IsotonicEstimator {
     /// needs a second bookkeeping bug. For an EveryEvent estimator,
     /// `add_event_incremental` then re-anchors the peer adjustments.
     ///
-    /// In test builds it panics unless the thread set `RESYNC_EXPECTED`, so a
-    /// bookkeeping bug fails every test that reaches it, not just the ones that
-    /// read `window_resyncs`.
+    /// In lib unit tests it panics unless the thread set `RESYNC_EXPECTED`, so
+    /// a bookkeeping bug fails any such test that reaches it on the test
+    /// thread, not just the ones that read `window_resyncs`. See
+    /// `RESYNC_EXPECTED` for what that does not cover.
     fn resync_window(&mut self) {
         #[cfg(test)]
         assert!(
