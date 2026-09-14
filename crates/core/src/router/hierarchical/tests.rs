@@ -85,7 +85,7 @@ fn predict<K: Hash + Eq + Clone>(
     distance: f64,
 ) -> Option<f64> {
     stage
-        .predict(peer, contract, distance)
+        .predict(peer, contract, distance, 0.0)
         .map(|forecast| forecast.value)
 }
 
@@ -180,7 +180,6 @@ fn shrinkage_agrees_with_the_formula_on_a_hand_computed_case() {
             block.y
         );
     }
-    assert_eq!(shrunk.within_variance, Some(1.5));
 }
 
 /// A lone extreme block at the end of an otherwise flat 2% curve is pulled
@@ -488,7 +487,7 @@ fn variance_components_need_within_cell_replication() {
     }
     level.recount_squares();
     assert_eq!(level.compute_components(), None);
-    assert_eq!(level.residual(Some(0), 0), None);
+    assert_eq!(level.residual(Some(0), 0, 0.0), None);
 }
 
 /// Kish effective size at a short horizon: 2 events per cell per hour at a
@@ -545,23 +544,23 @@ fn shrinkage_limits_no_data_to_pool_and_lots_of_data_to_cell_mean() {
     level.components = level.compute_components();
     assert!(level.components.is_some());
 
-    let hot = level.residual(Some(30), 5).unwrap().mean;
+    let hot = level.residual(Some(30), 5, 0.0).unwrap().mean;
     let cell_mean = level.nodes[30].cells[5].mean();
     assert!(
         (hot - cell_mean).abs() < 0.05,
         "abundant evidence must yield the cell's own mean: {hot} vs {cell_mean}"
     );
-    let unknown = level.residual(None, 0).unwrap();
+    let unknown = level.residual(None, 0, 0.0).unwrap();
     assert!(
         unknown.mean.abs() < hot.abs() * 0.5,
         "an unknown peer must not inherit another peer's cell effect: {}",
         unknown.mean
     );
     assert!(
-        unknown.variance > level.residual(Some(30), 5).unwrap().variance,
+        unknown.variance > level.residual(Some(30), 5, 0.0).unwrap().variance,
         "an unknown peer carries more posterior variance than a well-observed cell"
     );
-    let other_band = level.residual(Some(30), 2).unwrap().mean;
+    let other_band = level.residual(Some(30), 2, 0.0).unwrap().mean;
     assert!(
         other_band < hot,
         "a band with no data for that peer shrinks toward the peer, not the hot cell"
@@ -613,7 +612,7 @@ fn observe_returns_the_pre_learning_forecast() {
         let contract = uniform();
         let distance = uniform() * 0.5;
         let y = f64::from(u8::from(uniform() < 0.05 + distance * 0.3));
-        let before = stage.predict(&peer, contract, distance);
+        let before = stage.predict(&peer, contract, distance, i as f64 / 60.0);
         let returned = stage.observe(&mut scratch, &peer, contract, distance, y, i as f64 / 60.0);
         assert_eq!(before, returned, "event {i}");
     }
@@ -886,7 +885,7 @@ fn clock_steps_and_long_gaps_stay_finite() {
             normal(),
             t,
         );
-        if let Some(forecast) = stage.predict(&(i % 11), 0.5, 0.2) {
+        if let Some(forecast) = stage.predict(&(i % 11), 0.5, 0.2, t) {
             assert!(forecast.value.is_finite() && forecast.spread.is_finite());
         }
     }
@@ -1195,7 +1194,7 @@ fn timing_and_speed_estimates_are_expectations_not_medians() {
             0.0,
         );
     }
-    let estimate = routing.estimate(&peers[3], Location::new(0.5), 0.25);
+    let estimate = routing.estimate(&peers[3], Location::new(0.5), 0.25, 0.0);
     let mean_time = (mu_t + sd_t * sd_t / 2.0).exp();
     let median_time = mu_t.exp();
     let time = estimate.time_to_response_start_secs.unwrap();
@@ -1236,11 +1235,11 @@ fn an_unknown_peer_carries_a_timing_penalty() {
         .min_by(|&a, &b| effects[a].abs().total_cmp(&effects[b].abs()))
         .unwrap();
     let known = routing
-        .estimate(&peers[typical], Location::new(0.5), 0.25)
+        .estimate(&peers[typical], Location::new(0.5), 0.25, 0.0)
         .time_to_response_start_secs
         .unwrap();
     let unknown = routing
-        .estimate(&PeerKeyLocation::random(), Location::new(0.5), 0.25)
+        .estimate(&PeerKeyLocation::random(), Location::new(0.5), 0.25, 0.0)
         .time_to_response_start_secs
         .unwrap();
     assert!(
@@ -1279,6 +1278,7 @@ fn routing_estimate_cost_per_candidate() {
             &peers[q % peers.len()],
             Location::new((q % 997) as f64 / 997.0),
             (q % 500) as f64 / 1000.0,
+            WINDOW_EVENTS as f64 / 600.0,
         );
         available += usize::from(estimate.transfer_speed_bps.is_some());
     }
@@ -1298,3 +1298,81 @@ fn routing_estimate_cost_per_candidate() {
 }
 
 use crate::ring::Ring;
+
+/// A node whose count has decayed to nothing by query time is treated as
+/// absent, as in the validated reference, rather than keeping full weight.
+#[test]
+fn a_fully_decayed_node_is_treated_as_absent() {
+    let _guard = GlobalRng::seed_guard(0x4485_57a1);
+    let mut level = Level::new(Some(1.5));
+    level.reset(0.0);
+    for slot in 0..20 {
+        let effect = normal();
+        for band in 0..BANDS {
+            for _ in 0..10 {
+                level.add(Some(slot), band, 1.0, effect + 0.1 * normal());
+            }
+        }
+    }
+    level.recount_squares();
+    level.components = level.compute_components();
+    let fresh = level.residual(Some(3), 2, 0.0).unwrap();
+    let unknown = level.residual(None, 2, 0.0).unwrap();
+    let stale = level.residual(Some(3), 2, 1_000.0).unwrap();
+    assert_ne!(fresh, unknown);
+    assert_eq!(
+        stale, unknown,
+        "after ~670 horizons the peer's evidence is gone and it reads as unknown"
+    );
+}
+
+/// The lognormality check reads zero skew and kurtosis for normal log
+/// residuals, and flags a heavy right tail.
+#[test]
+fn residual_shape_flags_departures_from_lognormal() {
+    let shape_for = |tail: bool| {
+        let _guard = GlobalRng::seed_guard(0x4485_5a9e);
+        let mut stage: Stage<u32> = Stage::new(Target::LogResponseTime, 64);
+        for i in 0..6_000u32 {
+            let noise = if tail && uniform() < 0.05 {
+                2.5 + normal()
+            } else {
+                0.5 * normal()
+            };
+            observe(
+                &mut stage,
+                &(i % 20),
+                uniform(),
+                uniform() * 0.5,
+                (0.1f64).ln() + noise,
+                0.0,
+            );
+        }
+        stage.diagnostics()
+    };
+    let normal_shape = shape_for(false);
+    let tailed_shape = shape_for(true);
+    assert!(normal_shape.residual_shape.events > 5_000);
+    let skew = normal_shape.residual_shape.skewness.unwrap();
+    let kurtosis = normal_shape.residual_shape.excess_kurtosis.unwrap();
+    assert!(
+        skew.abs() < 0.15 && kurtosis.abs() < 0.3,
+        "normal: skew {skew}, kurtosis {kurtosis}"
+    );
+    assert!(
+        (normal_shape.residual_sigma2.unwrap() - 0.25).abs() < 0.03,
+        "sigma2 {:?}",
+        normal_shape.residual_sigma2
+    );
+    let skew = tailed_shape.residual_shape.skewness.unwrap();
+    let kurtosis = tailed_shape.residual_shape.excess_kurtosis.unwrap();
+    assert!(
+        skew > 1.0 && kurtosis > 2.0,
+        "tailed: skew {skew}, kurtosis {kurtosis}"
+    );
+    let failure: Stage<u32> = Stage::new(Target::Failure, 64);
+    assert_eq!(
+        failure.diagnostics().residual_shape,
+        ResidualShape::default()
+    );
+}

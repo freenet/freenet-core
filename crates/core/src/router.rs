@@ -1023,6 +1023,14 @@ pub(crate) struct RouterSnapshotInfo {
     /// zero duration). Skipped, as legacy skips them; not rejections.
     #[serde(default)]
     pub hierarchical_non_speed_samples: u64,
+    /// Lognormality check for the response-time stage: the within-cell log
+    /// residual variance expectation timing uses, and the skewness and excess
+    /// kurtosis of those residuals (both ~0 when log times are normal).
+    #[serde(default)]
+    pub hierarchical_response_time_log_shape: LogResidualShape,
+    /// The same for the transfer-speed stage.
+    #[serde(default)]
+    pub hierarchical_transfer_speed_log_shape: LogResidualShape,
     /// Brier score of the blended estimate, and the climatology it is scored
     /// against, so the dashboard can show the baseline alongside the result.
     #[serde(default)]
@@ -1057,6 +1065,32 @@ pub(crate) struct RouterSnapshotInfo {
     /// 25-of-`max_connections` truncation is costing anything.
     #[serde(default)]
     pub selection_ranks: SelectionRankSnapshot,
+}
+
+/// Plain-data lognormality check for one hierarchical log stage (#4485).
+///
+/// Expectation timing, `exp(mu + sigma2/2)`, assumes log residuals are roughly
+/// normal. A soak reads this to check that on real traffic: skewness and excess
+/// kurtosis near zero support it; a large positive value of either means a
+/// heavy slow tail the expectation understates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct LogResidualShape {
+    pub sigma2: Option<f64>,
+    pub skewness: Option<f64>,
+    pub excess_kurtosis: Option<f64>,
+    pub events: usize,
+}
+
+impl From<hierarchical::StageDiagnostics> for LogResidualShape {
+    fn from(stage: hierarchical::StageDiagnostics) -> Self {
+        LogResidualShape {
+            sigma2: stage.residual_sigma2,
+            skewness: stage.residual_shape.skewness,
+            excess_kurtosis: stage.residual_shape.excess_kurtosis,
+            events: stage.residual_shape.events,
+        }
+    }
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -1210,6 +1244,16 @@ impl Default for EstimatorClock {
             crate::util::time_source::InstantTimeSrc::new(),
         ))
     }
+}
+
+/// Clock readings for one prediction, taken once so every model in it sees the
+/// same instant.
+#[derive(Debug, Clone, Copy)]
+struct PredictionClock {
+    /// Host wall clock in hours since the epoch, for the legacy Renegade path.
+    wall_clock_hours: f64,
+    /// The hierarchical estimator's hours, from [`EstimatorClock`].
+    estimator_hours: f64,
 }
 
 /// Whether the hierarchical estimator is computed at all for this event.
@@ -2384,23 +2428,24 @@ impl Router {
         peer: &PeerKeyLocation,
         target_location: Location,
     ) -> Result<RoutingPrediction, RoutingError> {
-        self.predict_routing_outcome_at(
-            peer,
-            target_location,
-            routing_predictor::wall_clock_hours(),
-        )
+        self.predict_routing_outcome_at(peer, target_location, self.prediction_clock())
     }
 
-    /// [`Self::predict_routing_outcome`] at an explicit host wall-clock reading
-    /// (hours since the epoch) for the legacy Renegade path, so a test can make
-    /// two calls on an identical clock. The hierarchical estimate does not
-    /// depend on the reading time: its decay is applied when evidence is
-    /// learned, and every quantity a prediction reads is scale-free.
+    /// Both clocks, read now.
+    fn prediction_clock(&self) -> PredictionClock {
+        PredictionClock {
+            wall_clock_hours: routing_predictor::wall_clock_hours(),
+            estimator_hours: self.estimator_clock.hours(),
+        }
+    }
+
+    /// [`Self::predict_routing_outcome`] at explicit clock readings, so a test
+    /// can make two calls on identical clocks.
     fn predict_routing_outcome_at(
         &self,
         peer: &PeerKeyLocation,
         target_location: Location,
-        wall_clock_hours: f64,
+        clock: PredictionClock,
     ) -> Result<RoutingPrediction, RoutingError> {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
@@ -2436,7 +2481,8 @@ impl Router {
         // residual correction. Computed ONLY when enabled: this runs once per
         // candidate per routing decision.
         let hierarchical = if hierarchical_routing_enabled() {
-            self.hierarchical.estimate(peer, target_location, distance)
+            self.hierarchical
+                .estimate(peer, target_location, distance, clock.estimator_hours)
         } else {
             hierarchical::Estimate::default()
         };
@@ -2466,7 +2512,7 @@ impl Router {
                 failure_estimate,
                 time_estimate,
                 transfer_estimate,
-                wall_clock_hours,
+                clock.wall_clock_hours,
             )
         });
 
@@ -2955,6 +3001,8 @@ impl Router {
             hierarchical_computed: hierarchical_computed(dataset::global()),
             hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
             hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
+            hierarchical_response_time_log_shape: hierarchical[1].into(),
+            hierarchical_transfer_speed_log_shape: hierarchical[2].into(),
             failure_brier_blended: self.failure_skill_blended.brier(),
             failure_climatology_brier: self.failure_skill_blended.climatology_brier(),
             failure_base_rate: self.failure_skill_blended.base_rate(),
@@ -3232,7 +3280,12 @@ mod tests {
         let hierarchical_estimate = |router: &Router| {
             router
                 .hierarchical
-                .estimate(&peer, contract, hierarchical_distance)
+                .estimate(
+                    &peer,
+                    contract,
+                    hierarchical_distance,
+                    router.estimator_clock.hours(),
+                )
                 .failure_probability
                 .expect("the hierarchical failure stage is warm")
         };
@@ -3643,7 +3696,7 @@ mod tests {
                 .chain((0..20).map(|_| (targeted_peer.clone(), Location::random())))
                 .chain((0..20).map(|_| (PeerKeyLocation::random(), Location::random())))
                 .collect();
-        let wall = routing_predictor::wall_clock_hours();
+        let wall = router.prediction_clock();
         let predict_all = |router: &Router| -> Vec<[u64; 5]> {
             queries
                 .iter()
@@ -3730,9 +3783,12 @@ mod tests {
         let _guard = force_hierarchical_routing(true);
         let mut router = Router::new(&[]);
         let (peer, contract) = feed_mixed_traffic(&mut router, 300);
-        let wall = routing_predictor::wall_clock_hours();
+        let wall = router.prediction_clock();
         let distance = contract.distance(peer.location().unwrap()).as_f64();
-        let estimate = router.hierarchical.estimate(&peer, contract, distance);
+        let estimate =
+            router
+                .hierarchical
+                .estimate(&peer, contract, distance, wall.estimator_hours);
         let prediction = router
             .predict_routing_outcome_at(&peer, contract, wall)
             .unwrap();
@@ -3767,9 +3823,12 @@ mod tests {
         let _learn = force_hierarchical_routing(true);
         let mut router = Router::new(&[]);
         let (peer, contract) = feed_mixed_traffic(&mut router, 300);
-        let wall = routing_predictor::wall_clock_hours();
+        let wall = router.prediction_clock();
         let distance = contract.distance(peer.location().unwrap()).as_f64();
-        let estimate = router.hierarchical.estimate(&peer, contract, distance);
+        let estimate =
+            router
+                .hierarchical
+                .estimate(&peer, contract, distance, wall.estimator_hours);
 
         let correction_only = {
             let _off = force_hierarchical_routing(false);
@@ -3813,7 +3872,7 @@ mod tests {
         let _learn = force_hierarchical_routing(true);
         let mut router = Router::new(&[]);
         let (peer, contract) = feed_mixed_traffic(&mut router, 300);
-        let wall = routing_predictor::wall_clock_hours();
+        let wall = router.prediction_clock();
 
         let before = evaluations();
         router
@@ -3921,7 +3980,7 @@ mod tests {
                 {
                     let predicted = router
                         .hierarchical
-                        .estimate(&peers[p], contract, 0.1)
+                        .estimate(&peers[p], contract, 0.1, router.estimator_clock.hours())
                         .time_to_response_start_secs
                         .unwrap();
                     *error += (predicted - expected).powi(2);
@@ -4004,7 +4063,7 @@ mod tests {
             if index >= WARMUP {
                 let expected_time = (mu_time + sd_time * sd_time / 2.0).exp();
                 let expected_transfer = BYTES * (-mu_speed + sd_speed * sd_speed / 2.0).exp();
-                let wall = routing_predictor::wall_clock_hours();
+                let wall = router.prediction_clock();
                 for (slot, enabled) in [(0, false), (1, true)] {
                     let _guard = force_hierarchical_routing(enabled);
                     let prediction = router
@@ -4108,7 +4167,7 @@ mod tests {
             let failed = GlobalRng::random_range(0.0..1.0) < p_star;
 
             if index >= WARMUP_EVENTS {
-                let wall = routing_predictor::wall_clock_hours();
+                let wall = router.prediction_clock();
                 let predict = |enabled: bool| {
                     let _guard = force_hierarchical_routing(enabled);
                     router

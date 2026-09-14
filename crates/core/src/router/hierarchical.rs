@@ -24,9 +24,25 @@
 //! model WITH an attribute level, on a different traffic shape, and with the
 //! reference's estimators for the curve shrinkage and the variance components.
 //! A statistical review of the port found those estimators biased, and they have
-//! been replaced here (see "Estimators" below). The bake-off's numbers therefore
-//! describe a related model, not this one; the head-to-head tests in `router.rs`
-//! are what measure this one.
+//! been replaced here (see "Estimators" below).
+//!
+//! **The shipped formulas are the ones re-validated on
+//! `exp/estimator-bakeoff` commit 390470ef1** (`recoverability::bakeoff::
+//! revalidate`, row 7: no attribute level, frozen components, corrections 1-3,
+//! expectation timing, standard descent). Over 53 scenarios, including
+//! production-like ones (200 peers, Zipf, 90% home band, 600 events/h), its
+//! worst natural-units ratio against legacy was 0.971 (confirmation seeds) and
+//! 1.002 (original seeds). Neither half alone passes: the corrections with
+//! median timing reach 1.44, and the uncorrected shape 1.60. The margin is
+//! thin, drifted peers (`pt.drift`) and narrow targeted pairs are its weak
+//! subsets, and expectation timing assumes approximately lognormal residuals,
+//! which [`ResidualShape`] exposes for checking on real traffic.
+//!
+//! Deliberate differences from that reference, each from the review brief:
+//! the horizon selector scores the clamped forecast (identical for the log
+//! stages; differs for failure only when a forecast clamps at 0 or 1); log
+//! stages are bounded (below) and need [`MIN_CURVE_POINTS_LOG`] points; the log
+//! curves are not floored at zero; and peers are bounded.
 //!
 //! # The model, per stage
 //!
@@ -76,9 +92,8 @@
 //!   instead overstates the evidence of a short horizon by about 2x, which drove
 //!   the between-group variance estimates to zero at low event rates.
 //! - **The descent uses each node's full mean**, not a leave-one-out mean. The
-//!   review measured a 4-5% gain from leave-one-out evidence in general but a 12%
-//!   loss with very few peers, which is exactly a young node's situation, so it
-//!   is not adopted.
+//!   re-validation rejected leave-one-out evidence at the descent (worst ratio
+//!   1.18 on `pt.drift`); leave-one-out is used for the variance components only.
 //!
 //! # Timing and speed return expectations
 //!
@@ -98,12 +113,14 @@
 //!   therefore advance under simulated time. The horizon is chosen by
 //!   prequential loss, so one that does not suit a node's event rate is simply
 //!   not selected; on a busy node the window binds before any horizon does.
+//!   A node whose count has decayed to [`NODE_MIN`] by the time of a query is
+//!   treated as absent, so predictions take the query time too.
 //! - **Variance components are frozen between refits**, exactly as stale as the
 //!   curve they describe. Node means stay live.
 //! - **Decay is stored epoch-scaled.** Sums are kept as
-//!   `sum_i exp((t_i - epoch)/h) x_i`. Every quantity a prediction reads is a
-//!   ratio in which the scale cancels. Each refit rebases the epoch to `now`; an
-//!   add that would push the scale past [`REBASE_EXPONENT`] forces a refit first.
+//!   `sum_i exp((t_i - epoch)/h) x_i`; the noise terms a prediction reads are
+//!   ratios in which the scale cancels. Each refit rebases the epoch to `now`;
+//!   an add that would push the scale past [`REBASE_EXPONENT`] forces a refit.
 //! - **No attribute level.** The router holds no cheap per-peer attribute at
 //!   `add_event` time. Future work, once the routing dataset shows which one
 //!   carries signal.
@@ -191,6 +208,10 @@ const REBASE_EXPONENT: f64 = 30.0;
 
 /// Minimum Kish effective sample size for a node to count as replicated.
 const MIN_EFFECTIVE_N: f64 = 2.0;
+
+/// A node whose decayed count is at or below this carries no evidence and is
+/// treated as absent, as in the validated reference (`NODE_MIN`).
+const NODE_MIN: f64 = 1e-12;
 
 /// Floor on the pooled within-cell variance, as in the reference.
 const MIN_SIGMA2: f64 = 1e-9;
@@ -293,9 +314,6 @@ struct Curve {
     centroid: (f64, f64),
     /// Hold the end values beyond the block range instead of extrapolating.
     flat_ends: bool,
-    /// Pooled within-block variance of the raw fit, the curve's own estimate of
-    /// single-observation noise. `None` without replication.
-    within_variance: Option<f64>,
 }
 
 impl Curve {
@@ -334,7 +352,6 @@ impl Curve {
             blocks,
             centroid: (sum_x / sum_w, sum_y / sum_w),
             flat_ends: false,
-            within_variance: None,
         })
     }
 
@@ -364,7 +381,6 @@ impl Curve {
         let sum_y2: f64 = window.iter().map(|event| event.y * event.y).sum();
         let explained: f64 = fit.blocks.iter().map(|b| b.w * b.y * b.y).sum();
         let s2 = (sum_y2 - explained).max(0.0) / (n - k) as f64;
-        fit.within_variance = Some(s2);
         if k < 2 {
             return Some(fit);
         }
@@ -391,7 +407,6 @@ impl Curve {
         });
         let mut shrunk = Curve::pav(shrunk, ascending)?;
         shrunk.flat_ends = fit.flat_ends;
-        shrunk.within_variance = fit.within_variance;
         Some(shrunk)
     }
 
@@ -648,7 +663,7 @@ impl Level {
                 }
             }
         }
-        if df <= 0.0 || !self.root.replicated() {
+        if df < 2.0 {
             return None;
         }
         let sigma2 = (ss / df).max(MIN_SIGMA2);
@@ -664,7 +679,7 @@ impl Level {
                     continue;
                 }
                 let rest = peer.n - cell.n;
-                if rest <= peer.n * 1e-9 {
+                if rest <= NODE_MIN {
                     continue;
                 }
                 let rest_w2 = (peer.w2 - cell.w2).max(0.0);
@@ -686,7 +701,7 @@ impl Level {
                 continue;
             }
             let rest = root.n - peer.n;
-            if rest <= root.n * 1e-9 {
+            if rest <= NODE_MIN {
                 continue;
             }
             let rest_w2 = (root.w2 - peer.w2).max(0.0);
@@ -710,10 +725,21 @@ impl Level {
             })
     }
 
+    /// Factor converting stored counts into counts decayed to `now`.
+    fn scale(&self, now: f64) -> f64 {
+        (-self.exponent(now).max(0.0)).exp()
+    }
+
     /// Posterior of the residual at a query, descending root -> peer -> cell
     /// with a normal-normal update. `None` without components.
-    fn residual(&self, slot: Option<usize>, band: usize) -> Option<Posterior> {
+    ///
+    /// Matches the validated reference (`exp/estimator-bakeoff` 390470ef1,
+    /// `HierC::predict` with standard descent): a node is present when its
+    /// count decayed to `now` exceeds [`NODE_MIN`], and its noise uses the Kish
+    /// factor, which the decay scale cancels out of.
+    fn residual(&self, slot: Option<usize>, band: usize, now: f64) -> Option<Posterior> {
         let components = self.components?;
+        let scale = self.scale(now);
         // `(mean, noise)` of a node, or `None` where there is no node.
         let step = |(mu, v): (f64, f64), node: Option<(f64, f64)>, tau2: f64| match node {
             Some((mean, noise)) if tau2 > 0.0 => {
@@ -726,7 +752,7 @@ impl Level {
 
         let mut state = (0.0, 0.0);
         let root = self.root;
-        if root.replicated() {
+        if root.n * scale > NODE_MIN {
             let n2 = root.n * root.n;
             let mean = root.mean();
             let noise = components.sigma2 * root.mean_variance_factor()
@@ -739,7 +765,7 @@ impl Level {
         let node = slot.and_then(|slot| self.nodes.get(slot));
         let peer = node.and_then(|node| {
             let peer = node.peer;
-            (peer.n > 0.0 && peer.w2 > 0.0).then(|| {
+            (peer.n * scale > NODE_MIN && peer.w2 > 0.0).then(|| {
                 let noise = components.tau2_cell * node.sq_cells.max(0.0) / (peer.n * peer.n)
                     + components.sigma2 * peer.mean_variance_factor();
                 (peer.mean(), noise)
@@ -749,7 +775,7 @@ impl Level {
 
         let cell = node.and_then(|node| {
             let cell = node.cells[band & (BANDS - 1)];
-            (cell.n > 0.0 && cell.w2 > 0.0)
+            (cell.n * scale > NODE_MIN && cell.w2 > 0.0)
                 .then(|| (cell.mean(), components.sigma2 * cell.mean_variance_factor()))
         });
         state = step(state, cell, components.tau2_cell);
@@ -951,6 +977,62 @@ fn integer_rate_ratio(slower_hours: f64, faster_hours: f64) -> Option<i32> {
     ((ratio - rounded).abs() < 1e-9 && (2.0..=16.0).contains(&rounded)).then_some(rounded as i32)
 }
 
+/// Shape of the within-cell log residuals, the check on the lognormal
+/// assumption behind expectation timing.
+///
+/// `E[T] = exp(mu + sigma2 / 2)` is exact only when log response times are
+/// normal around their cell mean. Skewness and excess kurtosis of those
+/// deviations are both zero for a normal; a heavy right tail (occasional very
+/// slow responses) shows up as positive skew and kurtosis, and means the
+/// expectation understates the mean. Measured on the no-forgetting level, over
+/// events whose peer is still tracked, at every refit.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ResidualShape {
+    pub events: usize,
+    pub skewness: Option<f64>,
+    pub excess_kurtosis: Option<f64>,
+}
+
+impl ResidualShape {
+    /// Fewest within-cell deviations before a shape is reported.
+    const MIN_EVENTS: usize = 30;
+
+    fn measure(prepared: &[Prepared], level: &Level) -> ResidualShape {
+        let (mut n, mut m2, mut m3, mut m4) = (0usize, 0.0, 0.0, 0.0);
+        for event in prepared {
+            let Some(node) = level.nodes.get(event.slot as usize) else {
+                continue;
+            };
+            let cell = node.cells[event.band as usize & (BANDS - 1)];
+            if !cell.replicated() {
+                continue;
+            }
+            // Deviations about the cell mean are shrunk by (n-1)/n; with the
+            // replication gate that bias is small and is not corrected here.
+            let e = event.residual - cell.mean();
+            let e2 = e * e;
+            n += 1;
+            m2 += e2;
+            m3 += e2 * e;
+            m4 += e2 * e2;
+        }
+        if n < Self::MIN_EVENTS || m2 <= 0.0 {
+            return ResidualShape {
+                events: n,
+                ..ResidualShape::default()
+            };
+        }
+        let count = n as f64;
+        let variance = m2 / count;
+        ResidualShape {
+            events: n,
+            skewness: Some((m3 / count) / variance.powf(1.5)).filter(|v| v.is_finite()),
+            excess_kurtosis: Some((m4 / count) / (variance * variance) - 3.0)
+                .filter(|v| v.is_finite()),
+        }
+    }
+}
+
 /// A stage's forecast on its own scale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Forecast {
@@ -978,6 +1060,11 @@ pub(crate) struct StageDiagnostics {
     /// Windowed events at the last refit whose peer had been evicted, so they
     /// informed the curve and root but no peer node.
     pub orphaned_at_last_refit: usize,
+    /// Pooled within-cell variance of the selected horizon (log units for the
+    /// timing stages), the `sigma2` expectation timing adds to the log mean.
+    pub residual_sigma2: Option<f64>,
+    /// Lognormality check for the log stages; default for failure.
+    pub residual_shape: ResidualShape,
 }
 
 /// One target's estimator.
@@ -1005,6 +1092,8 @@ pub(crate) struct Stage<K> {
     refits: u64,
     rejected: u64,
     orphaned_at_last_refit: usize,
+    /// Shape of the log residuals within cells at the last refit (log stages).
+    residual_shape: ResidualShape,
 }
 
 impl<K: Hash + Eq + Clone> Stage<K> {
@@ -1034,6 +1123,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             refits: 0,
             rejected: 0,
             orphaned_at_last_refit: 0,
+            residual_shape: ResidualShape::default(),
         }
     }
 
@@ -1082,18 +1172,18 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         slot: Option<usize>,
         band: usize,
         prior: f64,
+        now: f64,
     ) -> Forecast {
-        let posterior = self.levels[level].residual(slot, band);
+        let posterior = self.levels[level].residual(slot, band, now);
         let value = self.bound(prior + posterior.map_or(0.0, |p| p.mean));
+        // `sigma2 + v_post` from the horizon's components, as the reference
+        // does; before components exist there is no spread, so the forecast is
+        // the median until the first replicated refit.
         let spread = match self.target {
             Target::Failure => 0.0,
             Target::LogResponseTime | Target::LogTransferSpeed => {
-                let sigma2 = self.levels[level]
-                    .components
-                    .map(|c| c.sigma2)
-                    .or(self.curve.as_ref().and_then(|c| c.within_variance))
-                    .unwrap_or(0.0);
-                sigma2 + posterior.map_or(0.0, |p| p.variance)
+                posterior.map_or(0.0, |p| p.variance)
+                    + self.levels[level].components.map_or(0.0, |c| c.sigma2)
             }
         };
         Forecast { value, spread }
@@ -1108,13 +1198,16 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         peer: &K,
         contract_location: f64,
         distance: f64,
+        now: f64,
     ) -> Option<Forecast> {
+        let now = self.effective_time(now);
         let prior = self.prior(distance)?;
         let forecast = self.forecast_with(
             self.selected(),
             self.peers.lookup(peer),
             band_of(contract_location),
             prior,
+            now,
         );
         (forecast.value.is_finite() && forecast.spread.is_finite()).then_some(forecast)
     }
@@ -1143,7 +1236,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         if let Some(prior) = prior {
             let slot = self.peers.lookup(peer);
             let forecasts: [Forecast; HORIZONS] =
-                std::array::from_fn(|level| self.forecast_with(level, slot, band, prior));
+                std::array::from_fn(|level| self.forecast_with(level, slot, band, prior, now));
             let selected = forecasts[self.selected()];
             forecast =
                 (selected.value.is_finite() && selected.spread.is_finite()).then_some(selected);
@@ -1324,6 +1417,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             level.recount_squares();
             level.components = level.compute_components();
         }
+        if self.target.is_log() {
+            self.residual_shape = ResidualShape::measure(prepared, &self.levels[0]);
+        }
     }
 
     pub(crate) fn diagnostics(&self) -> StageDiagnostics {
@@ -1337,6 +1433,8 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             selected_horizon_hours: HORIZONS_HOURS[self.selected()],
             active: self.curve.is_some(),
             orphaned_at_last_refit: self.orphaned_at_last_refit,
+            residual_sigma2: self.levels[self.selected()].components.map(|c| c.sigma2),
+            residual_shape: self.residual_shape,
         }
     }
 }
@@ -1424,7 +1522,7 @@ impl HierarchicalRouting {
         let contract = contract_location.as_f64();
         let log_response_time = self
             .response_time
-            .predict(peer, contract, distance)
+            .predict(peer, contract, distance, time)
             .map(|forecast| forecast.value);
         let failure = self
             .failure
@@ -1511,27 +1609,28 @@ impl HierarchicalRouting {
             + self.transfer_speed.peers.evictions
     }
 
-    /// Estimate every stage in router units.
+    /// Estimate every stage in router units, at estimator time `time` (hours).
     pub(crate) fn estimate(
         &self,
         peer: &PeerKeyLocation,
         contract_location: Location,
         distance: f64,
+        time: f64,
     ) -> Estimate {
         let contract = contract_location.as_f64();
         Estimate {
             failure_probability: self
                 .failure
-                .predict(peer, contract, distance)
+                .predict(peer, contract, distance, time)
                 .map(|forecast| forecast.value),
             time_to_response_start_secs: self
                 .response_time
-                .predict(peer, contract, distance)
+                .predict(peer, contract, distance, time)
                 .map(|f| (f.value + f.spread / 2.0).exp())
                 .filter(|seconds| seconds.is_finite()),
             transfer_speed_bps: self
                 .transfer_speed
-                .predict(peer, contract, distance)
+                .predict(peer, contract, distance, time)
                 .map(|f| (f.value - f.spread / 2.0).exp())
                 .filter(|speed| speed.is_finite() && *speed > 0.0),
         }

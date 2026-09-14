@@ -55,6 +55,35 @@ fn fmt_evictions(computed: bool, evictions: u64, capacity: usize) -> String {
     }
 }
 
+/// Skewness or excess kurtosis beyond this reads as a departure from the
+/// lognormal assumption. For a normal sample of a few hundred the sampling
+/// standard error of either is about 0.1-0.3, so 1.0 is well clear of noise.
+const LOG_SHAPE_WARNING: f64 = 1.0;
+
+/// Render a timing stage's lognormality check.
+///
+/// Expectation timing is exact only for normal log residuals, so the reading an
+/// operator needs is whether that holds, said in words, with the numbers.
+fn fmt_log_shape(computed: bool, shape: &crate::router::LogResidualShape) -> String {
+    if !computed {
+        return NOT_COMPUTED.to_string();
+    }
+    let (Some(sigma2), Some(skew), Some(kurtosis)) =
+        (shape.sigma2, shape.skewness, shape.excess_kurtosis)
+    else {
+        return format!("&mdash; not enough data yet ({} residuals)", shape.events);
+    };
+    let verdict = if skew.abs() > LOG_SHAPE_WARNING || kurtosis.abs() > LOG_SHAPE_WARNING {
+        " &mdash; <strong>not lognormal</strong>: expected times may be understated"
+    } else {
+        " &mdash; consistent with lognormal"
+    };
+    format!(
+        "&sigma;&sup2; {sigma2:.3}, skew {skew:+.2}, excess kurtosis {kurtosis:+.2} (n={}){verdict}",
+        shape.events
+    )
+}
+
 /// Render the hierarchical estimator's selected forgetting horizon.
 ///
 /// `None` means two different things depending on whether the stage has any
@@ -218,6 +247,8 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
                     <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
                     <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
+                    <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
+                    <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -287,6 +318,14 @@ pub fn peer_detail_html(address_str: &str) -> String {
             } else {
                 " &mdash; off"
             },
+            shape_response = fmt_log_shape(
+                rs.hierarchical_computed,
+                &rs.hierarchical_response_time_log_shape
+            ),
+            shape_transfer = fmt_log_shape(
+                rs.hierarchical_computed,
+                &rs.hierarchical_transfer_speed_log_shape
+            ),
             hierarchical_evictions = fmt_evictions(
                 rs.hierarchical_computed,
                 rs.hierarchical_peer_evictions,
@@ -716,6 +755,24 @@ mod tests {
         let render = &source[start..end];
         assert!(!render.contains("moves it fully"));
         assert!(render.contains("if peers turn out not to differ, not at all"));
+    }
+
+    #[test]
+    fn log_shape_rendering_names_the_verdict_at_its_threshold() {
+        use crate::router::LogResidualShape;
+        let shape = |skew: f64, kurtosis: f64| LogResidualShape {
+            sigma2: Some(0.25),
+            skewness: Some(skew),
+            excess_kurtosis: Some(kurtosis),
+            events: 400,
+        };
+        assert!(fmt_log_shape(true, &shape(0.1, -0.2)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(true, &shape(0.99, 0.99)).contains("consistent with lognormal"));
+        assert!(fmt_log_shape(true, &shape(1.01, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(true, &shape(0.0, 1.01)).contains("not lognormal"));
+        assert!(fmt_log_shape(true, &shape(-1.5, 0.0)).contains("not lognormal"));
+        assert!(fmt_log_shape(true, &LogResidualShape::default()).contains("not enough data"));
+        assert!(fmt_log_shape(false, &shape(0.0, 0.0)).contains("not computed"));
     }
 
     #[test]
