@@ -33,10 +33,41 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
-/// What the hierarchical rows show when the estimator is not being computed,
-/// so an empty reading is not mistaken for a model with nothing to say.
-const NOT_COMPUTED: &str =
-    "&mdash; not computed (set FREENET_ROUTING_HIERARCHICAL or FREENET_ROUTING_DATASET)";
+/// What the hierarchical rows show when the estimator is not being computed
+/// now, so an empty reading is not mistaken for a model with nothing to say,
+/// and a count frozen when computation stopped (a routing dataset that hit its
+/// byte cap) is not mistaken for a live one.
+const NOT_COMPUTED: &str = "&mdash; not computed now (set FREENET_ROUTING_HIERARCHICAL, or      record FREENET_ROUTING_DATASET; readings stop when the recorder does)";
+
+/// The legacy rows' note when the hierarchical estimator routes. "Superseded"
+/// is a node-wide setting, not a per-query fact: a stage whose hierarchical
+/// curve is not warm yet still falls back to the legacy path for that query.
+const SUPERSEDED_BY_HIERARCHICAL: &str =
+    " &mdash; superseded (except where a hierarchical stage is not yet warm)";
+
+/// Render both models' RMS error in seconds on the same events.
+///
+/// This is the instrument for the promotion gate's "not worse in seconds", so
+/// it names which model is ahead rather than leaving two bare numbers.
+fn fmt_seconds_error(
+    computed: bool,
+    legacy: Option<f64>,
+    hierarchical: Option<f64>,
+    scored: u64,
+) -> String {
+    if !computed {
+        return NOT_COMPUTED.to_string();
+    }
+    let (Some(legacy), Some(hierarchical)) = (legacy, hierarchical) else {
+        return "&mdash; no event both models forecast yet".to_string();
+    };
+    let verdict = if hierarchical <= legacy {
+        "hierarchical no worse"
+    } else {
+        "hierarchical worse"
+    };
+    format!("legacy {legacy:.4}, hierarchical {hierarchical:.4} (n={scored}) &mdash; {verdict}")
+}
 
 /// Render the hierarchical peer-table eviction count against its capacity.
 ///
@@ -249,6 +280,8 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
                     <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
                     <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
+                    <div class="info-label">Response-time error, RMS seconds</div><div class="info-value">{timing_error}</div>
+                    <div class="info-label">Transfer-time error, RMS seconds</div><div class="info-value">{transfer_error}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -294,13 +327,15 @@ pub fn peer_detail_html(address_str: &str) -> String {
             skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
             skill_blended = fmt_skill(rs.failure_skill_blended),
             skill_corrected = fmt_skill(rs.failure_skill_corrected),
-            blend_note = if rs.residual_correction_enabled || rs.hierarchical_routing_enabled {
+            blend_note = if rs.hierarchical_routing_enabled {
+                SUPERSEDED_BY_HIERARCHICAL
+            } else if rs.residual_correction_enabled {
                 " &mdash; superseded"
             } else {
                 " &mdash; in use"
             },
             corrected_note = if rs.hierarchical_routing_enabled {
-                " &mdash; superseded"
+                SUPERSEDED_BY_HIERARCHICAL
             } else if rs.residual_correction_enabled {
                 " &mdash; in use"
             } else {
@@ -331,7 +366,23 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 rs.hierarchical_peer_evictions,
                 rs.hierarchical_peer_capacity
             ),
-            hierarchical_eval = rs.hierarchical_failure_evaluated,
+            hierarchical_eval = if rs.hierarchical_computed {
+                rs.hierarchical_failure_evaluated.to_string()
+            } else {
+                NOT_COMPUTED.to_string()
+            },
+            timing_error = fmt_seconds_error(
+                rs.hierarchical_computed,
+                rs.response_time_rmse_secs_legacy,
+                rs.response_time_rmse_secs_hierarchical,
+                rs.response_time_scored
+            ),
+            transfer_error = fmt_seconds_error(
+                rs.hierarchical_computed,
+                rs.transfer_time_rmse_secs_legacy,
+                rs.transfer_time_rmse_secs_hierarchical,
+                rs.transfer_time_scored
+            ),
             hierarchical_horizon = if rs.hierarchical_computed {
                 fmt_horizon(
                     rs.hierarchical_failure_events,
@@ -755,6 +806,53 @@ mod tests {
         let render = &source[start..end];
         assert!(!render.contains("moves it fully"));
         assert!(render.contains("if peers turn out not to differ, not at all"));
+    }
+
+    #[test]
+    fn seconds_error_rendering_names_the_verdict_and_hides_frozen_readings() {
+        assert!(
+            fmt_seconds_error(true, Some(0.2), Some(0.1), 40).contains("hierarchical no worse")
+        );
+        assert!(
+            fmt_seconds_error(true, Some(0.2), Some(0.2), 40).contains("hierarchical no worse")
+        );
+        assert!(fmt_seconds_error(true, Some(0.1), Some(0.2), 40).contains("hierarchical worse"));
+        assert!(fmt_seconds_error(true, None, Some(0.2), 0).contains("no event"));
+        assert!(
+            fmt_seconds_error(false, Some(0.1), Some(0.2), 40).contains("not computed"),
+            "a reading frozen when computation stopped must not render as live"
+        );
+    }
+
+    /// Every hierarchical reading in the layer panel must go through the
+    /// computed check, so a stopped recorder cannot leave frozen counts on show.
+    #[test]
+    fn every_hierarchical_reading_is_gated_on_computation() {
+        let source = include_str!("peer_detail.rs");
+        let start = source.find("pub fn peer_detail_html").unwrap();
+        let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
+        let render = &source[start..end];
+        for binding in [
+            "skill_hierarchical =",
+            "hierarchical_eval =",
+            "hierarchical_horizon =",
+            "hierarchical_evictions =",
+            "shape_response =",
+            "shape_transfer =",
+            "timing_error =",
+            "transfer_error =",
+        ] {
+            let at = render
+                .find(binding)
+                .unwrap_or_else(|| panic!("{binding} must be rendered"));
+            let next = render[at + binding.len()..]
+                .find(" = ")
+                .map_or(render.len(), |offset| at + binding.len() + offset);
+            assert!(
+                render[at..next].contains("hierarchical_computed"),
+                "{binding} must check rs.hierarchical_computed"
+            );
+        }
     }
 
     #[test]

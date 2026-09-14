@@ -38,6 +38,11 @@
 //! subsets, and expectation timing assumes approximately lognormal residuals,
 //! which [`ResidualShape`] exposes for checking on real traffic.
 //!
+//! Not covered by that re-validation: the transfer-speed stage (the bake-off
+//! had no speed target), the live root squared-count sums described below, and
+//! a 10k-event window refit every 100 events once full (the bake-off's windows
+//! and cadence were smaller).
+//!
 //! Deliberate differences from that reference, each from the review brief:
 //! the horizon selector scores the clamped forecast (identical for the log
 //! stages; differs for failure only when a forecast clamps at 0 or 1); log
@@ -109,14 +114,25 @@
 //! # Where production differs from the reference, and why
 //!
 //! - **Time comes from the router's injected `TimeSource`**, as hours since the
-//!   router was built, not event count and not the host wall clock. Horizons
-//!   therefore advance under simulated time. The horizon is chosen by
+//!   router was built, not event count and not the host wall clock. Ring passes
+//!   its `InstantTimeSrc`, which reads tokio's clock, so horizons advance under
+//!   a paused tokio runtime (the direct simulation runner); they do not follow
+//!   a hosting-only time override. Router-level tests inject a mock clock. The horizon is chosen by
 //!   prequential loss, so one that does not suit a node's event rate is simply
 //!   not selected; on a busy node the window binds before any horizon does.
 //!   A node whose count has decayed to [`NODE_MIN`] by the time of a query is
 //!   treated as absent, so predictions take the query time too.
 //! - **Variance components are frozen between refits**, exactly as stale as the
-//!   curve they describe. Node means stay live.
+//!   curve they describe. Node means stay live, and so do the squared-count
+//!   sums in the root's noise: the reference froze those at refit along with
+//!   the components. Live sums are consistent with the live root mean they
+//!   describe; the difference is being re-validated separately.
+//! - **Leave-one-out rests are summed, not subtracted.** A cell's rest is the
+//!   sum of its peer's other cells, and a peer holding all but a millionth of
+//!   the root is skipped, because under decay the reference's subtraction
+//!   cancels to zero and biases `tau2` upward.
+//! - **Equal distances pool on the descending (speed) curve too**; see
+//!   `window_order`.
 //! - **Decay is stored epoch-scaled.** Sums are kept as
 //!   `sum_i exp((t_i - epoch)/h) x_i`; the noise terms a prediction reads are
 //!   ratios in which the scale cancels. Each refit rebases the epoch to `now`;
@@ -212,6 +228,10 @@ const MIN_EFFECTIVE_N: f64 = 2.0;
 /// A node whose decayed count is at or below this carries no evidence and is
 /// treated as absent, as in the validated reference (`NODE_MIN`).
 const NODE_MIN: f64 = 1e-12;
+
+/// A peer is left out of `tau2_peer` when the rest of the root holds less than
+/// this share of its weight: the leave-one-out sums would be cancellation noise.
+const ROOT_REST_FLOOR: f64 = 1e-6;
 
 /// Floor on the pooled within-cell variance, as in the reference.
 const MIN_SIGMA2: f64 = 1e-9;
@@ -545,6 +565,10 @@ struct Level {
     sq_peers: f64,
     /// `sum over all cells of cell.n^2`.
     sq_cells: f64,
+    /// `sum w^2` of windowed events whose peer has been evicted, counted as
+    /// singleton peers and cells in `sq_peers` and `sq_cells` so the root's
+    /// noise does not understate their contribution. Set at rebuild.
+    orphan_w2: f64,
     /// Indexed by peer slot.
     nodes: Vec<PeerNode>,
     components: Option<Components>,
@@ -558,6 +582,7 @@ impl Level {
             root: Moments::default(),
             sq_peers: 0.0,
             sq_cells: 0.0,
+            orphan_w2: 0.0,
             nodes: Vec::new(),
             components: None,
         }
@@ -568,6 +593,7 @@ impl Level {
         self.root = Moments::default();
         self.sq_peers = 0.0;
         self.sq_cells = 0.0;
+        self.orphan_w2 = 0.0;
         for node in &mut self.nodes {
             *node = PeerNode::default();
         }
@@ -609,6 +635,7 @@ impl Level {
     /// squared-count sums are left for `recount_squares`.
     fn rebuild(&mut self, prepared: &mut [Prepared], weighting: Weighting) {
         let mut root = Moments::default();
+        let mut orphan_w2 = 0.0;
         let nodes = &mut self.nodes;
         for event in prepared.iter_mut() {
             let weight = match weighting {
@@ -626,9 +653,12 @@ impl Level {
             if let Some(node) = nodes.get_mut(event.slot as usize) {
                 node.peer.add(weight, event.residual);
                 node.cells[event.band as usize & (BANDS - 1)].add(weight, event.residual);
+            } else {
+                orphan_w2 += weight * weight;
             }
         }
         self.root = root;
+        self.orphan_w2 = orphan_w2;
     }
 
     fn evict(&mut self, slot: usize) {
@@ -642,8 +672,8 @@ impl Level {
     /// Recompute the squared-count sums exactly, removing any drift the
     /// incremental updates and evictions accumulated.
     fn recount_squares(&mut self) {
-        self.sq_peers = 0.0;
-        self.sq_cells = 0.0;
+        self.sq_peers = self.orphan_w2;
+        self.sq_cells = self.orphan_w2;
         for node in &mut self.nodes {
             self.sq_peers += node.peer.n * node.peer.n;
             node.sq_cells = node.cells.iter().map(|cell| cell.n * cell.n).sum();
@@ -671,22 +701,35 @@ impl Level {
         // tau2_cell: each replicated cell against the mean of its peer's other
         // cells. Weighted by the design factor of that contrast so peers whose
         // other cells are thin do not dominate.
+        //
+        // The rest is summed from the other (at most seven) cells directly, not
+        // taken as `peer - cell`. Under decay a stale band's weights can fall
+        // below ~1e-8 of the active band's, and the subtraction then cancels to
+        // exactly zero in `w2` and `n^2`, removing the rest's sampling noise from
+        // the contrast and biasing `tau2_cell` upward.
         let (mut acc, mut den) = (0.0, 0.0);
         for node in &self.nodes {
-            let peer = node.peer;
-            for cell in &node.cells {
+            for (index, cell) in node.cells.iter().enumerate() {
                 if !cell.replicated() {
                     continue;
                 }
-                let rest = peer.n - cell.n;
-                if rest <= NODE_MIN {
+                let mut rest = Moments::default();
+                let mut rest_sq = 0.0;
+                for (other_index, other) in node.cells.iter().enumerate() {
+                    if other_index != index {
+                        rest.n += other.n;
+                        rest.w2 += other.w2;
+                        rest.sum += other.sum;
+                        rest_sq += other.n * other.n;
+                    }
+                }
+                if rest.n <= NODE_MIN {
                     continue;
                 }
-                let rest_w2 = (peer.w2 - cell.w2).max(0.0);
-                let contrast = cell.mean() - (peer.sum - cell.sum) / rest;
-                let noise = sigma2 * (cell.mean_variance_factor() + rest_w2 / (rest * rest));
+                let contrast = cell.mean() - rest.mean();
+                let noise = sigma2 * (cell.mean_variance_factor() + rest.w2 / (rest.n * rest.n));
                 acc += contrast * contrast - noise;
-                den += 1.0 + (node.sq_cells - cell.n * cell.n).max(0.0) / (rest * rest);
+                den += 1.0 + rest_sq / (rest.n * rest.n);
             }
         }
         let tau2_cell = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
@@ -701,7 +744,10 @@ impl Level {
                 continue;
             }
             let rest = root.n - peer.n;
-            if rest <= NODE_MIN {
+            // A peer holding all but a sliver of the root's weight leaves a rest
+            // whose `w2` and squared counts are differences of nearly equal
+            // numbers; skip it rather than read cancellation noise as signal.
+            if rest <= NODE_MIN || rest < ROOT_REST_FLOOR * root.n {
                 continue;
             }
             let rest_w2 = (root.w2 - peer.w2).max(0.0);
@@ -920,12 +966,24 @@ struct Event {
     band: u8,
 }
 
-/// Window order: ascending distance, then descending `y` so equal-distance
-/// points pool in PAV exactly as `pav_regression` pools them.
-fn window_order(a: &Event, b: &Event) -> std::cmp::Ordering {
-    a.distance
-        .total_cmp(&b.distance)
-        .then_with(|| b.y.total_cmp(&a.y))
+/// Window order: ascending distance, with equal distances ordered so that PAV
+/// pools them into one block.
+///
+/// PAV merges a point into the previous block when it violates the curve's
+/// direction, so equal-`x` points must arrive in violating order: descending
+/// `y` for an ascending curve (as `pav_regression` orders them) and ascending
+/// `y` for a descending one. `pav_regression` uses descending `y` for both,
+/// which leaves ties on a descending curve as separate blocks; this does not.
+fn window_order(ascending: bool) -> impl Fn(&Event, &Event) -> std::cmp::Ordering + Copy {
+    move |a: &Event, b: &Event| {
+        a.distance.total_cmp(&b.distance).then_with(|| {
+            if ascending {
+                b.y.total_cmp(&a.y)
+            } else {
+                a.y.total_cmp(&b.y)
+            }
+        })
+    }
 }
 
 fn band_of(contract_location: f64) -> usize {
@@ -934,6 +992,21 @@ fn band_of(contract_location: f64) -> usize {
     }
     ((contract_location * BANDS as f64).floor().max(0.0) as usize).min(BANDS - 1)
 }
+
+/// Size bounds the published memory budget is computed from (window
+/// `WINDOW_EVENTS x EVENT_BYTES`, refit buffer `WINDOW_EVENTS x PREPARED_BYTES`,
+/// levels `HORIZONS x peer capacity x PEER_NODE_BYTES`). Enforced at compile
+/// time, so a field that grows a hot struct cannot silently grow the budget.
+const EVENT_BYTES: usize = 48;
+const PREPARED_BYTES: usize = 32;
+const PEER_NODE_BYTES: usize = 296;
+const LEVEL_BYTES: usize = 136;
+const _: () = {
+    assert!(std::mem::size_of::<Event>() <= EVENT_BYTES);
+    assert!(std::mem::size_of::<Prepared>() <= PREPARED_BYTES);
+    assert!(std::mem::size_of::<PeerNode>() <= PEER_NODE_BYTES);
+    assert!(std::mem::size_of::<Level>() <= LEVEL_BYTES);
+};
 
 /// A windowed event reduced to what a hierarchy rebuild needs.
 #[derive(Debug, Clone, Copy)]
@@ -997,6 +1070,12 @@ impl ResidualShape {
     /// Fewest within-cell deviations before a shape is reported.
     const MIN_EVENTS: usize = 30;
 
+    /// Fewest events a cell needs to contribute. Deviations about a small
+    /// cell's own mean are strongly non-normal even for normal data (a
+    /// two-event cell's two deviations are always equal and opposite), which
+    /// would read as spurious negative kurtosis.
+    const MIN_CELL_EVENTS: f64 = 10.0;
+
     fn measure(prepared: &[Prepared], level: &Level) -> ResidualShape {
         let (mut n, mut m2, mut m3, mut m4) = (0usize, 0.0, 0.0, 0.0);
         for event in prepared {
@@ -1004,12 +1083,13 @@ impl ResidualShape {
                 continue;
             };
             let cell = node.cells[event.band as usize & (BANDS - 1)];
-            if !cell.replicated() {
+            let cell_n = cell.effective_n();
+            if cell_n < Self::MIN_CELL_EVENTS {
                 continue;
             }
-            // Deviations about the cell mean are shrunk by (n-1)/n; with the
-            // replication gate that bias is small and is not corrected here.
-            let e = event.residual - cell.mean();
+            // A deviation about the cell's own mean has variance scaled by
+            // (n-1)/n; rescale so cells of different sizes pool on one scale.
+            let e = (event.residual - cell.mean()) * (cell_n / (cell_n - 1.0)).sqrt();
             let e2 = e * e;
             n += 1;
             m2 += e2;
@@ -1072,7 +1152,7 @@ pub(crate) struct StageDiagnostics {
 pub(crate) struct Stage<K> {
     target: Target,
     window_capacity: usize,
-    /// Events as of the last refit, in [`window_order`].
+    /// Events as of the last refit, in [`window_order`] for the target.
     sorted: Vec<Event>,
     /// Events learned since the last refit, in arrival order.
     fresh: Vec<Event>,
@@ -1150,8 +1230,10 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         best
     }
 
-    /// Map a composed value onto the target's range.
-    fn bound(&self, value: f64) -> f64 {
+    /// Map a composed value onto the target's range: `[0, 1]` for failure, the
+    /// window's observed range widened by [`LOG_PREDICTION_MARGIN`] for a log
+    /// stage.
+    pub(crate) fn bound(&self, value: f64) -> f64 {
         match self.target {
             Target::Failure => value.clamp(0.0, 1.0),
             Target::LogResponseTime | Target::LogTransferSpeed => {
@@ -1333,7 +1415,8 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let oldest_live = self.next_seq.saturating_sub(self.window_capacity as u64);
         self.sorted.retain(|event| event.seq >= oldest_live);
         self.fresh.retain(|event| event.seq >= oldest_live);
-        self.fresh.sort_unstable_by(window_order);
+        let order = window_order(self.target.ascending());
+        self.fresh.sort_unstable_by(order);
         // In-place merge from the back: no second window-sized buffer.
         let existing = self.sorted.len();
         let incoming = self.fresh.len();
@@ -1345,7 +1428,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             self.sorted.resize(existing + incoming, filler);
             let (mut i, mut j, mut write) = (existing, incoming, existing + incoming);
             while j > 0 {
-                if i > 0 && window_order(&self.sorted[i - 1], &self.fresh[j - 1]).is_gt() {
+                if i > 0 && order(&self.sorted[i - 1], &self.fresh[j - 1]).is_gt() {
                     self.sorted[write - 1] = self.sorted[i - 1];
                     i -= 1;
                 } else {
@@ -1447,10 +1530,10 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Observed {
     pub failure: Option<f64>,
-    /// Log-scale location `mu` of the response-time forecast, in log seconds,
-    /// made for every event whether or not it turned out to be timed, so timing
-    /// can be evaluated offline against the timed subset.
-    pub log_response_time: Option<f64>,
+    /// The timing and speed estimates routing would have acted on (expected
+    /// seconds, effective bytes/s), made for every event whether or not it
+    /// turned out to be timed, so timing can be scored against the timed subset.
+    pub estimate: Estimate,
 }
 
 /// A routing estimate in the router's own units.
@@ -1520,10 +1603,7 @@ impl HierarchicalRouting {
         time: f64,
     ) -> Observed {
         let contract = contract_location.as_f64();
-        let log_response_time = self
-            .response_time
-            .predict(peer, contract, distance, time)
-            .map(|forecast| forecast.value);
+        let estimate = self.estimate(peer, contract_location, distance, time);
         let failure = self
             .failure
             .observe(
@@ -1573,10 +1653,7 @@ impl HierarchicalRouting {
             }
         }
         self.log_saturation(time);
-        Observed {
-            failure,
-            log_response_time,
-        }
+        Observed { failure, estimate }
     }
 
     /// Info-level, rate-limited notice that the peer tables are evicting live
@@ -1623,15 +1700,19 @@ impl HierarchicalRouting {
                 .failure
                 .predict(peer, contract, distance, time)
                 .map(|forecast| forecast.value),
+            // The expectation's log, `mu +- spread/2`, is bounded like `mu`
+            // itself: a noisy early `tau2` can give an unknown peer a very large
+            // posterior variance, and unbounded it would price that peer as
+            // effectively unroutable. See `LOG_PREDICTION_MARGIN`.
             time_to_response_start_secs: self
                 .response_time
                 .predict(peer, contract, distance, time)
-                .map(|f| (f.value + f.spread / 2.0).exp())
+                .map(|f| self.response_time.bound(f.value + f.spread / 2.0).exp())
                 .filter(|seconds| seconds.is_finite()),
             transfer_speed_bps: self
                 .transfer_speed
                 .predict(peer, contract, distance, time)
-                .map(|f| (f.value - f.spread / 2.0).exp())
+                .map(|f| self.transfer_speed.bound(f.value - f.spread / 2.0).exp())
                 .filter(|speed| speed.is_finite() && *speed > 0.0),
         }
     }

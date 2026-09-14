@@ -1048,10 +1048,11 @@ pub(crate) struct RouterSnapshotInfo {
     /// Per-stage peer-table capacity, derived from `max_connections`.
     #[serde(default)]
     pub hierarchical_peer_capacity: usize,
-    /// Whether the hierarchical estimator is computed at all: only when it
-    /// routes or the routing dataset is being recorded. When false every
-    /// `hierarchical_*` reading above is empty by design, not because the
-    /// model has nothing to say.
+    /// Whether the hierarchical estimator is being computed NOW: only when it
+    /// routes or the routing dataset is recording. When false, every
+    /// `hierarchical_*` reading (and the timing error readings) is either empty
+    /// or FROZEN at the moment computation stopped (for example when the
+    /// recorder hit its byte cap); a consumer must not present it as live.
     #[serde(default)]
     pub hierarchical_computed: bool,
     /// Timed successes whose response time was floored to 1 ms before the log.
@@ -1061,6 +1062,23 @@ pub(crate) struct RouterSnapshotInfo {
     /// zero duration). Skipped, as legacy skips them; not rejections.
     #[serde(default)]
     pub hierarchical_non_speed_samples: u64,
+    /// RMS error in SECONDS of the response time each model would act on, and
+    /// the events scored (both models forecast, response timed). The promotion
+    /// gate's timing instrument.
+    #[serde(default)]
+    pub response_time_rmse_secs_legacy: Option<f64>,
+    #[serde(default)]
+    pub response_time_rmse_secs_hierarchical: Option<f64>,
+    #[serde(default)]
+    pub response_time_scored: u64,
+    /// The same for transfer time, `payload bytes / forecast speed`, over real
+    /// payload transfers.
+    #[serde(default)]
+    pub transfer_time_rmse_secs_legacy: Option<f64>,
+    #[serde(default)]
+    pub transfer_time_rmse_secs_hierarchical: Option<f64>,
+    #[serde(default)]
+    pub transfer_time_scored: u64,
     /// Lognormality check for the response-time stage: the within-cell log
     /// residual variance expectation timing uses, and the skewness and excess
     /// kurtosis of those residuals (both ~0 when log times are normal).
@@ -1198,6 +1216,17 @@ pub(crate) struct Router {
     /// Connection cap the hierarchical estimator's peer tables are sized from.
     #[serde(skip)]
     max_connections: usize,
+    /// Prequential error, in seconds, of the response time and transfer time
+    /// each model would act on, over events both forecast and that carry the
+    /// measurement. Scored only while the hierarchical estimator is computed.
+    #[serde(skip)]
+    response_time_error_legacy: ErrorTracker,
+    #[serde(skip)]
+    response_time_error_hierarchical: ErrorTracker,
+    #[serde(skip)]
+    transfer_time_error_legacy: ErrorTracker,
+    #[serde(skip)]
+    transfer_time_error_hierarchical: ErrorTracker,
     /// Where the chosen peer sits in distance order — the censoring diagnostic
     /// for the candidate-window size. See [`SelectionRankStats`].
     #[serde(skip)]
@@ -1242,6 +1271,10 @@ impl Clone for Router {
             hierarchical: hierarchical::HierarchicalRouting::new(self.max_connections),
             estimator_clock: self.estimator_clock.clone(),
             max_connections: self.max_connections,
+            response_time_error_legacy: ErrorTracker::default(),
+            response_time_error_hierarchical: ErrorTracker::default(),
+            transfer_time_error_legacy: ErrorTracker::default(),
+            transfer_time_error_hierarchical: ErrorTracker::default(),
             failure_skill_hierarchical: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
         }
@@ -1296,9 +1329,12 @@ struct PredictionClock {
 
 /// Whether the hierarchical estimator is computed at all for this event.
 ///
-/// Only when its output is used: in routing, or recorded in the dataset.
+/// Only when its output is used: in routing, or recorded into a dataset that
+/// is still RECORDING. A recorder that stopped (byte cap, write error) must not
+/// keep the estimator learning under the router's write lock for the rest of
+/// the process's life, recording nothing.
 fn hierarchical_computed(dataset: Option<&dataset::RoutingDataset>) -> bool {
-    hierarchical_routing_enabled() || dataset.is_some()
+    hierarchical_routing_enabled() || dataset.is_some_and(|dataset| dataset.is_recording())
 }
 
 /// Parse a `FREENET_ROUTING_*` boolean switch, failing safe.
@@ -1316,9 +1352,11 @@ fn parse_routing_flag(value: Option<&str>) -> bool {
 /// Whether the hierarchical estimator (#4485) replaces the legacy estimates in
 /// live routing.
 ///
-/// Default **off**. It is computed and scored either way, so a node gathers the
-/// evidence for promoting it without its routing changing. When on, it takes
-/// precedence over the residual correction for every stage it can estimate.
+/// Default **off**. With it off the estimator is computed and scored only while
+/// the routing dataset is recording (see [`hierarchical_computed`]), which is
+/// how a soak gathers the evidence for promoting it without routing changing.
+/// When on, it takes precedence over the residual correction for every stage it
+/// can estimate.
 fn hierarchical_routing_enabled() -> bool {
     // Same test-override shape, and for the same reason, as
     // `residual_correction_enabled`.
@@ -1813,13 +1851,18 @@ impl Router {
             hierarchical: hierarchical::HierarchicalRouting::new(Ring::DEFAULT_MAX_CONNECTIONS),
             estimator_clock: EstimatorClock::default(),
             max_connections: Ring::DEFAULT_MAX_CONNECTIONS,
+            response_time_error_legacy: ErrorTracker::default(),
+            response_time_error_hierarchical: ErrorTracker::default(),
+            transfer_time_error_legacy: ErrorTracker::default(),
+            transfer_time_error_hierarchical: ErrorTracker::default(),
             failure_skill_hierarchical: residual::SkillTracker::new(),
             selection_ranks: SelectionRankStats::default(),
         }
     }
 
-    /// Run the hierarchical estimator's horizons on `source` (the ring's time
-    /// source in production, simulated time in simulations).
+    /// Run the hierarchical estimator's horizons on `source`. Production passes
+    /// the ring's `InstantTimeSrc`, which follows tokio's clock (so it advances
+    /// under a paused runtime); tests pass a mock they advance by hand.
     pub(crate) fn with_time_source(
         mut self,
         source: crate::util::time_source::DynTimeSource,
@@ -1888,6 +1931,13 @@ impl Router {
         // below does not matter; it is placed after the legacy scoring so every
         // legacy forecast above is made on exactly the state it always was.
         if hierarchical_computed(dataset) {
+            let legacy_timing = self.legacy_timing_forecast(
+                &event.peer,
+                event.contract_location,
+                distance,
+                routing_predictor::wall_clock_hours(),
+            );
+            let actual_timing = ObservedTiming::of(&event.outcome);
             let observed = self.hierarchical.observe_at(
                 &event.peer,
                 event.contract_location,
@@ -1895,7 +1945,13 @@ impl Router {
                 &renegade_outcome,
                 self.estimator_clock.hours(),
             );
-            self.score_hierarchical_layer(forecasts.as_mut(), observed, actual_failure);
+            self.score_hierarchical_layer(
+                forecasts.as_mut(),
+                observed,
+                legacy_timing,
+                actual_timing,
+                actual_failure,
+            );
         }
         if let Some(dataset) = dataset.filter(|dataset| dataset.is_recording()) {
             dataset.record_route(self.route_record(&event, source, forecasts));
@@ -2257,23 +2313,6 @@ impl Router {
             (global + correction.value).clamp(0.0, 1.0)
         });
 
-        // The response time the router would act on with the flag off, for
-        // offline evaluation of timing: the same blend as
-        // `predict_routing_outcome`, in log seconds.
-        let log_response_time_legacy = self
-            .response_start_time_estimator
-            .estimate_retrieval_time(peer, contract_location)
-            .ok()
-            .map(|estimate| {
-                legacy_response_time(
-                    estimate,
-                    renegade.time_to_response_start,
-                    self.renegade_predictor.response_time_weight(),
-                )
-            })
-            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-            .map(f64::ln);
-
         self.failure_skill_global.record(global, actual_failure);
         self.failure_skill_adjusted.record(adjusted, actual_failure);
         self.failure_skill_blended.record(blended, actual_failure);
@@ -2287,10 +2326,12 @@ impl Router {
             corrected,
             lambda: corrections.failure.map(|correction| correction.lambda),
             n_eff: corrections.failure.map(|correction| correction.n_eff),
-            // Filled in by `score_hierarchical_layer`.
+            // Filled in by `score_hierarchical_layer`, when the estimator runs.
             hierarchical: None,
-            log_response_time_legacy,
+            log_response_time_legacy: None,
             log_response_time_hierarchical: None,
+            log_transfer_speed_legacy: None,
+            log_transfer_speed_hierarchical: None,
         })
     }
 
@@ -2398,8 +2439,13 @@ impl Router {
                 .map(|value| value.clamp(0.0, 1.0));
             // Note the shape: the base is adopted whenever it EXISTS, and the
             // correction is added only if the residual model has something to
-            // say. Abstention must mean "base plus nothing", not "revert to the
-            // old model".
+            // say. An earlier version required both, which quietly defeated the
+            // neutral-when-uninformed property this design rests on — when the
+            // correction abstained (post-restart warm-up, or a query whose
+            // kernel weights underflow) the estimate silently fell back to the
+            // legacy blend, i.e. to exactly the far-field behaviour the
+            // correction exists to replace. Abstention must mean "base plus
+            // nothing", not "revert to the old model".
             if let Some(base) = global_failure {
                 let corrected =
                     (base + corrections.failure.map_or(0.0, |c| c.value)).clamp(0.0, 1.0);
@@ -2444,20 +2490,104 @@ impl Router {
     ///
     /// Scored only on events the legacy layers were scored on (`forecasts` is
     /// `Some`), so every skill on the dashboard describes the same population.
+    ///
+    /// Also scores both models' timing and transfer forecasts, the values
+    /// routing would act on, in SECONDS on the events that carry them, and
+    /// records the forecasts in the dataset. This is the instrument for the
+    /// promotion gate's "not worse in seconds" (`.claude/rules/ring.md`).
     fn score_hierarchical_layer(
         &mut self,
         forecasts: Option<&mut dataset::FailureForecasts>,
         observed: hierarchical::Observed,
+        legacy: LegacyTimingForecast,
+        actual: ObservedTiming,
         actual_failure: f64,
     ) {
         let Some(forecasts) = forecasts else {
             return;
         };
+        let hierarchical = observed.estimate;
         forecasts.hierarchical = observed.failure;
-        forecasts.log_response_time_hierarchical = observed.log_response_time;
+        forecasts.log_response_time_hierarchical = hierarchical
+            .time_to_response_start_secs
+            .filter(|seconds| *seconds > 0.0)
+            .map(f64::ln);
+        forecasts.log_transfer_speed_hierarchical = hierarchical.transfer_speed_bps.map(f64::ln);
+        forecasts.log_response_time_legacy = legacy
+            .time_to_response_start_secs
+            .filter(|seconds| *seconds > 0.0)
+            .map(f64::ln);
+        forecasts.log_transfer_speed_legacy = legacy.transfer_speed_bps.map(f64::ln);
         if let Some(probability) = observed.failure {
             self.failure_skill_hierarchical
                 .record(probability, actual_failure);
+        }
+        // Same population for both models: an event counts only when both
+        // forecast it and it carries the measurement.
+        if let (Some(actual), Some(legacy_time), Some(hierarchical_time)) = (
+            actual.response_secs,
+            legacy.time_to_response_start_secs,
+            hierarchical.time_to_response_start_secs,
+        ) {
+            self.response_time_error_legacy.record(legacy_time, actual);
+            self.response_time_error_hierarchical
+                .record(hierarchical_time, actual);
+        }
+        if let (Some((bytes, actual)), Some(legacy_speed), Some(hierarchical_speed)) = (
+            actual.transfer,
+            legacy.transfer_speed_bps,
+            hierarchical.transfer_speed_bps,
+        ) {
+            self.transfer_time_error_legacy
+                .record(bytes / legacy_speed, actual);
+            self.transfer_time_error_hierarchical
+                .record(bytes / hierarchical_speed, actual);
+        }
+    }
+
+    /// The legacy stack's timing and transfer forecasts as routing would act on
+    /// them with the hierarchical flag off, including the residual correction
+    /// when `FREENET_ROUTING_RESIDUAL_CORRECTION` is on. Computed only alongside
+    /// the hierarchical estimator, whose comparison it exists for.
+    fn legacy_timing_forecast(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+        distance: f64,
+        wall_clock_hours: f64,
+    ) -> LegacyTimingForecast {
+        let Ok(failure) = self
+            .failure_estimator
+            .estimate_retrieval_time(peer, contract_location)
+        else {
+            return LegacyTimingForecast::default();
+        };
+        let time_estimate = self
+            .response_start_time_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .ok();
+        let transfer_estimate = self
+            .transfer_rate_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .ok();
+        let legacy = self.legacy_stage_estimates(
+            peer,
+            contract_location,
+            distance,
+            failure,
+            time_estimate,
+            transfer_estimate,
+            wall_clock_hours,
+        );
+        // Availability as `predict_routing_outcome` treats it: a stage the
+        // isotonic estimator cannot estimate is unknown to the cost formula.
+        LegacyTimingForecast {
+            time_to_response_start_secs: time_estimate
+                .map(|_| legacy.time_to_response_start)
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0),
+            transfer_speed_bps: transfer_estimate
+                .map(|_| legacy.xfer_speed)
+                .filter(|speed| speed.is_finite() && *speed > 0.0),
         }
     }
 
@@ -3043,6 +3173,12 @@ impl Router {
             hierarchical_computed: hierarchical_computed(dataset::global()),
             hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
             hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
+            response_time_rmse_secs_legacy: self.response_time_error_legacy.rmse(),
+            response_time_rmse_secs_hierarchical: self.response_time_error_hierarchical.rmse(),
+            response_time_scored: self.response_time_error_hierarchical.count,
+            transfer_time_rmse_secs_legacy: self.transfer_time_error_legacy.rmse(),
+            transfer_time_rmse_secs_hierarchical: self.transfer_time_error_hierarchical.rmse(),
+            transfer_time_scored: self.transfer_time_error_hierarchical.count,
             hierarchical_response_time_log_shape: hierarchical[1].into(),
             hierarchical_transfer_speed_log_shape: hierarchical[2].into(),
             failure_brier_blended: self.failure_skill_blended.brier(),
@@ -3105,6 +3241,62 @@ impl Router {
     fn has_sufficient_routing_events(&self) -> bool {
         const MIN_EVENTS_FOR_PREDICTION: usize = 50;
         self.failure_estimator.len() >= MIN_EVENTS_FOR_PREDICTION
+    }
+}
+
+/// The legacy stack's acted-on timing and transfer forecasts for one event.
+#[derive(Debug, Clone, Copy, Default)]
+struct LegacyTimingForecast {
+    time_to_response_start_secs: Option<f64>,
+    transfer_speed_bps: Option<f64>,
+}
+
+/// The timing measurements an event carries.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObservedTiming {
+    response_secs: Option<f64>,
+    /// `(payload bytes, transfer seconds)`, only for a real payload transfer.
+    transfer: Option<(f64, f64)>,
+}
+
+impl ObservedTiming {
+    fn of(outcome: &RouteOutcome) -> Self {
+        match outcome {
+            RouteOutcome::Success {
+                time_to_response_start,
+                payload_size,
+                payload_transfer_time,
+            } => ObservedTiming {
+                response_secs: Some(time_to_response_start.as_secs_f64()),
+                transfer: (*payload_size > 0 && !payload_transfer_time.is_zero())
+                    .then_some((*payload_size as f64, payload_transfer_time.as_secs_f64())),
+            },
+            RouteOutcome::SuccessUntimed | RouteOutcome::Failure => ObservedTiming::default(),
+        }
+    }
+}
+
+/// Prequential squared error in natural units (seconds).
+///
+/// Not [`residual::SkillTracker`]: that scores a binary forecast against a
+/// base-rate climatology, which has no meaning for a duration.
+#[derive(Debug, Default, Clone, Copy)]
+struct ErrorTracker {
+    squared_error: f64,
+    count: u64,
+}
+
+impl ErrorTracker {
+    fn record(&mut self, predicted: f64, actual: f64) {
+        let error = predicted - actual;
+        if error.is_finite() {
+            self.squared_error += error * error;
+            self.count += 1;
+        }
+    }
+
+    fn rmse(&self) -> Option<f64> {
+        (self.count > 0).then(|| (self.squared_error / self.count as f64).sqrt())
     }
 }
 
@@ -3332,6 +3524,19 @@ mod tests {
                 .expect("the hierarchical failure stage is warm")
         };
         let expected_hierarchical = hierarchical_estimate(&router);
+        // What routing would act on for this query, before ingestion.
+        let acted_on = router.hierarchical.estimate(
+            &peer,
+            contract,
+            hierarchical_distance,
+            router.estimator_clock.hours(),
+        );
+        let legacy_acted_on = router.legacy_timing_forecast(
+            &peer,
+            contract,
+            hierarchical_distance,
+            routing_predictor::wall_clock_hours(),
+        );
 
         router.add_event_recording(
             RouteEvent {
@@ -3420,6 +3625,152 @@ mod tests {
                 "{field} must be a log-seconds forecast near ln(0.1), got {value}"
             );
         }
+        // The recorded forecasts are the values routing ACTS on: ln E[T] and
+        // ln of the effective speed, not the log-scale location.
+        let pairs = [
+            (
+                "log_response_time_hierarchical",
+                acted_on.time_to_response_start_secs,
+            ),
+            (
+                "log_transfer_speed_hierarchical",
+                acted_on.transfer_speed_bps,
+            ),
+            (
+                "log_response_time_legacy",
+                legacy_acted_on.time_to_response_start_secs,
+            ),
+            (
+                "log_transfer_speed_legacy",
+                legacy_acted_on.transfer_speed_bps,
+            ),
+        ];
+        for (field, value) in pairs {
+            let expected = value
+                .unwrap_or_else(|| panic!("{field} has an acted-on value"))
+                .ln();
+            // Exact for the hierarchical forecasts. The legacy ones pass through
+            // Renegade, whose time feature reads the host clock inside
+            // `add_event`, so they can move in the fifth digit between the two
+            // readings; `legacy_timing_forecast_follows_the_residual_correction_flag`
+            // pins them exactly on a shared clock.
+            let tolerance = if field.ends_with("_legacy") {
+                1e-4
+            } else {
+                1e-12
+            };
+            assert!(
+                (recorded(field) - expected).abs() < tolerance,
+                "{field}: recorded {} but routing would act on ln = {expected}",
+                recorded(field)
+            );
+        }
+    }
+
+    /// The legacy timing forecast recorded for the comparison must be the one
+    /// routing acts on, so it includes the residual correction when that flag
+    /// is on.
+    #[test]
+    fn legacy_timing_forecast_follows_the_residual_correction_flag() {
+        let _learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]);
+        let (peer, contract) = feed_mixed_traffic(&mut router, 300);
+        let distance = contract.distance(peer.location().unwrap()).as_f64();
+        let clock = router.prediction_clock();
+        for correction in [false, true] {
+            let _correction = force_residual_correction(correction);
+            let _off = force_hierarchical_routing(false);
+            let forecast =
+                router.legacy_timing_forecast(&peer, contract, distance, clock.wall_clock_hours);
+            let acted = router
+                .predict_routing_outcome_at(&peer, contract, clock)
+                .unwrap();
+            assert_eq!(
+                forecast.time_to_response_start_secs,
+                Some(acted.time_to_response_start),
+                "correction={correction}"
+            );
+            assert_eq!(
+                forecast.transfer_speed_bps,
+                Some(acted.xfer_speed.bytes_per_second),
+                "correction={correction}"
+            );
+        }
+        let off = {
+            let _correction = force_residual_correction(false);
+            router.legacy_timing_forecast(&peer, contract, distance, clock.wall_clock_hours)
+        };
+        let on = {
+            let _correction = force_residual_correction(true);
+            router.legacy_timing_forecast(&peer, contract, distance, clock.wall_clock_hours)
+        };
+        assert_ne!(
+            (off.time_to_response_start_secs, off.transfer_speed_bps),
+            (on.time_to_response_start_secs, on.transfer_speed_bps),
+            "the flag must change the forecast, or the equalities above prove nothing"
+        );
+    }
+
+    /// The promotion gate's "not worse in seconds" instrument is populated by
+    /// traffic, on the same events for both models.
+    #[test]
+    fn timing_error_in_seconds_reaches_the_snapshot() {
+        let _learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]);
+        feed_mixed_traffic(&mut router, 400);
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.response_time_scored > 100,
+            "{}",
+            snapshot.response_time_scored
+        );
+        assert!(
+            snapshot.transfer_time_scored > 100,
+            "{}",
+            snapshot.transfer_time_scored
+        );
+        assert_eq!(
+            router.response_time_error_legacy.count, router.response_time_error_hierarchical.count,
+            "both models are scored on the same events"
+        );
+        for value in [
+            snapshot.response_time_rmse_secs_legacy,
+            snapshot.response_time_rmse_secs_hierarchical,
+            snapshot.transfer_time_rmse_secs_legacy,
+            snapshot.transfer_time_rmse_secs_hierarchical,
+        ] {
+            let value = value.expect("scored");
+            assert!((0.0..1.0).contains(&value), "{value}");
+        }
+    }
+
+    /// A recorder that has stopped (byte cap, write error) must not keep the
+    /// estimator learning, and the snapshot must say it is not computed now.
+    #[test]
+    fn a_stopped_recorder_does_not_keep_the_estimator_learning() {
+        let _off = force_hierarchical_routing(false);
+        let mut router = Router::new(&[]);
+        let stopped = dataset::RoutingDataset::stopped_for_test();
+        assert!(!stopped.is_recording());
+        for _ in 0..50 {
+            router.add_event_recording(
+                RouteEvent {
+                    peer: PeerKeyLocation::random(),
+                    contract_location: Location::random(),
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                },
+                dataset::RouteSource::Originator,
+                Some(&stopped),
+            );
+        }
+        assert_eq!(
+            router.hierarchical.diagnostics()[0].window_events,
+            0,
+            "a stopped recorder must not switch learning on"
+        );
+        assert!(!hierarchical_computed(Some(&stopped)));
+        assert!(!router.snapshot().hierarchical_computed);
     }
 
     #[test]

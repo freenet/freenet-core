@@ -162,12 +162,20 @@ pub(crate) struct FailureForecasts {
     pub n_eff: Option<f64>,
     /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
     pub hierarchical: Option<f64>,
-    /// `ln(seconds)` to response start the legacy stack would act on, forecast
-    /// for every event whether or not it turns out to be timed, so timing can be
-    /// scored offline on the timed subset. `None` without a timing estimate.
+    /// `ln(seconds)` to response start the legacy stack would act on (including
+    /// the residual correction when that flag is on), forecast for every event
+    /// whether or not it turns out to be timed, so timing can be scored offline
+    /// on the timed subset. `None` without a timing estimate, and recorded only
+    /// while the hierarchical estimator is computed.
     pub log_response_time_legacy: Option<f64>,
-    /// The same forecast from the hierarchical estimator.
+    /// The same forecast from the hierarchical estimator: `ln E[T]`, the value
+    /// routing would act on, not the log-scale location.
     pub log_response_time_hierarchical: Option<f64>,
+    /// `ln(bytes/s)` of the transfer speed the legacy stack would act on.
+    pub log_transfer_speed_legacy: Option<f64>,
+    /// `ln(bytes/s)` of the hierarchical estimator's effective speed (so that
+    /// `bytes / speed` is its expected transfer time).
+    pub log_transfer_speed_hierarchical: Option<f64>,
 }
 
 /// One observed routing outcome.
@@ -321,6 +329,15 @@ impl RoutingDataset {
             .name("routing-dataset".into())
             .spawn(move || write_loop(rx, file, max_bytes, &dropped, &stopped))?;
         Ok(dataset)
+    }
+
+    /// A handle that has already stopped, as after its byte cap or a write
+    /// error, for tests of callers that must notice.
+    #[cfg(test)]
+    pub(crate) fn stopped_for_test() -> Self {
+        let (dataset, _rx) = Self::unstarted();
+        dataset.stopped.store(true, Ordering::Relaxed);
+        dataset
     }
 
     /// A handle whose writer has not been started; the caller owns the receiver.
@@ -665,6 +682,8 @@ mod tests {
                 hierarchical: Some(0.11),
                 log_response_time_legacy: Some(-1.5),
                 log_response_time_hierarchical: None,
+                log_transfer_speed_legacy: Some(9.0),
+                log_transfer_speed_hierarchical: None,
             }),
         }
     }
@@ -734,6 +753,8 @@ mod tests {
         assert_eq!(lines[1]["forecasts"]["corrected"], 0.12);
         assert_eq!(lines[1]["forecasts"]["hierarchical"], 0.11);
         assert_eq!(lines[1]["forecasts"]["log_response_time_legacy"], -1.5);
+        assert_eq!(lines[1]["forecasts"]["log_transfer_speed_legacy"], 9.0);
+        assert!(lines[1]["forecasts"]["log_transfer_speed_hierarchical"].is_null());
         assert!(
             lines[1]["forecasts"]["log_response_time_hierarchical"].is_null(),
             "an absent forecast must be recorded as null, not omitted or zero"

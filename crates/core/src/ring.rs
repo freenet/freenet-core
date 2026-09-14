@@ -689,8 +689,9 @@ impl Ring {
         let max_connections = connection_manager.max_connections;
         // Built here, after the time source and the connection cap it depends
         // on: the hierarchical routing estimator's horizons run on the ring's
-        // clock (so they advance in simulations), and its peer tables are sized
-        // from this node's own `max_connections`.
+        // `InstantTimeSrc`, which reads tokio's clock (so they advance under a
+        // paused tokio runtime, but do NOT follow a hosting-only time override),
+        // and its peer tables are sized from this node's own `max_connections`.
         let router = Arc::new(RwLock::new(
             Router::new(&[])
                 .with_time_source(time_source.clone())

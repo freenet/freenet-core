@@ -36,8 +36,12 @@ fn event(distance: f64, y: f64) -> Event {
     }
 }
 
-fn sorted_window(mut events: Vec<Event>) -> Vec<Event> {
-    events.sort_by(window_order);
+fn sorted_window(events: Vec<Event>) -> Vec<Event> {
+    sorted_window_for(events, true)
+}
+
+fn sorted_window_for(mut events: Vec<Event>, ascending: bool) -> Vec<Event> {
+    events.sort_by(window_order(ascending));
     events
 }
 
@@ -106,8 +110,15 @@ fn curve_matches_pav_regression() {
             let len = 5 + trial * 37;
             let events: Vec<Event> = (0..len)
                 .map(|_| {
-                    // Quantised distances so equal-x pooling is exercised.
-                    let distance = (uniform() * 40.0).floor() / 80.0;
+                    // Quantised distances so equal-x pooling is exercised on the
+                    // ascending curve. Descending uses distinct distances: this
+                    // curve deliberately pools descending ties, which the crate
+                    // does not (see `descending_ties_pool_into_one_block`).
+                    let distance = if ascending {
+                        (uniform() * 40.0).floor() / 80.0
+                    } else {
+                        uniform() * 0.5
+                    };
                     let y = if trial % 2 == 0 {
                         f64::from(u8::from(uniform() < 0.1 + distance))
                     } else {
@@ -116,7 +127,7 @@ fn curve_matches_pav_regression() {
                     event(distance, y)
                 })
                 .collect();
-            let ours = raw_curve(&sorted_window(events.clone()), ascending);
+            let ours = raw_curve(&sorted_window_for(events.clone(), ascending), ascending);
             let points: Vec<pav_regression::Point<f64>> = events
                 .iter()
                 .map(|e| pav_regression::Point::new(e.distance, e.y))
@@ -264,6 +275,47 @@ fn shrinkage_preserves_a_real_monotone_signal() {
             );
         }
     }
+}
+
+/// Equal distances pool into one block on the descending (speed) curve too.
+/// Ordered y-descending, as `pav_regression` orders ties for both directions,
+/// they would stay separate blocks and the curve would read the smallest y.
+#[test]
+fn descending_ties_pool_into_one_block() {
+    let events = vec![event(0.1, 5.0), event(0.1, 4.0), event(0.1, 3.0)];
+    for ascending in [true, false] {
+        let window = sorted_window_for(events.clone(), ascending);
+        let curve = raw_curve(&window, ascending);
+        assert_eq!(
+            curve.blocks.len(),
+            1,
+            "ties must pool (ascending={ascending}): {:?}",
+            curve.blocks
+        );
+        assert!((curve.blocks[0].y - 4.0).abs() < 1e-12);
+        assert_eq!(curve.value(0.1), Some(4.0));
+    }
+
+    // Through a live stage: the speed window is ordered for its direction.
+    let mut stage: Stage<u32> = Stage::with_limits(Target::LogTransferSpeed, 1_000, 8);
+    for i in 0..60u32 {
+        let y = [5.0, 4.0, 3.0][(i % 3) as usize];
+        observe(
+            &mut stage,
+            &(i % 4),
+            0.5,
+            if i < 30 { 0.1 } else { 0.3 },
+            y,
+            0.0,
+        );
+    }
+    refit(&mut stage, 0.0);
+    let curve = stage.curve.as_ref().unwrap();
+    assert!(
+        curve.blocks.iter().all(|b| (b.y - 4.0).abs() < 1e-9),
+        "both distance groups must pool to their mean: {:?}",
+        curve.blocks
+    );
 }
 
 #[test]
@@ -450,6 +502,45 @@ fn variance_components_recover_the_truth_under_home_band_zipf_traffic() {
     assert!(
         (tp - 0.25).abs() < 0.08,
         "tau2_peer must be recovered under Zipf traffic, got {tp} (truth 0.25)"
+    );
+}
+
+/// A stale secondary band must not break the leave-one-out contrast.
+///
+/// At a 1.5h horizon, a band last seen 30 hours ago carries weights ~2e-9 of
+/// the active band's. Taken as `peer - cell`, the rest's `w2` and squared
+/// counts cancel to exactly zero, the contrast loses its noise term, and
+/// `tau2_cell` reads a spurious effect where the truth is zero.
+#[test]
+fn a_stale_secondary_band_does_not_bias_tau2_cell() {
+    let _guard = GlobalRng::seed_guard(0x4485_57a1);
+    let (horizon, now) = (1.5, 30.0);
+    let mut level = Level::new(Some(horizon));
+    level.reset(now);
+    for slot in 0..60 {
+        for _ in 0..40 {
+            // Home band, recent. No cell effects anywhere: truth tau2_cell = 0.
+            let t = now - uniform() * 0.5;
+            level.add(Some(slot), 1, level.weight(t), normal());
+        }
+        for _ in 0..40 {
+            // Secondary band, 30 hours stale.
+            level.add(Some(slot), 5, level.weight(0.0), normal());
+        }
+    }
+    level.recount_squares();
+    let peer = level.nodes[0].peer;
+    let cell = level.nodes[0].cells[1];
+    assert_eq!(
+        peer.w2 - cell.w2,
+        0.0,
+        "the scenario must reach the cancellation, or this test proves nothing"
+    );
+    let c = level.compute_components().expect("components exist");
+    assert!(
+        c.tau2_cell < 0.03,
+        "no cell effect exists; a stale secondary band must not create one, got {}",
+        c.tau2_cell
     );
 }
 
@@ -646,7 +737,7 @@ fn window_stays_bounded_and_sorted() {
         stage
             .sorted
             .windows(2)
-            .all(|pair| window_order(&pair[0], &pair[1]).is_le()),
+            .all(|pair| window_order(true)(&pair[0], &pair[1]).is_le()),
         "window must be sorted after in-place merges"
     );
     let mut seqs: Vec<u64> = stage.sorted.iter().map(|e| e.seq).collect();
@@ -940,6 +1031,64 @@ fn log_predictions_are_bounded_by_the_observed_range() {
             "prediction {value} for peer {peer} at {distance} escaped [{low}, {high}] +- margin"
         );
     }
+}
+
+/// An unknown peer's expected time and effective speed stay bounded by the
+/// observed range even when a noisy early `tau2` gives it a huge spread.
+#[test]
+fn expected_timing_is_bounded_for_an_unknown_peer() {
+    let _guard = GlobalRng::seed_guard(0x4485_b0d5);
+    let peers: Vec<PeerKeyLocation> = (0..6).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    // Few peers with wildly different speeds: the between-peer variance is
+    // estimated huge, so an unseen peer's posterior variance is huge too.
+    for i in 0..600 {
+        let p = i % peers.len();
+        let log_seconds = (0.1f64).ln() + 6.0 * (p as f64 - 2.5) + 0.1 * normal();
+        let log_speed = (40_000.0f64).ln() - 6.0 * (p as f64 - 2.5) + 0.1 * normal();
+        routing.observe_at(
+            &peers[p],
+            Location::new(uniform()),
+            0.2,
+            &timed(Some(log_seconds.exp()), Some(log_speed.exp())),
+            0.0,
+        );
+    }
+    let unknown = PeerKeyLocation::random();
+    let forecast = routing
+        .response_time
+        .predict(&unknown, 0.5, 0.2, 0.0)
+        .unwrap();
+    let (low, high) = routing.response_time.observed_range;
+    assert!(
+        forecast.value + forecast.spread / 2.0 > high + LOG_PREDICTION_MARGIN,
+        "the scenario must push the unbounded expectation past the bound: \
+         mu {}, spread {}, high {high}",
+        forecast.value,
+        forecast.spread
+    );
+    let estimate = routing.estimate(&unknown, Location::new(0.5), 0.2, 0.0);
+    let seconds = estimate.time_to_response_start_secs.unwrap();
+    assert!(
+        (seconds.ln() - (high + LOG_PREDICTION_MARGIN)).abs() < 1e-9,
+        "expected time must sit on the bound: {seconds}"
+    );
+    assert!(seconds.ln() >= low - LOG_PREDICTION_MARGIN);
+    let (speed_low, _) = routing.transfer_speed.observed_range;
+    let speed = estimate.transfer_speed_bps.unwrap();
+    assert!(
+        speed.ln() >= speed_low - LOG_PREDICTION_MARGIN - 1e-9,
+        "effective speed must not collapse below the bound: {speed}"
+    );
+}
+
+/// The hot structs stay at the sizes the published memory budget uses.
+#[test]
+fn struct_sizes_match_the_memory_budget() {
+    assert_eq!(std::mem::size_of::<Event>(), EVENT_BYTES);
+    assert_eq!(std::mem::size_of::<Prepared>(), PREPARED_BYTES);
+    assert_eq!(std::mem::size_of::<PeerNode>(), PEER_NODE_BYTES);
+    assert_eq!(std::mem::size_of::<Level>(), LEVEL_BYTES);
 }
 
 /// The selector scores the finished forecast the router would act on.
@@ -1344,6 +1493,86 @@ fn a_fully_decayed_node_is_treated_as_absent() {
     assert_eq!(
         stale, unknown,
         "after ~670 horizons the peer's evidence is gone and it reads as unknown"
+    );
+}
+
+/// Build a no-forgetting level and its prepared residuals from per-cell data.
+fn shape_of(cells: &[(usize, usize, Vec<f64>)]) -> ResidualShape {
+    let mut level = Level::new(None);
+    let mut prepared = Vec::new();
+    for (slot, band, values) in cells {
+        for &value in values {
+            level.add(Some(*slot), *band, 1.0, value);
+            prepared.push(Prepared {
+                residual: value,
+                time: 0.0,
+                weight: 1.0,
+                slot: *slot as u32,
+                band: *band as u8,
+            });
+        }
+    }
+    level.recount_squares();
+    ResidualShape::measure(&prepared, &level)
+}
+
+/// Exponential log residuals have skewness 2 and excess kurtosis 6; the
+/// diagnostic must read them, not a value shrunk by the cell-mean centring.
+#[test]
+fn residual_shape_recovers_the_moments_of_exponential_data() {
+    let _guard = GlobalRng::seed_guard(0x4485_e8b0);
+    let cells: Vec<(usize, usize, Vec<f64>)> = (0..400)
+        .map(|i| {
+            let values = (0..50)
+                .map(|_| -uniform().max(f64::MIN_POSITIVE).ln())
+                .collect();
+            (i % 200, i % BANDS, values)
+        })
+        .collect();
+    let shape = shape_of(&cells);
+    let skew = shape.skewness.unwrap();
+    let kurtosis = shape.excess_kurtosis.unwrap();
+    assert!((skew - 2.0).abs() < 0.25, "skewness {skew} (truth 2)");
+    assert!(
+        (kurtosis - 6.0).abs() < 2.0,
+        "excess kurtosis {kurtosis} (truth 6)"
+    );
+}
+
+/// Normal residuals in cells of very different sizes: small cells' centred
+/// deviations are non-normal and under-dispersed, so without the rescaling and
+/// the per-cell minimum they drag excess kurtosis negative.
+#[test]
+fn residual_shape_is_unbiased_for_normal_data_in_mixed_cell_sizes() {
+    let _guard = GlobalRng::seed_guard(0x4485_3c11);
+    let mut cells = Vec::new();
+    for i in 0..3_000 {
+        // Most events in tiny cells, the rest in large ones.
+        let size = if i < 2_900 { 3 } else { 400 };
+        let values = (0..size).map(|_| normal()).collect();
+        cells.push((i % 400, i % BANDS, values));
+    }
+    let shape = shape_of(&cells);
+    let skew = shape.skewness.unwrap();
+    let kurtosis = shape.excess_kurtosis.unwrap();
+    assert!(skew.abs() < 0.1, "skewness {skew} (truth 0)");
+    assert!(
+        kurtosis.abs() < 0.15,
+        "excess kurtosis {kurtosis} (truth 0)"
+    );
+
+    // Mixed sizes above the per-cell minimum must also read ~0 once rescaled.
+    let mut cells = Vec::new();
+    for i in 0..1_200 {
+        let size = if i % 2 == 0 { 10 } else { 60 };
+        let values = (0..size).map(|_| normal()).collect();
+        cells.push((i % 300, i % BANDS, values));
+    }
+    let shape = shape_of(&cells);
+    assert!(
+        shape.excess_kurtosis.unwrap().abs() < 0.15,
+        "excess kurtosis {:?} with cells of 10 and 60",
+        shape.excess_kurtosis
     );
 }
 

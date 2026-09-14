@@ -215,14 +215,23 @@ WHEN touching either stack:
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected
-    TimeSource (Ring wires ring.time_source), never the host wall clock
+    TimeSource, never the host wall clock. Ring wires ring.time_source, an
+    InstantTimeSrc reading tokio's clock: it advances under a paused tokio
+    runtime (direct sim runner) but NOT under hosting_time_source_override.
+    Router-level tests inject a SharedMockTimeSource and advance it by hand.
+  → It is computed only while its flag is on or the routing dataset is
+    RECORDING (a stopped recorder stops it); readings then freeze, and the
+    dashboard shows "not computed now" rather than frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
 
 PROMOTION GATE: flipping the default needs field data from a gateway soak
 collected AFTER #5653 (failure labels) is live, showing the hierarchical
 layer's prequential skill (dashboard / routing dataset) at least matching
-legacy for failure, and not worse in SECONDS for timing and transfer.
+legacy for failure, and not worse in SECONDS for timing and transfer (the
+snapshot's response_time_rmse_secs_* / transfer_time_rmse_secs_*, scored on
+the values each model would route on), with the lognormality check
+(hierarchical_*_log_shape) not contradicting expectation timing.
 
 REMOVAL PLAN: once promoted, a separate PR deletes Renegade, the per-peer
 EWMA adjustment path, the fixed blend and the residual correction. Do not
