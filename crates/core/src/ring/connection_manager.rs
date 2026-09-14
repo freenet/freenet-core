@@ -1867,6 +1867,14 @@ impl ConnectionManager {
         );
     }
 
+    /// Outbound requests the topology manager recorded for `peer`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn outbound_request_count_for_test(&self, peer: &PeerKeyLocation) -> usize {
+        self.topology_manager
+            .read()
+            .outbound_request_count_for_test(peer)
+    }
+
     /// Set only the local `own_addr`, WITHOUT mirroring to the process-global
     /// `network_status::external_address`.
     ///

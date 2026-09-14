@@ -24,7 +24,9 @@
 //! - It covers the router's `add_event` stream only. The separate CONNECT
 //!   forward-acceptance estimator is out of scope.
 //! - Events are tagged `originator` or `relay`: relay hops record outcomes under
-//!   their own conventions (see `record_relay_route_event`), and replays may need
+//!   their own conventions (see `record_relay_route_event`, and
+//!   `operations::route_attempt` for how failures of either origin are
+//!   labelled since #5657), and replays may need
 //!   to treat the two populations differently. `originator` means the node
 //!   started the operation, which includes sub-operations it starts while
 //!   serving someone else, not only its own clients' requests.
@@ -139,7 +141,9 @@ pub(crate) fn peer_hash(peer: &PeerKeyLocation) -> String {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RouteSource {
-    /// The node that started the operation (`Ring::routing_finished`).
+    /// The node that started the operation: `Ring::routing_finished`, and
+    /// since #5657 also the originator's per-attempt labels and hop-credited
+    /// successes (`Ring::record_route_event_router_only`).
     Originator,
     /// A relay hop observing its downstream peer (`record_relay_route_event`).
     Relay,

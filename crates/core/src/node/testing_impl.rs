@@ -550,6 +550,42 @@ impl ControlledSimulationResult {
             .is_some_and(|ring| ring.is_hosting_contract(key))
     }
 
+    /// `(failures, successes)` route events ingested by `label`'s router over
+    /// the whole run, or `None` if the node never published its Ring (#5657).
+    /// Cumulative, unlike the router's 500-event estimator windows.
+    pub fn node_route_outcome_totals(&self, label: &NodeLabel) -> Option<(u64, u64)> {
+        self.node_rings.get(label).map(|ring| {
+            let totals = ring.router.read().outcome_totals();
+            (totals.failures, totals.successes)
+        })
+    }
+
+    /// `(not_found, timeout, send_failure)` route failure labels `label`'s
+    /// node fed its router, by cause, or `None` if the node never published
+    /// its Ring (#5657).
+    pub fn node_route_failure_causes(&self, label: &NodeLabel) -> Option<(u64, u64, u64)> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.route_failure_cause_counts())
+    }
+
+    /// Ambiguous NotFounds `label`'s node dropped untrained, or `None` if the
+    /// node never published its Ring (#5657).
+    pub fn node_untrained_not_founds(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.untrained_not_found_count())
+    }
+
+    /// `(failures, successes)` route events summed over every node's router
+    /// (#5657). See [`Self::node_route_outcome_totals`].
+    pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
+        self.node_rings
+            .values()
+            .map(|ring| ring.router.read().outcome_totals())
+            .fold((0, 0), |(f, s), t| (f + t.failures, s + t.successes))
+    }
+
     /// The protocol version `label`'s node had recorded for the peer at `addr`
     /// at the end of the run, or `None` if it never learned one (#5161).
     ///
