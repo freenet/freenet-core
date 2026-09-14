@@ -1015,14 +1015,14 @@ impl RetryDriver for GetRetryDriver<'_> {
         // bookkeeping only. Carry `tried` minus the current target (which
         // IS this attempt's intended destination) so the relay's fallback
         // skips gateways that already failed and converges on the same
-        // gateway the client driver selected — keeping stream claims and
-        // route telemetry (both attributed via `current_target`) aligned
-        // with the actual wire hop.
+        // gateway the client driver selected. (Stream claims and route
+        // events use the hop the loopback relay actually recorded, not
+        // `current_target`; see `AttemptHopRegistry`.)
         //
         // The carried bloom travels the attempt's entire forward path, so
-        // a failed gateway is excluded at every hop of that attempt, not
-        // only at the loopback relay — bounded (empty-ring originators,
-        // <= MAX_RETRIES attempts) and re-keyed each retry.
+        // a failed peer is excluded at every hop of that attempt, not only
+        // at the loopback relay — bounded (<= MAX_RETRIES attempts) and
+        // re-keyed each retry.
         //
         // Not gated on the empty ring (#4485). On a non-empty ring the
         // loopback relay's `relay_advance_to_next_peer` builds its candidate
@@ -4450,10 +4450,21 @@ mod tests {
              the fresh attempt_visited bloom so gateway failover reaches \
              the wire (#4361 / #4364 H1)"
         );
+        // Superseded by #4485: the carry used to be gated on the empty ring
+        // (#4364) to leave normal-path retries unchanged, but on a non-empty
+        // ring that made every retry re-pick the same best candidate. It now
+        // applies on every ring, and also carries each forwarded hop;
+        // behaviourally pinned by
+        // `route_attempt_driver_tests::retries_reach_distinct_peers_via_the_relay_selection`.
         assert!(
-            nat_body.contains("connection_count()"),
-            "the failover carry must stay gated on the empty-ring case so \
-             normal-path retry routing semantics are unchanged (#4364)"
+            !nat_body.contains("connection_count()"),
+            "the retry carry must NOT be gated on the empty ring (#4485): \
+             gated, a non-empty-ring GET re-asks the same first hop every retry"
+        );
+        assert!(
+            nat_body.contains("self.attempted_hops"),
+            "new_attempt_tx must also exclude every hop an earlier attempt \
+             was actually forwarded to (#4485)"
         );
     }
 
