@@ -1,3 +1,4 @@
+pub(crate) mod dataset;
 mod isotonic_estimator;
 mod residual;
 mod routing_predictor;
@@ -1590,6 +1591,26 @@ impl Router {
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Originator, dataset::global());
+    }
+
+    /// [`Self::add_event`] for an outcome observed by a relay hop about its
+    /// downstream peer. Identical for the model; distinguished only in the
+    /// routing dataset, because relays record outcomes under their own
+    /// conventions (see `record_relay_route_event`).
+    pub(crate) fn add_relay_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Relay, dataset::global());
+    }
+
+    /// [`Self::add_event`], recording the event into `dataset` when one is
+    /// given. Split out so tests can supply a recorder without the
+    /// process-wide environment switch.
+    fn add_event_recording(
+        &mut self,
+        event: RouteEvent,
+        source: dataset::RouteSource,
+        dataset: Option<&dataset::RoutingDataset>,
+    ) {
         let was_below_threshold = !self.has_sufficient_routing_events();
         let op_type = event.op_type;
 
@@ -1606,11 +1627,14 @@ impl Router {
         // right now — before the isotonic estimators below ingest this event.
         let residuals =
             self.stage_residuals(&event.peer, event.contract_location, &renegade_outcome);
-        self.score_failure_layers(
+        let forecasts = self.score_failure_layers(
             &event.peer,
             event.contract_location,
             if renegade_outcome.success { 0.0 } else { 1.0 },
         );
+        if let Some(dataset) = dataset.filter(|dataset| dataset.is_recording()) {
+            dataset.record_route(self.route_record(&event, source, forecasts));
+        }
         self.renegade_predictor.record(
             &event.peer,
             event.contract_location,
@@ -1875,6 +1899,48 @@ impl Router {
         }
     }
 
+    /// The dataset record for one event, built from the state the forecasts
+    /// were made in — i.e. before the event is ingested.
+    fn route_record(
+        &self,
+        event: &RouteEvent,
+        source: dataset::RouteSource,
+        forecasts: Option<dataset::FailureForecasts>,
+    ) -> dataset::RouteRecord {
+        let (outcome, time_to_response_start_s, payload_bytes, payload_transfer_s) =
+            match &event.outcome {
+                RouteOutcome::Success {
+                    time_to_response_start,
+                    payload_size,
+                    payload_transfer_time,
+                } => (
+                    "success",
+                    Some(time_to_response_start.as_secs_f64()),
+                    Some(*payload_size),
+                    Some(payload_transfer_time.as_secs_f64()),
+                ),
+                RouteOutcome::SuccessUntimed => ("success_untimed", None, None, None),
+                RouteOutcome::Failure => ("failure", None, None, None),
+            };
+        let peer_location = event.peer.location();
+        dataset::RouteRecord {
+            t_ms: dataset::now_ms(),
+            source,
+            peer: dataset::peer_hash(&event.peer),
+            peer_location: peer_location.map(|location| location.as_f64()),
+            contract_location: event.contract_location.as_f64(),
+            distance: peer_location
+                .map(|location| event.contract_location.distance(location).as_f64()),
+            op: event.op_type.map(|op| op.as_str()),
+            outcome,
+            time_to_response_start_s,
+            payload_bytes,
+            payload_transfer_s,
+            prior_failure_events: self.failure_estimator.len(),
+            forecasts,
+        }
+    }
+
     /// Score every failure-prediction layer against what actually happened.
     ///
     /// MUST be called before the isotonic estimators ingest the event, for the
@@ -1885,14 +1951,14 @@ impl Router {
         peer: &PeerKeyLocation,
         contract_location: Location,
         actual_failure: f64,
-    ) {
+    ) -> Option<dataset::FailureForecasts> {
         let (Ok(global), Ok(adjusted)) = (
             self.failure_estimator
                 .estimate_global(peer, contract_location),
             self.failure_estimator
                 .estimate_retrieval_time(peer, contract_location),
         ) else {
-            return;
+            return None;
         };
         let global = global.clamp(0.0, 1.0);
         let adjusted = adjusted.clamp(0.0, 1.0);
@@ -1931,6 +1997,15 @@ impl Router {
         self.failure_skill_blended.record(blended, actual_failure);
         self.failure_skill_corrected
             .record(corrected, actual_failure);
+
+        Some(dataset::FailureForecasts {
+            global,
+            adjusted,
+            blended,
+            corrected,
+            lambda: corrections.failure.map(|correction| correction.lambda),
+            n_eff: corrections.failure.map(|correction| correction.n_eff),
+        })
     }
 
     fn predict_routing_outcome(
@@ -2745,6 +2820,127 @@ mod tests {
                 op_type: Some(OpType::Get),
             });
         }
+    }
+
+    /// The routing dataset exists to let predictors be replayed and compared
+    /// offline, so a record is only useful if its forecasts are the ones made
+    /// BEFORE the outcome was ingested — a forecast that has already seen its own
+    /// outcome would make every layer look better than it is.
+    #[test]
+    fn dataset_records_pre_ingestion_forecasts_and_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let recorder = dataset::RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+
+        let mut router = Router::new(&[]);
+        // A key of its own: `PeerKeyLocation::random()` reuses one key per
+        // thread, which would make the peer-hash assertion below vacuous.
+        let peer = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.10:31337".parse().unwrap(),
+        );
+        let contract = Location::new(0.5);
+
+        // Cold: nothing to forecast with yet, which the record must say rather
+        // than inventing numbers.
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Put),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+
+        add_relay_recorded_successes(&mut router, 120);
+        for _ in 0..30 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let expected_global = router
+            .failure_estimator
+            .estimate_global(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let expected_adjusted = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let events_before = router.failure_estimator.len();
+
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(250),
+                    payload_size: 4096,
+                    payload_transfer_time: Duration::from_millis(125),
+                },
+                op_type: Some(OpType::Get),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+        let adjusted_after = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        assert_ne!(
+            adjusted_after, expected_adjusted,
+            "sanity: ingesting the success must move the peer's estimate, or this \
+             test cannot tell pre- from post-ingestion forecasts"
+        );
+        drop(recorder);
+
+        let lines = dataset::lines_eventually(&path, |lines| {
+            lines.iter().filter(|line| line["kind"] == "route").count() == 2
+        });
+        let routes: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "route")
+            .collect();
+
+        let cold = routes[0];
+        assert_eq!(cold["outcome"], "failure");
+        assert_eq!(cold["op"], "PUT");
+        assert_eq!(cold["prior_failure_events"], 0);
+        assert!(
+            cold["forecasts"].is_null(),
+            "a cold router forecasts nothing: {cold}"
+        );
+
+        let warm = routes[1];
+        assert_eq!(warm["peer"], dataset::peer_hash(&peer));
+        assert_eq!(warm["source"], "originator");
+        let expected_distance = contract.distance(peer.location().unwrap()).as_f64();
+        assert!((warm["distance"].as_f64().unwrap() - expected_distance).abs() < 1e-12);
+        assert_eq!(warm["contract_location"], 0.5);
+        assert_eq!(warm["outcome"], "success");
+        assert_eq!(warm["time_to_response_start_s"], 0.25);
+        assert_eq!(warm["payload_bytes"], 4096);
+        assert_eq!(warm["payload_transfer_s"], 0.125);
+        assert_eq!(warm["prior_failure_events"], events_before);
+        // Within 1e-12, not bit-exact: serde_json's default float parser does not
+        // guarantee a lossless round trip, and which values it misses by an ulp
+        // depends on the randomly drawn peers.
+        let recorded = |field: &str| warm["forecasts"][field].as_f64().unwrap();
+        assert!((recorded("global") - expected_global).abs() < 1e-12);
+        assert!(
+            (recorded("adjusted") - expected_adjusted).abs() < 1e-12,
+            "the recorded forecast must be the pre-ingestion one: recorded {}, \
+             pre-ingestion {expected_adjusted}, post-ingestion {adjusted_after}",
+            recorded("adjusted")
+        );
     }
 
     #[test]

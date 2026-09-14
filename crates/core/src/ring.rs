@@ -209,6 +209,9 @@ const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
 const GOVERNANCE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 use connection_backoff::ConnectionBackoff;
+
+/// How often connected-peer attributes are written to the routing dataset.
+const ROUTING_DATASET_PEER_INTERVAL: Duration = Duration::from_secs(60);
 pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
@@ -854,6 +857,20 @@ impl Ring {
                 Duration::from_secs(60 * 5),
             )),
         );
+
+        // Peer-attribute snapshots for the opt-in routing dataset (#4485). Spawned
+        // only when an operator enabled recording, so a default node — and every
+        // simulation — runs no extra task and consumes no extra timer.
+        if let Some(dataset) = crate::router::dataset::global() {
+            task_monitor.register(
+                "record_routing_dataset_peers",
+                GlobalExecutor::spawn(Self::record_routing_dataset_peers(
+                    ring.clone(),
+                    dataset,
+                    ROUTING_DATASET_PEER_INTERVAL,
+                )),
+            );
+        }
 
         // Spawn periodic contract-directed CONNECT task.
         // When a peer is a "subscription root" (closest to contract among neighbors),
@@ -1728,6 +1745,95 @@ impl Ring {
         >,
     ) {
         self.event_register.register_events(events).await;
+    }
+
+    /// Periodically record the attributes of every connected peer into the
+    /// routing dataset, keyed like its route events so the two join offline.
+    async fn record_routing_dataset_peers(
+        ring: Arc<Self>,
+        dataset: &'static crate::router::dataset::RoutingDataset,
+        interval_duration: Duration,
+    ) {
+        let shutdown = ring.shutdown_token();
+        let mut interval = tokio::time::interval(interval_duration);
+        loop {
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                break;
+            }
+            // Skip, never leave the loop: this task is registered with the
+            // background task monitor, and any monitored task exiting ends the
+            // node. A recorder that reached its byte cap must not take a
+            // gateway down with it.
+            if !dataset.is_recording() {
+                continue;
+            }
+            let peers = ring.routing_dataset_peer_attributes();
+            // The dataset's own clock, shared with route events so the two join.
+            dataset.record_peers(crate::router::dataset::now_ms(), peers);
+        }
+    }
+
+    /// Snapshot connected-peer attributes. Each lock is taken on its own and
+    /// released before the next, so this cannot participate in a lock-order
+    /// inversion; assembly happens afterwards with no lock held.
+    fn routing_dataset_peer_attributes(&self) -> Vec<crate::router::dataset::PeerAttributes> {
+        use crate::router::dataset::{PeerSnapshotInputs, peer_attributes};
+
+        let connections: Vec<(PeerKeyLocation, f64)> = self
+            .connection_manager
+            .get_connections_by_location()
+            .into_values()
+            .flatten()
+            .map(|connection| {
+                let connected_s = connection.duration_ms() as f64 / 1000.0;
+                (connection.location, connected_s)
+            })
+            .collect();
+        let addrs: Vec<SocketAddr> = connections
+            .iter()
+            .filter_map(|(peer, _)| peer.socket_addr())
+            .collect();
+        let gateways: Option<Vec<TransportPublicKey>> =
+            self.upgrade_op_manager().map(|op_manager| {
+                op_manager
+                    .configured_gateways
+                    .iter()
+                    .map(|gateway| gateway.pub_key().clone())
+                    .collect()
+            });
+        let versions: HashMap<SocketAddr, (u8, u8, u16)> = addrs
+            .iter()
+            .filter_map(|addr| {
+                self.connection_manager
+                    .remote_version(*addr)
+                    .map(|version| (*addr, version))
+            })
+            .collect();
+        let health: HashMap<SocketAddr, (u64, u64)> = {
+            let tracker = self.connection_manager.peer_health.lock();
+            addrs
+                .iter()
+                .filter_map(|addr| tracker.counts(addr).map(|counts| (*addr, counts)))
+                .collect()
+        };
+        let transfer: HashMap<SocketAddr, (u64, u64)> =
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .into_iter()
+                .map(|(addr, sent, received)| (addr, (sent, received)))
+                .collect();
+
+        peer_attributes(&PeerSnapshotInputs {
+            connections: &connections,
+            gateways: gateways.as_deref(),
+            versions: &versions,
+            health: &health,
+            transfer: &transfer,
+        })
     }
 
     /// Periodically emit a router model snapshot as an EventKind::RouterSnapshot event.
@@ -7731,6 +7837,30 @@ mod k_closest_source_tests {
             }
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
+    }
+
+    /// The routing-dataset peer task is registered with the background task
+    /// monitor, and ANY monitored task exiting ends the node
+    /// (`p2p_impl.rs`, `wait_for_any_exit`). So its loop may leave only on
+    /// shutdown: a recorder that stops — at its byte cap, or on a write error —
+    /// must not take the gateway down. An earlier revision `break`ed there.
+    #[test]
+    fn routing_dataset_peer_task_exits_only_on_shutdown() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn record_routing_dataset_peers(");
+        let breaks = body.matches("break").count();
+        let returns = body.matches("return").count();
+        assert_eq!(
+            (breaks, returns),
+            (1, 0),
+            "record_routing_dataset_peers must leave its loop only on shutdown; \
+             any other exit ends the node"
+        );
+        let (before_break, _) = body.split_once("break").unwrap();
+        assert!(
+            before_break.contains("sleep_or_shutdown"),
+            "the single break must be the shutdown one"
+        );
     }
 
     /// Same mirror seam, for the contract-exec WASM counters. The export block

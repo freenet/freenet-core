@@ -325,6 +325,13 @@ impl PeerHealthTracker {
         Self::default()
     }
 
+    /// `(successes, failures)` recorded for the peer at `addr`, if tracked.
+    pub fn counts(&self, addr: &SocketAddr) -> Option<(u64, u64)> {
+        self.stats
+            .get(addr)
+            .map(|stats| (stats.successes, stats.failures))
+    }
+
     /// Initialize health tracking for a newly added peer.
     pub fn init_peer(&mut self, addr: SocketAddr) {
         self.stats.insert(
