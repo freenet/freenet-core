@@ -8313,6 +8313,170 @@ fn test_connect_despite_nat_partition() {
 }
 
 // =============================================================================
+// Gateway Zombie Sweep vs. an Unjoined Peer's Live Link (#5654)
+// =============================================================================
+
+/// Regression test for #5654: the gateway's zombie-transport sweep must not
+/// collect a link that a peer which cannot join the ring is still using.
+///
+/// **The bug.** With this seed, one node's every CONNECT is rejected (a
+/// saturated neighbourhood), so its gateway transport is its only route and is
+/// never in the gateway's ring. The gateway's zombie sweep judged that
+/// transport purely by AGE (`> 3 × transient_ttl`, 90s by default) and dropped
+/// it. The transport has no close message, so the peer was never told; it
+/// exempts its own gateway links from zombie cleanup and only notices a dead
+/// link after its 120s idle timeout. GETs it sent into the dead link timed out
+/// and reported NotFound for a contract that exists.
+///
+/// **The scenario.** 1 gateway + 12 nodes. Every node GETs a contract that has
+/// not been PUT yet, the gateway PUTs it, then every node GETs it again, with
+/// operations 5s apart. The second round is what is checked: every node must
+/// end up holding the state. At 5s spacing the last node's second-round GET
+/// lands inside the dead-link window on the unfixed base (the sweep dropping
+/// the link was confirmed as the cause by disabling the sweep, which made this
+/// pass). At 15s spacing a first-round GET lands there instead, which this
+/// assertion cannot see, so the spacing is load-bearing.
+///
+/// **Coupling.** Which node lands in the dead-link window depends on:
+/// `transient_ttl` (default 30s, so a transport is a zombie by age after 90s),
+/// the sweep interval (`STATS_LOG_INTERVAL`, 30s, in `p2p_protoc.rs`), the op
+/// spacing (5s, below), the seed, and the network shape. Changing any of them
+/// can move the window off every checked GET and make the outcome assertion
+/// pass for the wrong reason. The precondition assertions below catch that:
+/// they require that node 12 never joined the ring and that the gateway's sweep
+/// did evaluate its transport as a zombie by age.
+#[test_log::test]
+fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    const NETWORK_NAME: &str = "gw-zombie-live-link";
+    let num_nodes = 12;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            4,         // ring_max_htl
+            2,         // rnd_if_htl_above
+            5,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await
+    });
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    // The unjoined node for this seed. See "Coupling" above.
+    const UNJOINED_NODE: usize = 12;
+    let gateway_addr = sim
+        .node_address(&NodeLabel::gateway(NETWORK_NAME, 0))
+        .expect("gateway address");
+    let unjoined_addr = sim
+        .node_address(&NodeLabel::node(NETWORK_NAME, UNJOINED_NODE))
+        .expect("unjoined node address");
+
+    let contract = SimOperation::create_test_contract(0x85);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>| {
+        for i in 1..=num_nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+    let mut operations = Vec::new();
+    get_round(&mut operations);
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x85),
+            subscribe: true,
+        },
+    ));
+    get_round(&mut operations);
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(180),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Preconditions: without these the outcome below could pass for a reason
+    // that has nothing to do with the sweep.
+    let unjoined_ring_connections = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == unjoined_addr)
+        .map(|snap| snap.connection_count);
+    assert_eq!(
+        unjoined_ring_connections,
+        Some(0),
+        "precondition: node {UNJOINED_NODE} must end the run unjoined, so its \
+         gateway transport is its only route"
+    );
+    // `connection_count` reads 0 when unstamped, so require that the snapshot
+    // mechanism stamped other nodes, or the check above would be vacuous.
+    assert!(
+        result
+            .topology_snapshots
+            .iter()
+            .any(|snap| snap.peer_addr != unjoined_addr && snap.connection_count > 0),
+        "precondition check is vacuous: no node's snapshot carries a connection count"
+    );
+    let (past_age_threshold, kept_for_link_use) =
+        result.zombie_sweep_counts(gateway_addr, unjoined_addr);
+    assert!(
+        past_age_threshold > 0,
+        "precondition: the gateway's zombie sweep must have evaluated node \
+         {UNJOINED_NODE}'s transport as a zombie by age at least once"
+    );
+    tracing::info!(
+        past_age_threshold,
+        kept_for_link_use,
+        "gateway zombie sweep verdicts for the unjoined node's transport"
+    );
+
+    let key = contract.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            result
+                .node_storages
+                .get(&NodeLabel::node(NETWORK_NAME, *i))
+                .is_none_or(|s| s.get_stored_state(&key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must deliver state; nodes \
+         without state: {nodes_without_state:?} (#5654: the gateway's zombie \
+         sweep dropped an unjoined peer's only, still-used link)"
+    );
+    // Mechanism: the transport survived because its recent requests exempted it.
+    assert!(
+        kept_for_link_use > 0,
+        "the gateway's sweep must have kept node {UNJOINED_NODE}'s transport for \
+         recent requests (past_age_threshold={past_age_threshold})"
+    );
+}
+
+// =============================================================================
 // Connection Growth Stall Regression Test (PRs #3408, #3398, #3396, #3380)
 // =============================================================================
 
