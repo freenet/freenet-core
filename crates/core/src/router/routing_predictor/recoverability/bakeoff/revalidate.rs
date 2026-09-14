@@ -49,6 +49,21 @@
 //!   fixed pool of 64, so identical distances repeat. It is scored as routing
 //!   uses it: the expected transfer time of `PAYLOAD_BYTES`, in seconds. The
 //!   curve orders ties by the target's PAV direction (`Curve::descending`).
+//!
+//! # Follow-up 5: legacy re-scored with the fixed `IsotonicEstimator`
+//!
+//! From commit faf1db7ab (cherry-picked PR #5662), the legacy rows (`a`, `a'`,
+//! `b`) run on an isotonic estimator whose rolling window is rebuilt exactly,
+//! instead of being patched with `pav_regression`'s `remove_points`, which
+//! corrupted the curve between refits. Every row from 5 on reads its prior from
+//! `Curve`, a batch fit that was never affected; their MSE is bit-identical
+//! before and after. Only the baseline moved.
+//!
+//! 7c against FIXED legacy: worst 1.041 (`pt.drift`) on the original seeds,
+//! against 1.002 before; 0.971 (`pt.drift`) on the confirmation seeds, 0.971
+//! before. Legacy's own MSE fell by up to 26% (`p.rare-mixed`), 1-6% in most
+//! failure and timing groups, and was flat for speed. 7c's geometric-mean
+//! ratio moved by 0.00-0.03 in every group.
 
 use super::*;
 
