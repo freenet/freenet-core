@@ -68,6 +68,18 @@
 //! fixed event budget, so every noisy scenario also learns from fewer
 //! existing-contract events. Compare naive with delayed at equal share, not
 //! with clean.
+//!
+//! # Follow-up 2: the "untrained" policy (fixed before running)
+//!
+//! `Labeling::Untrained` trains only ops that end in success (delayed with
+//! share 0). It removes naive's noise blow-up, but it has a systematic
+//! optimism bias: exhausted ops are the failure-heavy ones. `H* EB` MSE runs
+//! about 1.45-1.9x its clean level even with no absent keys; legacy's runs
+//! 1.02-1.15x. It still beats legacy on MSE (worst ratio 0.88 confirmation,
+//! 0.99 original), against 0.74/0.83 under delayed. Ranking is roughly on par
+//! with delayed on the confirmation seeds and about 5 points of best@10 lower
+//! on the original seeds, 12 points at 20% uniform. See the
+//! `LABELING POLICY COMPARISON` section of the report.
 
 use super::*;
 
@@ -84,6 +96,7 @@ const ATTRIBUTE_BUCKETS: usize = 3;
 const COLD_START_EVENTS: usize = 10;
 /// Half-width of a naturally-sampled bad contract band.
 const NATURAL_BAND_HALF_WIDTH: f64 = 0.05;
+const HEAVY_BAND_HALF_WIDTH: f64 = 0.10;
 const HIER_BANDS: usize = 8;
 /// Forgetting horizon for the decayed hierarchical variants, in harness hours
 /// (60 events per hour, so ~1440 events).
@@ -131,6 +144,9 @@ enum Base {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Pairs {
     None,
+    /// Dead-end-heavy (follow-up, fixed before running): 50% of peers
+    /// (index % 2 == 0) have one bad band of half-width `HEAVY_BAND_HALF_WIDTH`.
+    Heavy,
     /// The original harness's three targeted pairs, every 12th event.
     Oversampled,
     /// 20% of peers (index % 5 == 2) have one bad band of half-width 0.05 at a
@@ -190,6 +206,9 @@ enum Labeling {
     /// is trained (all its attempts) only with probability
     /// `CONFIRMED_EXHAUSTED_SHARE`; ops that end in success are always trained.
     Delayed,
+    /// Only ops that end in success are trained (`Delayed` with share 0):
+    /// exhausted ops are never trained, absent or existing.
+    Untrained,
 }
 
 impl Spec {
@@ -333,6 +352,44 @@ fn scenarios() -> Vec<Spec> {
             Labeling::Delayed,
             AbsentLayout::HotKey,
         ),
+        // Follow-up 2 (fixed before running): the "untrained" policy, and a
+        // dead-end-heavy structure under all three policies.
+        noise("f.ops-untrained", 0.0, Labeling::Untrained),
+        noise("f.abs5-untrained", 0.05, Labeling::Untrained),
+        noise("f.abs20-untrained", 0.20, Labeling::Untrained),
+        noise_with(
+            "f.abs5-untrained-uni",
+            0.05,
+            Labeling::Untrained,
+            AbsentLayout::Uniform,
+        ),
+        noise_with(
+            "f.abs20-untrained-uni",
+            0.20,
+            Labeling::Untrained,
+            AbsentLayout::Uniform,
+        ),
+        noise_with(
+            "f.hotkey1-untrained",
+            0.01,
+            Labeling::Untrained,
+            AbsentLayout::HotKey,
+        ),
+        Spec {
+            pairs: Pairs::Heavy,
+            pair_effect: 0.50,
+            ..noise("f.heavy-naive", 0.0, Labeling::All)
+        },
+        Spec {
+            pairs: Pairs::Heavy,
+            pair_effect: 0.50,
+            ..noise("f.heavy-delayed", 0.0, Labeling::Delayed)
+        },
+        Spec {
+            pairs: Pairs::Heavy,
+            pair_effect: 0.50,
+            ..noise("f.heavy-untrained", 0.0, Labeling::Untrained)
+        },
         Spec::timing("t.dist"),
         Spec {
             marginal_sd: 0.4,
@@ -426,7 +483,8 @@ impl World {
             .collect();
         let bad_band = (0..spec.peers)
             .map(|i| {
-                (spec.pairs == Pairs::Natural && i % 5 == 2)
+                ((spec.pairs == Pairs::Natural && i % 5 == 2)
+                    || (spec.pairs == Pairs::Heavy && i % 2 == 0))
                     .then(|| GlobalRng::random_range(0.0..1.0))
             })
             .collect();
@@ -563,6 +621,8 @@ impl World {
             }),
             Pairs::Natural => self.bad_band[peer]
                 .is_some_and(|centre| ring_distance(contract, centre) < NATURAL_BAND_HALF_WIDTH),
+            Pairs::Heavy => self.bad_band[peer]
+                .is_some_and(|centre| ring_distance(contract, centre) < HEAVY_BAND_HALF_WIDTH),
         }
     }
 
@@ -1406,8 +1466,11 @@ struct RunResult {
     /// `[sigma2, tau2_cell, tau2_peer]`.
     components: [f64; 3],
     /// Per `RANK_ROWS`: `[best@10 hits, regret@10 sum, best@3 hits, regret@3 sum]`.
-    ranking: [[f64; 4]; RANK_ROWS.len()],
+    /// Per `RANK_ROWS`: `[.., targeted best@10 hits, targeted regret@10 sum]`,
+    /// targeted = a decision where any candidate has a bad band on this key.
+    ranking: [[f64; 6]; RANK_ROWS.len()],
     decisions: usize,
+    decisions_targeted: usize,
 }
 
 /// Inverse-distance mean/variance over `(distance, value)` pairs, renegade's
@@ -1512,7 +1575,8 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
     let mut joint = Joint::new(star_config);
     let mut learned_since_rebuild = 0usize;
     let mut index = 0usize;
-    let mut ranking = [[0.0f64; 4]; RANK_ROWS.len()];
+    let mut ranking = [[0.0f64; 6]; RANK_ROWS.len()];
+    let mut decisions_targeted = 0usize;
     let mut decisions = 0usize;
     while index < EVENTS {
         let op = world.next_op(index);
@@ -1638,6 +1702,9 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
                 };
                 let best10 = argmin(&truths);
                 let best3 = argmin(&truths[..3]);
+                let targeted = candidates
+                    .iter()
+                    .any(|&cand| world.in_pair(cand, contract_value));
                 for (row, row_scores) in scores.iter().enumerate() {
                     let chosen10 = argmin(row_scores);
                     let chosen3 = argmin(&row_scores[..3]);
@@ -1645,8 +1712,13 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
                     ranking[row][1] += truths[chosen10] - truths[best10];
                     ranking[row][2] += f64::from(u8::from(chosen3 == best3));
                     ranking[row][3] += truths[chosen3] - truths[best3];
+                    if targeted {
+                        ranking[row][4] += f64::from(u8::from(chosen10 == best10));
+                        ranking[row][5] += truths[chosen10] - truths[best10];
+                    }
                 }
                 decisions += 1;
+                decisions_targeted += usize::from(targeted);
             }
         }
 
@@ -1966,6 +2038,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
                 !op.absent
                     && (succeeded || GlobalRng::random_range(0.0..1.0) < CONFIRMED_EXHAUSTED_SHARE)
             }
+            Labeling::Untrained => succeeded,
         };
         if !learn {
             continue;
@@ -2114,6 +2187,7 @@ fn run_bakeoff(spec: Spec, seed: u64) -> RunResult {
         components,
         ranking,
         decisions,
+        decisions_targeted,
     }
 }
 
@@ -2430,5 +2504,109 @@ fn bakeoff_report(seeds: &[u64], title: &str) {
         out.push_str(&format!("{d:>22.0}"));
     }
     out.push('\n');
+
+    // Labeling-policy comparison for legacy and the passing estimator.
+    const POLICY_ROWS: [(usize, usize, &str); 2] = [(0, 0, "legacy"), (27, 6, "H* EB")];
+    let policy_layouts: [(&str, [&str; 3]); 7] = [
+        (
+            "clean (no absent)",
+            ["f.ops-clean", "f.ops-delayed", "f.ops-untrained"],
+        ),
+        (
+            "5% clustered",
+            ["f.abs5-naive", "f.abs5-delayed", "f.abs5-untrained"],
+        ),
+        (
+            "20% clustered",
+            ["f.abs20-naive", "f.abs20-delayed", "f.abs20-untrained"],
+        ),
+        (
+            "5% uniform",
+            [
+                "f.abs5-naive-uni",
+                "f.abs5-delayed-uni",
+                "f.abs5-untrained-uni",
+            ],
+        ),
+        (
+            "20% uniform",
+            [
+                "f.abs20-naive-uni",
+                "f.abs20-delayed-uni",
+                "f.abs20-untrained-uni",
+            ],
+        ),
+        (
+            "1% hot key",
+            [
+                "f.hotkey1-naive",
+                "f.hotkey1-delayed",
+                "f.hotkey1-untrained",
+            ],
+        ),
+        (
+            "dead-end-heavy, no absent",
+            ["f.heavy-naive", "f.heavy-delayed", "f.heavy-untrained"],
+        ),
+    ];
+    let rank_mean = |s: usize, row: usize, k: usize, targeted: bool| {
+        mean(
+            &results[s]
+                .iter()
+                .map(|r| {
+                    let n = if targeted {
+                        r.decisions_targeted
+                    } else {
+                        r.decisions
+                    };
+                    r.ranking[row][k] / n.max(1) as f64
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    out.push_str(
+        "\n== LABELING POLICY COMPARISON (naive | delayed p=0.5 | untrained p=0). Per cell: \
+         mse / own mse in f.ops-clean (heavy rows: / own mse in f.heavy-naive), ratio vs legacy, \
+         best@10 / regret@10 / best@3, targeted-decision best@10 (targeted regret@10)\n",
+    );
+    let policy_names = ["naive", "delayed", "untrained"];
+    let mut worst_by_policy = [[0.0f64; 3]; POLICY_ROWS.len()];
+    for (layout, names) in policy_layouts {
+        out.push_str(&format!("-- {layout}\n"));
+        let clean_for = if layout.starts_with("dead-end") {
+            index_of("f.heavy-naive")
+        } else {
+            clean
+        };
+        for (policy, name) in names.iter().enumerate() {
+            let s = index_of(name);
+            for (p_index, &(row, rank_row, label)) in POLICY_ROWS.iter().enumerate() {
+                if !layout.starts_with("dead-end") {
+                    worst_by_policy[p_index][policy] =
+                        worst_by_policy[p_index][policy].max(ratios[s][0][row]);
+                }
+                out.push_str(&format!(
+                    "  {:<10} {:<7} deg {:>5.2} ratio {:>5.2} | rank {:.3}/{:.4}/{:.3} | \
+                     targeted {:.3} ({:.4})\n",
+                    policy_names[policy],
+                    label,
+                    seed_mean(s, row) / seed_mean(clean_for, row),
+                    ratios[s][0][row],
+                    rank_mean(s, rank_row, 0, false),
+                    rank_mean(s, rank_row, 1, false),
+                    rank_mean(s, rank_row, 2, false),
+                    rank_mean(s, rank_row, 4, true),
+                    rank_mean(s, rank_row, 5, true),
+                ));
+            }
+        }
+    }
+    for (p_index, &(_, _, label)) in POLICY_ROWS.iter().enumerate() {
+        out.push_str(&format!(
+            "worst overall ratio vs legacy over the noise layouts, {label}: naive {:.3}, \
+             delayed {:.3}, untrained {:.3}\n",
+            worst_by_policy[p_index][0], worst_by_policy[p_index][1], worst_by_policy[p_index][2]
+        ));
+    }
     eprintln!("{out}");
 }
