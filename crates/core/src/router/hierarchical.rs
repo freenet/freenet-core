@@ -1077,6 +1077,13 @@ impl ResidualShape {
     const MIN_CELL_EVENTS: f64 = 10.0;
 
     fn measure(prepared: &[Prepared], level: &Level) -> ResidualShape {
+        Self::measure_with(prepared, level, Self::MIN_CELL_EVENTS)
+    }
+
+    /// [`Self::measure`] with an explicit per-cell minimum, so the two guards
+    /// (the minimum and the `sqrt(n/(n-1))` rescaling) can each be tested with
+    /// the other out of the way.
+    fn measure_with(prepared: &[Prepared], level: &Level, min_cell_events: f64) -> ResidualShape {
         let (mut n, mut m2, mut m3, mut m4) = (0usize, 0.0, 0.0, 0.0);
         for event in prepared {
             let Some(node) = level.nodes.get(event.slot as usize) else {
@@ -1084,7 +1091,7 @@ impl ResidualShape {
             };
             let cell = node.cells[event.band as usize & (BANDS - 1)];
             let cell_n = cell.effective_n();
-            if cell_n < Self::MIN_CELL_EVENTS {
+            if cell_n < min_cell_events.max(2.0) {
                 continue;
             }
             // A deviation about the cell's own mean has variance scaled by

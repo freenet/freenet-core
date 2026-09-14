@@ -523,8 +523,9 @@ fn a_stale_secondary_band_does_not_bias_tau2_cell() {
             let t = now - uniform() * 0.5;
             level.add(Some(slot), 1, level.weight(t), normal());
         }
-        for _ in 0..40 {
-            // Secondary band, 30 hours stale.
+        for _ in 0..3 {
+            // Secondary band, 30 hours stale, thin: its own sampling noise
+            // (sigma2 / 3) is exactly what the cancelled rest term drops.
             level.add(Some(slot), 5, level.weight(0.0), normal());
         }
     }
@@ -538,7 +539,7 @@ fn a_stale_secondary_band_does_not_bias_tau2_cell() {
     );
     let c = level.compute_components().expect("components exist");
     assert!(
-        c.tau2_cell < 0.03,
+        c.tau2_cell < 0.05,
         "no cell effect exists; a stale secondary band must not create one, got {}",
         c.tau2_cell
     );
@@ -1310,6 +1311,35 @@ fn timed(seconds: Option<f64>, speed: Option<f64>) -> RoutingOutcome {
     }
 }
 
+/// The timing estimate `observe_at` reports is the one made BEFORE the event
+/// is learned: it is what the dataset records as the forecast routing acted on.
+#[test]
+fn observed_timing_estimate_is_the_pre_learning_one() {
+    let _guard = GlobalRng::seed_guard(0x4485_0b5e);
+    let peers: Vec<PeerKeyLocation> = (0..8).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    for i in 0..800 {
+        let p = i % peers.len();
+        let seconds = ((0.1f64).ln() + 0.3 * p as f64 + 0.3 * normal()).exp();
+        routing.observe_at(
+            &peers[p],
+            Location::new(uniform()),
+            0.2,
+            &timed(Some(seconds), Some(1e4 / seconds)),
+            0.0,
+        );
+    }
+    let contract = Location::new(0.4);
+    let before = routing.estimate(&peers[1], contract, 0.2, 0.0);
+    let observed = routing.observe_at(&peers[1], contract, 0.2, &timed(Some(9.0), Some(10.0)), 0.0);
+    let after = routing.estimate(&peers[1], contract, 0.2, 0.0);
+    assert_ne!(
+        before, after,
+        "sanity: learning the event must move the estimate"
+    );
+    assert_eq!(observed.estimate, before);
+}
+
 #[test]
 fn routing_bundle_feeds_each_stage_from_its_own_outcomes() {
     let mut routing = HierarchicalRouting::new(200);
@@ -1498,6 +1528,10 @@ fn a_fully_decayed_node_is_treated_as_absent() {
 
 /// Build a no-forgetting level and its prepared residuals from per-cell data.
 fn shape_of(cells: &[(usize, usize, Vec<f64>)]) -> ResidualShape {
+    shape_with(cells, ResidualShape::MIN_CELL_EVENTS)
+}
+
+fn shape_with(cells: &[(usize, usize, Vec<f64>)], min_cell_events: f64) -> ResidualShape {
     let mut level = Level::new(None);
     let mut prepared = Vec::new();
     for (slot, band, values) in cells {
@@ -1513,7 +1547,7 @@ fn shape_of(cells: &[(usize, usize, Vec<f64>)]) -> ResidualShape {
         }
     }
     level.recount_squares();
-    ResidualShape::measure(&prepared, &level)
+    ResidualShape::measure_with(&prepared, &level, min_cell_events)
 }
 
 /// Exponential log residuals have skewness 2 and excess kurtosis 6; the
@@ -1526,7 +1560,7 @@ fn residual_shape_recovers_the_moments_of_exponential_data() {
             let values = (0..50)
                 .map(|_| -uniform().max(f64::MIN_POSITIVE).ln())
                 .collect();
-            (i % 200, i % BANDS, values)
+            (i / BANDS, i % BANDS, values)
         })
         .collect();
     let shape = shape_of(&cells);
@@ -1539,6 +1573,65 @@ fn residual_shape_recovers_the_moments_of_exponential_data() {
     );
 }
 
+/// The per-cell minimum: deviations about a SMALL cell's mean shrink a skewed
+/// distribution's skewness (to ~0.4x at three events), and rescaling cannot fix
+/// a shape change. Most events here sit in three-event cells, so without the
+/// minimum the diagnostic would read exponential data as nearly symmetric.
+#[test]
+fn residual_shape_ignores_cells_too_small_to_show_their_shape() {
+    let _guard = GlobalRng::seed_guard(0x4485_e8b3);
+    let exponential = || -uniform().max(f64::MIN_POSITIVE).ln();
+    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..20_000)
+        .map(|i| {
+            (
+                i / BANDS,
+                i % BANDS,
+                (0..3).map(|_| exponential()).collect(),
+            )
+        })
+        .collect();
+    cells.extend((0..300).map(|i| {
+        (
+            20_000 / BANDS + 1 + i / BANDS,
+            i % BANDS,
+            (0..50).map(|_| exponential()).collect(),
+        )
+    }));
+    let skew = shape_of(&cells).skewness.unwrap();
+    assert!(
+        (skew - 2.0).abs() < 0.3,
+        "skewness {skew} must read the truth, 2"
+    );
+    let unguarded = shape_with(&cells, 2.0).skewness.unwrap();
+    assert!(
+        unguarded < 1.4,
+        "sanity: small cells must distort the reading, or this test proves nothing ({unguarded})"
+    );
+}
+
+/// The rescaling: deviations about an n-event cell's mean have variance
+/// (n-1)/n. With the per-cell minimum lowered so it cannot hide the effect,
+/// pooling two-event cells with 500-event cells is a scale mixture that reads
+/// as excess kurtosis unless each deviation is rescaled.
+#[test]
+fn residual_shape_rescales_deviations_so_mixed_cell_sizes_pool() {
+    let _guard = GlobalRng::seed_guard(0x4485_3c12);
+    let mut cells: Vec<(usize, usize, Vec<f64>)> = (0..25_000)
+        .map(|i| (i / BANDS, i % BANDS, (0..2).map(|_| normal()).collect()))
+        .collect();
+    cells.extend((0..100).map(|i| {
+        (
+            25_000 / BANDS + 1 + i / BANDS,
+            i % BANDS,
+            (0..500).map(|_| normal()).collect(),
+        )
+    }));
+    let kurtosis = shape_with(&cells, 2.0).excess_kurtosis.unwrap();
+    assert!(
+        kurtosis.abs() < 0.1,
+        "rescaled deviations from mixed cell sizes must read normal, got excess kurtosis {kurtosis}"
+    );
+}
 /// Normal residuals in cells of very different sizes: small cells' centred
 /// deviations are non-normal and under-dispersed, so without the rescaling and
 /// the per-cell minimum they drag excess kurtosis negative.
@@ -1550,7 +1643,7 @@ fn residual_shape_is_unbiased_for_normal_data_in_mixed_cell_sizes() {
         // Most events in tiny cells, the rest in large ones.
         let size = if i < 2_900 { 3 } else { 400 };
         let values = (0..size).map(|_| normal()).collect();
-        cells.push((i % 400, i % BANDS, values));
+        cells.push((i / BANDS, i % BANDS, values));
     }
     let shape = shape_of(&cells);
     let skew = shape.skewness.unwrap();
@@ -1566,7 +1659,7 @@ fn residual_shape_is_unbiased_for_normal_data_in_mixed_cell_sizes() {
     for i in 0..1_200 {
         let size = if i % 2 == 0 { 10 } else { 60 };
         let values = (0..size).map(|_| normal()).collect();
-        cells.push((i % 300, i % BANDS, values));
+        cells.push((i / BANDS, i % BANDS, values));
     }
     let shape = shape_of(&cells);
     assert!(
