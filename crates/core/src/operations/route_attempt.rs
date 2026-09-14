@@ -524,6 +524,7 @@ impl AttemptHopRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn register(self: &Arc<Self>, tx: Transaction) -> AttemptHopGuard {
         self.register_excluding(tx, Vec::new())
     }
