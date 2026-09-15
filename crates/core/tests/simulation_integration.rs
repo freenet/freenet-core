@@ -12166,9 +12166,11 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
 /// `a_holder_that_timed_out_once_keeps_its_second_chance_over_an_unasked_peer`
 /// on a small ring where they do.
 ///
-/// Under plain `cargo test` this can fail its precondition while other sims
-/// share the process (#5673): a concurrent `SimNetwork` drop clears the
-/// process-global crash callback, so the host never really crashes.
+/// Plain `cargo test` runs the sims in one process. The process-global crash
+/// callback that used to make this fail its precondition there (#5673) is
+/// fixed by #5677, but simulated networks that share node addresses still
+/// collide in multi-threaded runs (#5676), so only single-threaded or nextest
+/// results count as evidence.
 #[test_log::test]
 fn test_get_retry_reaches_single_host_after_one_timeout() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
