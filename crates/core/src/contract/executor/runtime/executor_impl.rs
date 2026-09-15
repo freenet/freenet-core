@@ -97,6 +97,51 @@ where
         Some(ContractKey::from_id_and_code(*instance_id, code_hash))
     }
 
+    /// The stored parameters for `key`, but only if they are the parameters its
+    /// instance id was derived from.
+    ///
+    /// The params row is keyed by instance id alone, and every operation that
+    /// arrives without code runs the contract with what it finds there. A row
+    /// whose parameters do not derive the instance id, under the code hash the
+    /// instance->code index holds for it (the key's own hash when there is no
+    /// index row), is treated as absent rather than used. The next verified
+    /// container for the instance rewrites it.
+    pub(in crate::contract::executor) async fn verified_stored_params(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<Parameters<'static>>, ExecutorError> {
+        let Some(params) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            return Ok(None);
+        };
+        let code_hash = self
+            .runtime
+            .code_hash_from_id(key.id())
+            .unwrap_or(*key.code_hash());
+        let encoded_code_hash =
+            ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
+        match ContractKey::from_params(encoded_code_hash.clone(), params.clone()) {
+            Ok(derived) if derived.id() == key.id() => Ok(Some(params)),
+            _ => {
+                // WARN, not debug: a row that fails this check means the node was
+                // holding parameters it cannot vouch for, which an operator should
+                // be able to see in a release build.
+                tracing::warn!(
+                    contract = %key,
+                    code_hash = %encoded_code_hash,
+                    params_len = params.as_ref().len(),
+                    "Stored contract parameters do not derive this contract's instance id; \
+                     ignoring them until a verified container replaces them"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub(in crate::contract::executor) async fn bridged_fetch_contract(
         &mut self,
         key: ContractKey,
@@ -292,10 +337,8 @@ where
         let params = if let Some(code) = &code {
             code.params()
         } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
+            self.verified_stored_params(&key)
+                .await?
                 .ok_or_else(|| {
                     tracing::warn!(
                         contract = %key,
@@ -1470,10 +1513,8 @@ where
         }
 
         let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
+            .verified_stored_params(&key)
+            .await?
             .ok_or_else(|| {
                 ExecutorError::request(StdContractError::Get {
                     key,
@@ -1602,10 +1643,8 @@ where
         }
 
         let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
+            .verified_stored_params(&key)
+            .await?
             .ok_or_else(|| {
                 ExecutorError::request(StdContractError::Get {
                     key,
@@ -1678,12 +1717,7 @@ where
         &self,
         key: &ContractKey,
     ) -> Result<Option<ContractContainer>, ExecutorError> {
-        let Some(parameters) = self
-            .state_store
-            .get_params(key)
-            .await
-            .map_err(ExecutorError::other)?
-        else {
+        let Some(parameters) = self.verified_stored_params(key).await? else {
             tracing::debug!(
                 contract = %key,
                 "Contract parameters not in state_store, cannot fetch contract"

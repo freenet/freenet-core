@@ -19,8 +19,6 @@ impl Executor<Runtime> {
         let params = contract.params();
 
         if self.get_local_contract(key.id()).await.is_ok() {
-            // Contract already exists — merge states locally and broadcast async.
-            //
             // The container's key and params drive the merge and the commit below,
             // so verify they belong together first. `store_contract` is the store's
             // guarded ingress: it refuses a key not derived from the container's code
@@ -29,6 +27,8 @@ impl Executor<Runtime> {
                 .contract_store
                 .store_contract(contract.clone())
                 .map_err(ExecutorError::other)?;
+
+            // Contract already exists — merge states locally and broadcast async.
             //
             // We intentionally do NOT delegate to perform_contract_update here because
             // its network mode path uses op_request() which blocks waiting for the
@@ -186,10 +186,8 @@ impl Executor<Runtime> {
         // added for #4978 repairs such a row once the index does know it.
         let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
+            self.verified_stored_params(&key)
+                .await?
                 .ok_or_else(|| {
                     RequestError::ContractError(StdContractError::Update {
                         cause: "missing contract parameters".into(),
