@@ -37,7 +37,7 @@ aes-gcm = { workspace = true }
 # (P3 of #4381). `zeroize` wipes the derived output buffer; we use the low-level
 # `Argon2::hash_password_into` API (not the PHC-string `password_hash` path) so
 # the feature set is minimal.
-argon2 = { version = "0.5", features = ["zeroize"] }
+argon2 = { version = "0.6", features = ["zeroize"] }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
