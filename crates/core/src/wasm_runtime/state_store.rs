@@ -360,6 +360,11 @@ where
         Ok(())
     }
 
+    /// Store a contract's state and parameters.
+    ///
+    /// Precondition: as for [`Self::ensure_params`], `params` must already be
+    /// verified as the parameters `key`'s instance id was derived from; the
+    /// params row is keyed by instance id alone and is overwritten.
     pub async fn store(
         &mut self,
         key: ContractKey,

@@ -1739,7 +1739,7 @@ where
         let Some(parameters) = self.verified_stored_params(key).await? else {
             tracing::debug!(
                 contract = %key,
-                "Contract parameters not in state_store, cannot fetch contract"
+                "No usable contract parameters in state_store, cannot fetch contract"
             );
             return Ok(None);
         };

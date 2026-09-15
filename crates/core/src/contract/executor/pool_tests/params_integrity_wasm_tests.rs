@@ -460,7 +460,7 @@ fn upsert_writes_container_params_only_after_store_contract() {
         .expect("bridged_upsert_contract_state_inner not found");
     let after = &production[start..];
     let end = after
-        .find("async fn bridged_summarize_contract_state(")
+        .find("fn bridged_register_contract_notifier(")
         .expect("the method following bridged_upsert_contract_state_inner moved");
     // Whole-line `//` comments stripped, so prose naming a call cannot match.
     let body = after[..end]
