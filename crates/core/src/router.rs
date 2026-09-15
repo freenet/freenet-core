@@ -1269,7 +1269,8 @@ pub(crate) struct Router {
     /// the intended replacement for the legacy stack.
     ///
     /// Fed and scored only when it can matter: when it reaches routing (the
-    /// default; `FREENET_ROUTING_HIERARCHICAL=0` turns it off) or when the
+    /// default; `FREENET_ROUTING_HIERARCHICAL=0`, or any other value that
+    /// resolves off, turns it off) or when the
     /// routing dataset is recorded (see [`hierarchical_computed`]). A node that
     /// turned it off does not pay its learning cost for a measurement nobody
     /// reads.
@@ -1423,8 +1424,9 @@ struct PredictionClock {
 ///
 /// Whenever its output is used: in routing (the default), or recorded into a
 /// dataset that is still RECORDING. With routing on it is always computed,
-/// because it routes. Only on a node that turned it off with
-/// `FREENET_ROUTING_HIERARCHICAL=0` does the recorder decide, and a recorder
+/// because it routes. Only on a node where the flag resolves off
+/// (`FREENET_ROUTING_HIERARCHICAL=0`, or any unrecognised or non-UTF-8 value)
+/// does the recorder decide, and a recorder
 /// that stopped (byte cap, write error) must not keep the estimator learning
 /// under the router's write lock for the rest of the process's life, recording
 /// nothing.
@@ -1449,7 +1451,7 @@ fn parse_routing_flag(value: Option<&str>) -> bool {
 /// How a default-ON `FREENET_ROUTING_*` switch resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultOnFlag {
-    /// Unset or empty: the shipping default.
+    /// Unset, empty or whitespace-only: the shipping default.
     Default,
     /// An explicit affirmative (`1`, `true`, `yes`, `on`).
     Enabled,
@@ -1468,7 +1470,8 @@ impl DefaultOnFlag {
 
 /// Parse a default-ON `FREENET_ROUTING_*` switch.
 ///
-/// Unset or empty is the shipping default (ON), and only the recognised
+/// Unset, empty or whitespace-only is the shipping default (ON), and only the
+/// recognised
 /// affirmatives keep it on explicitly. Every other non-empty value turns the
 /// switch OFF: once a switch defaults on, setting it at all is almost always an
 /// attempt to turn it off (`disabled`, `legacy`, `n`), and on ambiguous input
@@ -1537,7 +1540,10 @@ const HIERARCHICAL_ENV: &str = "FREENET_ROUTING_HIERARCHICAL";
 /// crossover verification and pinned by
 /// `hierarchical_routing_enabled_follows_the_environment`; change them together.
 /// INFO (and WARN), never debug: release builds compile out everything below
-/// INFO (`release_max_level_info`).
+/// INFO (`release_max_level_info`). Being INFO, the enabled and `disabled via`
+/// lines appear in the MAIN log (`freenet.*`, or the journal), not in
+/// `freenet.error.*`, whose floor is WARN: only the unrecognised-value line
+/// reaches the error log, so confirm a node's mode from the main log.
 fn resolve_hierarchical_flag(raw: Option<&std::ffi::OsStr>) -> bool {
     let flag = match raw.map(std::ffi::OsStr::to_str) {
         None => parse_default_on_routing_flag(None),
@@ -4878,6 +4884,10 @@ mod tests {
             resolve_hierarchical_flag(Some(OsStr::new(""))),
             "empty must enable"
         );
+        assert!(
+            resolve_hierarchical_flag(Some(OsStr::new("   "))),
+            "whitespace-only is empty, so it must enable"
+        );
         assert!(resolve_hierarchical_flag(Some(OsStr::new("1"))));
         assert!(!resolve_hierarchical_flag(Some(OsStr::new("0"))));
         assert!(
@@ -4923,11 +4933,12 @@ mod tests {
     fn hierarchical_routing_enabled_follows_the_environment() {
         if let Some(expect) = std::env::var_os(HIERARCHICAL_CHILD_ENV) {
             let expect = expect.to_string_lossy().into_owned();
-            let mut parts = expect.splitn(3, '|');
-            let (mode, level, message) = (
+            let mut parts = expect.splitn(4, '|');
+            let (mode, level, message, value_suffix) = (
                 parts.next().expect("mode"),
                 parts.next().expect("level"),
                 parts.next().expect("message"),
+                parts.next().expect("value suffix"),
             );
             let (logs, guard) = crate::util::test_log_capture::install();
             let first = hierarchical_routing_enabled();
@@ -4950,10 +4961,12 @@ mod tests {
                 1,
                 "the mode must be logged exactly once; captured: {logs:?}"
             );
-            assert!(
-                mode_lines[0].starts_with(&format!("{level} message={message}")),
-                "expected `{level} message={message}...`, got {:?}",
-                mode_lines[0]
+            // The WHOLE line: level, the exact message (not only its prefix), and
+            // the `value` field, which tells an operator which value decided the
+            // mode (rendered lossily for non-UTF-8).
+            assert_eq!(
+                mode_lines[0].as_str(),
+                format!("{level} message={message}{value_suffix}"),
             );
             return;
         }
@@ -4966,26 +4979,36 @@ mod tests {
         const DISABLED_UNRECOGNISED: &str = "off|WARN|hierarchical routing estimator: disabled, \
              FREENET_ROUTING_HIERARCHICAL has an unrecognised value (use 0/false/no/off to \
              disable, 1/true/yes/on or unset to enable)";
+        // (raw value, expected "mode|LEVEL|message", expected `value` field as
+        // it follows the message in the captured line; the default line has
+        // none).
         #[allow(unused_mut)]
-        let mut cases: Vec<(Option<std::ffi::OsString>, &str)> = vec![
-            (None, ENABLED_DEFAULT),
-            (Some("".into()), ENABLED_DEFAULT),
-            (Some("1".into()), ENABLED_EXPLICIT),
-            (Some("0".into()), DISABLED_EXPLICIT),
-            (Some("off".into()), DISABLED_EXPLICIT),
-            (Some("flase".into()), DISABLED_UNRECOGNISED),
+        let mut cases: Vec<(Option<std::ffi::OsString>, &str, &str)> = vec![
+            (None, ENABLED_DEFAULT, ""),
+            (Some("".into()), ENABLED_DEFAULT, ""),
+            (Some("   ".into()), ENABLED_DEFAULT, ""),
+            (Some("1".into()), ENABLED_EXPLICIT, " value=1"),
+            (Some("0".into()), DISABLED_EXPLICIT, " value=0"),
+            (Some("off".into()), DISABLED_EXPLICIT, " value=off"),
+            (Some("flase".into()), DISABLED_UNRECOGNISED, " value=flase"),
         ];
+        // Non-UTF-8 is exercised on unix only. Windows could build one from a
+        // lone surrogate (`OsStringExt::from_wide(&[0x6F, 0x66, 0xD800])`), but
+        // no CI job or local build compiles this crate's lib tests on Windows,
+        // so such a case could never be seen to run; the branch it would reach
+        // is platform-independent and covered here.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             cases.push((
                 Some(std::ffi::OsString::from_vec(b"of\xff".to_vec())),
                 DISABLED_UNRECOGNISED,
+                " value=of\u{FFFD}",
             ));
         }
 
         let exe = std::env::current_exe().expect("test binary path");
-        for (value, expect) in cases {
+        for (value, expect, value_suffix) in cases {
             let mut command = std::process::Command::new(&exe);
             command
                 .args([
@@ -4994,12 +5017,37 @@ mod tests {
                     "--nocapture",
                     HIERARCHICAL_CHILD_TEST,
                 ])
-                .env(HIERARCHICAL_CHILD_ENV, expect);
+                .env(HIERARCHICAL_CHILD_ENV, format!("{expect}|{value_suffix}"))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
             match &value {
                 Some(value) => command.env(HIERARCHICAL_ENV, value),
                 None => command.env_remove(HIERARCHICAL_ENV),
             };
-            let output = command.output().expect("re-exec the test binary");
+            let mut child = command.spawn().expect("re-exec the test binary");
+            // Bounded, because under plain `cargo test` nothing else would stop
+            // a hung child. It resolves one flag, so 60 s is generous; its
+            // output is far below a pipe buffer, so polling cannot deadlock.
+            let mut finished = false;
+            for _ in 0..1_200 {
+                if child.try_wait().expect("poll the child").is_some() {
+                    finished = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if !finished {
+                if let Err(error) = child.kill() {
+                    eprintln!("could not kill the hung child: {error}");
+                }
+                if let Err(error) = child.wait() {
+                    eprintln!("could not reap the hung child: {error}");
+                }
+                panic!("child with {HIERARCHICAL_ENV}={value:?} did not finish within 60 s");
+            }
+            let output = child
+                .wait_with_output()
+                .expect("collect the child's output");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -5070,9 +5118,20 @@ mod tests {
     /// "Not replayed from `history`" comment), so a history-built router keeps
     /// a COLD estimator and routes entirely on the legacy fallback. Since the
     /// #4485 default flip a warm node routes on the hierarchical estimator
-    /// instead, so each behavioural guard runs in both modes: `History` covers
-    /// the cold-start fallback and the `=0` kill switch, `WarmHierarchical` the
-    /// estimator the fleet actually routes with.
+    /// instead, so each behavioural guard runs in both modes:
+    ///
+    /// - `History` covers the cold-start fallback. That is also what a node
+    ///   whose flag resolves OFF runs, but only by equivalence: today a
+    ///   never-fed estimator supplies no stage, so prediction takes the full
+    ///   legacy path bit for bit. If cold-ON ever diverges from OFF (a
+    ///   warm-start prior, a seeded root curve), `History` stops covering the
+    ///   kill switch.
+    /// - `WarmHierarchical` covers the estimator the fleet routes with. Its
+    ///   precondition always pins the FAILURE stage. The timing stages warm only
+    ///   after 30 timed events (`MIN_CURVE_POINTS_LOG`), so a guard trained on
+    ///   fewer still ranks on LEGACY timing; only the twins that train that
+    ///   many (realistic traffic, the transition's phase 3, #4230 steady state)
+    ///   have their timing pinned to the hierarchical estimator too.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Training {
         History,
@@ -5094,7 +5153,8 @@ mod tests {
         }
 
         /// The warm mode's precondition: every failure probability the decision
-        /// ranks on came from the hierarchical estimate. See
+        /// ranks on, and every timing estimate the hierarchical estimator
+        /// supplies, came from the hierarchical estimate. See
         /// [`assert_hierarchical_failure_decides`].
         fn check_decides(self, router: &Router, peers: &[PeerKeyLocation], target: Location) {
             if self == Training::WarmHierarchical {
@@ -5107,6 +5167,11 @@ mod tests {
     /// hierarchical estimator on, so it learns every event. The clock is a
     /// frozen mock, so a prediction and a direct `estimate` read the same
     /// instant and can be compared exactly.
+    ///
+    /// The price: every event lands at one estimator instant, so the online
+    /// horizon choice and forgetting a real node's time-spread events go
+    /// through are degenerate in the twins. Those are covered by the router
+    /// tests that advance a `SharedMockTimeSource` by hand, not here.
     fn warm_hierarchical_router(events: &[RouteEvent]) -> Router {
         let _on = force_hierarchical_routing(true);
         let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
@@ -5119,8 +5184,17 @@ mod tests {
     }
 
     /// Precondition for a warm-hierarchical guard: for every candidate, the
-    /// failure probability the router acts on IS the hierarchical estimate, so
-    /// the property the guard asserts cannot pass on the legacy fallback.
+    /// failure probability the router acts on IS the hierarchical estimate,
+    /// and so is each timing estimate (response time, transfer speed) whenever
+    /// the hierarchical estimator supplies one. So a guard cannot pass on the
+    /// legacy fallback for any stage the estimator has warmed. A timing stage it
+    /// has NOT warmed (below 30 timed events) is legitimately legacy and is not
+    /// checked; a guard whose property depends on timing must also call
+    /// [`assert_hierarchical_timing_decides`].
+    ///
+    /// Two stacks that happen to agree bit for bit (all-success data: both
+    /// read 0.0) cannot be told apart by equality; such a guard needs the
+    /// `LEGACY_STAGE_EVALUATIONS` check as well (see the transition twin).
     fn assert_hierarchical_failure_decides(
         router: &Router,
         peers: &[PeerKeyLocation],
@@ -5136,21 +5210,63 @@ mod tests {
                 .location()
                 .map(|loc| target.distance(loc).as_f64())
                 .unwrap_or(0.5);
-            let estimate = router
-                .hierarchical
-                .estimate(peer, target, distance, hours)
-                .failure_probability;
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
             let acted_on = router
                 .predict_routing_outcome(peer, target)
-                .expect("a warm router predicts")
-                .failure_probability;
+                .expect("a warm router predicts");
             assert_eq!(
-                estimate.map(|p| p.clamp(0.0, 1.0)),
-                Some(acted_on),
+                estimate.failure_probability.map(|p| p.clamp(0.0, 1.0)),
+                Some(acted_on.failure_probability),
                 "the failure probability for {peer:?} must come from the (warm) \
                  hierarchical estimator, not the legacy fallback"
             );
+            if let Some(seconds) = estimate
+                .time_to_response_start_secs
+                .filter(|t| t.is_finite() && *t >= 0.0)
+            {
+                assert_eq!(
+                    acted_on.time_to_response_start, seconds,
+                    "the response time for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
+            if let Some(speed) = estimate
+                .transfer_speed_bps
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                assert_eq!(
+                    acted_on.xfer_speed.bytes_per_second, speed,
+                    "the transfer speed for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
         }
+    }
+
+    /// The stricter precondition for a guard whose property depends on timing:
+    /// both hierarchical timing stages must be WARM for every candidate (so
+    /// [`assert_hierarchical_failure_decides`] compared them), not merely
+    /// consistent when present. Otherwise the guard's timing is legacy.
+    fn assert_hierarchical_timing_decides(
+        router: &Router,
+        peers: &[PeerKeyLocation],
+        target: Location,
+    ) {
+        let hours = router.estimator_clock.hours();
+        for peer in peers {
+            let distance = peer
+                .location()
+                .map(|loc| target.distance(loc).as_f64())
+                .unwrap_or(0.5);
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
+            assert!(
+                estimate.time_to_response_start_secs.is_some()
+                    && estimate.transfer_speed_bps.is_some(),
+                "both hierarchical timing stages must be warm for {peer:?} (train at \
+                 least 30 timed successes); got {estimate:?}"
+            );
+        }
+        assert_hierarchical_failure_decides(router, peers, target);
     }
 
     fn prediction_bits(prediction: &RoutingPrediction) -> [u64; 5] {
@@ -6427,6 +6543,36 @@ mod tests {
         events
     }
 
+    /// `history` with every success TIMED, response and transfer time rising
+    /// with distance (farther is slower), so the hierarchical timing stages
+    /// (30-point floor) warm and a ranking uses all three stages. Deterministic:
+    /// draws no RNG.
+    fn with_distance_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
+        history
+            .iter()
+            .map(|event| {
+                let distance = event
+                    .contract_location
+                    .distance(event.peer.location().expect("pool peers have locations"))
+                    .as_f64();
+                let outcome = match event.outcome.clone() {
+                    RouteOutcome::SuccessUntimed => RouteOutcome::Success {
+                        time_to_response_start: Duration::from_secs_f64(0.02 + 0.4 * distance),
+                        payload_size: 2000,
+                        payload_transfer_time: Duration::from_secs_f64(0.005 + 0.1 * distance),
+                    },
+                    RouteOutcome::Success { .. } | RouteOutcome::Failure => event.outcome.clone(),
+                };
+                RouteEvent {
+                    peer: event.peer.clone(),
+                    contract_location: event.contract_location,
+                    outcome,
+                    op_type: event.op_type,
+                }
+            })
+            .collect()
+    }
+
     /// Measure routing convergence at a given candidate window over many random
     /// targets, against a fixed trained router and peer pool.
     ///
@@ -6514,7 +6660,10 @@ mod tests {
     /// [`routing_convergence_preserved_at_window_25_4230`] on the warm
     /// hierarchical estimator, with the same bounds: the property #4230 pins
     /// must hold for the estimator the fleet routes with, not only for the
-    /// legacy fallback.
+    /// legacy fallback. The warm mode trains the same history with every
+    /// success timed (farther is slower, [`with_distance_timing`]) so ALL THREE
+    /// hierarchical stages are warm and ranking uses the full shipping formula;
+    /// the untimed history ranks on failure alone, which the sweep twin covers.
     #[test]
     fn routing_convergence_preserved_at_window_25_4230_warm_hierarchical() {
         convergence_at_window_25_case(Training::WarmHierarchical);
@@ -6583,7 +6732,22 @@ mod tests {
             adj_max - adj_min
         );
 
-        let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400, training);
+        // The History mode keeps the original untimed input. The warm mode
+        // times every success so the hierarchical timing stages warm too, and
+        // proves they did before measuring.
+        let measured = match training {
+            Training::History => history.clone(),
+            Training::WarmHierarchical => {
+                let timed = with_distance_timing(&history);
+                assert_hierarchical_timing_decides(
+                    &warm_hierarchical_router(&timed),
+                    &pool,
+                    Location::new(0.37),
+                );
+                timed
+            }
+        };
+        let (mean_pct, p90_pct) = measure_convergence(&measured, &pool, 25, 400, training);
 
         assert!(
             mean_pct < 0.18,
@@ -6631,7 +6795,10 @@ mod tests {
     }
 
     /// [`routing_convergence_window_sweep_does_not_degrade_4230`] on the warm
-    /// hierarchical estimator, with the same bounds.
+    /// hierarchical estimator, with the same bounds. FAILURE-ONLY in both
+    /// modes: `gradient_history` has no timed events, so no timing estimate
+    /// exists in either stack and the ranking is the failure term alone. The
+    /// timed, all-stages ranking is covered by the steady-state twin.
     #[test]
     fn routing_convergence_window_sweep_does_not_degrade_4230_warm_hierarchical() {
         convergence_window_sweep_case(Training::WarmHierarchical);
@@ -7446,10 +7613,18 @@ mod tests {
     }
 
     /// [`test_transition_from_failure_only_to_full_predictions`] on the warm
-    /// hierarchical estimator. Five timed successes are below the
-    /// hierarchical timing stages' 30-point floor, so phase 2's timing comes
-    /// from the legacy fallback while the failure stage stays hierarchical —
-    /// the mixed state a node is in for its first timed GETs.
+    /// hierarchical estimator, through three states a node passes through:
+    ///
+    /// 1. Failure-only (all-success, untimed). Both stacks read 0.0 failure
+    ///    here, so the precondition's equality cannot tell them apart; the
+    ///    warm mode instead asserts NO legacy stage was evaluated, which with
+    ///    no timing data holds only when the hierarchical failure estimate is
+    ///    used.
+    /// 2. Five timed successes: below the hierarchical timing stages' 30-point
+    ///    floor, so timing comes from the legacy fallback while failure stays
+    ///    hierarchical — the mixed state of a node's first timed GETs.
+    /// 3. (Warm only) 30 more timed successes: every stage hierarchical, no
+    ///    legacy stage evaluated, timing pinned to the hierarchical estimate.
     #[test]
     fn test_transition_from_failure_only_to_full_predictions_warm_hierarchical() {
         transition_from_failure_only_case(Training::WarmHierarchical);
@@ -7472,7 +7647,16 @@ mod tests {
 
         let router = training.train(&events);
         training.check_decides(&router, &peers, contract_location);
+        let legacy_before = LEGACY_STAGE_EVALUATIONS.with(|count| count.get());
         let (_, decision) = router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        if training == Training::WarmHierarchical {
+            assert_eq!(
+                LEGACY_STAGE_EVALUATIONS.with(|count| count.get()) - legacy_before,
+                0,
+                "phase 1 has no timing data, so a legacy stage runs only if the \
+                 hierarchical failure estimate is missing or ignored"
+            );
+        }
         // Failure-only: timing fields should be 0.0
         let pred = decision.candidates[0].prediction.as_ref().unwrap();
         assert_eq!(pred.time_to_response_start, 0.0);
@@ -7507,6 +7691,41 @@ mod tests {
             pred2.transfer_speed_bps > 0.0,
             "Should have real transfer speed after transition"
         );
+
+        if training == Training::WarmHierarchical {
+            // Phase 3: past the hierarchical timing stages' 30-point floor
+            // (5 + 30 timed successes), so every stage is hierarchical and no
+            // legacy stage may run at all.
+            for round in 0..6u64 {
+                for peer in &peers {
+                    events.push(RouteEvent {
+                        peer: peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 5 * round),
+                            payload_size: 1000,
+                            payload_transfer_time: Duration::from_millis(8 + round),
+                        },
+                        op_type: None,
+                    });
+                }
+            }
+            let router3 = training.train(&events);
+            assert_hierarchical_timing_decides(&router3, &peers, contract_location);
+            let legacy_before = LEGACY_STAGE_EVALUATIONS.with(|count| count.get());
+            let (_, decision3) =
+                router3.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+            assert_eq!(
+                LEGACY_STAGE_EVALUATIONS.with(|count| count.get()) - legacy_before,
+                0,
+                "phase 3: with every stage warm, no legacy stage may be evaluated"
+            );
+            let pred3 = decision3.candidates[0].prediction.as_ref().unwrap();
+            assert!(
+                pred3.time_to_response_start > 0.0 && pred3.transfer_speed_bps > 0.0,
+                "phase 3 must carry real hierarchical timing, got {pred3:?}"
+            );
+        }
     }
 
     /// Simulate realistic post-#3137 traffic: a mix of timed GET successes, untimed
@@ -7519,7 +7738,11 @@ mod tests {
     }
 
     /// [`test_realistic_mixed_traffic_routing`] on the warm hierarchical
-    /// estimator.
+    /// estimator. The warm mode triples the timed GET successes (39, past the
+    /// 30-point floor) so BOTH timing stages are hierarchical as well and the
+    /// ranking runs entirely on the hierarchical estimate, which the timing
+    /// precondition proves. The failure ordering is unchanged (close ~4%, mid
+    /// ~21%, far 75%); the History mode keeps the original 13 timed events.
     #[test]
     fn test_realistic_mixed_traffic_routing_warm_hierarchical() {
         realistic_mixed_traffic_case(Training::WarmHierarchical);
@@ -7539,9 +7762,17 @@ mod tests {
 
         let mut events = Vec::new();
 
+        // Timed-success multiplier: 1 in the History mode (the original
+        // input), 3 in the warm mode so the hierarchical timing stages warm.
+        let timed_rounds: usize = if training == Training::WarmHierarchical {
+            3
+        } else {
+            1
+        };
+
         // close_peer: 10 timed GET successes + 15 untimed PUT/SUB successes, 2 failures
         // → ~7% failure rate, good timing data
-        for _ in 0..10 {
+        for _ in 0..10 * timed_rounds {
             events.push(RouteEvent {
                 peer: close_peer.clone(),
                 contract_location,
@@ -7572,7 +7803,7 @@ mod tests {
 
         // mid_peer: 3 timed GET successes + 10 untimed successes, 5 failures
         // → ~28% failure rate, sparse timing data
-        for _ in 0..3 {
+        for _ in 0..3 * timed_rounds {
             events.push(RouteEvent {
                 peer: mid_peer.clone(),
                 contract_location,
@@ -7620,19 +7851,24 @@ mod tests {
             });
         }
 
-        // Total: 27 + 18 + 20 = 65 events > 50 threshold
+        // Total: 27 + 18 + 20 = 65 events > 50 threshold (History mode; the warm
+        // mode adds 26 timed successes)
         let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
 
-        // failure_estimator should have all 65 events
-        assert_eq!(router.failure_estimator.len(), 65);
-        // timing estimators only have the timed GET successes: 10 + 3 = 13
-        assert_eq!(router.response_start_time_estimator.len(), 13);
-        assert_eq!(router.transfer_rate_estimator.len(), 13);
+        let timed = 13 * timed_rounds;
+        // failure_estimator should have every event (65 in the History mode)
+        assert_eq!(router.failure_estimator.len(), 52 + timed);
+        // timing estimators only have the timed GET successes: 10 + 3 = 13 (x3 warm)
+        assert_eq!(router.response_start_time_estimator.len(), timed);
+        assert_eq!(router.transfer_rate_estimator.len(), timed);
 
         // Router should use prediction-based routing and prefer close_peer
         let peers = vec![close_peer.clone(), mid_peer.clone(), far_peer.clone()];
         training.check_decides(&router, &peers, contract_location);
+        if training == Training::WarmHierarchical {
+            assert_hierarchical_timing_decides(&router, &peers, contract_location);
+        }
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
 

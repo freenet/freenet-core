@@ -14,9 +14,10 @@
 //! estimated from the data. It is the intended REPLACEMENT for the legacy stack
 //! (Renegade, the per-peer EWMA, the fixed blend and the residual correction),
 //! which is removed in a later PR. Until then both stacks exist: this one
-//! routes by default, `FREENET_ROUTING_HIERARCHICAL=0` puts a node back on the
-//! legacy stack, and on such a node this estimator is computed at all only while
-//! the routing dataset is being recorded.
+//! routes by default, `FREENET_ROUTING_HIERARCHICAL=0` (or any other value that
+//! resolves off) puts a node back on the legacy stack, and on such a node this
+//! estimator is computed at all only while the routing dataset is being
+//! recorded.
 //!
 //! # Provenance, and what has changed since
 //!
