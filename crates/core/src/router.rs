@@ -6565,7 +6565,13 @@ mod tests {
     /// "No per-peer signal" holds only while the caller's history is
     /// ROUND-MAJOR (each round touches every peer once) AND its peer count is
     /// not a multiple of the 7-event cycle; otherwise a peer's jitter is a
-    /// fixed offset. The #4230 steady-state twin asserts the peer count.
+    /// fixed offset.
+    ///
+    /// Those two conditions are guarded ASYMMETRICALLY, and a new caller has
+    /// to know it: each caller asserts its own peer count (the #4230
+    /// steady-state twin does), while the ROUND-MAJOR half rests on this
+    /// paragraph alone. A history batched per peer would hand every peer a
+    /// fixed offset with nothing failing.
     fn with_uninformative_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
         history
             .iter()
@@ -6715,8 +6721,11 @@ mod tests {
         assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
         // `with_uninformative_timing` cycles its jitter every 7 events and
         // `gradient_history` is round-major (each round touches every peer
-        // once), so a peer's jitter walks the cycle across rounds and every
-        // peer ends with the same mean. If the pool size were a multiple of 7,
+        // once), so a peer's jitter walks the cycle across rounds and per-peer
+        // means differ only by the partial final cycle — at 40 peers x 12
+        // rounds, 2.67 to 3.33 jitter units, about 1.3 ms on a 50 ms base.
+        // (They are exactly equal only when the round count is a multiple of
+        // 7.) If the pool size were a multiple of 7,
         // the jitter would collapse to a FIXED per-peer offset: a per-peer
         // timing signal, which is exactly the per-peer-history-versus-locality
         // regime #4230 guards, injected by the test itself and invisible to
