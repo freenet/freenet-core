@@ -2087,7 +2087,7 @@ dependencies = [
  "cookie",
  "criterion",
  "ctrlc",
- "curve25519-dalek 4.1.3",
+ "curve25519-dalek 5.0.0",
  "dashmap",
  "delegate",
  "directories",
