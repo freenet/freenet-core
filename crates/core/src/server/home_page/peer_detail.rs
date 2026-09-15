@@ -1,11 +1,11 @@
 use super::assets::{CSS, JS, PEER_CSS};
 use super::cards::format_bytes;
 use super::estimator::{
-    build_estimator_chart_or_placeholder, build_renegade_accuracy_panel, failure_chart_y_max,
+    PeerLine, build_accuracy_panel, build_estimator_chart_or_placeholder, failure_chart_y_max,
     fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
 };
 use super::*;
-use crate::router::AdjustmentMode;
+use crate::router::{AdjustmentMode, Breakdown};
 
 // ─── Peer detail page ────────────────────────────────────────────────────────
 
@@ -33,79 +33,6 @@ fn fmt_skill(skill: Option<f64>) -> String {
     }
 }
 
-/// What the hierarchical rows show when the estimator has never been computed
-/// in this process, so an empty reading is not mistaken for a model with
-/// nothing to say.
-const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARCHICAL, or set \
-     FREENET_ROUTING_DATASET to record a routing dataset)";
-
-/// What the hierarchical rows show when a routing dataset recorder IS
-/// configured but stopped (byte cap or write error) before any event reached
-/// the estimator: telling the operator to set the variable would be wrong.
-const RECORDER_STOPPED_EMPTY: &str = "&mdash; not computed (the routing dataset recorder stopped \
-     before the estimator saw any event)";
-
-/// What the hierarchical rows show when `FREENET_ROUTING_DATASET` is set but
-/// the recorder could not be opened.
-const RECORDER_OPEN_FAILED: &str =
-    "&mdash; not computed (the routing dataset could not be opened; see the node log)";
-
-/// Whether the hierarchical readings are live, frozen, or absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Computation {
-    /// Being computed now.
-    Live,
-    /// Computed earlier, stopped since (a routing dataset that hit its byte cap
-    /// or failed to write). The readings are the soak's final numbers: worth
-    /// showing, but never as if they were still moving.
-    Frozen,
-    /// Never computed in this process, and no stopped recorder explains why.
-    Never,
-    /// A recorder was configured but stopped before any event was learned.
-    RecorderStoppedEmpty,
-    /// `FREENET_ROUTING_DATASET` is set but the recorder failed to open.
-    RecorderOpenFailed,
-}
-
-impl Computation {
-    fn of(rs: &crate::router::RouterSnapshotInfo) -> Self {
-        if rs.hierarchical_computed {
-            Computation::Live
-        } else if rs.hierarchical_failure_events > 0 || rs.hierarchical_failure_evaluated > 0 {
-            Computation::Frozen
-        } else if rs.routing_dataset_stopped {
-            Computation::RecorderStoppedEmpty
-        } else if rs.routing_dataset_open_failed {
-            Computation::RecorderOpenFailed
-        } else {
-            Computation::Never
-        }
-    }
-}
-
-/// Render one hierarchical reading according to whether it is live.
-fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> String {
-    match state {
-        Computation::Live => live(),
-        Computation::Frozen => format!("frozen when computation stopped: {}", live()),
-        Computation::Never => NOT_COMPUTED.to_string(),
-        Computation::RecorderStoppedEmpty => RECORDER_STOPPED_EMPTY.to_string(),
-        Computation::RecorderOpenFailed => RECORDER_OPEN_FAILED.to_string(),
-    }
-}
-
-/// The legacy rows' note when the hierarchical estimator routes. "Superseded"
-/// is a node-wide setting, not a per-query fact: a stage whose hierarchical
-/// curve is not warm yet still falls back to the legacy path for that query.
-const SUPERSEDED_BY_HIERARCHICAL: &str =
-    " &mdash; superseded (except where a hierarchical stage is not yet warm)";
-
-/// The blend row's note when the hierarchical estimator routes AND the residual
-/// correction is on: a cold hierarchical stage falls back to the correction, so
-/// the blend is not what the fallback uses either.
-const SUPERSEDED_BY_BOTH: &str = " &mdash; superseded (a cold hierarchical stage falls back to \
-     the correction, not to this blend)";
-
 /// A duration readable at any scale: µs below a millisecond, ms below a second.
 fn fmt_duration_secs(seconds: f64) -> String {
     if seconds < 1e-3 {
@@ -117,27 +44,26 @@ fn fmt_duration_secs(seconds: f64) -> String {
     }
 }
 
-/// Render both models' RMS error in seconds on the same events.
+/// Render the RMS error in seconds of the router's estimate and of the
+/// isotonic fallback's, on the same events.
 ///
-/// This is the instrument for the promotion gate's "not worse in seconds", so
-/// it names which model is ahead rather than leaving two bare numbers.
-///
-/// Below [`crate::router::MIN_WEIGHT_FOR_VERDICT`] of FORGOTTEN event weight it
-/// says so instead of naming a winner: a handful of recent timed events settles
+/// It names which is ahead rather than leaving two bare numbers. Below
+/// [`crate::router::MIN_WEIGHT_FOR_VERDICT`] of FORGOTTEN event weight it says
+/// so instead of naming a winner: a handful of recent timed events settles
 /// nothing, however many were scored long ago.
 fn fmt_seconds_error(
-    legacy: Option<f64>,
+    isotonic: Option<f64>,
     hierarchical: Option<f64>,
     scored: u64,
     weight: f64,
 ) -> String {
-    let (Some(legacy), Some(hierarchical)) = (legacy, hierarchical) else {
+    let (Some(isotonic), Some(hierarchical)) = (isotonic, hierarchical) else {
         return "&mdash; no event both models forecast yet".to_string();
     };
     let numbers = format!(
-        "legacy {}, hierarchical {} (n={scored}, recent weight {weight:.0})",
-        fmt_duration_secs(legacy),
-        fmt_duration_secs(hierarchical)
+        "hierarchical {}, isotonic fallback {} (n={scored}, recent weight {weight:.0})",
+        fmt_duration_secs(hierarchical),
+        fmt_duration_secs(isotonic)
     );
     if weight < crate::router::MIN_WEIGHT_FOR_VERDICT {
         return format!(
@@ -145,7 +71,7 @@ fn fmt_seconds_error(
             crate::router::MIN_WEIGHT_FOR_VERDICT
         );
     }
-    let verdict = if hierarchical <= legacy {
+    let verdict = if hierarchical <= isotonic {
         "hierarchical no worse"
     } else {
         "hierarchical worse"
@@ -236,17 +162,252 @@ fn fmt_window_reading(share: Option<f64>) -> String {
     }
 }
 
-/// Render a stage's observation count, saying so when the stage is inactive.
-///
-/// A stage below the prediction floor rendered a bare `0` and an empty chart,
-/// which is indistinguishable from a broken stage. Both nova gateways sit here
-/// permanently for transfer speed, so this is the normal case, not an edge one.
-fn fmt_stage_events(count: usize) -> String {
-    const PREDICTION_FLOOR: usize = 10;
-    if count < PREDICTION_FLOOR {
-        format!("{count} &mdash; inactive, needs {PREDICTION_FLOOR}")
+/// The three things the router estimates for a candidate, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageKind {
+    Failure,
+    ResponseTime,
+    TransferSpeed,
+}
+
+impl StageKind {
+    const ALL: [StageKind; 3] = [
+        StageKind::Failure,
+        StageKind::ResponseTime,
+        StageKind::TransferSpeed,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            StageKind::Failure => "Failure probability",
+            StageKind::ResponseTime => "Time to first response",
+            StageKind::TransferSpeed => "Transfer speed",
+        }
+    }
+
+    /// Outcomes a stage needs before it has a curve (the hierarchical
+    /// estimator's `MIN_CURVE_POINTS_*`).
+    fn needs(self) -> usize {
+        match self {
+            StageKind::Failure => 5,
+            StageKind::ResponseTime | StageKind::TransferSpeed => 30,
+        }
+    }
+
+    /// A value on the stage's own scale (a probability, or natural-log seconds
+    /// or bytes/s) in readable units.
+    fn render(self, value: f64) -> String {
+        match self {
+            StageKind::Failure => format!("{:.2}%", value * 100.0),
+            StageKind::ResponseTime => fmt_duration_secs(value.exp()),
+            StageKind::TransferSpeed => fmt_prediction_speed(value.exp()),
+        }
+    }
+
+    /// The change a level made, on the stage's own scale: percentage points
+    /// for a probability, a factor for a log-scale quantity.
+    fn change(self, before: f64, after: f64) -> String {
+        match self {
+            StageKind::Failure => format!("{:+.2} pt", (after - before) * 100.0),
+            StageKind::ResponseTime | StageKind::TransferSpeed => {
+                format!("&times;{:.2}", (after - before).exp())
+            }
+        }
+    }
+
+    /// An estimate in the router's own units (probability, seconds, bytes/s).
+    fn render_estimate(self, estimate: f64) -> String {
+        match self {
+            StageKind::Failure => format!("{:.2}%", estimate * 100.0),
+            StageKind::ResponseTime => fmt_duration_secs(estimate),
+            StageKind::TransferSpeed => fmt_prediction_speed(estimate),
+        }
+    }
+}
+
+/// Render a stage's data: how many outcomes its window holds, and whether it
+/// has a curve yet. A timing stage without one is estimated by the isotonic
+/// fallback, which the row says, because it is what routing uses meanwhile.
+fn fmt_stage_status(stage: StageKind, events: usize, active: bool) -> String {
+    if active {
+        return format!("{events} outcomes in the window");
+    }
+    let fallback = match stage {
+        StageKind::Failure => "",
+        StageKind::ResponseTime | StageKind::TransferSpeed => {
+            "; routing uses the per-distance fit meanwhile"
+        }
+    };
+    format!(
+        "{events} &mdash; no curve yet, needs {}{fallback}",
+        stage.needs()
+    )
+}
+
+/// Render the evidence behind a level's own average and how much of it the
+/// estimate adopted.
+fn fmt_evidence(evidence: f64, weight: f64) -> String {
+    if evidence <= 0.0 {
+        "no record".to_string()
     } else {
-        count.to_string()
+        format!(
+            "{evidence:.1} effective outcomes, {:.0}% adopted",
+            weight * 100.0
+        )
+    }
+}
+
+/// Render how much the router knows about this peer for one stage.
+fn fmt_record(breakdown: Option<&Breakdown>) -> String {
+    match breakdown {
+        None => "&mdash; no curve yet".to_string(),
+        Some(breakdown) if breakdown.peer_evidence <= 0.0 => "no record yet".to_string(),
+        Some(breakdown) => format!("{:.1} effective outcomes", breakdown.peer_evidence),
+    }
+}
+
+/// The rows explaining one stage's estimate for this peer.
+fn breakdown_rows(stage: StageKind, breakdown: Option<&Breakdown>) -> String {
+    let row = |label: &str, value: &str| {
+        format!(r#"<div class="info-label">{label}</div><div class="info-value">{value}</div>"#)
+    };
+    let Some(b) = breakdown else {
+        let fallback = match stage {
+            StageKind::Failure => String::new(),
+            StageKind::ResponseTime | StageKind::TransferSpeed => {
+                " Until then routing uses the per-distance fit with this peer's running \
+                 correction (the charts below)."
+                    .to_string()
+            }
+        };
+        return row(
+            "Estimate",
+            &format!(
+                "&mdash; no curve yet (needs {} outcomes).{fallback}",
+                stage.needs()
+            ),
+        );
+    };
+    let mut rows = row("Distance curve at distance 0", &stage.render(b.curve));
+    let step = |before: f64, after: Option<f64>, note: String| match after {
+        Some(after) => format!(
+            "{} ({}){note}",
+            stage.render(after),
+            stage.change(before, after)
+        ),
+        None => "&mdash; no spread between peers measured yet".to_string(),
+    };
+    rows.push_str(&row(
+        "+ what every peer has in common",
+        &step(b.curve, b.after_all_peers, String::new()),
+    ));
+    let before_peer = b.after_all_peers.unwrap_or(b.curve);
+    rows.push_str(&row(
+        "+ this peer",
+        &step(
+            before_peer,
+            b.after_peer,
+            format!("; {}", fmt_evidence(b.peer_evidence, b.peer_weight)),
+        ),
+    ));
+    let before_band = b.after_peer.unwrap_or(before_peer);
+    rows.push_str(&row(
+        &format!(
+            "+ this peer on ring band {} ({:.3}&ndash;{:.3})",
+            b.band,
+            b.band as f64 / 8.0,
+            (b.band + 1) as f64 / 8.0
+        ),
+        &step(
+            before_band,
+            b.after_band,
+            format!("; {}", fmt_evidence(b.band_evidence, b.band_weight)),
+        ),
+    ));
+    match stage {
+        StageKind::Failure => {}
+        StageKind::ResponseTime | StageKind::TransferSpeed => {
+            // The router acts on the expectation, not the median: half the
+            // predictive log variance, added for time and subtracted for speed.
+            let half = b.spread / 2.0;
+            let factor = if stage == StageKind::ResponseTime {
+                half.exp()
+            } else {
+                (-half).exp()
+            };
+            rows.push_str(&row(
+                "Allowance for uncertainty",
+                &format!("&times;{factor:.2} (an average, not a typical case)"),
+            ));
+        }
+    }
+    let horizon = match b.horizon_hours {
+        Some(hours) => format!("forgets over {hours} h"),
+        None => "remembers its whole window".to_string(),
+    };
+    rows.push_str(&row(
+        "Estimate routing uses",
+        &format!(
+            "<strong>{}</strong> ({horizon})",
+            stage.render_estimate(b.estimate)
+        ),
+    ));
+    rows
+}
+
+/// Shown when `FREENET_ROUTING_FALLBACK_ISOTONIC` has routing on the emergency
+/// fallback, so no reading on the page is mistaken for the live algorithm.
+const FALLBACK_NOTE: &str = "<strong>Routing is on the emergency fallback</strong> \
+     (FREENET_ROUTING_FALLBACK_ISOTONIC is set): every estimate comes from the per-distance \
+     fit with a running per-peer correction. The estimates below are still computed, but \
+     routing does not use them.";
+
+/// The card that shows how the router builds its estimate for this peer.
+fn build_breakdown_card(breakdown: &[Option<Breakdown>; 3], fallback: bool) -> String {
+    let mut sections = String::new();
+    for (stage, breakdown) in StageKind::ALL.iter().zip(breakdown) {
+        write!(
+            sections,
+            r#"<h3 style="margin-top: 1em;">{title}</h3><div class="info-grid">{rows}</div>"#,
+            title = stage.title(),
+            rows = breakdown_rows(*stage, breakdown.as_ref()),
+        )
+        .ok();
+    }
+    let fallback_note = if fallback {
+        format!(
+            r#"<p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">{FALLBACK_NOTE}</p>"#
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="card">
+            <h2>How the Router Sees This Peer</h2>
+            <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The router&rsquo;s estimates for a contract at this peer&rsquo;s own location (distance 0), built up one level at a time. Each level adds an offset learned from outcomes, weighted by how much evidence stands behind it; &ldquo;adopted&rdquo; is how much of that level&rsquo;s own average the estimate took on. The last row of each is the number routing uses.</p>
+            {fallback_note}
+            {sections}
+        </div>"#
+    )
+}
+
+/// Top of the failure chart's y-axis, zoomed so every drawn line stays on
+/// screen. See [`failure_chart_y_max`].
+fn failure_axis_top(curve: &[(f64, f64)], line: PeerLine<'_>) -> f64 {
+    match line {
+        PeerLine::None => failure_chart_y_max(curve, None),
+        PeerLine::Adjustment(adjustment, _) => failure_chart_y_max(curve, Some(adjustment)),
+        PeerLine::Curve(points) => {
+            // Lift the axis by how far the peer's right edge sits above the
+            // curve's, exactly as an upward adjustment would.
+            let right_edge = |points: &[(f64, f64)]| {
+                points
+                    .iter()
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .map_or(0.0, |&(_, y)| y)
+            };
+            failure_chart_y_max(curve, Some(right_edge(points) - right_edge(curve)))
+        }
     }
 }
 
@@ -309,60 +470,46 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
     // Build routing model status card
     let model_card = if let Some(ref rs) = router_snapshot {
-        let state = Computation::of(rs);
         let total_events = rs.failure_events + rs.success_events;
-        let peer_failure_events = peer_routing
-            .as_ref()
-            .and_then(|pr| pr.failure_adjustment.map(|(_, c)| c))
-            .unwrap_or(0);
-        let peer_response_events = peer_routing
-            .as_ref()
-            .and_then(|pr| pr.response_time_adjustment.map(|(_, c)| c))
-            .unwrap_or(0);
-        let peer_transfer_events = peer_routing
-            .as_ref()
-            .and_then(|pr| pr.transfer_rate_adjustment.map(|(_, c)| c))
-            .unwrap_or(0);
+        let record = |stage: usize| {
+            fmt_record(
+                peer_routing
+                    .as_ref()
+                    .and_then(|pr| pr.breakdown[stage].as_ref()),
+            )
+        };
         format!(
             r#"<div class="card">
                 <h2>Routing Model</h2>
                 <div class="info-grid">
                     <div class="info-label">Prediction active</div><div class="info-value">{active}</div>
+                    <div class="info-label">Routing estimator</div><div class="info-value">{estimator}</div>
                     <div class="info-label">Global events</div><div class="info-value">{total}</div>
-                    <div class="info-label">This peer: failure</div><div class="info-value">{pf} events</div>
-                    <div class="info-label">This peer: response time</div><div class="info-value">{pr} events</div>
-                    <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
-                </div>
-                <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It learns from four features (peer, contract location, distance, time) what the distance-based estimate gets <em>wrong</em> for a particular peer and contract, and corrects it &mdash; catching patterns distance alone misses, such as a peer that drops requests for specific contracts. It corrects the <em>distance-only</em> estimate directly, taking over from the simpler per-peer offset rather than adding to it. How much of the correction is applied depends on how much nearby evidence supports it, so a query the model knows nothing about leaves the distance-only estimate untouched.</p>
-                <div class="info-grid">
-                    <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
-                    <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
-                    <div class="info-label">Transfer speed observations</div><div class="info-value">{rt}</div>
-                    <div class="info-label">Known peers</div><div class="info-value">{rp}</div>
-                    <div class="info-label">Predictions evaluated</div><div class="info-value">{n_eval}</div>
-                    <div class="info-label">Brier score (overall)</div><div class="info-value">{brier}</div>
-                    <div class="info-label">Brier score (recent)</div><div class="info-value">{recent_brier}</div>
+                    <div class="info-label">This peer: failure record</div><div class="info-value">{pf}</div>
+                    <div class="info-label">This peer: response-time record</div><div class="info-value">{pr}</div>
+                    <div class="info-label">This peer: transfer-speed record</div><div class="info-value">{pt}</div>
                 </div>
 
-                <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The first rows are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the end points, not the rows in order.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It replaces all of the above rather than adding to any of them, and is planned to replace them for good once it has proven itself. It is only computed while it routes or while the routing dataset is being recorded. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
+                <h3 style="margin-top: 1em;">How the router estimates</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">For each candidate peer the router estimates three things: the chance the request fails, the time to the first response, and the transfer speed. Each estimate starts from a <strong>distance curve</strong> fitted over the node&rsquo;s recent traffic, then adds an offset for the peer, and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It forgets old evidence at whichever rate has predicted best recently. The timing estimates need 30 timed responses before they have a curve; until then routing uses a simpler per-distance fit with a running per-peer correction.</p>
                 <div class="info-grid">
-                    <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
-                    <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
-                    <div class="info-label">&#8627; established: + Renegade blend{blend_note}</div><div class="info-value">{skill_blended}</div>
-                    <div class="info-label">&#8627; correction: distance only + residual{corrected_note}</div><div class="info-value">{skill_corrected}</div>
-                    <div class="info-label">Hierarchical: own curve + evidence-weighted offsets{hierarchical_note}</div><div class="info-value">{skill_hierarchical}</div>
-                    <div class="info-label">Scored predictions</div><div class="info-value">{layers_eval}</div>
-                    <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
-                    <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
-                    <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
-                    <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
-                    <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
+                    <div class="info-label">Failure data</div><div class="info-value">{stage_failure}</div>
+                    <div class="info-label">Response-time data</div><div class="info-value">{stage_response}</div>
+                    <div class="info-label">Transfer-speed data</div><div class="info-value">{stage_transfer}</div>
+                    <div class="info-label">Forgetting horizon (failure)</div><div class="info-value">{horizon}</div>
+                    <div class="info-label">Peer-table evictions</div><div class="info-value">{evictions}</div>
+                </div>
+
+                <h3 style="margin-top: 1em;">How good are the estimates?</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The failure estimate&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent. The timing rows compare the router&rsquo;s estimates, in seconds, with the per-distance fit&rsquo;s on the same responses.</p>
+                <div class="info-grid">
+                    <div class="info-label">Failure-estimate skill</div><div class="info-value">{skill}</div>
+                    <div class="info-label">Brier score</div><div class="info-value">{brier}</div>
+                    <div class="info-label">Scored predictions</div><div class="info-value">{evaluated}</div>
                     <div class="info-label">Response-time error, RMS seconds</div><div class="info-value">{timing_error}</div>
                     <div class="info-label">Transfer-time error, RMS seconds</div><div class="info-value">{transfer_error}</div>
+                    <div class="info-label">Response-time log residuals</div><div class="info-value">{shape_response}</div>
+                    <div class="info-label">Transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
                 </div>
 
                 <h3 style="margin-top: 1em;">Is the candidate window too narrow?</h3>
@@ -374,28 +521,43 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">&#8627; chose from the farthest quarter</div><div class="info-value">{rank_far}</div>
                 </div>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.5em;">{rank_reading}</p>
-
-                <h3 style="margin-top: 1em;">Correction state</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">These are learned from the data, not configured &mdash; both are chosen by scoring candidate values against what actually happened, and both will change as the network does. <em>&kappa;</em> is how much evidence the correction demands before it applies half of itself; the bandwidth is the distance in feature space beyond which neighbouring observations stop counting as nearby.</p>
-                <div class="info-grid">
-                    <div class="info-label">Reaching routing decisions</div><div class="info-value">{corr_enabled}</div>
-                    <div class="info-label">Selected &kappa;</div><div class="info-value">{kappa}</div>
-                    <div class="info-label">Kernel bandwidth</div><div class="info-value">{bandwidth}</div>
-                    <div class="info-label">Residual observations: failure</div><div class="info-value">{res_f}</div>
-                    <div class="info-label">Residual observations: response time</div><div class="info-value">{res_r}</div>
-                    <div class="info-label">Residual observations: transfer speed</div><div class="info-value">{res_t}</div>
-                    <div class="info-label">Corrections scored</div><div class="info-value">{res_scored}</div>
-                </div>
             </div>"#,
             active = if rs.prediction_active { "Yes" } else { "No" },
+            estimator = if rs.isotonic_fallback_enabled {
+                "<strong>emergency fallback</strong>: the per-distance fit with a running \
+                 per-peer correction (FREENET_ROUTING_FALLBACK_ISOTONIC is set); the estimates \
+                 below are computed but not used"
+            } else {
+                "hierarchical: evidence-weighted, described below"
+            },
             total = total_events,
-            pf = peer_failure_events,
-            pr = peer_response_events,
-            pt = peer_transfer_events,
-            rf = rs.renegade_failure_events,
-            rr = fmt_stage_events(rs.renegade_response_time_events),
-            rt = fmt_stage_events(rs.renegade_transfer_speed_events),
-            rp = rs.renegade_known_peers,
+            pf = record(0),
+            pr = record(1),
+            pt = record(2),
+            stage_failure = fmt_stage_status(
+                StageKind::Failure,
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_active
+            ),
+            stage_response = fmt_stage_status(
+                StageKind::ResponseTime,
+                rs.hierarchical_response_time_events,
+                rs.hierarchical_response_time_active
+            ),
+            stage_transfer = fmt_stage_status(
+                StageKind::TransferSpeed,
+                rs.hierarchical_transfer_speed_events,
+                rs.hierarchical_transfer_speed_active
+            ),
+            horizon = fmt_horizon(
+                rs.hierarchical_failure_active,
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_horizon_hours,
+            ),
+            evictions = fmt_evictions(
+                rs.hierarchical_peer_evictions,
+                rs.hierarchical_peer_capacity
+            ),
             base_rate = rs
                 .failure_base_rate
                 .map(|b| format!("{:.2}%", b * 100.0))
@@ -404,87 +566,29 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 .failure_climatology_brier
                 .map(|b| format!("{:.4}", b))
                 .unwrap_or_else(|| "\u{2014}".to_string()),
-            skill_global = fmt_skill(rs.failure_skill_global),
-            skill_adjusted = fmt_skill(rs.failure_skill_adjusted),
-            skill_blended = fmt_skill(rs.failure_skill_blended),
-            skill_corrected = fmt_skill(rs.failure_skill_corrected),
-            blend_note = if rs.hierarchical_routing_enabled && rs.residual_correction_enabled {
-                SUPERSEDED_BY_BOTH
-            } else if rs.hierarchical_routing_enabled {
-                SUPERSEDED_BY_HIERARCHICAL
-            } else if rs.residual_correction_enabled {
-                " &mdash; superseded"
-            } else {
-                " &mdash; in use"
-            },
-            corrected_note = if rs.hierarchical_routing_enabled {
-                SUPERSEDED_BY_HIERARCHICAL
-            } else if rs.residual_correction_enabled {
-                " &mdash; in use"
-            } else {
-                " &mdash; measured, not applied"
-            },
-            skill_hierarchical =
-                hierarchical_reading(state, || fmt_skill(rs.failure_skill_hierarchical)),
-            hierarchical_note = if rs.hierarchical_routing_enabled {
-                " &mdash; in use"
-            } else {
-                match state {
-                    Computation::Live => " &mdash; measured, not applied",
-                    Computation::Frozen | Computation::RecorderStoppedEmpty => " &mdash; stopped",
-                    Computation::RecorderOpenFailed => " &mdash; recorder failed to open",
-                    Computation::Never => " &mdash; off",
+            skill = fmt_skill(rs.failure_skill_hierarchical),
+            brier = match (rs.failure_brier, rs.failure_climatology_brier) {
+                (Some(brier), Some(climatology)) => {
+                    format!("{brier:.4} (assuming the average scores {climatology:.4})")
                 }
+                (Some(brier), None) => format!("{brier:.4}"),
+                _ => "\u{2014}".to_string(),
             },
-            shape_response = hierarchical_reading(state, || {
-                fmt_log_shape(&rs.hierarchical_response_time_log_shape)
-            }),
-            shape_transfer = hierarchical_reading(state, || {
-                fmt_log_shape(&rs.hierarchical_transfer_speed_log_shape)
-            }),
-            hierarchical_evictions = hierarchical_reading(state, || {
-                fmt_evictions(
-                    rs.hierarchical_peer_evictions,
-                    rs.hierarchical_peer_capacity,
-                )
-            }),
-            hierarchical_eval =
-                hierarchical_reading(state, || { rs.hierarchical_failure_evaluated.to_string() }),
-            timing_error = hierarchical_reading(state, || fmt_seconds_error(
-                rs.response_time_rmse_secs_legacy,
+            evaluated = rs.hierarchical_failure_evaluated,
+            timing_error = fmt_seconds_error(
+                rs.response_time_rmse_secs_isotonic,
                 rs.response_time_rmse_secs_hierarchical,
                 rs.response_time_scored,
                 rs.response_time_weight
-            )),
-            transfer_error = hierarchical_reading(state, || fmt_seconds_error(
-                rs.transfer_time_rmse_secs_legacy,
+            ),
+            transfer_error = fmt_seconds_error(
+                rs.transfer_time_rmse_secs_isotonic,
                 rs.transfer_time_rmse_secs_hierarchical,
                 rs.transfer_time_scored,
                 rs.transfer_time_weight
-            )),
-            hierarchical_horizon = hierarchical_reading(state, || fmt_horizon(
-                rs.hierarchical_failure_active,
-                rs.hierarchical_failure_events,
-                rs.hierarchical_failure_horizon_hours,
-            )),
-            layers_eval = rs.failure_layers_evaluated,
-            corr_enabled = if rs.residual_correction_enabled {
-                "Yes"
-            } else {
-                "No \u{2014} measuring only"
-            },
-            kappa = rs
-                .residual_kappa
-                .map(|k| format!("{:.1}", k))
-                .unwrap_or_else(|| "\u{2014}".to_string()),
-            bandwidth = rs
-                .residual_bandwidth
-                .map(|b| format!("{:.4}", b))
-                .unwrap_or_else(|| "not yet estimated".to_string()),
-            res_f = rs.residual_failure_events,
-            res_r = rs.residual_response_time_events,
-            res_t = rs.residual_transfer_speed_events,
-            res_scored = rs.residual_scored,
+            ),
+            shape_response = fmt_log_shape(&rs.hierarchical_response_time_log_shape),
+            shape_transfer = fmt_log_shape(&rs.hierarchical_transfer_speed_log_shape),
             window = rs.consider_n_closest_peers,
             rank_total = rs.selection_ranks.total,
             rank_mean = rs
@@ -499,18 +603,22 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 .map(|share| format!("{:.1}%", share * 100.0))
                 .unwrap_or_else(|| "&mdash;".to_string()),
             rank_reading = fmt_window_reading(rs.selection_ranks.far_quarter_share()),
-            brier = rs
-                .renegade_brier_score
-                .map(|b| format!("{:.4}", b))
-                .unwrap_or_else(|| "—".to_string()),
-            recent_brier = rs
-                .renegade_recent_brier_score
-                .map(|b| format!("{:.4}", b))
-                .unwrap_or_else(|| "—".to_string()),
-            n_eval = rs.renegade_predictions_evaluated,
         )
     } else {
         r#"<div class="card"><h2>Routing Model</h2><p class="empty">Router data not available</p></div>"#.to_string()
+    };
+
+    // Whether routing is on the emergency isotonic fallback.
+    let fallback = router_snapshot
+        .as_ref()
+        .is_some_and(|rs| rs.isotonic_fallback_enabled);
+
+    // How the router builds its estimate for this peer, level by level.
+    let breakdown_card = match &peer_routing {
+        Some(pr) if pr.breakdown.iter().any(Option::is_some) => {
+            build_breakdown_card(&pr.breakdown, fallback)
+        }
+        _ => String::new(),
     };
 
     // Build SVG charts with per-operation-type tabs
@@ -524,7 +632,37 @@ pub fn peer_detail_html(address_str: &str) -> String {
         let xfer_adj = peer_routing
             .as_ref()
             .and_then(|pr| pr.transfer_rate_adjustment.map(|(m, _)| m));
+        let peer_curves = peer_routing.as_ref().map(|pr| &pr.peer_curves);
         let ploc = peer.location;
+
+        // What the All tab draws for one stage: the hierarchical curves once the
+        // stage has one (they are what routing uses), otherwise the isotonic fit
+        // with this peer's EWMA adjustment (which routing uses meanwhile). The
+        // mode per chart MUST match the router's (`Router::new`): failure and
+        // transfer additive, response time multiplicative.
+        let all_tab = |stage: usize,
+                       hierarchical: &[(f64, f64)],
+                       adjustment: Option<f64>,
+                       mode: AdjustmentMode| {
+            // On the emergency fallback routing reads the isotonic fit for
+            // every stage, so that is what the chart shows.
+            if hierarchical.is_empty() || rs.isotonic_fallback_enabled {
+                (
+                    false,
+                    adjustment.map_or(PeerLine::None, |adj| PeerLine::Adjustment(adj, mode)),
+                )
+            } else {
+                let own = peer_curves.map_or(&[][..], |curves| curves[stage].as_slice());
+                (
+                    true,
+                    if own.is_empty() {
+                        PeerLine::None
+                    } else {
+                        PeerLine::Curve(own)
+                    },
+                )
+            }
+        };
 
         // Build tab content for each operation type
         let tab_names = ["All", "GET", "PUT", "UPDATE", "SUBSCRIBE"];
@@ -599,6 +737,44 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 )
             };
 
+            // Per stage: the curve to draw and this peer's line. The per-op tabs
+            // break the isotonic fit down by operation type and draw no peer line.
+            let hierarchical = &rs.hierarchical_curves;
+            let (f_curve, f_line) = if tab_name == "All" {
+                match all_tab(0, &hierarchical.failure, fail_adj, AdjustmentMode::Additive) {
+                    (true, line) => (hierarchical.failure.as_slice(), line),
+                    (false, line) => (f_curve, line),
+                }
+            } else {
+                (f_curve, PeerLine::None)
+            };
+            let (rt_curve, rt_line) = if tab_name == "All" {
+                match all_tab(
+                    1,
+                    &hierarchical.response_time,
+                    rt_adj,
+                    AdjustmentMode::Multiplicative,
+                ) {
+                    (true, line) => (hierarchical.response_time.as_slice(), line),
+                    (false, line) => (rt_curve, line),
+                }
+            } else {
+                (rt_curve, PeerLine::None)
+            };
+            let (xfer_curve, xfer_line) = if tab_name == "All" {
+                match all_tab(
+                    2,
+                    &hierarchical.transfer_speed,
+                    xfer_adj,
+                    AdjustmentMode::Additive,
+                ) {
+                    (true, line) => (hierarchical.transfer_speed.as_slice(), line),
+                    (false, line) => (xfer_curve, line),
+                }
+            } else {
+                (xfer_curve, PeerLine::None)
+            };
+
             // Tab label with event count badge
             let count_badge = if event_count > 0 {
                 format!(r#" <span class="tab-count">{event_count}</span>"#)
@@ -637,28 +813,15 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 // dashboard regression that surfaced this code path).
                 // Failure probabilities are tiny, so a fixed 0.0–1.0 axis
                 // squashes the curve flat against the bottom. Zoom the top of
-                // the axis to 2x the curve's value at the right edge of the
-                // plot so the line is legible. See failure_chart_y_max.
-                let fail_y_max =
-                    failure_chart_y_max(f_curve, if tab_name == "All" { fail_adj } else { None })
-                        .to_string();
-                // The adjustment mode per chart MUST match the router's choice for
-                // that estimator (see `Router::new`): failure + transfer are
-                // additive, response time is multiplicative. The dashboard renders
-                // the peer-adjusted curve with this mode, so a wrong mode would draw
-                // a curve of the wrong SHAPE vs the router's prediction. (The curve
-                // is intentionally a *preview*: the dashboard draws it whenever an
-                // adjustment exists, while the router only applies it once the peer
-                // has `MIN_POINTS_FOR_REGRESSION` effective observations.) When
-                // #4547 flips transfer rate to multiplicative, update its mode here
-                // too — the mode is mirrored, not read from the snapshot.
+                // the axis to 2x the drawn lines' value at the right edge of the
+                // plot so they are legible. See failure_chart_y_max.
+                let fail_y_max = failure_axis_top(f_curve, f_line).to_string();
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
                     f_points,
                     f_range,
-                    if tab_name == "All" { fail_adj } else { None },
-                    AdjustmentMode::Additive,
+                    f_line,
                     ploc,
                     "0.0",
                     &fail_y_max,
@@ -669,8 +832,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     rt_curve,
                     rt_points,
                     rt_range,
-                    if tab_name == "All" { rt_adj } else { None },
-                    AdjustmentMode::Multiplicative,
+                    rt_line,
                     ploc,
                     "0",
                     "auto",
@@ -681,8 +843,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     xfer_curve,
                     xfer_points,
                     xfer_range,
-                    if tab_name == "All" { xfer_adj } else { None },
-                    AdjustmentMode::Additive,
+                    xfer_line,
                     ploc,
                     // Transfer rate is a positive B/s value: floor at 0, auto-scale
                     // the top. (Was "auto"/"0", which clamped the max to 0 and gave a
@@ -708,19 +869,20 @@ pub fn peer_detail_html(address_str: &str) -> String {
             r#"<div class="card">
                 <h2>Outcomes vs Distance</h2>
                 <p style="font-size:0.8em;color:var(--text-muted);">
-                    Actual observed outcomes (dots) against ring distance to the contract, with the
-                    isotonic fit overlaid (the All tab is the aggregate the router uses; per-op tabs
-                    just break it down and are not consulted separately). "Peer-adjusted" applies this
-                    peer's running EWMA correction to that fit — a multiplicative factor for response
-                    time, an additive offset for failure and transfer rate. How tightly the dots hug a monotonic
-                    curve shows how well distance alone predicts the outcome. A separate Renegade
-                    model is blended into the final estimate; its accuracy is in the Prediction
-                    Accuracy panel below.
+                    Actual observed outcomes (dots) against ring distance to the contract. On the
+                    All tab the lines are what routing uses: the <strong>distance curve</strong> is
+                    the estimate for a peer the router has no record of, and <strong>this peer</strong>
+                    adds what it has learned about this one (ring-band effects left out; they are in
+                    the card above). A timing estimate needs 30 timed responses before it has such a
+                    curve; until then its chart shows the simpler per-distance fit and this peer&rsquo;s
+                    running correction, which is what routing uses meanwhile. The per-operation tabs
+                    break the per-distance fit down by operation type for comparison; routing does
+                    not consult them separately.
                 </p>
                 <p class="chart-legend">
                     <span class="chart-key"><span class="chart-dot chart-dot-actual"></span> Actual outcomes</span>
-                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Isotonic fit</span>
-                    <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Distance curve</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> This peer</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-loc"></span> Peer location</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-ext"></span> Extrapolated</span>
                 </p>
@@ -736,15 +898,14 @@ pub fn peer_detail_html(address_str: &str) -> String {
         String::new()
     };
 
-    // Build the renegade prediction-accuracy panel (failure + timing models)
-    let renegade_chart = if let Some(ref rs) = router_snapshot {
-        build_renegade_accuracy_panel(
-            // The chart derives its own score from these pairs. Passing one in
-            // was the bug: every score available to pass describes a different
-            // window from the one drawn.
-            &rs.renegade_accuracy_pairs,
-            &rs.renegade_response_time_pairs,
-            &rs.renegade_transfer_speed_pairs,
+    // How the router's recent estimates matched what happened.
+    let accuracy_chart = if let Some(ref rs) = router_snapshot {
+        build_accuracy_panel(
+            // The chart derives its own score from these pairs, so the score
+            // always describes the window drawn.
+            &rs.hierarchical_failure_pairs,
+            &rs.hierarchical_response_time_pairs,
+            &rs.hierarchical_transfer_speed_pairs,
         )
     } else {
         String::new()
@@ -787,9 +948,10 @@ pub fn peer_detail_html(address_str: &str) -> String {
         version = html_escape(version),
         info_card = info_card,
         model_card = model_card,
-        charts = charts,
-        renegade_chart = renegade_chart,
         prediction_card = prediction_card,
+        breakdown_card = breakdown_card,
+        charts = charts,
+        accuracy_chart = accuracy_chart,
     )
 }
 
@@ -861,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_rendering_flags_churn_and_says_when_not_computed() {
+    fn eviction_rendering_flags_churn() {
         assert_eq!(fmt_evictions(0, 400), "0 (capacity 400 per stage)");
         let churning = fmt_evictions(12, 400);
         assert!(
@@ -870,17 +1032,44 @@ mod tests {
         );
     }
 
-    /// The layer copy must not promise that evidence alone moves the estimate:
-    /// with no measured between-peer spread, a peer seen thousands of times
-    /// does not move it at all.
-    #[test]
-    fn layer_panel_does_not_overstate_what_evidence_buys() {
+    /// The page source from the rendering function to the test module, so a
+    /// scrape cannot match this module's own literals.
+    fn rendering_source() -> &'static str {
         let source = include_str!("peer_detail.rs");
         let start = source.find("pub fn peer_detail_html").unwrap();
         let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
-        let render = &source[start..end];
+        &source[start..end]
+    }
+
+    /// The copy must not promise that evidence alone moves the estimate: with
+    /// no measured between-peer spread, a peer seen thousands of times does not
+    /// move it at all.
+    #[test]
+    fn model_panel_does_not_overstate_what_evidence_buys() {
+        let render = rendering_source();
         assert!(!render.contains("moves it fully"));
         assert!(render.contains("if peers turn out not to differ, not at all"));
+    }
+
+    /// The page shows the live algorithm: nothing on it may describe the
+    /// removed legacy stack as if it still ran (#4485).
+    #[test]
+    fn peer_page_describes_only_the_live_estimator() {
+        let source = include_str!("peer_detail.rs");
+        let production = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        for removed in [
+            "Renegade",
+            "renegade",
+            "residual correction",
+            "Correction state",
+            "Which layer is doing the work",
+            "FREENET_ROUTING_HIERARCHICAL",
+        ] {
+            assert!(
+                !production.contains(removed),
+                "the peer page still mentions {removed:?}, which no longer routes"
+            );
+        }
     }
 
     #[test]
@@ -893,53 +1082,11 @@ mod tests {
         );
         assert!(fmt_seconds_error(Some(0.1), Some(0.2), 400, 400.0).contains("hierarchical worse"));
         assert!(fmt_seconds_error(None, Some(0.2), 0, 0.0).contains("no event"));
-    }
-
-    /// Every hierarchical reading in the layer panel must go through the
-    /// computed check, so a stopped recorder cannot leave frozen counts on show.
-    #[test]
-    fn every_hierarchical_reading_is_gated_on_computation() {
-        let source = include_str!("peer_detail.rs");
-        let start = source.find("pub fn peer_detail_html").unwrap();
-        let end = start + source[start..].find("\n#[cfg(test)]").unwrap();
-        let render = &source[start..end];
-        for binding in [
-            "skill_hierarchical =",
-            "hierarchical_eval =",
-            "hierarchical_horizon =",
-            "hierarchical_evictions =",
-            "shape_response =",
-            "shape_transfer =",
-            "timing_error =",
-            "transfer_error =",
-        ] {
-            let at = render
-                .find(binding)
-                .unwrap_or_else(|| panic!("{binding} must be rendered"));
-            let next = render[at + binding.len()..]
-                .find(" = ")
-                .map_or(render.len(), |offset| at + binding.len() + offset);
-            assert!(
-                render[at..next].contains("hierarchical_reading(state"),
-                "{binding} must render through hierarchical_reading"
-            );
-        }
-    }
-
-    #[test]
-    fn hierarchical_readings_are_labelled_live_frozen_or_absent() {
-        let live = || "0.123".to_string();
-        assert_eq!(hierarchical_reading(Computation::Live, live), "0.123");
-        let frozen = hierarchical_reading(Computation::Frozen, live);
+        let numbers = fmt_seconds_error(Some(0.2), Some(0.1), 400, 400.0);
         assert!(
-            frozen.contains("frozen") && frozen.contains("0.123"),
-            "a stopped soak's final numbers must stay visible, labelled: {frozen}"
-        );
-        let never = hierarchical_reading(Computation::Never, live);
-        assert!(never.contains("not computed") && !never.contains("0.123"));
-        assert!(
-            !NOT_COMPUTED.contains("  "),
-            "no runs of spaces in the copy"
+            numbers.contains("hierarchical 100.0 ms")
+                && numbers.contains("isotonic fallback 200.0 ms"),
+            "each figure must sit beside its model's name: {numbers}"
         );
     }
 
@@ -955,16 +1102,6 @@ mod tests {
         );
         let enough = fmt_seconds_error(Some(0.2), Some(0.1), 150, min);
         assert!(enough.contains("hierarchical no worse"), "{enough}");
-    }
-
-    #[test]
-    fn a_recorder_stopped_before_any_event_is_not_told_to_set_the_variable() {
-        let stopped = hierarchical_reading(Computation::RecorderStoppedEmpty, || "x".to_string());
-        assert!(stopped.contains("stopped") && !stopped.contains("set FREENET_ROUTING_DATASET"));
-        let never = hierarchical_reading(Computation::Never, || "x".to_string());
-        assert!(never.contains("FREENET_ROUTING_DATASET"));
-        let failed = hierarchical_reading(Computation::RecorderOpenFailed, || "x".to_string());
-        assert!(failed.contains("could not be opened") && !failed.contains("set FREENET"));
     }
 
     #[test]
@@ -1013,12 +1150,6 @@ mod tests {
             inactive.contains("not active yet") && !inactive.contains("whole window"),
             "a stage with no curve must not read as forgetting nothing: {inactive}"
         );
-        let frozen_inactive =
-            hierarchical_reading(Computation::Frozen, || fmt_horizon(false, 3, None));
-        assert!(
-            frozen_inactive.contains("frozen") && frozen_inactive.contains("not active yet"),
-            "frozen while inactive: {frozen_inactive}"
-        );
         let whole = fmt_horizon(true, 120, None);
         assert!(
             whole.contains("whole window"),
@@ -1059,105 +1190,123 @@ mod tests {
         assert!(fmt_window_reading(Some(0.05)).contains("5%"));
     }
 
+    /// A timing stage without a curve is estimated by the isotonic fallback,
+    /// and the row must say so rather than read as broken. The threshold named
+    /// is the one the estimator uses.
     #[test]
-    fn stage_events_marks_an_inactive_stage_at_the_boundary() {
-        // Both nova gateways sit below the floor for transfer speed
-        // permanently, so this is the normal case rather than an edge one.
-        assert!(fmt_stage_events(0).contains("inactive"));
-        assert!(fmt_stage_events(9).contains("inactive"));
+    fn stage_status_names_the_threshold_and_the_fallback() {
+        let cold = fmt_stage_status(StageKind::ResponseTime, 29, false);
         assert!(
-            fmt_stage_events(9).contains("10"),
-            "an inactive stage must name the threshold it needs"
+            cold.contains("needs 30") && cold.contains("per-distance fit"),
+            "{cold}"
         );
-        // Exactly at the floor the stage IS active — an off-by-one here would
-        // label a working stage broken.
-        assert_eq!(fmt_stage_events(10), "10");
-        assert_eq!(fmt_stage_events(4155), "4155");
+        let cold_failure = fmt_stage_status(StageKind::Failure, 3, false);
+        assert!(
+            cold_failure.contains("needs 5") && !cold_failure.contains("per-distance fit"),
+            "the failure stage has no fallback to name: {cold_failure}"
+        );
+        assert_eq!(
+            fmt_stage_status(StageKind::TransferSpeed, 30, true),
+            "30 outcomes in the window"
+        );
     }
 
-    /// Pins that the layer panel presents the correction as a BRANCH off the
-    /// distance-only estimate, not as another term stacked on the per-peer
-    /// offset.
-    ///
-    /// It is stacked in neither the code nor the copy, but it was in the copy
-    /// until the B5 change flipped the composition and this panel was not
-    /// updated with it. The label read "+ residual correction" directly beneath
-    /// "+ per-peer adjustment", which invites exactly the wrong comparison —
-    /// reading down the rows as a running total when the last row branches off
-    /// the first.
     #[test]
-    fn layer_panel_does_not_present_the_correction_as_stacking() {
-        let source = include_str!("peer_detail.rs");
-        // Scope to the RENDERING FUNCTION before searching for anything, so the
-        // scrape cannot anchor on this test's own literals, on a second panel
-        // introduced earlier in the file, or on text that is never rendered.
-        // Proving the match merely precedes the test module is weaker: it still
-        // permits the pin to validate dead copy while the real panel regresses.
-        let render_start = source
-            .find("pub fn peer_detail_html")
-            .expect("the rendering function must exist");
-        let render_end = source[render_start..]
-            .find("\n#[cfg(test)]")
-            .map(|offset| render_start + offset)
-            .expect("the test module must follow the rendering function");
-        let source = &source[render_start..render_end];
+    fn evidence_rendering_distinguishes_no_record_from_little() {
+        assert_eq!(fmt_evidence(0.0, 0.0), "no record");
+        assert_eq!(
+            fmt_evidence(12.34, 0.65),
+            "12.3 effective outcomes, 65% adopted"
+        );
+    }
 
-        let panel_start = source
-            .find("Which layer is doing the work?")
-            .expect("the layer panel heading must exist inside peer_detail_html");
-        let panel_end = source[panel_start..]
-            .find("Correction state")
-            .map(|offset| panel_start + offset)
-            .expect("the correction-state heading must follow the layer panel");
-        let panel = &source[panel_start..panel_end];
+    fn breakdown(estimate: f64) -> Breakdown {
+        Breakdown {
+            curve: (0.1f64).ln(),
+            after_all_peers: Some((0.1f64).ln()),
+            after_peer: Some((0.2f64).ln()),
+            after_band: Some((0.2f64).ln()),
+            peer_evidence: 12.0,
+            peer_weight: 0.5,
+            band_evidence: 0.0,
+            band_weight: 0.0,
+            band: 3,
+            spread: 0.5,
+            horizon_hours: Some(6.0),
+            estimate,
+        }
+    }
 
+    /// The breakdown shows each level as a readable value with the change it
+    /// made, the evidence behind it, and ends on the number routing uses.
+    #[test]
+    fn breakdown_rows_walk_the_levels_to_the_routing_estimate() {
+        let rows = breakdown_rows(StageKind::ResponseTime, Some(&breakdown(0.257)));
+        assert!(rows.contains("100.0 ms"), "the curve in ms: {rows}");
+        assert!(rows.contains("&times;2.00"), "this peer doubles it: {rows}");
         assert!(
-            panel.contains("two routes from the same starting point"),
-            "the panel must say the rows are alternative routes, not a running total"
+            rows.contains("12.0 effective outcomes, 50% adopted"),
+            "{rows}"
         );
-        // Scoped to the correction's own paragraph: the hierarchical paragraph
-        // also says "replaces", which would satisfy a panel-wide search even if
-        // the correction's wording regressed.
-        let routes_start = panel
-            .find("two routes from the same starting point")
-            .expect("the routes paragraph exists");
-        let paragraph_start = panel[..routes_start]
-            .rfind("<p")
-            .expect("the routes sentence sits in a paragraph");
-        let paragraph_end = panel[routes_start..]
-            .find("</p>")
-            .map(|offset| routes_start + offset)
-            .expect("the routes paragraph closes");
-        let correction_paragraph = &panel[paragraph_start..paragraph_end];
+        assert!(rows.contains("ring band 3 (0.375&ndash;0.500)"), "{rows}");
         assert!(
-            correction_paragraph.contains("<strong>replaces</strong> the per-peer offset"),
-            "the correction paragraph must say the correction REPLACES the per-peer offset"
+            rows.contains("&times;1.28"),
+            "exp(0.25) uncertainty: {rows}"
         );
+        assert!(rows.contains("<strong>257.0 ms</strong>"), "{rows}");
+        assert!(rows.contains("forgets over 6 h"), "{rows}");
+
+        let failure = Breakdown {
+            curve: 0.02,
+            after_all_peers: None,
+            after_peer: None,
+            after_band: None,
+            spread: 0.0,
+            ..breakdown(0.02)
+        };
+        let rows = breakdown_rows(StageKind::Failure, Some(&failure));
+        assert!(rows.contains("2.00%"), "{rows}");
         assert!(
-            !correction_paragraph.contains("hierarchical"),
-            "the correction paragraph must be its own paragraph"
-        );
-        assert!(
-            panel.contains("separate, self-contained model")
-                && panel.contains("replaces all of the above"),
-            "the hierarchical row must be presented as its own model that replaces \
-             the others, not as another step in a running total"
-        );
-        assert!(
-            panel.contains("{skill_hierarchical}"),
-            "the hierarchical skill must be rendered inside the layer panel"
+            rows.contains("no spread between peers measured yet"),
+            "{rows}"
         );
         assert!(
-            !panel.contains(r#"<div class="info-label">+ hierarchical"#)
-                && !panel.contains(r#"<div class="info-label">&#8627; hierarchical"#)
-                && !panel.contains(r#"<div class="info-label">&#8627; Hierarchical"#),
-            "the hierarchical row must not be labelled as a branch of, or a term \
-             added to, the rows above it"
+            !rows.contains("Allowance for uncertainty"),
+            "a probability carries no expectation allowance: {rows}"
         );
+    }
+
+    #[test]
+    fn breakdown_rows_name_the_fallback_for_a_cold_timing_stage() {
+        let cold = breakdown_rows(StageKind::TransferSpeed, None);
         assert!(
-            !panel.contains(r#"<div class="info-label">+ residual correction"#),
-            "the corrected row must not be labelled with a leading '+', which \
-             reads as another term added to the row above it"
+            cold.contains("needs 30") && cold.contains("per-distance fit"),
+            "{cold}"
         );
+    }
+
+    /// On the emergency fallback the breakdown card says its numbers are not
+    /// what routing uses; otherwise it says nothing of the kind.
+    #[test]
+    fn breakdown_card_says_when_routing_is_on_the_fallback() {
+        let on = build_breakdown_card(&[None, None, None], true);
+        assert!(
+            on.contains("emergency fallback") && on.contains("does not use them"),
+            "{on}"
+        );
+        let off = build_breakdown_card(&[None, None, None], false);
+        assert!(!off.contains("emergency fallback"), "{off}");
+    }
+
+    /// The failure axis stays zoomed to the drawn lines: a peer curve above
+    /// the distance curve lifts it, one below does not lower it.
+    #[test]
+    fn failure_axis_keeps_the_peer_curve_on_screen() {
+        let curve = [(0.0, 0.001), (0.5, 0.02)];
+        let above = [(0.0, 0.002), (0.5, 0.05)];
+        let below = [(0.0, 0.0), (0.5, 0.01)];
+        assert!((failure_axis_top(&curve, PeerLine::Curve(&above)) - 0.10).abs() < 1e-9);
+        assert!((failure_axis_top(&curve, PeerLine::Curve(&below)) - 0.04).abs() < 1e-9);
+        assert!((failure_axis_top(&curve, PeerLine::None) - 0.04).abs() < 1e-9);
     }
 }

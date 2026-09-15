@@ -3,8 +3,8 @@
 //!
 //! # Why this exists
 //!
-//! Every question about which failure predictor is better — the legacy blend,
-//! the residual correction, or a design not yet written — is ultimately a
+//! Every question about which failure predictor is better — the hierarchical
+//! estimator, the isotonic baseline, or a design not yet written — is ultimately a
 //! question about real traffic, and a synthetic harness can only answer it for
 //! the structure it was built to contain. The router's inputs are small: one
 //! [`RouteEvent`](super::RouteEvent) per observed outcome. Recording that
@@ -112,11 +112,12 @@ const MARKER_RESERVE: u64 = 512;
 
 /// The single clock every record is stamped with.
 ///
-/// Host wall clock, deliberately not `TimeSource`: the predictor this data
-/// exists to replay derives its own time feature from the host wall clock
-/// (`routing_predictor::wall_clock_hours`), so a replay needs records on that
-/// same clock. Route events and peer snapshots MUST share this function, or they
-/// stop joining the moment either side's clock is changed.
+/// Host wall clock, deliberately not `TimeSource`: the records are joined
+/// offline against node logs, telemetry and each other, all of which carry
+/// host time. (The Renegade predictor this data was first recorded for also
+/// read the host wall clock; it was removed in #4485.) Route events and peer
+/// snapshots MUST share this function, or they stop joining the moment either
+/// side's clock is changed.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -149,33 +150,34 @@ pub(crate) enum RouteSource {
     Relay,
 }
 
-/// What every failure layer forecast for an event, before ingesting it.
+/// What the forecasts for an event were, before ingesting it.
+///
+/// Until #4485 removed the legacy routing stack this also carried `blended`
+/// (the fixed-weight Renegade blend), `corrected` (the residual correction)
+/// and the correction's `lambda` and `n_eff`. Records written by earlier builds
+/// still have them; the `*_legacy` timing fields below changed meaning at the
+/// same point (see their docs).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub(crate) struct FailureForecasts {
     /// The global isotonic distance curve.
     pub global: f64,
     /// The global curve with the per-peer EWMA adjustment.
     pub adjusted: f64,
-    /// The legacy fixed-weight blend of `adjusted` with Renegade.
-    pub blended: f64,
-    /// The residual correction composed on the global curve.
-    pub corrected: f64,
-    /// Shrinkage applied to the correction, when one was formed.
-    pub lambda: Option<f64>,
-    /// Effective evidence behind the correction, when one was formed.
-    pub n_eff: Option<f64>,
-    /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
+    /// The hierarchical empirical-Bayes estimator (#4485), once it has a
+    /// curve: the failure probability routing acts on.
     pub hierarchical: Option<f64>,
     /// FLOORED AT 1 ms: every `log_response_time_*` field is `ln(max(t, 0.001))`,
     /// while routing acts on the unfloored value and `time_to_response_start_s`
     /// is recorded raw. Floor `time_to_response_start_s` the same way before any
     /// log-scale scoring against these, or a 0 s outcome becomes `-inf`.
     ///
-    /// `ln(seconds)` to response start the legacy stack would act on (including
-    /// the residual correction when that flag is on), forecast for every event
-    /// whether or not it turns out to be timed, so timing can be scored offline
-    /// on the timed subset. `None` without a timing estimate, and recorded only
-    /// while the hierarchical estimator is computed.
+    /// `ln(seconds)` to response start of the isotonic estimate with the
+    /// per-peer EWMA, the one a timing stage without a hierarchical curve falls
+    /// back to, forecast for every event whether or not it turns out to be
+    /// timed, so timing can be scored offline on the timed subset. `None`
+    /// without a timing estimate. Named `legacy` because it is what remains of
+    /// the legacy stack: builds before #4485's removal recorded the Renegade
+    /// blend here (and the residual correction when that flag was on).
     pub log_response_time_legacy: Option<f64>,
     /// The same forecast from the hierarchical estimator: `ln E[T]`, the value
     /// routing would act on, not the log-scale location.
@@ -632,18 +634,6 @@ pub(crate) fn global() -> Option<&'static RoutingDataset> {
     None
 }
 
-/// Whether `FREENET_ROUTING_DATASET` is set, so a missing recorder means it
-/// failed to open rather than was never asked for.
-#[cfg(not(test))]
-pub(crate) fn configured() -> bool {
-    std::env::var_os(DATASET_PATH_ENV).is_some()
-}
-
-#[cfg(test)]
-pub(crate) fn configured() -> bool {
-    false
-}
-
 /// Read a recording once the asynchronous writer has produced what `want`
 /// describes — polling the artifact rather than sleeping a fixed amount.
 #[cfg(test)]
@@ -696,10 +686,6 @@ mod tests {
             forecasts: Some(FailureForecasts {
                 global: 0.1,
                 adjusted: 0.2,
-                blended: 0.15,
-                corrected: 0.12,
-                lambda: Some(0.5),
-                n_eff: Some(4.0),
                 hierarchical: Some(0.11),
                 log_response_time_legacy: Some(-1.5),
                 log_response_time_hierarchical: None,
@@ -771,7 +757,11 @@ mod tests {
         assert_eq!(lines[1]["source"], "relay");
         assert_eq!(lines[1]["peer"], "00000000000000aa");
         assert_eq!(lines[1]["outcome"], "failure");
-        assert_eq!(lines[1]["forecasts"]["corrected"], 0.12);
+        assert_eq!(lines[1]["forecasts"]["adjusted"], 0.2);
+        assert!(
+            lines[1]["forecasts"]["blended"].is_null(),
+            "the Renegade blend was removed with the legacy stack (#4485)"
+        );
         assert_eq!(lines[1]["forecasts"]["hierarchical"], 0.11);
         assert_eq!(lines[1]["forecasts"]["log_response_time_legacy"], -1.5);
         assert_eq!(lines[1]["forecasts"]["log_transfer_speed_legacy"], 9.0);

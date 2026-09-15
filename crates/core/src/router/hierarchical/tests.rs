@@ -1554,6 +1554,134 @@ fn an_unknown_peer_carries_a_timing_penalty() {
     );
 }
 
+/// An estimator with warm stages and real between-peer differences, for the
+/// dashboard-explanation tests.
+fn trained_routing() -> (HierarchicalRouting, Vec<PeerKeyLocation>) {
+    let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    for i in 0..1_500 {
+        let p = GlobalRng::random_range(0..peers.len());
+        let distance = uniform() * 0.5;
+        let outcome = if uniform() < 0.05 + 0.03 * p as f64 {
+            RoutingOutcome {
+                success: false,
+                time_to_response_start_secs: None,
+                transfer_speed_bps: None,
+            }
+        } else {
+            let seconds = ((0.1f64).ln() + distance + 0.2 * p as f64 + 0.3 * normal()).exp();
+            timed(Some(seconds), Some(1e5 / seconds))
+        };
+        routing.observe_at(
+            &peers[p],
+            Location::new(uniform()),
+            distance,
+            &outcome,
+            i as f64 / 100.0,
+        );
+    }
+    (routing, peers)
+}
+
+/// The dashboard's breakdown must describe the estimate routing acts on, not a
+/// lookalike: each stage's `estimate` equals `HierarchicalRouting::estimate` bit
+/// for bit, and the level-by-level posterior ends exactly where
+/// `Level::residual` does.
+#[test]
+fn explanation_reproduces_the_estimate_routing_acts_on() {
+    let _guard = GlobalRng::seed_guard(0x4485_e791);
+    let (routing, peers) = trained_routing();
+    let now = 15.0;
+    let stranger = PeerKeyLocation::random();
+    let (mut layered, mut weighted) = (0, 0);
+    for q in 0..200 {
+        let peer = if q % 10 == 0 {
+            &stranger
+        } else {
+            &peers[q % peers.len()]
+        };
+        let contract = Location::new((q as f64 * 0.37).fract());
+        let distance = (q % 50) as f64 / 100.0;
+        let estimate = routing.estimate(peer, contract, distance, now);
+        let [failure, response, transfer] = routing.explain(peer, contract, distance, now);
+        assert_eq!(failure.map(|b| b.estimate), estimate.failure_probability);
+        assert_eq!(
+            response.map(|b| b.estimate),
+            estimate.time_to_response_start_secs
+        );
+        assert_eq!(transfer.map(|b| b.estimate), estimate.transfer_speed_bps);
+        for (stage, breakdown) in [
+            (&routing.failure, failure),
+            (&routing.response_time, response),
+            (&routing.transfer_speed, transfer),
+        ] {
+            let breakdown = breakdown.expect("every stage is warm");
+            let forecast = stage
+                .predict(peer, contract.as_f64(), distance, now)
+                .expect("warm");
+            assert_eq!(breakdown.spread, forecast.spread);
+            if let Some(after_band) = breakdown.after_band {
+                assert_eq!(
+                    stage.bound(after_band),
+                    forecast.value,
+                    "the last level must land where `residual` does"
+                );
+                layered += 1;
+            }
+            assert!((0.0..=1.0).contains(&breakdown.peer_weight));
+            assert!((0.0..=1.0).contains(&breakdown.band_weight));
+            if breakdown.peer_weight > 0.0 {
+                weighted += 1;
+            }
+        }
+        if std::ptr::eq(peer, &stranger) {
+            let breakdown = failure.expect("warm");
+            assert_eq!(breakdown.peer_evidence, 0.0, "no record means no evidence");
+            assert_eq!(breakdown.peer_weight, 0.0);
+        }
+    }
+    assert!(
+        layered > 0 && weighted > 0,
+        "the hierarchy must have components and adopt some peer means, or the \
+         checks above are vacuous: layered {layered}, weighted {weighted}"
+    );
+}
+
+/// The dashboard's distance curve for a peer with no record is the failure
+/// estimate routing would make for one, the timing curves follow the curves'
+/// directions, and a peer with a record gets its own curve.
+#[test]
+fn peer_curves_follow_the_estimate() {
+    let _guard = GlobalRng::seed_guard(0x4485_c0e5);
+    let (routing, peers) = trained_routing();
+    let now = 15.0;
+    let stranger = PeerKeyLocation::random();
+    let [failure, response, transfer] = routing.peer_curves(None, now);
+    assert_eq!(failure.len(), 51);
+    for &(distance, value) in &failure {
+        let estimate = routing
+            .estimate(&stranger, Location::new(0.9), distance, now)
+            .failure_probability
+            .expect("warm");
+        assert_eq!(value, estimate, "at distance {distance}");
+    }
+    assert!(!response.is_empty() && !transfer.is_empty());
+    assert!(
+        response.windows(2).all(|pair| pair[1].1 >= pair[0].1),
+        "response time must not fall with distance"
+    );
+    assert!(
+        transfer.windows(2).all(|pair| pair[1].1 <= pair[0].1),
+        "transfer speed must not rise with distance"
+    );
+    let [own_failure, own_response, _] = routing.peer_curves(Some(&peers[11]), now);
+    assert_ne!(
+        (own_failure, own_response),
+        (failure, response),
+        "a peer with a record must get its own curve"
+    );
+}
+
 /// Per-candidate cost of a full three-stage estimate with real peer keys.
 /// Printed, not asserted.
 #[test]
