@@ -1,0 +1,126 @@
+name: Nix
+
+# Nothing else in CI evaluates flake.nix, package.nix, nix/ or the devShell, so
+# the monthly nixpkgs/rust-overlay bump Dependabot raises would otherwise land
+# with no build signal behind it at all.
+#
+# NOT a required check: it is path-filtered to the nix files, so it does not run
+# on every PR, and a path-filtered workflow does not reliably produce a check
+# context for branch protection (#5451 is what happens when one does). It runs
+# as an informational gate on PRs touching those files and on main. WHO WATCHES
+# IT: the author of the PR that changed a nix file, and — for the Dependabot
+# bumps, which is the case with no human author paying attention — whoever
+# reviews that PR, since a red run here is the only evidence the bump broke the
+# build. If it is ever promoted to required, add its context to
+# REQUIRED_CONTEXTS in .github/scripts/check_required_check_path_filters.py in
+# the same change.
+#
+# Nix is a SUPPORTED DEPLOYMENT PATH (docs/nix.md), not a developer convenience,
+# which is why this exists at all rather than leaving the flake to rot.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'package.nix'
+      - 'nix/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'crates/core/build.rs'
+      - '.github/workflows/nix.yml'
+  pull_request:
+    paths:
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'package.nix'
+      - 'nix/**'
+      - 'rust-toolchain.toml'
+      - 'Cargo.lock'
+      - 'crates/core/build.rs'
+      - '.github/workflows/nix.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  nix-build:
+    name: Nix flake build
+    runs-on: ubicloud-standard-8
+    # A cold build compiles the whole dependency graph; no binary cache exists.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check flake outputs evaluate
+        run: nix flake check --no-build
+
+      # THE STEP THAT MATTERS MOST, and the reason it is spelled `path:.`.
+      #
+      # `actions/checkout` always leaves a clean `.git`, so `self ? rev` is
+      # always true for a bare `nix build .#...` and the NO-VCS branch of
+      # flake.nix has no coverage by construction. `path:.` evaluates the flake
+      # with no VCS metadata at all — the same shape as a release tarball, a
+      # distro source drop, or a downstream `pkgs.callPackage ./package.nix
+      # { }`. That branch is exactly where the gitCommitHash defect lived: a
+      # placeholder passed into FREENET_GIT_COMMIT_HASH, which build.rs
+      # validates as hex and panics on.
+      #
+      # Deliberately FIRST, so a regression in it cannot be masked by the
+      # ordinary build having already failed for another reason.
+      - name: Build with no VCS metadata (release-tarball / source-drop shape)
+        run: nix build 'path:.' -L
+
+      - name: Build the freenet package
+        run: nix build .#freenet -L
+
+      # `writeShellApplication` runs shellcheck at build time, so building the
+      # supervisor IS a lint of it. Its BEHAVIOUR is covered by
+      # scripts/nix-node-wrapper_test.sh in the main CI job, which needs no Nix.
+      - name: Build the supervised node wrapper
+        run: nix build .#freenet-node -L
+
+      # The devShell breaks independently of the package. `cargo metadata` runs
+      # cargo against the real workspace; a bare `cargo --version` would not.
+      - name: Check the devShell opens and cargo works inside it
+        run: |
+          nix develop --command rustc --version
+          nix develop --command cargo metadata --format-version 1 > /dev/null
+          # Asserted directly because `cargo metadata` runs no build script, so
+          # it passes in a shell where `cargo clippy --workspace` cannot compile.
+          nix develop --command pkg-config --exists openssl
+
+      # A shell whose rustc differs from the pin gives clippy and rustfmt
+      # results that disagree with CI.
+      - name: Verify the devShell matches rust-toolchain.toml
+        run: |
+          pinned="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          actual="$(nix develop --command rustc --version | awk '{print $2}')"
+          if [ "$pinned" != "$actual" ]; then
+              echo "devShell rustc is $actual but rust-toolchain.toml pins $pinned" >&2
+              exit 1
+          fi
+          echo "devShell rustc matches the pin: $actual"
+
+      # Two-sided: the shellHook must actually take effect, or every `cargo
+      # build` in the shell stamps a 1980 build timestamp into the binary (see
+      # docs/nix.md). Asserting the variable is unset INSIDE the shell is the
+      # only way to see that; the hook's presence in flake.nix is not evidence
+      # that it ran.
+      - name: Verify the devShell unsets SOURCE_DATE_EPOCH
+        run: |
+          # `printenv` exits non-zero when the variable is unset, which is the
+          # outcome we want, so the failure is inverted explicitly.
+          if nix develop --command printenv SOURCE_DATE_EPOCH; then
+              echo "SOURCE_DATE_EPOCH is still set in the devShell; cargo builds there would be stamped 1980-01-01" >&2
+              exit 1
+          fi
+          echo "SOURCE_DATE_EPOCH is unset in the devShell"

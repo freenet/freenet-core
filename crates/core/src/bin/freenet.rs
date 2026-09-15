@@ -2796,6 +2796,328 @@ mod tests {
             "both systemd unit templates must set Environment=FREENET_SUPERVISED=1 \
              (#4580); found {marker_count}"
         );
+
+        // The Nix supervisor (`nix/freenet-node.sh`, run by the `freenet-node`
+        // package). It is a Freenet supervisor exactly as the systemd units and
+        // the launchd wrapper are, so it owes the same marker.
+        //
+        // Read with `std::fs` rather than `include_str!`: the file lives ABOVE
+        // `crates/core`, so an `include_str!` would be a compile-time dependency
+        // on a path outside the crate and would break a packaged build of it.
+        // A missing file PANICS here rather than skipping -- a pin that
+        // disappears with its subject is worse than no pin.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read_repo_file = |rel: &str| -> String {
+            let path = repo_root.join(rel);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "could not read {} ({e}). The Nix supervisor is pinned here for \
+                     the same reason as the systemd and launchd ones (#4580); if it \
+                     moved, update this test rather than removing it.",
+                    path.display()
+                )
+            })
+        };
+
+        // STATEMENT POSITION, not mere presence. `nix/freenet-node.sh` documents
+        // the systemd directives it mirrors in its own header comments, so a
+        // bare `contains` would be satisfied by prose describing a marker the
+        // script no longer sets.
+        //
+        // The needle must survive stripping the line's comment. A
+        // `!trimmed.starts_with('#')` test rejected only a FULL-LINE comment
+        // and passed vacuously for a trailing one: `child=0  # export
+        // FREENET_SUPERVISED=1` satisfied it while the script exported nothing.
+        // Verified by performing that edit, per the "test the pin by performing
+        // the edit" rule in .claude/rules/bug-prevention-patterns.md. Splitting
+        // on the first `#` is sound for every file scraped here -- shell, nix,
+        // YAML and the nix code blocks inside docs/nix.md all comment with `#`,
+        // and no line carrying one of these needles has a `#` before it.
+        //
+        // EVERY POSITIVE assertion below goes through this, not just the ones
+        // about the wrapper. Two used a bare whole-file `contains` and were
+        // therefore satisfied by a COMMENTED-OUT line, which is the realistic
+        // edit (deletion fails loudly; disabling does not, and disabling is
+        // what a person does while debugging -- exactly when the pin is the
+        // only thing left watching). Measured: commenting out the three
+        // `assert_eq "$(self_of ...)"` lines in the wrapper test, with BOTH
+        // `network` and `update` simultaneously run from the read-only store
+        // seed, left the shell suite, the rule-lint counter, this pin and
+        // shellcheck all green over the failure the wrapper's own header calls
+        // "the single worst failure this package has".
+        //
+        // The one NEGATIVE assertion (docs must not offer `on-failure`)
+        // deliberately keeps the bare `contains`: for a must-not-appear needle
+        // the broader match is the stronger one, and stripping comments there
+        // would let the forbidden form back in as an example.
+        // A nested `fn`, not a closure: closure inference ties the argument and
+        // return to one lifetime, which does not typecheck for a borrow-through.
+        //
+        // A bare `split('#')` also truncates at a `#` that is CODE, not a
+        // comment -- `${#arr[@]}` is the one that occurs here, and
+        // `nix/freenet-node.sh` has such a line. No needle is affected (none
+        // sits after a `${#...}` on its line), but the next one could be, so
+        // cut only where a comment can actually begin: at a line-leading `#`,
+        // or at a `#` preceded by whitespace. That is the shell/nix/YAML
+        // convention, and it leaves `${#arr[@]}` and `%s#%s` intact.
+        fn code_of(line: &str) -> &str {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return "";
+            }
+            match line
+                .char_indices()
+                .find(|&(i, c)| c == '#' && i > 0 && line.as_bytes()[i - 1].is_ascii_whitespace())
+            {
+                Some((i, _)) => &line[..i],
+                None => line,
+            }
+        }
+        let has_statement =
+            |src: &str, needle: &str| src.lines().any(|line| code_of(line).contains(needle));
+
+        // `code_of` is only as good as its notion of where a comment starts, and
+        // it is easy to make it eat code. These four pin both directions.
+        assert_eq!(code_of("  # a full-line comment").trim(), "");
+        assert_eq!(code_of("foo=1  # trailing").trim_end(), "foo=1");
+        assert_eq!(
+            code_of("    if [ \"${#failures[@]}\" -gt 0 ]; then"),
+            "    if [ \"${#failures[@]}\" -gt 0 ]; then",
+            "a `#` that is CODE must not truncate the line -- `${{#arr[@]}}` is \
+             the shape that occurs in nix/freenet-node.sh"
+        );
+        assert_eq!(
+            code_of("printf '%s#%s' \"$a\" \"$b\""),
+            "printf '%s#%s' \"$a\" \"$b\"",
+            "nor a `#` with no whitespace before it"
+        );
+
+        let nix_src = read_repo_file("nix/freenet-node.sh");
+        let supervised_export = format!(
+            "export {}=1",
+            super::commands::auto_update::SUPERVISED_ENV_VAR
+        );
+        assert!(
+            has_statement(&nix_src, &supervised_export),
+            "the Nix supervisor must `{supervised_export}` on the node it runs, so the \
+             node detects its supervisor instead of erroring on the exit-42 path (#4580)"
+        );
+        // The marker is a CLAIM that something applies the update. These two
+        // pin that the claim is true: the script must actually invoke the
+        // updater, and must forward the node's status so crash-loop rollback
+        // can classify it (#4073).
+        assert!(
+            has_statement(&nix_src, "update --quiet"),
+            "the Nix supervisor sets the supervised marker, so it must actually run \
+             `freenet update --quiet` on a non-graceful exit (#4580/#4073)"
+        );
+        assert!(
+            has_statement(
+                &nix_src,
+                super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+            ),
+            "the Nix supervisor must forward the node's exit status via {} so \
+             crash-loop auto-rollback can tell a post-stop restart from a manual \
+             update (#4073)",
+            super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+        );
+        // The wrapper's seed/re-seed decision must be driven by ONE predicate --
+        // "can this binary update itself?" -- not by a version comparison. The
+        // distinction is the whole invariant: a CLEAN OLDER binary walks itself
+        // to the current release, while a DIRTY NEWER one never exits 42 again,
+        // so ordering versions answers the wrong question and each refusal
+        // layered on top of it opened a new stuck corner.
+        assert!(
+            has_statement(&nix_src, "self_update_blocker"),
+            "the Nix supervisor must decide what to run from whether the binary can \
+             UPDATE ITSELF, not from which version is newer: a clean older binary is \
+             forward progress (it exits 42 and walks itself to current), a dirty newer \
+             one is a dead end (GIT_DIRTY is an auto-update kill switch)"
+        );
+        assert!(
+            has_statement(&nix_src, "binary_is_dirty"),
+            "the Nix supervisor must recognise a -dirty build specifically: it never \
+             auto-updates, and `freenet --version` prints the marker on the COMMIT \
+             HASH, so a version comparison alone cannot see it"
+        );
+        // ...and the ONE refusal that is genuinely about which version.
+        //
+        // It is standing in for a safety net that is absent rather than backing
+        // one up: `capture_known_good` and `begin_probation` run only inside
+        // `commands::update`, so EVERY binary the wrapper installs -- not just a
+        // pinned-bad one -- arrives with no known-good snapshot and no probation
+        // marker, and #4073 rollback cannot fire for a version the wrapper
+        // itself first put there. `handle_post_stop_at` drops a marker belonging
+        // to a different version rather than mis-applying it, so the residual is
+        // a loud flap (the wrapper's own limiter plus `Restart=always`), not a
+        // wrong-version rollback. The wrapper header says so next to the guard.
+        assert!(
+            has_statement(&nix_src, "version_is_pinned_bad"),
+            "the Nix supervisor must consult the node's known-bad pin before replacing \
+             a peer that is still serving. `is_version_pinned_bad` only refuses to \
+             INSTALL such a version; nothing refuses to RUN one already in place, and \
+             the wrapper installs it with no probation marker, so rollback could never \
+             fire"
+        );
+        // The pin lives under the node's HOME, and `dirs::home_dir()` falls back
+        // to `getpwuid_r` when $HOME is unset or empty -- so the node writes a
+        // pin in an environment where a `[ -n "$HOME" ]` guard sees nothing.
+        // systemd exports $HOME only for a unit with `User=`, which the
+        // documented root-capable shapes need not have. Verified by execution:
+        // same pin on disk, only $HOME differing, the guard refused with it set
+        // and installed the pinned-bad version with it unset.
+        assert!(
+            has_statement(&nix_src, "passwd_home"),
+            "the Nix supervisor must mirror `dirs::home_dir()`'s passwd fallback when \
+             $HOME is unset or empty, or the known-bad lookup fails OPEN in exactly \
+             the environment (a systemd unit without `User=`, a scrubbed container) \
+             where the node still writes the pin"
+        );
+        // ...under the name and in the directory the node actually uses. Both
+        // sides are scraped so a rename on either fails here, rather than
+        // leaving the shell reading a path that is now always absent -- which
+        // reads exactly like "no pin", the fail-open direction.
+        // Matched as a complete quoted path segment (`/known_bad_version"`), not
+        // as a bare substring: a bare one is satisfied by any name this is a
+        // PREFIX of, and a suffixed near-miss is exactly the drift to catch.
+        let pin_file_needle = format!("/{}\"", super::commands::rollback::KNOWN_BAD_FILE);
+        assert!(
+            has_statement(&nix_src, &pin_file_needle),
+            "the Nix supervisor must read the known-bad pin from the file the node \
+             writes it to ({})",
+            super::commands::rollback::KNOWN_BAD_FILE
+        );
+        // The directory half cannot be taken from a constant -- `state_dir()`
+        // builds the path inline -- so it is pinned from BOTH sides instead:
+        // move it in Rust and this fails, naming the shell file that has to
+        // move with it. Note what each half is worth. The Rust-side assertion
+        // is decisive. The shell-side one is a floor, not a proof: the wrapper
+        // also uses this path for its own XDG fallback, so it would survive
+        // deleting the known-bad lookup. What actually proves the wrapper reads
+        // the pin THERE is the behavioural case in the wrapper suite, which
+        // writes the pin only under a fake $HOME (verified by execution:
+        // dropping that directory from the lookup turns it red).
+        let auto_update_src = include_str!("commands/auto_update.rs");
+        const NODE_STATE_DIR: &str = ".local/state/freenet";
+        assert!(
+            auto_update_src.contains(NODE_STATE_DIR),
+            "auto_update::state_dir() is expected to resolve to {NODE_STATE_DIR} under \
+             HOME, which is where the node writes the known-bad pin and therefore \
+             where nix/freenet-node.sh looks for it. If it moved, move the wrapper too"
+        );
+        assert!(
+            has_statement(&nix_src, NODE_STATE_DIR),
+            "the Nix supervisor must know about HOME/{NODE_STATE_DIR}: that is where \
+             `auto_update::state_dir()` puts the known-bad pin, NOT $STATE_DIRECTORY, \
+             which the documented systemd unit points somewhere else entirely"
+        );
+        // ...and the flake must actually build that script, or the assertions
+        // above guard a file nothing runs.
+        let node_nix = read_repo_file("nix/node.nix");
+        assert!(
+            has_statement(&node_nix, "./freenet-node.sh"),
+            "nix/node.nix must build the supervisor from ./freenet-node.sh, or the \
+             pins above guard a script the `freenet-node` package never runs (#4580)"
+        );
+        // ...and the flake must make that supervised output the DEFAULT.
+        // Changing `default` to the bare `freenet` leaves every other test in
+        // the tree green while silently turning `nix run
+        // github:freenet/freenet-core` -- the headline command in docs/nix.md --
+        // into a peer that never updates itself.
+        let flake_nix = read_repo_file("flake.nix");
+        assert!(
+            has_statement(&flake_nix, "default = freenet-node;"),
+            "flake.nix must set `packages.default = freenet-node`, so the documented \
+             `nix run github:freenet/freenet-core` gets the supervised, self-updating node \
+             instead of a peer pinned forever to the flake's version"
+        );
+
+        // A source scrape cannot see a statement wrapped in `if false; then ...
+        // fi`, and should not pretend to: what catches that is EXECUTION. So
+        // pin the executable guard as well -- that it exists, that it asserts
+        // the property these text markers only stand in for, and that CI runs
+        // it. Without this, deleting the behavioural test silently downgrades
+        // every assertion above to "the text is still somewhere in the file".
+        let wrapper_test = read_repo_file("scripts/nix-node-wrapper_test.sh");
+        assert!(
+            has_statement(&wrapper_test, "self_of network")
+                && has_statement(&wrapper_test, "self_of update"),
+            "scripts/nix-node-wrapper_test.sh must assert WHICH binary `freenet network` and \
+             `freenet update` ran. Run either from the read-only /nix/store seed and \
+             `current_exe()` is un-renameable, every update fails with EROFS, and after \
+             MAX_UPDATE_FAILURES the node stops exiting 42 at all -- a silently and \
+             permanently stale peer, which is the whole failure this package exists to avoid"
+        );
+        // ...and the two re-seed refusals above are likewise only text until
+        // something drives them. Their cases feed the wrapper a store binary
+        // that is newer AND unusable, in each of the two ways.
+        // The needles are the ASSERTION TEXT of the driving cases, not the knob
+        // names that set them up. `"-dirty\""` and `"WRAP_PINNED_BAD"` were both
+        // satisfied by the suite's own declaration and reset lines, which
+        // survive deleting every case that uses them: measured by deleting the
+        // three refusal cases, which left the shell suite green AND this pin
+        // green, and then by stubbing `version_is_pinned_bad` to always return
+        // false, which also left both green -- zero coverage of the guard this
+        // pin exists to protect. These two strings occur exactly once each, in
+        // an `assert_contains` naming the behaviour, so commenting the case out
+        // strips them with `code_of` and this fails closed.
+        assert!(
+            has_statement(&wrapper_test, "it is a -dirty build")
+                && has_statement(&wrapper_test, "KNOWN-BAD"),
+            "scripts/nix-node-wrapper_test.sh must drive BOTH halves of the re-seed \
+             decision that depend on more than \"can it update itself\" -- a -dirty \
+             binary and a version pinned known-bad -- or the source pins above are \
+             satisfied by guards that never fire"
+        );
+        let ci_yml = read_repo_file(".github/workflows/ci.yml");
+        assert!(
+            has_statement(&ci_yml, "bash scripts/nix-node-wrapper_test.sh"),
+            "CI must run scripts/nix-node-wrapper_test.sh, or the Nix supervisor's only \
+             behavioural guard never executes and these source scrapes are all that is left"
+        );
+
+        // The documented unit must RESTART a wrapper that stood down. The
+        // wrapper exits 0 both for a clean shutdown and for exit 43 ("another
+        // instance already holds the port"), and the #3967 stale-orphan
+        // pre-flight is deliberately NOT ported (a KNOWN DIVERGENCE recorded in
+        // the wrapper header). Under `Restart = "on-failure"` a peer blocked by
+        // a stale orphan is therefore dead forever with nothing to revive it.
+        let nix_docs = read_repo_file("docs/nix.md");
+        assert!(
+            has_statement(&nix_docs, "Restart = \"always\";"),
+            "the docs/nix.md example unit must use `Restart = \"always\"`, so a wrapper that \
+             stood down is retried rather than left dead (the wrapper's exit 0 does not mean \
+             the peer is healthy)"
+        );
+        assert!(
+            !nix_docs.contains("Restart = \"on-failure\""),
+            "docs/nix.md must not offer `Restart = \"on-failure\"` for freenet-node: it \
+             restarts only on a non-zero exit, and the peer-is-stood-down case exits 0"
+        );
+        // ...and the unit must not inherit systemd's own start limit on top of
+        // the wrapper's. Its default (burst 5 / interval 10s) never fires at
+        // `RestartSec = 30`, so an operator who lowers RestartSec reinstates
+        // the #3967 permanent death this example exists to prevent.
+        assert!(
+            has_statement(&nix_docs, "startLimitIntervalSec = 0;"),
+            "the docs/nix.md example unit must disable systemd's own start limit, or \
+             lowering RestartSec puts the unit permanently in `failed` on the fifth \
+             exit -- dead forever, with nothing to revive it (#3967)"
+        );
+
+        // A packager surface documented on the same page: all three provenance
+        // variables treat EMPTY as "no override". `SOURCE_DATE_EPOCH` was the
+        // odd one out and PANICKED the build for a set-but-empty value, which
+        // is what a wrapper produces when it forwards a variable it has not
+        // got. This is a SOURCE SCRAPE, not execution: `cargo test` has no test
+        // target for a build script, so nothing can run the arm.
+        let build_rs = read_repo_file("crates/core/build.rs");
+        assert!(
+            has_statement(&build_rs, r#"Ok("") | Err(_) => chrono::Utc::now()"#),
+            "crates/core/build.rs must treat an EMPTY SOURCE_DATE_EPOCH as \"no \
+             override\", as its FREENET_GIT_COMMIT_HASH and FREENET_GIT_IS_DIRTY \
+             siblings do and as docs/nix.md documents -- not panic the build"
+        );
     }
 
     /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on

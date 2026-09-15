@@ -1,10 +1,20 @@
 ---
 paths:
   - "crates/core/src/bin/**"
+  # The build script is what DECIDES the auto-update gate below (it emits
+  # GIT_DIRTY), and this rule read as complete while never loading on a change
+  # to it.
+  - "crates/core/build.rs"
   - "Cargo.toml"
   - "crates/*/Cargo.toml"
   - "apps/freenet-ping/**"
   - "*.service"
+  # The Nix deployment path: package.nix supplies the build-time provenance that
+  # feeds the same gate, and nix/freenet-node.sh is a supervisor bound by the
+  # exit-code rule at the top of this file.
+  - "package.nix"
+  - "flake.nix"
+  - "nix/**"
 ---
 
 # Deployment Resilience Rules
@@ -41,6 +51,27 @@ try.freenet.org from-source node) has GIT_DIRTY empty, so it is NOT gated — it
 would detect the newer published release and exit 42 in a loop. For that case,
 pass `--disable-auto-update` on that deployment's `ExecStart` (default is off,
 so release nodes are unaffected). See #4690.
+
+There are THREE ways the gate is controlled, not two. The third is BUILD-TIME
+and is the easiest to set by accident:
+
+  1. `GIT_DIRTY` non-empty      — a dirty working tree, detected by build.rs
+  2. `--disable-auto-update`    — a runtime flag, deliberately with no `env`
+                                  binding (config.rs explains why)
+  3. `FREENET_GIT_IS_DIRTY=1`   — a BUILD-TIME env var read by
+                                  crates/core/build.rs, which forces (1)
+
+(3) exists so a packager with no `.git` (release tarball, `nix build`, distro
+source drop) can state the provenance build.rs would otherwise probe for. It is
+parsed STRICTLY — only `1`/`true`/`0`/`false`/empty, anything else fails the
+build — precisely because it is the kill switch: a lenient truthiness rule would
+read `FREENET_GIT_IS_DIRTY=false` as DIRTY and ship a release binary that
+silently never updates itself. Empty means "no override", NOT "clean".
+
+Its sibling `FREENET_GIT_COMMIT_HASH` has the same empty-means-no-override rule
+and must be <= 40 hex characters. Passing a placeholder such as `unknown` FAILS
+THE BUILD; pass empty instead and let build.rs's own fallback report `unknown`.
+See docs/nix.md.
 ```
 
 ### WHEN tightening security (sandbox, CSP, CORS)
