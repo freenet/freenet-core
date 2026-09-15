@@ -177,7 +177,11 @@ const PROBATION_FILE: &str = "update_probation.json";
 /// Pinned known-bad version (plain text, a single version string). The
 /// installer and the node's update checks both refuse to (re-)apply this exact
 /// version.
-const KNOWN_BAD_FILE: &str = "known_bad_version";
+/// `pub(crate)` because the Nix supervisor (`nix/freenet-node.sh`) must read
+/// this same file before it re-seeds a binary, and a pin in `bin/freenet.rs`
+/// asserts the shell looks for THIS name. A private constant with a literal
+/// copy in the pin would be rewritten by the same rename it is meant to catch.
+pub(crate) const KNOWN_BAD_FILE: &str = "known_bad_version";
 
 /// Snapshot of the previous, known-good binary kept as the rollback target.
 const KNOWN_GOOD_BINARY_FILE: &str = "known_good_binary";

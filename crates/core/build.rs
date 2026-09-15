@@ -186,7 +186,14 @@ fn emit_build_metadata() {
     // timestamp into the binary -- and that field is what ops uses to correlate
     // a running node's log with the artifact it came from. The flake's devShell
     // unsets the variable for exactly this reason.
-    let now = match std::env::var("SOURCE_DATE_EPOCH") {
+    //
+    // EMPTY means "no override", exactly as it does for the two variables
+    // above. Set-but-empty is what a build wrapper produces when it forwards a
+    // variable it has not got (`SOURCE_DATE_EPOCH=$SOMETHING_UNSET`), and
+    // panicking on it made this the one of the three that fails the build over
+    // an absent value rather than falling through to the probe.
+    let now = match std::env::var("SOURCE_DATE_EPOCH").as_deref().map(str::trim) {
+        Ok("") | Err(_) => chrono::Utc::now(),
         Ok(val) => {
             let epoch: i64 = val
                 .parse()
@@ -196,7 +203,6 @@ fn emit_build_metadata() {
                 .single()
                 .unwrap_or_else(|| panic!("SOURCE_DATE_EPOCH ({val}) is not a valid timestamp"))
         }
-        Err(_) => chrono::Utc::now(),
     };
     let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");

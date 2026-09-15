@@ -61,6 +61,13 @@
       sourceDateEpoch = if self ? lastModified then toString self.lastModified else null;
     in
     {
+      # NOTE for anyone applying this overlay: `pkgs.freenet` is the BARE
+      # binary. Putting it in `environment.systemPackages` gives every user a
+      # `freenet` on PATH that never updates itself, and nothing about it says
+      # so -- a peer started from it silently falls behind every release. Use
+      # `pkgs.freenet-node` for anything that runs a peer; `pkgs.freenet` is for
+      # building, packaging and `nix develop`. See docs/nix.md, "The two
+      # outputs".
       overlays.default = final: _prev: {
         freenet = final.callPackage ./package.nix {
           inherit gitCommitHash gitDirty sourceDateEpoch;

@@ -32,6 +32,12 @@
 # pin it. Three mutations of the wrapper used to pass this suite 29/29:
 # running `network` from the seed, running `update` from the seed, and seeding
 # by symlink instead of by copy. Re-apply any of them and this file must go red.
+#
+# THE SUITE RUNS IN A FAKE $HOME. The wrapper reads the node's known-bad pin
+# from $HOME/.local/state/freenet (`auto_update::state_dir()`, which does NOT
+# use $STATE_DIRECTORY), so every invocation below points HOME at its own temp
+# dir. Without that, this suite would read -- and its verdict would depend on --
+# the rollback state of whatever real peer the developer happens to run.
 set -euo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -83,18 +89,26 @@ assert_not_contains() {
 # on its Nth `network` invocation.
 # ---------------------------------------------------------------------------
 write_fake_freenet() {
-  local path="$1" version="${2:-0.2.100}"
-  # First heredoc unquoted so the version is baked in; the body quoted so
-  # nothing else expands at write time.
+  local path="$1" version="${2:-0.2.100}" commit="${3:-abc1234}"
+  # First heredoc unquoted so the version and commit are baked in; the body
+  # quoted so nothing else expands at write time.
+  #
+  # The COMMIT field is what carries the `-dirty` marker in the real binary
+  # (`Freenet version: 0.2.136 (bbbb222-dirty)`, `run_node` in
+  # crates/core/src/bin/freenet.rs) -- NOT the version. That asymmetry is the
+  # whole reason a dirty build cannot be recognised by parsing the version, so
+  # the fake has to reproduce it exactly or the guard is tested against a shape
+  # that never occurs.
   cat >"$path" <<FAKE
 #!/usr/bin/env bash
 set -euo pipefail
 FAKE_VERSION='$version'
+FAKE_COMMIT='$commit'
 FAKE
   cat >>"$path" <<'FAKE'
 case "${1:-}" in
   --version)
-    printf 'Freenet version: %s (abc1234)\n' "$FAKE_VERSION"
+    printf 'Freenet version: %s (%s)\n' "$FAKE_VERSION" "$FAKE_COMMIT"
     printf 'Build timestamp: 1970-01-01T00:00:00Z\n'
     exit 0
     ;;
@@ -134,29 +148,51 @@ FAKE
 
 # Optional knobs for run_wrapper, reset after every call.
 WRAP_SEED_VERSION=""
+WRAP_SEED_COMMIT=""
 WRAP_STATE_VERSION=""
+WRAP_STATE_COMMIT=""
 WRAP_RESTART_SECS=""
 WRAP_MAX_SECS=""
 WRAP_UPDATER_TIMEOUT=""
 WRAP_UPDATE_SLEEP=""
+# Version to write into the node's known-bad pin. WRAP_PINNED_BAD writes it in
+# $STATE_DIRECTORY; WRAP_PINNED_BAD_HOME writes it where the NODE itself keeps
+# it ($HOME/.local/state/freenet, `auto_update::state_dir()`), which is the
+# location that actually applies under the documented systemd unit.
+WRAP_PINNED_BAD=""
+WRAP_PINNED_BAD_HOME=""
 
 # run_wrapper <plan-as-newline-separated-exit-codes> [wrapper args...]
-# Sets LOG, STDOUT, RC, WORK, STATE and SEED for the caller.
+# Sets LOG, STDOUT, RC, WORK, STATE, HOMEDIR and SEED for the caller.
 run_wrapper() {
   local plan="$1"
   shift
   WORK="$(mktemp -d)"
   STATE="$WORK/state"
   SEED="$WORK/seed-freenet"
-  write_fake_freenet "$SEED" "${WRAP_SEED_VERSION:-0.2.100}"
+  # A fake HOME, always. The wrapper reads the node's known-bad pin out of
+  # $HOME/.local/state/freenet, so leaving the developer's real HOME in place
+  # would make this suite read (and depend on) a real peer's rollback state.
+  HOMEDIR="$WORK/home"
+  mkdir -p "$HOMEDIR"
+  write_fake_freenet "$SEED" "${WRAP_SEED_VERSION:-0.2.100}" "${WRAP_SEED_COMMIT:-abc1234}"
   if [ -n "$WRAP_STATE_VERSION" ]; then
     mkdir -p "$STATE/bin"
-    write_fake_freenet "$STATE/bin/freenet" "$WRAP_STATE_VERSION"
+    write_fake_freenet "$STATE/bin/freenet" "$WRAP_STATE_VERSION" "${WRAP_STATE_COMMIT:-abc1234}"
+  fi
+  if [ -n "$WRAP_PINNED_BAD" ]; then
+    mkdir -p "$STATE"
+    printf '%s\n' "$WRAP_PINNED_BAD" >"$STATE/known_bad_version"
+  fi
+  if [ -n "$WRAP_PINNED_BAD_HOME" ]; then
+    mkdir -p "$HOMEDIR/.local/state/freenet"
+    printf '%s\n' "$WRAP_PINNED_BAD_HOME" >"$HOMEDIR/.local/state/freenet/known_bad_version"
   fi
   printf '%s\n' "$plan" >"$WORK/plan"
   : >"$WORK/log"
   RC=0
   env -u XDG_STATE_HOME \
+    HOME="$HOMEDIR" \
     FAKE_LOG="$WORK/log" \
     FAKE_PLAN="$WORK/plan" \
     FAKE_COUNT="$WORK/count" \
@@ -170,11 +206,15 @@ run_wrapper() {
   LOG="$(cat "$WORK/log")"
   STDOUT="$(cat "$WORK/stdout")"
   WRAP_SEED_VERSION=""
+  WRAP_SEED_COMMIT=""
   WRAP_STATE_VERSION=""
+  WRAP_STATE_COMMIT=""
   WRAP_RESTART_SECS=""
   WRAP_MAX_SECS=""
   WRAP_UPDATER_TIMEOUT=""
   WRAP_UPDATE_SLEEP=""
+  WRAP_PINNED_BAD=""
+  WRAP_PINNED_BAD_HOME=""
 }
 
 starts_of() {
@@ -341,6 +381,7 @@ printf '0\n' >"$WORK2/plan"
 : >"$WORK2/log"
 RC2=0
 env -u XDG_STATE_HOME \
+  HOME="$WORK2/home" \
   FAKE_LOG="$WORK2/log" \
   FAKE_PLAN="$WORK2/plan" \
   FAKE_COUNT="$WORK2/count" \
@@ -364,6 +405,7 @@ printf '0\n' >"$WORK3/plan"
 : >"$WORK3/log"
 RC3=0
 env -u STATE_DIRECTORY \
+  HOME="$WORK3/home" \
   FAKE_LOG="$WORK3/log" \
   FAKE_PLAN="$WORK3/plan" \
   FAKE_COUNT="$WORK3/count" \
@@ -396,6 +438,7 @@ printf '0\n' >"$WORK4/plan"
 : >"$WORK4/log"
 RC4=0
 env -u XDG_STATE_HOME \
+  HOME="$WORK4/home" \
   FAKE_LOG="$WORK4/log" \
   FAKE_PLAN="$WORK4/plan" \
   FAKE_COUNT="$WORK4/count" \
@@ -432,6 +475,7 @@ printf '0\n' >"$WORK4B/plan"
   ulimit -c 0
   ulimit -f 1
   env -u XDG_STATE_HOME \
+    HOME="$WORK4B/home" \
     FAKE_LOG="$WORK4B/log" \
     FAKE_PLAN="$WORK4B/plan" \
     FAKE_COUNT="$WORK4B/count" \
@@ -442,6 +486,36 @@ printf '0\n' >"$WORK4B/plan"
 ) || true
 assert_eq "$([ -e "$STATE4B/bin/freenet" ] && echo present || echo absent)" "absent" \
   "a seed that dies mid-copy leaves NO binary at all, never a truncated one: the copy goes to a temp name and is renamed into place"
+
+# ...and the temp file that death leaves behind must not accumulate. The name
+# carries the DEAD process's pid, so the next start's `rm -f "$tmp"` -- a
+# different pid -- never touches it. Without a sweep of the siblings, a peer
+# whose seed is repeatedly killed (a boot loop under memory pressure, say)
+# litters the bin dir with one file per killed start, forever, and a killed
+# `install` can have written most of a release binary first.
+assert_eq "$([ "$(find "$STATE4B/bin" -name '.freenet.seed.*' | wc -l)" -gt 0 ] && echo littered || echo clean)" "littered" \
+  "a seed killed mid-copy really does leave a pid-named temp file behind (the precondition the sweep below exists for)"
+
+# The sweep is AGE-BOUNDED, so a FRESH sibling must survive: two wrappers can
+# start at once (exit 43 exists because they do) and both seed before either
+# starts a node, so a blanket sweep would destroy the other's temp mid-copy.
+touch "$STATE4B/bin/.freenet.seed.concurrent"
+# ...while genuine wreckage, which is hours old by the time anything looks, goes.
+touch -d '3 hours ago' "$STATE4B"/bin/.freenet.seed.[0-9]*
+printf '0\n' >"$WORK4B/plan"
+env -u XDG_STATE_HOME \
+  HOME="$WORK4B/home" \
+  FAKE_LOG="$WORK4B/log" \
+  FAKE_PLAN="$WORK4B/plan" \
+  FAKE_COUNT="$WORK4B/count2" \
+  FREENET_NIX_SEED_BINARY="$SEED4B" \
+  STATE_DIRECTORY="$STATE4B" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >/dev/null 2>&1 || true
+assert_eq "$(find "$STATE4B/bin" -name '.freenet.seed.[0-9]*' | wc -l)" "0" \
+  "the next seed sweeps STALE temp files left by earlier killed seeds, not only the one its own pid would have used"
+assert_eq "$([ -e "$STATE4B/bin/.freenet.seed.concurrent" ] && echo kept || echo deleted)" "kept" \
+  "...but a FRESH sibling temp is left alone: a concurrently-starting wrapper is mid-copy, not wreckage"
 
 # ---------------------------------------------------------------------------
 # 12. A symlink at the binary path is replaced, not run.
@@ -460,6 +534,7 @@ printf '0\n' >"$WORK5/plan"
 : >"$WORK5/log"
 RC5=0
 env -u XDG_STATE_HOME \
+  HOME="$WORK5/home" \
   FAKE_LOG="$WORK5/log" \
   FAKE_PLAN="$WORK5/plan" \
   FAKE_COUNT="$WORK5/count" \
@@ -509,6 +584,72 @@ assert_not_contains "$STDOUT" "seeded" \
   "an unparseable state version is never treated as older -- parse failure means do not act"
 
 # ---------------------------------------------------------------------------
+# 13b. NEWER IS NECESSARY, NOT SUFFICIENT.
+#
+#      The re-seed exists to rescue a peer that can no longer update itself. Two
+#      candidates would instead CREATE that peer, and both arrive looking like a
+#      perfectly ordinary version bump.
+#
+#      (a) A `-dirty` store binary. `GIT_DIRTY` disables auto-update, so after
+#          the re-seed the node never exits 42 again and the store and state
+#          versions now MATCH, so the wrapper never re-seeds again either. The
+#          peer is stuck forever and the only log line says it is fine.
+#          `binary_version` cannot see this: the marker is printed on the COMMIT
+#          HASH (`0.2.136 (bbbb222-dirty)`) and the parse truncates at the first
+#          non-[0-9.] character. The realistic trigger is ordinary: `nix run .`
+#          in a checkout with one uncommitted line, on a host already running a
+#          seeded release peer.
+#
+#      (b) A version this node has PINNED KNOWN-BAD. It crash-looped here and
+#          was rolled back; the re-seed writes the binary directly, with no
+#          probation marker, so the crash loop repeats with rollback unable to
+#          fire. The pin is per-host state, so whoever advanced the flake cannot
+#          know which hosts it applies to.
+# ---------------------------------------------------------------------------
+WRAP_STATE_VERSION="0.2.135" WRAP_SEED_VERSION="0.2.136" WRAP_SEED_COMMIT="bbbb222-dirty" \
+  run_wrapper "0"
+assert_not_contains "$STDOUT" "seeded" \
+  "a -dirty store binary never re-seeds over a healthy peer, however much newer its version is"
+assert_contains "$STDOUT" "it is a -dirty build" \
+  "...and the refusal says why, instead of silently doing nothing"
+assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "differ" \
+  "...and the state binary is genuinely untouched, not merely unmentioned"
+
+# The same dirty marker on the STATE binary is the case the re-seed exists FOR:
+# that peer cannot update itself, so a clean newer store binary must rescue it.
+WRAP_STATE_VERSION="0.2.135" WRAP_STATE_COMMIT="bbbb222-dirty" WRAP_SEED_VERSION="0.2.136" \
+  run_wrapper "0"
+assert_contains "$STDOUT" "is newer than the state binary" \
+  "a DIRTY STATE binary is still rescued by a clean newer store binary -- the guard above is about the seed, not about dirtiness anywhere"
+
+# A first seed from a dirty build is allowed (there is nothing to protect), but
+# it must not claim an update contract the binary cannot honour.
+WRAP_SEED_COMMIT="bbbb222-dirty" run_wrapper "0"
+assert_contains "$STDOUT" "seeded" "a first run still seeds from a dirty build -- there is no healthy peer to protect"
+assert_contains "$STDOUT" "never auto-updates" \
+  "...but it warns that this peer will not keep itself current, rather than promising it will"
+
+# Known-bad pin in $STATE_DIRECTORY.
+WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.139" run_wrapper "0"
+assert_not_contains "$STDOUT" "seeded" \
+  "a store version pinned KNOWN-BAD on this node is never re-seeded, however much newer it is"
+assert_contains "$STDOUT" "KNOWN-BAD" "...and the refusal names the pin, which is per-host state the operator cannot see from the flake"
+
+# ...and in the directory the NODE actually writes it to, which is derived from
+# HOME (`auto_update::state_dir()`), not from $STATE_DIRECTORY. Under the
+# documented systemd unit those are different paths, so a wrapper that consulted
+# only its own state dir would miss every pin the node ever wrote.
+WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD_HOME="0.2.139" run_wrapper "0"
+assert_not_contains "$STDOUT" "seeded" \
+  "the pin is honoured in \$HOME/.local/state/freenet too, where the node itself writes it"
+
+# A pin for a DIFFERENT version must not block anything: the pin is one exact
+# version, and a fail-closed reading would strand every peer that ever rolled back.
+WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.137" run_wrapper "0"
+assert_contains "$STDOUT" "is newer than the state binary" \
+  "a pin naming a DIFFERENT version does not block the re-seed -- the pin is one exact version, not a floor"
+
+# ---------------------------------------------------------------------------
 # 14. Restart backoff GROWS and is CAPPED (RestartSteps / RestartMaxDelaySec).
 #
 #     Exit 42 is burst-exempt -- correctly, an update chain must not take a peer
@@ -547,6 +688,7 @@ write_fake_freenet "$SEED6"
 printf '101\n101\n101\n101\n0\n' >"$WORK6/plan"
 : >"$WORK6/log"
 env -u XDG_STATE_HOME \
+  HOME="$WORK6/home" \
   FAKE_LOG="$WORK6/log" \
   FAKE_PLAN="$WORK6/plan" \
   FAKE_COUNT="$WORK6/count" \

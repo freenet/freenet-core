@@ -133,22 +133,82 @@ fi
 bin_dir="$state_dir/bin"
 binary="$bin_dir/freenet"
 
-# `Freenet version: 0.2.135 (abc1234)` -> `0.2.135`. Prints NOTHING unless the
-# output is unambiguously that line with a dotted numeric version, because every
-# caller treats "no version" as "do not act".
-binary_version() {
-    local out ver
+# The `Freenet version: ` line of a binary, prefix stripped and the following
+# `Build timestamp:` line dropped: `0.2.135 (abc1234)`, or
+# `0.2.136 (bbbb222-dirty)` for a build made from a dirty tree (`run_node`,
+# crates/core/src/bin/freenet.rs). Prints NOTHING unless the output is
+# unambiguously that line, because every caller treats "no version line" as
+# "do not act".
+version_line() {
+    local out rest
     out="$(timeout 10 "$1" --version 2>/dev/null || true)"
     case "$out" in
         *"Freenet version: "*) ;;
         *) return 0 ;;
     esac
-    ver="${out#*"Freenet version: "}"
+    rest="${out#*"Freenet version: "}"
+    printf '%s' "${rest%%$'\n'*}"
+}
+
+# `Freenet version: 0.2.135 (abc1234)` -> `0.2.135`. Prints NOTHING unless the
+# output is unambiguously that line with a dotted numeric version, because every
+# caller treats "no version" as "do not act".
+binary_version() {
+    local ver
+    ver="$(version_line "$1")"
     ver="${ver%%[!0-9.]*}"
     case "$ver" in
         [0-9]*.[0-9]*.[0-9]*) printf '%s' "$ver" ;;
         *) ;;
     esac
+}
+
+# Whether a binary was built from a dirty tree. `GIT_DIRTY` is one of the three
+# auto-update kill switches (`auto_update_is_disabled`, crates/core/src/bin/
+# freenet.rs), so a dirty binary NEVER updates itself, and installing one over a
+# peer that still can is a one-way trip: the node stops exiting 42, so nothing
+# in this design moves it forward again.
+#
+# THE MARKER IS PRINTED ON THE COMMIT HASH, NOT THE VERSION --
+# `0.2.136 (bbbb222-dirty)` -- so `binary_version` cannot see it: it truncates at
+# the first character that is not [0-9.] and yields `0.2.136`, indistinguishable
+# from a clean release build of the same version. Hence a separate test.
+binary_is_dirty() {
+    case "$(version_line "$1")" in
+        *-dirty\)*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The node's own known-bad pin (`KNOWN_BAD_FILE`, crates/core/src/bin/commands/
+# rollback.rs): a plain-text file naming the single version that crash-looped on
+# THIS host and was rolled back. `is_version_pinned_bad` makes the updater refuse
+# to INSTALL that version -- but nothing in the node refuses to RUN one already
+# in place, and the re-seed below writes $binary directly, with no
+# `capture_known_good` snapshot and no probation marker. Re-seeding a pinned-bad
+# version would therefore crash-loop with rollback unable to fire, and the pin is
+# per-host state that whoever advanced the flake cannot see. So consult it here,
+# before installing anything.
+#
+# Two directories, because the node resolves this one from HOME
+# (`auto_update::state_dir()` is `dirs::home_dir()/.local/state/freenet`) and NOT
+# from $STATE_DIRECTORY: under this script's XDG fallback the two are the same
+# path, and under a systemd unit with `StateDirectory=` they are not. Either
+# pinning this version is a refusal.
+version_is_pinned_bad() {
+    local want="$1" dir pinned
+    local dirs=("$state_dir")
+    if [ -n "${HOME:-}" ]; then
+        dirs+=("$HOME/.local/state/freenet")
+    fi
+    for dir in "${dirs[@]}"; do
+        [ -f "$dir/known_bad_version" ] || continue
+        pinned="$(tr -d '[:space:]' <"$dir/known_bad_version" 2>/dev/null || true)"
+        if [ -n "$pinned" ] && [ "$pinned" = "$want" ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # install(1) writes the DESTINATION IN PLACE, so a kill, an OOM or a full disk
@@ -157,7 +217,7 @@ binary_version() {
 # never re-seeded. Write to a temp name in the SAME directory and rename: within
 # one directory rename(2) is atomic, so $binary is only ever absent or complete.
 seed_binary() {
-    local why="$1" tmp
+    local why="$1" tmp now stale age
     if [ -z "$FREENET_NIX_SEED_BINARY" ]; then
         echo "freenet-node: no usable binary at $binary and no seed binary configured (FREENET_NIX_SEED_BINARY is empty)." >&2
         exit 78
@@ -165,9 +225,41 @@ seed_binary() {
     mkdir -p "$bin_dir"
     tmp="$bin_dir/.freenet.seed.$$"
     rm -f "$tmp"
+    # The temp name carries THIS process's pid, so the line above never touches
+    # the one a PREVIOUS seed left behind when it died mid-copy (the OOM /
+    # reboot / ENOSPC shape case 11 of the test suite models). Those accumulate
+    # one per killed start, forever, and a killed `install` can have written
+    # most of a release binary before dying.
+    #
+    # AGE-BOUNDED, not a bare `rm .freenet.seed.*`: two wrappers can legitimately
+    # start at once (that is what exit 43 exists for) and both seed before
+    # either starts a node, so a blanket sweep would delete a SIBLING'S temp
+    # mid-copy and fail its `mv`. A live seed is seconds old; an hour is far
+    # past any of them and unambiguously wreckage. `stat` rather than `find`:
+    # coreutils is the only runtime input nix/node.nix declares.
+    now="$(date +%s)"
+    for stale in "$bin_dir"/.freenet.seed.*; do
+        # An unmatched glob stays literal, so test for existence first.
+        if [ ! -e "$stale" ] || [ "$stale" = "$tmp" ]; then
+            continue
+        fi
+        age="$((now - $(stat -c '%Y' "$stale" 2>/dev/null || printf '%s' "$now")))"
+        if [ "$age" -gt 3600 ]; then
+            rm -f "$stale"
+        fi
+    done
     install -m 0755 "$FREENET_NIX_SEED_BINARY" "$tmp"
     mv -f "$tmp" "$binary"
     echo "freenet-node: seeded $binary from $FREENET_NIX_SEED_BINARY ($why; the node owns it from now on and will update it in place)."
+    # ...except when it cannot. A dirty build never auto-updates, so the line
+    # above would be a promise this binary is unable to keep; say so rather than
+    # leave an operator believing the peer is self-maintaining when it is frozen.
+    # Only reachable on a FIRST seed (or a repair) -- the re-seed path below
+    # refuses a dirty store binary outright, because there it would be replacing
+    # a peer that still updates itself.
+    if binary_is_dirty "$binary"; then
+        echo "freenet-node: WARNING -- $binary is a -dirty build, which never auto-updates (GIT_DIRTY is an auto-update kill switch). This peer will NOT keep itself current; seed it from a clean release build before leaving it running." >&2
+    fi
 }
 
 # Copied, never symlinked: the node must be able to rename a new file over this
@@ -204,13 +296,32 @@ else
     # exits 42 again, so nothing else in this design can ever move it forward.
     # Stepping FORWARD onto a newer store binary preserves "never pin
     # backwards"; both versions must parse or nothing happens.
+    #
+    # ...and "newer" is necessary but NOT sufficient. This exception exists to
+    # move a peer that cannot update itself onto one that can, so it must refuse
+    # any candidate that would land the peer in the same hole or a deeper one:
+    # a `-dirty` store binary (never auto-updates, so the re-seed would be the
+    # LAST move this peer ever makes) and a version this node has pinned
+    # known-bad (crash-loops, and the re-seed installs it with no probation
+    # marker, so auto-rollback cannot fire). See the two guards below.
     seed_version="$(binary_version "${FREENET_NIX_SEED_BINARY:-/nonexistent}")"
     state_version="$(binary_version "$binary")"
     if [ -n "$seed_version" ] && [ -n "$state_version" ] && [ "$seed_version" != "$state_version" ]; then
         newest="$(printf '%s\n%s\n' "$state_version" "$seed_version" | sort -V)"
         newest="${newest##*$'\n'}"
         if [ "$newest" = "$seed_version" ]; then
-            seed_binary "the store binary $seed_version is newer than the state binary $state_version"
+            # Two refusals. Both would otherwise replace a peer that CAN still
+            # update itself with one that cannot -- the exact failure this whole
+            # design exists to prevent, reached through the escape hatch that
+            # exists to prevent it. A NEWER version number is not on its own
+            # evidence that stepping onto it is forward progress.
+            if binary_is_dirty "${FREENET_NIX_SEED_BINARY:-/nonexistent}"; then
+                echo "freenet-node: the store binary $seed_version is newer than the state binary $state_version, but it is a -dirty build, which never auto-updates. NOT re-seeding: $binary stays in place and keeps updating itself. Build from a clean tree if you meant to move this peer forward." >&2
+            elif version_is_pinned_bad "$seed_version"; then
+                echo "freenet-node: the store binary $seed_version is newer than the state binary $state_version, but this node pinned $seed_version KNOWN-BAD after it crash-looped here and was rolled back. NOT re-seeding: installing it again would crash-loop with no probation marker, so rollback could never fire. Advance the flake past $seed_version." >&2
+            else
+                seed_binary "the store binary $seed_version is newer than the state binary $state_version"
+            fi
         fi
     fi
 fi
