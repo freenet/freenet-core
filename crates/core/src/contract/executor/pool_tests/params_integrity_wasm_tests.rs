@@ -499,6 +499,54 @@ fn upsert_writes_container_params_only_after_store_contract() {
          only parameters that verification has bound to the instance id may be written",
         writes[0]
     );
+    // The initial-state install also writes the params row, through
+    // `state_store.store`; it must follow verification too.
+    let install = body
+        .find(".store(key, state_to_store, params.clone())")
+        .expect("the bridged upsert's initial-state install moved");
+    assert!(
+        last_verify < install,
+        "the initial-state install ({install}) writes the params row and must follow every \
+         store_contract call (last at {last_verify})"
+    );
+}
+
+/// A local re-PUT of the verified container repairs a params row that the
+/// read-side check refuses, which is the remedy the refusal's WARN names.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_reput_repairs_a_refused_params_row() -> Result<(), Box<dyn std::error::Error>> {
+    let mut h = build_harness().await?;
+    let params = Parameters::from(vec![0x5C, 0x01]);
+    let honest = load(params.clone()).await;
+    let key = honest.key();
+    local_put(&mut h.executor, honest.clone(), b"honest state")
+        .await
+        .map_err(|e| format!("honest local PUT failed: {e}"))?;
+
+    h.executor
+        .state_store
+        .inner()
+        .store_params(key, Parameters::from(vec![0x5C, 0xEE]))
+        .await
+        .expect("overwrite the params row directly");
+    assert!(
+        h.executor
+            .verified_stored_params(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none(),
+        "sanity: the overwritten row is refused"
+    );
+
+    local_put(&mut h.executor, honest, b"re-put state")
+        .await
+        .map_err(|e| format!("re-PUT of the verified container failed: {e}"))?;
+    assert_eq!(
+        stored_params(&h.executor, &key).await.as_deref(),
+        Some(params.as_ref()),
+        "a local re-PUT of the verified container must repair the params row"
+    );
+    Ok(())
 }
 
 /// Pins `verified_stored_params` to exactly the derivation that the store audit

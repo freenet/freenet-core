@@ -27,6 +27,17 @@ impl Executor<Runtime> {
                 .contract_store
                 .store_contract(contract.clone())
                 .map_err(ExecutorError::other)?;
+            // Now verified, persist the container's params. The merge below commits
+            // through `state_store.update`, which writes state only, so without this
+            // a re-PUT could not repair a params row that `verified_stored_params`
+            // refuses.
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
 
             // Contract already exists — merge states locally and broadcast async.
             //

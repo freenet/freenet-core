@@ -110,6 +110,9 @@ where
     /// protect: every path that runs or serves a contract resolves its code
     /// through that index, so such a contract cannot be run either way. The
     /// params are returned unchecked, which keeps that case's existing errors.
+    /// That reasoning relies on one contract's operations running one at a time
+    /// on this executor: an index row cannot appear between this read and a
+    /// later write of the same parameters on the same operation's path.
     pub(in crate::contract::executor) async fn verified_stored_params(
         &self,
         key: &ContractKey,
