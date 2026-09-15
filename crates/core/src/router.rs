@@ -1541,9 +1541,11 @@ const HIERARCHICAL_ENV: &str = "FREENET_ROUTING_HIERARCHICAL";
 /// `hierarchical_routing_enabled_follows_the_environment`; change them together.
 /// INFO (and WARN), never debug: release builds compile out everything below
 /// INFO (`release_max_level_info`). Being INFO, the enabled and `disabled via`
-/// lines appear in the MAIN log (`freenet.*`, or the journal), not in
+/// lines appear in the main freenet log (`freenet.*.log`), not in
 /// `freenet.error.*`, whose floor is WARN: only the unrecognised-value line
-/// reaches the error log, so confirm a node's mode from the main log.
+/// reaches the error log, so confirm a node's mode from the main log. A
+/// file-logging node's journal has none of them (stdout carries the console
+/// layer only on a TTY or with `FREENET_LOG_TO_CONSOLE`).
 fn resolve_hierarchical_flag(raw: Option<&std::ffi::OsStr>) -> bool {
     let flag = match raw.map(std::ffi::OsStr::to_str) {
         None => parse_default_on_routing_flag(None),
@@ -5128,7 +5130,8 @@ mod tests {
     ///   kill switch.
     /// - `WarmHierarchical` covers the estimator the fleet routes with. Its
     ///   precondition always pins the FAILURE stage. The timing stages warm only
-    ///   after 30 timed events (`MIN_CURVE_POINTS_LOG`), so a guard trained on
+    ///   after 30 timed successes (`MIN_CURVE_POINTS_LOG`; the speed stage
+    ///   counts only those with a non-zero payload), so a guard trained on
     ///   fewer still ranks on LEGACY timing; only the twins that train that
     ///   many (realistic traffic, the transition's phase 3, #4230 steady state)
     ///   have their timing pinned to the hierarchical estimator too.
@@ -5188,7 +5191,7 @@ mod tests {
     /// and so is each timing estimate (response time, transfer speed) whenever
     /// the hierarchical estimator supplies one. So a guard cannot pass on the
     /// legacy fallback for any stage the estimator has warmed. A timing stage it
-    /// has NOT warmed (below 30 timed events) is legitimately legacy and is not
+    /// has NOT warmed (below 30 timed successes) is legitimately legacy and is not
     /// checked; a guard whose property depends on timing must also call
     /// [`assert_hierarchical_timing_decides`].
     ///
@@ -6543,23 +6546,28 @@ mod tests {
         events
     }
 
-    /// `history` with every success TIMED, response and transfer time rising
-    /// with distance (farther is slower), so the hierarchical timing stages
-    /// (30-point floor) warm and a ranking uses all three stages. Deterministic:
-    /// draws no RNG.
-    fn with_distance_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
+    /// `history` with every success TIMED, so the hierarchical timing stages
+    /// (30-point floor) warm and a ranking uses all three stages — but with
+    /// timing that carries NO locality and NO per-peer signal: it varies only
+    /// with the event's position in the history.
+    ///
+    /// Timing that rose with distance was a perfect "route to the closest
+    /// peer" term on its own, so a locality guard trained on it passed whatever
+    /// the failure stage did (measured: an inverted hierarchical failure
+    /// estimate left the #4230 steady twin green). Per-peer timing would add
+    /// exactly the per-peer-history-versus-locality competition #4230 guards,
+    /// from a source the test does not control. Deterministic: draws no RNG.
+    fn with_uninformative_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
         history
             .iter()
-            .map(|event| {
-                let distance = event
-                    .contract_location
-                    .distance(event.peer.location().expect("pool peers have locations"))
-                    .as_f64();
+            .enumerate()
+            .map(|(index, event)| {
+                let jitter = (index % 7) as f64;
                 let outcome = match event.outcome.clone() {
                     RouteOutcome::SuccessUntimed => RouteOutcome::Success {
-                        time_to_response_start: Duration::from_secs_f64(0.02 + 0.4 * distance),
+                        time_to_response_start: Duration::from_secs_f64(0.05 + 0.002 * jitter),
                         payload_size: 2000,
-                        payload_transfer_time: Duration::from_secs_f64(0.005 + 0.1 * distance),
+                        payload_transfer_time: Duration::from_secs_f64(0.010 + 0.001 * jitter),
                     },
                     RouteOutcome::Success { .. } | RouteOutcome::Failure => event.outcome.clone(),
                 };
@@ -6661,9 +6669,10 @@ mod tests {
     /// hierarchical estimator, with the same bounds: the property #4230 pins
     /// must hold for the estimator the fleet routes with, not only for the
     /// legacy fallback. The warm mode trains the same history with every
-    /// success timed (farther is slower, [`with_distance_timing`]) so ALL THREE
-    /// hierarchical stages are warm and ranking uses the full shipping formula;
-    /// the untimed history ranks on failure alone, which the sweep twin covers.
+    /// success timed ([`with_uninformative_timing`]: no distance or per-peer
+    /// signal) so ALL THREE hierarchical stages are warm and ranking uses the
+    /// full shipping formula, while the property still rests on the failure
+    /// stage: an inverted hierarchical failure estimate must turn it red.
     #[test]
     fn routing_convergence_preserved_at_window_25_4230_warm_hierarchical() {
         convergence_at_window_25_case(Training::WarmHierarchical);
@@ -6733,12 +6742,13 @@ mod tests {
         );
 
         // The History mode keeps the original untimed input. The warm mode
-        // times every success so the hierarchical timing stages warm too, and
+        // times every success (with no distance signal, so the ranking stays
+        // failure-driven) so the hierarchical timing stages warm too, and
         // proves they did before measuring.
         let measured = match training {
             Training::History => history.clone(),
             Training::WarmHierarchical => {
-                let timed = with_distance_timing(&history);
+                let timed = with_uninformative_timing(&history);
                 assert_hierarchical_timing_decides(
                     &warm_hierarchical_router(&timed),
                     &pool,
@@ -7618,8 +7628,10 @@ mod tests {
     /// 1. Failure-only (all-success, untimed). Both stacks read 0.0 failure
     ///    here, so the precondition's equality cannot tell them apart; the
     ///    warm mode instead asserts NO legacy stage was evaluated, which with
-    ///    no timing data holds only when the hierarchical failure estimate is
-    ///    used.
+    ///    no timing data holds only when a hierarchical failure estimate is
+    ///    PRESENT (so the legacy stage is not consulted). It cannot tell which
+    ///    value that arm then uses: returning the raw isotonic estimate there
+    ///    would also read 0.0 and pass. That residual is equality-blind.
     /// 2. Five timed successes: below the hierarchical timing stages' 30-point
     ///    floor, so timing comes from the legacy fallback while failure stays
     ///    hierarchical — the mixed state of a node's first timed GETs.
@@ -7743,6 +7755,9 @@ mod tests {
     /// ranking runs entirely on the hierarchical estimate, which the timing
     /// precondition proves. The failure ordering is unchanged (close ~4%, mid
     /// ~21%, far 75%); the History mode keeps the original 13 timed events.
+    /// So under realistic traffic this twin covers only fully-warm timing; the
+    /// mixed state (warm failure, sparse legacy timing) is covered by the
+    /// transition twin's phase 2, with uniform timing.
     #[test]
     fn test_realistic_mixed_traffic_routing_warm_hierarchical() {
         realistic_mixed_traffic_case(Training::WarmHierarchical);
