@@ -2832,7 +2832,11 @@ mod tests {
         // the edit" rule in .claude/rules/bug-prevention-patterns.md. Splitting
         // on the first `#` is sound for these files: no line carrying one of
         // these needles has a `#` before it.
-        let code_of = |line: &str| line.split('#').next().unwrap_or("");
+        // A nested `fn`, not a closure: closure inference ties the argument and
+        // return to one lifetime, which does not typecheck for a borrow-through.
+        fn code_of(line: &str) -> &str {
+            line.split('#').next().unwrap_or("")
+        }
         let has_statement =
             |src: &str, needle: &str| src.lines().any(|line| code_of(line).contains(needle));
 

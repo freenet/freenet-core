@@ -416,6 +416,33 @@ assert_contains "$(cat "$WORK4/log")" "network|" "the repaired peer actually run
 assert_eq "$(find "$STATE4/bin" -name '.freenet.seed.*' | wc -l)" "0" \
   "seeding leaves no temp file behind (it is renamed into place, never written in place)"
 
+# ...and the atomicity itself, by making the copy genuinely fail part-way.
+# `ulimit -f` makes the write past the limit raise SIGXFSZ, which is the same
+# shape as the OOM kill / reboot / ENOSPC that produced the wreckage above:
+# install(1) dies mid-copy having already created the destination. The property
+# is that $binary is ABSENT OR COMPLETE, never truncated -- which is true only
+# if the copy lands on a temp name and is renamed into place.
+WORK4B="$(mktemp -d)"
+STATE4B="$WORK4B/state"
+SEED4B="$WORK4B/seed-freenet"
+write_fake_freenet "$SEED4B"
+printf '0\n' >"$WORK4B/plan"
+: >"$WORK4B/log"
+(
+  ulimit -c 0
+  ulimit -f 1
+  env -u XDG_STATE_HOME \
+    FAKE_LOG="$WORK4B/log" \
+    FAKE_PLAN="$WORK4B/plan" \
+    FAKE_COUNT="$WORK4B/count" \
+    FREENET_NIX_SEED_BINARY="$SEED4B" \
+    STATE_DIRECTORY="$STATE4B" \
+    FREENET_NODE_RESTART_SECS=0 \
+    bash "$WRAPPER" >/dev/null 2>&1
+) || true
+assert_eq "$([ -e "$STATE4B/bin/freenet" ] && echo present || echo absent)" "absent" \
+  "a seed that dies mid-copy leaves NO binary at all, never a truncated one: the copy goes to a temp name and is renamed into place"
+
 # ---------------------------------------------------------------------------
 # 12. A symlink at the binary path is replaced, not run.
 #
