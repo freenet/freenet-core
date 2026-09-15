@@ -32,6 +32,25 @@ When in doubt about which bucket you're in, file an issue first. It costs you a 
 - **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
 - **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet-locutus:matrix.org) before writing code.
 
+## Building with Nix (optional)
+
+An alternative to a local rustup install, not a requirement.
+
+```bash
+nix develop                  # dev shell: pinned toolchain, nextest, shellcheck, ...
+nix build .#freenet          # build the node binary (result/bin/freenet)
+nix run .                    # run the supervised, self-updating node
+```
+
+The shell's toolchain is pinned to [`rust-toolchain.toml`](rust-toolchain.toml),
+so `cargo fmt` and `cargo clippy -- -D warnings` inside it agree with CI.
+
+Nix is also a supported **deployment** path, and the two package outputs differ
+in whether the node keeps itself current — which matters to the network, not
+just to you. [`docs/nix.md`](docs/nix.md) has the full picture, including the
+drift tradeoff you accept by running the self-updating output and what this
+build does *not* tell you about the published release binaries.
+
 ## Quality Standards
 
 - PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/) format (`feat:`, `fix:`, `docs:`, etc.) — CI enforces this.
