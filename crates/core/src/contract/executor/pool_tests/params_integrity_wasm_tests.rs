@@ -3,9 +3,8 @@
 //!
 //! The params row is keyed by instance id alone, and every later operation that
 //! arrives without code (UPDATE, summarize, delta, serving the contract) reads
-//! its parameters from there. So a container that claims an existing contract's
-//! instance id, but carries other parameters, must be refused before anything
-//! is written, not merely refused.
+//! its parameters from there, so a container's parameters must not be written
+//! before its key has been verified.
 //!
 //! These tests need a real `Executor<Runtime>`. The identity check lives in
 //! `ContractStore::store_contract`, and the mock executor's in-memory store
@@ -538,7 +537,7 @@ async fn local_reput_repairs_a_refused_params_row() -> Result<(), Box<dyn std::e
         "sanity: the overwritten row is refused"
     );
 
-    local_put(&mut h.executor, honest, b"re-put state")
+    local_put(&mut h.executor, honest.clone(), b"re-put state")
         .await
         .map_err(|e| format!("re-PUT of the verified container failed: {e}"))?;
     assert_eq!(
@@ -546,11 +545,36 @@ async fn local_reput_repairs_a_refused_params_row() -> Result<(), Box<dyn std::e
         Some(params.as_ref()),
         "a local re-PUT of the verified container must repair the params row"
     );
+    assert!(
+        h.executor
+            .verified_stored_params(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some(),
+        "the repaired row must pass the read-side check again"
+    );
+
+    // The usual remedy re-sends the SAME state, which takes the merge's
+    // no-change early return. The repair must not depend on the state changing.
+    h.executor
+        .state_store
+        .inner()
+        .store_params(key, Parameters::from(vec![0x5C, 0xEF]))
+        .await
+        .expect("overwrite the params row directly");
+    local_put(&mut h.executor, honest, b"re-put state")
+        .await
+        .map_err(|e| format!("same-state re-PUT of the verified container failed: {e}"))?;
+    assert_eq!(
+        stored_params(&h.executor, &key).await.as_deref(),
+        Some(params.as_ref()),
+        "a same-state local re-PUT of the verified container must also repair the params row"
+    );
     Ok(())
 }
 
-/// Pins `verified_stored_params` to exactly the derivation that the store audit
-/// measured against real node data: stdlib `ContractKey::from_params` over the
+/// Pins `verified_stored_params` to exactly one derivation: stdlib
+/// `ContractKey::from_params` over the
 /// stored parameter bytes and the instance's INDEXED code hash, with an
 /// instance that has no index row passed through unchanged. The derivation is
 /// computed here independently of the helper, and each case asserts the helper
