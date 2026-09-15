@@ -321,7 +321,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -330,6 +330,17 @@ jobs:
       # is broken" looking identical.
       - name: Self-test PR backlog sweep
         run: bash scripts/pr-backlog-sweep_test.sh
+      # The Nix deployment path's supervisor. `nix build .#freenet-node` only
+      # LINTS that script (writeShellApplication runs shellcheck at build time)
+      # and costs a full dependency-graph compile; this RUNS it against a fake
+      # `freenet` in about a second, and asserts the exit-code contract in both
+      # directions — the updater runs on exit 42 and on a crash, and does NOT
+      # run on 0, 43, or a signal-shaped status. Auto-update is the whole reason
+      # the Nix node exists, so it is checked in the always-on job rather than
+      # in the path-filtered nix.yml.
+      - name: Self-test the Nix node supervisor
+        run: bash scripts/nix-node-wrapper_test.sh
+
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
