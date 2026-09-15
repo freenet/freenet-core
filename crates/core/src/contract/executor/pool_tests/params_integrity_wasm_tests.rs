@@ -341,6 +341,159 @@ async fn valid_container_restores_missing_params_on_merge_with_stored_code()
     valid_container_restores_missing_params_on_merge(true).await
 }
 
+/// A params row that does not derive its instance id, such as one written
+/// before the write was ordered after verification, must not be used by the
+/// operations that arrive without code, and must not be served. A verified
+/// container for the instance repairs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_params_not_deriving_the_instance_are_not_used()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut h = build_harness().await?;
+    let honest_params = Parameters::from(vec![0x57, 0x01]);
+    let honest = load(honest_params.clone()).await;
+    let honest_key = install_honest(&mut h.executor, &honest_params, b"honest state").await;
+
+    h.executor
+        .state_store
+        .inner()
+        .store_params(honest_key, Parameters::from(vec![0x57, 0xEE]))
+        .await
+        .expect("overwrite the params row directly");
+
+    // A code-less update must not run the contract with the row's parameters.
+    let result = h
+        .executor
+        .upsert_contract_state(
+            honest_key,
+            Either::Left(WrappedState::new(b"code-less update".to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a code-less update must be refused while the stored parameters do not derive \
+         the instance id"
+    );
+    assert_eq!(
+        stored_state(&h.executor, &honest_key).await,
+        b"honest state",
+        "a refused code-less update must not change the stored state"
+    );
+
+    // Serving must not build a container from the row's parameters.
+    let (_, served) = h.executor.fetch_contract(honest_key, true).await?;
+    if let Some(served) = served {
+        assert_eq!(
+            served.key().id(),
+            honest_key.id(),
+            "the node served a container whose key is not the contract that was asked for"
+        );
+    }
+
+    // A verified container repairs the row, and code-less operations work again.
+    upsert(&mut h.executor, honest, b"repaired")
+        .await
+        .map_err(|e| format!("verified container upsert failed: {e}"))?;
+    assert_eq!(
+        stored_params(&h.executor, &honest_key).await.as_deref(),
+        Some(honest_params.as_ref()),
+        "a verified container must rewrite the params row"
+    );
+    h.executor
+        .upsert_contract_state(
+            honest_key,
+            Either::Left(WrappedState::new(b"after repair".to_vec())),
+            RelatedContracts::default(),
+            None,
+        )
+        .await
+        .map_err(|e| format!("code-less update after repair failed: {e}"))?;
+    assert_eq!(stored_state(&h.executor, &honest_key).await, b"after repair");
+    Ok(())
+}
+
+/// A forged container for an instance this node does not hold must not leave a
+/// params row behind for the instance id it claimed. The claim carries EMPTY
+/// parameters, the smallest input the row can take.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_container_for_unheld_instance_leaves_no_params_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut h = build_harness().await?;
+    // Never installed on this node.
+    let claimed = load(Parameters::from(vec![0x58, 0x01])).await.key();
+    let forged = claim_instance(&claimed, load(Parameters::from(Vec::<u8>::new())).await);
+
+    let err = upsert(&mut h.executor, forged, b"forged state")
+        .await
+        .expect_err("a container whose key is not derived from its code and parameters must be refused");
+
+    assert_eq!(
+        stored_params(&h.executor, &claimed).await,
+        None,
+        "a refused container must not create a params row for the instance it claimed \
+         (refusal was: {err})"
+    );
+    assert!(
+        h.executor.lookup_key(claimed.id()).is_none(),
+        "a refused container must not index the instance it claimed"
+    );
+    Ok(())
+}
+
+/// Ordering pin: the bridged upsert has exactly one params write, and it follows
+/// every `store_contract` call (the calls that verify a supplied container).
+///
+/// The behavioural tests above catch a reverted ordering on both code branches.
+/// This also catches a SECOND params write added to the function ahead of
+/// verification, which none of them would notice if it sat on a path they do
+/// not take. It scrapes `executor_impl.rs` from this file, so its own needle
+/// strings cannot satisfy it, and it cuts off that file's test modules first,
+/// whose pins quote the same signatures.
+#[test]
+fn upsert_writes_container_params_only_after_store_contract() {
+    let full = include_str!("../runtime/executor_impl.rs");
+    let production = &full[..full
+        .find("\n#[cfg(test)]\nmod ")
+        .expect("executor_impl.rs must have a top-level #[cfg(test)] mod section")];
+    let start = production
+        .find("async fn bridged_upsert_contract_state_inner(")
+        .expect("bridged_upsert_contract_state_inner not found");
+    let after = &production[start..];
+    let end = after
+        .find("async fn bridged_summarize_contract_state(")
+        .expect("the method following bridged_upsert_contract_state_inner moved");
+    // Whole-line `//` comments stripped, so prose naming a call cannot match.
+    let body = after[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let writes: Vec<usize> = body
+        .match_indices(".ensure_params(")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "expected exactly one params write in the bridged upsert"
+    );
+    assert!(
+        !body.contains("store_params("),
+        "the bridged upsert must not write the params row directly"
+    );
+    let last_verify = body
+        .rfind(".store_contract(")
+        .expect("the bridged upsert no longer calls store_contract");
+    assert!(
+        last_verify < writes[0],
+        "the params write ({}) must follow every store_contract call (last at {last_verify}): \
+         only parameters that verification has bound to the instance id may be written",
+        writes[0]
+    );
+}
+
 /// A valid new instance of an already-stored binary is stored with its own
 /// parameters and leaves the first instance's parameters alone.
 #[tokio::test(flavor = "multi_thread")]
