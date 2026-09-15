@@ -226,6 +226,17 @@ test's thread-local log capture to those callsites only. 29 failures in 1000
 0 in 2000 after the fix, and **unreachable under nextest at any repeat
 count**. `test_utils::TestLogger` still has the same hazard: #5315.
 
+The mirror shape is a **global cleared by whichever thread leaves first**.
+Instance ([#5673](https://github.com/freenet/freenet-core/issues/5673)): the
+simulation harness's packet-delivery callback, the thing that makes
+`SimOperation::CrashNode` actually drop packets, was one process-global slot,
+and every `SimNetwork::Drop` cleared it. Under plain `cargo test` the first
+simulation to finish turned crash enforcement off for every other one, so
+crash tests could pass without the crash ever happening. The fix was to key
+the state by the network that owns it, as every other harness registry
+already was. The same family still has one open member: `ADDRESS_NETWORKS`
+is keyed by bare `SocketAddr`, and simulations share one port range (#5676).
+
 Audit question for any new or changed test: *could this interact with other
 tests through global state* (a static cache, `set_global_default`, an env var,
 a singleton registry, a shared temp path)? If so, run plain `cargo test`

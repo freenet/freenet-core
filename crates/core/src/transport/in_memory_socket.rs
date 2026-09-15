@@ -80,7 +80,11 @@ fn get_address_network(addr: &SocketAddr) -> Option<String> {
     ADDRESS_NETWORKS.get(addr).map(|r| r.value().clone())
 }
 
-/// Clears all address-network mappings. Useful for test cleanup.
+/// Clears all address-network mappings, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use clear_network_address_mappings"
+)]
 pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
 }
@@ -91,7 +95,11 @@ pub fn clear_network_address_mappings(network_name: &str) {
     ADDRESS_NETWORKS.retain(|_, v| v != network_name);
 }
 
-/// Clears all network time sources. Useful for test cleanup.
+/// Clears all network time sources, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use unregister_network_time_source"
+)]
 pub fn clear_all_network_time_sources() {
     NETWORK_TIME_SOURCES.clear();
 }
@@ -159,33 +167,66 @@ pub type PacketDeliveryCallback =
 pub type QueuePacketCallback =
     Arc<dyn Fn(&str, u64, Vec<u8>, SocketAddr, SocketAddr) + Send + Sync>;
 
-/// Global callbacks for fault injection integration.
-static DELIVERY_CALLBACK: LazyLock<RwLock<Option<PacketDeliveryCallback>>> =
-    LazyLock::new(|| RwLock::new(None));
+/// Fault-injection callbacks, keyed by the network that installed them.
+///
+/// Scoped per network (like every other registry in this module) because
+/// several `SimNetwork`s run concurrently in one process under plain
+/// `cargo test`. When this was a single process-global slot, the first
+/// network to drop cleared it for every network still running, so their
+/// `CrashNode` crashes silently stopped dropping packets (#5673).
+static DELIVERY_CALLBACKS: LazyLock<DashMap<String, PacketDeliveryCallback>> =
+    LazyLock::new(DashMap::new);
 
-static QUEUE_PACKET_CALLBACK: LazyLock<RwLock<Option<QueuePacketCallback>>> =
-    LazyLock::new(|| RwLock::new(None));
+static QUEUE_PACKET_CALLBACKS: LazyLock<DashMap<String, QueuePacketCallback>> =
+    LazyLock::new(DashMap::new);
 
-/// Registers the packet delivery callback for fault injection.
+/// Registers (or with `None`, removes) the packet delivery callback for one
+/// network. Other networks' callbacks are unaffected.
 ///
 /// This is called by the testing infrastructure to wire up fault injection.
-pub fn set_packet_delivery_callback(callback: Option<PacketDeliveryCallback>) {
-    *DELIVERY_CALLBACK.write().unwrap() = callback;
+pub fn set_packet_delivery_callback(network_name: &str, callback: Option<PacketDeliveryCallback>) {
+    match callback {
+        Some(cb) => {
+            DELIVERY_CALLBACKS.insert(network_name.to_string(), cb);
+        }
+        None => {
+            DELIVERY_CALLBACKS.remove(network_name);
+        }
+    }
 }
 
-/// Registers the queue packet callback for virtual time delivery.
-pub fn set_queue_packet_callback(callback: Option<QueuePacketCallback>) {
-    *QUEUE_PACKET_CALLBACK.write().unwrap() = callback;
+/// Registers (or with `None`, removes) the queue packet callback for virtual
+/// time delivery on one network. Other networks' callbacks are unaffected.
+pub fn set_queue_packet_callback(network_name: &str, callback: Option<QueuePacketCallback>) {
+    match callback {
+        Some(cb) => {
+            QUEUE_PACKET_CALLBACKS.insert(network_name.to_string(), cb);
+        }
+        None => {
+            QUEUE_PACKET_CALLBACKS.remove(network_name);
+        }
+    }
 }
 
-/// Checks if a packet should be delivered based on fault injection config.
-fn check_packet_delivery(
+/// Returns whether `network_name` currently has a delivery callback installed.
+#[cfg(test)]
+pub(crate) fn has_packet_delivery_callback(network_name: &str) -> bool {
+    DELIVERY_CALLBACKS.contains_key(network_name)
+}
+
+/// Checks if a packet should be delivered based on this network's fault
+/// injection callback. Networks without one deliver everything.
+pub(crate) fn check_packet_delivery(
     network_name: &str,
     from: SocketAddr,
     to: SocketAddr,
 ) -> PacketDeliveryDecision {
-    let callback = DELIVERY_CALLBACK.read().unwrap();
-    match callback.as_ref() {
+    // Clone the Arc out so no map shard guard is held while the callback runs
+    // (it locks the network's fault injector).
+    let callback = DELIVERY_CALLBACKS
+        .get(network_name)
+        .map(|r| r.value().clone());
+    match callback {
         Some(cb) => cb(network_name, from, to),
         None => PacketDeliveryDecision::Deliver,
     }
@@ -199,8 +240,10 @@ fn queue_packet_for_delivery(
     from: SocketAddr,
     target: SocketAddr,
 ) {
-    let callback = QUEUE_PACKET_CALLBACK.read().unwrap();
-    if let Some(cb) = callback.as_ref() {
+    let callback = QUEUE_PACKET_CALLBACKS
+        .get(network_name)
+        .map(|r| r.value().clone());
+    if let Some(cb) = callback {
         cb(network_name, deadline, data, from, target);
     }
 }
@@ -375,7 +418,11 @@ pub fn remove_network_socket_registry(network_name: &str) {
     SOCKET_REGISTRIES.remove(network_name);
 }
 
-/// Clears all socket registries (useful between test runs).
+/// Clears all socket registries, for EVERY network in the process.
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use remove_network_socket_registry"
+)]
 pub fn clear_all_socket_registries() {
     SOCKET_REGISTRIES.clear();
 }
@@ -661,6 +708,60 @@ impl Socket for SimulationSocket {
 mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
+
+    /// Delivery callbacks are scoped per network (#5673): installing one
+    /// network's callback does not replace another's, and removing one (as
+    /// `SimNetwork::Drop` does) leaves every other network's in force.
+    #[test]
+    fn delivery_callbacks_are_scoped_per_network() {
+        let net_a = "callback-scope-a";
+        let net_b = "callback-scope-b";
+        let from: SocketAddr = "127.0.0.1:10101".parse().unwrap();
+        let to: SocketAddr = "127.0.0.1:10102".parse().unwrap();
+        let is_drop = |d: PacketDeliveryDecision| matches!(d, PacketDeliveryDecision::Drop);
+
+        let drop_all: PacketDeliveryCallback =
+            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr| PacketDeliveryDecision::Drop);
+        let deliver_all: PacketDeliveryCallback =
+            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr| PacketDeliveryDecision::Deliver);
+
+        set_packet_delivery_callback(net_a, Some(drop_all));
+        set_packet_delivery_callback(net_b, Some(deliver_all));
+        assert!(
+            is_drop(check_packet_delivery(net_a, from, to)),
+            "installing network B's callback must not replace network A's"
+        );
+        assert!(!is_drop(check_packet_delivery(net_b, from, to)));
+
+        set_packet_delivery_callback(net_b, None);
+        assert!(
+            is_drop(check_packet_delivery(net_a, from, to)),
+            "removing network B's callback must leave network A's in force"
+        );
+
+        set_packet_delivery_callback(net_a, None);
+        assert!(
+            !is_drop(check_packet_delivery(net_a, from, to)),
+            "a network with no callback delivers everything"
+        );
+
+        // The queue callback has the same per-network scoping.
+        let queued_on = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = |log: Arc<std::sync::Mutex<Vec<String>>>| -> QueuePacketCallback {
+            Arc::new(move |net: &str, _, _, _, _| log.lock().unwrap().push(net.to_string()))
+        };
+        set_queue_packet_callback(net_a, Some(record(queued_on.clone())));
+        set_queue_packet_callback(net_b, Some(record(queued_on.clone())));
+        set_queue_packet_callback(net_b, None);
+        queue_packet_for_delivery(net_a, 0, vec![1], from, to);
+        queue_packet_for_delivery(net_b, 0, vec![2], from, to);
+        assert_eq!(
+            *queued_on.lock().unwrap(),
+            vec![net_a.to_string()],
+            "removing network B's queue callback must leave network A's in force"
+        );
+        set_queue_packet_callback(net_a, None);
+    }
 
     #[tokio::test]
     async fn test_socket_bind_and_send() {

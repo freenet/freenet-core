@@ -23,8 +23,8 @@ use freenet::dev_tool::{
 };
 use freenet::simulation::TimeSource;
 use freenet::transport::in_memory_socket::{
-    SimulationSocket, clear_all_socket_registries, register_address_network,
-    register_network_time_source,
+    SimulationSocket, register_address_network, register_network_time_source,
+    remove_network_socket_registry,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1587,10 +1587,12 @@ fn test_high_latency_timeout_regression() {
 /// This verifies that the real in-memory socket works with Turmoil's deterministic scheduler.
 #[test]
 fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
-    // Clean up any previous socket state
-    clear_all_socket_registries();
-
     let network_name = "turmoil-test";
+
+    // Clean up any previous socket state for THIS network only. Clearing every
+    // registry would wipe the sockets of simulations running concurrently in
+    // the same process under plain `cargo test` (#5673).
+    remove_network_socket_registry(network_name);
     let virtual_time = VirtualTime::new();
 
     // Register the network's time source
@@ -7769,7 +7771,7 @@ fn test_direct_runner_churn() {
 /// Regression test for #4694: direct-runner `ChurnConfig` crashes must actually
 /// DROP packets, not merely set fault config.
 ///
-/// Before the fix, `run_simulation_direct` never installed the global
+/// Before the fix, `run_simulation_direct` never installed the
 /// packet-delivery callback and never set `enforce_fault_drops`, so the chaos
 /// driver's `crash_node()` calls were inert: a "crashed" node kept exchanging
 /// packets. Any near-K churn / partition validation on the direct runner was
