@@ -2852,11 +2852,45 @@ mod tests {
         // would let the forbidden form back in as an example.
         // A nested `fn`, not a closure: closure inference ties the argument and
         // return to one lifetime, which does not typecheck for a borrow-through.
+        //
+        // A bare `split('#')` also truncates at a `#` that is CODE, not a
+        // comment -- `${#arr[@]}` is the one that occurs here, and
+        // `nix/freenet-node.sh` has such a line. No needle is affected (none
+        // sits after a `${#...}` on its line), but the next one could be, so
+        // cut only where a comment can actually begin: at a line-leading `#`,
+        // or at a `#` preceded by whitespace. That is the shell/nix/YAML
+        // convention, and it leaves `${#arr[@]}` and `%s#%s` intact.
         fn code_of(line: &str) -> &str {
-            line.split('#').next().unwrap_or("")
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return "";
+            }
+            match line
+                .char_indices()
+                .find(|&(i, c)| c == '#' && i > 0 && line.as_bytes()[i - 1].is_ascii_whitespace())
+            {
+                Some((i, _)) => &line[..i],
+                None => line,
+            }
         }
         let has_statement =
             |src: &str, needle: &str| src.lines().any(|line| code_of(line).contains(needle));
+
+        // `code_of` is only as good as its notion of where a comment starts, and
+        // it is easy to make it eat code. These four pin both directions.
+        assert_eq!(code_of("  # a full-line comment").trim(), "");
+        assert_eq!(code_of("foo=1  # trailing").trim_end(), "foo=1");
+        assert_eq!(
+            code_of("    if [ \"${#failures[@]}\" -gt 0 ]; then"),
+            "    if [ \"${#failures[@]}\" -gt 0 ]; then",
+            "a `#` that is CODE must not truncate the line -- `${{#arr[@]}}` is \
+             the shape that occurs in nix/freenet-node.sh"
+        );
+        assert_eq!(
+            code_of("printf '%s#%s' \"$a\" \"$b\""),
+            "printf '%s#%s' \"$a\" \"$b\"",
+            "nor a `#` with no whitespace before it"
+        );
 
         let nix_src = read_repo_file("nix/freenet-node.sh");
         let supervised_export = format!(
@@ -2887,31 +2921,57 @@ mod tests {
              update (#4073)",
             super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
         );
-        // The re-seed escape hatch -- "a STRICTLY NEWER store binary replaces
-        // the state binary" -- must not CREATE the peer it exists to rescue.
-        // Two candidates look like an ordinary version bump and are not:
-        //
-        //   * a `-dirty` build, which never auto-updates (GIT_DIRTY is a kill
-        //     switch), so after the re-seed the node never exits 42 again AND
-        //     the two versions now match, so the wrapper never re-seeds again
-        //     either. Stuck forever, with the log claiming the node "owns it
-        //     from now on and will update it in place".
-        //   * a version this node pinned KNOWN-BAD after it crash-looped here.
-        //     The re-seed writes the binary directly, with no probation marker,
-        //     so the crash loop repeats and auto-rollback cannot fire.
+        // The wrapper's seed/re-seed decision must be driven by ONE predicate --
+        // "can this binary update itself?" -- not by a version comparison. The
+        // distinction is the whole invariant: a CLEAN OLDER binary walks itself
+        // to the current release, while a DIRTY NEWER one never exits 42 again,
+        // so ordering versions answers the wrong question and each refusal
+        // layered on top of it opened a new stuck corner.
         assert!(
-            has_statement(&nix_src, "binary_is_dirty"),
-            "the Nix supervisor's re-seed must refuse a -dirty store binary: it never \
-             auto-updates, so installing one over a peer that still does is a one-way \
-             trip to a permanently stale peer -- and `freenet --version` prints the \
-             marker on the COMMIT HASH, so a version comparison alone cannot see it"
+            has_statement(&nix_src, "self_update_blocker"),
+            "the Nix supervisor must decide what to run from whether the binary can \
+             UPDATE ITSELF, not from which version is newer: a clean older binary is \
+             forward progress (it exits 42 and walks itself to current), a dirty newer \
+             one is a dead end (GIT_DIRTY is an auto-update kill switch)"
         );
         assert!(
+            has_statement(&nix_src, "binary_is_dirty"),
+            "the Nix supervisor must recognise a -dirty build specifically: it never \
+             auto-updates, and `freenet --version` prints the marker on the COMMIT \
+             HASH, so a version comparison alone cannot see it"
+        );
+        // ...and the ONE refusal that is genuinely about which version.
+        //
+        // It is standing in for a safety net that is absent rather than backing
+        // one up: `capture_known_good` and `begin_probation` run only inside
+        // `commands::update`, so EVERY binary the wrapper installs -- not just a
+        // pinned-bad one -- arrives with no known-good snapshot and no probation
+        // marker, and #4073 rollback cannot fire for a version the wrapper
+        // itself first put there. `handle_post_stop_at` drops a marker belonging
+        // to a different version rather than mis-applying it, so the residual is
+        // a loud flap (the wrapper's own limiter plus `Restart=always`), not a
+        // wrong-version rollback. The wrapper header says so next to the guard.
+        assert!(
             has_statement(&nix_src, "version_is_pinned_bad"),
-            "the Nix supervisor's re-seed must consult the node's known-bad pin. \
-             `is_version_pinned_bad` only refuses to INSTALL such a version; nothing \
-             refuses to RUN one already in place, and the re-seed installs it with no \
-             probation marker, so rollback could never fire"
+            "the Nix supervisor must consult the node's known-bad pin before replacing \
+             a peer that is still serving. `is_version_pinned_bad` only refuses to \
+             INSTALL such a version; nothing refuses to RUN one already in place, and \
+             the wrapper installs it with no probation marker, so rollback could never \
+             fire"
+        );
+        // The pin lives under the node's HOME, and `dirs::home_dir()` falls back
+        // to `getpwuid_r` when $HOME is unset or empty -- so the node writes a
+        // pin in an environment where a `[ -n "$HOME" ]` guard sees nothing.
+        // systemd exports $HOME only for a unit with `User=`, which the
+        // documented root-capable shapes need not have. Verified by execution:
+        // same pin on disk, only $HOME differing, the guard refused with it set
+        // and installed the pinned-bad version with it unset.
+        assert!(
+            has_statement(&nix_src, "passwd_home"),
+            "the Nix supervisor must mirror `dirs::home_dir()`'s passwd fallback when \
+             $HOME is unset or empty, or the known-bad lookup fails OPEN in exactly \
+             the environment (a systemd unit without `User=`, a scrubbed container) \
+             where the node still writes the pin"
         );
         // ...under the name and in the directory the node actually uses. Both
         // sides are scraped so a rename on either fails here, rather than
@@ -2991,12 +3051,23 @@ mod tests {
         // ...and the two re-seed refusals above are likewise only text until
         // something drives them. Their cases feed the wrapper a store binary
         // that is newer AND unusable, in each of the two ways.
+        // The needles are the ASSERTION TEXT of the driving cases, not the knob
+        // names that set them up. `"-dirty\""` and `"WRAP_PINNED_BAD"` were both
+        // satisfied by the suite's own declaration and reset lines, which
+        // survive deleting every case that uses them: measured by deleting the
+        // three refusal cases, which left the shell suite green AND this pin
+        // green, and then by stubbing `version_is_pinned_bad` to always return
+        // false, which also left both green -- zero coverage of the guard this
+        // pin exists to protect. These two strings occur exactly once each, in
+        // an `assert_contains` naming the behaviour, so commenting the case out
+        // strips them with `code_of` and this fails closed.
         assert!(
-            has_statement(&wrapper_test, "-dirty\"")
-                && has_statement(&wrapper_test, "WRAP_PINNED_BAD"),
-            "scripts/nix-node-wrapper_test.sh must drive BOTH re-seed refusals -- a \
-             -dirty store binary and one pinned known-bad -- or the source pins above \
-             are satisfied by guards that never fire"
+            has_statement(&wrapper_test, "it is a -dirty build")
+                && has_statement(&wrapper_test, "KNOWN-BAD"),
+            "scripts/nix-node-wrapper_test.sh must drive BOTH halves of the re-seed \
+             decision that depend on more than \"can it update itself\" -- a -dirty \
+             binary and a version pinned known-bad -- or the source pins above are \
+             satisfied by guards that never fire"
         );
         let ci_yml = read_repo_file(".github/workflows/ci.yml");
         assert!(

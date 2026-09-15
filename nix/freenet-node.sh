@@ -12,9 +12,16 @@
 # store path.
 #
 # So nix does not own the running binary. It SEEDS one into a mutable state
-# directory, once, and from then on the node self-updates from there exactly as
-# it does on every other platform -- same signature verification, same rollback
+# directory and from then on the node self-updates from there exactly as it does
+# on every other platform -- same signature verification, same rollback
 # snapshot, same crash probation, same known-bad pinning.
+#
+# THIS SCRIPT ASKS ONE QUESTION AND NOTHING ELSE: can the binary in the state
+# directory update itself? If it can, the store copy is never written over it.
+# If it cannot -- absent, a symlink, a partial copy, not a freenet binary, or a
+# `-dirty` build that can never exit 42 -- the store copy replaces it. That
+# predicate, not a version comparison, is the whole placement policy; the full
+# reasoning is on the decision block below.
 #
 # THE LOAD-BEARING PROPERTY IS THAT BOTH `freenet network` AND `freenet update`
 # RUN FROM THE STATE DIRECTORY, NEVER FROM THE STORE PATH. Run either from
@@ -114,8 +121,114 @@ START_LIMIT_BURST="${FREENET_NODE_START_LIMIT_BURST:-5}"
 START_LIMIT_INTERVAL_SECS="${FREENET_NODE_START_LIMIT_INTERVAL_SECS:-120}"
 
 # ---------------------------------------------------------------------------
-# Locate (and, on first run only, seed) the mutable binary.
+# Locate the mutable binary -- and, when it cannot update itself, replace it.
+#
+# THE INVARIANT IS "ALWAYS END UP ON A BINARY THAT CAN UPDATE ITSELF".
+#
+# It is NOT "never move backwards in version". That is what earlier revisions
+# of this file tried to encode, as a growing pile of refusals, and each new
+# refusal opened a new stuck corner -- because version ordering is the wrong
+# question. A CLEAN OLDER binary is forward progress: it exits 42 on its next
+# start and walks itself to the current release. A DIRTY NEWER binary is a dead
+# end: GIT_DIRTY is one of the three auto-update kill switches
+# (`auto_update_is_disabled`, crates/core/src/bin/freenet.rs), the node never
+# exits 42 again, and nothing in this design moves it forward. Version ordering
+# only discriminates between two binaries that can BOTH update themselves, and
+# there it barely matters, because whichever one runs reaches the newest release
+# on its own.
+#
+# So this file asks ONE question, of the binary in the state directory:
+#
+#     can it update itself?
+#
+#   yes -> leave it completely alone, whatever the store holds. This is the
+#          common path, and it is the whole reason the flake's version never
+#          pins a peer that has already moved past it.
+#   no  -> replace it with the store binary, if that is an improvement.
+#
+# "An improvement" has two shapes, and neither of them is a version comparison:
+#
+#   * the state binary still RUNS but cannot update itself (a `-dirty` build).
+#     Swap only for a store binary that can update itself: trading one frozen
+#     binary for another frozen binary gains nothing and risks losing a peer
+#     that at least serves the network.
+#   * the state binary cannot even run -- absent, a symlink, non-executable, or
+#     not a freenet binary at all. Anything runnable beats nothing, so the store
+#     binary goes in even if it is itself frozen, with the every-start warning
+#     below saying so.
+#
+# THE ONE REFUSAL THAT IS GENUINELY ABOUT WHICH VERSION is the node's own
+# known-bad pin: do not install a version THIS host crash-looped on and rolled
+# back from. It applies only in the first shape, where there is a running peer
+# to keep instead. In the second there is nothing else to run, and a peer that
+# flaps loudly -- and that this wrapper's own `freenet update` can step forward
+# out of as soon as a newer release exists -- beats a peer that is simply down.
+#
+# WHAT A RE-SEED DOES NOT DO, stated here because it undercuts that refusal:
+# `capture_known_good` and `begin_probation` run only inside `commands::update`,
+# so EVERY binary this script installs -- not only a pinned-bad one -- arrives
+# with no known-good snapshot and no probation marker. The #4073 crash-loop
+# rollback therefore cannot fire for any version the wrapper itself first put
+# there, which means the pin below stands in for a safety net that is not
+# present rather than backing one up. It is not a WRONG rollback:
+# `handle_post_stop_at` drops a probation marker left by a different version
+# instead of mis-applying it. And the failure is loud -- `count_failure` below,
+# plus `Restart=always` in the documented unit -- rather than silent.
+#
+# AND A CORRECTION TO AN EARLIER VERSION OF THIS COMMENT, which justified the
+# old version-forward re-seed as the escape from a MAX_UPDATE_FAILURES lockout.
+# It is not, twice over. The lockout is a COUNTER FILE (`update_failures`, in
+# `auto_update::state_dir()`) -- host state, not binary state -- so installing a
+# different binary does not clear it. And it does not gate this wrapper's update
+# path at all: `commands::update::run` never consults `should_attempt_update()`,
+# so the ExecStopPost `freenet update` below runs regardless and clears the
+# counter on a successful install. What the lockout genuinely stops is the
+# node's in-process exit-42 re-poll, so a locked-out peer that never crashes
+# also never updates. That residual is real, and this script cannot close it
+# without making update decisions, which is the one thing it must not do.
 # ---------------------------------------------------------------------------
+
+# `dirs::home_dir()` -- which is what `auto_update::state_dir()` is built from --
+# does NOT give up when $HOME is unset or empty: `dirs-sys` falls back to
+# `getpwuid_r(geteuid())`. So the NODE still resolves a state directory, and
+# still writes its known-bad pin into one, in an environment where $HOME is
+# absent. systemd exports $HOME only for a unit that sets `User=`, so a root
+# unit without one, or any scrubbed container, is exactly that environment.
+#
+# Mirror the fallback rather than guarding on `[ -n "$HOME" ]`, which failed
+# OPEN: with the same pin on disk and only $HOME differing, the lookup refused
+# the pinned-bad version with $HOME set and installed it with $HOME unset,
+# saying nothing at all about the lookup it had skipped.
+passwd_home() {
+    local uid line home="" uid_field home_field _name _pw _gid _gecos _shell
+    uid="$(id -u 2>/dev/null || true)"
+    [ -n "$uid" ] || return 1
+    line="$(getent passwd "$uid" 2>/dev/null || true)"
+    if [ -n "$line" ]; then
+        home="$(printf '%s\n' "$line" | cut -d: -f6)"
+    elif [ -r /etc/passwd ]; then
+        # `getent` is glibc's, not coreutils', and nix/node.nix declares only
+        # coreutils as a runtime input; a unit with a scrubbed PATH may not have
+        # it. /etc/passwd is not authoritative under NSS, but it does carry
+        # every statically-declared NixOS user, which is what docs/nix.md's
+        # example unit uses.
+        while IFS=: read -r _name _pw uid_field _gid _gecos home_field _shell; do
+            if [ "$uid_field" = "$uid" ]; then
+                home="$home_field"
+                break
+            fi
+        done </etc/passwd
+    fi
+    [ -n "$home" ] || return 1
+    printf '%s' "$home"
+}
+
+# The home directory the NODE will resolve, which is not necessarily $HOME.
+node_home="${HOME:-}"
+if [ -z "$node_home" ]; then
+    node_home="$(passwd_home || true)"
+fi
+
 state_dir="${STATE_DIRECTORY:-}"
 # systemd passes StateDirectory= as a colon-separated LIST; take the first.
 state_dir="${state_dir%%:*}"
@@ -123,10 +236,10 @@ if [ -n "$state_dir" ]; then
     : # systemd already told us where to put state.
 elif [ -n "${XDG_STATE_HOME:-}" ]; then
     state_dir="$XDG_STATE_HOME/freenet"
-elif [ -n "${HOME:-}" ]; then
-    state_dir="$HOME/.local/state/freenet"
+elif [ -n "$node_home" ]; then
+    state_dir="$node_home/.local/state/freenet"
 else
-    echo "freenet-node: neither STATE_DIRECTORY, XDG_STATE_HOME nor HOME is set, so there is nowhere to put a writable binary." >&2
+    echo "freenet-node: neither STATE_DIRECTORY, XDG_STATE_HOME nor a home directory (\$HOME, or this uid's passwd entry) is available, so there is nowhere to put a writable binary." >&2
     exit 78
 fi
 
@@ -138,7 +251,7 @@ binary="$bin_dir/freenet"
 # `0.2.136 (bbbb222-dirty)` for a build made from a dirty tree (`run_node`,
 # crates/core/src/bin/freenet.rs). Prints NOTHING unless the output is
 # unambiguously that line, because every caller treats "no version line" as
-# "do not act".
+# "this is not a usable freenet binary".
 version_line() {
     local out rest
     out="$(timeout 10 "$1" --version 2>/dev/null || true)"
@@ -151,8 +264,9 @@ version_line() {
 }
 
 # `Freenet version: 0.2.135 (abc1234)` -> `0.2.135`. Prints NOTHING unless the
-# output is unambiguously that line with a dotted numeric version, because every
-# caller treats "no version" as "do not act".
+# output is unambiguously that line with a dotted numeric version. Used ONLY to
+# ask the known-bad pin about a version -- nothing in this file orders two
+# versions any more; see the invariant above.
 binary_version() {
     local ver
     ver="$(version_line "$1")"
@@ -165,14 +279,16 @@ binary_version() {
 
 # Whether a binary was built from a dirty tree. `GIT_DIRTY` is one of the three
 # auto-update kill switches (`auto_update_is_disabled`, crates/core/src/bin/
-# freenet.rs), so a dirty binary NEVER updates itself, and installing one over a
-# peer that still can is a one-way trip: the node stops exiting 42, so nothing
-# in this design moves it forward again.
+# freenet.rs), so a dirty binary NEVER updates itself.
 #
 # THE MARKER IS PRINTED ON THE COMMIT HASH, NOT THE VERSION --
 # `0.2.136 (bbbb222-dirty)` -- so `binary_version` cannot see it: it truncates at
 # the first character that is not [0-9.] and yields `0.2.136`, indistinguishable
 # from a clean release build of the same version. Hence a separate test.
+#
+# It doubles as "runnable but frozen": it can only be true of a binary that
+# actually ran and printed a version line. So `binary_is_dirty` false PLUS a
+# non-empty `self_update_blocker` means the binary cannot even run.
 binary_is_dirty() {
     case "$(version_line "$1")" in
         *-dirty\)*) return 0 ;;
@@ -180,26 +296,64 @@ binary_is_dirty() {
     esac
 }
 
+# THE ONE QUESTION. Prints the reason this binary CANNOT update itself, and
+# prints nothing at all if it can. Every caller reads "prints nothing" as
+# "leave it alone".
+#
+# It runs `--version` twice (once here, once through `binary_is_dirty`). That is
+# a couple of execs per wrapper start plus one per node start, which is not
+# worth folding together at the price of a helper whose name stops saying what
+# it tests.
+self_update_blocker() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        printf '%s' "it is a symlink, and the in-place updater renames a new file over this PATH -- which replaces the link and leaves the node running whatever it pointed at, and into /nix/store it is worse still, because current_exe() is then read-only and every update fails with EROFS"
+        return 0
+    fi
+    if [ ! -e "$path" ]; then
+        printf '%s' "there is nothing at that path yet"
+        return 0
+    fi
+    if [ ! -f "$path" ]; then
+        printf '%s' "it is not a regular file"
+        return 0
+    fi
+    if [ ! -x "$path" ]; then
+        printf '%s' "it is not executable, so it is a partially-written binary from an interrupted copy -- replace_binary chmods its temp file 0755 BEFORE renaming it into place, so a genuinely updated binary is always executable"
+        return 0
+    fi
+    if [ -z "$(version_line "$path")" ]; then
+        printf '%s' "it does not print a 'Freenet version:' line, so it is not a usable freenet binary"
+        return 0
+    fi
+    if binary_is_dirty "$path"; then
+        printf '%s' "it is a -dirty build, which never auto-updates -- GIT_DIRTY is one of the three auto-update kill switches, so the node never exits 42 and nothing moves it forward"
+        return 0
+    fi
+}
+
 # The node's own known-bad pin (`KNOWN_BAD_FILE`, crates/core/src/bin/commands/
 # rollback.rs): a plain-text file naming the single version that crash-looped on
 # THIS host and was rolled back. `is_version_pinned_bad` makes the updater refuse
 # to INSTALL that version -- but nothing in the node refuses to RUN one already
-# in place, and the re-seed below writes $binary directly, with no
-# `capture_known_good` snapshot and no probation marker. Re-seeding a pinned-bad
-# version would therefore crash-loop with rollback unable to fire, and the pin is
-# per-host state that whoever advanced the flake cannot see. So consult it here,
-# before installing anything.
+# in place, and this script writes $binary directly, with no `capture_known_good`
+# snapshot and no probation marker. So consult it before replacing a peer that
+# is still serving the network.
 #
-# Two directories, because the node resolves this one from HOME
-# (`auto_update::state_dir()` is `dirs::home_dir()/.local/state/freenet`) and NOT
-# from $STATE_DIRECTORY: under this script's XDG fallback the two are the same
-# path, and under a systemd unit with `StateDirectory=` they are not. Either
-# pinning this version is a refusal.
+# Two directories, because the node resolves this one from its home directory
+# (`auto_update::state_dir()`) and NOT from $STATE_DIRECTORY: under this script's
+# XDG fallback the two are the same path, and under a systemd unit with
+# `StateDirectory=` they are not. Either pinning this version is a refusal.
 version_is_pinned_bad() {
     local want="$1" dir pinned
     local dirs=("$state_dir")
-    if [ -n "${HOME:-}" ]; then
-        dirs+=("$HOME/.local/state/freenet")
+    if [ -n "$node_home" ]; then
+        dirs+=("$node_home/.local/state/freenet")
+    else
+        # Fail LOUD rather than open. The node can still have written a pin of
+        # its own (see `passwd_home`), and a silent skip reads exactly like "no
+        # pin" -- which is the wrong direction to guess in.
+        echo "freenet-node: WARNING -- no home directory could be resolved for this user, so the node's own copy of the known-bad pin could not be consulted; only $state_dir was checked." >&2
     fi
     for dir in "${dirs[@]}"; do
         [ -f "$dir/known_bad_version" ] || continue
@@ -211,118 +365,105 @@ version_is_pinned_bad() {
     return 1
 }
 
+# Temp files left by a seed that died mid-copy. The name carries the DEAD
+# process's pid, so nothing else ever removes them, and a killed `install` can
+# have written most of a release binary first: one file per killed start,
+# forever.
+#
+# Swept on EVERY start, not only on a start that seeds. A killed first seed is
+# followed by a start that DOES seed, repairing the binary -- after which no
+# later start seeds again, so a sweep living inside `seed_binary` never ran
+# again and the wreckage stayed on disk for the life of the peer.
+#
+# AGE-BOUNDED, not a bare `rm .freenet.seed.*`: two wrappers can legitimately
+# start at once (that is what exit 43 exists for) and both seed before either
+# starts a node, so a blanket sweep would delete a SIBLING'S temp mid-copy and
+# fail its `mv`. A live seed is seconds old; an hour is far past any of them and
+# unambiguously wreckage. `stat` rather than `find`: coreutils is the only
+# runtime input nix/node.nix declares.
+sweep_stale_seed_temps() {
+    local now stale age
+    now="$(date +%s)"
+    for stale in "$bin_dir"/.freenet.seed.*; do
+        # An unmatched glob stays literal, so test for existence first.
+        [ -e "$stale" ] || continue
+        age="$((now - $(stat -c '%Y' "$stale" 2>/dev/null || printf '%s' "$now")))"
+        if [ "$age" -gt 3600 ]; then
+            rm -f "$stale"
+        fi
+    done
+}
+
 # install(1) writes the DESTINATION IN PLACE, so a kill, an OOM or a full disk
 # part-way through leaves a truncated file at $binary -- and the old `[ ! -e ]`
 # gate then considered the peer seeded forever, so it never started again and
 # never re-seeded. Write to a temp name in the SAME directory and rename: within
 # one directory rename(2) is atomic, so $binary is only ever absent or complete.
 seed_binary() {
-    local why="$1" tmp now stale age
+    local why="$1" tmp
     if [ -z "$FREENET_NIX_SEED_BINARY" ]; then
         echo "freenet-node: no usable binary at $binary and no seed binary configured (FREENET_NIX_SEED_BINARY is empty)." >&2
         exit 78
     fi
     mkdir -p "$bin_dir"
+    # The temp name carries THIS process's pid, so it never collides with one a
+    # PREVIOUS seed left behind when it died mid-copy; those are cleared by
+    # `sweep_stale_seed_temps`, on every start.
     tmp="$bin_dir/.freenet.seed.$$"
     rm -f "$tmp"
-    # The temp name carries THIS process's pid, so the line above never touches
-    # the one a PREVIOUS seed left behind when it died mid-copy (the OOM /
-    # reboot / ENOSPC shape case 11 of the test suite models). Those accumulate
-    # one per killed start, forever, and a killed `install` can have written
-    # most of a release binary before dying.
-    #
-    # AGE-BOUNDED, not a bare `rm .freenet.seed.*`: two wrappers can legitimately
-    # start at once (that is what exit 43 exists for) and both seed before
-    # either starts a node, so a blanket sweep would delete a SIBLING'S temp
-    # mid-copy and fail its `mv`. A live seed is seconds old; an hour is far
-    # past any of them and unambiguously wreckage. `stat` rather than `find`:
-    # coreutils is the only runtime input nix/node.nix declares.
-    now="$(date +%s)"
-    for stale in "$bin_dir"/.freenet.seed.*; do
-        # An unmatched glob stays literal, so test for existence first.
-        if [ ! -e "$stale" ] || [ "$stale" = "$tmp" ]; then
-            continue
-        fi
-        age="$((now - $(stat -c '%Y' "$stale" 2>/dev/null || printf '%s' "$now")))"
-        if [ "$age" -gt 3600 ]; then
-            rm -f "$stale"
-        fi
-    done
     install -m 0755 "$FREENET_NIX_SEED_BINARY" "$tmp"
     mv -f "$tmp" "$binary"
-    echo "freenet-node: seeded $binary from $FREENET_NIX_SEED_BINARY ($why; the node owns it from now on and will update it in place)."
-    # ...except when it cannot. A dirty build never auto-updates, so the line
-    # above would be a promise this binary is unable to keep; say so rather than
-    # leave an operator believing the peer is self-maintaining when it is frozen.
-    # Only reachable on a FIRST seed (or a repair) -- the re-seed path below
-    # refuses a dirty store binary outright, because there it would be replacing
-    # a peer that still updates itself.
-    if binary_is_dirty "$binary"; then
-        echo "freenet-node: WARNING -- $binary is a -dirty build, which never auto-updates (GIT_DIRTY is an auto-update kill switch). This peer will NOT keep itself current; seed it from a clean release build before leaving it running." >&2
+    echo "freenet-node: seeded $binary from $FREENET_NIX_SEED_BINARY ($why)."
+    if [ -z "$(self_update_blocker "$binary")" ]; then
+        # Claim the update contract only when the binary can actually honour
+        # it. The old wording asserted "the node owns it from now on and will
+        # update it in place" unconditionally, so the one sentence an operator
+        # would grep for to confirm a peer is self-maintaining was printed,
+        # verbatim, on exactly the peers that were frozen.
+        echo "freenet-node: the node owns $binary from now on and will update it in place."
     fi
+    # The frozen case is NOT warned about here. It is warned about in the
+    # supervise loop, on every node start -- a warning printed once at seed time
+    # is invisible for the whole subsequent life of the peer it is about, which
+    # is precisely the peer that needs looking at.
 }
+
+sweep_stale_seed_temps
+
+# A directory, a fifo or a device at the binary path is not wreckage this script
+# can have produced, and `mv` onto a directory moves the new binary INSIDE it
+# rather than over it. Refuse, loudly, rather than guess.
+if [ -e "$binary" ] && [ ! -L "$binary" ] && [ ! -f "$binary" ]; then
+    echo "freenet-node: $binary exists but is not a regular file; refusing to touch it." >&2
+    exit 78
+fi
 
 # Copied, never symlinked: the node must be able to rename a new file over this
 # path, and it must survive `nix-collect-garbage` removing the store path this
-# generation was built from. A symlink into /nix/store makes `current_exe()`
-# resolve read-only and every update fail with EROFS.
-if [ ! -e "$binary" ] && [ ! -L "$binary" ]; then
-    seed_binary "first run"
-elif [ -L "$binary" ]; then
-    # Never produced by this script, but a hand-placed symlink is the exact
-    # shape that silently disables updating, so replace it rather than run it.
-    seed_binary "replacing a symlink, which the in-place updater cannot rename over"
-elif [ ! -f "$binary" ]; then
-    echo "freenet-node: $binary exists but is not a regular file; refusing to touch it." >&2
-    exit 78
-elif [ ! -x "$binary" ]; then
-    # `replace_binary` chmods its temp file to 0755 BEFORE renaming it into
-    # place, so a legitimately-updated binary is always executable. A
-    # non-executable one is wreckage from an interrupted seed by an older
-    # version of this script, which had no atomic write.
-    seed_binary "replacing a partially-written binary"
-else
-    # NEVER overwrite an existing binary from the store merely because it
-    # differs: after the first update the state-dir binary is a NEWER release
-    # than this derivation was built from, and re-seeding on every start would
-    # silently pin the node to the flake's version -- the whole failure this
-    # design exists to avoid.
-    #
-    # The ONE exception is a store binary that is STRICTLY NEWER, which is the
-    # only unattended escape from a state binary that can no longer update
-    # itself: a `-dirty` build (FREENET_GIT_IS_DIRTY=1, or `nix run .` in a
-    # dirty checkout) never auto-updates at all, and a binary that has hit the
-    # MAX_UPDATE_FAILURES lockout has stopped trying. Either way the node never
-    # exits 42 again, so nothing else in this design can ever move it forward.
-    # Stepping FORWARD onto a newer store binary preserves "never pin
-    # backwards"; both versions must parse or nothing happens.
-    #
-    # ...and "newer" is necessary but NOT sufficient. This exception exists to
-    # move a peer that cannot update itself onto one that can, so it must refuse
-    # any candidate that would land the peer in the same hole or a deeper one:
-    # a `-dirty` store binary (never auto-updates, so the re-seed would be the
-    # LAST move this peer ever makes) and a version this node has pinned
-    # known-bad (crash-loops, and the re-seed installs it with no probation
-    # marker, so auto-rollback cannot fire). See the two guards below.
+# generation was built from.
+state_blocker="$(self_update_blocker "$binary")"
+if [ -n "$state_blocker" ]; then
+    seed_blocker="$(self_update_blocker "${FREENET_NIX_SEED_BINARY:-/nonexistent}")"
     seed_version="$(binary_version "${FREENET_NIX_SEED_BINARY:-/nonexistent}")"
-    state_version="$(binary_version "$binary")"
-    if [ -n "$seed_version" ] && [ -n "$state_version" ] && [ "$seed_version" != "$state_version" ]; then
-        newest="$(printf '%s\n%s\n' "$state_version" "$seed_version" | sort -V)"
-        newest="${newest##*$'\n'}"
-        if [ "$newest" = "$seed_version" ]; then
-            # Two refusals. Both would otherwise replace a peer that CAN still
-            # update itself with one that cannot -- the exact failure this whole
-            # design exists to prevent, reached through the escape hatch that
-            # exists to prevent it. A NEWER version number is not on its own
-            # evidence that stepping onto it is forward progress.
-            if binary_is_dirty "${FREENET_NIX_SEED_BINARY:-/nonexistent}"; then
-                echo "freenet-node: the store binary $seed_version is newer than the state binary $state_version, but it is a -dirty build, which never auto-updates. NOT re-seeding: $binary stays in place and keeps updating itself. Build from a clean tree if you meant to move this peer forward." >&2
-            elif version_is_pinned_bad "$seed_version"; then
-                echo "freenet-node: the store binary $seed_version is newer than the state binary $state_version, but this node pinned $seed_version KNOWN-BAD after it crash-looped here and was rolled back. NOT re-seeding: installing it again would crash-loop with no probation marker, so rollback could never fire. Advance the flake past $seed_version." >&2
-            else
-                seed_binary "the store binary $seed_version is newer than the state binary $state_version"
-            fi
+    if binary_is_dirty "$binary"; then
+        # The state binary still SERVES the network -- it just cannot move
+        # itself forward. Only a store binary that CAN is worth the swap.
+        if [ -n "$seed_blocker" ]; then
+            echo "freenet-node: $binary cannot update itself ($state_blocker), and neither can the store binary ($seed_blocker). NOT re-seeding: trading one frozen binary for another gains nothing. Build from a clean tree to move this peer forward." >&2
+        elif [ -n "$seed_version" ] && version_is_pinned_bad "$seed_version"; then
+            echo "freenet-node: $binary cannot update itself ($state_blocker), but the store binary $seed_version is pinned KNOWN-BAD on this host -- it crash-looped here and was rolled back. NOT re-seeding: this script installs a binary with no known-good snapshot and no probation marker, so #4073 rollback could not fire the second time. Advance the flake past $seed_version." >&2
+        else
+            seed_binary "the state binary cannot update itself: $state_blocker"
         fi
+    else
+        # The state binary cannot even RUN, so there is no peer to protect and
+        # anything runnable is an improvement. This installs the store binary
+        # even when it is itself frozen or pinned known-bad -- with a warning
+        # naming what it got, rather than a refusal that leaves the peer down.
+        if [ -n "$seed_version" ] && version_is_pinned_bad "$seed_version"; then
+            echo "freenet-node: WARNING -- the store binary $seed_version is pinned KNOWN-BAD on this host, but there is nothing usable at $binary ($state_blocker), so it is installed anyway: a peer that flaps loudly -- and that this wrapper's own 'freenet update' can step forward out of on the next release -- beats a peer that is simply down. Advance the flake past $seed_version." >&2
+        fi
+        seed_binary "$state_blocker"
     fi
 fi
 
@@ -432,6 +573,17 @@ restart_pause() {
 }
 
 while true; do
+    # ON EVERY NODE START, not once at seed time. A peer whose binary cannot
+    # update itself is frozen for as long as it runs, and the wrapper's start-up
+    # decision block runs ONCE per wrapper start -- so a warning printed there
+    # is emitted on the first start of a peer that is then silent about it
+    # forever, which is exactly backwards. Re-asked each time because the binary
+    # changes underneath this loop: `freenet update` renames a new one over it.
+    running_blocker="$(self_update_blocker "$binary")"
+    if [ -n "$running_blocker" ]; then
+        echo "freenet-node: WARNING -- $binary cannot update itself ($running_blocker). This peer will NOT keep itself current, which makes it a liability for the network. Re-seed it from a clean release build, or remove $binary and restart so this wrapper replaces it." >&2
+    fi
+
     # Backgrounded and `wait`ed rather than run in the foreground, so a SIGTERM
     # aimed at this wrapper alone runs the trap immediately instead of being
     # deferred until the node happens to exit.

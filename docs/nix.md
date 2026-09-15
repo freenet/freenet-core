@@ -59,27 +59,51 @@ and from then on the node owns that file and updates it exactly as it does on
 every other platform — same signature verification, same rollback snapshot, same
 crash probation, same known-bad pinning.
 
-The wrapper never overwrites a *working* state binary with the store's — that
-would silently pin the node to the flake's version, the exact failure this
-design exists to avoid. It does replace one in three narrow cases, each of them
-a peer that would otherwise be stuck forever: a partially-written seed left by
-an interrupted first copy, a symlink (which the in-place updater cannot rename
-over), and a store binary that is **strictly newer**, which is the only
-unattended way out of a state binary that has stopped updating itself — a
-`-dirty` build never auto-updates at all, and one that has hit the
-auto-update failure lockout has given up.
+The wrapper asks exactly one question about that binary on every start: **can it
+update itself?** If it can, the wrapper leaves it completely alone, whatever
+version the store holds — which is what stops a peer being pinned back to the
+flake's version. If it cannot, the wrapper replaces it with the store's copy.
 
-Being newer is necessary but not sufficient for that third case, because two
-candidates would replace a peer that *can* still update itself with one that
-cannot. The re-seed therefore refuses a store binary that is itself `-dirty` —
-it would never auto-update, and since the two versions would then match nothing
-would ever re-seed again either, so the peer is stuck forever with the log
-saying it is fine — and one whose version **this node has pinned known-bad**
-after it crash-looped here and was rolled back, since the re-seed installs a
-binary directly, with no probation marker, so rollback could not fire the
-second time. Both refusals say so on stderr rather than doing nothing quietly.
-A *first* seed from a dirty build is still allowed (there is no working peer to
-protect) but warns that the peer will not keep itself current.
+The invariant is *always end up on a binary that can update itself*, and
+deliberately **not** "never move backwards in version". A clean older binary is
+forward progress: it exits 42 on its next start and walks itself to the current
+release. A `-dirty` newer one is a dead end, because `GIT_DIRTY` is one of the
+three auto-update kill switches, so the node never exits 42 again and nothing
+moves it forward. Version ordering only separates two binaries that can *both*
+update themselves, and there it decides nothing worth deciding.
+
+"Cannot update itself" covers a binary that is absent, a symlink (which the
+in-place updater renames *over*, replacing the link rather than the file it
+names), a partially-written copy left by an interrupted seed, something that is
+not a freenet binary at all, and a `-dirty` build. The first four cannot run; the
+last one runs but is frozen. That difference decides how much the wrapper will
+do:
+
+* **It cannot run.** Anything runnable is better than nothing, so the store
+  binary is installed even if it is itself `-dirty` or pinned known-bad — with a
+  warning saying exactly what was installed.
+* **It runs but is frozen.** The store binary replaces it only if the store
+  binary can itself update. Trading one frozen binary for another gains nothing,
+  and the one refusal that is genuinely about *which version* applies here: a
+  version **this node has pinned known-bad**, after it crash-looped here and was
+  rolled back, is not installed over a peer that is still serving. The wrapper
+  installs binaries directly, with no known-good snapshot and no probation
+  marker, so crash-loop rollback (#4073) could not fire the second time.
+
+Every refusal says so on stderr rather than doing nothing quietly, and **a peer
+whose binary cannot update itself is warned about on every node start**, not once
+when it was seeded. A *first* seed from a dirty build is still allowed — there is
+no working peer to protect — but it does not print the sentence promising that
+the node owns the binary and will update it in place, because that promise would
+be false.
+
+One honest residual: the wrapper cannot see the node's auto-update failure
+lockout, and re-seeding would not clear it if it could. The lockout is a counter
+file in the node's own state directory, not a property of the binary. It does not
+gate the wrapper's own `freenet update` (which clears the counter on a successful
+install), so it only stops the node's in-process update re-poll — which means a
+locked-out peer that never crashes also never updates. Closing that would mean
+making update decisions in shell, which this wrapper deliberately does not do.
 
 The supervisor itself (`nix/freenet-node.sh`) is a faithful port of the systemd
 unit the node generates for itself (`generate_user_service_file`,
@@ -182,11 +206,32 @@ systemd.services.freenet-node = {
   # (5 failures in 120s, then exit 1), so let that be the only one.
   startLimitIntervalSec = 0;
 };
+
+# Load-bearing, and the part that is easy to leave out. `StateDirectory` is NOT
+# the only writable directory this needs: the node's auto-update state —
+# the crash-probation marker, the known-good rollback snapshot and the
+# known-bad version pin — lives under the service user's HOME
+# (`auto_update::state_dir()` is `dirs::home_dir()/.local/state/freenet`), NOT
+# under $STATE_DIRECTORY. A NixOS user declared without `home` gets
+# `/var/empty`, which is not writable, so `prepare_known_good_for_install` and
+# `begin_probation` both fail and the peer runs with #4073 crash-loop rollback
+# silently OFF — a release that boot-crashes then has nothing to roll it back.
+users.users.freenet = {
+  isSystemUser = true;
+  group = "freenet";
+  home = "/var/lib/freenet";
+  createHome = true;
+};
+users.groups.freenet = { };
 ```
 
 The directories are named explicitly because the node otherwise derives them
 from the service user's home, which a system user may not usefully have. A
-read-only `/nix/store` is fine; what must be writable is the state directory.
+read-only `/nix/store` is fine; **two** things must be writable, and they are
+different directories: the state directory (`$STATE_DIRECTORY`, where the
+wrapper seeds the binary) and the service user's home (where the node keeps its
+auto-update rollback state). This wrapper already has to know they differ — it
+looks for the known-bad pin in both — so an operator does too.
 
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and
@@ -248,6 +293,26 @@ genuinely dirty tree and `--disable-auto-update` — a build marked dirty never
 updates itself. It is parsed strictly for that reason: a lenient "any non-empty
 value is truthy" rule would read `FREENET_GIT_IS_DIRTY=false` as dirty and ship a
 binary that silently never updates.
+
+### `nix build 'path:.'` reports a CLEAN build from a dirty tree
+
+Worth knowing before you read a version string as evidence. The flake derives
+dirtiness from nix's own view of the source: `gitDirty = self ? dirtyRev`, which
+is set only for a `git+file:` source that nix has determined to be dirty. A
+`path:` source carries no VCS metadata at all, so neither `rev` nor `dirtyRev`
+exists, `FREENET_GIT_IS_DIRTY=0` is passed, and that **suppresses build.rs's own
+`git` probe** — so a build from a tree with uncommitted changes reports no
+`-dirty` marker.
+
+That is correct for the case the flag exists for (a tarball or unpacked source
+drop, which genuinely has no VCS to probe and must not be guessed dirty — see
+`gitDirty`'s comment in `flake.nix`), and it is what `.github/workflows/nix.yml`
+depends on, because `nix build 'path:.'` is exactly how it covers the no-VCS
+path that `actions/checkout` can never produce. But it surprises anyone using
+`path:.` locally to test an uncommitted change: `freenet --version` will not say
+`-dirty`, and the resulting binary **will** auto-update. Use `nix build .` (a
+`git+file:` source) if you want nix's dirty detection, or pass
+`FREENET_GIT_IS_DIRTY=1` explicitly.
 
 ## Working in `nix develop`
 

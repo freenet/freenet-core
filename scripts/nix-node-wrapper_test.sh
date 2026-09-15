@@ -224,6 +224,18 @@ starts_of() {
   printf '%s' "$n"
 }
 
+count_of() {
+  # How many lines of the wrapper's own output carry "$1". Used for the
+  # warnings that must appear on EVERY node start rather than once at seed
+  # time: "it was mentioned" and "it is mentioned every time" are different
+  # claims, and only the second is worth anything on a peer that is frozen for
+  # the rest of its life. `grep -F` and no status-consuming pipe, per the
+  # SIGPIPE note on `assert_contains`.
+  local n
+  n="$(grep -Fc -- "$1" "$WORK/stdout" || true)"
+  printf '%s' "$n"
+}
+
 self_of() {
   # The `self=` field of the first "$1|" line: WHICH binary actually ran.
   # `grep -m1` rather than a pipe into `head`, for the SIGPIPE reason above.
@@ -547,107 +559,331 @@ assert_eq "$(is_symlink "$STATE5/bin/freenet")" "regular" \
   "a symlink at the binary path is replaced by a real copy the updater can rename over"
 
 # ---------------------------------------------------------------------------
-# 13. The only escape from a state binary that can no longer update itself.
+# 13. THE INVARIANT: always end up on a binary that can update itself.
 #
-#     A `-dirty` build never auto-updates (that is what the dirty flag means),
-#     and a binary that has hit MAX_UPDATE_FAILURES has stopped trying. Either
-#     way the node never exits 42 again, so nothing else in this design can move
-#     it forward: without this, `nix run` in a dirty checkout seeds a peer that
-#     is stale forever. Re-seed only when the store binary is STRICTLY NEWER,
-#     which keeps "never pin backwards" intact.
+#     NOT "never move backwards in version". Three revisions of the wrapper
+#     tried to encode that instead, as a growing pile of refusals, and each one
+#     opened a new stuck corner -- because version ordering is the wrong
+#     question. A CLEAN OLDER binary is forward progress: it exits 42 on its
+#     next start and walks itself to the current release. A DIRTY NEWER binary
+#     is a dead end: GIT_DIRTY is an auto-update kill switch, so the node never
+#     exits 42 again and nothing in the design moves it forward.
+#
+#     So the cases below are driven by ONE property of the state binary -- can
+#     it update itself? -- and the version pairs appear only to prove that
+#     ordering does not decide anything.
+#
+#     A CLEAN state binary is left alone, whichever way the versions run.
 # ---------------------------------------------------------------------------
 WRAP_STATE_VERSION="0.2.100" WRAP_SEED_VERSION="0.2.135" run_wrapper "0"
-assert_contains "$STDOUT" "is newer than the state binary" \
-  "a STRICTLY NEWER store binary re-seeds, so a locked-out or dirty peer can still move forward"
-assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "same" \
-  "the re-seed actually replaced the state binary"
+assert_not_contains "$STDOUT" "seeded" \
+  "a NEWER store binary does NOT replace a clean state binary -- that one updates itself, and re-seeding would pin the peer to the flake's version"
+assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "differ" \
+  "...and the state binary is genuinely untouched, not merely unmentioned"
+assert_not_contains "$STDOUT" "liability for the network" \
+  "...and nothing warns, because a binary that can update itself is exactly what this design wants"
 
 WRAP_STATE_VERSION="0.2.135" WRAP_SEED_VERSION="0.2.100" run_wrapper "0"
 assert_not_contains "$STDOUT" "seeded" \
-  "an OLDER store binary never re-seeds -- the node is never pinned backwards to the flake's version"
+  "an OLDER store binary does not replace a clean state binary either"
 
 WRAP_STATE_VERSION="0.2.100" WRAP_SEED_VERSION="0.2.100" run_wrapper "0"
-assert_not_contains "$STDOUT" "seeded" "an EQUAL store binary never re-seeds"
+assert_not_contains "$STDOUT" "seeded" "nor an EQUAL one"
 
-# 0.2.9 vs 0.2.10 is the case a lexical comparison gets backwards.
-WRAP_STATE_VERSION="0.2.9" WRAP_SEED_VERSION="0.2.10" run_wrapper "0"
-assert_contains "$STDOUT" "is newer than the state binary" \
-  "version comparison is numeric, not lexical (0.2.10 is newer than 0.2.9)"
-
-WRAP_STATE_VERSION="0.2.10" WRAP_SEED_VERSION="0.2.9" run_wrapper "0"
-assert_not_contains "$STDOUT" "seeded" \
-  "and numeric in the other direction too (0.2.9 is NOT newer than 0.2.10)"
-
-# An unreadable version must mean "do nothing", never "re-seed anyway".
+# A version string this script cannot parse is not a reason to act: the binary
+# runs, prints a version line, and is not dirty, so it can still update itself.
 WRAP_STATE_VERSION="not-a-version" WRAP_SEED_VERSION="0.2.135" run_wrapper "0"
 assert_not_contains "$STDOUT" "seeded" \
-  "an unparseable state version is never treated as older -- parse failure means do not act"
+  "an unparseable state VERSION is not a blocker -- the binary runs and can still update itself, and parsing is only ever used to ask the known-bad pin a question"
 
 # ---------------------------------------------------------------------------
-# 13b. NEWER IS NECESSARY, NOT SUFFICIENT.
+# 13b. A state binary that CANNOT update itself is replaced -- WHICHEVER WAY
+#      THE VERSIONS RUN. This is the corner the previous revision left stuck.
 #
-#      The re-seed exists to rescue a peer that can no longer update itself. Two
-#      candidates would instead CREATE that peer, and both arrive looking like a
-#      perfectly ordinary version bump.
-#
-#      (a) A `-dirty` store binary. `GIT_DIRTY` disables auto-update, so after
-#          the re-seed the node never exits 42 again and the store and state
-#          versions now MATCH, so the wrapper never re-seeds again either. The
-#          peer is stuck forever and the only log line says it is fine.
-#          `binary_version` cannot see this: the marker is printed on the COMMIT
-#          HASH (`0.2.136 (bbbb222-dirty)`) and the parse truncates at the first
-#          non-[0-9.] character. The realistic trigger is ordinary: `nix run .`
-#          in a checkout with one uncommitted line, on a host already running a
-#          seeded release peer.
-#
-#      (b) A version this node has PINNED KNOWN-BAD. It crash-looped here and
-#          was rolled back; the re-seed writes the binary directly, with no
-#          probation marker, so the crash loop repeats with rollback unable to
-#          fire. The pin is per-host state, so whoever advanced the flake cannot
-#          know which hosts it applies to.
+#      `binary_is_dirty` was called only inside the seed path, and the re-seed
+#      was gated on the store binary being STRICTLY NEWER. So a dirty state
+#      binary at an equal-or-newer version could never be replaced: the node
+#      never exits 42 (GIT_DIRTY), the unit's ExecStart is a fixed store path,
+#      and the single warning was printed at seed time and never again.
+#      Verified by execution at the time: the wrapper started and exited without
+#      mentioning the dirty binary at all. Stale forever, silent after the first
+#      start.
 # ---------------------------------------------------------------------------
+WRAP_STATE_VERSION="0.2.136" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.136" WRAP_SEED_COMMIT="cccc333" run_wrapper "0"
+assert_contains "$STDOUT" "seeded" \
+  "a DIRTY state binary at the SAME version as the store is replaced -- it can never update itself, so version ordering is beside the point"
+assert_contains "$STDOUT" "it is a -dirty build" \
+  "...and the reason given is the one that matters: the binary cannot update itself"
+assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "same" \
+  "...and the replacement genuinely landed"
+assert_eq "$(self_of network)" "$STATE/bin/freenet" \
+  "...and the node runs the replacement, from the writable state dir"
+assert_not_contains "$STDOUT" "liability for the network" \
+  "...and the rescued peer is no longer warned about, because it can update itself now"
+
+# The same rescue with a strictly OLDER store binary, which the old gate refused
+# outright. A clean 0.2.100 reaches the current release by itself on its next
+# start; a dirty 0.2.200 never reaches anything.
+WRAP_STATE_VERSION="0.2.200" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.100" run_wrapper "0"
+assert_contains "$STDOUT" "seeded" \
+  "a DIRTY state binary is replaced by an OLDER clean store binary: moving backwards in version is forward progress when it restores self-update"
+assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "same" \
+  "...and that replacement landed too"
+
+# ...and the rescued peer really does resume updating: it exits 42 and the
+# wrapper runs `freenet update` from the state dir, which is the whole contract.
+WRAP_STATE_VERSION="0.2.136" WRAP_STATE_COMMIT="bbbb222-dirty" WRAP_SEED_VERSION="0.2.136" \
+  run_wrapper "$(printf '42\n0')"
+assert_contains "$LOG" "update|args=--quiet" \
+  "the rescued peer resumes the auto-update contract: exit 42 runs 'freenet update'"
+assert_eq "$(self_of update)" "$STATE/bin/freenet" \
+  "...from the writable state dir, so 'current_exe()' is renameable (no EROFS)"
+
+# ---------------------------------------------------------------------------
+# 13c. ...but only when the replacement is an IMPROVEMENT, and a peer left in
+#      place because it is not says so on EVERY start.
+# ---------------------------------------------------------------------------
+# Two frozen binaries: swapping gains nothing, so the running one stays.
+WRAP_STATE_VERSION="0.2.136" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.200" WRAP_SEED_COMMIT="cccc333-dirty" run_wrapper "$(printf '101\n0')"
+assert_not_contains "$STDOUT" "seeded" \
+  "a -dirty store binary never replaces a state binary that is equally frozen -- the swap buys nothing and risks the peer that is at least serving"
+assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "differ" \
+  "...and the state binary is genuinely untouched"
+assert_eq "$(count_of 'liability for the network')" "2" \
+  "...and the frozen peer is warned about on EVERY node start, not once at seed time -- the old warning fired only while seeding, so the one peer that was frozen was also the one that never mentioned it again"
+
+# A dirty STORE binary must not replace a peer that can still update itself
+# either, however much newer it is: that would CREATE the frozen peer.
 WRAP_STATE_VERSION="0.2.135" WRAP_SEED_VERSION="0.2.136" WRAP_SEED_COMMIT="bbbb222-dirty" \
   run_wrapper "0"
 assert_not_contains "$STDOUT" "seeded" \
-  "a -dirty store binary never re-seeds over a healthy peer, however much newer its version is"
-assert_contains "$STDOUT" "it is a -dirty build" \
-  "...and the refusal says why, instead of silently doing nothing"
+  "a -dirty store binary never replaces a healthy peer, however much newer its version is"
 assert_eq "$(same_bytes "$SEED" "$STATE/bin/freenet")" "differ" \
-  "...and the state binary is genuinely untouched, not merely unmentioned"
+  "...and that state binary is untouched too"
 
-# The same dirty marker on the STATE binary is the case the re-seed exists FOR:
-# that peer cannot update itself, so a clean newer store binary must rescue it.
-WRAP_STATE_VERSION="0.2.135" WRAP_STATE_COMMIT="bbbb222-dirty" WRAP_SEED_VERSION="0.2.136" \
-  run_wrapper "0"
-assert_contains "$STDOUT" "is newer than the state binary" \
-  "a DIRTY STATE binary is still rescued by a clean newer store binary -- the guard above is about the seed, not about dirtiness anywhere"
-
-# A first seed from a dirty build is allowed (there is nothing to protect), but
-# it must not claim an update contract the binary cannot honour.
+# A first seed from a dirty build is still allowed -- there is no healthy peer
+# to protect -- but it must not print the sentence that promises an update
+# contract this binary cannot honour. That sentence is what an operator greps
+# for, so printing it on a frozen peer is worse than printing nothing.
 WRAP_SEED_COMMIT="bbbb222-dirty" run_wrapper "0"
-assert_contains "$STDOUT" "seeded" "a first run still seeds from a dirty build -- there is no healthy peer to protect"
-assert_contains "$STDOUT" "never auto-updates" \
-  "...but it warns that this peer will not keep itself current, rather than promising it will"
+assert_contains "$STDOUT" "seeded" \
+  "a first run still seeds from a dirty build -- there is no healthy peer to protect"
+assert_contains "$STDOUT" "liability for the network" \
+  "...but it warns that this peer will not keep itself current"
+assert_not_contains "$STDOUT" "will update it in place" \
+  "...and does NOT print the promise that the node owns the binary and will update it in place"
 
-# Known-bad pin in $STATE_DIRECTORY.
-WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.139" run_wrapper "0"
+# ...which a clean seed does print, so the assertion above is not vacuous.
+run_wrapper "0"
+assert_contains "$STDOUT" "will update it in place" \
+  "a clean seed DOES promise the update contract, so the dirty case's silence is a real difference"
+
+# ---------------------------------------------------------------------------
+# 13d. The one refusal that is genuinely about WHICH VERSION: the node's own
+#      known-bad pin. It applies where there is a running peer to keep instead.
+# ---------------------------------------------------------------------------
+WRAP_STATE_VERSION="0.2.138" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.139" run_wrapper "0"
 assert_not_contains "$STDOUT" "seeded" \
-  "a store version pinned KNOWN-BAD on this node is never re-seeded, however much newer it is"
-assert_contains "$STDOUT" "KNOWN-BAD" "...and the refusal names the pin, which is per-host state the operator cannot see from the flake"
+  "a store version pinned KNOWN-BAD on this node does not replace a peer that is still serving, even one that cannot update itself"
+assert_contains "$STDOUT" "KNOWN-BAD" \
+  "...and the refusal names the pin, which is per-host state the operator cannot see from the flake"
+assert_contains "$STDOUT" "liability for the network" \
+  "...and the peer left in place is still reported as frozen on every start, so the refusal is not itself a silent dead end"
 
 # ...and in the directory the NODE actually writes it to, which is derived from
-# HOME (`auto_update::state_dir()`), not from $STATE_DIRECTORY. Under the
-# documented systemd unit those are different paths, so a wrapper that consulted
-# only its own state dir would miss every pin the node ever wrote.
-WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD_HOME="0.2.139" run_wrapper "0"
+# its home directory (`auto_update::state_dir()`), not from $STATE_DIRECTORY.
+# Under the documented systemd unit those are different paths, so a wrapper that
+# consulted only its own state dir would miss every pin the node ever wrote.
+WRAP_STATE_VERSION="0.2.138" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD_HOME="0.2.139" run_wrapper "0"
 assert_not_contains "$STDOUT" "seeded" \
-  "the pin is honoured in \$HOME/.local/state/freenet too, where the node itself writes it"
+  "the pin is honoured in the node's own home-derived state dir too, where the node itself writes it"
 
 # A pin for a DIFFERENT version must not block anything: the pin is one exact
 # version, and a fail-closed reading would strand every peer that ever rolled back.
-WRAP_STATE_VERSION="0.2.138" WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.137" run_wrapper "0"
-assert_contains "$STDOUT" "is newer than the state binary" \
-  "a pin naming a DIFFERENT version does not block the re-seed -- the pin is one exact version, not a floor"
+WRAP_STATE_VERSION="0.2.138" WRAP_STATE_COMMIT="bbbb222-dirty" \
+  WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.137" run_wrapper "0"
+assert_contains "$STDOUT" "seeded" \
+  "a pin naming a DIFFERENT version does not block the rescue -- the pin is one exact version, not a floor"
+
+# ...and with NOTHING runnable in the state dir the pin does not apply at all.
+# There is no peer to keep, so refusing would leave the host with no node: a
+# flapping peer is loud, and this wrapper's own `freenet update` steps it
+# forward as soon as a newer release exists, which a peer that is down cannot do.
+WRAP_SEED_VERSION="0.2.139" WRAP_PINNED_BAD="0.2.139" run_wrapper "0"
+assert_contains "$STDOUT" "seeded" \
+  "with nothing runnable in the state dir, a pinned-bad store binary IS installed -- there is nothing else to run and a peer that is simply down helps nobody"
+assert_contains "$STDOUT" "pinned KNOWN-BAD" \
+  "...and it says so loudly rather than installing it quietly"
+
+# ---------------------------------------------------------------------------
+# 13e. "Cannot update itself" also covers a binary that cannot even RUN.
+#      An executable that is not a freenet binary at all prints no
+#      `Freenet version:` line, so it is wreckage, not a peer.
+# ---------------------------------------------------------------------------
+WORK7="$(mktemp -d)"
+STATE7="$WORK7/state"
+mkdir -p "$STATE7/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$STATE7/bin/freenet"
+chmod +x "$STATE7/bin/freenet"
+SEED7="$WORK7/seed-freenet"
+write_fake_freenet "$SEED7"
+printf '0\n' >"$WORK7/plan"
+: >"$WORK7/log"
+RC7=0
+env -u XDG_STATE_HOME \
+  HOME="$WORK7/home" \
+  FAKE_LOG="$WORK7/log" \
+  FAKE_PLAN="$WORK7/plan" \
+  FAKE_COUNT="$WORK7/count" \
+  FREENET_NIX_SEED_BINARY="$SEED7" \
+  STATE_DIRECTORY="$STATE7" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >"$WORK7/stdout" 2>&1 || RC7=$?
+assert_eq "$RC7" "0" "an executable that is not a freenet binary is replaced and the node starts"
+assert_contains "$(cat "$WORK7/stdout")" "not a usable freenet binary" \
+  "...and the reason says what was wrong with it"
+assert_eq "$(same_bytes "$SEED7" "$STATE7/bin/freenet")" "same" \
+  "...and the replacement is the full seed"
+
+# A DIRECTORY at the binary path is not wreckage this script can have made, and
+# `mv` onto one moves the new binary INSIDE it. Refuse loudly instead.
+WORK8="$(mktemp -d)"
+STATE8="$WORK8/state"
+mkdir -p "$STATE8/bin/freenet"
+SEED8="$WORK8/seed-freenet"
+write_fake_freenet "$SEED8"
+printf '0\n' >"$WORK8/plan"
+: >"$WORK8/log"
+RC8=0
+env -u XDG_STATE_HOME \
+  HOME="$WORK8/home" \
+  FAKE_LOG="$WORK8/log" \
+  FAKE_PLAN="$WORK8/plan" \
+  FAKE_COUNT="$WORK8/count" \
+  FREENET_NIX_SEED_BINARY="$SEED8" \
+  STATE_DIRECTORY="$STATE8" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >"$WORK8/stdout" 2>&1 || RC8=$?
+assert_eq "$RC8" "78" "a non-regular file at the binary path stops the wrapper rather than being overwritten"
+assert_contains "$(cat "$WORK8/stdout")" "refusing to touch it" "...and says why"
+
+# ---------------------------------------------------------------------------
+# 13f. The known-bad lookup must not fail OPEN when $HOME is unset or empty.
+#
+#      The wrapper guarded its second lookup directory with `[ -n "$HOME" ]`.
+#      The NODE has no such guard: `dirs::home_dir()` falls back to
+#      `getpwuid_r(geteuid())`, so `auto_update::state_dir()` still resolves and
+#      the node still writes a known-bad pin the wrapper could not see. systemd
+#      exports $HOME only for a unit that sets `User=`, so a root unit without
+#      one -- or any scrubbed container -- is exactly that environment, and the
+#      wrapper installed the version this host had already rolled back from,
+#      with no line saying the lookup had been skipped.
+#
+#      The double is a fake `getent`, the same shape as the fake `freenet`: the
+#      wrapper asks passwd for this uid's home, so the test answers.
+# ---------------------------------------------------------------------------
+WORK9="$(mktemp -d)"
+STATE9="$WORK9/state"
+HOME9="$WORK9/nodehome"
+SEED9="$WORK9/seed-freenet"
+FAKEBIN9="$WORK9/bin"
+mkdir -p "$STATE9/bin" "$HOME9/.local/state/freenet" "$FAKEBIN9"
+write_fake_freenet "$SEED9" "0.2.139" "cccc333"
+# A state binary that cannot update itself, so the wrapper is genuinely about to
+# install the store one -- the only moment the pin is consulted.
+write_fake_freenet "$STATE9/bin/freenet" "0.2.138" "bbbb222-dirty"
+printf '0.2.139\n' >"$HOME9/.local/state/freenet/known_bad_version"
+cat >"$FAKEBIN9/getent" <<GETENT
+#!/usr/bin/env bash
+# Only 'passwd <uid>' is ever asked for. The answer is a passwd line whose sixth
+# field is this test's fake home -- exactly what getpwuid_r hands the node.
+printf 'fake:x:%s:0:fake:%s:/bin/sh\n' "\$2" "$HOME9"
+GETENT
+chmod +x "$FAKEBIN9/getent"
+printf '0\n' >"$WORK9/plan"
+: >"$WORK9/log"
+RC9=0
+env -u XDG_STATE_HOME -u HOME \
+  PATH="$FAKEBIN9:$PATH" \
+  FAKE_LOG="$WORK9/log" \
+  FAKE_PLAN="$WORK9/plan" \
+  FAKE_COUNT="$WORK9/count" \
+  FREENET_NIX_SEED_BINARY="$SEED9" \
+  STATE_DIRECTORY="$STATE9" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >"$WORK9/stdout" 2>&1 || RC9=$?
+assert_eq "$RC9" "0" \
+  "the peer kept in place still runs, so the refusal is not a way of stopping the node"
+assert_contains "$(cat "$WORK9/stdout")" "pinned KNOWN-BAD" \
+  "with \$HOME UNSET the pin is still found, via this uid's passwd home, exactly as the node finds it -- the guard used to fail open here"
+assert_not_contains "$(cat "$WORK9/stdout")" "seeded" \
+  "...so the pinned-bad store binary is not installed over the running peer"
+
+# ...and when NO home can be resolved at all, say so. A silent skip reads
+# exactly like "no pin", which is the wrong direction to guess in.
+WORK10="$(mktemp -d)"
+STATE10="$WORK10/state"
+SEED10="$WORK10/seed-freenet"
+FAKEBIN10="$WORK10/bin"
+mkdir -p "$STATE10/bin" "$FAKEBIN10"
+write_fake_freenet "$SEED10" "0.2.139" "cccc333"
+write_fake_freenet "$STATE10/bin/freenet" "0.2.138" "bbbb222-dirty"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$FAKEBIN10/id"
+chmod +x "$FAKEBIN10/id"
+printf '0\n' >"$WORK10/plan"
+: >"$WORK10/log"
+env -u XDG_STATE_HOME -u HOME \
+  PATH="$FAKEBIN10:$PATH" \
+  FAKE_LOG="$WORK10/log" \
+  FAKE_PLAN="$WORK10/plan" \
+  FAKE_COUNT="$WORK10/count" \
+  FREENET_NIX_SEED_BINARY="$SEED10" \
+  STATE_DIRECTORY="$STATE10" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >"$WORK10/stdout" 2>&1 || true
+assert_contains "$(cat "$WORK10/stdout")" "could not be consulted" \
+  "with no home directory resolvable at all, the skipped pin lookup is reported instead of passing silently"
+
+# ---------------------------------------------------------------------------
+# 13g. The stale-temp sweep runs on EVERY start, not only on a start that seeds.
+#
+#      A killed seed leaves a pid-named temp file; the next start seeds (which
+#      repairs the binary) and from then on no start seeds again -- so a sweep
+#      living inside `seed_binary` never ran again and the wreckage stayed for
+#      the life of the peer.
+# ---------------------------------------------------------------------------
+WORK11="$(mktemp -d)"
+STATE11="$WORK11/state"
+SEED11="$WORK11/seed-freenet"
+mkdir -p "$STATE11/bin"
+write_fake_freenet "$SEED11"
+write_fake_freenet "$STATE11/bin/freenet"
+# Wreckage from a seed killed hours ago, and a sibling mid-copy right now.
+printf 'half a release binary' >"$STATE11/bin/.freenet.seed.4242"
+touch -d '3 hours ago' "$STATE11/bin/.freenet.seed.4242"
+touch "$STATE11/bin/.freenet.seed.concurrent"
+printf '0\n' >"$WORK11/plan"
+: >"$WORK11/log"
+env -u XDG_STATE_HOME \
+  HOME="$WORK11/home" \
+  FAKE_LOG="$WORK11/log" \
+  FAKE_PLAN="$WORK11/plan" \
+  FAKE_COUNT="$WORK11/count" \
+  FREENET_NIX_SEED_BINARY="$SEED11" \
+  STATE_DIRECTORY="$STATE11" \
+  FREENET_NODE_RESTART_SECS=0 \
+  bash "$WRAPPER" >"$WORK11/stdout" 2>&1 || true
+assert_not_contains "$(cat "$WORK11/stdout")" "seeded" \
+  "the sweep case does NOT seed -- which is the whole point: the binary is fine"
+assert_eq "$([ -e "$STATE11/bin/.freenet.seed.4242" ] && echo kept || echo swept)" "swept" \
+  "a start that does not seed still sweeps stale seed temps, so wreckage from a killed seed does not persist forever"
+assert_eq "$([ -e "$STATE11/bin/.freenet.seed.concurrent" ] && echo kept || echo deleted)" "kept" \
+  "...and a FRESH sibling temp survives that sweep too"
 
 # ---------------------------------------------------------------------------
 # 14. Restart backoff GROWS and is CAPPED (RestartSteps / RestartMaxDelaySec).

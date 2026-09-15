@@ -56,6 +56,16 @@
       # Dirty only when nix positively says so. Treating "no VCS metadata" as
       # dirty would disable auto-update for every source-drop build, which is the
       # one failure this whole design exists to prevent.
+      #
+      # NOTE the consequence for `path:` sources, which is right for a tarball
+      # and surprising for a developer: a `path:` source has neither `rev` nor
+      # `dirtyRev`, so this is false, `FREENET_GIT_IS_DIRTY=0` is passed, and
+      # that value SUPPRESSES build.rs's own `git` probe -- so `nix build
+      # 'path:.'` in a tree with uncommitted changes reports a CLEAN build and
+      # the binary auto-updates. `.github/workflows/nix.yml` relies on exactly
+      # that (it is how the no-VCS path gets covered at all, since
+      # `actions/checkout` always leaves a clean `.git`). Use `nix build .` if
+      # you want nix's dirty detection. docs/nix.md says so too.
       gitDirty = self ? dirtyRev;
 
       sourceDateEpoch = if self ? lastModified then toString self.lastModified else null;
