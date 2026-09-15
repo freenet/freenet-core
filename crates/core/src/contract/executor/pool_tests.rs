@@ -8,6 +8,8 @@ mod disk_budget_gate_tests;
 mod identical_input_probe_tests;
 mod merge_rejected_tests;
 mod non_idempotent_detector_tests;
+#[cfg(feature = "wasmtime-backend")]
+mod params_integrity_wasm_tests;
 mod related_contract_tests;
 mod runtime_pool_tests;
 mod subscriber_limit_tests;
