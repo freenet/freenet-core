@@ -1,27 +1,40 @@
 services:
   freenet-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: freenet-gateway:latest
-    environment:
-      # The client API binds LOOPBACK by default (GHSA-824h-7x5x-wfmf). This
-      # service uses `network_mode: host`, so that is the HOST's loopback:
-      # reachable from anything on the host (including other containers sharing
-      # its namespace), not from the LAN. That is the right posture for a
-      # gateway, whose job is the P2P port below, not the control API. Set
-      # FREENET_WS_API_ADDRESS=:: only if you deliberately need to drive this
-      # gateway's API from another machine, and put an authenticating proxy in
-      # front of it.
-      TRANSPORT_KEYPAIR: /root/.cache/freenet/keys/transport-keypair.pem
-      PUBLIC_NETWORK_ADDRESS: 0.0.0.0
-      PUBLIC_NETWORK_PORT: 31337
-      NETWORK_PORT: 31337
+    image: ghcr.io/freenet/freenet-gateway:latest
+
+    # Host networking, deliberately -- for the same two reasons as
+    # docker/freenet-node's compose file:
+    #
+    # 1. The client API binds loopback (config.rs `resolve_ws_api_address`).
+    #    Under bridge that is the CONTAINER's loopback, unreachable from the
+    #    host entirely. Under host networking it is the host's loopback.
+    #
+    # 2. The gateway is a UDP peer, and its whole job is being reachable at a
+    #    STABLE public address:port that it advertises to every peer that
+    #    connects through it. Bridge NAT rewrites the source port of
+    #    outbound packets, which works against that; host networking makes
+    #    NETWORK_PORT and PUBLIC_NETWORK_PORT the same port peers actually see.
+    #
+    # This needs Linux. On Docker Desktop, use the bridge fallback documented
+    # in README.md.
     network_mode: host
+
+    environment:
+      # REQUIRED: the address other peers should advertise/connect to. There
+      # is no default -- see README.md.
+      - PUBLIC_NETWORK_ADDRESS=${PUBLIC_NETWORK_ADDRESS:?set PUBLIC_NETWORK_ADDRESS to this gateway's publicly reachable address/hostname}
+
     volumes:
-      - freenet-gateway-data:/root/.cache/freenet
+      - freenet-gateway-data:/data
+
     restart: unless-stopped
+
+    # The gateway drains in-flight operations for up to `shutdown_drain_secs`
+    # (30s by default) when it receives SIGTERM. Docker's default 10s stop
+    # timeout would SIGKILL it mid-drain on every stop and restart.
+    stop_grace_period: 45s
+
+    # The gateway self-updates. See README.md.
 
 volumes:
   freenet-gateway-data:
-    driver: local
