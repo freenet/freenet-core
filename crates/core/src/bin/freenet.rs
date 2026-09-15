@@ -2917,25 +2917,39 @@ mod tests {
         // sides are scraped so a rename on either fails here, rather than
         // leaving the shell reading a path that is now always absent -- which
         // reads exactly like "no pin", the fail-open direction.
+        // Matched as a complete quoted path segment (`/known_bad_version"`), not
+        // as a bare substring: a bare one is satisfied by any name this is a
+        // PREFIX of, and a suffixed near-miss is exactly the drift to catch.
+        let pin_file_needle = format!("/{}\"", super::commands::rollback::KNOWN_BAD_FILE);
         assert!(
-            has_statement(&nix_src, super::commands::rollback::KNOWN_BAD_FILE),
+            has_statement(&nix_src, &pin_file_needle),
             "the Nix supervisor must read the known-bad pin from the file the node \
              writes it to ({})",
             super::commands::rollback::KNOWN_BAD_FILE
         );
+        // The directory half cannot be taken from a constant -- `state_dir()`
+        // builds the path inline -- so it is pinned from BOTH sides instead:
+        // move it in Rust and this fails, naming the shell file that has to
+        // move with it. Note what each half is worth. The Rust-side assertion
+        // is decisive. The shell-side one is a floor, not a proof: the wrapper
+        // also uses this path for its own XDG fallback, so it would survive
+        // deleting the known-bad lookup. What actually proves the wrapper reads
+        // the pin THERE is the behavioural case in the wrapper suite, which
+        // writes the pin only under a fake $HOME (verified by execution:
+        // dropping that directory from the lookup turns it red).
         let auto_update_src = include_str!("commands/auto_update.rs");
         const NODE_STATE_DIR: &str = ".local/state/freenet";
         assert!(
             auto_update_src.contains(NODE_STATE_DIR),
             "auto_update::state_dir() is expected to resolve to {NODE_STATE_DIR} under \
-             HOME; if it moved, nix/freenet-node.sh must move with it"
+             HOME, which is where the node writes the known-bad pin and therefore \
+             where nix/freenet-node.sh looks for it. If it moved, move the wrapper too"
         );
         assert!(
             has_statement(&nix_src, NODE_STATE_DIR),
-            "the Nix supervisor must look for the known-bad pin under \
-             HOME/{NODE_STATE_DIR}, which is where `auto_update::state_dir()` puts it \
-             -- NOT $STATE_DIRECTORY, which the documented systemd unit points \
-             somewhere else entirely"
+            "the Nix supervisor must know about HOME/{NODE_STATE_DIR}: that is where \
+             `auto_update::state_dir()` puts the known-bad pin, NOT $STATE_DIRECTORY, \
+             which the documented systemd unit points somewhere else entirely"
         );
         // ...and the flake must actually build that script, or the assertions
         // above guard a file nothing runs.
