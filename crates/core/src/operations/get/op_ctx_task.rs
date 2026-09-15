@@ -1142,14 +1142,24 @@ impl RetryDriver for GetRetryDriver<'_> {
                 // diverge: the relay may re-ask the stalled peer while the
                 // guess moves on. So the guesses can run out while a ring peer
                 // was never asked. Rather than give up, spend the retry
-                // `advance_to_next_peer` already counted on the closest such
-                // peer. `current_target` alone would not get it there, since
-                // the loopback relay picks the hop: `steer_to_unasked` makes
-                // every hop already asked, timed-out ones included, a
-                // first-hop exclusion from now on, so the relay's pick lands
-                // on an unasked peer. Guesses run out only once every ring
-                // peer was guessed, which within the retry budget means a
-                // ring of three peers or fewer.
+                // `advance_to_next_peer` already counted, in one of two ways.
+                //
+                // If a peer was never asked, go there. `current_target` alone
+                // would not get it there, since the loopback relay picks the
+                // hop: `steer_to_unasked` makes every hop already asked,
+                // timed-out ones included, a first-hop exclusion from now on,
+                // so the relay's pick lands on an unasked peer. A timed-out
+                // hop is excluded only here, and by then it failed to answer
+                // every attempt it was given: a holder that timed out once and
+                // recovered answers the very next attempt, because timed-out
+                // hops otherwise stay eligible. It also stays routable beyond
+                // the first hop.
+                //
+                // Otherwise, re-ask a peer that did not answer NotFound (below).
+                //
+                // Guesses run out only once every ring peer was guessed,
+                // which within the retry budget means a ring of three peers
+                // or fewer.
                 if matches!(
                     reason,
                     crate::tracing::GetExhaustionReason::NoRoutingCandidates
@@ -1167,6 +1177,29 @@ impl RetryDriver for GetRetryDriver<'_> {
                         self.tried.push(addr);
                         self.current_target = peer;
                         self.steer_to_unasked = true;
+                        return AdvanceOutcome::Next;
+                    }
+                    // Every ring peer was asked. If one did not answer
+                    // NotFound (it timed out, or its connection dropped),
+                    // spend the remaining retry re-asking: with only NotFound
+                    // hops excluded, the relay's pick lands on such a peer.
+                    // This is what keeps a contract with a single holder
+                    // reachable when that holder timed out once and has since
+                    // recovered.
+                    let unanswered = self
+                        .asked_hops
+                        .iter()
+                        .copied()
+                        .find(|addr| !self.not_found_hops.contains(addr))
+                        .and_then(|addr| {
+                            self.op_manager
+                                .ring
+                                .connection_manager
+                                .get_peer_by_addr(addr)
+                        });
+                    if let Some(peer) = unanswered {
+                        self.current_target = peer;
+                        self.steer_to_unasked = false;
                         return AdvanceOutcome::Next;
                     }
                 }
@@ -10506,6 +10539,85 @@ mod route_attempt_driver_tests {
             hops[3], hops[0],
             "the last attempt must go to a peer never asked: {hops:?}"
         );
+    }
+
+    /// The only holder of a contract times out once, transiently, and then
+    /// recovers. On 2- and 3-peer rings the other peers answer NotFound first,
+    /// so the driver's guesses run out with every ring peer asked: the
+    /// fallback must re-ask the holder rather than exhaust, and steering must
+    /// not skip it. On a 4-peer ring the guesses do not run out, so it is the
+    /// control.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_single_holder_that_timed_out_once_is_re_asked_after_the_guesses_run_out() {
+        for peers_in_ring in [2usize, 3, 4] {
+            let label = format!("get-single-holder-{peers_in_ring}");
+            let (op_manager, rx, _peers, _guards) =
+                op_manager_with_peers(&label, peers_in_ring).await;
+            let instance_id = ContractInstanceId::new([81u8; 32]);
+            let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+            // Ring peers from closest to farthest.
+            let mut order: Vec<SocketAddr> = Vec::new();
+            for _ in 0..peers_in_ring {
+                let mut skip = order.clone();
+                skip.push(own);
+                let next = op_manager
+                    .ring
+                    .k_closest_potentially_hosting(&instance_id, skip.as_slice(), 1)
+                    .into_iter()
+                    .next()
+                    .expect("a ring peer");
+                order.push(addr(&next));
+            }
+            // The holder is the farthest peer on 2- and 3-peer rings, so every
+            // other peer is asked first; on the 4-peer ring it is third.
+            let holder = order[peers_in_ring.min(3) - 1];
+            let view = op_manager.clone();
+            let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let seen = hops.clone();
+            let mut holder_asks = 0usize;
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Get,
+                move |_, msg, _| {
+                    let (peer, peer_addr) =
+                        loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                    seen.lock().push(peer_addr);
+                    let answer = if peer_addr == holder {
+                        holder_asks += 1;
+                        if holder_asks == 1 {
+                            Answer::Never
+                        } else {
+                            Answer::Reply(found(msg, instance_id))
+                        }
+                    } else {
+                        Answer::Reply(not_found(msg, instance_id))
+                    };
+                    Step {
+                        hop: Some(peer),
+                        answer,
+                    }
+                },
+            );
+            let client_tx = Transaction::new::<GetMsg>();
+            let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+            let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
+            let hops = hops.lock().clone();
+            let asked: std::collections::HashSet<_> = hops.iter().copied().collect();
+            if peers_in_ring <= 3 {
+                assert_eq!(
+                    asked.len(),
+                    peers_in_ring,
+                    "{label}: precondition: every ring peer was asked, so the guesses \
+                     ran out: {hops:?}"
+                );
+            }
+            assert!(
+                matches!(outcome, RetryLoopOutcome::Done(_)),
+                "{label}: the recovered single holder must be re-asked: {hops:?}"
+            );
+            assert_eq!(hops.last(), Some(&holder), "{label}: {hops:?}");
+        }
     }
 
     /// A peer that answered NotFound is not re-asked when the driver's own
