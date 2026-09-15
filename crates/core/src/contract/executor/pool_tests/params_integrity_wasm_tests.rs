@@ -501,6 +501,131 @@ fn upsert_writes_container_params_only_after_store_contract() {
     );
 }
 
+/// Pins `verified_stored_params` to exactly the derivation that the store audit
+/// measured against real node data: stdlib `ContractKey::from_params` over the
+/// stored parameter bytes and the instance's INDEXED code hash, with an
+/// instance that has no index row passed through unchanged. The derivation is
+/// computed here independently of the helper, and each case asserts the helper
+/// agrees with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn verified_stored_params_is_the_indexed_code_hash_derivation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut h = build_harness().await?;
+    let params = Parameters::from(vec![0x59, 0x01]);
+    let key = install_honest(&mut h.executor, &params, b"state").await;
+    let indexed = h
+        .executor
+        .runtime
+        .contract_store
+        .code_hash_from_id(key.id())
+        .expect("an honest install indexes the instance");
+    let derives = |bytes: &[u8], code_hash: CodeHash| {
+        let encoded = ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
+        ContractKey::from_params(encoded, Parameters::from(bytes.to_vec()))
+            .map(|derived| derived.id() == key.id())
+            .unwrap_or(false)
+    };
+
+    // (a) The honest row: the derivation holds, and the helper returns the
+    // stored bytes unchanged.
+    assert!(derives(params.as_ref(), indexed));
+    let got = h
+        .executor
+        .verified_stored_params(&key)
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(
+        got.as_ref().map(|p| p.as_ref()),
+        Some(params.as_ref()),
+        "the helper must accept an honest row and return its parameters unchanged"
+    );
+
+    // (b1) Tampered parameters under the same index row.
+    let tampered = Parameters::from(vec![0x59, 0xEE]);
+    assert!(!derives(tampered.as_ref(), indexed));
+    h.executor
+        .state_store
+        .inner()
+        .store_params(key, tampered)
+        .await
+        .expect("write tampered params row");
+    assert!(
+        h.executor
+            .verified_stored_params(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none(),
+        "the helper must refuse parameters that do not derive the instance id"
+    );
+
+    // (b2) Honest parameters, but the index names another code hash. The check
+    // must use the INDEXED hash, not a hash that would make the row pass.
+    h.executor
+        .state_store
+        .inner()
+        .store_params(key, params.clone())
+        .await
+        .expect("restore honest params row");
+    assert!(
+        h.executor
+            .verified_stored_params(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some(),
+        "sanity: the restored honest row is accepted again"
+    );
+    let other = CodeHash::new([0x42; 32]);
+    assert!(!derives(params.as_ref(), other));
+    h.executor
+        .runtime
+        .contract_store
+        .ensure_key_indexed(&ContractKey::from_id_and_code(*key.id(), other))
+        .expect("re-point the index row");
+    assert_eq!(
+        h.executor.runtime.contract_store.code_hash_from_id(key.id()),
+        Some(other)
+    );
+    assert!(
+        h.executor
+            .verified_stored_params(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none(),
+        "the helper must check against the code hash the index holds"
+    );
+
+    // (c) No index row: the parameters pass through unchanged, whatever they are.
+    let unindexed = ContractKey::from_id_and_code(
+        ContractInstanceId::new([0x5A; 32]),
+        CodeHash::new([0x5B; 32]),
+    );
+    assert!(
+        h.executor
+            .runtime
+            .contract_store
+            .code_hash_from_id(unindexed.id())
+            .is_none()
+    );
+    let arbitrary = Parameters::from(vec![1, 2, 3]);
+    h.executor
+        .state_store
+        .inner()
+        .store_params(unindexed, arbitrary.clone())
+        .await
+        .expect("write params row for an unindexed instance");
+    let got = h
+        .executor
+        .verified_stored_params(&unindexed)
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(
+        got.as_ref().map(|p| p.as_ref()),
+        Some(arbitrary.as_ref()),
+        "with no index row the helper must return the stored parameters unchanged"
+    );
+    Ok(())
+}
+
 /// A valid new instance of an already-stored binary is stored with its own
 /// parameters and leaves the first instance's parameters alone.
 #[tokio::test(flavor = "multi_thread")]
