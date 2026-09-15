@@ -3259,12 +3259,17 @@ impl crate::util::Contains<SocketAddr> for AdmitOnly {
 /// `addr`'s peer, if it is a first-hop routing candidate for `instance_id`
 /// right now (#5660): connected and not transient. Readiness is not enforced
 /// (see `AdmitOnly`). That is looser than the relay's own ranking only for a
-/// peer that has not advertised readiness while other peers have; readiness
-/// only ever moves from not ready to ready, and the peer was a routing pick
-/// earlier in this GET or was chosen by the ranking itself. The retry fallback
-/// uses it to choose a peer the loopback relay will accept, and the relay to
-/// decide whether to honour a pinned first hop, so the two cannot disagree
-/// about which peers qualify.
+/// peer that has not advertised readiness while other peers have, and that
+/// window is bounded by `ConnectionManager::is_peer_ready` itself rather than
+/// by readiness being one-way — a connected peer does go back to not ready
+/// when it sends `ReadyState { ready: false }`, which `node.rs` routes to
+/// `mark_peer_not_ready`. `is_peer_ready` is unconditionally true when
+/// `min_ready_connections == 0`, and otherwise becomes true once the
+/// connection is older than `OPTIMISTIC_READY_TIMEOUT` (60s), whatever the
+/// peer last advertised. The retry fallback uses this function to choose a
+/// peer the loopback relay will accept, and the relay to decide whether to
+/// honour a pinned first hop, so the two cannot disagree about which peers
+/// qualify.
 ///
 /// It goes through `k_closest_potentially_hosting`, so with 50 or more routing
 /// events the router records a one-peer window, with that peer at rank 0, in
@@ -3272,8 +3277,20 @@ impl crate::util::Contains<SocketAddr> for AdmitOnly {
 /// per candidate the fallback probes, and once more at the relay's re-check.
 /// That is a diagnostic side effect only, not a routing-dataset or route
 /// event, and it happens only after the guesses run out, on rings of three
-/// peers or fewer. A direct connection-exists and not-transient check would
-/// avoid it; this way the driver and the relay share one filter.
+/// peers or fewer. Probing a peer that has not advertised readiness also emits
+/// that function's `warn!` about falling back to not-yet-ready peers, which
+/// reads as a ring-wide shortage and is not one here: every other peer was
+/// removed by `AdmitOnly`, not by the readiness filter. A direct
+/// connection-exists and not-transient check would avoid both; this way the
+/// driver and the relay share one filter.
+///
+/// It can also return `None` for every `addr` at once: an addressless ring
+/// entry bypasses the skip list and the other per-peer filters, so with `k`
+/// of 1 one ranking above the admitted peer takes the single slot and the
+/// `socket_addr` filter below discards it. That would disable the fallback
+/// and the relay's pin honouring together, and no production path writes an
+/// addressless entry today (see `advance_to_next_peer`'s
+/// `AddresslessCandidate`).
 fn first_hop_candidate(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
@@ -3341,9 +3358,13 @@ fn relay_advance_to_next_peer(
         !first_hop_pin.is_some_and(|pin| first_hop_exclusions.contains(&pin)),
         "a pinned first hop must not also be a first-hop exclusion"
     );
-    // The bloom check is defence only. The loopback request's bloom carries
-    // tried peers only on an empty ring, where no pin is ever set, so on a
-    // non-empty ring a pin cannot be in it.
+    // The bloom check is defence only, and it covers the ring-emptied race
+    // rather than being made redundant by it: `new_attempt_tx` re-reads
+    // `connection_count()`, so the ring can empty after `advance` pinned a
+    // peer and the attempt then carries `tried` into its bloom. Even then the
+    // carry skips the attempt's current target, which after a pin is set is
+    // the pinned peer itself, so only a bloom false positive can drop a pin
+    // here.
     let pinned = first_hop_pin
         .filter(|pin| !new_visited.probably_visited(*pin))
         .and_then(|pin| first_hop_candidate(op_manager, instance_id, pin));
@@ -11008,6 +11029,13 @@ mod route_attempt_driver_tests {
                         // the peer is an ordinary candidate again. Re-register
                         // it every second, with no await between the drop and
                         // the re-register, so it stays transient throughout.
+                        // One refresher per `StallTransient` hit, and nothing
+                        // stops it: a script that stalls the same peer twice
+                        // runs two of them against one entry (harmless, since
+                        // `try_register_transient` returns true on the
+                        // already-registered path, but it doubles the 1s
+                        // timers the paused clock steps through). Every
+                        // script here hits it once.
                         let refresher = view.clone();
                         tokio::spawn(async move {
                             loop {
@@ -11349,6 +11377,13 @@ mod route_attempt_driver_tests {
     /// earlier-asked, because it is transient, and pins B. The relay would
     /// route around a transient pin anyway, so the pins, not the hops, are what
     /// show the driver's choice.
+    ///
+    /// The scenario is synthetic: the transient TTL (30s) is shorter than the
+    /// attempt timeout (60s), so a peer that turns transient during one
+    /// attempt is usually an ordinary candidate again by the time the fallback
+    /// runs, and this filter is commonly a no-op. It takes a peer that keeps
+    /// re-registering as transient — a flapping CONNECT-coordination peer —
+    /// which the harness stands in for (see `Scripted::StallTransient`).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_transient_peer_is_not_pinned_for_its_second_chance() {
         use Scripted as S;

@@ -1901,9 +1901,6 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
-    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
-    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
-    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// Source-grep pin for the fast infra-retry path in
     /// `drive_retry_loop`. A `NotificationError` (local callback
     /// dropped without a reply) is a transient infra hiccup, NOT a
@@ -1923,14 +1920,27 @@ mod tests {
     fn drive_retry_loop_has_fast_infra_retry_path() {
         let src = include_str!("op_ctx.rs");
         // Every assertion reads the production body only, so no assertion's
-        // own text can satisfy it.
-        let body = crate::operations::route_attempt::driver_test_support::production_fn_body(
+        // own text can satisfy it — and with the `//` comments stripped, so
+        // production PROSE cannot either. Without the strip, `MAX_INFRA_RETRIES`
+        // below is satisfied by the arm's own explanatory comment, which
+        // survives deleting the code that reads the cap. (Line comments only:
+        // this body has no block comment, and no string literal in it contains
+        // `//`, so keep needles out of string literals.)
+        let raw = crate::operations::route_attempt::driver_test_support::production_fn_body(
             src,
             "pub(crate) async fn drive_retry_loop",
         );
+        let body: String = raw
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
         assert!(
             body.contains("MAX_INFRA_RETRIES"),
-            "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
+            "drive_retry_loop's CODE must reference the MAX_INFRA_RETRIES cap \
+             (comments are stripped before this check, so naming it only in \
+             prose does not count)"
         );
         assert!(
             body.contains("Ok(Err(OpError::NotificationError))"),
@@ -1970,6 +1980,9 @@ mod tests {
         );
     }
 
+    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
+    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
+    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// per-attempt timeout — currently only PUT, for streaming-payload
     /// scaling per #4001 — must override explicitly. Pin the default so
     /// a refactor that changes the trait can't silently shift behaviour
