@@ -103,9 +103,13 @@ where
     /// The params row is keyed by instance id alone, and every operation that
     /// arrives without code runs the contract with what it finds there. A row
     /// whose parameters do not derive the instance id, under the code hash the
-    /// instance->code index holds for it (the key's own hash when there is no
-    /// index row), is treated as absent rather than used. The next verified
-    /// container for the instance rewrites it.
+    /// instance->code index holds for it, is treated as absent rather than
+    /// used. The next verified container for the instance rewrites it.
+    ///
+    /// With no index row there is no code hash to check against and nothing to
+    /// protect: every path that runs or serves a contract resolves its code
+    /// through that index, so such a contract cannot be run either way. The
+    /// params are returned unchecked, which keeps that case's existing errors.
     pub(in crate::contract::executor) async fn verified_stored_params(
         &self,
         key: &ContractKey,
@@ -118,10 +122,9 @@ where
         else {
             return Ok(None);
         };
-        let code_hash = self
-            .runtime
-            .code_hash_from_id(key.id())
-            .unwrap_or(*key.code_hash());
+        let Some(code_hash) = self.runtime.code_hash_from_id(key.id()) else {
+            return Ok(Some(params));
+        };
         let encoded_code_hash =
             ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
         match ContractKey::from_params(encoded_code_hash.clone(), params.clone()) {

@@ -463,8 +463,8 @@ where
     /// Precondition: `params` must already be verified as the parameters `key`'s
     /// instance id was derived from (`ContractStore::store_contract` checks this
     /// for a supplied container). The row is keyed by instance id alone and is
-    /// overwritten, so a caller that skips verification can replace another
-    /// contract's parameters.
+    /// overwritten unconditionally, so it must only ever receive verified
+    /// parameters.
     pub async fn ensure_params(
         &self,
         key: ContractKey,

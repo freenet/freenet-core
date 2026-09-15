@@ -25,8 +25,9 @@ use crate::wasm_runtime::{
 
 /// `validate_state` always returns `Valid` and `update_state` takes the last
 /// incoming state. It ignores its parameters, so the same binary under
-/// different parameters gives distinct, individually valid instances — which
-/// is exactly what a forged container needs to look like.
+/// different parameters gives distinct, individually valid instances, and any
+/// refusal a test observes comes from the identity check rather than from the
+/// contract.
 const CONTRACT: &str = "test-contract-mock-aligned";
 
 struct Harness {
@@ -67,10 +68,9 @@ async fn load(params: Parameters<'static>) -> ContractContainer {
         .expect("compile contract")
 }
 
-/// Re-key `container` onto `victim`'s instance id, keeping the true hash of
-/// the container's code. Only the instance derivation is wrong, which is the
-/// shape that passes the executor's own `key.id() == container.key().id()`
-/// comparison, since the sender chooses both sides of it.
+/// A container whose key names `victim`'s instance id while its code and
+/// parameters derive a different one. The key keeps the true hash of the
+/// container's code, so the instance derivation is the only thing wrong with it.
 fn claim_instance(victim: &ContractKey, container: ContractContainer) -> ContractContainer {
     let ContractContainer::Wasm(ContractWasmAPIVersion::V1(mut contract)) = container else {
         panic!("unexpected container version");
@@ -383,13 +383,12 @@ async fn stored_params_not_deriving_the_instance_are_not_used()
 
     // Serving must not build a container from the row's parameters.
     let (_, served) = h.executor.fetch_contract(honest_key, true).await?;
-    if let Some(served) = served {
-        assert_eq!(
-            served.key().id(),
-            honest_key.id(),
-            "the node served a container whose key is not the contract that was asked for"
-        );
-    }
+    assert!(
+        served.is_none(),
+        "no container may be built from stored parameters that do not derive the \
+         instance id (served key: {:?})",
+        served.map(|c| c.key())
+    );
 
     // A verified container repairs the row, and code-less operations work again.
     upsert(&mut h.executor, honest, b"repaired")
