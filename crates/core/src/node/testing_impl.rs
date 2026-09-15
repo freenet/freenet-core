@@ -725,6 +725,7 @@ impl ControlledSimulationResult {
     /// Timeout route-failure labels `label`'s node recorded as the originator
     /// of an operation, excluding those it recorded while relaying other
     /// nodes' operations. `None` if the node never published its Ring (#5660).
+    #[cfg(any(test, feature = "testing"))]
     pub fn node_originator_route_timeouts(&self, label: &NodeLabel) -> Option<u64> {
         self.node_rings
             .get(label)

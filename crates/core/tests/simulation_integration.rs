@@ -12158,8 +12158,11 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
 /// What this sim does NOT discriminate is whether a timed-out hop is wrongly
 /// excluded from later first-hop picks: with exclusions scoped to the first
 /// hop, a retry that skipped the host would start from another peer, which
-/// forwards to the host (the node closest to the key) anyway. The unit test
-/// `a_timed_out_hop_is_retried_not_excluded` pins that property.
+/// forwards to the host (the node closest to the key) anyway. Unit tests pin
+/// that property: `a_timed_out_hop_is_retried_not_excluded` on a ring large
+/// enough that the driver's guesses never run out, and
+/// `a_holder_that_timed_out_once_keeps_its_second_chance_over_an_unasked_peer`
+/// on a small ring where they do.
 ///
 /// Under plain `cargo test` this can fail its precondition while other sims
 /// share the process (#5673): a concurrent `SimNetwork` drop clears the
@@ -12281,7 +12284,10 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     // host sits at the key, so it is the requester's closest candidate and
     // first hop. And the requester recorded a timeout as an ORIGINATOR, which
     // can only be its own GET: labels it recorded while relaying the gateway's
-    // filler GETs do not count.
+    // filler GETs do not count. The connection is read at the end of the run,
+    // so on its own it would also accept a host that connected only after the
+    // GET; the timeout check is what shows the requester's own GET met the
+    // stall.
     assert!(
         result.node_is_connected_to(&requester, &host),
         "precondition: the requester must be connected to the host"

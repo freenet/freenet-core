@@ -116,7 +116,12 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     NotFound when its own downstream send fails or its connection drops, so a
     whole-path exclusion could cut a single-host contract off behind one
     flapping peer. If the exclusions leave no candidate, the relay ignores
-    them.
+    them. Once the driver's own guesses run out (rings of three peers or
+    fewer), `advance` falls back to a peer never asked, else re-asks a
+    connected peer that failed only once without answering NotFound; from
+    then on a peer given `FALLBACK_MAX_ASKS_PER_PEER` attempts is excluded
+    too. A peer that timed out once is never excluded, and the fallback
+    re-asks each peer at most once.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,
