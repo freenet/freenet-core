@@ -1603,3 +1603,104 @@ fn test_streaming_get_retries_after_assembly_failure() {
          state delivered). Per-candidate outcomes: {failures:#?}"
     );
 }
+
+// =============================================================================
+// Streaming PUT relay: a real stream failure is reported upstream (#5671)
+// =============================================================================
+
+/// #5671, triggered with the simulation's own fault injection: the gateway goes
+/// silent (a scripted `CrashNode`) while its streaming PUT is in flight, so the
+/// receiving relay stops getting fragments and cannot receive the stream. The
+/// relay must report that upstream instead of going silent, and the client's
+/// retry after the gateway recovers must store the contract.
+///
+/// This is the real trigger, not the `relay_stream_fault_injection` hook the
+/// unit and e2e tests use: the gateway's outage (3 s of virtual time) grows
+/// into a fragment gap of at least 5 s at the relay, so its `assemble()` hits
+/// the 5 s inactivity timeout, as in CI run 34422250768. A sweep of the crash
+/// offset reproduced it at 300, 400 (3 runs of 3) and 500 ms after the PUT;
+/// at 20, 50, 150 and 1000 ms the stream either survived the outage or had
+/// already finished.
+///
+/// The controlled simulation exposes no client results, so this asserts the
+/// relay side (`RELAY_PUT_STREAMING_FAILURES_REPORTED`, a process-global whose
+/// delta is this test's alone under nextest's process-per-test isolation) and
+/// the retry's stored state. That the originator then completes promptly is
+/// asserted with real nodes in
+/// `error_notification::test_streaming_put_relay_failure_completes_promptly`.
+#[test]
+fn test_streaming_put_relay_stream_failure_is_reported_upstream() {
+    use freenet::dev_tool::RELAY_PUT_STREAMING_FAILURES_REPORTED;
+    use std::sync::atomic::Ordering;
+
+    const SEED: u64 = 0x5671_0000_5EED_0001;
+    const NETWORK_NAME: &str = "streaming-put-relay-failure";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 1024 * 1024; // 1 MB, a long stream
+    // Where in the stream the gateway goes silent; see the sweep above.
+    const CRASH_AFTER: Duration = Duration::from_millis(400);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 2, SEED, THRESHOLD));
+    // The crash follows the first PUT by this interval, which lands while its
+    // stream is still in flight.
+    sim.with_controlled_op_interval(CRASH_AFTER);
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    let contract = SimOperation::create_test_contract(0x56);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0x56);
+    let contract_key = contract.key();
+    let put = || {
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: large_state.clone(),
+                subscribe: false,
+            },
+        )
+    };
+    let operations = vec![
+        put(),
+        // Silent for 3 s (the runner settles each special op for 3 s): the
+        // gateway's outbound stream stalls and the relay stops receiving it.
+        ScheduledOperation::new(gateway.clone(), SimOperation::CrashNode),
+        ScheduledOperation::new(gateway.clone(), SimOperation::RecoverNode),
+        // The client's retry once the gateway is back.
+        put(),
+    ];
+
+    let reported_before = RELAY_PUT_STREAMING_FAILURES_REPORTED.load(Ordering::SeqCst);
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+    );
+    let reported = RELAY_PUT_STREAMING_FAILURES_REPORTED.load(Ordering::SeqCst) - reported_before;
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "the scripted crash must actually drop the gateway's packets"
+    );
+    assert!(
+        reported > 0,
+        "the relay that lost the gateway's stream must report the failure \
+         upstream (#5671); none was reported"
+    );
+    let stored = find_contract_in_non_gateway_storages(&result.node_storages, &contract_key)
+        .expect("the retried PUT must store the contract on a non-gateway node");
+    assert_eq!(
+        stored.as_ref(),
+        large_state.as_slice(),
+        "the stored state must be the retried PUT's full 1 MB state"
+    );
+}
