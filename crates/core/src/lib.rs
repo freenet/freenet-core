@@ -67,6 +67,12 @@ mod wasm_runtime;
 /// Deterministic simulation testing framework.
 pub mod simulation;
 
+/// `build.rs`'s choice of `rerun-if-changed` paths (#5667). Build scripts have
+/// no test harness of their own, so the module is compiled here to test it.
+#[cfg(test)]
+#[path = "../build/git_watch.rs"]
+mod build_git_watch;
+
 /// Pin the process-start anchor used by the bootstrap-latency metric
 /// (`freenet.bootstrap.time_to_min_connections_seconds`, issue #4787).
 ///
