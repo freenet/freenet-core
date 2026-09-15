@@ -6557,6 +6557,15 @@ mod tests {
     /// estimate left the #4230 steady twin green). Per-peer timing would add
     /// exactly the per-peer-history-versus-locality competition #4230 guards,
     /// from a source the test does not control. Deterministic: draws no RNG.
+    ///
+    /// The jitter has a second job: it keeps the values varied, so the
+    /// log-curve fit is well-conditioned rather than fitted to one repeated
+    /// value.
+    ///
+    /// "No per-peer signal" holds only while the caller's history is
+    /// ROUND-MAJOR (each round touches every peer once) AND its peer count is
+    /// not a multiple of the 7-event cycle; otherwise a peer's jitter is a
+    /// fixed offset. The #4230 steady-state twin asserts the peer count.
     fn with_uninformative_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
         history
             .iter()
@@ -6704,6 +6713,21 @@ mod tests {
             .map(|p| p.location().unwrap().as_f64().to_bits())
             .collect();
         assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
+        // `with_uninformative_timing` cycles its jitter every 7 events and
+        // `gradient_history` is round-major (each round touches every peer
+        // once), so a peer's jitter walks the cycle across rounds and every
+        // peer ends with the same mean. If the pool size were a multiple of 7,
+        // the jitter would collapse to a FIXED per-peer offset: a per-peer
+        // timing signal, which is exactly the per-peer-history-versus-locality
+        // regime #4230 guards, injected by the test itself and invisible to
+        // every assertion below.
+        assert_ne!(
+            pool.len() % 7,
+            0,
+            "pool size {} is a multiple of with_uninformative_timing's 7-event \
+             jitter cycle, so its timing would become a fixed per-peer offset",
+            pool.len()
+        );
 
         let history = gradient_history(&pool, 12, 0.35); // 40 * 12 = 480 events
 

@@ -246,9 +246,10 @@ WHEN touching either stack:
     transition phase-3 and #4230 steady-state twins do); otherwise its
     timing is legacy. Timing that correlates with distance is itself a
     locality signal and can pre-solve a locality property, so a guard of
-    the FAILURE stage should train timing that carries no distance signal. Where both stacks agree bit for bit (all-success
-    data), add a LEGACY_STAGE_EVALUATIONS delta check. Give a new guard
-    both modes.
+    the FAILURE stage should train timing that carries no distance signal
+    — and none per peer either, which is the same hazard one level down.
+    Where both stacks agree bit for bit (all-success data), add a
+    LEGACY_STAGE_EVALUATIONS delta check. Give a new guard both modes.
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected
