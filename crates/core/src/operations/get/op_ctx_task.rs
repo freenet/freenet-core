@@ -10651,10 +10651,12 @@ mod route_attempt_driver_tests {
     /// last entry repeating; every hop is picked by the real loopback-relay
     /// selection. Returns whether the GET completed, the ring peers from
     /// closest to farthest, the hops asked in order, and the driver's
-    /// exhaustion reason.
+    /// exhaustion reason. `joins_late` names a peer, by ring order, that is off
+    /// the ring until the first attempt's hop has been picked.
     async fn run_scripted_ring(
         label: &str,
         script: Vec<Vec<Scripted>>,
+        joins_late: Option<usize>,
     ) -> (
         bool,
         Vec<SocketAddr>,
@@ -10662,7 +10664,7 @@ mod route_attempt_driver_tests {
         Option<crate::tracing::GetExhaustionReason>,
     ) {
         let peers = script.len();
-        let (op_manager, rx, _peers, _guards) = op_manager_with_peers(label, peers).await;
+        let (op_manager, rx, ring_peers, _guards) = op_manager_with_peers(label, peers).await;
         let instance_id = ContractInstanceId::new([82u8; 32]);
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let mut order: Vec<SocketAddr> = Vec::new();
@@ -10677,6 +10679,21 @@ mod route_attempt_driver_tests {
                 .expect("a ring peer");
             order.push(addr(&next));
         }
+        // The late peer leaves the ring now and is re-added, with its own
+        // location and key, once the first attempt's hop is picked.
+        let mut late = joins_late.map(|i| {
+            let peer = ring_peers
+                .iter()
+                .find(|p| addr(p) == order[i])
+                .cloned()
+                .expect("a ring peer");
+            let location = op_manager
+                .ring
+                .connection_manager
+                .prune_alive_connection(order[i])
+                .expect("the late peer was connected");
+            (peer, location)
+        });
         let view = op_manager.clone();
         let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = hops.clone();
@@ -10690,6 +10707,14 @@ mod route_attempt_driver_tests {
                 let (peer, peer_addr) =
                     loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
                 seen.lock().push(peer_addr);
+                if let Some((late_peer, location)) = late.take() {
+                    assert!(view.ring.connection_manager.add_connection(
+                        location,
+                        addr(&late_peer),
+                        late_peer.pub_key().clone(),
+                        false,
+                    ));
+                }
                 let i = ring_order
                     .iter()
                     .position(|a| *a == peer_addr)
@@ -10743,11 +10768,41 @@ mod route_attempt_driver_tests {
                 vec![S::Stall, S::Found],
                 vec![S::NotFound],
             ],
+            None,
         )
         .await;
         assert_eq!(
             hops,
             vec![order[0], order[0], order[1], order[1]],
+            "the holder's second attempt must not be steered to the unasked peer"
+        );
+        assert!(done, "the recovered holder answers: {hops:?}");
+    }
+
+    /// The holder's single timeout can come BEFORE a closer peer's two: the
+    /// router re-ranks peers after a timeout, so the holder may be picked
+    /// first. Connection timing produces that order here. Ring order is Y
+    /// (closest), the holder, U, and Y joins only after the first attempt. So
+    /// the holder is asked first and times out once, Y then stalls and drops
+    /// its connection, and U is never asked. The last attempt must go back to
+    /// the holder rather than to U: a hop that failed only once is not
+    /// excluded, however early its failure came.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_holder_asked_before_a_closer_peer_keeps_its_second_chance() {
+        use Scripted as S;
+        let (done, order, hops, _) = run_scripted_ring(
+            "get-second-chance-reranked",
+            vec![
+                vec![S::Stall, S::Disconnect],
+                vec![S::Stall, S::Found],
+                vec![S::NotFound],
+            ],
+            Some(0),
+        )
+        .await;
+        assert_eq!(
+            hops,
+            vec![order[1], order[0], order[0], order[1]],
             "the holder's second attempt must not be steered to the unasked peer"
         );
         assert!(done, "the recovered holder answers: {hops:?}");
@@ -10769,6 +10824,7 @@ mod route_attempt_driver_tests {
                 vec![S::NotFound],
                 vec![S::Stall, S::Found],
             ],
+            None,
         )
         .await;
         assert_eq!(
@@ -10794,7 +10850,7 @@ mod route_attempt_driver_tests {
             ("get-re-ask-not-found", vec![S::Stall, S::NotFound]),
         ] {
             let (done, order, hops, _) =
-                run_scripted_ring(label, vec![closest, vec![S::Stall, S::Found]]).await;
+                run_scripted_ring(label, vec![closest, vec![S::Stall, S::Found]], None).await;
             assert_eq!(
                 hops,
                 vec![order[0], order[0], order[1], order[1]],
@@ -10824,7 +10880,7 @@ mod route_attempt_driver_tests {
         ] {
             let label = format!("get-stalled-ring-{peers}");
             let (done, order, hops, exhausted) =
-                run_scripted_ring(&label, vec![vec![S::Stall]; peers]).await;
+                run_scripted_ring(&label, vec![vec![S::Stall]; peers], None).await;
             assert!(!done, "{label}: every peer stalls");
             let expected: Vec<SocketAddr> = expected.iter().map(|i| order[*i]).collect();
             assert_eq!(hops, expected, "{label}");
