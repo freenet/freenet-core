@@ -139,8 +139,7 @@ where
                 const REPORTED_CAP: usize = 4096;
                 static REPORTED: std::sync::LazyLock<dashmap::DashSet<ContractInstanceId>> =
                     std::sync::LazyLock::new(dashmap::DashSet::new);
-                let first_report =
-                    REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
+                let first_report = REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
                 if first_report {
                     tracing::warn!(
                         contract = %key,
@@ -356,19 +355,17 @@ where
         let params = if let Some(code) = &code {
             code.params()
         } else {
-            self.verified_stored_params(&key)
-                .await?
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        contract = %key,
-                        is_delta = matches!(update, Either::Right(_)),
-                        "Contract parameters not found in state_store"
-                    );
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
+                tracing::warn!(
+                    contract = %key,
+                    is_delta = matches!(update, Either::Right(_)),
+                    "Contract parameters not found in state_store"
+                );
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
         };
 
         // Track if we stored a new contract. `charged_wasm` carries the blob
@@ -1531,15 +1528,12 @@ where
             return Ok(cached_summary);
         }
 
-        let params = self
-            .verified_stored_params(&key)
-            .await?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // Summarize-storm falsifier (spec step 8 / #4440): count the actual WASM
         // `summarize_state` invocation — the SLOW-path miss the state-hash cache
@@ -1661,15 +1655,12 @@ where
             return Ok(cached_delta);
         }
 
-        let params = self
-            .verified_stored_params(&key)
-            .await?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // The delta twin of the summarize slow-path counter: a true cache miss
         // that actually runs the contract's WASM `get_state_delta`. Recorded at

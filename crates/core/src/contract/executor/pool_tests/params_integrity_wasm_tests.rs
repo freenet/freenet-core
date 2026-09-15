@@ -47,14 +47,8 @@ async fn build_harness() -> Result<Harness, Box<dyn std::error::Error>> {
     )?;
     let state_store = StateStore::new(db, 10_000_000)?;
     let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)?;
-    let executor = Executor::new(
-        state_store,
-        || Ok(()),
-        OperationMode::Local,
-        runtime,
-        None,
-    )
-    .await?;
+    let executor =
+        Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await?;
     Ok(Harness {
         executor,
         _temp_dir: temp_dir,
@@ -176,7 +170,9 @@ async fn forged_container_for_stored_code_leaves_stored_params_unchanged()
 
     let err = upsert(&mut h.executor, forged, b"forged state")
         .await
-        .expect_err("a container whose key is not derived from its code and parameters must be refused");
+        .expect_err(
+            "a container whose key is not derived from its code and parameters must be refused",
+        );
 
     assert_eq!(
         stored_params(&h.executor, &honest_key).await.as_deref(),
@@ -216,7 +212,9 @@ async fn forged_container_with_new_code_leaves_stored_params_unchanged()
 
     let err = upsert(&mut h.executor, forged, b"forged state")
         .await
-        .expect_err("a container whose key is not derived from its code and parameters must be refused");
+        .expect_err(
+            "a container whose key is not derived from its code and parameters must be refused",
+        );
 
     assert_eq!(
         stored_params(&h.executor, &honest_key).await.as_deref(),
@@ -284,7 +282,12 @@ async fn valid_container_restores_missing_params_on_merge(
     let tag = if blob_stored { 0x55 } else { 0x54 };
     if blob_stored {
         // Another instance of the same binary puts the blob on disk.
-        install_honest(&mut h.executor, &Parameters::from(vec![tag, 0x02]), b"other").await;
+        install_honest(
+            &mut h.executor,
+            &Parameters::from(vec![tag, 0x02]),
+            b"other",
+        )
+        .await;
     }
 
     let params = Parameters::from(vec![tag, 0x01]);
@@ -408,7 +411,10 @@ async fn stored_params_not_deriving_the_instance_are_not_used()
         )
         .await
         .map_err(|e| format!("code-less update after repair failed: {e}"))?;
-    assert_eq!(stored_state(&h.executor, &honest_key).await, b"after repair");
+    assert_eq!(
+        stored_state(&h.executor, &honest_key).await,
+        b"after repair"
+    );
     Ok(())
 }
 
@@ -425,7 +431,9 @@ async fn forged_container_for_unheld_instance_leaves_no_params_row()
 
     let err = upsert(&mut h.executor, forged, b"forged state")
         .await
-        .expect_err("a container whose key is not derived from its code and parameters must be refused");
+        .expect_err(
+            "a container whose key is not derived from its code and parameters must be refused",
+        );
 
     assert_eq!(
         stored_params(&h.executor, &claimed).await,

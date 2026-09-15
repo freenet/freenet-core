@@ -186,14 +186,12 @@ impl Executor<Runtime> {
         // added for #4978 repairs such a row once the index does know it.
         let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
-            self.verified_stored_params(&key)
-                .await?
-                .ok_or_else(|| {
-                    RequestError::ContractError(StdContractError::Update {
-                        cause: "missing contract parameters".into(),
-                        key,
-                    })
-                })?
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
+                RequestError::ContractError(StdContractError::Update {
+                    cause: "missing contract parameters".into(),
+                    key,
+                })
+            })?
         };
 
         let current_state = self
