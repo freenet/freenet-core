@@ -1922,10 +1922,12 @@ mod tests {
     #[test]
     fn drive_retry_loop_has_fast_infra_retry_path() {
         let src = include_str!("op_ctx.rs");
-        let loop_pos = src
-            .find("pub(crate) async fn drive_retry_loop")
-            .expect("drive_retry_loop must exist");
-        let body = &src[loop_pos..];
+        // Every assertion reads the production body only, so no assertion's
+        // own text can satisfy it.
+        let body = crate::operations::route_attempt::driver_test_support::production_fn_body(
+            src,
+            "pub(crate) async fn drive_retry_loop",
+        );
         assert!(
             body.contains("MAX_INFRA_RETRIES"),
             "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
@@ -1936,15 +1938,9 @@ mod tests {
              to route the infra-retry path — bare `Ok(Err(err))` would lump it with \
              real wire errors and call advance()"
         );
-        // Scoped to the production body, so this assertion's own text cannot
-        // satisfy it.
-        let production = crate::operations::route_attempt::driver_test_support::production_fn_body(
-            src,
-            "pub(crate) async fn drive_retry_loop",
-        );
         assert!(
-            production.contains("&& infra_retries < MAX_INFRA_RETRIES;")
-                && production.contains("Ok(Err(OpError::NotificationError)) if infra_retry =>"),
+            body.contains("&& infra_retries < MAX_INFRA_RETRIES;")
+                && body.contains("Ok(Err(OpError::NotificationError)) if infra_retry =>"),
             "the NotificationError arm must be guarded by `infra_retry`, which \
              requires `infra_retries < MAX_INFRA_RETRIES`, so a true shutdown \
              doesn't loop forever burning CPU"
@@ -1955,7 +1951,7 @@ mod tests {
         // `match` (the regular wire_error arm) and assert it doesn't
         // contain `driver.advance()`.
         let infra_arm_start = body
-            .find("Ok(Err(OpError::NotificationError))")
+            .find("Ok(Err(OpError::NotificationError)) if infra_retry =>")
             .expect("matched above");
         let next_arm_start = body[infra_arm_start..]
             .find("Ok(Err(err)) => {")

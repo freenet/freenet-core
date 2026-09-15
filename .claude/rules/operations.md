@@ -119,13 +119,18 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     them. Once the driver's own guesses run out (rings of three peers or
     fewer), `advance` chooses each remaining attempt's first hop itself and
     pins it for the loopback relay (`fallback_target`), so the router's
-    ranking cannot reorder the choice: first a connected peer that failed
-    once without answering NotFound, for its second attempt, then a peer
-    never asked. A peer given `FALLBACK_MAX_ASKS_PER_PEER` attempts is not
-    chosen again and is excluded from the relay's own pick, so after the
-    guesses run out the fallback re-asks each peer at most once. A local
-    infra retry (a callback dropped on this node) does not count as an
-    attempt on the peer.
+    ranking cannot reorder the choice. Every connected peer that failed once
+    without answering NotFound gets its second attempt before any
+    never-asked peer is tried, earliest-asked first: so with two such peers
+    and one attempt left the earlier-asked one wins, and with two such peers
+    a never-asked peer, even one that connected late, can go unasked. The
+    relay honours the pin only while the peer passes `first_hop_candidate`
+    (connected and not transient; readiness is not enforced). A peer given
+    `FALLBACK_MAX_ASKS_PER_PEER` attempts is not chosen again and is
+    excluded from the relay's own pick, so after the guesses run out the
+    fallback re-asks each peer at most once. A local infra retry (a
+    callback dropped on this node, within `MAX_INFRA_RETRIES`) does not
+    count as an attempt on the peer; one beyond that budget does.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,
