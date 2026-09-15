@@ -21,6 +21,15 @@ impl Executor<Runtime> {
         if self.get_local_contract(key.id()).await.is_ok() {
             // Contract already exists — merge states locally and broadcast async.
             //
+            // The container's key and params drive the merge and the commit below,
+            // so verify they belong together first. `store_contract` is the store's
+            // guarded ingress: it refuses a key not derived from the container's code
+            // and params, and for already-stored code it only re-indexes the instance.
+            self.runtime
+                .contract_store
+                .store_contract(contract.clone())
+                .map_err(ExecutorError::other)?;
+            //
             // We intentionally do NOT delegate to perform_contract_update here because
             // its network mode path uses op_request() which blocks waiting for the
             // network operation to complete (120s timeout). For client-initiated puts

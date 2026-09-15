@@ -287,21 +287,10 @@ where
                 "Upserting contract state"
             );
         }
+        // A container's params are persisted further down, once `store_contract`
+        // has verified the container; see the `ensure_params` call there.
         let params = if let Some(code) = &code {
-            let p = code.params();
-            // Ensure params are persisted to state_store so they survive restarts.
-            // The code path (PUT via GET) always provides params in the container,
-            // but state_store.store() is only called for new contracts. If the contract
-            // already exists (merge path), commit_state_update() calls state_store.update()
-            // which doesn't write params. Persisting here covers all cases.
-            if let Err(e) = self.state_store.ensure_params(key, p.clone()).await {
-                tracing::warn!(
-                    contract = %key,
-                    error = %e,
-                    "Failed to persist contract parameters to state_store"
-                );
-            }
-            p
+            code.params()
         } else {
             self.state_store
                 .get_params(&key)
@@ -431,6 +420,27 @@ where
             } else {
                 (false, false, None)
             };
+
+        // Persist the container's params so they survive restarts. The code path
+        // (PUT via GET) always provides params in the container, but
+        // state_store.store() is only called for new contracts; if the contract
+        // already exists (merge path), commit_state_update() calls
+        // state_store.update(), which doesn't write params.
+        //
+        // This must follow verification. Every branch above that had a container
+        // passed it through `store_contract`, which returns an error (propagated
+        // by `?`) unless the key is derived from the container's code and params,
+        // and the params row is keyed by instance id alone. So only params that
+        // verification has bound to this instance id may be written to it.
+        if code.is_some() {
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+        }
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
