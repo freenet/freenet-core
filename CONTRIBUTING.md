@@ -38,18 +38,22 @@ An alternative to a local rustup install, not a requirement.
 
 ```bash
 nix develop                  # dev shell: pinned toolchain, nextest, shellcheck, ...
-nix build .#freenet          # build the node binary (result/bin/freenet)
+nix build .#freenet          # build only: the bare binary (result/bin/freenet)
 nix run .                    # run the supervised, self-updating node
 ```
 
 The shell's toolchain is pinned to [`rust-toolchain.toml`](rust-toolchain.toml),
 so `cargo fmt` and `cargo clippy -- -D warnings` inside it agree with CI.
 
-Nix is also a supported **deployment** path, and the two package outputs differ
-in whether the node keeps itself current — which matters to the network, not
-just to you. [`docs/nix.md`](docs/nix.md) has the full picture, including the
-drift tradeoff you accept by running the self-updating output and what this
-build does *not* tell you about the published release binaries.
+Nix is also a supported **deployment** path, but only through one of the two
+outputs. `packages.freenet` is for **building and development** — CI, the dev
+shell, packaging. It is **not a way to run a peer**: nothing updates it, so a
+peer started from it falls behind every release and eventually stops working,
+which costs the network rather than whoever pinned it. To run a peer, use
+`packages.freenet-node` (the flake default). [`docs/nix.md`](docs/nix.md) has the
+full picture, including the store-path drift you accept by running the
+self-updating output and what this build does *not* tell you about the published
+release binaries.
 
 ## Quality Standards
 

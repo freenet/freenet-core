@@ -2823,12 +2823,18 @@ mod tests {
         // the systemd directives it mirrors in its own header comments, so a
         // bare `contains` would be satisfied by prose describing a marker the
         // script no longer sets.
-        let has_statement = |src: &str, needle: &str| {
-            src.lines().any(|line| {
-                let trimmed = line.trim();
-                !trimmed.starts_with('#') && trimmed.contains(needle)
-            })
-        };
+        //
+        // The needle must survive stripping the line's comment. A
+        // `!trimmed.starts_with('#')` test rejected only a FULL-LINE comment
+        // and passed vacuously for a trailing one: `child=0  # export
+        // FREENET_SUPERVISED=1` satisfied it while the script exported nothing.
+        // Verified by performing that edit, per the "test the pin by performing
+        // the edit" rule in .claude/rules/bug-prevention-patterns.md. Splitting
+        // on the first `#` is sound for these files: no line carrying one of
+        // these needles has a `#` before it.
+        let code_of = |line: &str| line.split('#').next().unwrap_or("");
+        let has_statement =
+            |src: &str, needle: &str| src.lines().any(|line| code_of(line).contains(needle));
 
         let nix_src = read_repo_file("nix/freenet-node.sh");
         let supervised_export = format!(
@@ -2866,6 +2872,59 @@ mod tests {
             node_nix.contains("./freenet-node.sh"),
             "nix/node.nix must build the supervisor from ./freenet-node.sh, or the \
              pins above guard a script the `freenet-node` package never runs (#4580)"
+        );
+        // ...and the flake must make that supervised output the DEFAULT.
+        // Changing `default` to the bare `freenet` leaves every other test in
+        // the tree green while silently turning `nix run
+        // github:freenet/freenet-core` -- the headline command in docs/nix.md --
+        // into a peer that never updates itself.
+        let flake_nix = read_repo_file("flake.nix");
+        assert!(
+            has_statement(&flake_nix, "default = freenet-node;"),
+            "flake.nix must set `packages.default = freenet-node`, so the documented \
+             `nix run github:freenet/freenet-core` gets the supervised, self-updating node \
+             instead of a peer pinned forever to the flake's version"
+        );
+
+        // A source scrape cannot see a statement wrapped in `if false; then ...
+        // fi`, and should not pretend to: what catches that is EXECUTION. So
+        // pin the executable guard as well -- that it exists, that it asserts
+        // the property these text markers only stand in for, and that CI runs
+        // it. Without this, deleting the behavioural test silently downgrades
+        // every assertion above to "the text is still somewhere in the file".
+        let wrapper_test = read_repo_file("scripts/nix-node-wrapper_test.sh");
+        assert!(
+            wrapper_test.contains("self_of network") && wrapper_test.contains("self_of update"),
+            "scripts/nix-node-wrapper_test.sh must assert WHICH binary `freenet network` and \
+             `freenet update` ran. Run either from the read-only /nix/store seed and \
+             `current_exe()` is un-renameable, every update fails with EROFS, and after \
+             MAX_UPDATE_FAILURES the node stops exiting 42 at all -- a silently and \
+             permanently stale peer, which is the whole failure this package exists to avoid"
+        );
+        let ci_yml = read_repo_file(".github/workflows/ci.yml");
+        assert!(
+            ci_yml.contains("bash scripts/nix-node-wrapper_test.sh"),
+            "CI must run scripts/nix-node-wrapper_test.sh, or the Nix supervisor's only \
+             behavioural guard never executes and these source scrapes are all that is left"
+        );
+
+        // The documented unit must RESTART a wrapper that stood down. The
+        // wrapper exits 0 both for a clean shutdown and for exit 43 ("another
+        // instance already holds the port"), and the #3967 stale-orphan
+        // pre-flight is deliberately NOT ported (a KNOWN DIVERGENCE recorded in
+        // the wrapper header). Under `Restart = "on-failure"` a peer blocked by
+        // a stale orphan is therefore dead forever with nothing to revive it.
+        let nix_docs = read_repo_file("docs/nix.md");
+        assert!(
+            nix_docs.contains("Restart = \"always\";"),
+            "the docs/nix.md example unit must use `Restart = \"always\"`, so a wrapper that \
+             stood down is retried rather than left dead (the wrapper's exit 0 does not mean \
+             the peer is healthy)"
+        );
+        assert!(
+            !nix_docs.contains("Restart = \"on-failure\""),
+            "docs/nix.md must not offer `Restart = \"on-failure\"` for freenet-node: it \
+             restarts only on a non-zero exit, and the peer-is-stood-down case exits 0"
         );
     }
 

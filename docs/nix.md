@@ -14,13 +14,20 @@ output is a node that keeps itself current.
 
 | Output | Auto-updates | Use it for |
 |---|---|---|
-| `packages.freenet-node` (also `packages.default`) | **Yes** | Running a peer on the Freenet network. |
-| `packages.freenet` | No | Development, CI, and deployments where you want `nixos-rebuild` to decide which version runs. |
+| `packages.freenet-node` (also `packages.default`) | **Yes** | Running a peer on the Freenet network. The only supported way to do that. |
+| `packages.freenet` | No | **Building and development only** — the bare compiler output, for CI, `nix develop`, and packaging. |
+
+**`packages.freenet` is not a supported way to run a peer.** It is just the
+binary: nothing seeds it into a writable location and nothing restarts it, so a
+peer started from it never updates itself. It will fall behind — Freenet ships
+several releases on a busy day — and a peer far enough behind first becomes a
+drag on the network and then stops working against it. If you are running a
+peer, run `packages.freenet-node`.
 
 ```bash
 nix run github:freenet/freenet-core            # the supervised, self-updating node
 nix run github:freenet/freenet-core -- --config-dir /srv/freenet   # arguments are forwarded
-nix build github:freenet/freenet-core#freenet  # just the binary, result/bin/freenet
+nix build github:freenet/freenet-core#freenet  # build only: the bare binary at result/bin/freenet
 nix develop                                    # dev shell: pinned toolchain, nextest, shellcheck, ...
 ```
 
@@ -45,8 +52,17 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/freenet/bin/freenet   # otherwise
 
 and from then on the node owns that file and updates it exactly as it does on
 every other platform — same signature verification, same rollback snapshot, same
-crash probation, same known-bad pinning. The wrapper never overwrites an
-existing binary.
+crash probation, same known-bad pinning.
+
+The wrapper never overwrites a *working* state binary with the store's — that
+would silently pin the node to the flake's version, the exact failure this
+design exists to avoid. It does replace one in three narrow cases, each of them
+a peer that would otherwise be stuck forever: a partially-written seed left by
+an interrupted first copy, a symlink (which the in-place updater cannot rename
+over), and a store binary that is **strictly newer**, which is the only
+unattended way out of a state binary that has stopped updating itself — a
+`-dirty` build never auto-updates at all, and one that has hit the
+auto-update failure lockout has given up.
 
 The supervisor itself (`nix/freenet-node.sh`) is a faithful port of the systemd
 unit the node generates for itself (`generate_user_service_file`,
@@ -69,14 +85,20 @@ generation was built from; `freenet --version` on the state-dir binary will name
 whatever the node has updated itself to. That is not a bug to be fixed later — it
 is the price of a peer that stays current, and it is why the two outputs exist.
 
-If that divergence is unacceptable for your deployment — because you reproduce
-hosts from a pinned flake, or because an auditor needs the running artifact to be
-the one the closure describes — use `packages.freenet` and pass
-`--disable-auto-update` on the node's command line. That flag exists for exactly
-this case (#4690): a clean build that deliberately runs a version other than the
-latest release would otherwise detect the newer release, exit 42 to request an
-update, and be restarted onto the same version indefinitely. You then own keeping
-the pin current, and the network is relying on you to do it.
+That divergence is the deal, and **there is no supported configuration in which
+a peer stays pinned to its store path.** If you need the running artifact to be
+exactly the one your closure describes — because you reproduce hosts from a
+pinned flake, or an auditor needs the closure to describe what runs — then what
+you need is not a pinned peer, it is to not run a peer on that host. A pinned
+peer silently falls behind every release until it stops working, which is a cost
+paid by the whole network rather than by whoever pinned it.
+
+`--disable-auto-update` is **a development flag, not a deployment option.** It
+exists (#4690) for a node deliberately running a build that is AHEAD of the
+latest release, such as a from-source test node: without it that node detects
+the newer published release, exits 42 to request an update, and is restarted
+onto the same version indefinitely. Do not reach for it to hold a peer on a
+pinned version; this page deliberately does not describe a way to do that.
 
 To go back to a self-updating node after seeding one by hand, delete the
 state-dir binary and let `freenet-node` re-seed it.
@@ -91,8 +113,15 @@ there until a release catches up — and if you seeded it from a commit that is
 For a peer you intend to leave running, seed from a release tag:
 
 ```bash
-nix run github:freenet/freenet-core/v0.2.135
+# A real release tag at or after the first one containing this flake.
+nix run github:freenet/freenet-core/vX.Y.Z
 ```
+
+Check the tag actually has it (`nix flake show github:freenet/freenet-core/vX.Y.Z`
+should list `freenet-node`). An OLDER tag has no `freenet-node` output at all,
+and the `freenet-autoupdate` output it replaced was a different implementation
+with no release-signature check and no rollback — so following a tag from before
+this landed silently gets you a worse updater, not an older copy of this one.
 
 After the first update the tag stops mattering: the state-dir binary is a real
 release, and the node tracks releases from then on.
@@ -103,7 +132,7 @@ release, and the node tracks releases from then on.
 codes internally, so the surrounding unit should be plain:
 
 ```nix
-systemd.services.freenet = {
+systemd.services.freenet-node = {
   wantedBy = [ "multi-user.target" ];
   after = [ "network-online.target" ];
   wants = [ "network-online.target" ];
@@ -118,7 +147,13 @@ systemd.services.freenet = {
     Group = "freenet";
     # /var/lib/freenet. The wrapper seeds the binary under $STATE_DIRECTORY/bin.
     StateDirectory = "freenet";
-    Restart = "on-failure";
+    # Load-bearing, not a default: the wrapper exits 0 for a stood-down peer
+    # as well as for a clean shutdown — notably on exit 43, "another instance
+    # already holds the port", where the holder may be a stale orphan (see the
+    # #3967 KNOWN DIVERGENCE in nix/freenet-node.sh). Restarting only on
+    # failure leaves such a peer dead forever with nothing to revive it. A real
+    # `systemctl stop` still stops, because systemd knows it issued the stop.
+    Restart = "always";
     RestartSec = 30;
   };
 };
@@ -132,7 +167,15 @@ Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and
 `freenet-node` already absorbs those codes — it exits 0 for both, and for a
 crash loop it exits 1 after five failures in two minutes, which is the case
-`Restart=on-failure` is there to back-stop.
+`Restart` is there to back-stop.
+
+**Do not name the unit `freenet`.** `freenet update` probes
+`/etc/systemd/system/freenet.service` and `~/.config/systemd/user/freenet.service`
+and rewrites the unit when it has drifted from the template the node generates
+for itself (`ensure_service_file_updated`, `crates/core/src/bin/commands/update.rs`).
+On NixOS that path is a symlink into the read-only store holding a unit Nix
+owns, so every update would try — and fail — to rewrite it. Any name other than
+`freenet` avoids the probe entirely.
 
 ## What this does NOT give you
 
@@ -191,6 +234,21 @@ path-filtered to the nix files and is **not a required check** — see the note 
 the workflow for why, and for who is expected to watch it.
 
 `scripts/nix-node-wrapper_test.sh` drives `nix/freenet-node.sh` against a fake
-`freenet` and asserts the exit-code contract in both directions (update runs on
-42 and on a crash; does **not** run on 0, 43, or a signal-shaped status). It runs
-in the main CI job, needs no Nix, and takes about a second.
+`freenet` and asserts, by execution:
+
+* the exit-code contract in both directions — `freenet update` runs on 42, on a
+  crash, and on a signal aimed at the node alone; it does **not** run on 0 or 43;
+* **which binary each invocation ran.** The fake logs `$0`, and both
+  `freenet network` and `freenet update` must come from the state directory.
+  Run either from the store seed and `current_exe()` is read-only, every update
+  fails with EROFS, and after three failures the node stops asking to be
+  updated at all — permanent silent staleness, and the cheapest possible
+  regression to introduce;
+* that the seed is a regular file, byte-identical to the store binary, and
+  written atomically, so an interrupted first copy cannot brick the peer;
+* the re-seed rules (strictly-newer only, never backwards, never on an
+  unparseable version);
+* the growing, capped, jittered restart backoff, the bounded updater, and that
+  a SIGTERM to the wrapper is honoured mid-pause.
+
+It runs in the main CI job, needs no Nix, and takes about five seconds.
