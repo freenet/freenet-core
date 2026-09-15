@@ -2796,6 +2796,77 @@ mod tests {
             "both systemd unit templates must set Environment=FREENET_SUPERVISED=1 \
              (#4580); found {marker_count}"
         );
+
+        // The Nix supervisor (`nix/freenet-node.sh`, run by the `freenet-node`
+        // package). It is a Freenet supervisor exactly as the systemd units and
+        // the launchd wrapper are, so it owes the same marker.
+        //
+        // Read with `std::fs` rather than `include_str!`: the file lives ABOVE
+        // `crates/core`, so an `include_str!` would be a compile-time dependency
+        // on a path outside the crate and would break a packaged build of it.
+        // A missing file PANICS here rather than skipping -- a pin that
+        // disappears with its subject is worse than no pin.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read_repo_file = |rel: &str| -> String {
+            let path = repo_root.join(rel);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "could not read {} ({e}). The Nix supervisor is pinned here for \
+                     the same reason as the systemd and launchd ones (#4580); if it \
+                     moved, update this test rather than removing it.",
+                    path.display()
+                )
+            })
+        };
+
+        // STATEMENT POSITION, not mere presence. `nix/freenet-node.sh` documents
+        // the systemd directives it mirrors in its own header comments, so a
+        // bare `contains` would be satisfied by prose describing a marker the
+        // script no longer sets.
+        let has_statement = |src: &str, needle: &str| {
+            src.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with('#') && trimmed.contains(needle)
+            })
+        };
+
+        let nix_src = read_repo_file("nix/freenet-node.sh");
+        let supervised_export = format!(
+            "export {}=1",
+            super::commands::auto_update::SUPERVISED_ENV_VAR
+        );
+        assert!(
+            has_statement(&nix_src, &supervised_export),
+            "the Nix supervisor must `{supervised_export}` on the node it runs, so the \
+             node detects its supervisor instead of erroring on the exit-42 path (#4580)"
+        );
+        // The marker is a CLAIM that something applies the update. These two
+        // pin that the claim is true: the script must actually invoke the
+        // updater, and must forward the node's status so crash-loop rollback
+        // can classify it (#4073).
+        assert!(
+            has_statement(&nix_src, "update --quiet"),
+            "the Nix supervisor sets the supervised marker, so it must actually run \
+             `freenet update --quiet` on a non-graceful exit (#4580/#4073)"
+        );
+        assert!(
+            has_statement(
+                &nix_src,
+                super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+            ),
+            "the Nix supervisor must forward the node's exit status via {} so \
+             crash-loop auto-rollback can tell a post-stop restart from a manual \
+             update (#4073)",
+            super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+        );
+        // ...and the flake must actually build that script, or the assertions
+        // above guard a file nothing runs.
+        let node_nix = read_repo_file("nix/node.nix");
+        assert!(
+            node_nix.contains("./freenet-node.sh"),
+            "nix/node.nix must build the supervisor from ./freenet-node.sh, or the \
+             pins above guard a script the `freenet-node` package never runs (#4580)"
+        );
     }
 
     /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on
