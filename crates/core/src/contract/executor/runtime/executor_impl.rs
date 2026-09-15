@@ -132,14 +132,30 @@ where
             _ => {
                 // WARN, not debug: a row that fails this check means the node was
                 // holding parameters it cannot vouch for, which an operator should
-                // be able to see in a release build.
-                tracing::warn!(
-                    contract = %key,
-                    code_hash = %encoded_code_hash,
-                    params_len = params.as_ref().len(),
-                    "Stored contract parameters do not derive this contract's instance id; \
-                     ignoring them until a verified container replaces them"
-                );
+                // be able to see in a release build. Once per contract per process,
+                // because the refusal repeats on every read (summaries run on each
+                // interest heartbeat). Bounded; past the bound it keeps warning
+                // rather than going quiet.
+                const REPORTED_CAP: usize = 4096;
+                static REPORTED: std::sync::LazyLock<dashmap::DashSet<ContractInstanceId>> =
+                    std::sync::LazyLock::new(dashmap::DashSet::new);
+                let first_report =
+                    REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
+                if first_report {
+                    tracing::warn!(
+                        contract = %key,
+                        code_hash = %encoded_code_hash,
+                        params_len = params.as_ref().len(),
+                        "Stored parameters for this contract do not derive its instance id, \
+                         so this node will not run or serve it. Re-PUT the contract (for \
+                         example `fdev publish` of the same contract) to repair them"
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        "Stored contract parameters still do not derive the instance id"
+                    );
+                }
                 Ok(None)
             }
         }
