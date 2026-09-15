@@ -145,8 +145,7 @@ pub(crate) enum LabelMode {
 /// [`LabelMode::Current`]). A kill switch for the soak: it restores the
 /// pre-#5657 router inputs without a rebuild.
 pub(crate) fn label_mode() -> LabelMode {
-    // Thread-local test override, for the same reason as the router's
-    // `residual_correction_enabled`: a process-global OnceLock is resolved by
+    // Thread-local test override: a process-global OnceLock is resolved by
     // whichever test touches it first, which would make one branch untestable
     // and let tests interfere under plain `cargo test`.
     #[cfg(test)]

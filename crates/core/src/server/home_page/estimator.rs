@@ -30,6 +30,19 @@ pub fn failure_chart_y_max(curve_points: &[(f64, f64)], peer_adjustment: Option<
     (2.0 * right_edge).min(1.0)
 }
 
+/// This peer's line on an estimator chart.
+#[derive(Debug, Clone, Copy)]
+pub enum PeerLine<'a> {
+    /// No per-peer line.
+    None,
+    /// The isotonic per-peer EWMA adjustment, applied to the chart's curve the
+    /// way the router applies it (`AdjustmentMode`). What routing uses for a
+    /// timing stage the hierarchical estimator cannot estimate yet.
+    Adjustment(f64, AdjustmentMode),
+    /// An explicit curve: the hierarchical estimator's estimate for this peer.
+    Curve(&'a [(f64, f64)]),
+}
+
 /// Render the named estimator chart, or — when no data has been observed
 /// yet — a titled placeholder. The placeholder keeps the slot visible so
 /// users can always see every component of a routing prediction even when
@@ -43,8 +56,7 @@ pub fn build_estimator_chart_or_placeholder(
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
-    peer_adjustment: Option<f64>,
-    adjustment_mode: AdjustmentMode,
+    peer_line: PeerLine<'_>,
     peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
@@ -62,8 +74,7 @@ pub fn build_estimator_chart_or_placeholder(
         curve_points,
         scatter_points,
         data_range,
-        peer_adjustment,
-        adjustment_mode,
+        peer_line,
         peer_location,
         y_min_hint,
         y_max_hint,
@@ -80,8 +91,7 @@ pub fn build_estimator_chart(
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
-    peer_adjustment: Option<f64>,
-    adjustment_mode: AdjustmentMode,
+    peer_line: PeerLine<'_>,
     peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
@@ -127,12 +137,23 @@ pub fn build_estimator_chart(
             }
         }
 
-        // Include peer-adjusted values in range if present
-        if let Some(adj) = peer_adjustment {
-            for (_, y) in curve_points {
-                let adjusted = adjustment_mode.apply(*y, adj);
-                y_min = y_min.min(adjusted);
-                y_max = y_max.max(adjusted);
+        // Include this peer's line in the range.
+        match peer_line {
+            PeerLine::None => {}
+            PeerLine::Adjustment(adj, mode) => {
+                for (_, y) in curve_points {
+                    let adjusted = mode.apply(*y, adj);
+                    y_min = y_min.min(adjusted);
+                    y_max = y_max.max(adjusted);
+                }
+            }
+            PeerLine::Curve(points) => {
+                for (_, y) in points {
+                    if y.is_finite() {
+                        y_min = y_min.min(*y);
+                        y_max = y_max.max(*y);
+                    }
+                }
             }
         }
 
@@ -275,6 +296,13 @@ pub fn build_estimator_chart(
         .ok();
     }
 
+    // The mode `draw_curve` applies an adjustment in. An explicit curve is drawn
+    // with a zero adjustment, which is neutral in either mode.
+    let adjustment_mode = match peer_line {
+        PeerLine::Adjustment(_, mode) => mode,
+        PeerLine::None | PeerLine::Curve(_) => AdjustmentMode::Additive,
+    };
+
     // Helper: draw a curve with solid line in data range and dashed outside.
     // `points` are (x, y) pairs; `adj` is the peer adjustment, combined with each
     // y via `adjustment_mode.apply` (an additive offset or a multiplicative factor
@@ -397,8 +425,10 @@ pub fn build_estimator_chart(
 
     // Peer-adjusted curve (violet — deliberately off the teal/green family so it
     // is not confused with the teal global curve)
-    if let Some(adj) = peer_adjustment {
-        draw_curve(&mut svg, curve_points, adj, "#8b5cf6");
+    match peer_line {
+        PeerLine::None => {}
+        PeerLine::Adjustment(adj, _) => draw_curve(&mut svg, curve_points, adj, "#8b5cf6"),
+        PeerLine::Curve(points) => draw_curve(&mut svg, points, 0.0, "#8b5cf6"),
     }
 
     // Peer location marker (vertical dashed line)
@@ -457,12 +487,12 @@ pub enum RegKind {
     Speed,
 }
 
-/// Build the renegade prediction-accuracy panel: one reliability diagram for the
-/// binary failure model plus predicted-vs-actual scatters for the two regression
-/// models (response time, transfer speed). Returns an empty string when no model
-/// has scored any predictions yet, so a fresh node shows nothing rather than an
-/// empty card.
-pub fn build_renegade_accuracy_panel(
+/// Build the prediction-accuracy panel for the estimates routing acts on: one
+/// reliability diagram for the failure forecast plus predicted-vs-actual
+/// scatters for response time and transfer speed, all from the hierarchical
+/// estimator's recent forecasts. Returns an empty string when nothing has been
+/// scored yet, so a fresh node shows nothing rather than an empty card.
+pub fn build_accuracy_panel(
     failure_pairs: &[(f64, f64)],
     response_time_pairs: &[(f64, f64)],
     transfer_speed_pairs: &[(f64, f64)],
@@ -480,9 +510,9 @@ pub fn build_renegade_accuracy_panel(
         r#"<div class="card">
         <h2>Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            How well the Renegade layer's recent predictions matched reality, in isolation —
-            for how each layer contributes to the estimate the router actually uses, see
-            "Which layer is doing the work?" above. On the dashed diagonal predictions are
+            How well the router's recent estimates matched what happened. Each point is a
+            forecast the hierarchical estimator made before the outcome was known &mdash; the
+            value routing acts on once that stage has a curve. On the dashed diagonal predictions are
             perfect: for failure, predicted probability equals the observed failure rate
             (calibration); for the timing models, predicted equals actual. A calibration
             curve that collapses to the two far corners is a model that only ever says
@@ -915,10 +945,10 @@ mod tests {
         let svg = build_estimator_chart(
             "Failure Probability",
             &curve,
-            &[],           // no scatter
-            (0.0, 0.5),    // entire range is data (solid line)
-            Some(-1000.0), // strongly-negative peer adjustment
-            AdjustmentMode::Additive,
+            &[],        // no scatter
+            (0.0, 0.5), // entire range is data (solid line)
+            // strongly-negative peer adjustment
+            PeerLine::Adjustment(-1000.0, AdjustmentMode::Additive),
             None,
             "0.0", // y floor
             "auto",
@@ -948,8 +978,8 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            Some(-1000.0), // log-ratio: exp(-1000) ≈ 0
-            AdjustmentMode::Multiplicative,
+            // log-ratio: exp(-1000) ≈ 0
+            PeerLine::Adjustment(-1000.0, AdjustmentMode::Multiplicative),
             None,
             "0", // y floor as used for the response-time chart
             "auto",
@@ -976,8 +1006,8 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            Some(std::f64::consts::LN_2), // factor exp(ln 2) = 2.0
-            AdjustmentMode::Multiplicative,
+            // factor exp(ln 2) = 2.0
+            PeerLine::Adjustment(std::f64::consts::LN_2, AdjustmentMode::Multiplicative),
             None,
             "0",
             "auto",

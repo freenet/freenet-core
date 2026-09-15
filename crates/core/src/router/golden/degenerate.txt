@@ -1,0 +1,16 @@
+# Decisions the soaked build (origin/main d9fa29522, FREENET_ROUTING_HIERARCHICAL=1)
+# made OUTSIDE the cold window with a candidate whose isotonic transfer-speed
+# estimate was zero, so its transfer cost was the f64::MAX/2 sentinel. This build
+# floors that estimate, so these decisions legitimately differ; golden_replay
+# skips them. Derived from the soaked build's decision trace. Format: <scenario> <decision>
+production_like 440
+production_like 464
+production_like 472
+production_like 488
+production_like 520
+production_like 528
+production_like 544
+production_like 552
+production_like 560
+production_like 568
+production_like 576
