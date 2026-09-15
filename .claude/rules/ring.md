@@ -200,18 +200,24 @@ WHEN routing fails (no peers):
 ```
 Two prediction stacks exist in router.rs; exactly one reaches routing.
 
-  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
-    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
-    the residual correction in place of the blend.
-  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
-    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
-    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
-    over BOTH legacy variants for every stage it can estimate (a cold stage
-    falls back to legacy). Computed at all only when that flag is on or
-    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
+  HIERARCHICAL (default; router/hierarchical.rs): EB-shrunk isotonic prior,
+    root > peer > (peer, band) empirical-Bayes hierarchy, horizon chosen
+    online. Takes precedence over BOTH legacy variants for every stage it can
+    estimate (a cold stage falls back to legacy). FREENET_ROUTING_HIERARCHICAL=0
+    (false/no/off) is the per-node kill switch; on such a node it is computed
+    at all only while FREENET_ROUTING_DATASET is recording.
+  LEGACY (only with FREENET_ROUTING_HIERARCHICAL=0, and as the cold-stage
+    fallback): isotonic curve + per-peer EWMA + fixed-weight Renegade blend
+    (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1 the
+    residual correction in place of the blend.
 
 WHEN touching either stack:
-  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
+  → Flags parse fail-safe, and the safe direction is the flag's DEFAULT:
+    default-off flags (parse_routing_flag, e.g. RESIDUAL_CORRECTION) enable
+    only on 1/true/yes/on; the default-on HIERARCHICAL flag
+    (parse_default_on_routing_flag) disables only on 0/false/no/off, and any
+    other value keeps it on with a warn!. The resolved mode is logged once
+    at info! ("hierarchical routing estimator: ...")
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected

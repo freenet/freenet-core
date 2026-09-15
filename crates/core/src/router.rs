@@ -1268,10 +1268,11 @@ pub(crate) struct Router {
     /// Hierarchical empirical-Bayes estimator for all three stages (#4485),
     /// the intended replacement for the legacy stack.
     ///
-    /// Fed and scored only when it can matter: when it reaches routing
-    /// (`FREENET_ROUTING_HIERARCHICAL`) or when the routing dataset is recorded
-    /// (see [`hierarchical_computed`]). Otherwise every node would pay its
-    /// learning cost for a measurement nobody reads.
+    /// Fed and scored only when it can matter: when it reaches routing (the
+    /// default; `FREENET_ROUTING_HIERARCHICAL=0` turns it off) or when the
+    /// routing dataset is recorded (see [`hierarchical_computed`]). A node that
+    /// turned it off does not pay its learning cost for a measurement nobody
+    /// reads.
     #[serde(skip)]
     hierarchical: hierarchical::HierarchicalRouting,
     /// The clock the hierarchical estimator's forgetting horizons run on.
@@ -1420,19 +1421,24 @@ struct PredictionClock {
 
 /// Whether the hierarchical estimator is computed at all for this event.
 ///
-/// Only when its output is used: in routing, or recorded into a dataset that
-/// is still RECORDING. A recorder that stopped (byte cap, write error) must not
-/// keep the estimator learning under the router's write lock for the rest of
-/// the process's life, recording nothing.
+/// Whenever its output is used: in routing (the default), or recorded into a
+/// dataset that is still RECORDING. With routing on it is always computed,
+/// because it routes. Only on a node that turned it off with
+/// `FREENET_ROUTING_HIERARCHICAL=0` does the recorder decide, and a recorder
+/// that stopped (byte cap, write error) must not keep the estimator learning
+/// under the router's write lock for the rest of the process's life, recording
+/// nothing.
 fn hierarchical_computed(dataset: Option<&dataset::RoutingDataset>) -> bool {
     hierarchical_routing_enabled() || dataset.is_some_and(|dataset| dataset.is_recording())
 }
 
-/// Parse a `FREENET_ROUTING_*` boolean switch, failing safe.
+/// Parse a default-OFF `FREENET_ROUTING_*` boolean switch, failing safe.
 ///
 /// Only an explicit affirmative turns a switch on. Anything else — unset,
 /// empty, a typo, `0`, `off` — leaves it off, because every switch parsed here
 /// changes live routing and a misspelt value must not do that silently.
+///
+/// Default-ON switches use [`parse_default_on_routing_flag`] instead.
 fn parse_routing_flag(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         let value = value.trim().to_ascii_lowercase();
@@ -1440,14 +1446,57 @@ fn parse_routing_flag(value: Option<&str>) -> bool {
     })
 }
 
+/// How a default-ON `FREENET_ROUTING_*` switch resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultOnFlag {
+    /// Unset or empty: the shipping default.
+    Default,
+    /// An explicit affirmative (`1`, `true`, `yes`, `on`).
+    Enabled,
+    /// An explicit negative (`0`, `false`, `no`, `off`).
+    Disabled,
+    /// Anything else. Treated as the default, and worth a warning.
+    Unrecognised,
+}
+
+impl DefaultOnFlag {
+    fn enabled(self) -> bool {
+        !matches!(self, DefaultOnFlag::Disabled)
+    }
+}
+
+/// Parse a default-ON `FREENET_ROUTING_*` switch, failing safe.
+///
+/// The mirror of [`parse_routing_flag`]: here the shipping default is ON, so
+/// only an explicit negative turns the switch off. A misspelt value must not
+/// silently move live routing away from the default any more than it may move
+/// it towards a non-default, so an unrecognised value keeps the default and is
+/// reported as [`DefaultOnFlag::Unrecognised`] for the caller to warn about.
+fn parse_default_on_routing_flag(value: Option<&str>) -> DefaultOnFlag {
+    let Some(value) = value else {
+        return DefaultOnFlag::Default;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => DefaultOnFlag::Default,
+        "1" | "true" | "yes" | "on" => DefaultOnFlag::Enabled,
+        "0" | "false" | "no" | "off" => DefaultOnFlag::Disabled,
+        _ => DefaultOnFlag::Unrecognised,
+    }
+}
+
 /// Whether the hierarchical estimator (#4485) replaces the legacy estimates in
 /// live routing.
 ///
-/// Default **off**. With it off the estimator is computed and scored only while
-/// the routing dataset is recording (see [`hierarchical_computed`]), which is
-/// how a soak gathers the evidence for promoting it without routing changing.
-/// When on, it takes precedence over the residual correction for every stage it
-/// can estimate.
+/// Default **on**. It takes precedence over the legacy blend and the residual
+/// correction for every stage it can estimate (a cold stage falls back to
+/// legacy). The kill switch is `FREENET_ROUTING_HIERARCHICAL=0` (or `false`,
+/// `no`, `off`); with it off the estimator is computed and scored only while
+/// the routing dataset is recording (see [`hierarchical_computed`]).
+///
+/// Because the shipping default is on, a misspelt value keeps it on and logs a
+/// warning rather than silently changing live routing away from the default.
+/// The resolved mode is logged once at `info!`, so an operator can tell from a
+/// release build's log which estimator a node routes with.
 fn hierarchical_routing_enabled() -> bool {
     // Same test-override shape, and for the same reason, as
     // `residual_correction_enabled`.
@@ -1461,11 +1510,30 @@ fn hierarchical_routing_enabled() -> bool {
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        parse_routing_flag(
-            std::env::var("FREENET_ROUTING_HIERARCHICAL")
-                .ok()
-                .as_deref(),
-        )
+        let raw = std::env::var("FREENET_ROUTING_HIERARCHICAL").ok();
+        let flag = parse_default_on_routing_flag(raw.as_deref());
+        // INFO, not debug: release builds compile out everything below INFO
+        // (`release_max_level_info`), and this line is how an operator tells
+        // which estimator a gateway routes with.
+        match flag {
+            DefaultOnFlag::Default => {
+                tracing::info!("hierarchical routing estimator: enabled (default)")
+            }
+            DefaultOnFlag::Enabled => tracing::info!(
+                "hierarchical routing estimator: enabled via FREENET_ROUTING_HIERARCHICAL"
+            ),
+            DefaultOnFlag::Disabled => tracing::info!(
+                value = raw.as_deref().unwrap_or_default(),
+                "hierarchical routing estimator: disabled via FREENET_ROUTING_HIERARCHICAL"
+            ),
+            DefaultOnFlag::Unrecognised => tracing::warn!(
+                value = raw.as_deref().unwrap_or_default(),
+                "FREENET_ROUTING_HIERARCHICAL has an unrecognised value; keeping the \
+                 default (hierarchical routing estimator enabled). Use 0/false/no/off \
+                 to disable it"
+            ),
+        }
+        flag.enabled()
     })
 }
 
@@ -4508,6 +4576,9 @@ mod tests {
     /// the test fails with instructions when it changes.
     #[test]
     fn enabled_correction_changes_the_estimate_the_router_acts_on() {
+        // The residual correction only reaches routing on the legacy stack; the
+        // (default-on) hierarchical estimator takes precedence over it.
+        let _legacy = force_hierarchical_routing(false);
         let _guard = crate::config::GlobalRng::seed_guard(39);
         // FNV-1a over the bits of every location the scenario draws. Fixed
         // arithmetic, so the recorded value cannot drift with the Rust version
@@ -4625,6 +4696,9 @@ mod tests {
     /// legacy blend produces and nothing about the correction leaks into it.
     #[test]
     fn disabled_correction_leaves_the_legacy_estimate_untouched() {
+        // About the legacy blend, so pin the legacy stack: under the default-on
+        // hierarchical estimator this would pass without exercising the blend.
+        let _legacy = force_hierarchical_routing(false);
         let mut router = Router::new(&[]);
         add_relay_recorded_successes(&mut router, 300);
         let peer = PeerKeyLocation::random();
@@ -4649,8 +4723,10 @@ mod tests {
         }
     }
 
-    /// The hierarchical switch fails safe: only an explicit affirmative turns
-    /// on something that changes live routing.
+    /// A default-off switch (`FREENET_ROUTING_RESIDUAL_CORRECTION`) fails safe:
+    /// only an explicit affirmative turns on something that changes live
+    /// routing. Pinned separately from the default-on parser below so flipping
+    /// the hierarchical default cannot flip this one with it.
     #[test]
     fn routing_flags_parse_fail_safe() {
         for on in ["1", "true", "TRUE", " yes ", "On"] {
@@ -4669,6 +4745,53 @@ mod tests {
         ] {
             assert!(!parse_routing_flag(off), "{off:?} must NOT enable");
         }
+    }
+
+    /// The hierarchical switch is default-ON, so its safe direction is the
+    /// default: only an explicit negative turns it off, and a typo keeps the
+    /// default (flagged `Unrecognised` so the caller warns) rather than
+    /// silently moving live routing back to the legacy stack.
+    #[test]
+    fn default_on_routing_flag_disables_only_on_explicit_negative() {
+        for default in [None, Some(""), Some("   ")] {
+            let flag = parse_default_on_routing_flag(default);
+            assert_eq!(flag, DefaultOnFlag::Default, "{default:?}");
+            assert!(flag.enabled(), "{default:?} must keep the default (on)");
+        }
+        for on in ["1", "true", "TRUE", " yes ", "On", "ON\n"] {
+            let flag = parse_default_on_routing_flag(Some(on));
+            assert_eq!(flag, DefaultOnFlag::Enabled, "{on:?}");
+            assert!(flag.enabled(), "{on:?} must enable");
+        }
+        for off in ["0", "false", "FALSE", " no ", "Off", "\toff\n"] {
+            let flag = parse_default_on_routing_flag(Some(off));
+            assert_eq!(flag, DefaultOnFlag::Disabled, "{off:?}");
+            assert!(!flag.enabled(), "{off:?} must disable");
+        }
+        for typo in ["flase", "ture", "disabled", "2", "-1", "nope"] {
+            let flag = parse_default_on_routing_flag(Some(typo));
+            assert_eq!(flag, DefaultOnFlag::Unrecognised, "{typo:?}");
+            assert!(
+                flag.enabled(),
+                "{typo:?} must keep the default (on), not disable"
+            );
+        }
+    }
+
+    /// With no test override, the resolved default is ON — and the residual
+    /// correction, parsed by the default-off parser, stays OFF. Reads the same
+    /// parse the `OnceLock`s run, on an unset variable, so it does not depend on
+    /// the test process's environment.
+    #[test]
+    fn hierarchical_defaults_on_and_residual_correction_defaults_off() {
+        assert!(
+            parse_default_on_routing_flag(None).enabled(),
+            "unset FREENET_ROUTING_HIERARCHICAL must enable the estimator"
+        );
+        assert!(
+            !parse_routing_flag(None),
+            "unset FREENET_ROUTING_RESIDUAL_CORRECTION must stay off"
+        );
     }
 
     /// Traffic that gives every stage a curve: timed successes, untimed
