@@ -515,7 +515,9 @@ pub(crate) trait RetryDriver {
 
     /// Called once per attempt, before its outcome is handled, with the peer
     /// the attempt was actually forwarded to (`None` when none was recorded).
-    /// Default: ignore.
+    /// Not called for an attempt that ends in a local infra retry (a callback
+    /// dropped on this node, retried on the same peer without spending the
+    /// retry budget): no verdict came from the peer. Default: ignore.
     fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 
     /// Peers the originator-loopback relay should not pick as this attempt's
@@ -525,6 +527,15 @@ pub(crate) trait RetryDriver {
     /// so relays further along may still route through them. Default: none.
     fn first_hop_exclusions(&self) -> Vec<std::net::SocketAddr> {
         Vec::new()
+    }
+
+    /// The peer the originator-loopback relay should use as this attempt's
+    /// first hop instead of its own ranking, handed over the same way as
+    /// [`Self::first_hop_exclusions`]. The relay honours it only while that
+    /// peer is still one of its routing candidates, and otherwise picks as
+    /// usual. Default: none.
+    fn first_hop_pin(&self) -> Option<std::net::SocketAddr> {
+        None
     }
 }
 
@@ -750,9 +761,11 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         // picks the real first hop may run before `send_and_await` returns.
         // Dropped at the end of this iteration on every path, so a `continue`
         // or `return` cannot leak it.
-        let hop_slot = op_manager
-            .attempt_hop_registry()
-            .register_excluding(attempt_tx, driver.first_hop_exclusions());
+        let hop_slot = op_manager.attempt_hop_registry().register_excluding(
+            attempt_tx,
+            driver.first_hop_exclusions(),
+            driver.first_hop_pin(),
+        );
         let attempt_started = tokio::time::Instant::now();
 
         let attempt_timeout = driver.attempt_timeout();
@@ -796,7 +809,14 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let attempt_resolved = tokio::time::Instant::now();
         let hop_record = hop_slot.hop_record();
         let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
-        driver.on_attempt_hop(attempt_hop.as_ref());
+        // A local callback drop within the infra-retry budget is retried on
+        // the same peer below. It got no verdict from that peer, so the driver
+        // does not count it as an attempt on it (#5660).
+        let infra_retry = matches!(round_trip, Ok(Err(OpError::NotificationError)))
+            && infra_retries < MAX_INFRA_RETRIES;
+        if !infra_retry {
+            driver.on_attempt_hop(attempt_hop.as_ref());
+        }
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -813,7 +833,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // for the budget analysis. Capped to avoid burning CPU in
             // a true shutdown (where the receiver is genuinely
             // dropped and will keep failing).
-            Ok(Err(OpError::NotificationError)) if infra_retries < MAX_INFRA_RETRIES => {
+            Ok(Err(OpError::NotificationError)) if infra_retry => {
                 infra_retries += 1;
                 tracing::debug!(
                     tx = %client_tx,
@@ -1916,10 +1936,17 @@ mod tests {
              to route the infra-retry path — bare `Ok(Err(err))` would lump it with \
              real wire errors and call advance()"
         );
+        // Scoped to the production body, so this assertion's own text cannot
+        // satisfy it.
+        let production = crate::operations::route_attempt::driver_test_support::production_fn_body(
+            src,
+            "pub(crate) async fn drive_retry_loop",
+        );
         assert!(
-            body.contains("if infra_retries < MAX_INFRA_RETRIES"),
-            "the NotificationError arm must be guarded by \
-             `if infra_retries < MAX_INFRA_RETRIES` so a true shutdown \
+            production.contains("&& infra_retries < MAX_INFRA_RETRIES;")
+                && production.contains("Ok(Err(OpError::NotificationError)) if infra_retry =>"),
+            "the NotificationError arm must be guarded by `infra_retry`, which \
+             requires `infra_retries < MAX_INFRA_RETRIES`, so a true shutdown \
              doesn't loop forever burning CPU"
         );
         // The infra-retry arm must `continue` (re-attempt same peer)

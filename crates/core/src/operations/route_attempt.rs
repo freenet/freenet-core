@@ -517,6 +517,10 @@ struct AttemptSlot {
     /// Peers the loopback relay must not pick as the attempt's first hop.
     /// Local to this node: never put in the forwarded request's visited bloom.
     first_hop_exclusions: Vec<std::net::SocketAddr>,
+    /// The peer the retry loop chose as the attempt's first hop, which the
+    /// loopback relay uses over its own ranking while that peer is still one
+    /// of its routing candidates.
+    first_hop_pin: Option<std::net::SocketAddr>,
 }
 
 impl AttemptHopRegistry {
@@ -526,21 +530,24 @@ impl AttemptHopRegistry {
 
     #[cfg(test)]
     pub(crate) fn register(self: &Arc<Self>, tx: Transaction) -> AttemptHopGuard {
-        self.register_excluding(tx, Vec::new())
+        self.register_excluding(tx, Vec::new(), None)
     }
 
     /// [`register`](Self::register), asking the loopback relay not to pick any
-    /// of `first_hop_exclusions` as this attempt's first hop.
+    /// of `first_hop_exclusions` as this attempt's first hop, and to use
+    /// `first_hop_pin` instead while that peer is one of its candidates.
     pub(crate) fn register_excluding(
         self: &Arc<Self>,
         tx: Transaction,
         first_hop_exclusions: Vec<std::net::SocketAddr>,
+        first_hop_pin: Option<std::net::SocketAddr>,
     ) -> AttemptHopGuard {
         self.slots.insert(
             tx,
             AttemptSlot {
                 hop: None,
                 first_hop_exclusions,
+                first_hop_pin,
             },
         );
         AttemptHopGuard {
@@ -557,6 +564,12 @@ impl AttemptHopRegistry {
             .get(tx)
             .map(|slot| slot.first_hop_exclusions.clone())
             .unwrap_or_default()
+    }
+
+    /// The peer the originator's retry loop chose as `tx`'s first hop, if
+    /// any. `None` when no attempt is registered for `tx`.
+    pub(crate) fn first_hop_pin(&self, tx: &Transaction) -> Option<std::net::SocketAddr> {
+        self.slots.get(tx).and_then(|slot| slot.first_hop_pin)
     }
 
     /// Called by the originator-loopback relay immediately before it dispatches

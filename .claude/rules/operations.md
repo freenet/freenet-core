@@ -117,11 +117,15 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     whole-path exclusion could cut a single-host contract off behind one
     flapping peer. If the exclusions leave no candidate, the relay ignores
     them. Once the driver's own guesses run out (rings of three peers or
-    fewer), `advance` falls back to a peer never asked, else re-asks a
-    connected peer that failed only once without answering NotFound; from
-    then on a peer given `FALLBACK_MAX_ASKS_PER_PEER` attempts is excluded
-    too. A peer that timed out once is never excluded, and the fallback
-    re-asks each peer at most once.
+    fewer), `advance` chooses each remaining attempt's first hop itself and
+    pins it for the loopback relay (`fallback_target`), so the router's
+    ranking cannot reorder the choice: first a connected peer that failed
+    once without answering NotFound, for its second attempt, then a peer
+    never asked. A peer given `FALLBACK_MAX_ASKS_PER_PEER` attempts is not
+    chosen again and is excluded from the relay's own pick, so after the
+    guesses run out the fallback re-asks each peer at most once. A local
+    infra retry (a callback dropped on this node) does not count as an
+    attempt on the peer.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,

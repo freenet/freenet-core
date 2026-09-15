@@ -453,6 +453,7 @@ async fn drive_client_get_inner(
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
         guesses_exhausted: false,
+        first_hop_pin: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -924,13 +925,20 @@ struct GetRetryDriver<'a> {
     /// falls back on these when its own `tried` guesses run out. An attempt
     /// counts even when the relay's local dispatch to the hop had not returned
     /// by the deadline: such a hop is not blamed (#5657), but the count bounds
-    /// how long the fallback keeps retrying, not what the peer did.
+    /// how long the fallback keeps retrying, not what the peer did. A local
+    /// infra retry (a callback dropped on this node) does not count.
     asked_hops: Vec<(SocketAddr, usize)>,
     /// Set by `advance` once its own guesses have run out, and never cleared.
-    /// From then on a hop given `FALLBACK_MAX_ASKS_PER_PEER` attempts is a
-    /// first-hop exclusion too (see `first_hop_exclusions`); a peer that
-    /// connects later is picked on its merits.
+    /// From then on `advance` chooses every attempt's first hop itself (see
+    /// `fallback_target`), a peer that connects later included, and a hop
+    /// given `FALLBACK_MAX_ASKS_PER_PEER` attempts is a first-hop exclusion
+    /// too (see `first_hop_exclusions`).
     guesses_exhausted: bool,
+    /// The first hop `advance` chose for the next attempt once the guesses ran
+    /// out, handed to the loopback relay through `AttemptHopRegistry`.
+    /// Cleared by every `advance`, so it applies to the attempt it was chosen
+    /// for, and to that attempt's local infra retries.
+    first_hop_pin: Option<SocketAddr>,
 }
 
 /// Terminal value for the GET driver.
@@ -1138,89 +1146,46 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn advance(&mut self) -> AdvanceOutcome {
-        match advance_to_next_peer(
+        // A pin is chosen for one attempt: the one this call sets up.
+        self.first_hop_pin = None;
+        let reason = match advance_to_next_peer(
             self.op_manager,
             &self.instance_id,
             &mut self.tried,
             &mut self.retries,
         ) {
-            Ok((next_target, _next_addr)) => {
+            Ok((next_target, _next_addr)) if !self.guesses_exhausted => {
                 self.current_target = next_target;
-                AdvanceOutcome::Next
+                return AdvanceOutcome::Next;
             }
-            Err(reason) => {
-                // `tried` holds this driver's own guesses, not the hops the
-                // loopback relay actually asked, and after a timeout the two
-                // diverge: the relay may re-ask the stalled peer while the
-                // guess moves on. So the guesses can run out while a ring peer
-                // was never asked, or while a peer that failed once could
-                // still answer. Guesses run out only once every ring peer was
-                // guessed, which within the retry budget means a ring of three
-                // peers or fewer. Rather than give up, spend the retry
-                // `advance_to_next_peer` already counted on one of those
-                // peers, below.
-                //
-                // From here on, a hop given `FALLBACK_MAX_ASKS_PER_PEER`
-                // attempts without answering NotFound is a first-hop exclusion
-                // too (see `first_hop_exclusions`), and only a hop given fewer
-                // is worth re-asking. So a peer that keeps stalling stops
-                // absorbing attempts, a holder that failed only once still
-                // gets its second chance, and this fallback re-asks each peer
-                // at most once. Excluded hops stay routable beyond the first
-                // hop.
-                if matches!(
-                    reason,
-                    crate::tracing::GetExhaustionReason::NoRoutingCandidates
-                ) {
-                    self.guesses_exhausted = true;
-                    // A ring peer never asked. `current_target` records the
-                    // choice, but the loopback relay picks the hop: with the
-                    // exclusions above its pick lands here, unless a closer
-                    // peer that failed only once gets its second chance first.
-                    let mut asked: Vec<SocketAddr> =
-                        self.asked_hops.iter().map(|(addr, _)| *addr).collect();
-                    asked.extend(self.op_manager.ring.connection_manager.get_own_addr());
-                    let unasked = self
-                        .op_manager
-                        .ring
-                        .k_closest_potentially_hosting(&self.instance_id, asked.as_slice(), 1)
-                        .into_iter()
-                        .next()
-                        .and_then(|peer| peer.socket_addr().map(|addr| (peer, addr)));
-                    if let Some((peer, addr)) = unasked {
-                        self.tried.push(addr);
-                        self.current_target = peer;
-                        return AdvanceOutcome::Next;
-                    }
-                    // Every ring peer was asked. Re-ask a still-connected one
-                    // that failed only once without answering NotFound (it
-                    // timed out, or its connection dropped): this keeps a
-                    // contract with a single holder reachable when that holder
-                    // timed out once and has since recovered. Again the relay
-                    // picks the hop, and once every ring peer was asked the
-                    // only peers the exclusions leave are such peers.
-                    let reaskable = self
-                        .asked_hops
-                        .iter()
-                        .filter(|(addr, asks)| {
-                            *asks < FALLBACK_MAX_ASKS_PER_PEER
-                                && !self.not_found_hops.contains(addr)
-                        })
-                        .find_map(|(addr, _)| {
-                            self.op_manager
-                                .ring
-                                .connection_manager
-                                .get_peer_by_addr(*addr)
-                        });
-                    if let Some(peer) = reaskable {
-                        self.current_target = peer;
-                        return AdvanceOutcome::Next;
-                    }
-                }
-                self.exhaustion_reason = Some(reason);
-                AdvanceOutcome::Exhausted
+            // A peer that connected after the guesses ran out is a never-asked
+            // peer like any other: `fallback_target` decides whether it gets
+            // this attempt.
+            Ok(_) => crate::tracing::GetExhaustionReason::NoRoutingCandidates,
+            Err(reason) => reason,
+        };
+        // `tried` holds this driver's own guesses, not the hops the loopback
+        // relay actually asked, and after a timeout the two diverge: the relay
+        // may re-ask the stalled peer while the guess moves on. So the guesses
+        // can run out while a ring peer was never asked, or while a peer that
+        // failed once could still answer. Guesses run out only once every ring
+        // peer was guessed, which within the retry budget means a ring of three
+        // peers or fewer. Rather than give up, spend the retry
+        // `advance_to_next_peer` already counted on one of those peers, chosen
+        // here and pinned rather than left to the relay's ranking.
+        if matches!(
+            reason,
+            crate::tracing::GetExhaustionReason::NoRoutingCandidates
+        ) {
+            self.guesses_exhausted = true;
+            if let Some((peer, addr)) = self.fallback_target() {
+                self.current_target = peer;
+                self.first_hop_pin = Some(addr);
+                return AdvanceOutcome::Next;
             }
         }
+        self.exhaustion_reason = Some(reason);
+        AdvanceOutcome::Exhausted
     }
 
     fn attempt_recorder(&mut self) -> Option<&mut RouteAttemptRecorder> {
@@ -1254,11 +1219,13 @@ impl RetryDriver for GetRetryDriver<'_> {
     // `current_target` included: on a non-empty ring the client's pick never
     // reaches the wire, so exempting it would only let the relay re-ask a
     // peer that already answered NotFound. Timed-out hops are not excluded
-    // until the driver's guesses have run out; from then on a hop given
-    // `FALLBACK_MAX_ASKS_PER_PEER` attempts is excluded too, so the relay's
-    // pick moves to a peer never asked or one that failed only once (see
-    // `advance`). Exclusions only ever apply to the loopback relay's first-hop
-    // pick, and it ignores them if they cover every candidate.
+    // until the driver's guesses have run out. From then on `advance` pins
+    // each attempt's first hop, and a hop given `FALLBACK_MAX_ASKS_PER_PEER`
+    // attempts is excluded too, so that if the pinned peer is no longer a
+    // candidate when the relay picks, the relay's own pick still avoids a peer
+    // that already had its attempts. Exclusions only ever apply to the
+    // loopback relay's first-hop pick, and it ignores them if they cover every
+    // candidate.
     fn first_hop_exclusions(&self) -> Vec<SocketAddr> {
         let mut exclusions = self.not_found_hops.clone();
         if self.guesses_exhausted {
@@ -1269,6 +1236,52 @@ impl RetryDriver for GetRetryDriver<'_> {
             }
         }
         exclusions
+    }
+
+    fn first_hop_pin(&self) -> Option<SocketAddr> {
+        self.first_hop_pin
+    }
+}
+
+impl GetRetryDriver<'_> {
+    /// The peer the next attempt goes to once this driver's own guesses have
+    /// run out (#5660), pinned for the loopback relay so the router's ranking
+    /// cannot reorder it. Left to the router, a holder that timed out once
+    /// could lose the attempt to a never-asked peer: below 50 routing events
+    /// the router ranks every peer without history ahead of any peer with
+    /// some, and a timeout label gives the holder history at once.
+    ///
+    /// First a peer that failed once without answering NotFound (it timed out,
+    /// or its connection dropped), for its second attempt: that is what keeps
+    /// a contract with a single holder reachable when the holder stalled once
+    /// and has since recovered. Then a peer never asked. So with budget left
+    /// for both, both get an attempt; with one attempt left, the second chance
+    /// goes first. A peer that has had `FALLBACK_MAX_ASKS_PER_PEER` attempts
+    /// is not chosen again, which bounds how long a node whose only ring peer
+    /// stalls keeps retrying. Either way the peer must be a routing candidate
+    /// under the relay's own filters, or it could not be pinned.
+    fn fallback_target(&self) -> Option<(PeerKeyLocation, SocketAddr)> {
+        let second_chance = self
+            .asked_hops
+            .iter()
+            .filter(|(addr, asks)| {
+                *asks < FALLBACK_MAX_ASKS_PER_PEER && !self.not_found_hops.contains(addr)
+            })
+            .find_map(|(addr, _)| {
+                first_hop_candidate(self.op_manager, &self.instance_id, *addr)
+                    .map(|peer| (peer, *addr))
+            });
+        second_chance.or_else(|| {
+            let mut asked: Vec<SocketAddr> =
+                self.asked_hops.iter().map(|(addr, _)| *addr).collect();
+            asked.extend(self.op_manager.ring.connection_manager.get_own_addr());
+            self.op_manager
+                .ring
+                .k_closest_potentially_hosting(&self.instance_id, asked.as_slice(), 1)
+                .into_iter()
+                .next()
+                .and_then(|peer| peer.socket_addr().map(|addr| (peer, addr)))
+        })
     }
 }
 
@@ -2685,6 +2698,7 @@ async fn drive_sub_op_get(
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
         guesses_exhausted: false,
+        first_hop_pin: None,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -3203,6 +3217,35 @@ async fn check_local_with_interest_gate(
     }
 }
 
+/// A skip list that admits exactly one peer, so
+/// `k_closest_potentially_hosting` returns that peer when, and only when, it
+/// is a routing candidate under the same filters as any first-hop pick.
+#[derive(Clone, Copy)]
+struct AdmitOnly(SocketAddr);
+
+impl crate::util::Contains<SocketAddr> for AdmitOnly {
+    fn has_element(&self, addr: SocketAddr) -> bool {
+        addr != self.0
+    }
+}
+
+/// `addr`'s peer, if it is a first-hop routing candidate for `instance_id`
+/// right now (#5660). The retry fallback uses it to choose a peer the
+/// loopback relay will accept, and the relay to decide whether to honour a
+/// pinned first hop, so the two cannot disagree about which peers qualify.
+fn first_hop_candidate(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    addr: SocketAddr,
+) -> Option<PeerKeyLocation> {
+    op_manager
+        .ring
+        .k_closest_potentially_hosting(instance_id, AdmitOnly(addr), 1)
+        .into_iter()
+        .next()
+        .filter(|peer| peer.socket_addr() == Some(addr))
+}
+
 /// Select the next downstream peer for relay forwarding.
 ///
 /// Uses `new_visited` (bloom filter) as the primary skip list for
@@ -3219,6 +3262,7 @@ fn relay_advance_to_next_peer(
     retries: &mut usize,
     new_visited: &VisitedPeers,
     first_hop_exclusions: &[SocketAddr],
+    first_hop_pin: Option<SocketAddr>,
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
     // Legacy relay does NOT retry alternative peers at each hop — it
     // forwards once and bubbles back whatever downstream returned. The
@@ -3241,6 +3285,9 @@ fn relay_advance_to_next_peer(
     // `first_hop_exclusions` (#5660) is skipped too, in a local copy that is
     // never forwarded. If it leaves no candidate it is ignored: re-asking a
     // peer that answered NotFound once beats failing the attempt locally.
+    // A pinned first hop (#5660), the peer the retry loop chose itself once
+    // its guesses ran out, goes before both, but only while it is still a
+    // routing candidate here and not in the bloom.
     let closest = |skip: VisitedPeers| {
         op_manager
             .ring
@@ -3248,16 +3295,24 @@ fn relay_advance_to_next_peer(
             .into_iter()
             .next()
     };
-    let excluding = if first_hop_exclusions.is_empty() {
-        None
-    } else {
-        let mut skip = new_visited.clone();
-        for addr in first_hop_exclusions {
-            skip.mark_visited(*addr);
+    let pinned = first_hop_pin
+        .filter(|pin| !new_visited.probably_visited(*pin))
+        .and_then(|pin| first_hop_candidate(op_manager, instance_id, pin));
+    let excluding = || {
+        if first_hop_exclusions.is_empty() {
+            None
+        } else {
+            let mut skip = new_visited.clone();
+            for addr in first_hop_exclusions {
+                skip.mark_visited(*addr);
+            }
+            closest(skip)
         }
-        closest(skip)
     };
-    let peer = match excluding.or_else(|| closest(new_visited.clone())) {
+    let peer = match pinned
+        .or_else(excluding)
+        .or_else(|| closest(new_visited.clone()))
+    {
         Some(peer) => peer,
         None => {
             // Bootstrap fallback (#4361): empty ring → forward via a
@@ -3820,15 +3875,17 @@ where
     let mut did_forward = false;
 
     // Retry diversity (#5660): on the originator's own loopback, the peers its
-    // retry loop asked this relay not to pick as the attempt's first hop.
-    // Applied to that pick only; `new_visited`, which is forwarded, never
-    // carries them.
-    let first_hop_exclusions = if Some(upstream_addr) == own_addr {
-        op_manager
-            .attempt_hop_registry()
-            .first_hop_exclusions(&incoming_tx)
+    // retry loop asked this relay not to pick as the attempt's first hop, and
+    // the first hop it chose itself, if any. Applied to that pick only;
+    // `new_visited`, which is forwarded, never carries them.
+    let (first_hop_exclusions, first_hop_pin) = if Some(upstream_addr) == own_addr {
+        let registry = op_manager.attempt_hop_registry();
+        (
+            registry.first_hop_exclusions(&incoming_tx),
+            registry.first_hop_pin(&incoming_tx),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     loop {
@@ -3840,6 +3897,7 @@ where
             &mut retries,
             &new_visited,
             &first_hop_exclusions,
+            first_hop_pin,
         ) {
             Some(p) => {
                 consult_active = false;
@@ -5506,6 +5564,7 @@ mod tests {
             not_found_hops: Vec::new(),
             asked_hops: Vec::new(),
             guesses_exhausted: false,
+            first_hop_pin: None,
         };
 
         assert!(
@@ -8410,6 +8469,7 @@ mod route_attempt_driver_tests {
             not_found_hops: Vec::new(),
             asked_hops: Vec::new(),
             guesses_exhausted: false,
+            first_hop_pin: None,
         }
     }
 
@@ -10266,6 +10326,7 @@ mod route_attempt_driver_tests {
         let mut tried = vec![own];
         let mut retries = 0;
         let exclusions = op_manager.attempt_hop_registry().first_hop_exclusions(id);
+        let pin = op_manager.attempt_hop_registry().first_hop_pin(id);
         relay_advance_to_next_peer(
             op_manager,
             instance_id,
@@ -10273,6 +10334,7 @@ mod route_attempt_driver_tests {
             &mut retries,
             &relay_visited,
             &exclusions,
+            pin,
         )
     }
 
@@ -10467,7 +10529,7 @@ mod route_attempt_driver_tests {
             let exclusions = if exclude { vec![addr(&best)] } else { vec![] };
             let _slot = op_manager
                 .attempt_hop_registry()
-                .register_excluding(tx, exclusions);
+                .register_excluding(tx, exclusions, None);
             let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
             let result = drive_relay_get_inner(
                 &op_manager,
@@ -10510,6 +10572,76 @@ mod route_attempt_driver_tests {
                     "{label}: without exclusions the relay picks the best candidate"
                 );
             }
+        }
+    }
+
+    /// The REAL originator-loopback relay uses the first hop its retry loop
+    /// pinned over its own ranking, but only while that peer is a routing
+    /// candidate: a pinned peer that has left the ring is ignored, and the
+    /// relay picks as usual.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn loopback_relay_honours_a_pinned_first_hop_only_while_it_is_a_candidate() {
+        for (label, pin_connected) in [("get-loopback-pin", true), ("get-loopback-pin-gone", false)]
+        {
+            let (op_manager, mut rx, _peers, _guards, _store) =
+                op_manager_with_peers_and_store(label, 4).await;
+            let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+            let instance_id = ContractInstanceId::new([84u8; 32]);
+            let closest = |skip: &[SocketAddr]| {
+                op_manager
+                    .ring
+                    .k_closest_potentially_hosting(&instance_id, skip, 1)
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            };
+            let best = closest(&[own]);
+            let second = closest(&[own, addr(&best)]);
+            if !pin_connected {
+                let _pruned = op_manager
+                    .ring
+                    .connection_manager
+                    .prune_alive_connection(addr(&second));
+            }
+            let tx = Transaction::new::<GetMsg>();
+            let _slot = op_manager.attempt_hop_registry().register_excluding(
+                tx,
+                Vec::new(),
+                Some(addr(&second)),
+            );
+            let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+            let result = drive_relay_get_inner(
+                &op_manager,
+                &conn_manager,
+                tx,
+                instance_id,
+                3,
+                own,
+                VisitedPeers::new(&tx),
+                false,
+                false,
+            )
+            .await;
+            assert!(result.is_ok(), "{label}: {result:?}");
+            let mut forwarded = None;
+            while let Ok((_reply, outbound, target)) = rx.try_recv() {
+                if *outbound.id() == tx && is_request(&outbound) {
+                    forwarded = Some(target);
+                    break;
+                }
+            }
+            let target = forwarded
+                .expect("the loopback relay forwarded the request")
+                .expect("the forward names its peer");
+            let expected = if pin_connected {
+                addr(&second)
+            } else {
+                addr(&best)
+            };
+            assert_eq!(
+                target, expected,
+                "{label}: a pinned candidate is the first hop; a departed one is ignored"
+            );
         }
     }
 
@@ -10644,25 +10776,46 @@ mod route_attempt_driver_tests {
         /// The connection drops: the peer leaves the ring and the waiter wakes
         /// with `PeerDisconnected`.
         Disconnect,
+        /// The callback is dropped on this node: a `NotificationError`, which
+        /// the retry loop retries on the same peer.
+        DropCallback,
+    }
+
+    /// How a scripted ring differs from a plain one.
+    #[derive(Default)]
+    struct RingSetup {
+        /// A peer, by ring order, that is off the ring until the hop of the
+        /// attempt with the given index (infra retries included) is picked.
+        joins_late: Option<(usize, usize)>,
+        /// Routing events fed to the router before the GET, all for a peer
+        /// outside the ring, so the ring's own peers start without history.
+        router_events: usize,
+        /// Ring peers, by ring order, given one routing event of their own
+        /// before the GET, after the outside ones.
+        history_for: Vec<usize>,
+    }
+
+    /// The outcome of a scripted-ring GET.
+    struct ScriptedRun {
+        done: bool,
+        /// The ring peers from closest to farthest.
+        order: Vec<SocketAddr>,
+        /// The first hop of every attempt, in order.
+        hops: Vec<SocketAddr>,
+        exhausted: Option<crate::tracing::GetExhaustionReason>,
+        op_manager: Arc<OpManager>,
+        instance_id: ContractInstanceId,
     }
 
     /// A client GET on a ring of `script.len()` peers. `script[i]` lists what
     /// the i-th closest peer answers to its first, second, ... attempt, the
     /// last entry repeating; every hop is picked by the real loopback-relay
-    /// selection. Returns whether the GET completed, the ring peers from
-    /// closest to farthest, the hops asked in order, and the driver's
-    /// exhaustion reason. `joins_late` names a peer, by ring order, that is off
-    /// the ring until the first attempt's hop has been picked.
+    /// selection, pin and exclusions included.
     async fn run_scripted_ring(
         label: &str,
         script: Vec<Vec<Scripted>>,
-        joins_late: Option<usize>,
-    ) -> (
-        bool,
-        Vec<SocketAddr>,
-        Vec<SocketAddr>,
-        Option<crate::tracing::GetExhaustionReason>,
-    ) {
+        setup: RingSetup,
+    ) -> ScriptedRun {
         let peers = script.len();
         let (op_manager, rx, ring_peers, _guards) = op_manager_with_peers(label, peers).await;
         let instance_id = ContractInstanceId::new([82u8; 32]);
@@ -10679,9 +10832,35 @@ mod route_attempt_driver_tests {
                 .expect("a ring peer");
             order.push(addr(&next));
         }
+        // Seeded only now, so `order` above is by distance alone.
+        if setup.router_events > 0 || !setup.history_for.is_empty() {
+            let outsider = PeerKeyLocation::random();
+            let mut router = op_manager.ring.router.write();
+            for i in 0..setup.router_events {
+                router.add_event(crate::router::RouteEvent {
+                    peer: outsider.clone(),
+                    contract_location: crate::ring::Location::new((0.03 * i as f64) % 1.0),
+                    outcome: crate::router::RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+            for &i in &setup.history_for {
+                let peer = ring_peers
+                    .iter()
+                    .find(|p| addr(p) == order[i])
+                    .cloned()
+                    .expect("a ring peer");
+                router.add_event(crate::router::RouteEvent {
+                    peer,
+                    contract_location: crate::ring::Location::new(0.5),
+                    outcome: crate::router::RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+        }
         // The late peer leaves the ring now and is re-added, with its own
-        // location and key, once the first attempt's hop is picked.
-        let mut late = joins_late.map(|i| {
+        // location and key, once its attempt's hop is picked.
+        let mut late = setup.joins_late.map(|(i, after)| {
             let peer = ring_peers
                 .iter()
                 .find(|p| addr(p) == order[i])
@@ -10692,7 +10871,7 @@ mod route_attempt_driver_tests {
                 .connection_manager
                 .prune_alive_connection(order[i])
                 .expect("the late peer was connected");
-            (peer, location)
+            (peer, location, after)
         });
         let view = op_manager.clone();
         let hops = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -10703,17 +10882,19 @@ mod route_attempt_driver_tests {
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
-            move |_, msg, _| {
+            move |attempt, msg, _| {
                 let (peer, peer_addr) =
                     loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
                 seen.lock().push(peer_addr);
-                if let Some((late_peer, location)) = late.take() {
-                    assert!(view.ring.connection_manager.add_connection(
-                        location,
-                        addr(&late_peer),
-                        late_peer.pub_key().clone(),
-                        false,
-                    ));
+                if late.as_ref().is_some_and(|(_, _, after)| attempt >= *after) {
+                    if let Some((late_peer, location, _)) = late.take() {
+                        assert!(view.ring.connection_manager.add_connection(
+                            location,
+                            addr(&late_peer),
+                            late_peer.pub_key().clone(),
+                            false,
+                        ));
+                    }
                 }
                 let i = ring_order
                     .iter()
@@ -10733,6 +10914,7 @@ mod route_attempt_driver_tests {
                             .prune_alive_connection(peer_addr);
                         Answer::PeerDisconnected
                     }
+                    Scripted::DropCallback => Answer::DropWaiter,
                 };
                 Step {
                     hop: Some(peer),
@@ -10744,12 +10926,14 @@ mod route_attempt_driver_tests {
         let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
         let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         let hops = hops.lock().clone();
-        (
-            matches!(outcome, RetryLoopOutcome::Done(_)),
+        ScriptedRun {
+            done: matches!(outcome, RetryLoopOutcome::Done(_)),
             order,
             hops,
-            driver.exhaustion_reason,
-        )
+            exhausted: driver.exhaustion_reason,
+            op_manager,
+            instance_id,
+        }
     }
 
     /// A holder that timed out once keeps its second chance when the driver's
@@ -10757,18 +10941,21 @@ mod route_attempt_driver_tests {
     /// first: the closest times out and then answers NotFound, the holder
     /// (second) times out once, on the third attempt, and the third peer is
     /// never asked. The last attempt must go back to the holder rather than to
-    /// the never-asked peer: a hop that failed only once is not excluded.
+    /// the never-asked peer: a peer that failed once gets its second attempt
+    /// before a peer never asked.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_holder_that_timed_out_once_keeps_its_second_chance_over_an_unasked_peer() {
         use Scripted as S;
-        let (done, order, hops, _) = run_scripted_ring(
+        let ScriptedRun {
+            done, order, hops, ..
+        } = run_scripted_ring(
             "get-second-chance",
             vec![
                 vec![S::Stall, S::NotFound],
                 vec![S::Stall, S::Found],
                 vec![S::NotFound],
             ],
-            None,
+            RingSetup::default(),
         )
         .await;
         assert_eq!(
@@ -10779,25 +10966,31 @@ mod route_attempt_driver_tests {
         assert!(done, "the recovered holder answers: {hops:?}");
     }
 
-    /// The holder's single timeout can come BEFORE a closer peer's two: the
-    /// router re-ranks peers after a timeout, so the holder may be picked
-    /// first. Connection timing produces that order here. Ring order is Y
-    /// (closest), the holder, U, and Y joins only after the first attempt. So
-    /// the holder is asked first and times out once, Y then stalls and drops
-    /// its connection, and U is never asked. The last attempt must go back to
-    /// the holder rather than to U: a hop that failed only once is not
-    /// excluded, however early its failure came.
+    /// The holder's single timeout can come BEFORE a closer peer's two. Here
+    /// connection timing produces that order; the router's own re-ranking
+    /// after a timeout is covered by
+    /// `a_holder_keeps_its_second_chance_when_the_router_prefers_untried_peers`.
+    /// Ring order is Y (closest), the holder, U, and Y joins only after the
+    /// first attempt. So the holder is asked first and times out once, Y then
+    /// stalls and drops its connection, and U is never asked. The last attempt
+    /// must go back to the holder rather than to U, however early its failure
+    /// came.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_holder_asked_before_a_closer_peer_keeps_its_second_chance() {
         use Scripted as S;
-        let (done, order, hops, _) = run_scripted_ring(
+        let ScriptedRun {
+            done, order, hops, ..
+        } = run_scripted_ring(
             "get-second-chance-reranked",
             vec![
                 vec![S::Stall, S::Disconnect],
                 vec![S::Stall, S::Found],
                 vec![S::NotFound],
             ],
-            Some(0),
+            RingSetup {
+                joins_late: Some((0, 0)),
+                ..RingSetup::default()
+            },
         )
         .await;
         assert_eq!(
@@ -10817,14 +11010,16 @@ mod route_attempt_driver_tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_departed_peer_does_not_hide_a_holder_that_timed_out_once() {
         use Scripted as S;
-        let (done, order, hops, _) = run_scripted_ring(
+        let ScriptedRun {
+            done, order, hops, ..
+        } = run_scripted_ring(
             "get-departed-peer",
             vec![
                 vec![S::Disconnect],
                 vec![S::NotFound],
                 vec![S::Stall, S::Found],
             ],
-            None,
+            RingSetup::default(),
         )
         .await;
         assert_eq!(
@@ -10838,10 +11033,12 @@ mod route_attempt_driver_tests {
     /// Once the guesses have run out, a peer that failed twice stays excluded
     /// from the first hop through the re-ask as well. Two peers: the closest
     /// times out on every attempt, and the holder (second) times out once and
-    /// then answers. The fallback first steers to the holder and then re-asks
-    /// it, and that re-ask must not go back to the peer that already stalled
-    /// twice. The second case is the same run with the closest peer answering
-    /// NotFound on its second attempt instead.
+    /// then answers. The fallback first picks the holder, a peer never asked,
+    /// and then re-asks it, and that re-ask must not go back to the peer that
+    /// already stalled twice. The second case is the same run with the
+    /// closest peer answering NotFound on its second attempt instead. Only the
+    /// first case pins the one re-ask per peer: in the second, the closest
+    /// peer is excluded for its NotFound alone.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_peer_that_failed_twice_does_not_absorb_the_re_ask() {
         use Scripted as S;
@@ -10849,8 +11046,14 @@ mod route_attempt_driver_tests {
             ("get-re-ask-stalled", vec![S::Stall]),
             ("get-re-ask-not-found", vec![S::Stall, S::NotFound]),
         ] {
-            let (done, order, hops, _) =
-                run_scripted_ring(label, vec![closest, vec![S::Stall, S::Found]], None).await;
+            let ScriptedRun {
+                done, order, hops, ..
+            } = run_scripted_ring(
+                label,
+                vec![closest, vec![S::Stall, S::Found]],
+                RingSetup::default(),
+            )
+            .await;
             assert_eq!(
                 hops,
                 vec![order[0], order[0], order[1], order[1]],
@@ -10879,13 +11082,147 @@ mod route_attempt_driver_tests {
             (3, vec![0, 0, 0, 1], RetryBudget),
         ] {
             let label = format!("get-stalled-ring-{peers}");
-            let (done, order, hops, exhausted) =
-                run_scripted_ring(&label, vec![vec![S::Stall]; peers], None).await;
+            let ScriptedRun {
+                done,
+                order,
+                hops,
+                exhausted,
+                ..
+            } = run_scripted_ring(&label, vec![vec![S::Stall]; peers], RingSetup::default()).await;
             assert!(!done, "{label}: every peer stalls");
             let expected: Vec<SocketAddr> = expected.iter().map(|i| order[*i]).collect();
             assert_eq!(hops, expected, "{label}");
             assert_eq!(exhausted, Some(reason), "{label}");
         }
+    }
+
+    /// The second chance is the driver's choice, not the router's. Below 50
+    /// routing events the router ranks every peer without history ahead of
+    /// any peer with some, and a timeout label gives a peer history at once,
+    /// so left to the router a holder that timed out once ranks behind a
+    /// never-asked peer. The router here holds outside history, which puts it
+    /// in that regime. Ring order is Y, the holder, U, and U joins only after
+    /// the third attempt's hop is picked. Y stalls, the holder stalls once and
+    /// then answers, and U would answer NotFound. When the last attempt is
+    /// chosen the router would pick U; the driver pins the holder instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_holder_keeps_its_second_chance_when_the_router_prefers_untried_peers() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-second-chance-untried-first",
+            vec![vec![S::Stall], vec![S::Stall, S::Found], vec![S::NotFound]],
+            RingSetup {
+                joins_late: Some((2, 2)),
+                router_events: 20,
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        let (y, holder, u) = (run.order[0], run.order[1], run.order[2]);
+        let own = run
+            .op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .unwrap();
+        // Precondition: with Y set aside, the router picks the never-asked U
+        // over the holder, although U is farther from the key, because the
+        // holder has routing history and U has none.
+        let router_pick = run
+            .op_manager
+            .ring
+            .k_closest_potentially_hosting(&run.instance_id, [own, y].as_slice(), 1)
+            .into_iter()
+            .next()
+            .and_then(|peer| peer.socket_addr());
+        assert_eq!(
+            router_pick,
+            Some(u),
+            "precondition: the router must rank the untried peer above the holder"
+        );
+        assert_eq!(
+            run.hops,
+            vec![y, holder, y, holder],
+            "the holder's second attempt must not go to the untried peer"
+        );
+        assert!(run.done, "the recovered holder answers: {:?}", run.hops);
+    }
+
+    /// The same regime when every ring peer was already asked. Distance order
+    /// is Y, the holder, U, and only Y has routing history before the GET. The
+    /// router picks the untried holder first, which stalls once, then the
+    /// untried U, which answers NotFound, then Y, which stalls. With the
+    /// guesses run out, the holder and Y have both failed once and both have
+    /// history, so the router would give the last attempt to the closer Y;
+    /// the driver pins the holder instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_holder_keeps_its_second_chance_over_a_closer_once_failed_peer_under_untried_first() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-second-chance-over-closer",
+            vec![vec![S::Stall], vec![S::Stall, S::Found], vec![S::NotFound]],
+            RingSetup {
+                router_events: 20,
+                history_for: vec![0],
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        let (y, holder, u) = (run.order[0], run.order[1], run.order[2]);
+        let own = run
+            .op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .unwrap();
+        // Precondition: with U set aside, the router picks the closer Y over
+        // the holder, since both have history now.
+        let router_pick = run
+            .op_manager
+            .ring
+            .k_closest_potentially_hosting(&run.instance_id, [own, u].as_slice(), 1)
+            .into_iter()
+            .next()
+            .and_then(|peer| peer.socket_addr());
+        assert_eq!(
+            router_pick,
+            Some(y),
+            "precondition: left to the router, the last attempt goes to Y"
+        );
+        assert_eq!(
+            run.hops,
+            vec![holder, u, y, holder],
+            "the holder's second attempt must not go to the closer peer"
+        );
+        assert!(run.done, "the recovered holder answers: {:?}", run.hops);
+    }
+
+    /// A callback dropped on this node is retried on the same peer without
+    /// spending the retry budget, and it does not count as an attempt on the
+    /// peer either: no verdict came from it. One peer: its first attempt ends
+    /// in a local callback drop, the retry on it times out, and the peer must
+    /// still get its second chance and answer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_local_callback_drop_does_not_use_up_a_peers_second_chance() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-callback-drop",
+            vec![vec![S::DropCallback, S::Stall, S::Found]],
+            RingSetup::default(),
+        )
+        .await;
+        let peer = run.order[0];
+        assert_eq!(
+            run.hops,
+            vec![peer, peer, peer],
+            "the callback drop is retried on the peer, then the peer gets its \
+             second chance"
+        );
+        assert!(
+            run.done,
+            "a local callback drop must not use up the peer's second chance: {:?}",
+            run.hops
+        );
     }
 
     /// A peer that answered NotFound is not re-asked when the driver's own
@@ -11028,6 +11365,7 @@ mod route_attempt_driver_tests {
                 &mut retries,
                 &visited,
                 exclusions,
+                None,
             )
             .map(|(_, addr)| addr)
         };
