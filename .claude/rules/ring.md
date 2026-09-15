@@ -200,18 +200,36 @@ WHEN routing fails (no peers):
 ```
 Two prediction stacks exist in router.rs; exactly one reaches routing.
 
-  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
-    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
-    the residual correction in place of the blend.
-  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
-    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
-    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
-    over BOTH legacy variants for every stage it can estimate (a cold stage
-    falls back to legacy). Computed at all only when that flag is on or
-    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
+  HIERARCHICAL (default; router/hierarchical.rs): EB-shrunk isotonic prior,
+    root > peer > (peer, band) empirical-Bayes hierarchy, horizon chosen
+    online. Takes precedence over BOTH legacy variants for every stage it can
+    estimate (a cold stage falls back to legacy). FREENET_ROUTING_HIERARCHICAL=0
+    (false/no/off) is the per-node kill switch; on such a node it is computed
+    at all only while FREENET_ROUTING_DATASET is recording.
+  LEGACY (only with FREENET_ROUTING_HIERARCHICAL=0, and as the cold-stage
+    fallback): isotonic curve + per-peer EWMA + fixed-weight Renegade blend
+    (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1 the
+    residual correction in place of the blend.
 
 WHEN touching either stack:
-  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
+  → Flags parse fail-safe. Default-off flags (parse_routing_flag, e.g.
+    RESIDUAL_CORRECTION) enable only on 1/true/yes/on. The default-on
+    HIERARCHICAL flag (parse_default_on_routing_flag, wired through
+    resolve_hierarchical_flag) is ON when unset/empty or 1/true/yes/on, OFF on
+    0/false/no/off, and OFF with a warn! on ANY other non-empty or non-UTF-8
+    value: setting a default-on flag at all almost always means "off", and
+    ambiguous input falls back to the proven legacy stack.
+  → The resolved mode is logged ONCE, on first use (first route event,
+    prediction or dashboard snapshot — not at boot). Every line starts
+    "hierarchical routing estimator: "; the soak's crossover check greps
+    them, and the exact strings are pinned end to end (real env var, real
+    OnceLock, child processes) by
+    hierarchical_routing_enabled_follows_the_environment.
+  → Routing-behaviour guards must cover BOTH stacks. Router::new(&history)
+    never feeds the hierarchical estimator, so a history-built router
+    routes on the legacy fallback. The tests' Training::WarmHierarchical
+    trains through add_event with a frozen clock and asserts the
+    hierarchical estimate made the decision; give a new guard both modes.
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected
@@ -219,14 +237,17 @@ WHEN touching either stack:
     InstantTimeSrc reading tokio's clock: it advances under a paused tokio
     runtime (direct sim runner) but NOT under hosting_time_source_override.
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
-  → It is computed only while its flag is on or the routing dataset is
-    RECORDING (a stopped recorder stops it); readings then freeze, and the
-    dashboard shows "not computed now" rather than frozen values
+  → With the default (on) it is always computed, because it routes. Only on
+    a FREENET_ROUTING_HIERARCHICAL=0 node is it computed solely while the
+    routing dataset is RECORDING (a stopped recorder stops it); readings
+    then freeze, and the dashboard shows "not computed now" rather than
+    frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
 
-PROMOTION GATE, in two parts, both on data collected after #5653 (failure
-labels) is deployed:
+PROMOTION GATE, run by the 2026-09 two-gateway soak; the default flip
+(#5682) merges only after it passes. Two parts, both on data collected after
+#5653 (failure labels) is deployed:
   (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
       score and seconds error for both models on the same events. This is
       calibration of each model's estimate for the peer actually tried. It
@@ -235,9 +256,12 @@ labels) is deployed:
       the other model would have chosen would have fared is unobserved.
       Offline ranking evaluation would need a per-decision candidate log
       with exploration (future work).
-  (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
-      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
-      which gateway has the flag halfway through the window. The two gateways
+  (b) ON-FIELD CROSSOVER between gateways: one gateway on the hierarchical
+      estimator against the other on legacy, then SWAP the arms halfway
+      through the window. On a post-flip build unset means ON, so the legacy
+      arm needs an EXPLICIT FREENET_ROUTING_HIERARCHICAL=0; confirm it from
+      that node's log ("hierarchical routing estimator: disabled via
+      FREENET_ROUTING_HIERARCHICAL") before trusting the arm. The two gateways
       differ in connection population (address age, bootstrap-list position),
       so a one-gateway-per-arm comparison is confounded by gateway identity;
       compare WITHIN-gateway differences (flag on vs off on the same gateway)
