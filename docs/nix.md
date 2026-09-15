@@ -108,19 +108,31 @@ systemd.services.freenet = {
   after = [ "network-online.target" ];
   wants = [ "network-online.target" ];
   serviceConfig = {
-    ExecStart = "${freenet-node}/bin/freenet-node";
-    DynamicUser = true;
-    StateDirectory = "freenet";   # the wrapper seeds the binary under this
+    ExecStart = ''
+      ${freenet-node}/bin/freenet-node \
+        --config-dir /var/lib/freenet/config \
+        --data-dir   /var/lib/freenet/data \
+        --log-dir    /var/lib/freenet/logs
+    '';
+    User = "freenet";
+    Group = "freenet";
+    # /var/lib/freenet. The wrapper seeds the binary under $STATE_DIRECTORY/bin.
+    StateDirectory = "freenet";
     Restart = "on-failure";
     RestartSec = 30;
   };
 };
 ```
 
+The directories are named explicitly because the node otherwise derives them
+from the service user's home, which a system user may not usefully have. A
+read-only `/nix/store` is fine; what must be writable is the state directory.
+
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and
-`freenet-node` already absorbs those codes. A read-only `/nix/store` is fine;
-what must be writable is the state directory.
+`freenet-node` already absorbs those codes — it exits 0 for both, and for a
+crash loop it exits 1 after five failures in two minutes, which is the case
+`Restart=on-failure` is there to back-stop.
 
 ## What this does NOT give you
 
