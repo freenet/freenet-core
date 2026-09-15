@@ -654,7 +654,10 @@ async fn verified_stored_params_is_the_indexed_code_hash_derivation()
         .ensure_key_indexed(&ContractKey::from_id_and_code(*key.id(), other))
         .expect("re-point the index row");
     assert_eq!(
-        h.executor.runtime.contract_store.code_hash_from_id(key.id()),
+        h.executor
+            .runtime
+            .contract_store
+            .code_hash_from_id(key.id()),
         Some(other)
     );
     assert!(
