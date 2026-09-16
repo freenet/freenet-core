@@ -13,9 +13,11 @@
 //! This estimator replaces all of that with one model whose every weight is
 //! estimated from the data. It is the intended REPLACEMENT for the legacy stack
 //! (Renegade, the per-peer EWMA, the fixed blend and the residual correction),
-//! which is removed in a later PR after a gateway soak. Until then it reaches
-//! routing only under `FREENET_ROUTING_HIERARCHICAL`, and is computed at all only
-//! when that flag is on or the routing dataset is being recorded.
+//! which is removed in a later PR. Until then both stacks exist: this one
+//! routes by default, `FREENET_ROUTING_HIERARCHICAL=0` (or any other value that
+//! resolves off) puts a node back on the legacy stack, and on such a node this
+//! estimator is computed at all only while the routing dataset is being
+//! recorded.
 //!
 //! # Provenance, and what has changed since
 //!
