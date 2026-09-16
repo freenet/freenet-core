@@ -4147,6 +4147,12 @@ where
                         target = %consult_addr,
                         "GET relay: terminus consulting advertised host off routing path"
                     );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Get,
+                        crate::ring::Location::from(&instance_id),
+                        &consult_peer,
+                        crate::router::dataset::UncapturedReason::TerminalConsult,
+                    );
                     (consult_peer, consult_addr)
                 } else {
                     // Dead-end confirmed: no usable advertised host (or every
@@ -11921,7 +11927,8 @@ mod route_attempt_driver_tests {
 mod candidate_log_call_site_tests {
     use super::*;
     use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
-    use crate::router::dataset::{self, RoutingDataset};
+    use crate::ring::candidate_log_wiring_tests::{lines_through_sentinel, recorder};
+    use crate::router::dataset;
 
     #[tokio::test]
     async fn only_the_relay_next_hop_logs_and_a_pinned_hop_logs_as_a_bypass() {
@@ -11940,20 +11947,9 @@ mod candidate_log_call_site_tests {
                 });
             }
         }
-        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let path = dir.path().join("routing.jsonl");
-        let recorder: &'static RoutingDataset = Box::leak(Box::new(
-            RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap(),
-        ));
-        let _log = dataset::force_candidate_log(recorder, 1.0);
+        let (recorder, _dir, path) = recorder();
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
-        let pin = peers[1].socket_addr().unwrap();
-
-        // Not routing decisions.
-        assert!(first_hop_candidate(&op_manager, &instance_id, pin).is_some());
-        let mut tried = vec![own];
-        let mut retries = 0;
-        assert!(advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries).is_ok());
 
         let relay = |pin: Option<SocketAddr>| {
             let tx = Transaction::new::<GetMsg>();
@@ -11972,25 +11968,27 @@ mod candidate_log_call_site_tests {
             )
             .expect("a next hop")
         };
-        let (pinned, _) = relay(Some(pin));
-        assert_eq!(pinned.socket_addr(), Some(pin));
-        let (routed, _) = relay(None);
+        // Not routing decisions.
+        let mut tried = vec![own];
+        let mut retries = 0;
+        assert!(advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries).is_ok());
+        // The relay's own next hop: a captured GET decision.
+        let (routed, routed_addr) = relay(None);
+        // A probe of that peer, then the same peer pinned: a bypass, which
+        // supersedes the capture.
+        assert!(first_hop_candidate(&op_manager, &instance_id, routed_addr).is_some());
+        let (pinned, _) = relay(Some(routed_addr));
+        assert_eq!(pinned, routed);
 
-        let lines = dataset::lines_eventually(&path, |lines| lines.len() >= 3);
+        let lines = lines_through_sentinel(&recorder, &path);
         let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
         assert_eq!(
             kinds,
-            ["start", "decision_uncaptured", "decision"],
+            ["start", "decision", "decision_uncaptured", "peers"],
             "{lines:?}"
         );
-        assert_eq!(lines[1]["reason"], "pinned_first_hop");
         assert_eq!(lines[1]["op"], "GET");
-        assert_eq!(
-            lines[1]["selected"],
-            serde_json::json!([dataset::peer_hash(&pinned)])
-        );
-        assert_eq!(lines[2]["op"], "GET");
-        let chosen = lines[2]["candidates"]
+        let chosen = lines[1]["candidates"]
             .as_array()
             .unwrap()
             .iter()
@@ -11998,5 +11996,11 @@ mod candidate_log_call_site_tests {
             .unwrap()["peer"]
             .clone();
         assert_eq!(chosen, dataset::peer_hash(&routed));
+        assert_eq!(lines[2]["reason"], "pinned_first_hop");
+        assert_eq!(lines[2]["op"], "GET");
+        assert_eq!(
+            lines[2]["selected"],
+            serde_json::json!([dataset::peer_hash(&pinned)])
+        );
     }
 }

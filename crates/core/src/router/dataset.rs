@@ -49,72 +49,95 @@
 //! # Candidate sets (`decision` lines)
 //!
 //! With `FREENET_ROUTING_DATASET_CANDIDATES` set as well as a recording path,
-//! each routing decision whose outcome this node records as a route event (GET,
-//! PUT and SUBSCRIBE, at the originator's loopback relay and at relays) writes
-//! one `"kind":"decision"` line: every candidate the router scored (the
-//! `consider_n_closest_peers` distance window, in distance order), BOTH models'
-//! estimates for each — the legacy stack as routing would act on it with the
-//! hierarchical flag off, and the hierarchical estimator as routing would act on
-//! it with the flag on (legacy fallback for any stage it cannot yet estimate,
-//! flagged per stage in `hierarchical_stages`) — each candidate's rank under
-//! each model, and which candidates the router actually returned
-//! (`selected_position`, 0 = first choice). `acting_model` says which of the two
-//! routed. The record is captured inside the decision from the values the router
-//! sorted, not reconstructed afterwards; ranks use the router's own cost
-//! ordering ([`cost_order_key`], stable over distance order).
+//! each routing decision whose outcome this node records as a route event
+//! writes one `"kind":"decision"` line: GET and PUT at relays and at the
+//! originator's loopback relay, SUBSCRIBE at relays and at the originator
+//! itself (a SUBSCRIBE originator routes directly). The line holds every
+//! candidate the router scored (the `consider_n_closest_peers` distance window,
+//! in distance order), BOTH models' estimates for each — the legacy stack as
+//! routing would act on it with the hierarchical flag off, and the hierarchical
+//! estimator as routing would act on it with the flag on (legacy fallback for
+//! any stage it cannot yet estimate, flagged per stage in
+//! `hierarchical_stages`) — each candidate's rank under each model, and which
+//! candidates the router actually returned (`selected_position`, 0 = first
+//! choice). `acting_model` says which of the two routed. The record is captured
+//! inside the decision from the values the router sorted, not reconstructed
+//! afterwards; ranks use the router's own cost ordering ([`cost_order_key`],
+//! stable over distance order).
 //!
 //! **Which selections log.** Every caller of the ring's selection functions
 //! says whether its selection is a routing decision ([`DecisionLog`]). NOT
 //! logged: driver-side pre-selections the loopback relay then re-decides (GET
-//! and PUT client drivers, sub-op GETs), `first_hop_candidate` admission
-//! probes, diagnostics, PUT probe forwards (no route event), all UPDATE routing
-//! (UPDATE feeds the router nothing, so no UPDATE line could ever join), and
-//! CONNECT peer selection. A selection that returns no peer writes nothing.
+//! and PUT client drivers, sub-op GETs), the executor SUBSCRIBE's local-hit
+//! pre-check, `first_hop_candidate` admission probes, diagnostics, PUT probe
+//! forwards (no route event), all UPDATE routing (UPDATE feeds the router
+//! nothing, so no UPDATE line could ever join), and CONNECT peer selection. A
+//! selection that returns no peer writes nothing. The classification is pinned
+//! per call site (`operations::routing_dataset_call_site_pins`).
 //!
 //! **Sampling and pacing.** The switch takes a SAMPLING RATE: `1`/`true`/`yes`
 //! /`on` capture every decision, a fraction such as `0.05` captures that share
 //! (drawn per decision with `GlobalRng`, so setting a fraction perturbs a
 //! seeded simulation's RNG stream; unset draws nothing), anything else is off.
 //! Captures are also PACED so the sample spreads over the run rather than
-//! spending the budget in the cold-router hours after a start: by time `t` into
-//! a run, captured and uncaptured decision lines may have used at most the
-//! budget times `t` over [`DATASET_CANDIDATES_PACE_HOURS_ENV`] (default
-//! [`DEFAULT_CANDIDATES_PACE_HOURS`], `0` disables pacing), plus
-//! [`PACE_BURST_BYTES`]; a decision over that allowance is written uncaptured
-//! with reason `paced`. The `start` line's `t_ms` gives each decision's time
-//! since run start, and `prior_failure_events` how warm the router was. At most
-//! [`MAX_RECORDED_CANDIDATES`] candidates are written per decision; beyond that
-//! every selected candidate and then the acting model's best are kept,
-//! `candidates_omitted` counts the rest, and ranks stay those over the full
-//! window.
+//! spending the budget in the cold-router hours after a start: a capture is
+//! allowed only while this run's decision-kind bytes are under the budget times
+//! the elapsed fraction of [`DATASET_CANDIDATES_PACE_HOURS_ENV`] (default
+//! [`DEFAULT_CANDIDATES_PACE_HOURS`], `0` disables pacing), plus a burst of
+//! [`PACE_BURST_BYTES`] or a sixteenth of the budget, whichever is smaller;
+//! otherwise the decision is uncaptured with reason `paced`. Elapsed time comes
+//! from the ring's injected `TimeSource`, starting at the run's first paced
+//! decision, never from the host clock. Uncaptured lines count toward the same
+//! bytes but are bounded by the number of captures (below), so they cannot
+//! crowd captures out however high the decision rate. The `start` line's `t_ms`
+//! gives each decision's time since run start, and `prior_failure_events` how
+//! warm the router was. At most [`MAX_RECORDED_CANDIDATES`] candidates are
+//! written per decision; beyond that every selected candidate and then the
+//! acting model's best are kept, `candidates_omitted` counts the rest, and ranks
+//! stay those over the full window.
 //!
-//! **Uncaptured decisions and bypasses.** A logged decision that is not
-//! captured, and a route chosen WITHOUT ring selection, writes a ~120-byte
-//! `"kind":"decision_uncaptured"` line — op, contract location, the selected
-//! peers, and `reason`: `sampled_out`, `paced`, `distance_based` (too little
-//! history to predict), or a bypass: `pinned_first_hop` (a GET retry pinned by
-//! the driver, #5660), `bootstrap_gateway` (empty-ring fallback, #4361),
-//! `directed_first_hop` or `any_connection_fallback` (SUBSCRIBE). Its only job
-//! is to stop that route's outcome joining an older captured decision.
+//! **Uncaptured decisions and bypasses.** An uncaptured decision, or a route
+//! chosen WITHOUT ring selection, writes a ~120-byte
+//! `"kind":"decision_uncaptured"` line ONLY for selections whose most recent
+//! decision-kind line is a capture, because that is the only join it could
+//! corrupt; for any other selection the most recent line is already
+//! uncaptured, or absent, and the outcome is discarded or unjoined anyway. So
+//! there is at most one such line per captured selection, whatever the decision
+//! rate. It carries the op, contract location, those selected peers, and
+//! `reason`: `sampled_out`, `paced`, `distance_based` (too little history to
+//! predict), `expired` (the capture fell out of the
+//! [`MAX_LIVE_CAPTURED_SELECTIONS`]-entry table that detects this, so it is
+//! closed rather than risk a silent mis-join), or a bypass: `pinned_first_hop`
+//! (a GET retry pinned by the driver, #5660), `bootstrap_gateway` (empty-ring
+//! fallback, #4361), `terminal_consult` (a GET or SUBSCRIBE relay consulting an
+//! advertised host after a NotFound), `directed_first_hop` or
+//! `any_connection_fallback` (SUBSCRIBE).
 //!
 //! **Decision lines cannot exhaust the file.** They have their OWN byte budget
 //! ([`DATASET_CANDIDATES_MAX_BYTES_ENV`], default
 //! [`DEFAULT_CANDIDATES_MAX_BYTES`]) and, across ALL runs appending to one file,
 //! may only occupy the first half of it: each run's budget is at most half the
 //! usable file minus everything already in it, so the second half is left to
-//! route and peer lines however often the node restarts (by induction, the sum
-//! of every run's decision bytes is at most half). Running out of budget, or
-//! finding the file itself full, writes one `"kind":"decisions_truncated"` line
-//! (with its `cause`) and stops ONLY decision capture for the rest of the run:
-//! route recording, and the hierarchical estimator that is computed while the
-//! recorder is recording, carry on. They do still share the file and the
-//! 8192-slot channel with route records: decisions shorten the route runway by
-//! at most half the file, and hold at most [`MAX_QUEUED_DECISIONS`] channel
-//! slots, so under a stalled disk route records can find the channel full
-//! somewhat sooner (those drops are counted as route drops, as always).
-//! Decision records that never reach the file (queue bound, full channel, or
-//! still queued when the writer stops) are counted apart from route drops, and
-//! each change of that count is written as `"kind":"decisions_dropped"`.
+//! route and peer lines however often the node restarts. Decision, uncaptured,
+//! drop-mark and stop-marker lines all count as decision bytes. Running out of
+//! budget, or finding the file itself full, writes one
+//! `"kind":"decisions_truncated"` line (with its `cause`) and stops ONLY
+//! decision capture for the rest of the run: route recording, and the
+//! hierarchical estimator that is computed while the recorder is recording,
+//! carry on. They do still share the file and the 8192-slot channel with route
+//! records: decisions shorten the route runway by at most half the file, and
+//! hold at most [`MAX_QUEUED_DECISIONS`] channel slots, so under a stalled disk
+//! route records can find the channel full somewhat sooner (counted as route
+//! drops, as always).
+//!
+//! **Lost decisions are marked where they were lost.** Decision records that
+//! never reach the file (queue bound, full channel) are counted apart from route
+//! drops. Once any decision-kind record has been sent, every send to the channel
+//! is serialised with the decision bookkeeping, and a loss puts a
+//! `"kind":"decisions_dropped"` record into the channel ahead of the NEXT record
+//! of any kind: after everything enqueued before the loss, before everything
+//! enqueued after it. If the mark itself cannot be enqueued, the record behind
+//! it is dropped too, so nothing ever lands on the wrong side of a missing mark.
 //!
 //! **Cost.** Measured in a release build (25-candidate window): a captured
 //! decision costs about +10% under the router READ lock while legacy routes
@@ -126,8 +149,10 @@
 //! the lock no longer than every legacy-routed decision already does. Building
 //! a record takes about 6 µs after the lock is released and serialising it
 //! about 23 µs on the writer thread; a line is about 16 KB. An uncaptured
-//! decision adds nothing under the lock: its line is about 0.3 µs to build and
-//! serialise.
+//! decision adds nothing under the router lock. Once decisions are logged, route
+//! records sent under the router WRITE lock also take the recorder's own
+//! bookkeeping mutex (held for a table lookup and a `try_send`, never across
+//! I/O); nothing changes for a node that has not enabled candidate logging.
 //!
 //! **Joining a decision to its outcome.** No identifier is threaded through the
 //! operation, so the join is by value, within one run (split on `start`): a
@@ -136,22 +161,29 @@
 //! (both are `Location::as_f64` of the same contract, so equal in the JSON), and
 //! a selected candidate whose `peer` equals the route line's `peer`. Discard the
 //! route line when that most recent line is uncaptured, when a
-//! `decisions_dropped` line lies between it and the route line (the decision
-//! that really routed may be the one dropped), or when it comes after a
-//! `decisions_truncated` line. Decision lines carry no originator/relay role,
-//! while route lines do.
+//! `decisions_dropped` line lies between it and the route line, or when it comes
+//! after a `decisions_truncated` line. Decision lines carry no originator/relay
+//! role, while route lines do. Under `FREENET_ROUTING_LEGACY_LABELS=1`,
+//! originator GET and PUT route lines are labelled with the client driver's own
+//! unlogged guess rather than the hop the loopback relay chose, so do not join
+//! `originator` route lines from a legacy-labels run.
 //!
-//! The join is BIASED, in a known direction. Two decisions for the same op and
-//! contract on one node that select the same peer are indistinguishable, and the
-//! later one wins. The longer an outcome takes to arrive, the likelier another
-//! such decision lands in between, so joined outcomes under-represent SLOW
-//! outcomes and FAILURES (timeouts take seconds, successes milliseconds), most
-//! on hot contracts that relays route to the same best peer, and most for the
-//! first attempt of a GET that is then retried to the same peer. To measure it:
-//! call a join ambiguous when any other decision-kind line for the same op,
-//! contract and peer lies between the decision and the route line, and report
-//! the ambiguous fraction alongside any result. Decisions with no joined
-//! outcome are expected (an ambiguous `NotFound` is not trained, see
+//! The join is BIASED, in known directions. Decisions for the same op, contract
+//! and peer on one node are indistinguishable, so:
+//! - an outcome is DISCARDED when a later decision for that selection lands
+//!   before it, which is likelier the slower the outcome: joined outcomes
+//!   under-represent SLOW outcomes and FAILURES (timeouts take seconds,
+//!   successes milliseconds), most on hot contracts that relays route to the
+//!   same best peer;
+//! - a slow outcome of an EARLIER decision for that selection, arriving after a
+//!   capture, is attached to the capture; the earlier decision may have written
+//!   no line at all. Such a capture then has more than one joined route line
+//!   from the same source.
+//!
+//! Report both alongside any result: the share of route lines discarded because
+//! their most recent line was uncaptured, and the share of captured selections
+//! joined by more than one route line (treat those as ambiguous). Decisions with
+//! no joined outcome are expected (an ambiguous `NotFound` is not trained, see
 //! `operations::route_attempt`; a relay that terminates a PUT routes nowhere),
 //! and they are not a random sample.
 //!
@@ -230,8 +262,14 @@ pub(crate) const DATASET_CANDIDATES_PACE_HOURS_ENV: &str =
 pub(crate) const DEFAULT_CANDIDATES_PACE_HOURS: f64 = 168.0;
 
 /// Decision bytes a run may write before pacing allows any, so a run starts
-/// with a useful sample (about 500 captured decisions) rather than none.
+/// with a useful sample (about 500 captured decisions) rather than none. Never
+/// more than a sixteenth of the run's budget.
 pub(crate) const PACE_BURST_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Captured (op, contract, peer) selections remembered for stub suppression
+/// (see the module doc). An evicted one gets an `expired` line, so eviction
+/// costs data, never correctness.
+pub(crate) const MAX_LIVE_CAPTURED_SELECTIONS: usize = 16_384;
 
 /// Most candidates written for one decision. Above the default window (25), so
 /// it only binds when an operator widens `consider_n_closest_peers`.
@@ -517,6 +555,12 @@ pub(crate) enum UncapturedReason {
     DirectedFirstHop,
     /// A SUBSCRIBE that fell back to any connected peer.
     AnyConnectionFallback,
+    /// A GET or SUBSCRIBE relay consulting an advertised host off the routing
+    /// path after a downstream NotFound.
+    TerminalConsult,
+    /// No decision: the captured selection fell out of the suppression table,
+    /// so a later decision for it could no longer be detected.
+    Expired,
 }
 
 /// Why decision capture stopped for the run.
@@ -541,11 +585,36 @@ pub(crate) struct UncapturedDecision {
     pub selected: Vec<String>,
 }
 
+/// A recorder reference: the process recorder, or in tests a shared one.
+#[derive(Debug, Clone)]
+pub(crate) enum RecorderRef<'a> {
+    Borrowed(&'a RoutingDataset),
+    #[cfg(test)]
+    Shared(Arc<RoutingDataset>),
+}
+
+impl std::ops::Deref for RecorderRef<'_> {
+    type Target = RoutingDataset;
+    fn deref(&self) -> &RoutingDataset {
+        match self {
+            RecorderRef::Borrowed(recorder) => recorder,
+            #[cfg(test)]
+            RecorderRef::Shared(recorder) => recorder,
+        }
+    }
+}
+
+impl<'a> From<&'a RoutingDataset> for RecorderRef<'a> {
+    fn from(recorder: &'a RoutingDataset) -> Self {
+        RecorderRef::Borrowed(recorder)
+    }
+}
+
 /// Candidate logging for one routing decision, decided BEFORE the router lock
 /// is taken: whether to capture it at all is `capture`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct CandidateLog<'a> {
-    recorder: &'a RoutingDataset,
+    recorder: RecorderRef<'a>,
     /// `true` to capture; otherwise the decision is written uncaptured with
     /// `skipped`.
     pub capture: bool,
@@ -606,13 +675,33 @@ struct DecisionState {
 }
 
 /// Decision bytes a run may have used `elapsed_ms` into it: the budget released
-/// linearly over `pace_ms`, plus a burst. `pace_ms == 0` releases it all.
+/// linearly over `pace_ms`, plus a burst of at most [`PACE_BURST_BYTES`] and a
+/// sixteenth of the budget. `pace_ms == 0` releases it all.
 pub(crate) fn paced_allowance(limit: u64, elapsed_ms: u64, pace_ms: u64) -> u64 {
     if pace_ms == 0 || elapsed_ms >= pace_ms {
         return limit;
     }
     let released = (limit as f64 * (elapsed_ms as f64 / pace_ms as f64)) as u64;
-    released.saturating_add(PACE_BURST_BYTES).min(limit)
+    released
+        .saturating_add(PACE_BURST_BYTES.min(limit / 16))
+        .min(limit)
+}
+
+/// A captured selection: op, contract location bits, peer hash.
+type LiveSelection = (&'static str, u64, String);
+
+/// The sender-side order of decision-kind records, serialised by one mutex so
+/// that what reaches the channel matches the order of the decisions and drops
+/// it describes.
+struct DecisionOrder {
+    /// Selections whose most recent decision-kind record was a capture. An
+    /// uncaptured decision needs a line only for these: for any other
+    /// selection the most recent line is already uncaptured (or absent), so
+    /// the join discards (or never finds) its outcome anyway.
+    live: lru::LruCache<LiveSelection, ()>,
+    /// A decision-kind record was lost and no `decisions_dropped` mark has
+    /// reached the channel since.
+    unmarked_drop: bool,
 }
 
 /// Rank of every candidate under one model: a stable sort of distance order by
@@ -787,6 +876,11 @@ enum Record {
     Route(Box<RouteRecord>),
     Decision(Box<DecisionRecord>),
     DecisionUncaptured(Box<UncapturedDecision>),
+    /// Placed in the channel exactly where decision records were lost.
+    DecisionsDropped {
+        t_ms: u64,
+        total: u64,
+    },
     Peers {
         t_ms: u64,
         peers: Vec<PeerAttributes>,
@@ -801,10 +895,14 @@ pub(crate) struct RoutingDataset {
     /// could only ever be dropped.
     stopped: Arc<AtomicBool>,
     decisions: Arc<DecisionState>,
-    /// When this handle's run started, for pacing ([`now_ms`] clock).
-    run_start_ms: u64,
+    /// The first pacing reading, on the caller's injected clock.
+    pace_origin: std::sync::OnceLock<tokio::time::Instant>,
     /// Pacing period in ms; 0 disables pacing.
     pace_ms: u64,
+    /// Set by the first decision-kind record, after which every send takes
+    /// `order` so a drop mark precedes whatever follows the drop.
+    decisions_active: AtomicBool,
+    order: parking_lot::Mutex<DecisionOrder>,
 }
 
 impl std::fmt::Debug for RoutingDataset {
@@ -879,8 +977,16 @@ impl RoutingDataset {
                 limit: AtomicU64::new(u64::MAX),
                 ..DecisionState::default()
             }),
-            run_start_ms: now_ms(),
+            pace_origin: std::sync::OnceLock::new(),
             pace_ms: 0,
+            decisions_active: AtomicBool::new(false),
+            order: parking_lot::Mutex::new(DecisionOrder {
+                live: lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_LIVE_CAPTURED_SELECTIONS)
+                        .unwrap_or(std::num::NonZeroUsize::MIN),
+                ),
+                unmarked_drop: false,
+            }),
         };
         (dataset, rx)
     }
@@ -901,37 +1007,132 @@ impl RoutingDataset {
         self.is_recording() && !self.decisions.stopped.load(Ordering::Relaxed)
     }
 
+    /// Queue a captured decision, and remember its selected peers as live.
     pub(crate) fn record_decision(&self, record: DecisionRecord) {
-        self.send_decision(Record::Decision(Box::new(record)));
+        let selections: Vec<LiveSelection> = record
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.selected_position.is_some())
+            .map(|candidate| {
+                (
+                    record.op,
+                    record.contract_location.to_bits(),
+                    candidate.peer.clone(),
+                )
+            })
+            .collect();
+        self.decisions_active.store(true, Ordering::Relaxed);
+        let mut order = self.order.lock();
+        // A record that cannot be queued is lost before any mark is placed,
+        // so a mark always has a record behind it rather than a second loss.
+        if self.decisions.queued.load(Ordering::Relaxed) >= MAX_QUEUED_DECISIONS
+            || !self.mark_drops(&mut order)
+        {
+            self.lose_decision(&mut order);
+            return;
+        }
+        if !self.enqueue_decision(Record::Decision(Box::new(record))) {
+            order.unmarked_drop = true;
+            return;
+        }
+        for selection in selections {
+            let full = order.live.len() == order.live.cap().get();
+            if full && !order.live.contains(&selection) {
+                if let Some(((op, contract_bits, peer), ())) = order.live.pop_lru() {
+                    let expired = UncapturedDecision {
+                        t_ms: now_ms(),
+                        op,
+                        contract_location: f64::from_bits(contract_bits),
+                        reason: UncapturedReason::Expired,
+                        selected: vec![peer],
+                    };
+                    if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(expired))) {
+                        order.unmarked_drop = true;
+                    }
+                }
+            }
+            order.live.put(selection, ());
+        }
     }
 
-    pub(crate) fn record_uncaptured(&self, record: UncapturedDecision) {
-        self.send_decision(Record::DecisionUncaptured(Box::new(record)));
+    /// Queue an uncaptured decision, but only for its selections that are live
+    /// captures: those are the only outcomes it could otherwise mis-join. The
+    /// rest write nothing, which is what keeps these lines bounded by the
+    /// number of captures rather than by the decision rate.
+    pub(crate) fn record_uncaptured(&self, mut record: UncapturedDecision) {
+        self.decisions_active.store(true, Ordering::Relaxed);
+        let mut order = self.order.lock();
+        let contract_bits = record.contract_location.to_bits();
+        record.selected.retain(|peer| {
+            order
+                .live
+                .pop(&(record.op, contract_bits, peer.clone()))
+                .is_some()
+        });
+        if record.selected.is_empty() {
+            return;
+        }
+        // A record that cannot be queued is lost before any mark is placed,
+        // so a mark always has a record behind it rather than a second loss.
+        if self.decisions.queued.load(Ordering::Relaxed) >= MAX_QUEUED_DECISIONS
+            || !self.mark_drops(&mut order)
+        {
+            self.lose_decision(&mut order);
+            return;
+        }
+        if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(record))) {
+            order.unmarked_drop = true;
+        }
     }
 
-    /// Whether this run's paced allowance leaves room for a capture at
-    /// `now_ms`.
-    fn within_pace(&self, now_ms: u64) -> bool {
+    /// Whether this run's paced allowance leaves room for a capture at `now`,
+    /// on the caller's injected clock. The first reading is the origin.
+    fn within_pace(&self, now: tokio::time::Instant) -> bool {
+        let origin = *self.pace_origin.get_or_init(|| now);
+        let elapsed = now.saturating_duration_since(origin).as_millis() as u64;
         let limit = self.decisions.limit.load(Ordering::Relaxed);
-        let elapsed = now_ms.saturating_sub(self.run_start_ms);
         self.decisions.written.load(Ordering::Relaxed)
             < paced_allowance(limit, elapsed, self.pace_ms)
     }
 
-    /// Queue a decision-kind record, unless [`MAX_QUEUED_DECISIONS`] are
-    /// already waiting. Every refusal counts as a DECISION drop, never a route
-    /// drop.
-    fn send_decision(&self, record: Record) {
+    /// Put a `decisions_dropped` mark in the channel if a loss is unmarked.
+    /// `false` when it did not fit, in which case nothing may follow it.
+    fn mark_drops(&self, order: &mut DecisionOrder) -> bool {
+        if !order.unmarked_drop {
+            return true;
+        }
+        let mark = Record::DecisionsDropped {
+            t_ms: now_ms(),
+            total: self.decisions.dropped.load(Ordering::Relaxed),
+        };
+        if self.tx.try_send(mark).is_err() {
+            return false;
+        }
+        order.unmarked_drop = false;
+        true
+    }
+
+    fn lose_decision(&self, order: &mut DecisionOrder) {
+        self.decisions.dropped.fetch_add(1, Ordering::Relaxed);
+        order.unmarked_drop = true;
+    }
+
+    /// Enqueue a decision-kind record within [`MAX_QUEUED_DECISIONS`]. A
+    /// refusal counts as a DECISION drop, never a route drop; the caller marks
+    /// it.
+    fn enqueue_decision(&self, record: Record) -> bool {
         let decisions = &self.decisions;
         if decisions.queued.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_DECISIONS {
             decisions.queued.fetch_sub(1, Ordering::Relaxed);
             decisions.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         if self.tx.try_send(record).is_err() {
             decisions.queued.fetch_sub(1, Ordering::Relaxed);
             decisions.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        true
     }
 
     pub(crate) fn record_peers(&self, t_ms: u64, peers: Vec<PeerAttributes>) {
@@ -939,6 +1140,22 @@ impl RoutingDataset {
     }
 
     fn send(&self, record: Record) {
+        // Once decisions are being logged, a pending drop mark must reach the
+        // channel before this record, or the record is lost with it: a route
+        // line ahead of the mark would let its outcome join across the gap.
+        if self.decisions_active.load(Ordering::Relaxed) {
+            let mut order = self.order.lock();
+            if !self.mark_drops(&mut order) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            self.try_send_counted(record);
+            return;
+        }
+        self.try_send_counted(record);
+    }
+
+    fn try_send_counted(&self, record: Record) {
         match self.tx.try_send(record) {
             Ok(()) => {}
             // Full: drop and count — never wait under the router lock.
@@ -975,7 +1192,6 @@ struct Writer {
     /// This run's decision-line budget, fixed at start (see [`Limits`]).
     decision_limit: u64,
     decision_written: u64,
-    reported_decision_drops: u64,
 }
 
 /// The byte limits a writer runs under.
@@ -1023,8 +1239,6 @@ impl Writer {
             decisions.dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        // A drop before this line is marked before it, so a join cannot cross it.
-        self.report_decision_drops(decisions)?;
         let Some(bytes) = encode(line) else {
             return Ok(());
         };
@@ -1054,30 +1268,17 @@ impl Writer {
             max_bytes: self.decision_limit,
             decisions_dropped_total: decisions.dropped.load(Ordering::Relaxed),
         };
-        // May use the marker reserve; if even that is gone, stay silent.
+        // May use the marker reserve; if even that is gone, stay silent. Its
+        // bytes count as decision bytes.
+        let before = self.written;
         match self.line_within(&marker, self.max_bytes) {
-            Ok(()) | Err(WriteError::Cap) => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Write a `decisions_dropped` line when decision records have been lost
-    /// since the last one. Never stops the recorder: a full file just skips it.
-    fn report_decision_drops(&mut self, decisions: &DecisionState) -> Result<(), WriteError> {
-        let total = decisions.dropped.load(Ordering::Relaxed);
-        if total == self.reported_decision_drops || decisions.stopped.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let line = Line::DecisionsDropped {
-            t_ms: now_ms(),
-            total,
-        };
-        match self.line_within(&line, self.max_bytes.saturating_sub(MARKER_RESERVE)) {
-            Ok(()) => {
-                self.reported_decision_drops = total;
+            Ok(()) | Err(WriteError::Cap) => {
+                self.decision_written += self.written - before;
+                decisions
+                    .written
+                    .store(self.decision_written, Ordering::Relaxed);
                 Ok(())
             }
-            Err(WriteError::Cap) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -1110,6 +1311,15 @@ impl Writer {
             }
             Record::DecisionUncaptured(decision) => {
                 return self.decision_line(&Line::DecisionUncaptured(decision), decisions);
+            }
+            Record::DecisionsDropped { t_ms, total } => {
+                return self.decision_line(
+                    &Line::DecisionsDropped {
+                        t_ms: *t_ms,
+                        total: *total,
+                    },
+                    decisions,
+                );
             }
             Record::Peers { t_ms, peers } => self.line(&Line::Peers { t_ms: *t_ms, peers }),
         };
@@ -1180,7 +1390,6 @@ fn run_writer(
         reported_dropped: 0,
         decision_limit: 0,
         decision_written: 0,
-        reported_decision_drops: 0,
     };
     writer.line(&Line::Start {
         t_ms: now_ms(),
@@ -1247,6 +1456,8 @@ fn count_undelivered(rx: &Receiver<Record>, dropped: &AtomicU64, decisions: &Dec
             Record::Route(_) | Record::Peers { .. } => {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
+            // A mark lost with the rest needs no count of its own.
+            Record::DecisionsDropped { .. } => {}
         }
     }
 }
@@ -1264,7 +1475,6 @@ fn drain(
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
         writer.report_drops(dropped)?;
-        writer.report_decision_drops(decisions)?;
         if let Some(record) = first {
             writer.record(&record, dropped, decisions)?;
             // Take whatever else is already queued, then flush: a busy node is
@@ -1416,15 +1626,15 @@ pub(crate) fn global() -> Option<&'static RoutingDataset> {
 // like the routing flag overrides, so parallel tests cannot see each other's.
 #[cfg(test)]
 thread_local! {
-    static TEST_CANDIDATE_LOG: std::cell::Cell<Option<(&'static RoutingDataset, f64)>> =
-        const { std::cell::Cell::new(None) };
+    static TEST_CANDIDATE_LOG: std::cell::RefCell<Option<(Arc<RoutingDataset>, f64)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Route candidate logging on this thread to `recorder` at `rate` (captures
 /// are never drawn below rate 1) until the guard drops.
 #[cfg(test)]
 pub(crate) fn force_candidate_log(
-    recorder: &'static RoutingDataset,
+    recorder: Arc<RoutingDataset>,
     rate: f64,
 ) -> CandidateLogOverrideGuard {
     let previous = TEST_CANDIDATE_LOG.with(|cell| cell.replace(Some((recorder, rate))));
@@ -1433,22 +1643,23 @@ pub(crate) fn force_candidate_log(
 
 #[cfg(test)]
 pub(crate) struct CandidateLogOverrideGuard {
-    previous: Option<(&'static RoutingDataset, f64)>,
+    previous: Option<(Arc<RoutingDataset>, f64)>,
 }
 
 #[cfg(test)]
 impl Drop for CandidateLogOverrideGuard {
     fn drop(&mut self) {
-        TEST_CANDIDATE_LOG.with(|cell| cell.set(self.previous));
+        let previous = self.previous.take();
+        TEST_CANDIDATE_LOG.with(|cell| *cell.borrow_mut() = previous);
     }
 }
 
-/// The process's candidate-logging recorder and rate: the operator's settings,
-/// or a test override.
-fn candidate_settings() -> (Option<&'static RoutingDataset>, f64) {
+/// The process's candidate-logging recorder and rate, and whether the rate is
+/// a test override (which never draws a capture below 1).
+fn candidate_settings() -> (Option<RecorderRef<'static>>, f64, bool) {
     #[cfg(test)]
-    if let Some((recorder, rate)) = TEST_CANDIDATE_LOG.with(std::cell::Cell::get) {
-        return (Some(recorder), rate);
+    if let Some((recorder, rate)) = TEST_CANDIDATE_LOG.with(|cell| cell.borrow().clone()) {
+        return (Some(RecorderRef::Shared(recorder)), rate, true);
     }
     static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     let rate = *RATE.get_or_init(|| {
@@ -1462,27 +1673,28 @@ fn candidate_settings() -> (Option<&'static RoutingDataset>, f64) {
         rate
     });
     if rate <= 0.0 {
-        return (None, rate);
+        return (None, rate, false);
     }
-    (global(), rate)
+    (global().map(RecorderRef::Borrowed), rate, false)
 }
 
 /// Candidate logging for the routing decision about to be made, decided before
 /// the router lock is taken: the process recorder, only while it is capturing
 /// decisions and only when [`DATASET_CANDIDATES_ENV`] enables it, with this
-/// decision drawn at the sampling rate and checked against the run's pacing.
-/// `None` costs routing nothing further.
-pub(crate) fn candidate_log() -> Option<CandidateLog<'static>> {
-    #[cfg(test)]
-    if let Some((recorder, rate)) = TEST_CANDIDATE_LOG.with(std::cell::Cell::get) {
-        return candidate_log_from(rate, || Some(recorder), |_| false, now_ms);
+/// decision drawn at the sampling rate and checked against the run's pacing on
+/// `now`, the caller's injected clock. `None` costs routing nothing further.
+pub(crate) fn candidate_log(
+    now: impl FnOnce() -> tokio::time::Instant,
+) -> Option<CandidateLog<'static>> {
+    let (recorder, rate, overridden) = candidate_settings();
+    if overridden {
+        return candidate_log_from(rate, || recorder, |_| false, now);
     }
-    let (recorder, rate) = candidate_settings();
     candidate_log_from(
         rate,
         || recorder,
         crate::config::GlobalRng::random_bool,
-        now_ms,
+        now,
     )
 }
 
@@ -1490,9 +1702,9 @@ pub(crate) fn candidate_log() -> Option<CandidateLog<'static>> {
 /// the sampler nor the clock is consulted while the rate is zero.
 pub(crate) fn candidate_log_from<'a>(
     rate: f64,
-    recorder: impl FnOnce() -> Option<&'a RoutingDataset>,
+    recorder: impl FnOnce() -> Option<RecorderRef<'a>>,
     sample: impl FnOnce(f64) -> bool,
-    now: impl FnOnce() -> u64,
+    now: impl FnOnce() -> tokio::time::Instant,
 ) -> Option<CandidateLog<'a>> {
     if rate <= 0.0 {
         return None;
@@ -1521,7 +1733,7 @@ pub(crate) fn record_bypass(
     peer: &PeerKeyLocation,
     reason: UncapturedReason,
 ) {
-    let (Some(recorder), rate) = candidate_settings() else {
+    let (Some(recorder), rate, _) = candidate_settings() else {
         return;
     };
     if rate <= 0.0 || !recorder.is_capturing_decisions() {
@@ -2101,7 +2313,7 @@ mod tests {
     }
 
     /// Run a writer synchronously over `records`, queued in order, appending
-    /// to `path`. Returns the handle's counters.
+    /// to `path`. Returns a handle carrying the run's counters.
     fn run_records(
         path: &Path,
         limits: Limits,
@@ -2119,29 +2331,54 @@ mod tests {
             dataset.stopped.clone(),
             dataset.decisions.clone(),
         );
-        let RoutingDataset {
-            tx,
-            run_start_ms,
-            pace_ms,
-            ..
-        } = dataset;
-        drop(tx);
+        // Disconnect the channel so the writer returns once drained.
+        drop(dataset);
         write_loop(rx, file, limits, &dropped, &stopped, &decisions);
-        let (tx, _rx) = sync_channel(0);
-        RoutingDataset {
-            tx,
-            dropped,
-            stopped,
-            decisions,
-            run_start_ms,
-            pace_ms,
-        }
+        let (mut counters, _rx) = RoutingDataset::unstarted();
+        counters.dropped = dropped;
+        counters.stopped = stopped;
+        counters.decisions = decisions;
+        counters
     }
 
     fn decision(peers: &[PeerKeyLocation]) -> DecisionRecord {
         let costs: Vec<Option<f64>> = (0..peers.len()).map(|i| Some(i as f64)).collect();
         capture(peers, &costs, &costs, &[(0, 0)])
             .into_record(crate::node::network_status::OpType::Get, 1)
+    }
+
+    /// A GET decision at contract 0.5 (the `capture` helper's contract) that
+    /// selected `selected`.
+    fn selecting(peers: &[PeerKeyLocation], selected: &[usize]) -> DecisionRecord {
+        let costs: Vec<Option<f64>> = (0..peers.len()).map(|i| Some(i as f64)).collect();
+        let positions: Vec<(usize, usize)> = selected
+            .iter()
+            .enumerate()
+            .map(|(position, &index)| (index, position))
+            .collect();
+        capture(peers, &costs, &costs, &positions)
+            .into_record(crate::node::network_status::OpType::Get, 1)
+    }
+
+    fn uncaptured(selected: &[&PeerKeyLocation]) -> UncapturedDecision {
+        UncapturedDecision {
+            t_ms: 1,
+            op: "GET",
+            contract_location: 0.5,
+            reason: UncapturedReason::SampledOut,
+            selected: selected.iter().map(|peer| peer_hash(peer)).collect(),
+        }
+    }
+
+    /// Bytes of the decision-kind lines (`decision`, `decision_uncaptured`,
+    /// `decisions_dropped`, `decisions_truncated`) in the file.
+    fn decision_kind_bytes(path: &Path) -> u64 {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(r#""kind":"decision"#))
+            .map(|line| line.len() as u64 + 1)
+            .sum()
     }
 
     fn kinds_of(lines: &[serde_json::Value], kind: &str) -> usize {
@@ -2161,12 +2398,13 @@ mod tests {
         let (spent, _rx) = RoutingDataset::unstarted();
         spent.decisions.stopped.store(true, Ordering::Relaxed);
         let never = |_: f64| -> bool { panic!("must not sample") };
-        let no_clock = || -> u64 { panic!("must not read the clock") };
+        let no_clock = || -> tokio::time::Instant { panic!("must not read the clock") };
+        let now = tokio::time::Instant::now;
 
         assert!(
             candidate_log_from(
                 0.0,
-                || -> Option<&RoutingDataset> {
+                || -> Option<RecorderRef<'_>> {
                     panic!("a disabled switch must not even look the recorder up")
                 },
                 never,
@@ -2176,20 +2414,20 @@ mod tests {
         );
         assert!(candidate_log_from(1.0, || None, never, no_clock).is_none());
         assert!(
-            candidate_log_from(1.0, || Some(&stopped), never, no_clock).is_none(),
+            candidate_log_from(1.0, || Some((&stopped).into()), never, no_clock).is_none(),
             "a recorder that stopped must stop candidate capture too"
         );
         assert!(
             spent.is_recording()
-                && candidate_log_from(1.0, || Some(&spent), never, no_clock).is_none(),
+                && candidate_log_from(1.0, || Some((&spent).into()), never, no_clock).is_none(),
             "spent decision capture stops while recording goes on"
         );
         // Unpaced: rate 1 captures without drawing.
-        let all = candidate_log_from(1.0, || Some(&recording), never, || 0).unwrap();
+        let all = candidate_log_from(1.0, || Some((&recording).into()), never, now).unwrap();
         assert!(all.capture);
         let drawn = candidate_log_from(
             0.25,
-            || Some(&recording),
+            || Some((&recording).into()),
             |rate| {
                 assert_eq!(rate, 0.25);
                 false
@@ -2203,7 +2441,7 @@ mod tests {
         );
         assert_eq!(drawn.skipped, UncapturedReason::SampledOut);
         assert!(
-            candidate_log_from(0.25, || Some(&recording), |_| true, || 0)
+            candidate_log_from(0.25, || Some((&recording).into()), |_| true, now)
                 .unwrap()
                 .capture
         );
@@ -2215,10 +2453,11 @@ mod tests {
     #[test]
     fn decisions_before_the_writer_starts_are_not_paced() {
         let (mut recorder, _rx) = RoutingDataset::unstarted();
-        assert!(recorder.within_pace(recorder.run_start_ms), "unpaced");
+        let now = tokio::time::Instant::now();
+        assert!(recorder.within_pace(now), "unpaced");
         recorder.pace_ms = 3_600_000;
         assert!(
-            recorder.within_pace(recorder.run_start_ms),
+            recorder.within_pace(now),
             "paced: the burst is available at once"
         );
     }
@@ -2236,111 +2475,219 @@ mod tests {
             "a zero period disables pacing"
         );
         assert_eq!(
-            paced_allowance(1000, 0, 1000),
+            paced_allowance(16_000, 0, 1000),
             1000,
-            "the burst never exceeds the budget"
+            "the burst is at most a sixteenth of a small budget"
         );
     }
 
     /// Pacing is what keeps the sample from being spent in the cold-router
-    /// hours right after a start.
+    /// hours right after a start; its clock is the caller's.
     #[test]
     fn captures_over_the_paced_allowance_are_written_uncaptured() {
         const LIMIT: u64 = 1024 * 1024 * 1024;
         const PACE_MS: u64 = 3_600_000;
         let (mut recorder, _rx) = RoutingDataset::unstarted();
         recorder.pace_ms = PACE_MS;
-        recorder.run_start_ms = 1_000;
         recorder.decisions.limit.store(LIMIT, Ordering::Relaxed);
         recorder
             .decisions
             .written
             .store(PACE_BURST_BYTES + LIMIT / 4, Ordering::Relaxed);
-        let at =
-            |now_ms: u64| candidate_log_from(1.0, || Some(&recorder), |_| true, || now_ms).unwrap();
+        let origin = tokio::time::Instant::now();
+        let at = |ms: u64| {
+            candidate_log_from(
+                1.0,
+                || Some((&recorder).into()),
+                |_| true,
+                || origin + Duration::from_millis(ms),
+            )
+            .unwrap()
+        };
 
-        let early = at(1_000 + PACE_MS / 10);
+        assert!(!at(0).capture, "the first reading is the origin");
+        let early = at(PACE_MS / 10);
         assert!(
             !early.capture,
             "a quarter of the budget spent a tenth of the way in"
         );
         assert_eq!(early.skipped, UncapturedReason::Paced);
         assert!(
-            at(1_000 + PACE_MS / 2).capture,
+            at(PACE_MS / 2).capture,
             "half the budget released by half-time"
         );
-        assert!(at(1_000 + 2 * PACE_MS).capture);
+        assert!(at(2 * PACE_MS).capture);
     }
 
     #[test]
-    fn an_uncaptured_decision_writes_its_reason_and_an_empty_selection_nothing() {
+    fn an_uncaptured_decision_writes_its_reason_for_live_captures_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing.jsonl");
         let dataset = RoutingDataset::open(&path, DEFAULT_MAX_BYTES).unwrap();
         let peers = peers(2);
-        let selected = [&peers[1], &peers[0]];
         let log = |capture, skipped| CandidateLog {
-            recorder: &dataset,
+            recorder: (&dataset).into(),
             capture,
             skipped,
         };
-        let loc = crate::ring::Location::new(0.25);
+        let loc = crate::ring::Location::new(0.5);
+        let get = crate::node::network_status::OpType::Get;
+
+        dataset.record_decision(selecting(&peers, &[0, 1]));
         log(false, UncapturedReason::SampledOut).record(
-            crate::node::network_status::OpType::Put,
+            get,
             loc,
-            &selected,
+            &[&peers[1], &peers[0]],
             false,
             None,
         );
-        log(false, UncapturedReason::Paced).record(
-            crate::node::network_status::OpType::Get,
-            loc,
-            &selected[..1],
-            false,
-            None,
-        );
+        // Neither selection is a live capture any more: nothing to mis-join.
+        log(false, UncapturedReason::SampledOut).record(get, loc, &[&peers[0]], false, None);
+        dataset.record_decision(selecting(&peers, &[0, 1]));
+        log(false, UncapturedReason::Paced).record(get, loc, &[&peers[0]], false, None);
         // Distance-based wins over the sampling outcome: it says why no
         // candidate set could exist at all.
-        log(false, UncapturedReason::SampledOut).record(
-            crate::node::network_status::OpType::Get,
-            loc,
-            &selected[..1],
-            true,
-            None,
-        );
+        log(false, UncapturedReason::SampledOut).record(get, loc, &[&peers[1]], true, None);
         // A selection that returned nobody routes nowhere: no line.
-        log(true, UncapturedReason::SampledOut).record(
-            crate::node::network_status::OpType::Get,
-            loc,
-            &[],
-            false,
-            None,
-        );
+        log(true, UncapturedReason::SampledOut).record(get, loc, &[], false, None);
         dataset.record_route(route("00000000000000ee"));
         drop(dataset);
 
-        let lines = lines_eventually(&path, |lines| lines.len() >= 5);
+        let lines = lines_eventually(&path, |lines| kinds_of(lines, "route") == 1);
         let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
         assert_eq!(
             kinds,
             [
                 "start",
+                "decision",
                 "decision_uncaptured",
+                "decision",
                 "decision_uncaptured",
                 "decision_uncaptured",
                 "route"
             ]
         );
-        assert_eq!(lines[1]["op"], "PUT");
-        assert_eq!(lines[1]["contract_location"], 0.25);
-        assert_eq!(lines[1]["reason"], "sampled_out");
+        assert_eq!(lines[2]["op"], "GET");
+        assert_eq!(lines[2]["contract_location"], 0.5);
+        assert_eq!(lines[2]["reason"], "sampled_out");
         assert_eq!(
-            lines[1]["selected"],
+            lines[2]["selected"],
             serde_json::json!([peer_hash(&peers[1]), peer_hash(&peers[0])]),
             "selected peers in the router's order"
         );
-        assert_eq!(lines[2]["reason"], "paced");
-        assert_eq!(lines[3]["reason"], "distance_based");
+        assert_eq!(lines[4]["reason"], "paced");
+        assert_eq!(lines[5]["reason"], "distance_based");
+    }
+
+    /// Uncaptured lines exist only to stop an outcome joining a capture, so
+    /// there must be at most one per captured selection, whatever the decision
+    /// rate: otherwise they crowd captures out of the paced allowance.
+    #[test]
+    fn uncaptured_lines_are_bounded_by_captures_not_by_the_decision_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let peers = peers(50);
+        run_records(
+            &path,
+            Limits {
+                max_bytes: DEFAULT_MAX_BYTES,
+                decision_max_bytes: DEFAULT_CANDIDATES_MAX_BYTES,
+            },
+            |dataset| {
+                for i in 0..10_000 {
+                    dataset.record_uncaptured(uncaptured(&[&peers[i % peers.len()]]));
+                }
+                dataset.record_decision(selecting(&peers, &[7]));
+                for i in 0..1_000 {
+                    let mut other_op = uncaptured(&[&peers[7]]);
+                    other_op.op = "PUT";
+                    dataset.record_uncaptured(other_op);
+                    dataset.record_uncaptured(uncaptured(&[&peers[7], &peers[i % peers.len()]]));
+                }
+            },
+        );
+        let lines = read_lines(&path);
+        assert_eq!(kinds_of(&lines, "decision"), 1);
+        assert_eq!(
+            kinds_of(&lines, "decision_uncaptured"),
+            1,
+            "one per captured selection"
+        );
+        let stub = lines
+            .iter()
+            .find(|l| l["kind"] == "decision_uncaptured")
+            .unwrap();
+        assert_eq!(stub["selected"], serde_json::json!([peer_hash(&peers[7])]));
+    }
+
+    /// Captures must keep coming after the burst at a decision rate where
+    /// per-decision stub lines alone would outrun the paced allowance.
+    #[test]
+    fn captures_continue_past_the_burst_at_a_high_decision_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.path().join("routing.jsonl"))
+            .unwrap();
+        const LIMIT: u64 = 400_000;
+        let (mut recorder, rx) = RoutingDataset::unstarted();
+        recorder.pace_ms = 1_000_000;
+        recorder.decisions.limit.store(LIMIT, Ordering::Relaxed);
+        let mut writer = Writer {
+            out: BufWriter::new(file),
+            written: 0,
+            max_bytes: u64::MAX,
+            reported_dropped: 0,
+            decision_limit: LIMIT,
+            decision_written: 0,
+        };
+        let dropped = AtomicU64::new(0);
+        let peers = peers(50);
+        let origin = tokio::time::Instant::now();
+        let get = crate::node::network_status::OpType::Get;
+        let loc = crate::ring::Location::new(0.5);
+        const DECISIONS: u64 = 20_000; // 20 per second over the 1000 s period
+        let mut late_captures = 0;
+        let mut logged_until = DECISIONS;
+        for i in 0..DECISIONS {
+            let peer = &peers[(i as usize * 7) % peers.len()];
+            let now = origin + Duration::from_millis(i * 50);
+            let Some(log) =
+                candidate_log_from(0.05, || Some((&recorder).into()), |_| i % 20 == 0, || now)
+            else {
+                logged_until = i;
+                break;
+            };
+            if log.capture {
+                recorder.record_decision(decision(std::slice::from_ref(peer)));
+                if i >= DECISIONS / 2 {
+                    late_captures += 1;
+                }
+            } else {
+                log.record(get, loc, &[peer], false, None);
+            }
+            for record in rx.try_iter() {
+                assert!(
+                    writer
+                        .record(
+                            &taken(record, &recorder.decisions),
+                            &dropped,
+                            &recorder.decisions,
+                        )
+                        .is_ok(),
+                    "decision lines never stop the writer"
+                );
+            }
+        }
+        assert!(
+            late_captures > 50,
+            "captures in the second half of the period: {late_captures}"
+        );
+        assert!(
+            logged_until >= DECISIONS * 9 / 10,
+            "the budget lasted into the last tenth of the period: stopped at {logged_until}"
+        );
     }
 
     #[test]
@@ -2358,8 +2705,11 @@ mod tests {
         }
     }
 
+    /// A lost decision must be marked exactly where the loss sits in the record
+    /// stream: after everything enqueued before it (the backlog), before
+    /// anything enqueued after it, route lines included.
     #[test]
-    fn queued_decisions_are_bounded_and_every_loss_is_marked_before_the_next_decision() {
+    fn a_lost_decision_is_marked_at_its_place_in_the_record_stream() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing.jsonl");
         let peers = peers(1);
@@ -2381,6 +2731,7 @@ mod tests {
                     dataset.decisions.queued.load(Ordering::Relaxed),
                     MAX_QUEUED_DECISIONS
                 );
+                dataset.record_route(route("00000000000000aa"));
             },
         );
         assert_eq!(
@@ -2389,24 +2740,20 @@ mod tests {
             "every written decision frees its slot"
         );
         let lines = read_lines(&path);
-        assert_eq!(kinds_of(&lines, "decision"), MAX_QUEUED_DECISIONS);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        let mut expected = vec!["start"];
+        expected.extend(std::iter::repeat_n("decision", MAX_QUEUED_DECISIONS));
+        expected.extend(["decisions_dropped", "route"]);
         assert_eq!(
-            kinds_of(&lines, "dropped"),
-            0,
-            "decision drops must not mark the route stream incomplete"
+            kinds, expected,
+            "the mark sits after the backlog, before the route"
         );
-        let marks: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line["kind"] == "decisions_dropped")
-            .map(|(index, _)| index)
-            .collect();
-        assert_eq!(marks.len(), 1, "{:?}", &lines[..3]);
-        assert_eq!(lines[marks[0]]["total"], OVER as u64);
-        let first_decision = lines.iter().position(|l| l["kind"] == "decision").unwrap();
-        assert!(
-            marks[0] < first_decision,
-            "a loss must be marked before any later decision a join could cross it to"
+        assert_eq!(lines[1 + MAX_QUEUED_DECISIONS]["total"], OVER as u64);
+        assert_eq!(kinds_of(&lines, "dropped"), 0);
+        assert_eq!(
+            dataset.decisions.written.load(Ordering::Relaxed),
+            decision_kind_bytes(&path),
+            "the drop mark is charged as decision bytes"
         );
     }
 
@@ -2459,6 +2806,54 @@ mod tests {
         assert_eq!(
             dataset.decisions_dropped(),
             (DECISIONS - decision_lines) as u64
+        );
+        assert_eq!(
+            dataset.decisions.written.load(Ordering::Relaxed),
+            decision_kind_bytes(&path),
+            "the stop marker is charged as decision bytes"
+        );
+    }
+
+    /// A capture that falls out of the table that detects later decisions for
+    /// it is closed with an `expired` line, so a later decision cannot go
+    /// undetected and let its outcome join the capture.
+    #[test]
+    fn a_capture_evicted_from_the_live_table_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let peers = peers(3);
+        run_records(
+            &path,
+            Limits {
+                max_bytes: DEFAULT_MAX_BYTES,
+                decision_max_bytes: DEFAULT_CANDIDATES_MAX_BYTES,
+            },
+            |dataset| {
+                dataset.order.lock().live =
+                    lru::LruCache::new(std::num::NonZeroUsize::new(2).unwrap());
+                for index in 0..3 {
+                    dataset.record_decision(selecting(&peers, &[index]));
+                }
+                // Peer 0 is closed already: its later decision writes nothing.
+                dataset.record_uncaptured(uncaptured(&[&peers[0]]));
+            },
+        );
+        let lines = read_lines(&path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision",
+                "decision",
+                "decision_uncaptured"
+            ]
+        );
+        assert_eq!(lines[4]["reason"], "expired");
+        assert_eq!(
+            lines[4]["selected"],
+            serde_json::json!([peer_hash(&peers[0])])
         );
     }
 

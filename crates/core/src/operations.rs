@@ -1762,3 +1762,250 @@ mod terminal_consult_tests {
         GlobalTestMetrics::reset();
     }
 }
+
+/// Source pins for the routing dataset's call-site classification (#4485).
+///
+/// Which ring selections are routing decisions (`DecisionLog::Joinable`), which
+/// are not (`Unlogged`), and which routes bypass ring selection
+/// (`record_bypass`) decide whether a replay can join an outcome to the decision
+/// that produced it. A wrong classification fails nothing at runtime: outcomes
+/// silently join the wrong decision. The GET sites also have a behavioural test
+/// (`get::op_ctx_task::candidate_log_call_site_tests`); these pins cover every
+/// site, and fail when a site is added without being classified here.
+#[cfg(test)]
+mod routing_dataset_call_site_pins {
+    const GET: &str = include_str!("operations/get/op_ctx_task.rs");
+    const PUT: &str = include_str!("operations/put/op_ctx_task.rs");
+    const SUBSCRIBE_DRIVER: &str = include_str!("operations/subscribe/op_ctx_task.rs");
+    const SUBSCRIBE: &str = include_str!("operations/subscribe.rs");
+    const UPDATE: &str = include_str!("operations/update/op_ctx_task.rs");
+
+    /// Production code only: everything before the file's first test module,
+    /// with `//` comments removed (so a commented-out call does not count) and
+    /// all whitespace removed (so rustfmt's line breaks do not matter).
+    fn production(src: &str) -> String {
+        let end = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
+        squash(&src[..end])
+    }
+
+    /// The body of the one function called `name` in `src`'s production code,
+    /// from its signature to its closing brace at the signature's indentation.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let end_of_production = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
+        let production = &src[..end_of_production];
+        // `fn name(` or a generic `fn name<`.
+        let signatures: Vec<usize> = production
+            .match_indices(&format!("fn {name}"))
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                matches!(
+                    production[at + 3 + name.len()..].chars().next(),
+                    Some('(') | Some('<')
+                )
+            })
+            .filter(|&at| {
+                let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
+                let prefix = production[line_start..at].trim_start();
+                prefix.is_empty() || prefix.ends_with("async ") || prefix.starts_with("pub")
+            })
+            .collect();
+        assert_eq!(signatures.len(), 1, "exactly one production `fn {name}(`");
+        let at = signatures[0];
+        let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
+        let indent: String = production[line_start..]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .collect();
+        let close = format!("\n{indent}}}\n");
+        let end = production[at..]
+            .find(&close)
+            .unwrap_or_else(|| panic!("no closing brace for `fn {name}(`"));
+        &production[at..at + end]
+    }
+
+    /// Comments and whitespace removed, and rustfmt's trailing commas before a
+    /// closing parenthesis, so a call reads the same however it was wrapped.
+    fn squash(code: &str) -> String {
+        code.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+            .collect::<String>()
+            .replace(",)", ")")
+    }
+
+    const JOINABLE: &str = "crate::router::dataset::DecisionLog::Joinable(";
+    const UNLOGGED: &str = "crate::router::dataset::DecisionLog::Unlogged";
+    const BYPASS: &str = "crate::router::dataset::record_bypass(";
+
+    fn joinable(op: &str) -> String {
+        format!("{JOINABLE}crate::node::network_status::OpType::{op})")
+    }
+
+    fn reason(name: &str) -> String {
+        // The last argument of `record_bypass(..)`.
+        format!("crate::router::dataset::UncapturedReason::{name})")
+    }
+
+    struct Site {
+        name: &'static str,
+        /// `Joinable(op)` arguments.
+        joinable: usize,
+        unlogged: usize,
+        /// `record_bypass` calls, by reason.
+        bypasses: &'static [&'static str],
+    }
+
+    const fn site(
+        name: &'static str,
+        joinable: usize,
+        unlogged: usize,
+        bypasses: &'static [&'static str],
+    ) -> Site {
+        Site {
+            name,
+            joinable,
+            unlogged,
+            bypasses,
+        }
+    }
+
+    fn check(file: &str, src: &str, op: &str, sites: &[Site]) {
+        for site in sites {
+            let body = squash(fn_body(src, site.name));
+            let context = format!("{file}::{}", site.name);
+            assert_eq!(
+                body.matches(&joinable(op)).count(),
+                site.joinable,
+                "{context}: Joinable({op}) selections"
+            );
+            assert_eq!(
+                body.matches(JOINABLE).count(),
+                site.joinable,
+                "{context}: every Joinable selection is for {op}"
+            );
+            assert_eq!(
+                body.matches(UNLOGGED).count(),
+                site.unlogged,
+                "{context}: Unlogged"
+            );
+            assert_eq!(
+                body.matches(BYPASS).count(),
+                site.bypasses.len(),
+                "{context}: bypass lines"
+            );
+            for name in site.bypasses {
+                assert!(
+                    body.contains(&reason(name)),
+                    "{context}: bypass reason {name}"
+                );
+            }
+        }
+        // Every classified site in the file is in the table above.
+        let whole = production(src);
+        let expect = |f: fn(&Site) -> usize| sites.iter().map(f).sum::<usize>();
+        assert_eq!(
+            whole.matches(JOINABLE).count(),
+            expect(|s| s.joinable),
+            "{file}: a Joinable site missing from the table"
+        );
+        assert_eq!(
+            whole.matches(BYPASS).count(),
+            expect(|s| s.bypasses.len()),
+            "{file}: a bypass site missing from the table"
+        );
+    }
+
+    #[test]
+    fn get_sites_are_classified() {
+        check(
+            "get",
+            GET,
+            "Get",
+            &[
+                site("drive_client_get_inner", 0, 1, &[]),
+                site("fallback_target", 0, 1, &[]),
+                site("advance_to_next_peer", 0, 1, &[]),
+                site("drive_sub_op_get", 0, 1, &[]),
+                site("first_hop_candidate", 0, 1, &[]),
+                site(
+                    "relay_advance_to_next_peer",
+                    1,
+                    0,
+                    &["PinnedFirstHop", "BootstrapGateway"],
+                ),
+                site("drive_relay_get_inner", 0, 0, &["TerminalConsult"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn put_sites_are_classified() {
+        check(
+            "put",
+            PUT,
+            "Put",
+            &[
+                site("drive_client_put_inner", 0, 1, &[]),
+                site("advance_to_next_peer", 0, 1, &[]),
+                site("drive_relay_put", 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_put_streaming", 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_probe", 0, 1, &[]),
+                site("drive_relay_probe_reconcile", 0, 1, &[]),
+            ],
+        );
+    }
+
+    #[test]
+    fn subscribe_sites_are_classified() {
+        check(
+            "subscribe driver",
+            SUBSCRIBE_DRIVER,
+            "Subscribe",
+            &[
+                site("run_executor_subscribe", 0, 1, &[]),
+                site("drive_client_subscribe_inner", 1, 0, &[]),
+                site("advance_to_next_peer", 1, 0, &[]),
+                site("drive_relay_subscribe", 1, 0, &["TerminalConsult"]),
+            ],
+        );
+        check(
+            "subscribe",
+            SUBSCRIBE,
+            "Subscribe",
+            &[site(
+                "prepare_initial_request",
+                0,
+                // The three bypass guards compare against `Unlogged`.
+                3,
+                &[
+                    "DirectedFirstHop",
+                    "AnyConnectionFallback",
+                    "BootstrapGateway",
+                ],
+            )],
+        );
+        // The selection logs as its caller says, and a pre-check writes no
+        // bypass lines either.
+        let body = squash(fn_body(SUBSCRIBE, "prepare_initial_request"));
+        assert!(body.contains("k_closest_potentially_hosting(log_as,"));
+        assert_eq!(
+            body.matches(&format!("iflog_as!={UNLOGGED}{{{BYPASS}"))
+                .count(),
+            3,
+            "every bypass is skipped for a pre-check"
+        );
+    }
+
+    #[test]
+    fn update_sites_are_never_logged() {
+        check(
+            "update",
+            UPDATE,
+            "Update",
+            &[
+                site("drive_client_update", 0, 1, &[]),
+                site("drive_relay_request_update", 0, 2, &[]),
+            ],
+        );
+    }
+}

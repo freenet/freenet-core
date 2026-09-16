@@ -540,6 +540,9 @@ pub(crate) async fn run_executor_subscribe(
         instance_id,
         /* is_renewal */ false,
         /* first_hop */ None,
+        // A pre-check: the network case re-selects in the inner driver, which
+        // is the decision that routes.
+        crate::router::dataset::DecisionLog::Unlogged,
     )
     .await
     {
@@ -697,8 +700,17 @@ async fn drive_client_subscribe_inner(
     // resolving, leaving this peer subscribed-but-bodyless. `None` for ordinary
     // (non-directed) subscribes, which keep the greedy fetch.
     let directed_holder = first_hop.clone();
-    let initial =
-        prepare_initial_request(op_manager, client_tx, instance_id, is_renewal, first_hop).await?;
+    let initial = prepare_initial_request(
+        op_manager,
+        client_tx,
+        instance_id,
+        is_renewal,
+        first_hop,
+        crate::router::dataset::DecisionLog::Joinable(
+            crate::node::network_status::OpType::Subscribe,
+        ),
+    )
+    .await?;
 
     let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
         InitialRequest::LocallyComplete { key } => {
@@ -1972,6 +1984,12 @@ async fn drive_relay_subscribe(
                         target = %consult_addr,
                         "SUBSCRIBE relay: consulting advertised host off routing path after \
                          downstream NotFound"
+                    );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Subscribe,
+                        crate::ring::Location::from(&instance_id),
+                        &consult_hop,
+                        crate::router::dataset::UncapturedReason::TerminalConsult,
                     );
                     let consult_outcome = relay_subscribe_forward_once(
                         op_manager,

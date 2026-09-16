@@ -237,8 +237,9 @@ labels) is deployed:
       ranking comparisons over the candidates the ACTING model chose among.
       There is still no exploration, so how a peer the acting model did not
       select would have fared is unobserved (future work). The by-value join
-      from outcome to decision under-represents slow outcomes and failures on
-      busy contracts (module doc "Joining"): report its ambiguous fraction.
+      from outcome to decision is biased in two known directions (module doc
+      "Joining"): report both measures it names with any result. Size
+      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length.
   (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
       FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
       which gateway has the flag halfway through the window. The two gateways
