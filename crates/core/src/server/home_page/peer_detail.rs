@@ -36,8 +36,8 @@ fn fmt_skill(skill: Option<f64>) -> String {
 /// What the hierarchical rows show when the estimator has never been computed
 /// in this process, so an empty reading is not mistaken for a model with
 /// nothing to say.
-const NOT_COMPUTED: &str = "&mdash; not computed (FREENET_ROUTING_HIERARCHICAL is set to \
-     disable it; unset it, or set FREENET_ROUTING_DATASET to record a routing dataset)";
+const NOT_COMPUTED: &str = "&mdash; not computed (enable FREENET_ROUTING_HIERARCHICAL, or set \
+     FREENET_ROUTING_DATASET to record a routing dataset)";
 
 /// What the hierarchical rows show when a routing dataset recorder IS
 /// configured but stopped (byte cap or write error) before any event reached
