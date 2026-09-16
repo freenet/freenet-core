@@ -234,7 +234,7 @@ async fn drive_client_update(
         op_manager
             .ring
             .closest_potentially_hosting(
-                crate::node::network_status::OpType::Update,
+                crate::router::dataset::DecisionLog::Unlogged,
                 &key,
                 [sender_addr].as_slice(),
             )
@@ -1153,7 +1153,7 @@ async fn drive_relay_request_update(
     let skip_list = vec![self_addr, sender_addr];
 
     let next_target = op_manager.ring.closest_potentially_hosting(
-        crate::node::network_status::OpType::Update,
+        crate::router::dataset::DecisionLog::Unlogged,
         &key,
         skip_list.as_slice(),
     );
@@ -1165,7 +1165,7 @@ async fn drive_relay_request_update(
             let candidates = op_manager
                 .ring
                 .k_closest_potentially_hosting(
-                    crate::node::network_status::OpType::Update,
+                    crate::router::dataset::DecisionLog::Unlogged,
                     &key,
                     skip_list.as_slice(),
                     5,

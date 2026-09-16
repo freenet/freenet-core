@@ -230,10 +230,18 @@ pub(super) async fn prepare_initial_request(
             phase = "directed_first_hop",
             "Using caller-supplied first hop for subscription (bypassing ring selection)"
         );
+        crate::router::dataset::record_bypass(
+            crate::node::network_status::OpType::Subscribe,
+            crate::ring::Location::from(&instance_id),
+            &holder,
+            crate::router::dataset::UncapturedReason::DirectedFirstHop,
+        );
         (holder, Vec::new())
     } else {
         let mut candidates = op_manager.ring.k_closest_potentially_hosting(
-            crate::node::network_status::OpType::Subscribe,
+            crate::router::dataset::DecisionLog::Joinable(
+                crate::node::network_status::OpType::Subscribe,
+            ),
             &instance_id,
             &visited,
             MAX_BREADTH,
@@ -276,6 +284,12 @@ pub(super) async fn prepare_initial_request(
                         phase = "fallback_routing",
                         "Using fallback connection for subscription (k_closest returned empty)"
                     );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Subscribe,
+                        crate::ring::Location::from(&instance_id),
+                        &target,
+                        crate::router::dataset::UncapturedReason::AnyConnectionFallback,
+                    );
                     target
                 }
                 None => {
@@ -296,6 +310,12 @@ pub(super) async fn prepare_initial_request(
                             gateway = %gateway_addr,
                             phase = "bootstrap_gateway",
                             "subscribe: ring empty — routing initial request via configured gateway"
+                        );
+                        crate::router::dataset::record_bypass(
+                            crate::node::network_status::OpType::Subscribe,
+                            crate::ring::Location::from(&instance_id),
+                            &gateway,
+                            crate::router::dataset::UncapturedReason::BootstrapGateway,
                         );
                         gateway
                     } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {

@@ -282,7 +282,7 @@ async fn drive_client_put_inner(
     // (Multi-gateway failover across PUT retries is intentionally not
     // implemented; see the design doc's out-of-scope notes.)
     let initial_target = op_manager.ring.closest_potentially_hosting(
-        crate::node::network_status::OpType::Put,
+        crate::router::dataset::DecisionLog::Unlogged,
         &key,
         tried.as_slice(),
     );
@@ -1322,7 +1322,7 @@ fn advance_to_next_peer(
     *retries += 1;
 
     let peer = op_manager.ring.closest_potentially_hosting(
-        crate::node::network_status::OpType::Put,
+        crate::router::dataset::DecisionLog::Unlogged,
         key,
         tried.as_slice(),
     )?;
@@ -1941,7 +1941,7 @@ where
 
     let next_hop = if htl > 0 {
         op_manager.ring.closest_potentially_hosting(
-            crate::node::network_status::OpType::Put,
+            crate::router::dataset::DecisionLog::Joinable(crate::node::network_status::OpType::Put),
             &key,
             &new_skip_list,
         )
@@ -2135,6 +2135,12 @@ where
                         gateway = %gateway_addr,
                         phase = "relay_put_bootstrap_gateway",
                         "PUT relay: ring empty — forwarding to configured gateway"
+                    );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Put,
+                        crate::ring::Location::from(&key),
+                        &gateway,
+                        crate::router::dataset::UncapturedReason::BootstrapGateway,
                     );
                     (gateway, gateway_addr)
                 }
@@ -3631,7 +3637,7 @@ where
 
     let next_hop = if htl > 0 {
         op_manager.ring.closest_potentially_hosting(
-            crate::node::network_status::OpType::Put,
+            crate::router::dataset::DecisionLog::Joinable(crate::node::network_status::OpType::Put),
             &contract_key,
             &new_skip_list,
         )
@@ -3656,6 +3662,12 @@ where
                     gateway = %gateway_addr,
                     phase = "relay_put_streaming_bootstrap_gateway",
                     "PUT streaming relay: ring empty — forwarding to configured gateway"
+                );
+                crate::router::dataset::record_bypass(
+                    crate::node::network_status::OpType::Put,
+                    crate::ring::Location::from(&contract_key),
+                    &gateway,
+                    crate::router::dataset::UncapturedReason::BootstrapGateway,
                 );
                 Some(gateway)
             }
@@ -4467,7 +4479,7 @@ async fn drive_relay_probe(
 
     let next_hop = if htl > 0 {
         op_manager.ring.closest_potentially_hosting(
-            crate::node::network_status::OpType::Put,
+            crate::router::dataset::DecisionLog::Unlogged,
             &key,
             &new_skip_list,
         )
@@ -4748,7 +4760,7 @@ async fn drive_relay_probe_reconcile(
     }
 
     let next_hop = op_manager.ring.closest_potentially_hosting(
-        crate::node::network_status::OpType::Put,
+        crate::router::dataset::DecisionLog::Unlogged,
         &key,
         &new_skip_list,
     );
@@ -8519,7 +8531,7 @@ mod route_attempt_driver_tests {
         op_manager
             .ring
             .closest_potentially_hosting(
-                crate::node::network_status::OpType::Put,
+                crate::router::dataset::DecisionLog::Unlogged,
                 key,
                 [own].as_slice(),
             )

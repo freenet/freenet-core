@@ -4066,54 +4066,78 @@ impl Ring {
     /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
-    /// `op` labels the decision in the routing dataset's candidate log.
+    /// `log_as` says whether this selection is a routing decision for the
+    /// routing dataset's candidate log.
     #[inline]
     pub fn closest_potentially_hosting(
         &self,
-        op: crate::node::network_status::OpType,
+        log_as: crate::router::dataset::DecisionLog,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
-        let log = crate::router::dataset::candidate_log();
+        let log = self.candidate_log_for(log_as);
         // The router read lock is held across candidate gathering and
-        // selection exactly as before candidate logging existed (this was
-        // `ConnectionManager::routing_with_telemetry`); only the dataset write
-        // below waits for it to be released.
+        // selection, as before candidate logging existed; it is released
+        // before the dataset write and the debug trace.
         let router = self.router.read();
         let target = Location::from(contract_key);
-        let candidates = self
-            .connection_manager
-            .routing_candidates(target, None, skip_list, true);
-        if candidates.is_empty() {
-            return None;
+        self.connection_manager
+            .routing_with(target, None, skip_list, move |candidates| {
+                let (selected, decision, capture) = router.select_k_best_peers_capturing(
+                    candidates.iter(),
+                    target,
+                    1,
+                    log.is_some_and(|(log, _)| log.capture),
+                );
+                drop(router);
+                if let Some((log, op)) = log {
+                    log.record(
+                        op,
+                        target,
+                        &selected,
+                        matches!(
+                            decision.strategy,
+                            crate::router::RoutingStrategy::DistanceBased
+                        ),
+                        capture,
+                    );
+                }
+                let peer = selected.into_iter().next().cloned();
+                tracing::debug!(
+                    target_location = %target.as_f64(),
+                    strategy = ?decision.strategy,
+                    num_candidates = decision.candidates.len(),
+                    total_routing_events = decision.total_routing_events,
+                    selected = peer.is_some(),
+                    "routing_decision"
+                );
+                peer
+            })
+            .flatten()
+    }
+
+    /// The candidate log for a selection, and its op, when it is a routing
+    /// decision and logging is on. `Unlogged` consults nothing.
+    fn candidate_log_for(
+        &self,
+        log_as: crate::router::dataset::DecisionLog,
+    ) -> Option<(
+        crate::router::dataset::CandidateLog<'static>,
+        crate::node::network_status::OpType,
+    )> {
+        match log_as {
+            crate::router::dataset::DecisionLog::Joinable(op) => {
+                crate::router::dataset::candidate_log().map(|log| (log, op))
+            }
+            crate::router::dataset::DecisionLog::Unlogged => None,
         }
-        let (selected, decision, capture) = router.select_k_best_peers_capturing(
-            candidates.iter(),
-            target,
-            1,
-            log.is_some_and(|log| log.capture),
-        );
-        drop(router);
-        if let Some(log) = log {
-            log.record(op, target, &selected, capture);
-        }
-        let peer = selected.into_iter().next().cloned();
-        tracing::debug!(
-            target_location = %target.as_f64(),
-            strategy = ?decision.strategy,
-            num_candidates = decision.candidates.len(),
-            total_routing_events = decision.total_routing_events,
-            selected = peer.is_some(),
-            "routing_decision"
-        );
-        peer
     }
 
     /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
     pub fn k_closest_potentially_hosting<K>(
         &self,
-        op: crate::node::network_status::OpType,
+        log_as: crate::router::dataset::DecisionLog,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
@@ -4231,18 +4255,27 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let log = crate::router::dataset::candidate_log();
+        let log = self.candidate_log_for(log_as);
         let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
             candidates.iter(),
             target_location,
             k,
-            log.is_some_and(|log| log.capture),
+            log.is_some_and(|(log, _)| log.capture),
         );
         // `selected` and `capture` borrow from `candidates`, not from the
         // router guard, so the read lock is released at the end of the
         // statement above, before the dataset write.
-        if let Some(log) = log {
-            log.record(op, target_location, &selected, capture);
+        if let Some((log, op)) = log {
+            log.record(
+                op,
+                target_location,
+                &selected,
+                matches!(
+                    decision.strategy,
+                    crate::router::RoutingStrategy::DistanceBased
+                ),
+                capture,
+            );
         }
 
         tracing::debug!(
@@ -10610,6 +10643,176 @@ mod hosting_stats_mirror_source_tests {
         assert_eq!(
             expected_mirror("read_count_hist"),
             "host_reads: hosting.read_count_hist,"
+        );
+    }
+}
+
+/// The ring's selection functions are where candidate logging is wired to the
+/// op that routed; the router- and writer-level tests cannot see a wrong op, a
+/// dropped `record` call or a probe that logs.
+#[cfg(test)]
+mod candidate_log_wiring_tests {
+    use std::net::SocketAddr;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    use crate::node::network_status::OpType;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+    use crate::ring::{Location, PeerKeyLocation};
+    use crate::router::dataset::{self, DecisionLog, RoutingDataset, UncapturedReason};
+    use crate::router::{RouteEvent, RouteOutcome};
+
+    /// A recorder that outlives the test, as `force_candidate_log` requires.
+    fn leaked_recorder() -> (&'static RoutingDataset, std::path::PathBuf) {
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let path = dir.path().join("routing.jsonl");
+        let recorder = RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+        (Box::leak(Box::new(recorder)), path)
+    }
+
+    /// Enough routing history that decisions are prediction-based.
+    fn warm_router(ring: &super::Ring, peers: &[PeerKeyLocation], contract: Location) {
+        let mut router = ring.router.write();
+        for i in 0..120 {
+            router.add_event(RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location: contract,
+                outcome: if i % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+    }
+
+    fn selected_at(line: &serde_json::Value, position: usize) -> String {
+        line["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["selected_position"] == position)
+            .unwrap_or_else(|| panic!("no candidate at position {position}: {line}"))["peer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn ring_selections_log_only_routing_decisions_with_their_op() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-wiring", 5).await;
+        let ring = &op_manager.ring;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([0u8; 32]),
+        );
+        let contract = Location::from(&key);
+        warm_router(ring, &peers, contract);
+        let (recorder, path) = leaked_recorder();
+        let none: Vec<SocketAddr> = Vec::new();
+        let all: Vec<SocketAddr> = peers.iter().filter_map(|p| p.socket_addr()).collect();
+
+        let (subscribe, put) = {
+            let _log = dataset::force_candidate_log(recorder, 1.0);
+            // Probes and pre-selections log nothing.
+            assert_eq!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Unlogged,
+                    key.id(),
+                    none.as_slice(),
+                    2
+                )
+                .len(),
+                2
+            );
+            assert!(
+                ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice())
+                    .is_some()
+            );
+            // A selection of nobody routes nowhere and logs nothing.
+            assert!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Get),
+                    key.id(),
+                    all.as_slice(),
+                    1
+                )
+                .is_empty()
+            );
+            let subscribe = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Subscribe),
+                key.id(),
+                none.as_slice(),
+                2,
+            );
+            let put = ring
+                .closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Put),
+                    &key,
+                    none.as_slice(),
+                )
+                .unwrap();
+            (subscribe, put)
+        };
+        let get = {
+            // Below rate 1 the test override never draws a capture.
+            let _log = dataset::force_candidate_log(recorder, 0.5);
+            ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            )
+        };
+        {
+            let _log = dataset::force_candidate_log(recorder, 0.5);
+            dataset::record_bypass(
+                OpType::Subscribe,
+                contract,
+                &peers[3],
+                UncapturedReason::DirectedFirstHop,
+            );
+        }
+
+        let lines = dataset::lines_eventually(&path, |lines| lines.len() >= 5);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision",
+                "decision_uncaptured",
+                "decision_uncaptured"
+            ],
+            "{lines:?}"
+        );
+
+        let (sub_line, put_line, get_line, bypass) = (&lines[1], &lines[2], &lines[3], &lines[4]);
+        assert_eq!(sub_line["op"], "SUBSCRIBE");
+        assert_eq!(sub_line["contract_location"], contract.as_f64());
+        assert_eq!(sub_line["k"], 2);
+        assert_eq!(sub_line["candidates_considered"], peers.len());
+        assert_eq!(selected_at(sub_line, 0), dataset::peer_hash(&subscribe[0]));
+        assert_eq!(selected_at(sub_line, 1), dataset::peer_hash(&subscribe[1]));
+
+        assert_eq!(put_line["op"], "PUT");
+        assert_eq!(put_line["k"], 1);
+        assert_eq!(selected_at(put_line, 0), dataset::peer_hash(&put));
+
+        assert_eq!(get_line["op"], "GET");
+        assert_eq!(get_line["reason"], "sampled_out");
+        assert_eq!(
+            get_line["selected"],
+            serde_json::json!([dataset::peer_hash(&get[0])])
+        );
+
+        assert_eq!(bypass["op"], "SUBSCRIBE");
+        assert_eq!(bypass["reason"], "directed_first_hop");
+        assert_eq!(
+            bypass["selected"],
+            serde_json::json!([dataset::peer_hash(&peers[3])])
         );
     }
 }

@@ -1258,7 +1258,9 @@ async fn advance_to_next_peer(
         attempts_at_hop,
         |instance_id, visited| {
             op_manager.ring.k_closest_potentially_hosting(
-                crate::node::network_status::OpType::Subscribe,
+                crate::router::dataset::DecisionLog::Joinable(
+                    crate::node::network_status::OpType::Subscribe,
+                ),
                 instance_id,
                 visited,
                 MAX_BREADTH,
@@ -1826,7 +1828,9 @@ async fn drive_relay_subscribe(
     new_visited.mark_visited(upstream_addr);
 
     let mut candidates = op_manager.ring.k_closest_potentially_hosting(
-        crate::node::network_status::OpType::Subscribe,
+        crate::router::dataset::DecisionLog::Joinable(
+            crate::node::network_status::OpType::Subscribe,
+        ),
         &instance_id,
         &new_visited,
         MAX_BREADTH,
@@ -4230,7 +4234,7 @@ mod route_attempt_driver_tests {
         let greedy = op_manager
             .ring
             .k_closest_potentially_hosting(
-                crate::node::network_status::OpType::Subscribe,
+                crate::router::dataset::DecisionLog::Unlogged,
                 &instance_id,
                 [own, upstream].as_slice(),
                 1,

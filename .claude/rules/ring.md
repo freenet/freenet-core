@@ -236,7 +236,9 @@ labels) is deployed:
       scored candidate; router/dataset.rs "Candidate sets"), which supports
       ranking comparisons over the candidates the ACTING model chose among.
       There is still no exploration, so how a peer the acting model did not
-      select would have fared is unobserved (future work).
+      select would have fared is unobserved (future work). The by-value join
+      from outcome to decision under-represents slow outcomes and failures on
+      busy contracts (module doc "Joining"): report its ambiguous fraction.
   (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
       FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
       which gateway has the flag halfway through the window. The two gateways
