@@ -89,15 +89,17 @@
 //! [`MAX_QUEUED_DECISIONS`] may wait for the writer at once.
 //!
 //! **Cost.** Measured in a release build (25-candidate window): a captured
-//! decision costs about +9% under the router READ lock while legacy routes
-//! (356 to 389 µs) but about 10x while the hierarchical estimator routes (42 to
-//! 424 µs), because the legacy stack's per-candidate Renegade queries then run
-//! only for the log. That is why the switch samples: at rate `r` the added
-//! read-lock time averages `r` times that, and a single captured decision holds
+//! decision costs about +10% under the router READ lock while legacy routes
+//! (about 356 to 391 µs) but about 10x while the hierarchical estimator routes
+//! (about 40 to 400 µs), because the legacy stack's per-candidate Renegade
+//! queries then run only for the log. That is why the switch samples: at rate
+//! `r` the added read-lock time averages `r` times that (at `0.05`, about +2 µs
+//! and +18 µs per decision respectively), and a single captured decision holds
 //! the lock no longer than every legacy-routed decision already does. Building
-//! a record takes about 6 µs after the lock is released and serialising it about
-//! 22 µs on the writer thread; a line is about 16 KB. An uncaptured decision adds
-//! no work under the lock.
+//! a record takes about 6 µs after the lock is released and serialising it
+//! about 23 µs on the writer thread; a line is about 16 KB. An uncaptured
+//! decision adds nothing under the lock: its `decision_unsampled` line is about
+//! 0.3 µs to build and serialise and about 120 bytes.
 //!
 //! **Joining a decision to its outcome.** No identifier is threaded through the
 //! operation, so the join is by value, within one run (split on `start`): a
@@ -697,7 +699,9 @@ impl std::fmt::Debug for RoutingDataset {
 }
 
 impl RoutingDataset {
-    /// Open `path` for appending and start the writer thread.
+    /// Open `path` for appending and start the writer thread, with the
+    /// default decision budget.
+    #[cfg(test)]
     pub(crate) fn open(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
         Self::open_with_decision_budget(path, max_bytes, DEFAULT_CANDIDATES_MAX_BYTES)
     }
@@ -1134,10 +1138,9 @@ pub(crate) fn parse_candidate_rate(value: Option<&str>) -> f64 {
     }
     match raw.trim().parse::<f64>() {
         Ok(rate) if rate > 0.0 && rate <= 1.0 => rate,
-        Ok(rate) if rate == 0.0 => 0.0,
         _ => {
             let lowered = raw.trim().to_ascii_lowercase();
-            if !matches!(lowered.as_str(), "" | "false" | "no" | "off") {
+            if !matches!(lowered.as_str(), "" | "0" | "false" | "no" | "off") {
                 tracing::warn!(
                     value = raw,
                     "routing dataset: {DATASET_CANDIDATES_ENV} must be 1/true or a fraction in (0, 1]; candidate logging is off"
