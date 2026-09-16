@@ -2500,6 +2500,9 @@ impl ConnectionManager {
     }
 
     /// Route an op to the most optimal target, returning telemetry about the decision.
+    /// Production routing goes through `Ring::closest_potentially_hosting`, which
+    /// also feeds the routing dataset's candidate log.
+    #[cfg(test)]
     pub fn routing_with_telemetry(
         &self,
         target: Location,

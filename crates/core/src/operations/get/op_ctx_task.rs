@@ -401,7 +401,12 @@ async fn drive_client_get_inner(
     }
     let initial_target = op_manager
         .ring
-        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+        .k_closest_potentially_hosting(
+            crate::node::network_status::OpType::Get,
+            &instance_id,
+            tried.as_slice(),
+            1,
+        )
         .into_iter()
         .next();
     let current_target = match initial_target {
@@ -1301,7 +1306,12 @@ impl GetRetryDriver<'_> {
             asked.extend(self.op_manager.ring.connection_manager.get_own_addr());
             self.op_manager
                 .ring
-                .k_closest_potentially_hosting(&self.instance_id, asked.as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &self.instance_id,
+                    asked.as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .and_then(|peer| peer.socket_addr().map(|addr| (peer, addr)))
@@ -2359,7 +2369,12 @@ fn advance_to_next_peer(
 
     let peer = match op_manager
         .ring
-        .k_closest_potentially_hosting(instance_id, tried.as_slice(), 1)
+        .k_closest_potentially_hosting(
+            crate::node::network_status::OpType::Get,
+            instance_id,
+            tried.as_slice(),
+            1,
+        )
         .into_iter()
         .next()
     {
@@ -2672,7 +2687,12 @@ async fn drive_sub_op_get(
     let initial_target = initial_target.or_else(|| {
         op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                tried.as_slice(),
+                1,
+            )
             .into_iter()
             .next()
     });
@@ -3298,7 +3318,12 @@ fn first_hop_candidate(
 ) -> Option<PeerKeyLocation> {
     op_manager
         .ring
-        .k_closest_potentially_hosting(instance_id, AdmitOnly(addr), 1)
+        .k_closest_potentially_hosting(
+            crate::node::network_status::OpType::Get,
+            instance_id,
+            AdmitOnly(addr),
+            1,
+        )
         .into_iter()
         .next()
         .filter(|peer| peer.socket_addr() == Some(addr))
@@ -3349,7 +3374,12 @@ fn relay_advance_to_next_peer(
     let closest = |skip: VisitedPeers| {
         op_manager
             .ring
-            .k_closest_potentially_hosting(instance_id, skip, 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                instance_id,
+                skip,
+                1,
+            )
             .into_iter()
             .next()
     };
@@ -8803,7 +8833,12 @@ mod route_attempt_driver_tests {
         // forwards to: the stream is claimed from, and labelled against, it.
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -8906,7 +8941,12 @@ mod route_attempt_driver_tests {
             let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
             let initial = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -9054,7 +9094,12 @@ mod route_attempt_driver_tests {
         let upstream = peers[0].clone();
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                [own, addr(&upstream)].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");
@@ -9169,7 +9214,12 @@ mod route_attempt_driver_tests {
                         // `drive_client_get_inner` just evaluated it.
                         let first = view
                             .ring
-                            .k_closest_potentially_hosting(instance_id, [own].as_slice(), 1)
+                            .k_closest_potentially_hosting(
+                                crate::node::network_status::OpType::Get,
+                                instance_id,
+                                [own].as_slice(),
+                                1,
+                            )
                             .into_iter()
                             .next()
                             .expect("a candidate");
@@ -9240,7 +9290,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -10091,7 +10146,12 @@ mod route_attempt_driver_tests {
         let instance_id = ContractInstanceId::new([53u8; 32]);
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                [own, addr(&upstream)].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");
@@ -10299,7 +10359,12 @@ mod route_attempt_driver_tests {
             let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
             let initial = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10309,7 +10374,12 @@ mod route_attempt_driver_tests {
             // (current) are distinguishable.
             let second = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own, addr(&initial)].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    [own, addr(&initial)].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10428,7 +10498,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -10591,7 +10666,12 @@ mod route_attempt_driver_tests {
             let instance_id = ContractInstanceId::new([79u8; 32]);
             let best = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10670,7 +10750,12 @@ mod route_attempt_driver_tests {
             let closest = |skip: &[SocketAddr]| {
                 op_manager
                     .ring
-                    .k_closest_potentially_hosting(&instance_id, skip, 1)
+                    .k_closest_potentially_hosting(
+                        crate::node::network_status::OpType::Get,
+                        &instance_id,
+                        skip,
+                        1,
+                    )
                     .into_iter()
                     .next()
                     .unwrap()
@@ -10798,7 +10883,12 @@ mod route_attempt_driver_tests {
                 skip.push(own);
                 let next = op_manager
                     .ring
-                    .k_closest_potentially_hosting(&instance_id, skip.as_slice(), 1)
+                    .k_closest_potentially_hosting(
+                        crate::node::network_status::OpType::Get,
+                        &instance_id,
+                        skip.as_slice(),
+                        1,
+                    )
                     .into_iter()
                     .next()
                     .expect("a ring peer");
@@ -10923,7 +11013,12 @@ mod route_attempt_driver_tests {
             skip.push(own);
             let next = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, skip.as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    skip.as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .expect("a ring peer");
@@ -11265,7 +11360,12 @@ mod route_attempt_driver_tests {
         let router_pick = run
             .op_manager
             .ring
-            .k_closest_potentially_hosting(&run.instance_id, [own, y].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &run.instance_id,
+                [own, y].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .and_then(|peer| peer.socket_addr());
@@ -11318,7 +11418,12 @@ mod route_attempt_driver_tests {
         let router_pick = run
             .op_manager
             .ring
-            .k_closest_potentially_hosting(&run.instance_id, [own, u].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Get,
+                &run.instance_id,
+                [own, u].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .and_then(|peer| peer.socket_addr());
@@ -11504,7 +11609,12 @@ mod route_attempt_driver_tests {
         let closest = |skip: &[SocketAddr]| {
             op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, skip, 1)
+                .k_closest_potentially_hosting(
+                    crate::node::network_status::OpType::Get,
+                    &instance_id,
+                    skip,
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap()

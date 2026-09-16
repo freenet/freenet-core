@@ -18,9 +18,11 @@
 //!
 //! # What it is and is not
 //!
-//! - It is a **prediction-accuracy** dataset: the outcome for the peer that was
-//!   actually tried, not the whole candidate set a routing decision chose from,
-//!   so it cannot answer "what if a different peer had been picked".
+//! - Its `route` lines are a **prediction-accuracy** dataset: the outcome for
+//!   the peer that was actually tried. The optional `decision` lines (below) add
+//!   the candidate set each routing decision chose from, which supports
+//!   **ranking** evaluation over those candidates, but still not "what if a
+//!   different peer had been picked" (see *Candidate sets*).
 //! - It covers the router's `add_event` stream only. The separate CONNECT
 //!   forward-acceptance estimator is out of scope.
 //! - Events are tagged `originator` or `relay`: relay hops record outcomes under
@@ -43,6 +45,53 @@
 //! connected peers that were never routed to and so never appear as events. The
 //! routing counts are all-contract, originator-only aggregates; per-contract
 //! density comes from the event stream itself.
+//!
+//! # Candidate sets (`decision` lines)
+//!
+//! With `FREENET_ROUTING_DATASET_CANDIDATES=1` as well as a recording path, each
+//! prediction-based routing decision for a GET, PUT, SUBSCRIBE or UPDATE writes
+//! one `"kind":"decision"` line: every candidate the router scored (the
+//! `consider_n_closest_peers` distance window, in distance order), BOTH models'
+//! estimates for each — the legacy stack as routing would act on it with the
+//! hierarchical flag off, and the hierarchical estimator as routing would act on
+//! it with the flag on (legacy fallback for any stage it cannot yet estimate,
+//! flagged per stage in `hierarchical_stages`) — each candidate's rank under
+//! each model, and which candidates the router actually returned
+//! (`selected_position`, 0 = first choice). `acting_model` says which of the two
+//! routed. The record is captured inside the decision from the values the router
+//! sorted, not reconstructed afterwards; ranks use the router's own cost
+//! ordering ([`cost_order_key`], stable over distance order).
+//!
+//! Off by default even when the recorder is on: a decision line is roughly
+//! 25 times a route line. Distance-based decisions (too little history to
+//! predict) and CONNECT peer selection are not recorded. At most
+//! [`MAX_RECORDED_CANDIDATES`] candidates are written per decision; beyond that
+//! every selected candidate and then the acting model's best are kept,
+//! `candidates_omitted` counts the rest, and ranks stay those over the full
+//! window. Decision lines share the byte cap and truncation marker with every
+//! other line, and at most [`MAX_QUEUED_DECISIONS`] may wait for the writer at
+//! once (beyond that they are dropped and counted like any other drop).
+//!
+//! **Joining a decision to its outcome.** No identifier is threaded through the
+//! operation, so the join is by value, within one run (split on `start`): a
+//! `route` line belongs to the most recent earlier `decision` line with the same
+//! `op`, the same `contract_location` (both are `Location::as_f64` of the same
+//! contract, so equal in the JSON), and a selected candidate whose `peer`
+//! equals the route line's `peer`. This is ambiguous when concurrent decisions
+//! for the same contract and op select the same peer (retries, several local
+//! clients); such a route line may be attributed to the later decision. `t_ms`
+//! of both kinds comes from the same clock ([`now_ms`]). Decisions with no
+//! joined outcome are expected (an ambiguous `NotFound` is not trained, see
+//! `operations::route_attempt`), and they are not a random sample.
+//!
+//! **What it can and cannot measure.** It lets a replay ask, over the
+//! candidates the CURRENT model chose among, whether another model would have
+//! ranked the peer that succeeded above the one that failed, and how the two
+//! models' orderings differ. It has no exploration: outcomes exist only for peers
+//! the acting model selected, so how an unselected candidate would have fared is
+//! never observed, and any "model B would have done better" estimate over
+//! unselected peers is extrapolation, not measurement. The candidate window is
+//! the router's distance cut, so peers outside it are invisible to both models.
 //!
 //! # Off by default, and local
 //!
@@ -73,7 +122,7 @@ use std::io::{BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -88,6 +137,19 @@ use crate::transport::TransportPublicKey;
 pub(crate) const DATASET_PATH_ENV: &str = "FREENET_ROUTING_DATASET";
 /// Environment variable overriding [`DEFAULT_MAX_BYTES`], in plain bytes.
 pub(crate) const DATASET_MAX_BYTES_ENV: &str = "FREENET_ROUTING_DATASET_MAX_BYTES";
+
+/// Environment variable that adds a `decision` line per routing decision. Off
+/// unless set to an affirmative value, and inert without [`DATASET_PATH_ENV`].
+pub(crate) const DATASET_CANDIDATES_ENV: &str = "FREENET_ROUTING_DATASET_CANDIDATES";
+
+/// Most candidates written for one decision. Above the default window (25), so
+/// it only binds when an operator widens `consider_n_closest_peers`.
+pub(crate) const MAX_RECORDED_CANDIDATES: usize = 32;
+
+/// Most decision records waiting for the writer at once. A decision line is
+/// several kilobytes, so the shared channel capacity alone would let a stalled
+/// disk hold tens of megabytes of them in memory.
+pub(crate) const MAX_QUEUED_DECISIONS: usize = 1024;
 
 /// Default size cap, so a forgotten setting cannot fill a disk.
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -228,6 +290,196 @@ pub(crate) struct PeerAttributes {
     pub bytes_received: Option<u64>,
 }
 
+/// Which estimator stack routing acted on for a decision.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoutingModel {
+    Legacy,
+    Hierarchical,
+}
+
+/// One model's estimate for one candidate, in the units routing acts on
+/// (unfloored; `expected_total_time` is the cost the router sorts by).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub(crate) struct ModelEstimate {
+    pub failure_probability: f64,
+    pub time_to_response_start_s: f64,
+    pub transfer_speed_bps: f64,
+    pub expected_total_time: f64,
+}
+
+/// Which stages the hierarchical estimator supplied itself for a candidate;
+/// a `false` stage in its [`ModelEstimate`] is the legacy fallback.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct HierarchicalStages {
+    pub failure: bool,
+    pub response_time: bool,
+    pub transfer_speed: bool,
+}
+
+/// The router's sort key for a candidate's cost: its expected total time, or
+/// last when it has no prediction. The router's sort and the recorded ranks
+/// both use this, so the ranks cannot drift from the ordering routing applied.
+pub(crate) fn cost_order_key(expected_total_time: Option<f64>) -> f64 {
+    expected_total_time.unwrap_or(f64::MAX)
+}
+
+/// One candidate as the router scored it, captured inside the decision.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedCandidate<'a> {
+    pub peer: &'a PeerKeyLocation,
+    pub legacy: Option<ModelEstimate>,
+    pub hierarchical: Option<ModelEstimate>,
+    pub hierarchical_stages: HierarchicalStages,
+    /// Position in the list the router returned, if it was returned.
+    pub selected_position: Option<usize>,
+}
+
+/// Everything a [`DecisionRecord`] is built from, filled in by the router while
+/// it decides. It borrows the candidates rather than cloning them, and the
+/// record is assembled from it only after the router lock is released.
+#[derive(Debug, Clone)]
+pub(crate) struct DecisionCapture<'a> {
+    pub contract_location: crate::ring::Location,
+    pub acting_model: RoutingModel,
+    /// Whether any candidate had no prediction under the acting model, so the
+    /// router ranked it last.
+    pub prediction_fallback: bool,
+    pub k: usize,
+    /// Peers offered to the decision before the distance window was applied.
+    pub candidates_available: usize,
+    pub prior_failure_events: usize,
+    /// Every candidate the router scored, in distance order.
+    pub candidates: Vec<CapturedCandidate<'a>>,
+}
+
+/// One candidate of a recorded decision.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct CandidateRecord {
+    pub peer: String,
+    pub peer_location: Option<f64>,
+    /// `None` when the peer's location is unknown (the router uses 0.5).
+    pub distance: Option<f64>,
+    /// 0 = closest of the scored window.
+    pub distance_rank: usize,
+    /// Position in the router's returned list, `None` if not returned.
+    pub selected_position: Option<usize>,
+    /// Rank under each model's cost over the WHOLE scored window, 0 = best.
+    pub rank_legacy: usize,
+    pub rank_hierarchical: usize,
+    pub legacy: Option<ModelEstimate>,
+    pub hierarchical: Option<ModelEstimate>,
+    pub hierarchical_stages: HierarchicalStages,
+}
+
+/// One prediction-based routing decision and its candidate set.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct DecisionRecord {
+    pub t_ms: u64,
+    pub op: &'static str,
+    pub contract_location: f64,
+    pub acting_model: RoutingModel,
+    pub prediction_fallback: bool,
+    pub k: usize,
+    pub candidates_available: usize,
+    /// Size of the scored window.
+    pub candidates_considered: usize,
+    /// Scored candidates not written because of [`MAX_RECORDED_CANDIDATES`].
+    pub candidates_omitted: usize,
+    pub prior_failure_events: usize,
+    /// Rank under each model of the router's first choice.
+    pub chosen_rank_legacy: Option<usize>,
+    pub chosen_rank_hierarchical: Option<usize>,
+    /// In distance order.
+    pub candidates: Vec<CandidateRecord>,
+}
+
+/// Rank of every candidate under one model: a stable sort of distance order by
+/// [`cost_order_key`], the router's own sort.
+fn ranks_by(
+    candidates: &[CapturedCandidate<'_>],
+    estimate: impl Fn(&CapturedCandidate<'_>) -> Option<ModelEstimate>,
+) -> Vec<usize> {
+    let key =
+        |index: usize| cost_order_key(estimate(&candidates[index]).map(|e| e.expected_total_time));
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+    let mut ranks = vec![0; candidates.len()];
+    for (rank, index) in order.into_iter().enumerate() {
+        ranks[index] = rank;
+    }
+    ranks
+}
+
+impl DecisionCapture<'_> {
+    /// Build the record. Runs outside the router lock.
+    pub(crate) fn into_record(
+        self,
+        op: crate::node::network_status::OpType,
+        t_ms: u64,
+    ) -> DecisionRecord {
+        let rank_legacy = ranks_by(&self.candidates, |c| c.legacy);
+        let rank_hierarchical = ranks_by(&self.candidates, |c| c.hierarchical);
+        let acting_rank = match self.acting_model {
+            RoutingModel::Legacy => &rank_legacy,
+            RoutingModel::Hierarchical => &rank_hierarchical,
+        };
+        let considered = self.candidates.len();
+        let chosen = self
+            .candidates
+            .iter()
+            .position(|c| c.selected_position == Some(0));
+
+        // Over the cap: keep every selected candidate, then the acting model's
+        // best, and write them back in distance order.
+        let mut keep: Vec<usize> = (0..considered).collect();
+        if considered > MAX_RECORDED_CANDIDATES {
+            keep.sort_by_key(|&i| {
+                (
+                    self.candidates[i].selected_position.is_none(),
+                    acting_rank[i],
+                )
+            });
+            keep.truncate(MAX_RECORDED_CANDIDATES);
+            keep.sort_unstable();
+        }
+        let candidates: Vec<CandidateRecord> = keep
+            .iter()
+            .map(|&i| {
+                let captured = &self.candidates[i];
+                let location = captured.peer.location();
+                CandidateRecord {
+                    peer: peer_hash(captured.peer),
+                    peer_location: location.map(|l| l.as_f64()),
+                    distance: location.map(|l| self.contract_location.distance(l).as_f64()),
+                    distance_rank: i,
+                    selected_position: captured.selected_position,
+                    rank_legacy: rank_legacy[i],
+                    rank_hierarchical: rank_hierarchical[i],
+                    legacy: captured.legacy,
+                    hierarchical: captured.hierarchical,
+                    hierarchical_stages: captured.hierarchical_stages,
+                }
+            })
+            .collect();
+        DecisionRecord {
+            t_ms,
+            op: op.as_str(),
+            contract_location: self.contract_location.as_f64(),
+            acting_model: self.acting_model,
+            prediction_fallback: self.prediction_fallback,
+            k: self.k,
+            candidates_available: self.candidates_available,
+            candidates_considered: considered,
+            candidates_omitted: considered - candidates.len(),
+            prior_failure_events: self.prior_failure_events,
+            chosen_rank_legacy: chosen.map(|i| rank_legacy[i]),
+            chosen_rank_hierarchical: chosen.map(|i| rank_hierarchical[i]),
+            candidates,
+        }
+    }
+}
+
 /// The inputs a peer snapshot is assembled from, gathered by the caller so
 /// that assembly itself takes no locks and can be tested directly.
 pub(crate) struct PeerSnapshotInputs<'a> {
@@ -280,6 +532,7 @@ enum Line<'a> {
         version: &'static str,
     },
     Route(&'a RouteRecord),
+    Decision(&'a DecisionRecord),
     Peers {
         t_ms: u64,
         peers: &'a [PeerAttributes],
@@ -300,6 +553,7 @@ enum Record {
     // peers record, and every slot of the bounded channel is sized to the
     // largest variant.
     Route(Box<RouteRecord>),
+    Decision(Box<DecisionRecord>),
     Peers {
         t_ms: u64,
         peers: Vec<PeerAttributes>,
@@ -313,6 +567,8 @@ pub(crate) struct RoutingDataset {
     /// Set by the writer when it exits, so callers stop building records that
     /// could only ever be dropped.
     stopped: Arc<AtomicBool>,
+    /// Decision records sent and not yet taken by the writer.
+    queued_decisions: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for RoutingDataset {
@@ -331,12 +587,15 @@ impl RoutingDataset {
         let (dataset, rx) = Self::unstarted();
         let dropped = dataset.dropped.clone();
         let stopped = dataset.stopped.clone();
+        let queued_decisions = dataset.queued_decisions.clone();
         // A plain OS thread, not a runtime task: its whole job is blocking file
         // I/O, and it lives exactly as long as the process. It exits when every
         // sender is gone, the cap is reached, or a write fails.
         std::thread::Builder::new()
             .name("routing-dataset".into())
-            .spawn(move || write_loop(rx, file, max_bytes, &dropped, &stopped))?;
+            .spawn(move || {
+                write_loop(rx, file, max_bytes, &dropped, &stopped, &queued_decisions)
+            })?;
         Ok(dataset)
     }
 
@@ -356,6 +615,7 @@ impl RoutingDataset {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
+            queued_decisions: Arc::new(AtomicUsize::new(0)),
         };
         (dataset, rx)
     }
@@ -367,21 +627,36 @@ impl RoutingDataset {
     }
 
     pub(crate) fn record_route(&self, record: RouteRecord) {
-        self.send(Record::Route(Box::new(record)));
+        let _ = self.send(Record::Route(Box::new(record)));
+    }
+
+    /// Queue a decision record, unless [`MAX_QUEUED_DECISIONS`] are already
+    /// waiting, in which case it is dropped and counted.
+    pub(crate) fn record_decision(&self, record: DecisionRecord) {
+        if self.queued_decisions.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_DECISIONS {
+            self.queued_decisions.fetch_sub(1, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if !self.send(Record::Decision(Box::new(record))) {
+            self.queued_decisions.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_peers(&self, t_ms: u64, peers: Vec<PeerAttributes>) {
-        self.send(Record::Peers { t_ms, peers });
+        let _ = self.send(Record::Peers { t_ms, peers });
     }
 
-    fn send(&self, record: Record) {
+    /// Whether the record was queued.
+    fn send(&self, record: Record) -> bool {
         match self.tx.try_send(record) {
-            Ok(()) => {}
+            Ok(()) => true,
             // Full: drop and count — never wait under the router lock.
             // Disconnected: the writer has stopped; counting keeps the total
             // honest for anything still in flight when it did.
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
             }
         }
     }
@@ -444,6 +719,7 @@ impl Writer {
     fn record(&mut self, record: &Record, dropped: &AtomicU64) -> Result<(), WriteError> {
         let result = match record {
             Record::Route(route) => self.line(&Line::Route(route)),
+            Record::Decision(decision) => self.line(&Line::Decision(decision)),
             Record::Peers { t_ms, peers } => self.line(&Line::Peers { t_ms: *t_ms, peers }),
         };
         if let Err(WriteError::Cap) = result {
@@ -463,8 +739,9 @@ fn write_loop(
     max_bytes: u64,
     dropped: &AtomicU64,
     stopped: &AtomicBool,
+    queued_decisions: &AtomicUsize,
 ) {
-    let outcome = run_writer(&rx, file, max_bytes, dropped, stopped);
+    let outcome = run_writer(&rx, file, max_bytes, dropped, stopped, queued_decisions);
     // Mark stopped before the receiver drops, so callers stop building records.
     stopped.store(true, Ordering::Relaxed);
     // Anything that slipped into the queue after the final drain is counted
@@ -490,6 +767,7 @@ fn run_writer(
     max_bytes: u64,
     dropped: &AtomicU64,
     stopped: &AtomicBool,
+    queued_decisions: &AtomicUsize,
 ) -> Result<(), WriteError> {
     // Appending to an existing recording counts its bytes against the cap. A
     // file without room for a start line gets nothing at all, so a restart loop
@@ -507,7 +785,7 @@ fn run_writer(
     })?;
     writer.flush()?;
 
-    let result = drain(rx, &mut writer, dropped);
+    let result = drain(rx, &mut writer, dropped, queued_decisions);
     if let Err(WriteError::Cap) = result {
         // Stop producers FIRST, then count what is still queued, so the marker's
         // total covers every record that will never be written. The one residual
@@ -538,14 +816,23 @@ fn run_writer(
     result
 }
 
+/// Release a decision record's slot in the queue bound once the writer has it.
+fn taken(record: Record, queued_decisions: &AtomicUsize) -> Record {
+    if let Record::Decision(_) = record {
+        queued_decisions.fetch_sub(1, Ordering::Relaxed);
+    }
+    record
+}
+
 fn drain(
     rx: &Receiver<Record>,
     writer: &mut Writer,
     dropped: &AtomicU64,
+    queued_decisions: &AtomicUsize,
 ) -> Result<(), WriteError> {
     loop {
         let first = match rx.recv_timeout(IDLE_WAKE) {
-            Ok(record) => Some(record),
+            Ok(record) => Some(taken(record, queued_decisions)),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         };
@@ -556,7 +843,7 @@ fn drain(
             // flushed every batch, not only when it happens to go idle.
             for _ in 1..MAX_RECORDS_PER_FLUSH {
                 match rx.try_recv() {
-                    Ok(record) => writer.record(&record, dropped)?,
+                    Ok(record) => writer.record(&taken(record, queued_decisions), dropped)?,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         writer.flush()?;
@@ -630,6 +917,43 @@ pub(crate) fn global() -> Option<&'static RoutingDataset> {
 #[cfg(test)]
 pub(crate) fn global() -> Option<&'static RoutingDataset> {
     None
+}
+
+/// The recorder to write `decision` lines to: the process recorder, only while
+/// it is recording and only when [`DATASET_CANDIDATES_ENV`] is affirmatively
+/// set. `None` costs routing nothing further.
+#[cfg(not(test))]
+pub(crate) fn candidate_recorder() -> Option<&'static RoutingDataset> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        let enabled =
+            super::parse_routing_flag(std::env::var(DATASET_CANDIDATES_ENV).ok().as_deref());
+        if enabled && !configured() {
+            tracing::warn!(
+                "routing dataset: {DATASET_CANDIDATES_ENV} is set but {DATASET_PATH_ENV} is not; \
+                 no decisions will be recorded"
+            );
+        }
+        enabled
+    });
+    candidate_recorder_from(enabled, global)
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_recorder() -> Option<&'static RoutingDataset> {
+    None
+}
+
+/// [`candidate_recorder`]'s decision, with its inputs supplied. The recorder
+/// is only looked up when the switch is on.
+pub(crate) fn candidate_recorder_from<'a>(
+    enabled: bool,
+    recorder: impl FnOnce() -> Option<&'a RoutingDataset>,
+) -> Option<&'a RoutingDataset> {
+    if !enabled {
+        return None;
+    }
+    recorder().filter(|recorder| recorder.is_recording())
 }
 
 /// Whether `FREENET_ROUTING_DATASET` is set, so a missing recorder means it
@@ -727,17 +1051,22 @@ mod tests {
             .append(true)
             .open(path)
             .unwrap();
-        let (dropped, stopped) = (dataset.dropped.clone(), dataset.stopped.clone());
+        let (dropped, stopped, queued_decisions) = (
+            dataset.dropped.clone(),
+            dataset.stopped.clone(),
+            dataset.queued_decisions.clone(),
+        );
         // Disconnect the channel so the writer returns once drained, while the
         // counters stay observable through the clones.
         let RoutingDataset { tx, .. } = dataset;
         drop(tx);
-        write_loop(rx, file, max_bytes, &dropped, &stopped);
+        write_loop(rx, file, max_bytes, &dropped, &stopped, &queued_decisions);
         let (tx, _rx) = sync_channel(0);
         RoutingDataset {
             tx,
             dropped,
             stopped,
+            queued_decisions,
         }
     }
 
@@ -1008,6 +1337,252 @@ mod tests {
         // silently turns recording off on every node that uses it.
         assert_eq!(DATASET_PATH_ENV, "FREENET_ROUTING_DATASET");
         assert_eq!(DATASET_MAX_BYTES_ENV, "FREENET_ROUTING_DATASET_MAX_BYTES");
+        assert_eq!(DATASET_CANDIDATES_ENV, "FREENET_ROUTING_DATASET_CANDIDATES");
+    }
+
+    fn estimate(expected_total_time: f64) -> ModelEstimate {
+        ModelEstimate {
+            failure_probability: 0.1,
+            time_to_response_start_s: 0.2,
+            transfer_speed_bps: 1000.0,
+            expected_total_time,
+        }
+    }
+
+    /// A capture over `peers` in the given (distance) order, with per-candidate
+    /// legacy and hierarchical costs and the router's returned positions.
+    fn capture<'a>(
+        peers: &'a [PeerKeyLocation],
+        legacy: &[Option<f64>],
+        hierarchical: &[Option<f64>],
+        selected: &[(usize, usize)],
+    ) -> DecisionCapture<'a> {
+        let mut candidates: Vec<CapturedCandidate<'a>> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| CapturedCandidate {
+                peer,
+                legacy: legacy[i].map(estimate),
+                hierarchical: hierarchical[i].map(estimate),
+                hierarchical_stages: HierarchicalStages {
+                    failure: true,
+                    response_time: i % 2 == 0,
+                    transfer_speed: false,
+                },
+                selected_position: None,
+            })
+            .collect();
+        for &(index, position) in selected {
+            candidates[index].selected_position = Some(position);
+        }
+        DecisionCapture {
+            contract_location: crate::ring::Location::new(0.5),
+            acting_model: RoutingModel::Legacy,
+            prediction_fallback: legacy.iter().any(Option::is_none),
+            k: selected.len(),
+            candidates_available: peers.len() + 10,
+            prior_failure_events: 77,
+            candidates,
+        }
+    }
+
+    fn peers(count: u32) -> Vec<PeerKeyLocation> {
+        (0..count)
+            .map(|i| peer_at(&format!("198.51.{}.{}:31337", i / 250, i % 250 + 1)))
+            .collect()
+    }
+
+    #[test]
+    fn a_decision_record_ranks_every_candidate_under_both_models() {
+        let peers = peers(4);
+        // Legacy order: 1, 3, 0, 2 (2 has no prediction, so last, as in the
+        // router). Hierarchical order: 2, 0, 1, 3 — the tie between 1 and 3
+        // breaks by distance order, again as in the router's stable sort.
+        let record = capture(
+            &peers,
+            &[Some(3.0), Some(1.0), None, Some(2.0)],
+            &[Some(2.0), Some(5.0), Some(1.0), Some(5.0)],
+            &[(1, 0), (3, 1)],
+        )
+        .into_record(crate::node::network_status::OpType::Subscribe, 42);
+
+        let ranks: Vec<(usize, usize)> = record
+            .candidates
+            .iter()
+            .map(|c| (c.rank_legacy, c.rank_hierarchical))
+            .collect();
+        assert_eq!(ranks, [(2, 1), (0, 2), (3, 0), (1, 3)]);
+        assert_eq!(record.chosen_rank_legacy, Some(0));
+        assert_eq!(record.chosen_rank_hierarchical, Some(2));
+        assert_eq!(record.op, "SUBSCRIBE");
+        assert_eq!(record.t_ms, 42);
+        assert!(record.prediction_fallback);
+        assert_eq!((record.k, record.candidates_available), (2, 14));
+        assert_eq!(
+            (record.candidates_considered, record.candidates_omitted),
+            (4, 0)
+        );
+        for (index, (candidate, peer)) in record.candidates.iter().zip(&peers).enumerate() {
+            assert_eq!(candidate.peer, peer_hash(peer), "peers keep distance order");
+            assert_eq!(candidate.distance_rank, index);
+            let location = peer.location().unwrap();
+            assert_eq!(candidate.peer_location, Some(location.as_f64()));
+            assert_eq!(
+                candidate.distance,
+                Some(crate::ring::Location::new(0.5).distance(location).as_f64())
+            );
+        }
+        assert!(record.candidates[2].legacy.is_none());
+        assert_eq!(
+            record
+                .candidates
+                .iter()
+                .map(|c| c.selected_position)
+                .collect::<Vec<_>>(),
+            [None, Some(0), None, Some(1)]
+        );
+    }
+
+    #[test]
+    fn a_decision_over_the_candidate_cap_keeps_the_selection_and_counts_the_rest() {
+        let extra = 8;
+        let count = MAX_RECORDED_CANDIDATES + extra;
+        let peers = peers(count as u32);
+        // Legacy cost rises with index, so the acting model's worst is last —
+        // and the router selected that worst one anyway (as it would with k
+        // larger than the cap, or an ordering this test does not model).
+        let legacy: Vec<Option<f64>> = (0..count).map(|i| Some(i as f64)).collect();
+        let hierarchical: Vec<Option<f64>> = (0..count).map(|i| Some((count - i) as f64)).collect();
+        let record = capture(&peers, &legacy, &hierarchical, &[(count - 1, 0)])
+            .into_record(crate::node::network_status::OpType::Get, 1);
+
+        assert_eq!(record.candidates.len(), MAX_RECORDED_CANDIDATES);
+        assert_eq!(record.candidates_considered, count);
+        assert_eq!(record.candidates_omitted, extra);
+        let kept: Vec<usize> = record.candidates.iter().map(|c| c.distance_rank).collect();
+        let mut expected: Vec<usize> = (0..MAX_RECORDED_CANDIDATES - 1).collect();
+        expected.push(count - 1);
+        assert_eq!(
+            kept, expected,
+            "the selection, then the acting model's best, in distance order"
+        );
+        let chosen = record.candidates.last().unwrap();
+        assert_eq!(chosen.selected_position, Some(0));
+        assert_eq!(
+            (chosen.rank_legacy, chosen.rank_hierarchical),
+            (count - 1, 0),
+            "ranks are over the whole window, not the written subset"
+        );
+        assert_eq!(record.chosen_rank_legacy, Some(count - 1));
+    }
+
+    #[test]
+    fn decision_lines_round_trip_as_tagged_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let dataset = RoutingDataset::open(&path, DEFAULT_MAX_BYTES).unwrap();
+        let peers = peers(2);
+        dataset.record_decision(
+            capture(&peers, &[Some(1.0), None], &[None, Some(1.0)], &[(0, 0)])
+                .into_record(crate::node::network_status::OpType::Put, 9),
+        );
+        drop(dataset);
+
+        let lines = lines_eventually(&path, |lines| lines.len() >= 2);
+        let decision = &lines[1];
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["op"], "PUT");
+        assert_eq!(decision["t_ms"], 9);
+        assert_eq!(decision["contract_location"], 0.5);
+        assert_eq!(decision["acting_model"], "legacy");
+        assert_eq!(decision["candidates_omitted"], 0);
+        assert_eq!(decision["chosen_rank_hierarchical"], 1);
+        let first = &decision["candidates"][0];
+        assert_eq!(first["peer"], peer_hash(&peers[0]));
+        assert_eq!(first["selected_position"], 0);
+        assert_eq!(first["legacy"]["expected_total_time"], 1.0);
+        assert_eq!(first["legacy"]["transfer_speed_bps"], 1000.0);
+        assert!(
+            first["hierarchical"].is_null(),
+            "an absent estimate is null, not omitted"
+        );
+        assert_eq!(first["hierarchical_stages"]["response_time"], true);
+        assert!(decision["candidates"][1]["selected_position"].is_null());
+        assert_eq!(decision["candidates"][1]["rank_hierarchical"], 0);
+    }
+
+    #[test]
+    fn candidate_logging_is_off_unless_switched_on_and_recording() {
+        assert!(
+            !super::super::parse_routing_flag(None),
+            "an unset {DATASET_CANDIDATES_ENV} must leave candidate logging off"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let recording =
+            RoutingDataset::open(&dir.path().join("r.jsonl"), DEFAULT_MAX_BYTES).unwrap();
+        let stopped = RoutingDataset::stopped_for_test();
+
+        assert!(
+            candidate_recorder_from(false, || -> Option<&RoutingDataset> {
+                panic!("a disabled switch must not even look the recorder up")
+            })
+            .is_none()
+        );
+        assert!(candidate_recorder_from(false, || Some(&recording)).is_none());
+        assert!(candidate_recorder_from(true, || None).is_none());
+        assert!(
+            candidate_recorder_from(true, || Some(&stopped)).is_none(),
+            "a recorder that stopped must stop candidate capture too"
+        );
+        assert!(candidate_recorder_from(true, || Some(&recording)).is_some());
+    }
+
+    #[test]
+    fn queued_decisions_are_bounded_and_the_bound_is_released_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let peers = peers(1);
+        let record = || {
+            capture(&peers, &[Some(1.0)], &[Some(1.0)], &[(0, 0)])
+                .into_record(crate::node::network_status::OpType::Get, 1)
+        };
+        // Writer not started, so nothing drains while sending.
+        let (dataset, rx) = RoutingDataset::unstarted();
+        const OVER: usize = 3;
+        for _ in 0..MAX_QUEUED_DECISIONS + OVER {
+            dataset.record_decision(record());
+        }
+        assert_eq!(dataset.dropped(), OVER as u64);
+        assert_eq!(
+            dataset.queued_decisions.load(Ordering::Relaxed),
+            MAX_QUEUED_DECISIONS
+        );
+
+        // Drain on this thread; the sender stays alive so the writer idles out
+        // only after taking everything.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let (dropped, stopped, queued) = (
+            dataset.dropped.clone(),
+            dataset.stopped.clone(),
+            dataset.queued_decisions.clone(),
+        );
+        let RoutingDataset { tx, .. } = dataset;
+        drop(tx);
+        write_loop(rx, file, DEFAULT_MAX_BYTES, &dropped, &stopped, &queued);
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            0,
+            "every written decision frees its slot"
+        );
+        let decisions = read_lines(&path)
+            .iter()
+            .filter(|line| line["kind"] == "decision")
+            .count();
+        assert_eq!(decisions, MAX_QUEUED_DECISIONS);
     }
 
     #[test]

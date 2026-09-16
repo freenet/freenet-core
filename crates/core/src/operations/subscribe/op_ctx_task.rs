@@ -1257,9 +1257,12 @@ async fn advance_to_next_peer(
         retries,
         attempts_at_hop,
         |instance_id, visited| {
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(instance_id, visited, MAX_BREADTH)
+            op_manager.ring.k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Subscribe,
+                instance_id,
+                visited,
+                MAX_BREADTH,
+            )
         },
     )
 }
@@ -1822,10 +1825,12 @@ async fn drive_relay_subscribe(
     new_visited.mark_visited(own_addr);
     new_visited.mark_visited(upstream_addr);
 
-    let mut candidates =
-        op_manager
-            .ring
-            .k_closest_potentially_hosting(&instance_id, &new_visited, MAX_BREADTH);
+    let mut candidates = op_manager.ring.k_closest_potentially_hosting(
+        crate::node::network_status::OpType::Subscribe,
+        &instance_id,
+        &new_visited,
+        MAX_BREADTH,
+    );
 
     if candidates.is_empty() {
         // True no-candidate terminus: every connection is already in the
@@ -4224,7 +4229,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, upstream].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::node::network_status::OpType::Subscribe,
+                &instance_id,
+                [own, upstream].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");

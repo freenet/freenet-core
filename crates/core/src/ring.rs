@@ -4066,36 +4066,68 @@ impl Ring {
     /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
+    /// `op` labels the decision in the routing dataset's candidate log.
     #[inline]
     pub fn closest_potentially_hosting(
         &self,
+        op: crate::node::network_status::OpType,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
-        let router = self.router.read();
         let target = Location::from(contract_key);
-        let (peer, decision) = self
+        // Same candidates and selection as
+        // `ConnectionManager::routing_with_telemetry`, with the router lock
+        // taken only for the selection so the candidate record is built and
+        // sent after it is released.
+        let candidates = self
             .connection_manager
-            .routing_with_telemetry(target, None, skip_list, &router);
-
-        if let Some(decision) = &decision {
-            tracing::debug!(
-                target_location = %target.as_f64(),
-                strategy = ?decision.strategy,
-                num_candidates = decision.candidates.len(),
-                total_routing_events = decision.total_routing_events,
-                selected = peer.is_some(),
-                "routing_decision"
-            );
+            .routing_candidates(target, None, skip_list, true);
+        if candidates.is_empty() {
+            return None;
         }
+        self.select_and_record(op, &candidates, target, 1).pop()
+    }
 
-        peer
+    /// Select up to `k` of `candidates` for an operation, and write the
+    /// decision's candidate set to the routing dataset when that is enabled
+    /// (`FREENET_ROUTING_DATASET_CANDIDATES`). The record is assembled and
+    /// queued after the router read lock is released.
+    fn select_and_record(
+        &self,
+        op: crate::node::network_status::OpType,
+        candidates: &[PeerKeyLocation],
+        target_location: Location,
+        k: usize,
+    ) -> Vec<PeerKeyLocation> {
+        let recorder = crate::router::dataset::candidate_recorder();
+        let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
+            candidates.iter(),
+            target_location,
+            k,
+            recorder.is_some(),
+        );
+        // `selected` and `capture` borrow from `candidates`, not from the
+        // router guard, so the read lock is released at the end of the
+        // statement above.
+        if let (Some(recorder), Some(capture)) = (recorder, capture) {
+            recorder.record_decision(capture.into_record(op, crate::router::dataset::now_ms()));
+        }
+        tracing::debug!(
+            target_location = %target_location.as_f64(),
+            strategy = ?decision.strategy,
+            num_candidates = decision.candidates.len(),
+            total_routing_events = decision.total_routing_events,
+            selected_count = selected.len(),
+            "routing_decision"
+        );
+        selected.into_iter().cloned().collect()
     }
 
     /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
     pub fn k_closest_potentially_hosting<K>(
         &self,
+        op: crate::node::network_status::OpType,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
@@ -4213,22 +4245,7 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let (selected, decision) = self.router.read().select_k_best_peers_with_telemetry(
-            candidates.iter(),
-            target_location,
-            k,
-        );
-        // `selected` borrows from `candidates`, not from the router guard, so
-        // the read lock is released here before the tracing/collect below.
-
-        tracing::debug!(
-            target_location = %target_location.as_f64(),
-            strategy = ?decision.strategy,
-            num_candidates = decision.candidates.len(),
-            total_routing_events = decision.total_routing_events,
-            selected_count = selected.len(),
-            "routing_decision"
-        );
+        let selected = self.select_and_record(op, &candidates, target_location, k);
 
         tracing::debug!(
             target_location = %target_location.as_f64(),
@@ -4238,7 +4255,7 @@ impl Ring {
             "k_closest_potentially_hosting result"
         );
 
-        selected.into_iter().cloned().collect()
+        selected
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {

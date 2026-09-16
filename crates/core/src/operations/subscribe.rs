@@ -232,10 +232,12 @@ pub(super) async fn prepare_initial_request(
         );
         (holder, Vec::new())
     } else {
-        let mut candidates =
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
+        let mut candidates = op_manager.ring.k_closest_potentially_hosting(
+            crate::node::network_status::OpType::Subscribe,
+            &instance_id,
+            &visited,
+            MAX_BREADTH,
+        );
 
         // First try the best candidates from k_closest_potentially_hosting.
         // If that returns empty, fall back to any available connection.

@@ -281,9 +281,11 @@ async fn drive_client_put_inner(
     // self-vs-gateway divergence here is cosmetic, not a routing bug.
     // (Multi-gateway failover across PUT retries is intentionally not
     // implemented; see the design doc's out-of-scope notes.)
-    let initial_target = op_manager
-        .ring
-        .closest_potentially_hosting(&key, tried.as_slice());
+    let initial_target = op_manager.ring.closest_potentially_hosting(
+        crate::node::network_status::OpType::Put,
+        &key,
+        tried.as_slice(),
+    );
     let current_target = match initial_target {
         Some(peer) => {
             if let Some(addr) = peer.socket_addr() {
@@ -1319,9 +1321,11 @@ fn advance_to_next_peer(
     }
     *retries += 1;
 
-    let peer = op_manager
-        .ring
-        .closest_potentially_hosting(key, tried.as_slice())?;
+    let peer = op_manager.ring.closest_potentially_hosting(
+        crate::node::network_status::OpType::Put,
+        key,
+        tried.as_slice(),
+    )?;
     let addr = peer.socket_addr()?;
     tried.push(addr);
     Some((peer, addr))
@@ -1936,9 +1940,11 @@ where
     }
 
     let next_hop = if htl > 0 {
-        op_manager
-            .ring
-            .closest_potentially_hosting(&key, &new_skip_list)
+        op_manager.ring.closest_potentially_hosting(
+            crate::node::network_status::OpType::Put,
+            &key,
+            &new_skip_list,
+        )
     } else {
         None
     };
@@ -3624,9 +3630,11 @@ where
     }
 
     let next_hop = if htl > 0 {
-        op_manager
-            .ring
-            .closest_potentially_hosting(&contract_key, &new_skip_list)
+        op_manager.ring.closest_potentially_hosting(
+            crate::node::network_status::OpType::Put,
+            &contract_key,
+            &new_skip_list,
+        )
     } else {
         None
     };
@@ -4458,9 +4466,11 @@ async fn drive_relay_probe(
     }
 
     let next_hop = if htl > 0 {
-        op_manager
-            .ring
-            .closest_potentially_hosting(&key, &new_skip_list)
+        op_manager.ring.closest_potentially_hosting(
+            crate::node::network_status::OpType::Put,
+            &key,
+            &new_skip_list,
+        )
     } else {
         None
     };
@@ -4737,9 +4747,11 @@ async fn drive_relay_probe_reconcile(
         return Ok(());
     }
 
-    let next_hop = op_manager
-        .ring
-        .closest_potentially_hosting(&key, &new_skip_list);
+    let next_hop = op_manager.ring.closest_potentially_hosting(
+        crate::node::network_status::OpType::Put,
+        &key,
+        &new_skip_list,
+    );
     let next_addr = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&key);
@@ -8506,7 +8518,11 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         op_manager
             .ring
-            .closest_potentially_hosting(key, [own].as_slice())
+            .closest_potentially_hosting(
+                crate::node::network_status::OpType::Put,
+                key,
+                [own].as_slice(),
+            )
             .expect("a ring candidate")
     }
 
