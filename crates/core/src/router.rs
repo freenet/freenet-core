@@ -3004,8 +3004,10 @@ impl Router {
     /// is made. `None` without `capture`, and for a distance-based decision.
     ///
     /// Capturing costs one extra prediction per candidate (the model that is
-    /// not routing) under the caller's router READ lock. Building and sending
-    /// the record is left to the caller, after the lock is released.
+    /// not routing) under the caller's router READ lock; see the cost notes in
+    /// [`dataset`]'s "Candidate sets". Without `capture` the path is the plain
+    /// routing decision. Building and sending the record is left to the
+    /// caller, after the lock is released.
     pub(crate) fn select_k_best_peers_capturing<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,

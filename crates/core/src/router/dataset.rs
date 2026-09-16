@@ -62,8 +62,16 @@
 //! sorted, not reconstructed afterwards; ranks use the router's own cost
 //! ordering ([`cost_order_key`], stable over distance order).
 //!
-//! Off by default even when the recorder is on: a decision line is roughly
-//! 25 times a route line. Distance-based decisions (too little history to
+//! Off by default even when the recorder is on. A decision line with the default
+//! 25-candidate window measured about 16 KB, roughly 25 route lines, so a busy
+//! node reaches the default byte cap far sooner. Capturing also costs routing
+//! time under the router READ lock, because the model that is not routing is
+//! evaluated for every candidate: measured in a release build at about +10%
+//! per decision while legacy routes (356 to 389 µs), but about 10x while the
+//! hierarchical estimator routes (42 to 424 µs), since the legacy stack's
+//! per-candidate Renegade queries then run only for the log. Building the record
+//! (about 6 µs) happens after the lock is released and serialising it (about
+//! 22 µs) on the writer thread. Distance-based decisions (too little history to
 //! predict) and CONNECT peer selection are not recorded. At most
 //! [`MAX_RECORDED_CANDIDATES`] candidates are written per decision; beyond that
 //! every selected candidate and then the acting model's best are kept,
