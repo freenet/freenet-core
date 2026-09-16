@@ -3194,7 +3194,9 @@ impl Router {
             // returned peer carried through the sort: from the decision itself.
             let capture = capture.then(|| {
                 for (position, (distance_rank, _, _, _)) in scored.iter().enumerate() {
-                    captured[*distance_rank].selected_position = Some(position);
+                    if let Some(candidate) = captured.get_mut(*distance_rank) {
+                        candidate.selected_position = Some(position);
+                    }
                 }
                 dataset::DecisionCapture {
                     contract_location: target_location,
