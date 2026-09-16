@@ -597,7 +597,9 @@ struct DecisionState {
     /// Decision records that never reached the file.
     dropped: AtomicU64,
     /// This run's decision budget, published by the writer once it knows the
-    /// file's size (0 until then).
+    /// file's size. `u64::MAX` until then, so pacing allows the burst rather
+    /// than refusing every decision made before the writer has started; the
+    /// writer enforces the real budget either way.
     limit: AtomicU64,
     /// Decision bytes this run has written.
     written: AtomicU64,
@@ -873,7 +875,10 @@ impl RoutingDataset {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
-            decisions: Arc::new(DecisionState::default()),
+            decisions: Arc::new(DecisionState {
+                limit: AtomicU64::new(u64::MAX),
+                ..DecisionState::default()
+            }),
             run_start_ms: now_ms(),
             pace_ms: 0,
         };
@@ -2201,6 +2206,20 @@ mod tests {
             candidate_log_from(0.25, || Some(&recording), |_| true, || 0)
                 .unwrap()
                 .capture
+        );
+    }
+
+    /// Decisions made before the writer thread has published the run's budget
+    /// must not be refused as paced: that race made the first decisions of a
+    /// run read `paced` with pacing switched off.
+    #[test]
+    fn decisions_before_the_writer_starts_are_not_paced() {
+        let (mut recorder, _rx) = RoutingDataset::unstarted();
+        assert!(recorder.within_pace(recorder.run_start_ms), "unpaced");
+        recorder.pace_ms = 3_600_000;
+        assert!(
+            recorder.within_pace(recorder.run_start_ms),
+            "paced: the burst is available at once"
         );
     }
 
