@@ -6042,6 +6042,37 @@ mod tests {
             .unwrap();
         assert_eq!(blind.distance, None);
         assert_eq!(blind.rank_legacy, record.candidates.len() - 1);
+
+        // A router that never ran the hierarchical estimator (flag off, no
+        // recording): every hierarchical stage is cold, so its logged estimate
+        // is the legacy one throughout and says so.
+        let mut unlearned = Router::new(&[]);
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                unlearned.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    outcome: if (index + round) % 3 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        let (_, _, capture) =
+            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true);
+        for candidate in capture.expect("prediction-based").candidates {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages::default(),
+                "nothing learned, nothing supplied"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            assert_eq!(hierarchical.failure_probability, legacy.failure_probability);
+        }
     }
 
     #[test]
