@@ -4623,30 +4623,80 @@ mod tests {
 
     /// The flag must actually gate: with it off, the estimate is whatever the
     /// legacy blend produces and nothing about the correction leaks into it.
+    ///
+    /// Poisons the correction terms themselves — they reach the legacy stage
+    /// as an argument of `combine_legacy_stages` — so a leak moves a bit here,
+    /// and the flag-on arm is the non-vacuity check that the poison is large
+    /// enough to show. (An earlier shape compared two flag-off predictions with
+    /// each other, which a leak would change identically.)
     #[test]
     fn disabled_correction_leaves_the_legacy_estimate_untouched() {
+        // About the legacy blend, so pin the legacy stack.
+        let _legacy = force_hierarchical_routing(false);
         let mut router = Router::new(&[]);
         add_relay_recorded_successes(&mut router, 300);
         let peer = PeerKeyLocation::random();
         let contract = Location::random();
-
-        let first = {
-            let _guard = force_residual_correction(false);
-            router.predict_routing_outcome(&peer, contract).ok()
+        let distance = peer
+            .location()
+            .map(|loc| contract.distance(loc).as_f64())
+            .unwrap_or(0.5);
+        let failure_estimate = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .expect("a failure curve after 300 events");
+        let renegade_time = router
+            .renegade_predictor
+            .time_at(routing_predictor::wall_clock_hours());
+        let poison = routing_predictor::Correction {
+            value: 0.9,
+            lambda: 1.0,
+            n_eff: 1.0e6,
         };
-        let second = {
-            let _guard = force_residual_correction(false);
-            router.predict_routing_outcome(&peer, contract).ok()
+        let poisoned = routing_predictor::RoutingCorrections {
+            failure: Some(poison),
+            response_time: Some(poison),
+            transfer_speed: Some(poison),
+        };
+        let combine = |corrections: routing_predictor::RoutingCorrections,
+                       correction_enabled: bool| {
+            let queries = LegacyQueries {
+                renegade: router.renegade_predictor.predict_at_time(
+                    &peer,
+                    contract,
+                    distance,
+                    renegade_time,
+                ),
+                corrections,
+            };
+            let estimates = router.combine_legacy_stages(
+                &peer,
+                contract,
+                failure_estimate,
+                None,
+                None,
+                &queries,
+                correction_enabled,
+            );
+            [
+                estimates.failure.to_bits(),
+                estimates.time_to_response_start.to_bits(),
+                estimates.xfer_speed.to_bits(),
+            ]
         };
 
-        match (first, second) {
-            (Some(a), Some(b)) => assert_eq!(
-                a.failure_probability, b.failure_probability,
-                "the disabled path must be deterministic and correction-free"
-            ),
-            (None, None) => {}
-            _ => panic!("prediction availability must not depend on the flag"),
-        }
+        let clean = combine(routing_predictor::RoutingCorrections::default(), false);
+        assert_eq!(
+            clean,
+            combine(poisoned, false),
+            "with the flag off, the correction terms must not reach any legacy stage estimate"
+        );
+        assert_ne!(
+            clean,
+            combine(poisoned, true),
+            "with the flag on the same poison must move the estimate, or the equality \
+             above proves nothing"
+        );
     }
 
     /// The hierarchical switch fails safe: only an explicit affirmative turns
