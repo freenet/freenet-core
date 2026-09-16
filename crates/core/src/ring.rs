@@ -258,6 +258,9 @@ struct RouteFailureCauseCounts {
     not_found: std::sync::atomic::AtomicU64,
     timeout: std::sync::atomic::AtomicU64,
     send_failure: std::sync::atomic::AtomicU64,
+    /// The subset of `timeout` recorded as the originator of the operation,
+    /// excluding labels recorded while relaying other nodes' operations.
+    originator_timeout: std::sync::atomic::AtomicU64,
 }
 
 /// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
@@ -4336,6 +4339,13 @@ impl Ring {
             AttemptFailure::SendFailure => &self.route_failure_causes.send_failure,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cause == AttemptFailure::Timeout
+            && matches!(source, crate::router::dataset::RouteSource::Originator)
+        {
+            self.route_failure_causes
+                .originator_timeout
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if cause == AttemptFailure::Timeout {
             if let Some(addr) = event.peer.socket_addr() {
                 self.timeout_label_window.lock().record(addr);
@@ -4384,6 +4394,16 @@ impl Ring {
             self.route_failure_causes.timeout.load(Relaxed),
             self.route_failure_causes.send_failure.load(Relaxed),
         )
+    }
+
+    /// Timeout failure labels this node recorded as the originator of an
+    /// operation: the subset of [`Self::route_failure_cause_counts`]'s timeouts
+    /// that excludes labels recorded while relaying (#5660).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn originator_route_timeout_count(&self) -> u64 {
+        self.route_failure_causes
+            .originator_timeout
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ==================== Subscription Management (Lease-Based) ====================

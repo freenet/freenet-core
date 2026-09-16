@@ -705,6 +705,33 @@ impl ControlledSimulationResult {
             .unwrap_or_default()
     }
 
+    /// Whether `label`'s node held a ring connection to `other`'s address at
+    /// the end of the run. `false` if either node is unknown or never
+    /// published its Ring.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_is_connected_to(&self, label: &NodeLabel, other: &NodeLabel) -> bool {
+        let Some(addr) = self
+            .node_rings
+            .get(other)
+            .and_then(|ring| ring.connection_manager.get_own_addr())
+        else {
+            return false;
+        };
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.connection_manager.get_peer_by_addr(addr).is_some())
+    }
+
+    /// Timeout route-failure labels `label`'s node recorded as the originator
+    /// of an operation, excluding those it recorded while relaying other
+    /// nodes' operations. `None` if the node never published its Ring (#5660).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_originator_route_timeouts(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.originator_route_timeout_count())
+    }
+
     /// Whether `label`'s node was actively receiving updates for `key` (has a
     /// live network/client subscription keeping the copy fresh) at the end of the
     /// run. Returns `false` if the node never published its Ring. The serve-DURING

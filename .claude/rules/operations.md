@@ -104,8 +104,33 @@ WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
     and conditions, hop-less successes included, in both label modes
     (`route_attempt::report_originator_route_outcome`). Only the router label
     uses the recorded hop. Never move a health input to the hop.
-  → The GET stream claim stays on `current_target` here; claiming from the
-    recorded hop is a delivery fix that belongs with retry diversity (#5660).
+  → The GET stream claim uses the recorded hop, falling back to
+    `current_target` only when none was recorded. This is delivery, not
+    labelling, so it does not follow the kill switch: with retry diversity
+    (#5660) the loopback relay's pick often differs from `current_target`, and
+    the stream is registered under the hop it actually came from.
+  → GET retry diversity (#5660): the peers that answered NotFound in this
+    operation are excluded from the originator-loopback relay's own
+    first-hop pick only, handed over through `AttemptHopRegistry`, and are
+    never carried in the forwarded visited bloom. A relay also answers
+    NotFound when its own downstream send fails or its connection drops, so a
+    whole-path exclusion could cut a single-host contract off behind one
+    flapping peer. If the exclusions leave no candidate, the relay ignores
+    them. Once the driver's own guesses run out (rings of three peers or
+    fewer), `advance` chooses each remaining attempt's first hop itself and
+    pins it for the loopback relay (`fallback_target`), so the router's
+    ranking cannot reorder the choice. Every connected peer that failed once
+    without answering NotFound gets its second attempt before any
+    never-asked peer is tried, earliest-asked first: so with two such peers
+    and one attempt left the earlier-asked one wins, and with two such peers
+    a never-asked peer, even one that connected late, can go unasked. The
+    relay honours the pin only while the peer passes `first_hop_candidate`
+    (connected and not transient; readiness is not enforced). A peer given
+    `FALLBACK_MAX_ASKS_PER_PEER` attempts is not chosen again and is
+    excluded from the relay's own pick, so after the guesses run out the
+    fallback re-asks each peer at most once. A local infra retry (a
+    callback dropped on this node, within `MAX_INFRA_RETRIES`) does not
+    count as an attempt on the peer; one beyond that budget does.
   → Every router label carries its routing-dataset source (#5648): the
     recorder passes its `AttemptOrigin` to the sink, and relay-observed
     events (recorder relay labels, legacy relay `SuccessUntimed`,

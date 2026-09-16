@@ -492,19 +492,35 @@ impl Drop for RouteAttemptRecorder {
     }
 }
 
-/// Per-attempt record of the peer an originator's request was actually
-/// forwarded to. See the module docs for why the client driver cannot know it.
+/// Per-attempt handoff between an originator's retry loop and its own
+/// originator-loopback relay: the peer the attempt was actually forwarded to
+/// (see the module docs for why the client driver cannot know it), and the
+/// peers the relay should not pick as that attempt's first hop (#5660).
 ///
 /// The retry loop [`register`](Self::register)s a slot BEFORE sending (the
 /// loopback relay may run before `send_and_await` returns), the loopback relay
-/// fills an existing slot via [`record_hop`](Self::record_hop), and the
-/// returned [`AttemptHopGuard`] removes the slot on every exit, including
-/// cancellation. `record_hop` never inserts, so a late relay cannot leak an
-/// entry: the registry holds at most one entry per in-flight attempt.
+/// reads the slot's [`first_hop_exclusions`](Self::first_hop_exclusions) and
+/// fills it via [`record_hop`](Self::record_hop), and the returned
+/// [`AttemptHopGuard`] removes the slot on every exit, including cancellation.
+/// `record_hop` never inserts, so a late relay cannot leak an entry: the
+/// registry holds at most one entry per in-flight attempt.
 #[derive(Default)]
 pub(crate) struct AttemptHopRegistry {
-    /// The hop and when its local dispatch returned (`None` until it has).
-    slots: DashMap<Transaction, Option<(PeerKeyLocation, Option<tokio::time::Instant>)>>,
+    slots: DashMap<Transaction, AttemptSlot>,
+}
+
+#[derive(Default)]
+struct AttemptSlot {
+    /// The peer the loopback relay forwarded the attempt to, and when its
+    /// local dispatch returned (`None` until it has).
+    hop: Option<(PeerKeyLocation, Option<tokio::time::Instant>)>,
+    /// Peers the loopback relay must not pick as the attempt's first hop.
+    /// Local to this node: never put in the forwarded request's visited bloom.
+    first_hop_exclusions: Vec<std::net::SocketAddr>,
+    /// The peer the retry loop chose as the attempt's first hop, which the
+    /// loopback relay uses over its own ranking while that peer is still one
+    /// of its routing candidates.
+    first_hop_pin: Option<std::net::SocketAddr>,
 }
 
 impl AttemptHopRegistry {
@@ -512,12 +528,48 @@ impl AttemptHopRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn register(self: &Arc<Self>, tx: Transaction) -> AttemptHopGuard {
-        self.slots.insert(tx, None);
+        self.register_excluding(tx, Vec::new(), None)
+    }
+
+    /// [`register`](Self::register), asking the loopback relay not to pick any
+    /// of `first_hop_exclusions` as this attempt's first hop, and to use
+    /// `first_hop_pin` instead while that peer is one of its candidates.
+    pub(crate) fn register_excluding(
+        self: &Arc<Self>,
+        tx: Transaction,
+        first_hop_exclusions: Vec<std::net::SocketAddr>,
+        first_hop_pin: Option<std::net::SocketAddr>,
+    ) -> AttemptHopGuard {
+        self.slots.insert(
+            tx,
+            AttemptSlot {
+                hop: None,
+                first_hop_exclusions,
+                first_hop_pin,
+            },
+        );
         AttemptHopGuard {
             registry: self.clone(),
             tx,
         }
+    }
+
+    /// The peers the originator's retry loop asked its loopback relay not to
+    /// pick as `tx`'s first hop. Empty when no attempt is registered for `tx`
+    /// (a relay hop for a remote upstream, or an attempt already resolved).
+    pub(crate) fn first_hop_exclusions(&self, tx: &Transaction) -> Vec<std::net::SocketAddr> {
+        self.slots
+            .get(tx)
+            .map(|slot| slot.first_hop_exclusions.clone())
+            .unwrap_or_default()
+    }
+
+    /// The peer the originator's retry loop chose as `tx`'s first hop, if
+    /// any. `None` when no attempt is registered for `tx`.
+    pub(crate) fn first_hop_pin(&self, tx: &Transaction) -> Option<std::net::SocketAddr> {
+        self.slots.get(tx).and_then(|slot| slot.first_hop_pin)
     }
 
     /// Called by the originator-loopback relay immediately before it dispatches
@@ -527,7 +579,7 @@ impl AttemptHopRegistry {
     /// unset until [`touch_hop`](Self::touch_hop).
     pub(crate) fn record_hop(&self, tx: &Transaction, peer: &PeerKeyLocation) {
         if let Some(mut slot) = self.slots.get_mut(tx) {
-            *slot = Some((peer.clone(), None));
+            slot.hop = Some((peer.clone(), None));
         }
     }
 
@@ -542,7 +594,7 @@ impl AttemptHopRegistry {
             .slots
             .get_mut(tx)
             .as_deref_mut()
-            .and_then(Option::as_mut)
+            .and_then(|slot| slot.hop.as_mut())
         {
             *recorded_at = Some(tokio::time::Instant::now());
         }
@@ -552,7 +604,7 @@ impl AttemptHopRegistry {
     /// so the attempt is not blamed on a peer that never saw the request.
     pub(crate) fn clear_hop(&self, tx: &Transaction) {
         if let Some(mut slot) = self.slots.get_mut(tx) {
-            *slot = None;
+            slot.hop = None;
         }
     }
 
@@ -581,7 +633,7 @@ impl AttemptHopGuard {
         self.registry
             .slots
             .get(&self.tx)
-            .and_then(|slot| slot.clone())
+            .and_then(|slot| slot.hop.clone())
     }
 }
 

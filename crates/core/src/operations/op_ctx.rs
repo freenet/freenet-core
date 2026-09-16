@@ -502,6 +502,41 @@ pub(crate) trait RetryDriver {
     /// driver attribute its terminal success event to the real hop rather than
     /// its own `current_target` guess. Default: ignore.
     fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
+
+    /// Called when an attempt was answered [`AttemptOutcome::Retry`] (a
+    /// `NotFound`), with the peer that attempt was actually forwarded to
+    /// (`None` when none was recorded), before `advance()`. A driver may avoid
+    /// that peer as a later attempt's FIRST hop (see
+    /// [`Self::first_hop_exclusions`]), and nowhere else: a relay also answers
+    /// `NotFound` when its own downstream send failed or its connection
+    /// dropped, so the peer may still be the only route to a host. Timeouts
+    /// and disconnects are not reported here. Default: ignore.
+    fn on_not_found_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Called once per attempt, before its outcome is handled, with the peer
+    /// the attempt was actually forwarded to (`None` when none was recorded).
+    /// Not called for an attempt that ends in a local infra retry (a callback
+    /// dropped on this node, retried on the same peer without spending the
+    /// retry budget): no verdict came from the peer. Default: ignore.
+    fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Peers the originator-loopback relay should not pick as this attempt's
+    /// first hop, handed to it through
+    /// [`crate::operations::route_attempt::AttemptHopRegistry`] and applied to
+    /// that one pick only. They are never put in the request's visited bloom,
+    /// so relays further along may still route through them. Default: none.
+    fn first_hop_exclusions(&self) -> Vec<std::net::SocketAddr> {
+        Vec::new()
+    }
+
+    /// The peer the originator-loopback relay should use as this attempt's
+    /// first hop instead of its own ranking, handed over the same way as
+    /// [`Self::first_hop_exclusions`]. The relay honours it only while that
+    /// peer is still one of its routing candidates, and otherwise picks as
+    /// usual. Default: none.
+    fn first_hop_pin(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 /// Report one non-terminal attempt outcome to the driver's recorder, if any.
@@ -726,7 +761,11 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         // picks the real first hop may run before `send_and_await` returns.
         // Dropped at the end of this iteration on every path, so a `continue`
         // or `return` cannot leak it.
-        let hop_slot = op_manager.attempt_hop_registry().register(attempt_tx);
+        let hop_slot = op_manager.attempt_hop_registry().register_excluding(
+            attempt_tx,
+            driver.first_hop_exclusions(),
+            driver.first_hop_pin(),
+        );
         let attempt_started = tokio::time::Instant::now();
 
         let attempt_timeout = driver.attempt_timeout();
@@ -770,6 +809,14 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let attempt_resolved = tokio::time::Instant::now();
         let hop_record = hop_slot.hop_record();
         let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
+        // A local callback drop within the infra-retry budget is retried on
+        // the same peer below. It got no verdict from that peer, so the driver
+        // does not count it as an attempt on it (#5660).
+        let infra_retry = matches!(round_trip, Ok(Err(OpError::NotificationError)))
+            && infra_retries < MAX_INFRA_RETRIES;
+        if !infra_retry {
+            driver.on_attempt_hop(attempt_hop.as_ref());
+        }
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -786,7 +833,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // for the budget analysis. Capped to avoid burning CPU in
             // a true shutdown (where the receiver is genuinely
             // dropped and will keep failing).
-            Ok(Err(OpError::NotificationError)) if infra_retries < MAX_INFRA_RETRIES => {
+            Ok(Err(OpError::NotificationError)) if infra_retry => {
                 infra_retries += 1;
                 tracing::debug!(
                     tx = %client_tx,
@@ -904,6 +951,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // `Retry` means the peer answered but could not serve the
                 // contract: GET's `NotFound` is its only producer, and PUT
                 // never returns it.
+                driver.on_not_found_hop(attempt_hop.as_ref());
                 record_attempt_failure(
                     driver,
                     attempt_hop,
@@ -1853,9 +1901,6 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
-    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
-    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
-    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// Source-grep pin for the fast infra-retry path in
     /// `drive_retry_loop`. A `NotificationError` (local callback
     /// dropped without a reply) is a transient infra hiccup, NOT a
@@ -1874,13 +1919,28 @@ mod tests {
     #[test]
     fn drive_retry_loop_has_fast_infra_retry_path() {
         let src = include_str!("op_ctx.rs");
-        let loop_pos = src
-            .find("pub(crate) async fn drive_retry_loop")
-            .expect("drive_retry_loop must exist");
-        let body = &src[loop_pos..];
+        // Every assertion reads the production body only, so no assertion's
+        // own text can satisfy it — and with the `//` comments stripped, so
+        // production PROSE cannot either. Without the strip, `MAX_INFRA_RETRIES`
+        // below is satisfied by the arm's own explanatory comment, which
+        // survives deleting the code that reads the cap. (Line comments only:
+        // this body has no block comment, and no string literal in it contains
+        // `//`, so keep needles out of string literals.)
+        let raw = crate::operations::route_attempt::driver_test_support::production_fn_body(
+            src,
+            "pub(crate) async fn drive_retry_loop",
+        );
+        let body: String = raw
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
         assert!(
             body.contains("MAX_INFRA_RETRIES"),
-            "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
+            "drive_retry_loop's CODE must reference the MAX_INFRA_RETRIES cap \
+             (comments are stripped before this check, so naming it only in \
+             prose does not count)"
         );
         assert!(
             body.contains("Ok(Err(OpError::NotificationError))"),
@@ -1889,9 +1949,10 @@ mod tests {
              real wire errors and call advance()"
         );
         assert!(
-            body.contains("if infra_retries < MAX_INFRA_RETRIES"),
-            "the NotificationError arm must be guarded by \
-             `if infra_retries < MAX_INFRA_RETRIES` so a true shutdown \
+            body.contains("&& infra_retries < MAX_INFRA_RETRIES;")
+                && body.contains("Ok(Err(OpError::NotificationError)) if infra_retry =>"),
+            "the NotificationError arm must be guarded by `infra_retry`, which \
+             requires `infra_retries < MAX_INFRA_RETRIES`, so a true shutdown \
              doesn't loop forever burning CPU"
         );
         // The infra-retry arm must `continue` (re-attempt same peer)
@@ -1900,7 +1961,7 @@ mod tests {
         // `match` (the regular wire_error arm) and assert it doesn't
         // contain `driver.advance()`.
         let infra_arm_start = body
-            .find("Ok(Err(OpError::NotificationError))")
+            .find("Ok(Err(OpError::NotificationError)) if infra_retry =>")
             .expect("matched above");
         let next_arm_start = body[infra_arm_start..]
             .find("Ok(Err(err)) => {")
@@ -1919,6 +1980,9 @@ mod tests {
         );
     }
 
+    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
+    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
+    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// per-attempt timeout — currently only PUT, for streaming-payload
     /// scaling per #4001 — must override explicitly. Pin the default so
     /// a refactor that changes the trait can't silently shift behaviour
