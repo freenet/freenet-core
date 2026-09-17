@@ -2256,6 +2256,7 @@ pub(crate) struct HierarchicalRouting {
     non_speed_samples: u64,
     last_saturation_log: Option<f64>,
     evictions_at_last_log: u64,
+    refusals_at_last_log: u64,
 }
 
 impl std::fmt::Debug for HierarchicalRouting {
@@ -2281,6 +2282,7 @@ impl HierarchicalRouting {
             non_speed_samples: 0,
             last_saturation_log: None,
             evictions_at_last_log: 0,
+            refusals_at_last_log: 0,
         }
     }
 
@@ -2349,11 +2351,16 @@ impl HierarchicalRouting {
     }
 
     /// Info-level, rate-limited notice that the peer tables are evicting live
-    /// entries. Evictions are the signal that `max_connections` headroom is too
-    /// small for this node's churn.
+    /// entries, or that the contract table is refusing residuals. Evictions are
+    /// the signal that `max_connections` headroom is too small for this node's
+    /// churn; refusals are contracts with more peers than
+    /// [`CONTRACT_ENTRIES`], whose residuals train the levels and the curve but
+    /// not the contract table. Both are counted in release builds, so a node
+    /// discarding evidence is not reading as a node with nothing to discard.
     fn log_saturation(&mut self, time: f64) {
         let evictions = self.total_evictions();
-        if evictions == self.evictions_at_last_log {
+        let refused = self.failure.diagnostics().contract_residuals_refused;
+        if evictions == self.evictions_at_last_log && refused == self.refusals_at_last_log {
             return;
         }
         let due = self
@@ -2366,10 +2373,15 @@ impl HierarchicalRouting {
             evictions_total = evictions,
             evictions_since_last_notice = evictions - self.evictions_at_last_log,
             peer_capacity = self.failure.peers.capacity,
-            "hierarchical routing estimator: peer table full, evicting least-recently-used peers"
+            contract_residuals_refused_total = refused,
+            contract_residuals_refused_since_last_notice = refused - self.refusals_at_last_log,
+            contract_entries = CONTRACT_ENTRIES,
+            "hierarchical routing estimator: peer table full, evicting least-recently-used \
+             peers, or contract entries full"
         );
         self.last_saturation_log = Some(time);
         self.evictions_at_last_log = evictions;
+        self.refusals_at_last_log = refused;
     }
 
     pub(crate) fn total_evictions(&self) -> u64 {
