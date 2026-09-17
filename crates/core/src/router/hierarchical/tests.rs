@@ -1588,28 +1588,51 @@ fn routing_estimate_cost_per_candidate() {
     let _guard = GlobalRng::seed_guard(0x4485_ca4d);
     let peers: Vec<PeerKeyLocation> = (0..200).map(|_| PeerKeyLocation::random()).collect();
     let mut routing = HierarchicalRouting::new(200);
+    // Contracts are drawn from a POOL, not fresh per event, so `(contract,
+    // peer)` cells are replicated, the contract term's components are
+    // estimable and the measured per-candidate cost includes its query work.
+    // A unique contract per event leaves the components `None` and `effect()`
+    // short-circuits, which is how the first version of this test measured a
+    // cost the term was absent from.
+    // Each contract is served by a group of eight peers, and every eighth
+    // contract fails half its requests, so there is real between-contract
+    // variance for the term to estimate. Unrealistically concentrated for a
+    // gateway, but this test measures the per-candidate cost, and the cost is
+    // only realistic when the term is doing its work.
+    let contracts: Vec<f64> = (0..32).map(|i| i as f64 / 32.0).collect();
     for i in 0..WINDOW_EVENTS {
-        let peer = &peers[GlobalRng::random_range(0..peers.len())];
+        let contract = GlobalRng::random_range(0..contracts.len());
+        let peer = &peers[(contract * 8 + GlobalRng::random_range(0..8)) % peers.len()];
+        let failure_rate = if contract % 8 == 0 { 0.5 } else { 0.03 };
         let outcome = RoutingOutcome {
-            success: uniform() > 0.05,
+            success: uniform() > failure_rate,
             time_to_response_start_secs: Some(0.05 + uniform()),
             transfer_speed_bps: Some(1_000.0 + 50_000.0 * uniform()),
         };
         routing.observe_at(
             peer,
-            Location::new(uniform()),
+            Location::new(contracts[contract]),
             uniform() * 0.5,
             &outcome,
             i as f64 / 600.0,
         );
     }
+    assert!(
+        routing
+            .failure
+            .contracts
+            .as_ref()
+            .and_then(|table| table.components)
+            .is_some_and(|components| components.tau2_contract > 0.0),
+        "the term must be active, or this measures a cost it is absent from"
+    );
     let queries = 25_000;
     let start = std::time::Instant::now();
     let mut available = 0;
     for q in 0..queries {
         let estimate = routing.estimate(
             &peers[q % peers.len()],
-            Location::new((q % 997) as f64 / 997.0),
+            Location::new(contracts[q % contracts.len()]),
             (q % 500) as f64 / 1000.0,
             WINDOW_EVENTS as f64 / 600.0,
         );
@@ -1984,6 +2007,11 @@ fn feed(stages: &mut [&mut Stage<u32>], mut steps: Vec<Step>) -> f64 {
     now
 }
 
+/// A peer's slot in a stage's peer table.
+fn stage_slot(stage: &Stage<u32>, peer: u32) -> u32 {
+    stage.peers.lookup(&peer).expect("the peer is tracked") as u32
+}
+
 /// A contract none of the tests' peers has seen, in the same band as the
 /// contracts the tests fail (`band_of` 2): a peer's learned failures reach its
 /// forecasts mostly through its (peer, band) cell, so this is where pollution
@@ -2006,26 +2034,32 @@ fn mean_forecast(stage: &Stage<u32>, peers: impl Iterator<Item = u32>) -> f64 {
 /// non-vacuity check: there the storm does raise them.
 #[test]
 fn explain_away_keeps_a_dead_contract_out_of_other_contracts_forecasts() {
-    let _guard = GlobalRng::seed_guard(0x4485_c001);
-    let dead = 0.37;
-    let mut steps = background(0.0, 3.25, 0..30);
-    for peer in 0..6 {
-        steps.extend(on_contract(peer, dead, true, 8, 3.0, 0.25));
+    // Averaged over seeds: a single RNG draw's gap moves by enough that a
+    // tight threshold on it is a threshold on the draw.
+    let seeds = 6u64;
+    let (mut polluted, mut explained) = (0.0, 0.0);
+    for seed in 0..seeds {
+        let _guard = GlobalRng::seed_guard(0x4485_c001 + seed);
+        let dead = 0.37;
+        let mut steps = background(0.0, 3.25, 0..30);
+        for peer in 0..6 {
+            steps.extend(on_contract(peer, dead, true, 8, 3.0, 0.25));
+        }
+        let (mut with_term, mut without_term) = failure_stage_pair();
+        feed(&mut [&mut with_term, &mut without_term], steps);
+        let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..6) - mean_forecast(stage, 6..30);
+        polluted += gap(&without_term) / seeds as f64;
+        explained += gap(&with_term) / seeds as f64;
     }
-    let (mut with_term, mut without_term) = failure_stage_pair();
-    feed(&mut [&mut with_term, &mut without_term], steps);
-
-    let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..6) - mean_forecast(stage, 6..30);
-    let (polluted, explained) = (gap(&without_term), gap(&with_term));
     assert!(
         polluted > 0.3,
         "without the term the storm must raise the failing peers' forecasts, or \
-         this test proves nothing: gap {polluted}"
+         this test proves nothing: mean gap {polluted} over {seeds} seeds"
     );
     assert!(
         explained < 0.2 * polluted,
         "with the term the dead contract must not raise the peers' other forecasts: \
-         gap {explained} against {polluted} without the term"
+         mean gap {explained} against {polluted} without the term, over {seeds} seeds"
     );
 }
 
@@ -2033,25 +2067,30 @@ fn explain_away_keeps_a_dead_contract_out_of_other_contracts_forecasts() {
 /// charged for it. Its own failures must never explain themselves away.
 #[test]
 fn a_peer_failing_a_contract_others_serve_is_charged_to_that_peer() {
-    let _guard = GlobalRng::seed_guard(0x4485_c002);
-    let contract = 0.52;
-    let mut steps = background(0.0, 3.25, 0..30);
-    steps.extend(on_contract(0, contract, true, 24, 3.0, 0.25));
-    steps.extend(on_contract(1, contract, false, 8, 3.0, 0.25));
-    steps.extend(on_contract(2, contract, false, 8, 3.0, 0.25));
-    let (mut with_term, mut without_term) = failure_stage_pair();
-    feed(&mut [&mut with_term, &mut without_term], steps);
-
-    let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..1) - mean_forecast(stage, 3..30);
-    let (charged, with) = (gap(&without_term), gap(&with_term));
+    // Averaged over seeds, as above.
+    let seeds = 6u64;
+    let (mut charged, mut with) = (0.0, 0.0);
+    for seed in 0..seeds {
+        let _guard = GlobalRng::seed_guard(0x4485_c002 + seed);
+        let contract = 0.52;
+        let mut steps = background(0.0, 3.25, 0..30);
+        steps.extend(on_contract(0, contract, true, 24, 3.0, 0.25));
+        steps.extend(on_contract(1, contract, false, 8, 3.0, 0.25));
+        steps.extend(on_contract(2, contract, false, 8, 3.0, 0.25));
+        let (mut with_term, mut without_term) = failure_stage_pair();
+        feed(&mut [&mut with_term, &mut without_term], steps);
+        let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..1) - mean_forecast(stage, 3..30);
+        charged += gap(&without_term) / seeds as f64;
+        with += gap(&with_term) / seeds as f64;
+    }
     assert!(
         charged > 0.05,
-        "sanity: the failures must raise peer 0, gap {charged}"
+        "sanity: the failures must raise peer 0, mean gap {charged} over {seeds} seeds"
     );
     assert!(
         with > 0.8 * charged,
-        "peer 0's own failures must stay charged to peer 0: gap {with} against \
-         {charged} without the term"
+        "peer 0's own failures must stay charged to peer 0: mean gap {with} against \
+         {charged} without the term, over {seeds} seeds"
     );
 }
 
@@ -2151,13 +2190,23 @@ fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
         &mut [&mut with_term, &mut without_term],
         on_contract(0, dead, true, 1, 2.0, 0.0),
     );
-    let first = |stage: &Stage<u32>| {
-        let slot = stage.peers.lookup(&0).unwrap() as u32;
+    // Located once, by peer, and tracked by sequence number after that: an
+    // exact float distance is not a robust way to find an event.
+    let seq = {
+        let slot = stage_slot(&with_term, 0);
+        with_term
+            .sorted
+            .iter()
+            .find(|event| event.slot == slot)
+            .expect("peer 0's only event is in the window")
+            .seq
+    };
+    let first = move |stage: &Stage<u32>| {
         *stage
             .sorted
             .iter()
-            .find(|event| event.slot == slot && event.distance == 0.05)
-            .unwrap()
+            .find(|event| event.seq == seq)
+            .expect("the event is still in the window")
     };
     assert_eq!(
         first(&with_term).adjustment,
@@ -2749,11 +2798,71 @@ fn timing_stages_are_unaffected_by_the_contract_term() {
             LOG_HORIZONS_HOURS
         );
     }
+    // The failure menu is asserted BEHAVIOURALLY, not against itself: setting
+    // `FAILURE_HORIZONS_HOURS` equal to `LOG_HORIZONS_HOURS` passed the old
+    // `assert_eq!(levels.map(horizon_hours), FAILURE_HORIZONS_HOURS)` while
+    // the whole accuracy gain attributed to the menu disappeared. What the
+    // short menu buys is tracking a failure burst faster, so that is what is
+    // checked: after a burst, the failure stage's forecast for the bursting
+    // peers must rise further than a stage carrying the timing menu does.
     let failure: Stage<u32> = Stage::new(Target::Failure, 64);
     assert_eq!(
-        failure.levels.clone().map(|level| level.horizon_hours),
-        FAILURE_HORIZONS_HOURS
+        failure.levels[0].horizon_hours, None,
+        "the menu must keep a no-forgetting level for quiet nodes"
     );
+    assert!(
+        failure
+            .levels
+            .iter()
+            .filter_map(|level| level.horizon_hours)
+            .all(|hours| hours <= 1.5),
+        "every forgetting level of the failure menu must be at most 1.5 h, \
+         which is what makes it faster than the timing menu"
+    );
+    {
+        let burst_response = |horizons: [Option<f64>; HORIZONS]| {
+            let _guard = GlobalRng::seed_guard(0x4485_c010);
+            let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+            for (level, hours) in stage.levels.iter_mut().zip(horizons) {
+                *level = Level::new(hours);
+            }
+            // Two hours of healthy traffic on unique contracts, then a burst
+            // in which peers 0..6 fail everything for six minutes.
+            let mut steps = background(0.0, 2.0, 0..30);
+            for peer in 0..6u32 {
+                for i in 0..60 {
+                    steps.push(Step {
+                        peer,
+                        contract: uniform(),
+                        distance: 0.1,
+                        failed: true,
+                        hours: 2.0 + 0.1 * i as f64 / 60.0,
+                    });
+                }
+            }
+            let mut scratch = Scratch::default();
+            steps.sort_by(|a, b| a.hours.total_cmp(&b.hours));
+            for step in &steps {
+                stage.observe(
+                    &mut scratch,
+                    &step.peer,
+                    step.contract,
+                    step.distance,
+                    f64::from(u8::from(step.failed)),
+                    step.hours,
+                );
+            }
+            stage.refit(&mut scratch, 2.1);
+            mean_forecast(&stage, 0..6) - mean_forecast(&stage, 6..30)
+        };
+        let fast = burst_response(FAILURE_HORIZONS_HOURS);
+        let slow = burst_response(LOG_HORIZONS_HOURS);
+        assert!(
+            fast > slow + 0.02,
+            "the failure menu must track a burst faster than the timing menu: \
+             gap {fast} against {slow}"
+        );
+    }
 
     // Two contracts in the same band, one of which six peers found slow (or
     // failed). An unseen peer's forecast for the two must match on a timing
@@ -2793,6 +2902,377 @@ fn timing_stages_are_unaffected_by_the_contract_term() {
         assert_eq!(difference(target), 0.0, "{target:?}");
     }
     assert!(difference(Target::Failure) > 0.1);
+}
+
+/// Finding 1 of the 2026-09-17 review, the falsifier for the claim this
+/// design rested on. The shared contract effect is candidate-INDEPENDENT, so
+/// it cannot change which candidate has the higher failure probability. The
+/// module docs used to conclude that it therefore "cannot reorder peers for
+/// one decision", and that does not follow: routing ranks by
+/// `t + transfer + 3 * t * p`, so a shared effect `d` moves candidate `i`'s
+/// cost by `3 * t_i * d`, which differs across candidates whose response
+/// times differ.
+///
+/// The test computes the router's cost formula itself, from estimates for two
+/// contracts in the SAME BAND at the SAME distance, one with dead-contract
+/// evidence and one without, so the only difference between the two sets of
+/// costs is the shared effect. It asserts the exact arithmetic identity and
+/// that at least one candidate pair's order changes. The router-level path is
+/// covered separately by
+/// `routing_cost_ranks_peers_whose_forecasts_clamp_at_one`.
+#[test]
+fn a_shared_contract_effect_reweights_peers_that_differ_in_response_time() {
+    let _guard = GlobalRng::seed_guard(0x4485_c011);
+    let (dead, unseen) = (0.37, 0.36);
+    assert_eq!(band_of(dead), band_of(unseen));
+    let peers: Vec<PeerKeyLocation> = (0..30).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    // Response time FALLS with the peer index while the failure rate RISES,
+    // so the fast peers are the unreliable ones. That is the direction in
+    // which a positive shared effect, which favours the faster peer, can
+    // overturn the order.
+    let mut events: Vec<(usize, f64, f64, bool, f64)> = Vec::new();
+    for i in 0..6_000 {
+        let peer = GlobalRng::random_range(0..peers.len());
+        let rate = 0.02 + 0.5 * (peer as f64 / 29.0);
+        events.push((peer, uniform(), 0.05, uniform() < rate, i as f64 / 600.0));
+    }
+    // Eight peers fail the dead contract in the last six minutes.
+    for peer in 0..8usize {
+        for i in 0..10 {
+            events.push((peer, dead, 0.05, true, 9.9 + 0.1 * i as f64 / 10.0));
+        }
+    }
+    events.sort_by(|a, b| a.4.total_cmp(&b.4));
+    for &(peer, contract, distance, failed, hours) in &events {
+        let outcome = RoutingOutcome {
+            success: !failed,
+            // Only successes are timed, as in production. Response time falls
+            // with the peer index; transfer speed is the same for every peer,
+            // so the transfer term cancels out of the comparison.
+            time_to_response_start_secs: (!failed).then(|| 0.02 * (30 - peer) as f64),
+            transfer_speed_bps: (!failed).then_some(50_000.0),
+        };
+        routing.observe_at(
+            &peers[peer],
+            Location::new(contract),
+            distance,
+            &outcome,
+            hours,
+        );
+    }
+    let now = events.last().expect("events exist").4;
+    let distance = 0.05;
+    let bytes = 4_096.0;
+    let cost = |estimate: &Estimate| -> f64 {
+        let t = estimate.time_to_response_start_secs.expect("timed");
+        let speed = estimate.transfer_speed_bps.expect("speed");
+        let p = estimate.failure_ranking.expect("failure");
+        t + bytes / speed + t * p * 3.0
+    };
+    let mut rows = Vec::new();
+    for peer in &peers {
+        let with = routing.estimate(peer, Location::new(dead), distance, now);
+        let without = routing.estimate(peer, Location::new(unseen), distance, now);
+        if with.failure_ranking.is_none() || with.time_to_response_start_secs.is_none() {
+            continue;
+        }
+        // The timing stages carry no contract term, so these must be identical
+        // between the two contracts: the failure term is the only difference.
+        assert_eq!(
+            with.time_to_response_start_secs,
+            without.time_to_response_start_secs
+        );
+        assert_eq!(with.transfer_speed_bps, without.transfer_speed_bps);
+        // Only peers whose forecasts clamp at neither end: where the bound
+        // binds, the RANKING value moves by the slope rather than by the
+        // effect, so the shared effect is no longer a common delta. That is a
+        // separate mechanism, pinned by
+        // `estimate_ranks_peers_whose_forecasts_clamp_at_one`.
+        let unclamped = |estimate: &Estimate| {
+            estimate
+                .failure_probability
+                .is_some_and(|p| p > 0.0 && p < 1.0)
+        };
+        if !unclamped(&with) || !unclamped(&without) {
+            continue;
+        }
+        let delta =
+            with.failure_ranking.expect("failure") - without.failure_ranking.expect("failure");
+        rows.push((
+            with.time_to_response_start_secs.expect("timed"),
+            delta,
+            cost(&with),
+            cost(&without),
+        ));
+    }
+    assert!(
+        rows.len() >= 10,
+        "enough peers must be warm and unclamped: {}",
+        rows.len()
+    );
+    let effect = rows[0].1;
+    assert!(
+        effect > 0.05,
+        "the dead contract must give a real shared effect, or this test proves \
+         nothing: {effect}"
+    );
+    let times: Vec<f64> = rows.iter().map(|row| row.0).collect();
+    let (fastest, slowest) = (
+        times.iter().copied().fold(f64::MAX, f64::min),
+        times.iter().copied().fold(0.0, f64::max),
+    );
+    assert!(
+        slowest > 1.5 * fastest,
+        "the peers must differ materially in response time, or this test proves \
+         nothing: {fastest} to {slowest}"
+    );
+    for &(t, delta, with, without) in &rows {
+        // The effect is the same number for every candidate...
+        assert!(
+            (delta - effect).abs() < 1e-9,
+            "the shared effect must be candidate-independent: {delta} against {effect}"
+        );
+        // ...and yet it moves each candidate's COST by `3 * t_i * delta`.
+        assert!(
+            ((with - without) - 3.0 * t * delta).abs() < 1e-9,
+            "the cost must move by 3 * t * delta: {} against {}",
+            with - without,
+            3.0 * t * delta
+        );
+    }
+    let flips = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| rows[i + 1..].iter().map(move |b| (a, b)))
+        .filter(|(a, b)| (a.2 - b.2).is_sign_positive() != (a.3 - b.3).is_sign_positive())
+        .count();
+    assert!(
+        flips > 0,
+        "a shared contract effect DOES reorder candidates: with {} candidates \
+         and an effect of {effect}, no pair changed order, which would mean \
+         this test can no longer see the mechanism",
+        rows.len()
+    );
+    eprintln!(
+        "#5702 finding 1: shared effect {effect:.4} changed the order of \
+         {flips} of {} candidate pairs (response times {fastest:.3} s to \
+         {slowest:.3} s)",
+        rows.len() * (rows.len() - 1) / 2
+    );
+}
+
+/// Finding 13 of the 2026-09-17 review: nothing drove the term through the
+/// router's own learn path with a REPEATED contract. Every pre-existing router
+/// test draws `Location::random()` per event, so no `(contract, peer)` cell is
+/// replicated and the term is inert; the PR's own router test replaced
+/// `router.hierarchical` wholesale. This is the one place the contract key can
+/// fail to be threaded at all.
+#[test]
+fn add_event_threads_a_repeated_contract_through_the_contract_term() {
+    use crate::node::network_status::OpType;
+    use crate::router::{RouteEvent, RouteOutcome, Router};
+
+    let _guard = GlobalRng::seed_guard(0x4485_c012);
+    let _correction = crate::router::force_residual_correction(false);
+    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let mut router = Router::new(&[]);
+    let peers: Vec<PeerKeyLocation> = (0..24).map(|_| PeerKeyLocation::random()).collect();
+    let contracts: Vec<Location> = (0..16).map(|i| Location::new(i as f64 / 16.0)).collect();
+    let dead = Location::new(0.37);
+    for index in 0..1_200 {
+        // A pool of repeated contracts, plus a dead one that eight peers fail.
+        let (peer, contract, outcome) = if index % 5 == 0 {
+            (&peers[index % 8], dead, RouteOutcome::Failure)
+        } else {
+            (
+                &peers[index % peers.len()],
+                contracts[index % contracts.len()],
+                if index % 11 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+            )
+        };
+        router.add_event(RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome,
+            op_type: Some(OpType::Get),
+        });
+    }
+    let snapshot = router.snapshot();
+    assert!(
+        snapshot.hierarchical_contracts > 1,
+        "the contract key must reach the term through add_event: {}",
+        snapshot.hierarchical_contracts
+    );
+    assert!(
+        snapshot.hierarchical_contract_estimable_refits > 0,
+        "the term must have become estimable, or it is inert on this path"
+    );
+    assert!(
+        snapshot
+            .hierarchical_contract_tau2
+            .is_some_and(|tau2| tau2 > 0.0),
+        "between-contract variance must be estimated: {:?}",
+        snapshot.hierarchical_contract_tau2
+    );
+    // And the key reaches the DECISION path, through the same `estimate` call
+    // `predict_with_model` makes. Held at one distance so the only difference
+    // between the two contracts is the shared effect; they share a band.
+    let unseen = Location::new(0.36);
+    assert_eq!(band_of(dead.as_f64()), band_of(unseen.as_f64()));
+    let clock = router.prediction_clock();
+    let failure_for = |contract: Location| {
+        router
+            .hierarchical
+            .estimate(&peers[20], contract, 0.05, clock.estimator_hours)
+            .failure_ranking
+            .expect("the failure stage predicts after 1,200 events")
+    };
+    assert!(
+        failure_for(dead) > failure_for(unseen) + 0.05,
+        "the dead contract must raise the forecast: {} against {}",
+        failure_for(dead),
+        failure_for(unseen)
+    );
+}
+
+/// Finding 22 of the 2026-09-17 review: `prepare`'s contract-liveness check
+/// had no test. An event whose contract has been evicted and its slot reused
+/// must not be adjusted against the NEW contract's evidence; it keeps the
+/// adjustment it last had.
+#[test]
+fn an_event_whose_contract_slot_was_reused_is_not_adjusted_by_the_new_contract() {
+    let _guard = GlobalRng::seed_guard(0x4485_c013);
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    let dead = 0.37;
+    let mut steps = background(0.0, 1.0, 0..30);
+    for peer in 0..6u32 {
+        steps.extend(on_contract(peer, dead, true, 8, 0.8, 0.15));
+    }
+    feed(&mut [&mut stage], steps);
+    let slot = stage.peers.lookup(&0).expect("peer 0 is tracked") as u32;
+    let event = *stage
+        .sorted
+        .iter()
+        .find(|event| event.slot == slot && event.distance == 0.05)
+        .expect("peer 0's contract event is in the window");
+    assert!(
+        event.adjustment > 0.1,
+        "the event must carry an adjustment, or this test proves nothing: {}",
+        event.adjustment
+    );
+    // Churn the contract table past its capacity so `dead`'s slot is reused.
+    let mut churn = Vec::new();
+    for i in 0..3 * CONTRACT_CAPACITY {
+        churn.push(Step {
+            peer: 1 + (i % 29) as u32,
+            contract: 0.5 + i as f64 / (8.0 * CONTRACT_CAPACITY as f64),
+            distance: 0.1,
+            failed: i % 3 == 0,
+            hours: 1.0 + i as f64 / 600.0,
+        });
+    }
+    feed(&mut [&mut stage], churn);
+    let table = stage
+        .contracts
+        .as_ref()
+        .expect("the failure stage has a term");
+    assert!(
+        !table.live(event.contract_slot, event.contract_generation),
+        "the churn must have evicted the contract, or this test proves nothing"
+    );
+    let find = |stage: &Stage<u32>| {
+        *stage
+            .sorted
+            .iter()
+            .find(|candidate| candidate.seq == event.seq)
+            .expect("the event is still in the window")
+    };
+    // `prepare` reports it as having no contract, so it cannot be adjusted by
+    // whatever now occupies the slot.
+    let mut prepared = Vec::new();
+    assert!(stage.prepare(&mut prepared));
+    let row = prepared
+        .iter()
+        .find(|row| stage.sorted[row.source as usize].seq == event.seq)
+        .expect("the event is prepared");
+    assert_eq!(row.contract_slot, u32::MAX);
+    // The adjustment it held when its contract went is now frozen, however
+    // much evidence the reused slot accumulates. (It is not compared against
+    // the PRE-churn value: refits early in the churn, while the contract was
+    // still present, legitimately refreshed it.)
+    let frozen = find(&stage).adjustment;
+    assert!(frozen > 0.1, "the frozen adjustment must be real: {frozen}");
+    let mut more = Vec::new();
+    for i in 0..CONTRACT_CAPACITY {
+        more.push(Step {
+            peer: 1 + (i % 29) as u32,
+            contract: dead + 1e-9 * i as f64,
+            distance: 0.05,
+            failed: true,
+            hours: 7.0 + i as f64 / 600.0,
+        });
+    }
+    feed(&mut [&mut stage], more);
+    assert_eq!(
+        find(&stage).adjustment.to_bits(),
+        frozen.to_bits(),
+        "an event whose contract slot has been reused keeps its adjustment"
+    );
+}
+
+/// Finding 22 of the 2026-09-17 review: the contract clause in `must_rebase`
+/// was untested. It is what keeps the contract table's epoch-scaled weights
+/// finite on a node whose levels forget nothing, where no level clause can
+/// fire: at a 0.5 h horizon the exponent passes `REBASE_EXPONENT` after 15 h.
+#[test]
+fn an_idle_gap_rebases_the_contract_table_even_when_no_level_would() {
+    let _guard = GlobalRng::seed_guard(0x4485_c014);
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    // Every level forgets nothing, so `Level::exponent` is 0 forever and only
+    // the contract table can force a rebase.
+    for level in &mut stage.levels {
+        *level = Level::new(None);
+    }
+    let mut scratch = Scratch::default();
+    for i in 0..200 {
+        stage.observe(
+            &mut scratch,
+            &(i % 20),
+            0.25,
+            uniform() * 0.5,
+            f64::from(u8::from(i % 4 == 0)),
+            i as f64 / 600.0,
+        );
+    }
+    let before = stage.refits;
+    let epoch = stage
+        .contracts
+        .as_ref()
+        .expect("the failure stage has a term")
+        .epoch;
+    // One event 20 hours later: past `REBASE_EXPONENT * CONTRACT_HORIZON_HOURS`.
+    let late = epoch + 20.0;
+    assert!(stage.contracts.as_ref().expect("term").exponent(late) > REBASE_EXPONENT);
+    stage.observe(&mut scratch, &0, 0.25, 0.1, 0.0, late);
+    assert!(
+        stage.refits > before,
+        "the contract clause must force a refit, or weights grow without bound"
+    );
+    let table = stage.contracts.as_ref().expect("term");
+    assert!(
+        table.exponent(late) <= 0.0,
+        "the epoch must be rebased to now"
+    );
+    assert!(
+        table.weight(late).is_finite() && table.weight(late) <= 1.0,
+        "weights must be finite after the rebase: {}",
+        table.weight(late)
+    );
 }
 
 /// The value peers are ranked by keeps the order of the unbounded forecasts

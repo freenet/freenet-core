@@ -5180,6 +5180,49 @@ mod tests {
         assert!(prediction.failure_probability.is_finite());
     }
 
+    /// The contract term's counters reach the snapshot the dashboard and
+    /// telemetry read, and read as "nothing yet" on a cold router rather than
+    /// as absent. Finding 10 of the 2026-09-17 review of #5702: none of them
+    /// was exported, so a soak in which the term never activated would have
+    /// been indistinguishable from one in which it worked and helped nothing.
+    /// The positive direction, that they move on real traffic, is asserted by
+    /// `hierarchical::tests::add_event_threads_a_repeated_contract_through_the_contract_term`.
+    #[test]
+    fn contract_term_counters_reach_the_snapshot() {
+        let _learn = force_hierarchical_routing(true);
+        let router = Router::new(&[]);
+        let snapshot = router.snapshot();
+        assert_eq!(snapshot.hierarchical_contracts, 0);
+        assert_eq!(snapshot.hierarchical_contract_evictions, 0);
+        assert_eq!(snapshot.hierarchical_contract_residuals_refused, 0);
+        assert_eq!(snapshot.hierarchical_contract_refit_pairs_refused, 0);
+        assert_eq!(snapshot.hierarchical_contract_estimable_refits, 0);
+        assert_eq!(snapshot.hierarchical_contract_tau2, None);
+        // Each field is the failure stage's own diagnostic, not a constant.
+        let diagnostics = router.hierarchical.diagnostics()[0];
+        assert_eq!(snapshot.hierarchical_contracts, diagnostics.contracts);
+        assert_eq!(
+            snapshot.hierarchical_contract_evictions,
+            diagnostics.contract_evictions
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_residuals_refused,
+            diagnostics.contract_residuals_refused
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_refit_pairs_refused,
+            diagnostics.contract_refit_pairs_refused
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_estimable_refits,
+            diagnostics.contract_estimable_refits
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_tau2,
+            diagnostics.contract_tau2
+        );
+    }
+
     /// The peer tables are sized from the configured connection cap, and
     /// evictions under churn reach the snapshot the dashboard and telemetry read.
     #[test]

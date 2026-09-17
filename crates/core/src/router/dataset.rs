@@ -368,6 +368,14 @@ pub(crate) struct FailureForecasts {
     /// Effective evidence behind the correction, when one was formed.
     pub n_eff: Option<f64>,
     /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
+    ///
+    /// The estimator is computed unconditionally on a recording node, so this
+    /// field's MEANING changed when the contract-level term landed: from that
+    /// release on it is the forecast WITH the term, on every recording node,
+    /// whatever `FREENET_ROUTING_HIERARCHICAL` is set to. The without-term
+    /// baseline is therefore not obtainable from data recorded after it, and
+    /// any comparison across that boundary must replay rather than read the
+    /// two directly.
     pub hierarchical: Option<f64>,
     /// FLOORED AT 1 ms: every `log_response_time_*` field is `ln(max(t, 0.001))`,
     /// while routing acts on the unfloored value and `time_to_response_start_s`

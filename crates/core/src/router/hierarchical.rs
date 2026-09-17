@@ -108,20 +108,60 @@
 //!   from the peer levels at the next refit. An event whose contract has no
 //!   present evidence keeps its last adjustment.
 //! - **Forecast.** A failure forecast adds the contract effect from ALL present
-//!   peers (at least `CONTRACT_MIN_OTHER_PEERS + 1`), at every horizon, before
-//!   the `[0, 1]` bound. It is identical for every candidate peer at a given
-//!   moment, so it cannot reorder peers for one decision; without it, the model
+//!   peers, at every horizon, before the `[0, 1]` bound; without it, the model
 //!   forecasts a dead contract's failures low once they are explained away.
-//!   Routing ranks peers by the forecast before the bound
+//!   The effect is candidate-INDEPENDENT: the same number is added to every
+//!   candidate at a given moment, so it never changes which candidate has the
+//!   higher failure PROBABILITY. It does NOT follow that it cannot change
+//!   which peer is SELECTED, and an earlier version of this note claimed that
+//!   it could not. Routing ranks by expected total cost, which on the timed
+//!   branch is `t + transfer + 3 * t * p` (`router.rs`), so a shared effect
+//!   `d` moves candidate `i`'s cost by `3 * t_i * d`, which differs across
+//!   candidates whenever their response times differ: a positive effect
+//!   favours the faster-responding peer, a negative one the slower. Measured
+//!   on the tuning window, the mean effect is about -0.013 to -0.066 at
+//!   healthy instants and +0.098 to +0.187 at degraded ones, so this
+//!   re-weighting happens in ordinary operation and not only on dead
+//!   contracts. Pinned by
+//!   `a_shared_contract_effect_reweights_peers_that_differ_in_response_time`.
+//!   The shared form is therefore preferred over the leave-one-peer-out form
+//!   on measured ranking behaviour, not on candidate-independence: the
+//!   leave-one-out form ranked the FAILING peer lower in 45 of 53 tuning-window
+//!   pairs, which is a direct ranking error, while the shared form's effect on
+//!   ranking is this indirect re-weighting. The bar is one peer higher than
+//!   the learning bar (at least `CONTRACT_MIN_OTHER_PEERS + 1` including the
+//!   candidate); see [`CONTRACT_MIN_OTHER_PEERS`] for what that asymmetry
+//!   costs. Routing ranks peers by the forecast before the bound
 //!   ([`ranking_failure_probability`]), so a large shared effect that clamps
 //!   several peers at 1 does not erase the differences between them.
 //!
-//! Validated offline on the recorded gateway soak (2026-09-17), with constants
+//! Measured offline on the recorded gateway soak (2026-09-17), with constants
 //! tuned on its first part only and scored once on the rest under the
-//! pre-registered gate: failure Brier against legacy 0.989 [0.924, 1.062]
-//! where the estimator without the term scored 1.322, and the excess false-alarm
-//! forecast on successes of recently storm-tainted peers 0.068 [0.018, 0.123]
-//! against 0.183. Ranking within a contract was not resolvable on that data.
+//! pre-registered gate (`routing-soak-gate/PLAN-v2.md`): failure Brier against
+//! legacy 0.989 [0.924, 1.062] where the estimator without the term scored
+//! 1.322, and the excess false-alarm forecast on successes of recently
+//! storm-tainted peers 0.068 [0.018, 0.123] against 0.183. **The gate's
+//! verdict on that scoring was INSUFFICIENT, not PASS**: the Brier check is
+//! secondary, the pollution measure's confidence interval did not resolve
+//! against its bar, and ranking within a contract was not resolvable on that
+//! data at all. So the term is not validated; it is measured, on a gate that
+//! could not decide. Three further limits of that measurement, from the
+//! 2026-09-17 review:
+//!
+//! - the #5655 synthetic bake-off condition holds VACUOUSLY. That harness
+//!   draws a fresh contract per event, so no `(contract, peer)` cell is ever
+//!   replicated, the components are never estimable, and the term never
+//!   activates. It is evidence that the term is inert there, not that it is
+//!   harmless where it acts.
+//! - M2 scores only forecasts that are too high on successes, so an
+//!   over-correction reads as an improvement, and M3's interval cannot resolve
+//!   a level shift of the size the explain-away coverage asymmetry implies.
+//! - the gate replays the recorded CLAMPED forecast, and the unbounded value
+//!   is recorded nowhere, so no offline tool can reproduce the router's order
+//!   among candidates whose forecasts all clamp.
+//!
+//! The numbers above were also re-scored after the 2026-09-17 review fixes,
+//! which changed the model's behaviour; see the PR for the re-scored row.
 //!
 //! # Estimators
 //!
@@ -203,10 +243,19 @@
 //!
 //! # Cost
 //!
-//! A prediction is one hash lookup, one binary search over the curve's blocks
-//! and a constant amount of arithmetic for the selected horizon. A refit is
-//! linear in the window, and once the window is full runs every
-//! [`refit_interval`] events.
+//! A prediction is one hash lookup in the peer table, one binary search over
+//! the curve's blocks, a constant amount of arithmetic for the selected
+//! horizon, and for the failure stage a second hash lookup plus a scan of one
+//! contract's [`CONTRACT_ENTRIES`] entries for the shared effect. That second
+//! lookup is per CANDIDATE although its value is one number per decision
+//! (measured at about 15 microseconds per decision at 200 candidates, under
+//! the router's read lock); hoisting it needs an estimator API that takes the
+//! contract once per decision rather than once per candidate, which is left
+//! for a follow-up.
+//!
+//! A refit is linear in the window, plus one sort of it for the contract
+//! table's rebuild, and once the window is full runs every [`refit_interval`]
+//! events.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -1072,6 +1121,15 @@ const CONTRACT_CAPACITY: usize = 1024;
 /// The Kish factor is scale-free, so without a presence cut a single event from
 /// hours ago would count as full-strength evidence about a contract's CURRENT
 /// state. Fixed in the offline prototype (2026-09-17) before tuning.
+///
+/// Note for tests: the cut compares a stored count against `scale(now)`, which
+/// is 1 when no time has passed, so a test built on a clock that never
+/// advances cannot exercise it at all and is not coverage of the forgetting
+/// behaviour. Router-level tests inject a mock clock and mostly leave it
+/// still; the tests that do exercise the cut
+/// (`the_presence_cut_stops_stale_evidence_from_explaining_a_contract`,
+/// `an_event_outside_the_presence_window_keeps_its_stored_adjustment`) drive
+/// the stage directly with advancing estimator hours.
 const CONTRACT_PRESENCE: f64 = 0.05;
 
 /// Forgetting horizon of the contract table, in hours.
@@ -1083,9 +1141,33 @@ const CONTRACT_PRESENCE: f64 = 0.05;
 const CONTRACT_HORIZON_HOURS: f64 = 0.5;
 
 /// Other peers that must be present on a contract before a peer's learned
-/// residual is adjusted for it. The forecast's shared effect needs one more
-/// (see [`ContractTable::shared_effect`]), the same evidence bar as a peer
-/// inside the contract. Tuned with [`CONTRACT_HORIZON_HOURS`].
+/// residual is adjusted for it. Tuned with [`CONTRACT_HORIZON_HOURS`].
+///
+/// The forecast's shared effect needs `CONTRACT_MIN_OTHER_PEERS + 1` present
+/// peers (see [`ContractTable::shared_effect`]), which is NOT the same
+/// evidence bar, and an earlier version of this comment said it was. Learning
+/// excludes the acting peer and so counts 2 others; the forecast includes
+/// every present peer and so counts 3. That leaves a band in which a residual
+/// is explained away for learning while the forecast never gets the
+/// explanation back. Measured with the gate's own dead-contract definition on
+/// the tuning streams: of gateway-1's 63 dead-contract failures all 63 were
+/// adjusted for learning and 18 (29%) were eligible for the forecast offset;
+/// of gateway-2's 5, all were adjusted and none was eligible. In that band the
+/// model is in the "explain away only" configuration, which the offline gate
+/// measured at failure Brier 1.758 [1.213, 2.529] and rejected. Two other
+/// forms were considered and neither is free: applying the shared offset
+/// wherever the learning adjustment applied re-introduces a leave-one-out
+/// asymmetry at the forecast, and raising the learning bar to 3 others cuts
+/// the mechanism's coverage further. The choice between them needs a measured
+/// comparison and is left open (#5700).
+///
+/// What the bar buys, and what it costs in coverage: the failure rate falls
+/// monotonically with present-peer count on the recorded soak (0.503 at zero
+/// present peers, 0.041 at four or more), so requiring two other present peers
+/// is what stops a single bad peer reading as a dead contract. The price is
+/// that 83.5% of gateway-1's failures and 95.4% of gateway-2's are on
+/// contracts that can never be adjusted or offset. The mechanism therefore
+/// covers a small share of the failure population, not the population.
 const CONTRACT_MIN_OTHER_PEERS: usize = 2;
 
 /// One peer's forgotten residual moments on one contract.
@@ -1284,7 +1366,7 @@ impl ContractTable {
     ///
     /// `pairs` is sorted in place. Ties in weight are broken by peer slot, so
     /// the result does not depend on the order pairs were accumulated in.
-    fn rebuild_node(&mut self, slot: usize, pairs: &mut Vec<(u32, u32, Moments)>) -> usize {
+    fn rebuild_node(&mut self, slot: usize, pairs: &mut [(u32, u32, Moments)]) -> usize {
         if self.nodes.len() <= slot {
             self.nodes.resize(slot + 1, ContractNode::default());
         }
@@ -1483,11 +1565,17 @@ impl ContractTable {
         )
     }
 
-    /// Effect a forecast adds for the contract with location bits `key`: the
-    /// same for every candidate peer, so it cannot reorder peers for one
-    /// decision. A leave-one-out effect here would: it excludes the failing
-    /// peer's own failures and includes the succeeding peer's successes, which
-    /// on the tuning window ranked the failing peer LOWER in 45 of 53 pairs.
+    /// Effect a forecast adds for the contract with location bits `key`.
+    ///
+    /// The same value for every candidate peer, so it never changes which
+    /// candidate has the higher failure PROBABILITY. It can still change which
+    /// peer the router SELECTS, because the cost formula multiplies the
+    /// probability by each candidate's own response time; see the module docs,
+    /// "Contract term", Forecast, for the arithmetic and the measured
+    /// magnitudes. A leave-one-out effect here would reorder the probabilities
+    /// themselves, and in the wrong direction: it excludes the failing peer's
+    /// own failures and includes the succeeding peer's successes, which on the
+    /// tuning window ranked the failing peer LOWER in 45 of 53 pairs.
     fn shared_effect(&self, key: u64, now: f64) -> Option<f64> {
         let slot = self.table.lookup(&key)?;
         self.effect(
@@ -1916,8 +2004,10 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 
     /// Forecast on the target's scale. `None` until the stage has a curve.
     ///
-    /// `O(1)` in the window: one hash lookup, one binary search over the
-    /// curve's blocks, and the selected horizon's arithmetic.
+    /// `O(1)` in the window: a hash lookup in the peer table, one binary
+    /// search over the curve's blocks, the selected horizon's arithmetic, and
+    /// for a stage with a contract term a second hash lookup plus a scan of
+    /// one contract's [`CONTRACT_ENTRIES`] entries.
     pub(crate) fn predict(
         &self,
         peer: &K,
