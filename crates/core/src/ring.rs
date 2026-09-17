@@ -10778,9 +10778,14 @@ pub(crate) mod candidate_log_wiring_tests {
             );
             (subscribe, put, get)
         };
-        {
-            // Below rate 1 the test override never draws a capture: the same
-            // GET selection, now uncaptured, supersedes the capture above.
+        let again = {
+            // Below rate 1 the test override never draws a capture: this GET
+            // decision is uncaptured. Tied costs are shuffled, so it may pick a
+            // different peer than the capture above; every peer is made a live
+            // GET capture first, so whichever it picks is closed.
+            for peer in &peers {
+                recorder.record_decision(live_capture(peer, OpType::Get, contract));
+            }
             let _log = dataset::force_candidate_log(recorder.clone(), 0.5);
             let again = ring.k_closest_potentially_hosting(
                 DecisionLog::Joinable(OpType::Get),
@@ -10788,14 +10793,15 @@ pub(crate) mod candidate_log_wiring_tests {
                 none.as_slice(),
                 1,
             );
-            assert_eq!(again, get);
+            assert_eq!(again.len(), 1);
             dataset::record_bypass(
                 OpType::Subscribe,
                 contract,
                 &subscribe[0],
                 UncapturedReason::DirectedFirstHop,
             );
-        }
+            again
+        };
 
         let lines = lines_through_sentinel(&recorder, &path);
         let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
@@ -10803,6 +10809,12 @@ pub(crate) mod candidate_log_wiring_tests {
             kinds,
             [
                 "start",
+                "decision",
+                "decision",
+                "decision",
+                // The live GET captures of every peer.
+                "decision",
+                "decision",
                 "decision",
                 "decision",
                 "decision",
@@ -10828,12 +10840,12 @@ pub(crate) mod candidate_log_wiring_tests {
         assert_eq!(get_line["op"], "GET");
         assert_eq!(selected_at(get_line, 0), dataset::peer_hash(&get[0]));
 
-        let (superseded, bypass) = (&lines[4], &lines[5]);
+        let (superseded, bypass) = (&lines[9], &lines[10]);
         assert_eq!(superseded["op"], "GET");
         assert_eq!(superseded["reason"], "sampled_out");
         assert_eq!(
             superseded["selected"],
-            serde_json::json!([dataset::peer_hash(&get[0])])
+            serde_json::json!([dataset::peer_hash(&again[0])])
         );
         assert_eq!(bypass["op"], "SUBSCRIBE");
         assert_eq!(bypass["reason"], "directed_first_hop");
@@ -10907,27 +10919,30 @@ pub(crate) mod candidate_log_wiring_tests {
                 1,
             )
         };
-        let first = get();
+        // The router shuffles candidates whose predicted costs tie, so the
+        // peer chosen may differ between calls: count captures, not peers.
+        let captures =
+            |lines: &[serde_json::Value]| lines.iter().filter(|l| l["kind"] == "decision").count();
+        assert_eq!(get().len(), 1);
         // Wait until the writer has charged the capture.
-        dataset::lines_eventually(&path, |lines| lines.iter().any(|l| l["kind"] == "decision"));
-        assert_eq!(get(), first);
+        dataset::lines_eventually(&path, |lines| captures(lines) == 1);
+        assert_eq!(get().len(), 1, "over the paced allowance: not captured");
         tokio::time::advance(std::time::Duration::from_secs(3600)).await;
-        assert_eq!(get(), first);
+        assert_eq!(
+            get().len(),
+            1,
+            "an hour later on the injected clock: captured"
+        );
 
         let lines = lines_through_sentinel(&recorder, &path);
-        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
-        assert_eq!(
-            kinds,
-            [
-                "start",
-                "decision",
-                "decision_uncaptured",
-                "decision",
-                "peers"
-            ],
+        assert_eq!(captures(&lines), 2, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l["kind"] == "decision_uncaptured")
+                .all(|l| l["reason"] == "paced"),
             "{lines:?}"
         );
-        assert_eq!(lines[2]["reason"], "paced");
     }
 
     /// A captured decision for `peer` alone, as a warm router would write it.
