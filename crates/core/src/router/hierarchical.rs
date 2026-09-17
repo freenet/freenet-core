@@ -137,10 +137,11 @@
 //!
 //! Measured offline on the recorded gateway soak (2026-09-17), with constants
 //! tuned on its first part only and scored once on the rest under the
-//! pre-registered gate (`routing-soak-gate/PLAN-v2.md`): failure Brier against
-//! legacy 0.989 [0.924, 1.062] where the estimator without the term scored
+//! pre-registered gate (`routing-soak-gate/PLAN-v2.md`), and re-scored after
+//! the 2026-09-17 review fixes changed the model: failure Brier against
+//! legacy 0.989 [0.923, 1.064] where the estimator without the term scored
 //! 1.322, and the excess false-alarm forecast on successes of recently
-//! storm-tainted peers 0.068 [0.018, 0.123] against 0.183. **The gate's
+//! storm-tainted peers 0.068 [0.018, 0.125] against 0.183. **The gate's
 //! verdict on that scoring was INSUFFICIENT, not PASS**: the Brier check is
 //! secondary, the pollution measure's confidence interval did not resolve
 //! against its bar, and ranking within a contract was not resolvable on that
@@ -160,8 +161,9 @@
 //!   is recorded nowhere, so no offline tool can reproduce the router's order
 //!   among candidates whose forecasts all clamp.
 //!
-//! The numbers above were also re-scored after the 2026-09-17 review fixes,
-//! which changed the model's behaviour; see the PR for the re-scored row.
+//! The numbers above are the re-scored ones; see the PR for the full row, the
+//! measured coverage asymmetry the review found and the fixes did not close,
+//! and the isolated measurement of the failure horizon menu.
 //!
 //! # Estimators
 //!
