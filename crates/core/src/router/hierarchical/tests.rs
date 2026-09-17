@@ -2216,6 +2216,45 @@ fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
     );
 }
 
+/// Between refits, a newly learned failure is adjusted by the effect the
+/// OTHER peers already give its contract, before it enters the levels.
+#[test]
+fn live_learning_subtracts_the_other_peers_contract_effect() {
+    let _guard = GlobalRng::seed_guard(0x4485_c00a);
+    let mut steps = background(0.0, 3.0, 0..30);
+    // An earlier dead contract, so the table has components at the last refit.
+    for peer in 10..16 {
+        steps.extend(on_contract(peer, 0.33, true, 8, 2.7, 0.25));
+    }
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    let now = feed(&mut [&mut with_term, &mut without_term], steps);
+
+    // Three peers fail another contract, then peer 4 fails it once. Fewer events
+    // than a refit interval, so nothing here is re-adjusted by a refit.
+    let dead = 0.37;
+    let mut scratch = Scratch::default();
+    for (index, peer) in [1u32, 2, 3, 1, 2, 3, 1, 2, 3, 4].iter().enumerate() {
+        let hours = now + 0.001 * (index + 1) as f64;
+        for stage in [&mut with_term, &mut without_term] {
+            stage.observe(&mut scratch, peer, dead, 0.05, 1.0, hours);
+        }
+    }
+    assert!(with_term.since_refit < refit_interval(WINDOW_EVENTS, with_term.sorted.len()));
+    let adjustment = with_term.fresh.last().unwrap().adjustment as f64;
+    assert!(
+        adjustment > 0.1,
+        "three other failing peers must give the contract an effect, got {adjustment}"
+    );
+    let slot = with_term.peers.lookup(&4).unwrap();
+    let charged = without_term.levels[0].nodes[slot].peer.sum;
+    let applied = with_term.levels[0].nodes[slot].peer.sum;
+    assert!(
+        ((charged - applied) - adjustment).abs() < 1e-6,
+        "the live residual must enter the levels adjusted: control {charged}, with \
+         term {applied}, adjustment {adjustment}"
+    );
+}
+
 /// The contract table holds at most `CONTRACT_CAPACITY` contracts and
 /// `CONTRACT_ENTRIES` peers per contract, and a reused slot starts empty.
 #[test]
