@@ -32,6 +32,9 @@ fn event(distance: f64, y: f64) -> Event {
         seq: 0,
         slot: 0,
         generation: 0,
+        contract_slot: u32::MAX,
+        contract_generation: 0,
+        adjustment: 0.0,
         band: 0,
     }
 }
@@ -1196,13 +1199,18 @@ fn struct_sizes_match_the_memory_budget() {
     assert_eq!(std::mem::size_of::<Prepared>(), PREPARED_BYTES);
     assert_eq!(std::mem::size_of::<PeerNode>(), PEER_NODE_BYTES);
     assert_eq!(std::mem::size_of::<Level>(), LEVEL_BYTES);
+    assert_eq!(std::mem::size_of::<ContractNode>(), CONTRACT_NODE_BYTES);
 }
 
 /// The selector scores the finished forecast the router would act on.
 #[test]
 fn horizon_loss_scores_the_clamped_forecast() {
     let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
-    let forecasts = [0.9, 1.0, 0.4, 0.0].map(|value| Forecast { value, spread: 0.0 });
+    let forecasts = [0.9, 1.0, 0.4, 0.0].map(|value| Forecast {
+        value,
+        unbounded: value,
+        spread: 0.0,
+    });
     stage.score(&forecasts, 1.0, 0.0);
     let expected = [0.01, 0.0, 0.36, 1.0];
     for (loss, want) in stage.loss.iter().zip(expected) {
@@ -1337,10 +1345,12 @@ fn refit_and_prediction_cost_at_a_full_window() {
     for i in 0..WINDOW_EVENTS as u64 + 7 {
         let distance = uniform() * 0.5;
         let y = f64::from(u8::from(uniform() < 0.02 + distance * 0.2));
+        // A few hundred contracts, several peers on each, so the contract
+        // term does its full per-event and per-refit work.
         stage.observe(
             &mut scratch,
             &GlobalRng::random_range(0..peers),
-            uniform(),
+            f64::from(GlobalRng::random_range(0..300u32)) / 300.0,
             distance,
             y,
             i as f64 / 600.0,
@@ -1354,9 +1364,14 @@ fn refit_and_prediction_cost_at_a_full_window() {
     // estimate of the work itself.
     let rounds = 40u32;
     let interval = refit_interval(WINDOW_EVENTS, WINDOW_EVENTS);
-    let mut phases = [std::time::Duration::MAX; 4];
+    let mut phases = [std::time::Duration::MAX; 5];
     for round in 0..rounds {
         for i in 0..interval {
+            let (contract_slot, contract_generation) = stage
+                .contracts
+                .as_mut()
+                .expect("failure stage has a contract term")
+                .touch((f64::from(i as u32 % 300) / 300.0).to_bits());
             stage.fresh.push(Event {
                 distance: uniform() * 0.5,
                 y: 0.0,
@@ -1364,6 +1379,9 @@ fn refit_and_prediction_cost_at_a_full_window() {
                 seq: stage.next_seq,
                 slot: (i % 200) as u32,
                 generation: 0,
+                contract_slot: contract_slot as u32,
+                contract_generation,
+                adjustment: 0.0,
                 band: (round as usize % BANDS) as u8,
             });
             stage.next_seq += 1;
@@ -1382,11 +1400,13 @@ fn refit_and_prediction_cost_at_a_full_window() {
         }
         assert!(stage.prepare(&mut scratch.prepared));
         mark(2);
-        stage.rebuild_levels(&mut scratch.prepared, now);
+        stage.apply_contract_term(&mut scratch.prepared, now);
         mark(3);
+        stage.rebuild_levels(&mut scratch.prepared, now);
+        mark(4);
     }
-    let [merge, curve, prepare, levels] = phases;
-    let per_refit = merge + curve + prepare + levels;
+    let [merge, curve, prepare, contract_term, levels] = phases;
+    let per_refit = merge + curve + prepare + contract_term + levels;
 
     let queries = 25 * 3 * 1_000;
     let start = std::time::Instant::now();
@@ -1397,7 +1417,8 @@ fn refit_and_prediction_cost_at_a_full_window() {
     let per_prediction = start.elapsed() / queries as u32;
     eprintln!(
         "#4485 hierarchical cost over {WINDOW_EVENTS} events: refit {per_refit:?} = merge \
-         {merge:?} + curve {curve:?} + re-anchor {prepare:?} + levels {levels:?}, every \
+         {merge:?} + curve {curve:?} + re-anchor {prepare:?} + contract term {contract_term:?} + \
+         levels {levels:?}, every \
          {interval} events once full ({:?} amortised per event); prediction \
          {per_prediction:?} (sum {acc:.3}); curve blocks {}",
         per_refit / interval as u32,
@@ -1656,6 +1677,8 @@ fn shape_inputs(cells: &[(usize, usize, Vec<f64>)]) -> (Vec<Prepared>, Level) {
                 time: 0.0,
                 weight: 1.0,
                 slot: *slot as u32,
+                contract_slot: u32::MAX,
+                source: 0,
                 band: *band as u8,
             });
         }
@@ -1866,4 +1889,585 @@ fn residual_shape_flags_departures_from_lognormal() {
         failure.diagnostics().residual_shape,
         ResidualShape::default()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Contract term
+// ---------------------------------------------------------------------------
+
+/// One failure-stage event for the contract-term tests.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    peer: u32,
+    contract: f64,
+    distance: f64,
+    failed: bool,
+    hours: f64,
+}
+
+/// Healthy traffic at 600 events per hour: random peers from `peers`, every
+/// event on its own contract, failure rate rising with distance.
+fn background(start: f64, hours: f64, peers: std::ops::Range<u32>) -> Vec<Step> {
+    let count = (hours * 600.0) as usize;
+    (0..count)
+        .map(|i| {
+            let distance = uniform() * 0.5;
+            Step {
+                peer: GlobalRng::random_range(peers.clone()),
+                contract: uniform(),
+                distance,
+                failed: uniform() < 0.02 + 0.2 * distance,
+                hours: start + i as f64 / 600.0,
+            }
+        })
+        .collect()
+}
+
+/// `count` events by `peer` on `contract`, spread evenly over `hours` from
+/// `start`.
+fn on_contract(
+    peer: u32,
+    contract: f64,
+    failed: bool,
+    count: usize,
+    start: f64,
+    hours: f64,
+) -> Vec<Step> {
+    (0..count)
+        .map(|i| Step {
+            peer,
+            contract,
+            distance: 0.05,
+            failed,
+            hours: start + hours * i as f64 / count as f64,
+        })
+        .collect()
+}
+
+/// A production failure stage and the same stage with its contract term
+/// removed, the counterfactual every contract-term test compares against.
+fn failure_stage_pair() -> (Stage<u32>, Stage<u32>) {
+    let with_term: Stage<u32> = Stage::new(Target::Failure, 64);
+    let mut without_term: Stage<u32> = Stage::new(Target::Failure, 64);
+    assert!(with_term.contracts.is_some());
+    without_term.contracts = None;
+    (with_term, without_term)
+}
+
+/// Feed `steps` in time order to every stage, then refit each at the last
+/// event's time so every event carries its adjustment as of that refit.
+fn feed(stages: &mut [&mut Stage<u32>], mut steps: Vec<Step>) -> f64 {
+    steps.sort_by(|a, b| a.hours.total_cmp(&b.hours));
+    let mut scratch = Scratch::default();
+    for step in &steps {
+        for stage in stages.iter_mut() {
+            stage.observe(
+                &mut scratch,
+                &step.peer,
+                step.contract,
+                step.distance,
+                if step.failed { 1.0 } else { 0.0 },
+                step.hours,
+            );
+        }
+    }
+    let now = steps.last().map_or(0.0, |step| step.hours);
+    for stage in stages.iter_mut() {
+        stage.refit(&mut scratch, now);
+    }
+    now
+}
+
+/// A contract none of the tests' peers has seen, in the same band as the
+/// contracts the tests fail (`band_of` 2): a peer's learned failures reach its
+/// forecasts mostly through its (peer, band) cell, so this is where pollution
+/// shows.
+const UNSEEN_CONTRACT: f64 = 0.36;
+
+/// Mean failure forecast over `peers` for [`UNSEEN_CONTRACT`].
+fn mean_forecast(stage: &Stage<u32>, peers: impl Iterator<Item = u32>) -> f64 {
+    let (mut sum, mut count) = (0.0, 0.0);
+    for peer in peers {
+        sum += predict(stage, &peer, UNSEEN_CONTRACT, 0.1).expect("warm stage predicts");
+        count += 1.0;
+    }
+    sum / count
+}
+
+/// A contract that several peers fail and nobody serves must not raise those
+/// peers' forecasts for OTHER contracts: its failures are charged to the
+/// contract. The control, the same stage without the term, is the
+/// non-vacuity check: there the storm does raise them.
+#[test]
+fn explain_away_keeps_a_dead_contract_out_of_other_contracts_forecasts() {
+    let _guard = GlobalRng::seed_guard(0x4485_c001);
+    let dead = 0.37;
+    let mut steps = background(0.0, 3.25, 0..30);
+    for peer in 0..6 {
+        steps.extend(on_contract(peer, dead, true, 8, 3.0, 0.25));
+    }
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    feed(&mut [&mut with_term, &mut without_term], steps);
+
+    let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..6) - mean_forecast(stage, 6..30);
+    let (polluted, explained) = (gap(&without_term), gap(&with_term));
+    assert!(
+        polluted > 0.3,
+        "without the term the storm must raise the failing peers' forecasts, or \
+         this test proves nothing: gap {polluted}"
+    );
+    assert!(
+        explained < 0.2 * polluted,
+        "with the term the dead contract must not raise the peers' other forecasts: \
+         gap {explained} against {polluted} without the term"
+    );
+}
+
+/// Leave-one-peer-out: a peer that fails a contract other peers serve is
+/// charged for it. Its own failures must never explain themselves away.
+#[test]
+fn a_peer_failing_a_contract_others_serve_is_charged_to_that_peer() {
+    let _guard = GlobalRng::seed_guard(0x4485_c002);
+    let contract = 0.52;
+    let mut steps = background(0.0, 3.25, 0..30);
+    steps.extend(on_contract(0, contract, true, 24, 3.0, 0.25));
+    steps.extend(on_contract(1, contract, false, 8, 3.0, 0.25));
+    steps.extend(on_contract(2, contract, false, 8, 3.0, 0.25));
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    feed(&mut [&mut with_term, &mut without_term], steps);
+
+    let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..1) - mean_forecast(stage, 3..30);
+    let (charged, with) = (gap(&without_term), gap(&with_term));
+    assert!(
+        charged > 0.05,
+        "sanity: the failures must raise peer 0, gap {charged}"
+    );
+    assert!(
+        with > 0.8 * charged,
+        "peer 0's own failures must stay charged to peer 0: gap {with} against \
+         {charged} without the term"
+    );
+}
+
+/// The minimum-other-peers rule: one other failing peer cannot tell a dead
+/// contract from a bad peer, so it explains nothing. A second one does.
+#[test]
+fn one_other_failing_peer_does_not_explain_a_peers_failures() {
+    let run = |failing_others: u32| {
+        let _guard = GlobalRng::seed_guard(0x4485_c003);
+        let contract = 0.52;
+        let mut steps = background(0.0, 3.25, 0..30);
+        steps.extend(on_contract(0, contract, true, 24, 3.0, 0.25));
+        for peer in 1..=failing_others {
+            steps.extend(on_contract(peer, contract, true, 6, 3.0, 0.25));
+        }
+        let (mut with_term, mut without_term) = failure_stage_pair();
+        feed(&mut [&mut with_term, &mut without_term], steps);
+        (
+            predict(&with_term, &0, UNSEEN_CONTRACT, 0.1).unwrap(),
+            predict(&without_term, &0, UNSEEN_CONTRACT, 0.1).unwrap(),
+        )
+    };
+    let (with, without) = run(1);
+    assert_eq!(
+        with.to_bits(),
+        without.to_bits(),
+        "one other failing peer must not adjust peer 0: {with} against {without}"
+    );
+    let (with, without) = run(2);
+    assert!(
+        with < without - 0.01,
+        "two other failing peers must explain part of peer 0's failures, or the \
+         equality above proves nothing: {with} against {without}"
+    );
+}
+
+/// The effect a forecast adds is the contract's, not the candidate's: at one
+/// moment it is the same for a peer that failed the contract, a peer that
+/// never touched it, and a peer the stage has never seen.
+#[test]
+fn the_forecast_contract_effect_is_identical_for_every_candidate_peer() {
+    let _guard = GlobalRng::seed_guard(0x4485_c004);
+    let dead = 0.37;
+    let mut steps = background(0.0, 3.25, 0..30);
+    for peer in 0..6 {
+        steps.extend(on_contract(peer, dead, true, 8, 3.0, 0.25));
+    }
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    let now = feed(&mut [&mut stage], steps);
+
+    let distance = 0.1;
+    let prior = stage.prior(distance).unwrap();
+    let offsets: Vec<f64> = [0u32, 3, 12, 29, 999]
+        .iter()
+        .map(|peer| {
+            let with_effect = stage.predict(peer, dead, distance, now).unwrap().unbounded;
+            let without = stage
+                .forecast_with(
+                    stage.selected(),
+                    stage.peers.lookup(peer),
+                    band_of(dead),
+                    prior,
+                    now,
+                )
+                .unbounded;
+            with_effect - without
+        })
+        .collect();
+    assert!(
+        offsets[0] > 0.1,
+        "the dead contract must carry a shared effect, or equality proves nothing: \
+         {offsets:?}"
+    );
+    for offset in &offsets {
+        assert!(
+            (offset - offsets[0]).abs() < 1e-12,
+            "every candidate must get the same contract effect: {offsets:?}"
+        );
+    }
+}
+
+/// A refit re-adjusts every windowed event: a dead contract's FIRST failure,
+/// learned before any other peer had failed there, is explained at the next
+/// refit. Once the contract's evidence has decayed out of the table, events
+/// keep the adjustment they last had, and the levels still apply it.
+#[test]
+fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
+    let _guard = GlobalRng::seed_guard(0x4485_c005);
+    let dead = 0.37;
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    feed(
+        &mut [&mut with_term, &mut without_term],
+        background(0.0, 2.0, 1..30),
+    );
+    // Peer 0's first failure on the dead contract: nobody else has failed it.
+    feed(
+        &mut [&mut with_term, &mut without_term],
+        on_contract(0, dead, true, 1, 2.0, 0.0),
+    );
+    let first = |stage: &Stage<u32>| {
+        let slot = stage.peers.lookup(&0).unwrap() as u32;
+        *stage
+            .sorted
+            .iter()
+            .find(|event| event.slot == slot && event.distance == 0.05)
+            .unwrap()
+    };
+    assert_eq!(
+        first(&with_term).adjustment,
+        0.0,
+        "no other peer had failed the contract when the event was learned"
+    );
+
+    let mut storm = Vec::new();
+    for peer in 1..6 {
+        storm.extend(on_contract(peer, dead, true, 6, 2.01, 0.2));
+    }
+    feed(&mut [&mut with_term, &mut without_term], storm);
+    let adjustment = first(&with_term).adjustment;
+    assert!(
+        adjustment > 0.3,
+        "the refit must explain the first failure once other peers fail the \
+         contract, got {adjustment}"
+    );
+
+    // Three hours of other traffic: six contract horizons, so the dead
+    // contract's entries fall below the presence cut. Refits while they were
+    // still present may have refreshed the adjustment; after that it is frozen.
+    feed(
+        &mut [&mut with_term, &mut without_term],
+        background(2.21, 3.0, 0..30),
+    );
+    let kept = first(&with_term).adjustment;
+    assert!(
+        kept > 0.1,
+        "the adjustment survives the evidence, got {kept}"
+    );
+    // Another hour of refits with no present evidence for the dead contract,
+    // while its events are still in the window.
+    feed(
+        &mut [&mut with_term, &mut without_term],
+        background(5.21, 1.0, 0..30),
+    );
+    assert!(with_term.sorted.len() < WINDOW_EVENTS);
+    assert_eq!(
+        first(&with_term).adjustment.to_bits(),
+        kept.to_bits(),
+        "an event must keep its last adjustment once its contract has no present \
+         evidence"
+    );
+    // The no-forgetting level learns `residual - adjustment` for every event.
+    // The curve does not depend on the term, so the control level holds the
+    // same residuals unadjusted.
+    let slot = with_term.peers.lookup(&0).unwrap();
+    let adjustments: f64 = with_term
+        .sorted
+        .iter()
+        .filter(|event| event.slot == slot as u32)
+        .map(|event| event.adjustment as f64)
+        .sum();
+    let charged = without_term.levels[0].nodes[slot].peer.sum;
+    let applied = with_term.levels[0].nodes[slot].peer.sum;
+    assert!(adjustments > 0.3);
+    assert!(
+        ((charged - applied) - adjustments).abs() < 1e-6,
+        "the kept adjustments must still be subtracted: control sum {charged}, \
+         with term {applied}, adjustments {adjustments}"
+    );
+}
+
+/// The contract table holds at most `CONTRACT_CAPACITY` contracts and
+/// `CONTRACT_ENTRIES` peers per contract, and a reused slot starts empty.
+#[test]
+fn contract_table_is_bounded() {
+    let mut table = ContractTable::new();
+    table.touch(0.25f64.to_bits());
+    assert!(table.add(0, (7, 0), 1.0, 0.5));
+    let first = table.table.lookup(&0.25f64.to_bits()).unwrap();
+    for i in 1..3 * CONTRACT_CAPACITY as u64 {
+        let (slot, _) = table.touch((i as f64 / 1e5).to_bits());
+        assert!(table.add(slot, (1, 0), 1.0, 0.0));
+    }
+    assert!(table.table.index.len() <= CONTRACT_CAPACITY);
+    assert!(table.nodes.len() <= CONTRACT_CAPACITY);
+    assert!(table.table.evictions >= 2 * CONTRACT_CAPACITY as u64 - 64);
+    assert!(table.table.lookup(&0.25f64.to_bits()).is_none());
+    // Every slot has been reused; the one first used must hold only its new
+    // contract's entry, not peer 7's.
+    let node = &table.nodes[first];
+    assert_eq!(node.entries.iter().filter(|e| e.used()).count(), 1);
+    assert!(node.entries.iter().all(|e| e.peer_slot != 7));
+
+    // Entries per contract: a ninth peer replaces the lightest entry only when
+    // it is heavier, and is refused otherwise.
+    let mut table = ContractTable::new();
+    let (slot, _) = table.touch(0.5f64.to_bits());
+    for peer in 0..CONTRACT_ENTRIES as u32 {
+        assert!(table.add(slot, (peer, 0), 1.0 + peer as f64, 1.0));
+    }
+    assert!(
+        !table.add(slot, (100, 0), 0.5, 1.0),
+        "a lighter ninth peer is refused"
+    );
+    assert!(
+        table.add(slot, (101, 0), 2.5, 1.0),
+        "a heavier one replaces the lightest"
+    );
+    let peers: Vec<u32> = table.nodes[slot]
+        .entries
+        .iter()
+        .map(|e| e.peer_slot)
+        .collect();
+    assert!(!peers.contains(&0) && peers.contains(&101) && !peers.contains(&100));
+
+    // Through a stage: distinct contracts never grow the table past its bound,
+    // and the evictions are counted.
+    let _guard = GlobalRng::seed_guard(0x4485_c006);
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    feed(&mut [&mut stage], background(0.0, 5.0, 0..30));
+    let diagnostics = stage.diagnostics();
+    // Evictions come in batches of `CONTRACT_CAPACITY / 64`.
+    assert!(diagnostics.contracts <= CONTRACT_CAPACITY);
+    assert!(diagnostics.contracts > CONTRACT_CAPACITY - CONTRACT_CAPACITY / 64);
+    assert!(diagnostics.contract_evictions > 0);
+}
+
+/// The timing stages carry no contract term and keep their horizon menu, so
+/// a contract many peers were slow on does not move another contract's timing
+/// forecast. The failure stage in the same traffic is the non-vacuity check.
+#[test]
+fn timing_stages_are_unaffected_by_the_contract_term() {
+    for target in [Target::LogResponseTime, Target::LogTransferSpeed] {
+        let stage: Stage<u32> = Stage::new(target, 64);
+        assert!(stage.contracts.is_none());
+        assert_eq!(
+            stage.levels.map(|level| level.horizon_hours),
+            LOG_HORIZONS_HOURS
+        );
+    }
+    let failure: Stage<u32> = Stage::new(Target::Failure, 64);
+    assert_eq!(
+        failure.levels.clone().map(|level| level.horizon_hours),
+        FAILURE_HORIZONS_HOURS
+    );
+
+    // Two contracts in the same band, one of which six peers found slow (or
+    // failed). An unseen peer's forecast for the two must match on a timing
+    // stage, and differ on the failure stage.
+    let (slow, other) = (0.37, 0.36);
+    assert_eq!(band_of(slow), band_of(other));
+    let difference = |target: Target| {
+        let _guard = GlobalRng::seed_guard(0x4485_c007);
+        let mut stage: Stage<u32> = Stage::new(target, 64);
+        let mut steps = background(0.0, 3.25, 0..30);
+        for peer in 0..6 {
+            steps.extend(on_contract(peer, slow, true, 8, 3.0, 0.25));
+        }
+        // Timing stages read `failed` as a slow response: log time 3 against 0.
+        let mut scratch = Scratch::default();
+        steps.sort_by(|a, b| a.hours.total_cmp(&b.hours));
+        for step in &steps {
+            let y = match (target, step.failed) {
+                (Target::Failure, failed) => f64::from(u8::from(failed)),
+                (_, true) => 3.0,
+                (_, false) => 0.0,
+            };
+            stage.observe(
+                &mut scratch,
+                &step.peer,
+                step.contract,
+                step.distance,
+                y,
+                step.hours,
+            );
+        }
+        stage.refit(&mut scratch, 3.25);
+        let at = |contract: f64| stage.predict(&999, contract, 0.05, 3.25).unwrap().value;
+        at(slow) - at(other)
+    };
+    for target in [Target::LogResponseTime, Target::LogTransferSpeed] {
+        assert_eq!(difference(target), 0.0, "{target:?}");
+    }
+    assert!(difference(Target::Failure) > 0.1);
+}
+
+/// The value peers are ranked by keeps the order of the unbounded forecasts
+/// and equals the probability wherever the bound does not bind.
+#[test]
+fn ranking_probability_preserves_order_through_the_clamp() {
+    for p in [0.0, 1e-9, 0.3, 0.999, 1.0] {
+        assert_eq!(ranking_failure_probability(p).to_bits(), p.to_bits());
+    }
+    let values = [-2.0, -0.4, -1e-3, 0.0, 0.5, 1.0, 1.0 + 1e-3, 1.4, 3.0];
+    for pair in values.windows(2) {
+        let (low, high) = (
+            ranking_failure_probability(pair[0]),
+            ranking_failure_probability(pair[1]),
+        );
+        assert!(
+            low < high,
+            "{} -> {low} must rank below {} -> {high}",
+            pair[0],
+            pair[1]
+        );
+    }
+    for value in values {
+        let ranking = ranking_failure_probability(value);
+        assert!((ranking - value.clamp(0.0, 1.0)).abs() <= 3.0 * RANKING_OVERSHOOT_SLOPE);
+        // Stays positive enough that `t * (1 + 3p)` is increasing in `t`.
+        assert!(1.0 + 3.0 * ranking > 0.0);
+    }
+}
+
+/// Where the shared contract effect pushes two peers' forecasts past 1, the
+/// reported probabilities tie at 1 and the ranking still orders the peers by
+/// the evidence against each.
+#[test]
+fn estimate_ranks_peers_whose_forecasts_clamp_at_one() {
+    let _guard = GlobalRng::seed_guard(0x4485_c008);
+    let (routing, worse, better, dead, distance, now) = clamped_pair();
+    let at = |peer: &PeerKeyLocation| routing.estimate(peer, dead, distance, now);
+    let (worse, better) = (at(&worse), at(&better));
+    assert_eq!(worse.failure_probability, Some(1.0));
+    assert_eq!(better.failure_probability, Some(1.0));
+    assert!(
+        worse.failure_ranking.unwrap() > better.failure_ranking.unwrap(),
+        "ranking must keep the peers apart: {worse:?} against {better:?}"
+    );
+}
+
+/// An estimator in which two peers' failure forecasts for `dead` both exceed
+/// 1 before the bound, `worse` further than `better`. Returns (estimator,
+/// worse, better, dead contract, distance, estimator hours).
+fn clamped_pair() -> (
+    HierarchicalRouting,
+    PeerKeyLocation,
+    PeerKeyLocation,
+    Location,
+    f64,
+    f64,
+) {
+    let peers: Vec<PeerKeyLocation> = (0..30).map(|_| PeerKeyLocation::random()).collect();
+    let (worse, better) = (peers[0].clone(), peers[1].clone());
+    let dead = Location::new(0.37);
+    let distance = 0.05;
+    let failure = RoutingOutcome {
+        success: false,
+        time_to_response_start_secs: None,
+        transfer_speed_bps: None,
+    };
+    let success = RoutingOutcome {
+        success: true,
+        time_to_response_start_secs: None,
+        transfer_speed_bps: None,
+    };
+    let mut routing = HierarchicalRouting::new(200);
+    let mut steps = background(0.0, 3.25, 0..30);
+    for peer in 0..8 {
+        steps.extend(on_contract(peer, 0.37, true, 12, 3.0, 0.25));
+    }
+    // The two peers also fail much of their other traffic, `worse` more so.
+    for step in &mut steps {
+        if step.contract != 0.37 && step.peer < 2 {
+            step.failed = uniform() < if step.peer == 0 { 0.9 } else { 0.6 };
+        }
+    }
+    steps.sort_by(|a, b| a.hours.total_cmp(&b.hours));
+    for step in &steps {
+        routing.observe_at(
+            &peers[step.peer as usize],
+            Location::new(step.contract),
+            step.distance,
+            if step.failed { &failure } else { &success },
+            step.hours,
+        );
+    }
+    (routing, worse, better, dead, distance, 3.25)
+}
+
+/// Routing acts on the ranking value: two peers whose reported failure
+/// probabilities both clamp at 1 get different expected costs, the worse peer
+/// the higher, and the better one is selected.
+#[test]
+fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
+    use crate::node::network_status::OpType;
+    use crate::router::{RouteEvent, RouteOutcome, Router};
+
+    let _guard = GlobalRng::seed_guard(0x4485_c009);
+    let _correction = crate::router::force_residual_correction(false);
+    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let (estimator, worse, better, dead, _, _) = clamped_pair();
+    let mut router = Router::new(&[]);
+    // Untimed traffic only, so no stage has timing and the cost is the
+    // failure term alone.
+    for index in 0..200 {
+        router.add_event(RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome: if index % 5 == 0 {
+                RouteOutcome::Failure
+            } else {
+                RouteOutcome::SuccessUntimed
+            },
+            op_type: Some(OpType::Get),
+        });
+    }
+    router.hierarchical = estimator;
+    let clock = router.prediction_clock();
+    let predict = |peer: &PeerKeyLocation| {
+        router
+            .predict_routing_outcome_at(peer, dead, clock)
+            .expect("prediction after warm-up")
+    };
+    let (worse_prediction, better_prediction) = (predict(&worse), predict(&better));
+    assert_eq!(worse_prediction.failure_probability, 1.0);
+    assert_eq!(better_prediction.failure_probability, 1.0);
+    assert!(
+        worse_prediction.expected_total_time > better_prediction.expected_total_time,
+        "the clamp must not tie the two peers' costs: {} against {}",
+        worse_prediction.expected_total_time,
+        better_prediction.expected_total_time
+    );
+    let (selected, _) = router.select_k_best_peers_with_telemetry([&worse, &better], dead, 1);
+    assert_eq!(selected, vec![&better]);
 }

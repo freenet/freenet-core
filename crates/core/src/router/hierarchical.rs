@@ -74,10 +74,54 @@
 //!    descends the levels with a normal-normal update (`B = P / (P + V)`), so a
 //!    node with little evidence contributes little and a missing node passes its
 //!    level's variance down.
-//! 4. **Forgetting horizon chosen online.** One hierarchy per horizon in
-//!    [`HORIZONS_HOURS`]; the one with the lowest decayed prequential squared
-//!    loss of its FINISHED forecast predicts. Every horizon is scored before the
-//!    event is learned.
+//! 4. **Forgetting horizon chosen online.** One hierarchy per horizon in the
+//!    stage's menu ([`FAILURE_HORIZONS_HOURS`] for failure,
+//!    [`LOG_HORIZONS_HOURS`] for timing and speed); the one with the lowest
+//!    decayed prequential squared loss of its FINISHED forecast predicts. Every
+//!    horizon is scored before the event is learned.
+//! 5. **Contract term (failure stage only).** See below.
+//!
+//! # Contract term
+//!
+//! A failure on a contract that nobody can serve is not evidence about the peer
+//! that was asked. Learned as if it were, it raises that peer's forecasts for
+//! every OTHER contract: in the soak's storm hours (#4485, #5700) peers whose
+//! SUBSCRIBEs all succeeded were forecast to fail 24% of the time, against 3%
+//! for clean peers. The failure stage therefore models the residual as
+//! `r = c_contract + u_peer + v_(peer, band) + e`:
+//!
+//! - **Contract table.** A second small hierarchy, contract -> (contract,
+//!   peer), keyed by the contract location's bits, with at most
+//!   [`CONTRACT_ENTRIES`] peers per contract and [`CONTRACT_CAPACITY`]
+//!   contracts (batched LRU), forgetting at [`CONTRACT_HORIZON_HOURS`]. Its
+//!   variance components mirror the peer levels' (leave-one-out contrasts,
+//!   Kish counting); an entry counts only while its decayed count is at least
+//!   [`CONTRACT_PRESENCE`].
+//! - **Explain-away.** The raw residual goes into the contract table. What the
+//!   root, peer and cell levels learn is `r` minus the contract effect from
+//!   OTHER peers only (at least [`CONTRACT_MIN_OTHER_PEERS`] present). Leaving
+//!   the peer out is what keeps a peer that fails every contract charged to
+//!   itself: its own failures never explain themselves away. The curve is
+//!   still fitted on the raw target.
+//! - **Refit.** The table is rebuilt against the new curve and every windowed
+//!   residual re-adjusted, so the first failures on a dead contract are cleared
+//!   from the peer levels at the next refit. An event whose contract has no
+//!   present evidence keeps its last adjustment.
+//! - **Forecast.** A failure forecast adds the contract effect from ALL present
+//!   peers (at least `CONTRACT_MIN_OTHER_PEERS + 1`), at every horizon, before
+//!   the `[0, 1]` bound. It is identical for every candidate peer at a given
+//!   moment, so it cannot reorder peers for one decision; without it, the model
+//!   forecasts a dead contract's failures low once they are explained away.
+//!   Routing ranks peers by the forecast before the bound
+//!   ([`ranking_failure_probability`]), so a large shared effect that clamps
+//!   several peers at 1 does not erase the differences between them.
+//!
+//! Validated offline on the recorded gateway soak (2026-09-17), with constants
+//! tuned on its first part only and scored once on the rest under the
+//! pre-registered gate: failure Brier against legacy 0.989 [0.924, 1.062]
+//! where the estimator without the term scored 1.322, and the excess false-alarm
+//! forecast on successes of recently storm-tainted peers 0.068 [0.018, 0.123]
+//! against 0.183. Ranking within a contract was not resolvable on that data.
 //!
 //! # Estimators
 //!
@@ -214,9 +258,26 @@ pub(crate) const LOG_PREDICTION_MARGIN: f64 = std::f64::consts::LN_2;
 pub(crate) const BANDS: usize = 8;
 const _: () = assert!(BANDS.is_power_of_two(), "band masking needs a power of two");
 
-/// Forgetting horizons, in hours. `None` forgets nothing inside the window.
-/// Powers of four down from 24h, as in the reference.
-pub(crate) const HORIZONS_HOURS: [Option<f64>; HORIZONS] = [None, Some(24.0), Some(6.0), Some(1.5)];
+/// Forgetting horizons of the response-time and transfer-speed stages, in
+/// hours. `None` forgets nothing inside the window. Powers of four down from
+/// 24h, as in the reference.
+pub(crate) const LOG_HORIZONS_HOURS: [Option<f64>; HORIZONS] =
+    [None, Some(24.0), Some(6.0), Some(1.5)];
+
+/// Forgetting horizons of the failure stage, in hours.
+///
+/// Shorter than [`LOG_HORIZONS_HOURS`]: on the recorded gateway soak (#4485,
+/// 2026-09-15/16) the failure stage's accuracy gap against legacy came from
+/// bursts of failures that a 1.5 h memory was too slow to follow. The menu was
+/// chosen on the soak's first half (horizon sweep, 2026-09-15) and validated on
+/// held-out data and the synthetic bake-off (2026-09-16). It keeps `None` and
+/// 1.5 h because the prequential selector falls back to them on quiet nodes,
+/// where the short levels hold almost no evidence. The timing stages keep the
+/// longer menu: the same short menu there failed the bake-off's quiet timing
+/// scenarios and caused ranking churn against healthy peers.
+pub(crate) const FAILURE_HORIZONS_HOURS: [Option<f64>; HORIZONS] =
+    [None, Some(1.5), Some(0.25), Some(0.05)];
+
 pub(crate) const HORIZONS: usize = 4;
 
 /// Forgetting of the horizon selector's accumulated loss, in hours.
@@ -303,6 +364,24 @@ impl Target {
             MIN_CURVE_POINTS_LOG
         } else {
             MIN_CURVE_POINTS_FAILURE
+        }
+    }
+
+    /// The forgetting horizons this target's stage selects among.
+    fn horizons(self) -> [Option<f64>; HORIZONS] {
+        match self {
+            Target::Failure => FAILURE_HORIZONS_HOURS,
+            Target::LogResponseTime | Target::LogTransferSpeed => LOG_HORIZONS_HOURS,
+        }
+    }
+
+    /// Whether this target's stage carries a contract term. Only failure: a
+    /// dead contract is a failure-rate phenomenon, and the timing stages must
+    /// stay bit-identical to the estimator they were validated as.
+    fn has_contract_term(self) -> bool {
+        match self {
+            Target::Failure => true,
+            Target::LogResponseTime | Target::LogTransferSpeed => false,
         }
     }
 
@@ -969,6 +1048,380 @@ impl<K: Hash + Eq + Clone> PeerTable<K> {
 }
 
 // ---------------------------------------------------------------------------
+// Contract term (failure stage)
+// ---------------------------------------------------------------------------
+
+/// Per-peer entries kept for one contract.
+///
+/// Measured on the recorded gateway soak (#4485, 2026-09-17): distinct peers
+/// per contract over a whole file were p90 2-5, p99 6-12, max 17. A ninth peer
+/// replaces the entry with the smallest decayed weight, and only when its own
+/// weight is larger. Fixed-size entries make the count bound a byte bound.
+const CONTRACT_ENTRIES: usize = 8;
+
+/// Contracts tracked, with batched least-recently-used eviction.
+///
+/// Measured on the same soak: at most 214 distinct contracts in one hour and
+/// 1,259 in a whole file (about a day). An evicted contract loses only its
+/// explanation: its windowed events keep the adjustment they last had.
+const CONTRACT_CAPACITY: usize = 1024;
+
+/// An entry counts as present when its count decayed to the query time is at
+/// least this, about three contract horizons after its last event.
+///
+/// The Kish factor is scale-free, so without a presence cut a single event from
+/// hours ago would count as full-strength evidence about a contract's CURRENT
+/// state. Fixed in the offline prototype (2026-09-17) before tuning.
+const CONTRACT_PRESENCE: f64 = 0.05;
+
+/// Forgetting horizon of the contract table, in hours.
+///
+/// Tuned with [`CONTRACT_MIN_OTHER_PEERS`] on the soak's tuning window only
+/// (half 1 before 2026-09-16 00:00 CDT), by a selection rule written before any
+/// tuning run, over {0.25, 0.5, 1.5, 6} h x {1, 2} peers; frozen before the
+/// gate window was scored (2026-09-17, `PLAN-v2` gate).
+const CONTRACT_HORIZON_HOURS: f64 = 0.5;
+
+/// Other peers that must be present on a contract before a peer's learned
+/// residual is adjusted for it. The forecast's shared effect needs one more
+/// (see [`ContractTable::shared_effect`]), the same evidence bar as a peer
+/// inside the contract. Tuned with [`CONTRACT_HORIZON_HOURS`].
+const CONTRACT_MIN_OTHER_PEERS: usize = 2;
+
+/// One peer's forgotten residual moments on one contract.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContractEntry {
+    /// `u32::MAX` for an unused entry. Never a valid peer slot: slots are
+    /// bounded by the peer table's capacity.
+    peer_slot: u32,
+    peer_generation: u32,
+    moments: Moments,
+}
+
+impl Default for ContractEntry {
+    fn default() -> Self {
+        ContractEntry {
+            peer_slot: u32::MAX,
+            peer_generation: 0,
+            moments: Moments::default(),
+        }
+    }
+}
+
+impl ContractEntry {
+    fn used(&self) -> bool {
+        self.peer_slot != u32::MAX
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ContractNode {
+    entries: [ContractEntry; CONTRACT_ENTRIES],
+}
+
+/// Method-of-moments variance components of the contract table, fixed at refit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContractComponents {
+    /// Pooled within-(contract, peer) variance.
+    sigma2: f64,
+    /// Between-peer variance within a contract.
+    tau2_peer: f64,
+    /// Between-contract variance of contract effects about the curve.
+    tau2_contract: f64,
+}
+
+/// Which entries of a contract a query reads.
+#[derive(Debug, Clone, Copy)]
+enum ContractQuery {
+    /// Every present peer except this one (slot, generation): the adjustment
+    /// of that peer's own learned residual.
+    LeaveOut(Option<(u32, u32)>),
+    /// Every present peer: the effect a forecast adds, identical for every
+    /// candidate peer.
+    Shared,
+}
+
+/// Contract -> (contract, peer) hierarchy at one forgetting horizon (module
+/// docs, "Contract term").
+#[derive(Debug, Clone)]
+struct ContractTable {
+    epoch: f64,
+    table: PeerTable<u64>,
+    /// Indexed by contract slot.
+    nodes: Vec<ContractNode>,
+    components: Option<ContractComponents>,
+    evicted: Vec<usize>,
+    /// Live residuals not recorded because every entry of their contract held
+    /// a larger weight. The events still train the levels and the curve.
+    /// Refusals while rebuilding at refit are not counted: they repeat the
+    /// same events.
+    refused: u64,
+}
+
+impl ContractTable {
+    fn new() -> Self {
+        ContractTable {
+            epoch: 0.0,
+            table: PeerTable::new(CONTRACT_CAPACITY),
+            nodes: Vec::new(),
+            components: None,
+            evicted: Vec::new(),
+            refused: 0,
+        }
+    }
+
+    fn exponent(&self, time: f64) -> f64 {
+        (time - self.epoch) / CONTRACT_HORIZON_HOURS
+    }
+
+    fn weight(&self, time: f64) -> f64 {
+        self.exponent(time).exp()
+    }
+
+    fn scale(&self, now: f64) -> f64 {
+        (-self.exponent(now).max(0.0)).exp()
+    }
+
+    fn reset(&mut self, epoch: f64) {
+        self.epoch = epoch;
+        for node in &mut self.nodes {
+            *node = ContractNode::default();
+        }
+        self.components = None;
+    }
+
+    /// Slot and generation for a contract key, marking it used. Evicted
+    /// contracts' nodes are cleared.
+    fn touch(&mut self, key: u64) -> (usize, u32) {
+        self.evicted.clear();
+        let (slot, generation) = self.table.touch(&key, &mut self.evicted);
+        for &victim in &self.evicted {
+            if let Some(node) = self.nodes.get_mut(victim) {
+                *node = ContractNode::default();
+            }
+        }
+        if self.nodes.len() <= slot {
+            self.nodes.resize(slot + 1, ContractNode::default());
+        }
+        (slot, generation)
+    }
+
+    fn live(&self, slot: u32, generation: u32) -> bool {
+        self.table.generation(slot as usize) == Some(generation)
+    }
+
+    /// Add a raw residual to (contract, peer). A peer beyond
+    /// [`CONTRACT_ENTRIES`] replaces the entry with the smallest weight, but
+    /// only if its own weight is larger; otherwise the residual is refused and
+    /// `false` returned.
+    #[must_use]
+    fn add(&mut self, slot: usize, peer: (u32, u32), weight: f64, residual: f64) -> bool {
+        if self.nodes.len() <= slot {
+            self.nodes.resize(slot + 1, ContractNode::default());
+        }
+        let entries = &mut self.nodes[slot].entries;
+        let index = match entries
+            .iter()
+            .position(|e| e.used() && (e.peer_slot, e.peer_generation) == peer)
+        {
+            Some(index) => index,
+            None => {
+                let index = match entries.iter().position(|e| !e.used()) {
+                    Some(index) => index,
+                    None => {
+                        let mut smallest = 0;
+                        for index in 1..CONTRACT_ENTRIES {
+                            if entries[index].moments.n < entries[smallest].moments.n {
+                                smallest = index;
+                            }
+                        }
+                        if entries[smallest].moments.n >= weight {
+                            return false;
+                        }
+                        smallest
+                    }
+                };
+                entries[index] = ContractEntry {
+                    peer_slot: peer.0,
+                    peer_generation: peer.1,
+                    moments: Moments::default(),
+                };
+                index
+            }
+        };
+        entries[index].moments.add(weight, residual);
+        true
+    }
+
+    /// Variance components by method of moments over the entries present at
+    /// the last rebuild (the epoch is the rebuild time, so stored counts are
+    /// counts at refit), mirroring [`Level::compute_components`] with peers in
+    /// place of bands and contracts in place of peers.
+    ///
+    /// `tau2_contract` contrasts each contract's mean with ZERO, not with a
+    /// grand mean: residuals are defined against the curve, so the curve is the
+    /// prior for a contract. A grand mean at a short horizon would be pulled up
+    /// by the same dead contracts it is meant to measure.
+    fn compute_components(&self) -> Option<ContractComponents> {
+        let present = |e: &ContractEntry| e.used() && e.moments.n >= CONTRACT_PRESENCE;
+        let (mut ss, mut df) = (0.0, 0.0);
+        for node in &self.nodes {
+            for e in node.entries.iter().filter(|e| present(e)) {
+                if e.moments.replicated() {
+                    ss += (e.moments.sumsq - e.moments.sum * e.moments.sum / e.moments.n).max(0.0);
+                    df += e.moments.n - e.moments.w2 / e.moments.n;
+                }
+            }
+        }
+        if df < 2.0 {
+            return None;
+        }
+        let sigma2 = (ss / df).max(MIN_SIGMA2);
+
+        // tau2_peer: each replicated entry against the SUM of the other present
+        // entries of its contract (leave-one-out, summed rather than
+        // subtracted; see `Level::compute_components`).
+        let (mut acc, mut den) = (0.0, 0.0);
+        for node in &self.nodes {
+            for (index, e) in node.entries.iter().enumerate() {
+                if !present(e) || !e.moments.replicated() {
+                    continue;
+                }
+                let mut rest = Moments::default();
+                let mut rest_sq = 0.0;
+                for (other_index, other) in node.entries.iter().enumerate() {
+                    if other_index != index && present(other) {
+                        rest.n += other.moments.n;
+                        rest.w2 += other.moments.w2;
+                        rest.sum += other.moments.sum;
+                        rest_sq += other.moments.n * other.moments.n;
+                    }
+                }
+                if rest.n <= NODE_MIN {
+                    continue;
+                }
+                let contrast = e.moments.mean() - rest.mean();
+                let noise =
+                    sigma2 * (e.moments.mean_variance_factor() + rest.w2 / (rest.n * rest.n));
+                acc += contrast * contrast - noise;
+                den += 1.0 + rest_sq / (rest.n * rest.n);
+            }
+        }
+        let tau2_peer = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
+
+        let (mut acc, mut den) = (0.0, 0.0);
+        for node in &self.nodes {
+            let mut total = Moments::default();
+            let mut sq = 0.0;
+            for e in node.entries.iter().filter(|e| present(e)) {
+                total.n += e.moments.n;
+                total.w2 += e.moments.w2;
+                total.sum += e.moments.sum;
+                sq += e.moments.n * e.moments.n;
+            }
+            if !total.replicated() {
+                continue;
+            }
+            let n2 = total.n * total.n;
+            let mean = total.mean();
+            let noise = sigma2 * total.w2 / n2 + tau2_peer * sq / n2;
+            acc += mean * mean - noise;
+            den += 1.0;
+        }
+        let tau2_contract = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
+
+        [sigma2, tau2_peer, tau2_contract]
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(ContractComponents {
+                sigma2,
+                tau2_peer,
+                tau2_contract,
+            })
+    }
+
+    /// Shrunk contract effect at `now` from the entries `query` selects, or
+    /// `None` without components, without between-contract variance, or with
+    /// fewer than `min_peers` present entries.
+    ///
+    /// `noise = sigma2 * w2/n^2 + tau2_peer * sum_q n_q^2 / n^2`. The `tau2_peer`
+    /// term keeps one peer with many failures from reading as a dead contract:
+    /// evidence from a single peer carries at least `tau2_peer` of noise however
+    /// many events it has.
+    fn effect(
+        &self,
+        slot: Option<usize>,
+        query: ContractQuery,
+        now: f64,
+        min_peers: usize,
+    ) -> Option<f64> {
+        let components = self.components?;
+        if components.tau2_contract <= 0.0 {
+            return None;
+        }
+        let node = self.nodes.get(slot?)?;
+        let scale = self.scale(now);
+        let (mut n, mut w2, mut sum, mut sq, mut count) = (0.0, 0.0, 0.0, 0.0, 0usize);
+        for e in &node.entries {
+            if !e.used() {
+                continue;
+            }
+            if let ContractQuery::LeaveOut(Some(peer)) = query {
+                if (e.peer_slot, e.peer_generation) == peer {
+                    continue;
+                }
+            }
+            if e.moments.n * scale < CONTRACT_PRESENCE {
+                continue;
+            }
+            count += 1;
+            n += e.moments.n;
+            w2 += e.moments.w2;
+            sum += e.moments.sum;
+            sq += e.moments.n * e.moments.n;
+        }
+        if count < min_peers || n <= 0.0 || w2 <= 0.0 {
+            return None;
+        }
+        let n2 = n * n;
+        let noise = components.sigma2 * w2 / n2 + components.tau2_peer * sq / n2;
+        let shrink = components.tau2_contract / (components.tau2_contract + noise);
+        let value = shrink * sum / n;
+        value.is_finite().then_some(value)
+    }
+
+    /// Adjustment for `peer`'s own residual on the contract in `slot`.
+    fn leave_out_effect(
+        &self,
+        slot: Option<usize>,
+        peer: Option<(u32, u32)>,
+        now: f64,
+    ) -> Option<f64> {
+        self.effect(
+            slot,
+            ContractQuery::LeaveOut(peer),
+            now,
+            CONTRACT_MIN_OTHER_PEERS,
+        )
+    }
+
+    /// Effect a forecast adds for the contract with location bits `key`: the
+    /// same for every candidate peer, so it cannot reorder peers for one
+    /// decision. A leave-one-out effect here would: it excludes the failing
+    /// peer's own failures and includes the succeeding peer's successes, which
+    /// on the tuning window ranked the failing peer LOWER in 45 of 53 pairs.
+    fn shared_effect(&self, key: u64, now: f64) -> Option<f64> {
+        let slot = self.table.lookup(&key)?;
+        self.effect(
+            Some(slot),
+            ContractQuery::Shared,
+            now,
+            CONTRACT_MIN_OTHER_PEERS + 1,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stage
 // ---------------------------------------------------------------------------
 
@@ -981,6 +1434,14 @@ struct Event {
     seq: u64,
     slot: u32,
     generation: u32,
+    /// Contract-table slot and generation; `u32::MAX` for a stage without a
+    /// contract term.
+    contract_slot: u32,
+    contract_generation: u32,
+    /// The contract effect last subtracted from this event's residual before
+    /// it entered the levels. Kept when a later refit finds no present
+    /// evidence for the contract (module docs, "Contract term").
+    adjustment: f32,
     band: u8,
 }
 
@@ -1015,15 +1476,21 @@ fn band_of(contract_location: f64) -> usize {
 /// `WINDOW_EVENTS x EVENT_BYTES`, refit buffer `WINDOW_EVENTS x PREPARED_BYTES`,
 /// levels `HORIZONS x peer capacity x PEER_NODE_BYTES`). Enforced at compile
 /// time, so a field that grows a hot struct cannot silently grow the budget.
-const EVENT_BYTES: usize = 48;
-const PREPARED_BYTES: usize = 32;
+///
+/// The failure stage's contract table adds at most `CONTRACT_CAPACITY x
+/// CONTRACT_NODE_BYTES` (327,680 bytes) of nodes, plus its key table (a
+/// `HashMap<u64, usize>` and per-slot bookkeeping, about 80 KB at capacity).
+const EVENT_BYTES: usize = 56;
+const PREPARED_BYTES: usize = 40;
 const PEER_NODE_BYTES: usize = 296;
 const LEVEL_BYTES: usize = 136;
+const CONTRACT_NODE_BYTES: usize = 320;
 const _: () = {
     assert!(std::mem::size_of::<Event>() <= EVENT_BYTES);
     assert!(std::mem::size_of::<Prepared>() <= PREPARED_BYTES);
     assert!(std::mem::size_of::<PeerNode>() <= PEER_NODE_BYTES);
     assert!(std::mem::size_of::<Level>() <= LEVEL_BYTES);
+    assert!(std::mem::size_of::<ContractNode>() <= CONTRACT_NODE_BYTES);
 };
 
 /// A windowed event reduced to what a hierarchy rebuild needs.
@@ -1036,6 +1503,11 @@ pub(crate) struct Prepared {
     /// `u32::MAX` when the event's peer has since been evicted. Never a valid
     /// index: slots are bounded by the peer table's capacity.
     slot: u32,
+    /// Live contract-table slot, or `u32::MAX`.
+    contract_slot: u32,
+    /// Index of the source event in the sorted window, where a refit stores
+    /// the event's new adjustment.
+    source: u32,
     band: u8,
 }
 
@@ -1152,6 +1624,12 @@ impl ResidualShape {
 pub(crate) struct Forecast {
     /// Probability, or the log-scale location `mu`.
     pub value: f64,
+    /// `value` before the stage's output bound. For failure this can leave
+    /// `[0, 1]`; it is what peers are RANKED by (see
+    /// [`ranking_failure_probability`]), so a forecast that clamps at 1 for two
+    /// peers does not tie them. Equal to `value` wherever the bound does not
+    /// bind.
+    pub unbounded: f64,
     /// Predictive variance of a single log observation, `sigma2 + v_post`.
     /// Zero for the failure stage, which does not use it.
     pub spread: f64,
@@ -1179,6 +1657,14 @@ pub(crate) struct StageDiagnostics {
     pub residual_sigma2: Option<f64>,
     /// Lognormality check for the log stages; default for failure.
     pub residual_shape: ResidualShape,
+    /// Contracts held by the failure stage's contract table; 0 for a stage
+    /// without one.
+    pub contracts: usize,
+    /// Contracts evicted from that table.
+    pub contract_evictions: u64,
+    /// Residuals the contract table did not record because every entry of
+    /// their contract held a larger weight.
+    pub contract_residuals_refused: u64,
 }
 
 /// One target's estimator.
@@ -1208,6 +1694,8 @@ pub(crate) struct Stage<K> {
     orphaned_at_last_refit: usize,
     /// Shape of the log residuals within cells at the last refit (log stages).
     residual_shape: ResidualShape,
+    /// The contract term, for a target that has one.
+    contracts: Option<Box<ContractTable>>,
 }
 
 impl<K: Hash + Eq + Clone> Stage<K> {
@@ -1230,7 +1718,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             curve: None,
             observed_range: (f64::NEG_INFINITY, f64::INFINITY),
             peers: PeerTable::new(peer_capacity),
-            levels: HORIZONS_HOURS.map(Level::new),
+            levels: target.horizons().map(Level::new),
             loss: [0.0; HORIZONS],
             loss_time: None,
             clock: f64::NEG_INFINITY,
@@ -1238,6 +1726,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             rejected: 0,
             orphaned_at_last_refit: 0,
             residual_shape: ResidualShape::default(),
+            contracts: target
+                .has_contract_term()
+                .then(|| Box::new(ContractTable::new())),
         }
     }
 
@@ -1291,7 +1782,8 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         now: f64,
     ) -> Forecast {
         let posterior = self.levels[level].residual(slot, band, now);
-        let value = self.bound(prior + posterior.map_or(0.0, |p| p.mean));
+        let unbounded = prior + posterior.map_or(0.0, |p| p.mean);
+        let value = self.bound(unbounded);
         // `sigma2 + v_post` from the horizon's components, as the reference
         // does; before components exist there is no spread, so the forecast is
         // the median until the first replicated refit.
@@ -1302,7 +1794,25 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                     + self.levels[level].components.map_or(0.0, |c| c.sigma2)
             }
         };
-        Forecast { value, spread }
+        Forecast {
+            value,
+            unbounded,
+            spread,
+        }
+    }
+
+    /// The prior a forecast descends from: the curve at `distance`, plus the
+    /// contract's shared effect where the stage has a contract term and the
+    /// contract has enough present evidence.
+    fn forecast_prior(&self, prior: f64, contract_location: f64, now: f64) -> f64 {
+        match self
+            .contracts
+            .as_ref()
+            .and_then(|table| table.shared_effect(contract_location.to_bits(), now))
+        {
+            Some(effect) => prior + effect,
+            None => prior,
+        }
     }
 
     /// Forecast on the target's scale. `None` until the stage has a curve.
@@ -1317,7 +1827,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         now: f64,
     ) -> Option<Forecast> {
         let now = self.effective_time(now);
-        let prior = self.prior(distance)?;
+        let prior = self.forecast_prior(self.prior(distance)?, contract_location, now);
         let forecast = self.forecast_with(
             self.selected(),
             self.peers.lookup(peer),
@@ -1351,6 +1861,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let prior = self.prior(distance);
         if let Some(prior) = prior {
             let slot = self.peers.lookup(peer);
+            let prior = self.forecast_prior(prior, contract_location, now);
             let forecasts: [Forecast; HORIZONS] =
                 std::array::from_fn(|level| self.forecast_with(level, slot, band, prior, now));
             let selected = forecasts[self.selected()];
@@ -1366,6 +1877,13 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 level.evict(victim);
             }
         }
+        let (contract_slot, contract_generation) = match self.contracts.as_mut() {
+            Some(table) => {
+                let (contract_slot, contract_generation) = table.touch(contract_location.to_bits());
+                (contract_slot as u32, contract_generation)
+            }
+            None => (u32::MAX, 0),
+        };
         self.fresh.push(Event {
             distance,
             y,
@@ -1373,6 +1891,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             seq: self.next_seq,
             slot: slot as u32,
             generation,
+            contract_slot,
+            contract_generation,
+            adjustment: 0.0,
             band: band as u8,
         });
         self.next_seq += 1;
@@ -1383,11 +1904,34 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             must_rebase = self
                 .levels
                 .iter()
-                .any(|level| level.exponent(now) > REBASE_EXPONENT);
+                .any(|level| level.exponent(now) > REBASE_EXPONENT)
+                || self
+                    .contracts
+                    .as_ref()
+                    .is_some_and(|table| table.exponent(now) > REBASE_EXPONENT);
             if !must_rebase {
+                let residual = y - prior;
+                let mut adjusted = residual;
+                if let Some(table) = self.contracts.as_mut() {
+                    let peer_id = (slot as u32, generation);
+                    // The effect from OTHER peers as the table stands, before
+                    // this event joins it.
+                    if let Some(effect) =
+                        table.leave_out_effect(Some(contract_slot as usize), Some(peer_id), now)
+                    {
+                        adjusted = residual - effect;
+                        if let Some(event) = self.fresh.last_mut() {
+                            event.adjustment = effect as f32;
+                        }
+                    }
+                    let weight = table.weight(now);
+                    if !table.add(contract_slot as usize, peer_id, weight, residual) {
+                        table.refused += 1;
+                    }
+                }
                 for level in &mut self.levels {
                     let weight = level.weight(now);
-                    level.add(Some(slot), band, weight, y - prior);
+                    level.add(Some(slot), band, weight, adjusted);
                 }
             }
         }
@@ -1438,6 +1982,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             level.reset(now);
         }
         if self.prepare(&mut scratch.prepared) {
+            self.apply_contract_term(&mut scratch.prepared, now);
             self.rebuild_levels(&mut scratch.prepared, now);
         }
         scratch.prepared.clear();
@@ -1485,7 +2030,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let mut cursor = 0;
         prepared.clear();
         prepared.reserve_exact(self.sorted.len());
-        for event in &self.sorted {
+        for (source, event) in self.sorted.iter().enumerate() {
             let Some(value) = curve.value_sorted(event.distance, &mut cursor) else {
                 continue;
             };
@@ -1493,16 +2038,92 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             if !live {
                 orphaned += 1;
             }
+            let contract_live = self
+                .contracts
+                .as_ref()
+                .is_some_and(|table| table.live(event.contract_slot, event.contract_generation));
             prepared.push(Prepared {
                 residual: event.y - self.bound(value),
                 time: event.time,
                 weight: 1.0,
                 slot: if live { event.slot } else { u32::MAX },
+                contract_slot: if contract_live {
+                    event.contract_slot
+                } else {
+                    u32::MAX
+                },
+                source: source as u32,
                 band: event.band,
             });
         }
         self.orphaned_at_last_refit = orphaned;
         true
+    }
+
+    /// Rebuild the contract table from the prepared window against the new
+    /// curve, recompute its components, and re-adjust every prepared residual
+    /// before the levels are rebuilt from them. Linear in the window times
+    /// [`CONTRACT_ENTRIES`].
+    ///
+    /// Only events whose peer and contract are both still tracked enter the
+    /// table. Each event is then adjusted by its peer's leave-out effect as of
+    /// this refit, which clears a dead contract's FIRST failures (learned
+    /// before any other peer had failed there) from the peer levels. Where the
+    /// contract has no present evidence from other peers, the event keeps the
+    /// adjustment it last had: otherwise a storm's failures would be charged
+    /// back to the peers once the storm's evidence decays out of the table,
+    /// while the no-forgetting level still holds them.
+    fn apply_contract_term(&mut self, prepared: &mut [Prepared], now: f64) {
+        let Stage {
+            contracts,
+            peers,
+            sorted,
+            ..
+        } = self;
+        let Some(table) = contracts.as_mut() else {
+            return;
+        };
+        table.reset(now);
+        for event in prepared.iter() {
+            if event.contract_slot == u32::MAX || event.slot == u32::MAX {
+                continue;
+            }
+            let Some(generation) = peers.generation(event.slot as usize) else {
+                continue;
+            };
+            let weight = ((event.time - now) / CONTRACT_HORIZON_HOURS).exp();
+            // A refusal here repeats one already counted when the event was
+            // learned live (or one the entry cap applied then too).
+            let _recorded = table.add(
+                event.contract_slot as usize,
+                (event.slot, generation),
+                weight,
+                event.residual,
+            );
+        }
+        table.components = table.compute_components();
+        for event in prepared.iter_mut() {
+            let Some(source) = sorted.get_mut(event.source as usize) else {
+                continue;
+            };
+            let peer = (event.slot != u32::MAX)
+                .then(|| {
+                    peers
+                        .generation(event.slot as usize)
+                        .map(|g| (event.slot, g))
+                })
+                .flatten();
+            let effect = (event.contract_slot != u32::MAX)
+                .then(|| table.leave_out_effect(Some(event.contract_slot as usize), peer, now))
+                .flatten();
+            match effect {
+                Some(effect) => {
+                    source.adjustment = effect as f32;
+                    event.residual -= effect;
+                }
+                None => event.residual -= source.adjustment as f64,
+            }
+        }
     }
 
     /// Accumulate the prepared window into every (already reset) level and
@@ -1547,11 +2168,20 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             peer_evictions: self.peers.evictions,
             refits: self.refits,
             rejected: self.rejected,
-            selected_horizon_hours: HORIZONS_HOURS[self.selected()],
+            selected_horizon_hours: self.target.horizons()[self.selected()],
             active: self.curve.is_some(),
             orphaned_at_last_refit: self.orphaned_at_last_refit,
             residual_sigma2: self.levels[self.selected()].components.map(|c| c.sigma2),
             residual_shape: self.residual_shape,
+            contracts: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.table.index.len()),
+            contract_evictions: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.table.evictions),
+            contract_residuals_refused: self.contracts.as_ref().map_or(0, |table| table.refused),
         }
     }
 }
@@ -1574,11 +2204,39 @@ pub(crate) struct Observed {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Estimate {
     pub failure_probability: Option<f64>,
+    /// What routing ranks peers by on failure: [`ranking_failure_probability`]
+    /// of the unbounded forecast. Equal to `failure_probability` wherever the
+    /// `[0, 1]` bound does not bind.
+    pub failure_ranking: Option<f64>,
     /// Expected time to response start, `E[T]`, in seconds.
     pub time_to_response_start_secs: Option<f64>,
     /// Effective transfer speed in bytes/s: the reciprocal of `E[1/speed]`, so
     /// that `bytes / speed` is the expected transfer time.
     pub transfer_speed_bps: Option<f64>,
+}
+
+/// Slope of [`ranking_failure_probability`] outside `[0, 1]`.
+///
+/// Any positive slope keeps the order of the unbounded forecasts. A small one
+/// keeps the router's expected-cost formula within `1e-6` per unit of
+/// overshoot of the value it would compute from the clamped probability, so
+/// the ranking changes only where the clamp would otherwise create a tie. It
+/// is far above the resolution of `f64` at the cost formula's magnitudes.
+pub(crate) const RANKING_OVERSHOOT_SLOPE: f64 = 1e-6;
+
+/// Failure value routing ranks peers by: the probability clamped to `[0, 1]`,
+/// plus [`RANKING_OVERSHOOT_SLOPE`] times the overshoot beyond the bound.
+///
+/// Strictly increasing in the unbounded forecast, so two peers whose forecasts
+/// both clamp at 1 (a contract whose shared effect is large) are still ordered
+/// by the evidence against each peer, instead of tying and falling back to
+/// distance order. It stays within a hair of the clamped probability, which
+/// matters where the router multiplies it by a response time: using the raw
+/// unbounded value there would let a forecast below `-1/3` make a SLOWER peer
+/// cheaper. The clamped probability stays what is reported and recorded.
+pub(crate) fn ranking_failure_probability(unbounded: f64) -> f64 {
+    let clamped = unbounded.clamp(0.0, 1.0);
+    clamped + RANKING_OVERSHOOT_SLOPE * (unbounded - clamped)
 }
 
 /// Minimum estimator hours between two saturation log lines.
@@ -1729,11 +2387,12 @@ impl HierarchicalRouting {
         time: f64,
     ) -> Estimate {
         let contract = contract_location.as_f64();
+        let failure = self.failure.predict(peer, contract, distance, time);
         Estimate {
-            failure_probability: self
-                .failure
-                .predict(peer, contract, distance, time)
-                .map(|forecast| forecast.value),
+            failure_probability: failure.map(|forecast| forecast.value),
+            failure_ranking: failure
+                .map(|forecast| ranking_failure_probability(forecast.unbounded))
+                .filter(|ranking| ranking.is_finite()),
             // The expectation's log, `mu +- spread/2`, is bounded like `mu`
             // itself: a noisy early `tau2` can give an unknown peer a very large
             // posterior variance, and unbounded it would price that peer as

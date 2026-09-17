@@ -2941,6 +2941,16 @@ impl Router {
                 (legacy.failure, legacy.renegade_failure_adjustment)
             }),
         };
+        // The failure value the cost formula ranks by. For the hierarchical
+        // estimator it keeps the order of the forecasts BEFORE the [0, 1] bound,
+        // so peers whose forecasts all clamp at 1 are not tied (see
+        // `hierarchical::ranking_failure_probability`); it differs from the
+        // reported probability only where that bound binds, and then by at
+        // most 1e-6 per unit of overshoot. Legacy ranks by its own probability.
+        let failure_for_cost = match hierarchical_failure {
+            Some(probability) => hierarchical.failure_ranking.unwrap_or(probability),
+            None => failure_estimate,
+        };
         let time_to_response_start = hierarchical_time
             .or_else(|| legacy.map(|legacy| legacy.time_to_response_start))
             .unwrap_or(0.0);
@@ -2962,9 +2972,9 @@ impl Router {
             };
             time_to_response_start
                 + transfer_time
-                + (time_to_response_start * failure_estimate * failure_cost_multiplier)
+                + (time_to_response_start * failure_for_cost * failure_cost_multiplier)
         } else {
-            failure_estimate * failure_cost_multiplier
+            failure_for_cost * failure_cost_multiplier
         };
 
         let stages = dataset::HierarchicalStages {
@@ -4387,6 +4397,7 @@ mod tests {
                 failure: Some(0.1),
                 estimate: hierarchical::Estimate {
                     failure_probability: Some(0.1),
+                    failure_ranking: Some(0.1),
                     time_to_response_start_secs: Some(0.2),
                     transfer_speed_bps: None,
                 },
