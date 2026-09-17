@@ -2255,6 +2255,40 @@ fn live_learning_subtracts_the_other_peers_contract_effect() {
     );
 }
 
+/// The presence cut: evidence that has decayed away stops explaining its
+/// contract, instead of counting at full strength forever (the Kish factor a
+/// query reads is scale free, so nothing else would retire it).
+#[test]
+fn the_presence_cut_stops_stale_evidence_from_explaining_a_contract() {
+    let _guard = GlobalRng::seed_guard(0x4485_c00b);
+    let dead = 0.37;
+    let mut steps = background(0.0, 3.25, 0..30);
+    for peer in 0..6 {
+        steps.extend(on_contract(peer, dead, true, 8, 3.0, 0.25));
+    }
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    let now = feed(&mut [&mut stage], steps);
+    let effect_at = |stage: &Stage<u32>, at: f64| {
+        stage
+            .contracts
+            .as_ref()
+            .unwrap()
+            .shared_effect(dead.to_bits(), at)
+    };
+    assert!(effect_at(&stage, now).unwrap() > 0.1);
+    // Three hours on, six contract horizons, with nothing observed on the
+    // contract since.
+    assert_eq!(effect_at(&stage, now + 3.0), None);
+    let later = feed(&mut [&mut stage], background(now, 3.0, 0..30));
+    assert_eq!(effect_at(&stage, later), None);
+    let prior = stage.prior(0.05).unwrap();
+    assert_eq!(
+        stage.forecast_prior(prior, dead, later).to_bits(),
+        prior.to_bits(),
+        "a stale contract must add nothing to a forecast"
+    );
+}
+
 /// The contract table holds at most `CONTRACT_CAPACITY` contracts and
 /// `CONTRACT_ENTRIES` peers per contract, and a reused slot starts empty.
 #[test]
