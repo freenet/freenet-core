@@ -2513,6 +2513,72 @@ fn refit_refusals_are_counted_apart_from_live_refusals() {
     assert_eq!(other.nodes[other_slot], table.nodes[slot]);
 }
 
+/// The term is BIDIRECTIONAL, which is the second design limitation recorded
+/// on #5700 from the 2026-09-17 review and which no test covered (a mutation
+/// clamping the effect at zero survived the whole suite). A residual is
+/// `y - curve(distance)`, so a SUCCESS on a contract whose curve value is
+/// above zero contributes a NEGATIVE residual. A contract several peers
+/// succeed on therefore gets a negative effect, and the learning adjustment
+/// SUBTRACTS it, which RAISES what the peer levels learn from an honest
+/// peer's own events on that contract. Measured on the recorded soak's tuning
+/// window the mean effect is about -0.013 to -0.066 at healthy instants, so
+/// this is the ordinary case and not a corner.
+#[test]
+fn a_contract_peers_succeed_on_gets_a_negative_effect_that_raises_what_they_learn() {
+    let _guard = GlobalRng::seed_guard(0x4485_c015);
+    let good = 0.37;
+    // Traffic that fails 30% of the time at every distance, so the curve sits
+    // well above zero and a success is a large negative residual.
+    let mut steps: Vec<Step> = (0..1_800)
+        .map(|i| Step {
+            peer: GlobalRng::random_range(10..30u32),
+            contract: uniform(),
+            distance: uniform() * 0.5,
+            failed: uniform() < 0.3,
+            hours: i as f64 / 600.0,
+        })
+        .collect();
+    // Five peers succeed on one contract, then a sixth also succeeds there.
+    for peer in 0..5u32 {
+        steps.extend(on_contract(peer, good, false, 8, 2.8, 0.15));
+    }
+    steps.extend(on_contract(9, good, false, 4, 2.95, 0.02));
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    let now = feed(&mut [&mut with_term, &mut without_term], steps);
+
+    let table = with_term
+        .contracts
+        .as_ref()
+        .expect("the failure stage has a term");
+    let effect = table
+        .shared_effect(good.to_bits(), now)
+        .expect("six present peers");
+    assert!(
+        effect < -0.05,
+        "a contract everyone succeeds on must get a NEGATIVE effect: {effect}"
+    );
+    let slot = stage_slot(&with_term, 9);
+    let adjustments: f64 = with_term
+        .sorted
+        .iter()
+        .filter(|event| event.slot == slot)
+        .map(|event| event.adjustment as f64)
+        .sum();
+    assert!(
+        adjustments < -0.05,
+        "peer 9's events on the contract must carry a negative adjustment: {adjustments}"
+    );
+    // Subtracting a negative adjustment raises what the levels learn, so the
+    // honest peer's learned residual is HIGHER with the term than without it.
+    let charged = without_term.levels[0].nodes[slot as usize].peer.sum;
+    let applied = with_term.levels[0].nodes[slot as usize].peer.sum;
+    assert!(
+        applied > charged + 0.05,
+        "the negative effect must raise the honest peer's learned residual: \
+         {applied} against {charged} without the term"
+    );
+}
+
 /// Finding 4 of the 2026-09-17 review: an event older than the presence
 /// window keeps the adjustment it already had, instead of receiving the full
 /// current effect. Before the fix a 12-hour-old event, which contributes
