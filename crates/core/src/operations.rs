@@ -2255,8 +2255,8 @@ fn c<'a>(x: &'a str) { record_bypass(o, l, p, UncapturedReason::TerminalConsult)
     fn the_pin_lexer_handles_awkward_literals_and_turbofish() {
         let src = r##"
 fn a() {
-    let q = ['\'', '{'];
-    let arrow = ['→', '{'];
+    let q = ['\'','{'];
+    let arrow = ['→','{'];
     let esc = '\u{7d}';
     let raw = br"\";
     let craw = cr#"\"#;
