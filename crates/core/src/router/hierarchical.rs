@@ -1153,9 +1153,18 @@ struct ContractTable {
     evicted: Vec<usize>,
     /// Live residuals not recorded because every entry of their contract held
     /// a larger weight. The events still train the levels and the curve.
-    /// Refusals while rebuilding at refit are not counted: they repeat the
-    /// same events.
     refused: u64,
+    /// `(contract, peer)` pairs a REFIT dropped because the contract had more
+    /// than [`CONTRACT_ENTRIES`] peers in the window and the pair was not
+    /// among the heaviest. Counted separately from `refused`: the two paths
+    /// see different epochs, different weights and different admitted peer
+    /// sets, so neither count stands in for the other.
+    refused_at_refit: u64,
+    /// Refits after which the variance components were estimable, i.e. after
+    /// which the term can produce an effect at all. The only signal that
+    /// distinguishes a node on which the term worked from one on which it
+    /// never activated.
+    estimable_refits: u64,
 }
 
 impl ContractTable {
@@ -1167,6 +1176,8 @@ impl ContractTable {
             components: None,
             evicted: Vec::new(),
             refused: 0,
+            refused_at_refit: 0,
+            estimable_refits: 0,
         }
     }
 
@@ -1251,6 +1262,73 @@ impl ContractTable {
         };
         entries[index].moments.add(weight, residual);
         true
+    }
+
+    /// Write one contract's entries from already-accumulated per-peer moments,
+    /// keeping the [`CONTRACT_ENTRIES`] heaviest, and return how many pairs
+    /// were dropped.
+    ///
+    /// This is the REFIT admission rule, and it is deliberately not [`add`]'s.
+    /// `add` fills first-come and then displaces only when one incoming
+    /// event's weight exceeds an incumbent's whole accumulated count, so which
+    /// peers a contract keeps depends on the order events arrive in. At refit
+    /// the window is iterated in [`window_order`], which is ascending DISTANCE,
+    /// so a contract with more peers than entries kept a distance-biased
+    /// subset, its retained residuals were systematically smaller (the failure
+    /// curve rises with distance), and a displaced incumbent was zeroed rather
+    /// than merged, which left entries below `replicated()` and could drive
+    /// `df < 2` and disable the term. Keeping the heaviest pairs is
+    /// independent of iteration order, keeps every event of the pairs it
+    /// keeps, and keeps the pairs with the most present evidence, which is
+    /// what the variance components need.
+    ///
+    /// `pairs` is sorted in place. Ties in weight are broken by peer slot, so
+    /// the result does not depend on the order pairs were accumulated in.
+    fn rebuild_node(&mut self, slot: usize, pairs: &mut Vec<(u32, u32, Moments)>) -> usize {
+        if self.nodes.len() <= slot {
+            self.nodes.resize(slot + 1, ContractNode::default());
+        }
+        let entries = &mut self.nodes[slot].entries;
+        *entries = [ContractEntry::default(); CONTRACT_ENTRIES];
+        if pairs.len() > CONTRACT_ENTRIES {
+            pairs.sort_unstable_by(|a, b| b.2.n.total_cmp(&a.2.n).then(a.0.cmp(&b.0)));
+        }
+        let kept = pairs.len().min(CONTRACT_ENTRIES);
+        for (entry, &(peer_slot, peer_generation, moments)) in
+            entries.iter_mut().zip(pairs.iter().take(kept))
+        {
+            *entry = ContractEntry {
+                peer_slot,
+                peer_generation,
+                moments,
+            };
+        }
+        pairs.len() - kept
+    }
+
+    /// Drop every entry belonging to a peer the peer table has just evicted.
+    ///
+    /// Without this the entries survive under the old `(slot, generation)`,
+    /// `ContractQuery::LeaveOut` excludes only an exact match, and a
+    /// reconnecting peer commonly regains the same slot with a new generation
+    /// (`PeerTable::touch` pushes the freed slot onto a LIFO free list). Its
+    /// own earlier failures would then count as OTHER-peer evidence and toward
+    /// [`CONTRACT_MIN_OTHER_PEERS`], so the peer would explain away its own
+    /// failures, which is exactly what leaving the peer out exists to prevent.
+    /// One pass over the nodes per eviction batch, not per evicted peer.
+    /// Counterpart of [`Level::evict`], which does the same bookkeeping for
+    /// the peer levels.
+    fn evict_peers(&mut self, evicted: &[usize]) {
+        if evicted.is_empty() {
+            return;
+        }
+        for node in &mut self.nodes {
+            for entry in &mut node.entries {
+                if entry.used() && evicted.contains(&(entry.peer_slot as usize)) {
+                    *entry = ContractEntry::default();
+                }
+            }
+        }
     }
 
     /// Variance components by method of moments over the entries present at
@@ -1517,6 +1595,14 @@ pub(crate) struct Prepared {
 pub(crate) struct Scratch {
     prepared: Vec<Prepared>,
     evicted: Vec<usize>,
+    /// One entry per windowed event the contract-table rebuild admits:
+    /// `(contract_slot << 32 | peer_slot, weight, residual)`. Sorted by key
+    /// so that a contract's events, and within a contract a peer's events,
+    /// are contiguous.
+    contract_events: Vec<(u64, f64, f64)>,
+    /// One `(peer_slot, peer_generation, moments)` per peer of the contract
+    /// currently being written.
+    contract_pairs: Vec<(u32, u32, Moments)>,
 }
 
 /// How a level weights prepared events during a rebuild.
@@ -1662,9 +1748,22 @@ pub(crate) struct StageDiagnostics {
     pub contracts: usize,
     /// Contracts evicted from that table.
     pub contract_evictions: u64,
-    /// Residuals the contract table did not record because every entry of
-    /// their contract held a larger weight.
+    /// Residuals the contract table did not record LIVE because every entry
+    /// of their contract held a larger weight.
     pub contract_residuals_refused: u64,
+    /// `(contract, peer)` pairs a REFIT dropped for being outside the
+    /// contract's heaviest [`CONTRACT_ENTRIES`]. Counted separately from the
+    /// live refusals: the two paths admit different peer sets.
+    pub contract_refit_pairs_refused: u64,
+    /// Refits after which the contract term's variance components were
+    /// estimable. Zero on a node where the term never activated, which is
+    /// otherwise indistinguishable from one where it activated and changed
+    /// nothing.
+    pub contract_estimable_refits: u64,
+    /// Between-contract variance of the contract term at the last refit;
+    /// `None` when the components are not estimable. The term produces no
+    /// effect at all while this is absent or zero.
+    pub contract_tau2: Option<f64>,
 }
 
 /// One target's estimator.
@@ -1877,6 +1976,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 level.evict(victim);
             }
         }
+        if let Some(table) = self.contracts.as_mut() {
+            table.evict_peers(&scratch.evicted);
+        }
         let (contract_slot, contract_generation) = match self.contracts.as_mut() {
             Some(table) => {
                 let (contract_slot, contract_generation) = table.touch(contract_location.to_bits());
@@ -1982,10 +2084,18 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             level.reset(now);
         }
         if self.prepare(&mut scratch.prepared) {
-            self.apply_contract_term(&mut scratch.prepared, now);
-            self.rebuild_levels(&mut scratch.prepared, now);
+            let Scratch {
+                prepared,
+                contract_events,
+                contract_pairs,
+                ..
+            } = scratch;
+            self.apply_contract_term(prepared, contract_events, contract_pairs, now);
+            self.rebuild_levels(prepared, now);
         }
         scratch.prepared.clear();
+        scratch.contract_events.clear();
+        scratch.contract_pairs.clear();
     }
 
     /// Fold events learned since the last refit into the sorted window and drop
@@ -2062,18 +2172,41 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 
     /// Rebuild the contract table from the prepared window against the new
     /// curve, recompute its components, and re-adjust every prepared residual
-    /// before the levels are rebuilt from them. Linear in the window times
-    /// [`CONTRACT_ENTRIES`].
+    /// before the levels are rebuilt from them. Linear in the window, plus one
+    /// sort of it.
     ///
     /// Only events whose peer and contract are both still tracked enter the
-    /// table. Each event is then adjusted by its peer's leave-out effect as of
-    /// this refit, which clears a dead contract's FIRST failures (learned
-    /// before any other peer had failed there) from the peer levels. Where the
-    /// contract has no present evidence from other peers, the event keeps the
-    /// adjustment it last had: otherwise a storm's failures would be charged
-    /// back to the peers once the storm's evidence decays out of the table,
-    /// while the no-forgetting level still holds them.
-    fn apply_contract_term(&mut self, prepared: &mut [Prepared], now: f64) {
+    /// table. Admission is by accumulated weight, not by the order the window
+    /// is iterated in (see [`ContractTable::rebuild_node`]).
+    ///
+    /// Each event INSIDE the presence window is then adjusted by its peer's
+    /// leave-out effect as of this refit, which clears a dead contract's FIRST
+    /// failures (learned before any other peer had failed there) from the peer
+    /// levels. Two cases keep the adjustment the event last had instead:
+    ///
+    /// - the contract has no present evidence from other peers. Otherwise a
+    ///   storm's failures would be charged back to the peers once the storm's
+    ///   evidence decays out of the table, while the no-forgetting level still
+    ///   holds them.
+    /// - the EVENT's own decayed weight is below [`CONTRACT_PRESENCE`], i.e.
+    ///   it is older than about three contract horizons (1.50 h at a 0.5 h
+    ///   horizon). Such an event contributes essentially nothing to the
+    ///   estimate it would be re-scored against, so re-scoring it applies a
+    ///   contract state estimated from the last 1.5 h at full strength to an
+    ///   event from long before it. Measured on the recorded gateway soak at
+    ///   one instant: 364 of 593 windowed events on contracts with three or
+    ///   more present peers were older than that, 326 of them successes. The
+    ///   alternative considered, weighting the adjustment by the event's own
+    ///   decayed weight, was rejected because it un-explains a storm's older
+    ///   failures as they age, which is what the kept adjustment exists to
+    ///   prevent.
+    fn apply_contract_term(
+        &mut self,
+        prepared: &mut [Prepared],
+        events: &mut Vec<(u64, f64, f64)>,
+        pairs: &mut Vec<(u32, u32, Moments)>,
+        now: f64,
+    ) {
         let Stage {
             contracts,
             peers,
@@ -2084,24 +2217,43 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             return;
         };
         table.reset(now);
+        events.clear();
         for event in prepared.iter() {
             if event.contract_slot == u32::MAX || event.slot == u32::MAX {
                 continue;
             }
-            let Some(generation) = peers.generation(event.slot as usize) else {
+            if peers.generation(event.slot as usize).is_none() {
                 continue;
-            };
+            }
             let weight = ((event.time - now) / CONTRACT_HORIZON_HOURS).exp();
-            // A refusal here repeats one already counted when the event was
-            // learned live (or one the entry cap applied then too).
-            let _recorded = table.add(
-                event.contract_slot as usize,
-                (event.slot, generation),
-                weight,
-                event.residual,
-            );
+            let key = (u64::from(event.contract_slot) << 32) | u64::from(event.slot);
+            events.push((key, weight, event.residual));
+        }
+        // Only live peers were pushed, so one generation per slot: the key's
+        // low half identifies the pair on its own.
+        events.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut index = 0;
+        while index < events.len() {
+            let contract_slot = (events[index].0 >> 32) as usize;
+            pairs.clear();
+            while index < events.len() && (events[index].0 >> 32) as usize == contract_slot {
+                let peer_slot = events[index].0 as u32;
+                let generation = peers
+                    .generation(peer_slot as usize)
+                    .expect("only live peers were pushed");
+                let mut moments = Moments::default();
+                while index < events.len() && events[index].0 as u32 == peer_slot {
+                    moments.add(events[index].1, events[index].2);
+                    index += 1;
+                }
+                pairs.push((peer_slot, generation, moments));
+            }
+            table.refused_at_refit += table.rebuild_node(contract_slot, pairs) as u64;
         }
         table.components = table.compute_components();
+        if table.components.is_some() {
+            table.estimable_refits += 1;
+        }
         for event in prepared.iter_mut() {
             let Some(source) = sorted.get_mut(event.source as usize) else {
                 continue;
@@ -2113,7 +2265,8 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                         .map(|g| (event.slot, g))
                 })
                 .flatten();
-            let effect = (event.contract_slot != u32::MAX)
+            let present = ((event.time - now) / CONTRACT_HORIZON_HOURS).exp() >= CONTRACT_PRESENCE;
+            let effect = (present && event.contract_slot != u32::MAX)
                 .then(|| table.leave_out_effect(Some(event.contract_slot as usize), peer, now))
                 .flatten();
             match effect {
@@ -2182,6 +2335,19 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 .as_ref()
                 .map_or(0, |table| table.table.evictions),
             contract_residuals_refused: self.contracts.as_ref().map_or(0, |table| table.refused),
+            contract_refit_pairs_refused: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.refused_at_refit),
+            contract_estimable_refits: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.estimable_refits),
+            contract_tau2: self
+                .contracts
+                .as_ref()
+                .and_then(|table| table.components)
+                .map(|components| components.tau2_contract),
         }
     }
 }
@@ -2215,7 +2381,7 @@ pub(crate) struct Estimate {
     pub transfer_speed_bps: Option<f64>,
 }
 
-/// Slope of [`ranking_failure_probability`] outside `[0, 1]`.
+/// Slope of [`ranking_failure_probability`] above 1.
 ///
 /// Any positive slope keeps the order of the unbounded forecasts. A small one
 /// keeps the router's expected-cost formula within `1e-6` per unit of
@@ -2225,18 +2391,29 @@ pub(crate) struct Estimate {
 pub(crate) const RANKING_OVERSHOOT_SLOPE: f64 = 1e-6;
 
 /// Failure value routing ranks peers by: the probability clamped to `[0, 1]`,
-/// plus [`RANKING_OVERSHOOT_SLOPE`] times the overshoot beyond the bound.
+/// plus [`RANKING_OVERSHOOT_SLOPE`] times any overshoot ABOVE 1.
 ///
-/// Strictly increasing in the unbounded forecast, so two peers whose forecasts
-/// both clamp at 1 (a contract whose shared effect is large) are still ordered
-/// by the evidence against each peer, instead of tying and falling back to
-/// distance order. It stays within a hair of the clamped probability, which
-/// matters where the router multiplies it by a response time: using the raw
-/// unbounded value there would let a forecast below `-1/3` make a SLOWER peer
-/// cheaper. The clamped probability stays what is reported and recorded.
+/// Non-decreasing in the unbounded forecast, and strictly increasing above 1,
+/// so two peers whose forecasts both clamp at 1 (a contract whose shared
+/// effect is large) are still ordered by the evidence against each peer,
+/// instead of tying and falling back to distance order. It stays within a
+/// hair of the clamped probability, which matters where the router multiplies
+/// it by a response time: using the raw unbounded value there would let a
+/// forecast below `-1/3` make a SLOWER peer cheaper. The clamped probability
+/// stays what is reported and recorded.
+///
+/// The DOWNWARD overshoot is deliberately dropped rather than carried with the
+/// same slope. Carrying it returned a small negative value for the normal case
+/// of a good peer, and the router's no-timing cost branch is
+/// `failure * multiplier`, so the cost went negative: the dashboard's
+/// expected-total-time formatter prints "N/A" outside `0..1e9`, and negative
+/// expected times reached the routing dataset and telemetry. A negative value
+/// also cannot be the tie this mechanism exists for, which is at 1: below 0
+/// the peers being separated are all already the best available, and the
+/// remaining terms of the cost formula separate them.
 pub(crate) fn ranking_failure_probability(unbounded: f64) -> f64 {
     let clamped = unbounded.clamp(0.0, 1.0);
-    clamped + RANKING_OVERSHOOT_SLOPE * (unbounded - clamped)
+    clamped + RANKING_OVERSHOOT_SLOPE * (unbounded - clamped).max(0.0)
 }
 
 /// Minimum estimator hours between two saturation log lines.
@@ -2359,7 +2536,14 @@ impl HierarchicalRouting {
     /// discarding evidence is not reading as a node with nothing to discard.
     fn log_saturation(&mut self, time: f64) {
         let evictions = self.total_evictions();
-        let refused = self.failure.diagnostics().contract_residuals_refused;
+        // Read the counters directly. `diagnostics()` builds a 15-field struct
+        // and walks the peer index, and this runs per learned event under the
+        // router's write lock.
+        let (refused, refused_at_refit) = self
+            .failure
+            .contracts
+            .as_ref()
+            .map_or((0, 0), |table| (table.refused, table.refused_at_refit));
         if evictions == self.evictions_at_last_log && refused == self.refusals_at_last_log {
             return;
         }
@@ -2375,6 +2559,7 @@ impl HierarchicalRouting {
             peer_capacity = self.failure.peers.capacity,
             contract_residuals_refused_total = refused,
             contract_residuals_refused_since_last_notice = refused - self.refusals_at_last_log,
+            contract_refit_pairs_refused_total = refused_at_refit,
             contract_entries = CONTRACT_ENTRIES,
             "hierarchical routing estimator: peer table full, evicting least-recently-used \
              peers, or contract entries full"

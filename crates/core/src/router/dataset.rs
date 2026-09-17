@@ -441,6 +441,17 @@ pub(crate) enum RoutingModel {
 
 /// One model's estimate for one candidate, in the units routing acts on
 /// (unfloored; `expected_total_time` is the cost the router sorts by).
+///
+/// For the hierarchical model the two failure-bearing fields are NOT exactly
+/// reconcilable offline: `failure_probability` is the value clamped to
+/// `[0, 1]`, while `expected_total_time` embeds
+/// [`crate::router::hierarchical::ranking_failure_probability`] of the
+/// unbounded forecast. They differ only where the forecast exceeds 1, and then
+/// by at most `1e-6` per unit of overshoot, so recomputing the cost from
+/// `failure_probability` reproduces it to within that on every row and exactly
+/// on rows where the bound does not bind. The unbounded value itself is not
+/// recorded, so an offline tool cannot reproduce the router's ORDER among
+/// candidates that all clamp at 1.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub(crate) struct ModelEstimate {
     pub failure_probability: f64,

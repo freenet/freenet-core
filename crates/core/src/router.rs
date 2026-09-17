@@ -1077,6 +1077,32 @@ pub(crate) struct RouterSnapshotInfo {
     /// Per-stage peer-table capacity, derived from `max_connections`.
     #[serde(default)]
     pub hierarchical_peer_capacity: usize,
+    /// Contracts held by the failure stage's contract term (#4485, #5700).
+    #[serde(default)]
+    pub hierarchical_contracts: usize,
+    /// Contracts evicted from that table, least-recently-used in batches.
+    #[serde(default)]
+    pub hierarchical_contract_evictions: u64,
+    /// Residuals the contract table did not record LIVE, because every entry
+    /// of their contract already held a larger decayed weight. The events
+    /// still train the curve and the peer levels.
+    #[serde(default)]
+    pub hierarchical_contract_residuals_refused: u64,
+    /// `(contract, peer)` pairs a REFIT dropped for being outside a
+    /// contract's heaviest eight. Counted apart from the live refusals: the
+    /// two paths admit different peer sets.
+    #[serde(default)]
+    pub hierarchical_contract_refit_pairs_refused: u64,
+    /// Refits after which the contract term's variance components were
+    /// estimable. This is the "is the term doing anything" signal: 0 means it
+    /// has never been able to produce an effect on this node, which is
+    /// otherwise indistinguishable from a term that worked and helped nothing.
+    #[serde(default)]
+    pub hierarchical_contract_estimable_refits: u64,
+    /// Between-contract variance at the last refit; `None` when the components
+    /// are not estimable. The term produces no effect while it is absent or 0.
+    #[serde(default)]
+    pub hierarchical_contract_tau2: Option<f64>,
     /// Whether the hierarchical estimator is being computed NOW: only when it
     /// routes or the routing dataset is recording. When false, every
     /// `hierarchical_*` reading (and the timing error readings) is either empty
@@ -2945,8 +2971,9 @@ impl Router {
         // estimator it keeps the order of the forecasts BEFORE the [0, 1] bound,
         // so peers whose forecasts all clamp at 1 are not tied (see
         // `hierarchical::ranking_failure_probability`); it differs from the
-        // reported probability only where that bound binds, and then by at
-        // most 1e-6 per unit of overshoot. Legacy ranks by its own probability.
+        // reported probability only ABOVE that bound, and then by at most 1e-6
+        // per unit of overshoot, so it is never negative and cannot make this
+        // cost negative. Legacy ranks by its own probability.
         let failure_for_cost = match hierarchical_failure {
             Some(probability) => hierarchical.failure_ranking.unwrap_or(probability),
             None => failure_estimate,
@@ -3547,6 +3574,12 @@ impl Router {
             hierarchical_failure_events: hierarchical[0].window_events,
             hierarchical_peer_evictions: self.hierarchical.total_evictions(),
             hierarchical_peer_capacity: hierarchical[0].peer_capacity,
+            hierarchical_contracts: hierarchical[0].contracts,
+            hierarchical_contract_evictions: hierarchical[0].contract_evictions,
+            hierarchical_contract_residuals_refused: hierarchical[0].contract_residuals_refused,
+            hierarchical_contract_refit_pairs_refused: hierarchical[0].contract_refit_pairs_refused,
+            hierarchical_contract_estimable_refits: hierarchical[0].contract_estimable_refits,
+            hierarchical_contract_tau2: hierarchical[0].contract_tau2,
             hierarchical_computed: hierarchical_computed(dataset),
             hierarchical_failure_active: hierarchical[0].active,
             routing_dataset_stopped: dataset.is_some_and(|dataset| !dataset.is_recording()),

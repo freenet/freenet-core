@@ -10,6 +10,12 @@ pub(crate) mod app_packaging;
 pub(crate) mod client_api;
 pub(crate) mod errors;
 mod home_page;
+
+/// The dashboard's expected-total-time formatter, for the router test that
+/// pins the cost it is given to the range this prints (`hierarchical::tests::
+/// a_negative_unbounded_forecast_still_yields_a_printable_cost`).
+#[cfg(test)]
+pub(crate) use home_page::fmt_prediction_time as fmt_prediction_time_for_tests;
 pub(crate) mod path_handlers;
 
 use std::collections::HashSet;
