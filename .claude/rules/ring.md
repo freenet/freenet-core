@@ -204,7 +204,18 @@ Two prediction stacks exist in router.rs; exactly one reaches routing.
     blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
     the residual correction in place of the blend.
   HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
-    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
+    peer > (peer, band) empirical-Bayes hierarchy, forgetting horizon chosen
+    online from a PER-STAGE menu (FAILURE_HORIZONS_HOURS for failure,
+    LOG_HORIZONS_HOURS for response time and transfer speed; the failure menu
+    is the shorter one, so a failure burst is tracked faster). The FAILURE
+    stage also carries a CONTRACT-LEVEL TERM: a second hierarchy, contract >
+    (contract, peer), whose effect is subtracted from what the peer levels
+    learn (from OTHER peers only, so a peer's own failures never explain
+    themselves away) and added back to a forecast (from all present peers).
+    It exists because a failure on a contract nobody can serve was learned as
+    evidence about the peer that was asked, which raised that peer's forecasts
+    for every other contract (#5700). It is on unconditionally wherever the
+    estimator is computed; there is no separate flag for it.
     Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
     over BOTH legacy variants for every stage it can estimate (a cold stage
     falls back to legacy). Computed at all only when that flag is on or
@@ -224,9 +235,48 @@ WHEN touching either stack:
     dashboard shows "not computed now" rather than frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
+  → PAIRED VALUES, failure probability: the estimator returns TWO failure
+    numbers per candidate and they are not interchangeable.
+    failure_probability is clamped to [0, 1] and is what is REPORTED and
+    RECORDED (RoutingPrediction, the dataset, telemetry, the dashboard);
+    failure_ranking (hierarchical::ranking_failure_probability) is what the
+    cost formula RANKS BY, and it keeps the order of the forecasts above 1 so
+    that several peers clamped at 1 are not tied. They differ only above 1,
+    and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
+    the ranking value is pinned at 0 deliberately: carrying the downward
+    overshoot made the no-timing cost branch (failure * 3.0) negative for the
+    healthiest peers, which the dashboard prints as "N/A". Consequences to
+    keep in mind: an offline tool CANNOT reproduce the router's order among
+    candidates that all clamp, because the unbounded value is recorded
+    nowhere; and recomputing expected_total_time from the recorded
+    failure_probability reproduces it only to within the slope.
+  → The contract term must export enough to tell "it worked and helped
+    nothing" from "it never activated": hierarchical_contract_estimable_refits
+    and _contract_tau2 in the snapshot are that signal. Do not add a mechanism
+    whose activation nothing reports.
 
-PROMOTION GATE, in two parts, both on data collected after #5653 (failure
-labels) is deployed:
+PROMOTION GATE. The Brier-first gate below is SUPERSEDED for the estimator
+decision by /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17,
+approved by Ian), and the reason matters: the accuracy gap against legacy was
+almost entirely failed relayed GETs for contracts nobody can serve, which
+cannot change which peer is picked, so a Brier-at-most-1.00 gate was measuring
+the wrong thing. PLAN-v2 measures, in order, M1 within-contract RANKING
+(delta C-index, non-inferiority margin -0.05), M2 dead-contract POLLUTION (the
+excess forecast on successes of recently storm-tainted peers, bar
+max(legacy, 0) + 0.02), and M3 failure Brier only as a non-inferiority check
+(CI upper bound at most 1.10), plus the section 6 conditions: timing forecasts
+bit-identical to the shipped estimator, the #5655 bake-off still passing,
+quiet-node replays reported, and unit and simulation tests. PLAN-v2 also
+records that M1 cannot resolve on the recorded data at that margin, so the
+offline stage decides on M2, M3 and section 6 and REPORTS M1; and that the
+retracted M1b displacement measure is confounded by which model did the
+routing and must never be pooled across arms. Two properties of the offline
+gate to keep in view when reading a result from it: it scores the recorded
+CLAMPED forecast, so it is blind to the ranking value described above, and M2
+scores only forecasts that are too high on successes, so an over-correction
+reads as an improvement.
+
+The original two-part gate, still the shape of the LIVE half:
   (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
       score and seconds error for both models on the same events. This is
       calibration of each model's estimate for the peer actually tried. It
