@@ -2282,6 +2282,18 @@ fn a() {
     }
 
     #[test]
+    #[should_panic(expected = "pin lexer: unterminated block comment")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_block_comment() {
+        let _ = mask("fn a() { /* never closed /* nested */ }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated char literal")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_char_literal() {
+        let _ = mask("fn a() { let c = '\\n; }");
+    }
+
+    #[test]
     #[should_panic(expected = "pin lexer: unbalanced braces")]
     fn the_pin_lexer_fails_closed_on_unbalanced_braces() {
         let _ = production("fn a() { if x { }");

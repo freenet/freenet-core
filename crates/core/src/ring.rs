@@ -10911,38 +10911,47 @@ pub(crate) mod candidate_log_wiring_tests {
         );
         let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
         let none: Vec<SocketAddr> = Vec::new();
+        // Selecting every peer makes each call the same selection whatever
+        // order tied costs are shuffled into, so the second call's selections
+        // are live and its pacing is written as a line.
         let get = || {
             ring.k_closest_potentially_hosting(
                 DecisionLog::Joinable(OpType::Get),
                 key.id(),
                 none.as_slice(),
-                1,
+                peers.len(),
             )
         };
-        // The router shuffles candidates whose predicted costs tie, so the
-        // peer chosen may differ between calls: count captures, not peers.
-        let captures =
-            |lines: &[serde_json::Value]| lines.iter().filter(|l| l["kind"] == "decision").count();
-        assert_eq!(get().len(), 1);
-        // Wait until the writer has charged the capture.
-        dataset::lines_eventually(&path, |lines| captures(lines) == 1);
-        assert_eq!(get().len(), 1, "over the paced allowance: not captured");
-        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
-        assert_eq!(
-            get().len(),
-            1,
-            "an hour later on the injected clock: captured"
-        );
-
-        let lines = lines_through_sentinel(&recorder, &path);
-        assert_eq!(captures(&lines), 2, "{lines:?}");
-        assert!(
+        let kinds = |lines: &[serde_json::Value]| -> Vec<String> {
             lines
                 .iter()
-                .filter(|l| l["kind"] == "decision_uncaptured")
-                .all(|l| l["reason"] == "paced"),
+                .map(|l| l["kind"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Each call's line is awaited before the next call, so the lines pin
+        // which call was captured and which was paced.
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| kinds(lines) == ["start", "decision"]);
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| {
+            kinds(lines) == ["start", "decision", "decision_uncaptured"]
+        });
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(get().len(), peers.len());
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        assert_eq!(
+            kinds(&lines),
+            [
+                "start",
+                "decision",
+                "decision_uncaptured",
+                "decision",
+                "peers"
+            ],
             "{lines:?}"
         );
+        assert_eq!(lines[2]["reason"], "paced", "the second call is paced");
     }
 
     /// A captured decision for `peer` alone, as a warm router would write it.
