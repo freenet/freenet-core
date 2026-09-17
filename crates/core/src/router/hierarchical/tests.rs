@@ -2910,6 +2910,81 @@ fn sub_presence_entries_do_not_move_the_contract_components() {
     );
 }
 
+/// `tau2_peer` is a VARIANCE and is floored at zero: a mutation removing the
+/// floor survived the whole suite. The method-of-moments estimator subtracts
+/// a noise term from a squared contrast, so its raw value is negative
+/// whenever the contrast is smaller than the noise, which is the normal case
+/// when no between-peer effect exists. Left negative it would enter
+/// `effect`'s noise as `tau2_peer * sum n_q^2 / n^2`, REDUCING the noise and
+/// so INFLATING the shrunk contract effect, and it would also inflate
+/// `tau2_contract` by being subtracted from its own noise.
+///
+/// Constructed so the contrast is identically zero rather than relying on a
+/// draw: every cell holds the same alternating values, so every entry's mean
+/// and every leave-one-out rest mean are 0.5, while the within-cell variance
+/// is 0.25, so the raw estimate is exactly minus the mean noise.
+#[test]
+fn tau2_peer_is_floored_at_zero() {
+    let mut table = ContractTable::new();
+    for contract in 0..40u64 {
+        let (slot, _) = table.touch(contract);
+        for peer in 0..4u32 {
+            for i in 0..10 {
+                assert!(table.add(slot, (peer, 0), 1.0, f64::from(u8::from(i % 2 == 0))));
+            }
+        }
+    }
+    let c = table
+        .compute_components()
+        .expect("replicated cells everywhere");
+    assert!(
+        c.sigma2 > 0.2,
+        "the scenario must carry real within-cell variance, or the noise term \
+         is zero and this test proves nothing: {}",
+        c.sigma2
+    );
+    assert_eq!(
+        c.tau2_peer, 0.0,
+        "every entry has the same mean, so the raw estimate is negative and \
+         must be floored"
+    );
+}
+
+/// The degrees-of-freedom gate had no test: a mutation lowering `df < 2.0`
+/// to `df < 0.0` survived the whole suite. Without it a table in which no
+/// `(contract, peer)` cell has any within-cell replication still produces
+/// components: `ss` and `df` are both 0, `ss / df` is NaN, `.max(MIN_SIGMA2)`
+/// returns the finite operand, and the term then activates with a pooled
+/// within-cell variance of 1e-9 and a between-contract variance that is just
+/// each contract's mean squared. That is the term reading pure sampling noise
+/// as a dead contract.
+#[test]
+fn contract_components_need_within_cell_replication() {
+    let mut table = ContractTable::new();
+    for contract in 0..60u64 {
+        let (slot, _) = table.touch(contract);
+        for peer in 0..CONTRACT_ENTRIES as u32 {
+            // Exactly one event per cell, so no cell is replicated, while the
+            // per-contract totals are (8 events, Kish n_eff 8).
+            assert!(table.add(slot, (peer, 0), 1.0, 0.5));
+        }
+    }
+    assert_eq!(
+        table.compute_components(),
+        None,
+        "no cell carries within-cell replication, so there is no sigma2 to \
+         estimate and the term must not activate"
+    );
+    // One replicated cell is still not enough: the gate is on the POOLED
+    // degrees of freedom, and one unit-weight cell of two events carries 1.
+    let (slot, _) = table.touch(0);
+    assert!(table.add(slot, (0, 0), 1.0, 0.5));
+    assert_eq!(table.compute_components(), None);
+    // A second one crosses it.
+    assert!(table.add(slot, (1, 0), 1.0, 0.5));
+    assert!(table.compute_components().is_some());
+}
+
 /// Finding 8: the shrunk effect's arithmetic, pinned exactly. This is the
 /// number the whole term's magnitude comes from, and the mutation suite of
 /// 2026-09-17 found that dropping the `tau2_peer` noise term or the shrinkage
