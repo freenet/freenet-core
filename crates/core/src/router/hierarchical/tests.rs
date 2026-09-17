@@ -2796,6 +2796,62 @@ fn contract_variance_components_recover_the_generating_values() {
     );
 }
 
+/// The presence filter inside `compute_components` had no test: a mutation
+/// deleting it survived the whole suite. The filter is what stops evidence
+/// that has decayed away from setting the term's magnitude, and because the
+/// table's epoch is the rebuild time, a stored count below
+/// [`CONTRACT_PRESENCE`] IS decayed-away evidence. Pinned as an invariance:
+/// adding sub-presence entries to every contract must leave the components
+/// bit-identical.
+///
+/// Note the filter is not redundant with `replicated()`. A sub-presence entry
+/// is not replicated, so it never reaches `sigma2` or the `tau2_peer`
+/// numerator, but without the filter it still joins the leave-one-out REST
+/// sums and the per-contract total, which is where it moves both between-group
+/// variances.
+#[test]
+fn sub_presence_entries_do_not_move_the_contract_components() {
+    let build = |with_stale: bool| {
+        // Seeded INSIDE the closure, so both tables are built from the same
+        // random draws. Seeding outside it would have the second call continue
+        // the first's stream, and the two tables would differ for that reason
+        // rather than for the one under test.
+        let _guard = GlobalRng::seed_guard(0x4485_cc40);
+        let mut table = ContractTable::new();
+        for contract in 0..60u64 {
+            let (slot, _) = table.touch(contract);
+            let contract_effect = 0.4 * normal();
+            for peer in 0..4u32 {
+                let peer_effect = 0.5 * normal();
+                for _ in 0..30 {
+                    assert!(table.add(
+                        slot,
+                        (peer, 0),
+                        1.0,
+                        contract_effect + peer_effect + normal()
+                    ));
+                }
+            }
+            if with_stale {
+                // Four more peers, each one event whose decayed count is far
+                // below the presence cut. Values chosen to be large, so a
+                // mutation that lets them count cannot pass by being small.
+                for peer in 4..8u32 {
+                    assert!(table.add(slot, (peer, 0), CONTRACT_PRESENCE / 50.0, 5.0));
+                }
+            }
+        }
+        table
+            .compute_components()
+            .expect("a full table has components")
+    };
+    let (clean, with_stale) = (build(false), build(true));
+    assert_eq!(
+        clean, with_stale,
+        "sub-presence entries must not reach the components"
+    );
+}
+
 /// Finding 8: the shrunk effect's arithmetic, pinned exactly. This is the
 /// number the whole term's magnitude comes from, and the mutation suite of
 /// 2026-09-17 found that dropping the `tau2_peer` noise term or the shrinkage
