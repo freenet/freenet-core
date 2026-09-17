@@ -1648,6 +1648,10 @@ fn band_of(contract_location: f64) -> usize {
 /// The failure stage's contract table adds at most `CONTRACT_CAPACITY x
 /// CONTRACT_NODE_BYTES` (327,680 bytes) of nodes, plus its key table (a
 /// `HashMap<u64, usize>` and per-slot bookkeeping, about 80 KB at capacity).
+/// The shared [`Scratch`] also carries the contract rebuild's two buffers, at
+/// most `WINDOW_EVENTS x 24` bytes (240 KB) of events and one entry per
+/// `(contract, peer)` pair of the contract being written. Those are held once
+/// per router, not once per stage, and only the failure stage fills them.
 const EVENT_BYTES: usize = 56;
 const PREPARED_BYTES: usize = 40;
 const PEER_NODE_BYTES: usize = 296;
