@@ -2327,12 +2327,16 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             let contract_slot = (events[index].0 >> 32) as usize;
             pairs.clear();
             while index < events.len() && (events[index].0 >> 32) as usize == contract_slot {
-                let peer_slot = events[index].0 as u32;
+                // The WHOLE key, not its low half: two adjacent contracts can
+                // hold the same peer slot, and matching on the peer alone
+                // would merge the second contract's events into the first.
+                let key = events[index].0;
+                let peer_slot = key as u32;
                 let generation = peers
                     .generation(peer_slot as usize)
                     .expect("only live peers were pushed");
                 let mut moments = Moments::default();
-                while index < events.len() && events[index].0 as u32 == peer_slot {
+                while index < events.len() && events[index].0 == key {
                     moments.add(events[index].1, events[index].2);
                     index += 1;
                 }

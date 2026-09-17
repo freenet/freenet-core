@@ -2427,6 +2427,55 @@ fn the_refit_keeps_a_contracts_heaviest_peers_not_the_nearest() {
     );
 }
 
+/// The grouped rebuild must attribute each event to the right (contract,
+/// peer) pair. The events are sorted by `contract_slot << 32 | peer_slot`, so
+/// two adjacent contracts holding the SAME peer slot are adjacent in that
+/// order with an identical low half, and a peer-loop that matched on the low
+/// half alone merged the second contract's events into the first and left the
+/// second contract with no entries at all. Found by review of the fix for
+/// finding 2 before it was measured; this is the arrangement that reaches it.
+#[test]
+fn the_refit_attributes_events_to_the_right_contract_when_a_peer_repeats() {
+    let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
+    let mut scratch = Scratch::default();
+    let (first, second) = (0.25, 0.75);
+    for i in 0..3 {
+        stage.observe(&mut scratch, &0, first, 0.1, 1.0, i as f64 * 0.01);
+    }
+    for i in 0..5 {
+        stage.observe(&mut scratch, &0, second, 0.2, 0.0, 0.05 + i as f64 * 0.01);
+    }
+    let table = stage
+        .contracts
+        .as_ref()
+        .expect("the failure stage has a term");
+    // The premise: adjacent contract slots, one shared peer slot.
+    assert_eq!(table.table.lookup(&first.to_bits()), Some(0));
+    assert_eq!(table.table.lookup(&second.to_bits()), Some(1));
+    assert_eq!(stage.peers.lookup(&0), Some(0));
+    for (slot, count) in [(0usize, 3usize), (1, 5)] {
+        let used: Vec<&ContractEntry> = table.nodes[slot]
+            .entries
+            .iter()
+            .filter(|entry| entry.used())
+            .collect();
+        assert_eq!(
+            used.len(),
+            1,
+            "contract slot {slot} must hold exactly its own peer's entry"
+        );
+        assert_eq!(used[0].peer_slot, 0);
+        // Weights are `exp((t - now) / CONTRACT_HORIZON_HOURS)`, so the count
+        // is below the event count but bounded by it; the wrong grouping gave
+        // slot 0 all eight events and slot 1 none.
+        assert!(
+            used[0].moments.n <= count as f64 && used[0].moments.n > 0.5 * count as f64,
+            "contract slot {slot} must hold {count} events' worth of weight: {:?}",
+            used[0].moments
+        );
+    }
+}
+
 /// Finding 11, exactly: the refit's refusal count is a DIFFERENT quantity from
 /// the live one. `rebuild_node` reports its own discards and never touches the
 /// live counter, so deleting the live counter cannot make the refit count
@@ -2678,6 +2727,89 @@ fn contract_variance_components_recover_the_generating_values() {
     assert!(
         (tc - tau_contract * tau_contract).abs() < 0.05,
         "tau2_contract {tc}"
+    );
+}
+
+/// Finding 8: the shrunk effect's arithmetic, pinned exactly. This is the
+/// number the whole term's magnitude comes from, and the mutation suite of
+/// 2026-09-17 found that dropping the `tau2_peer` noise term or the shrinkage
+/// altogether left the rest of the suite green.
+///
+/// `noise = sigma2 * w2/n^2 + tau2_peer * (sum_q n_q^2)/n^2`,
+/// `shrink = tau2_contract / (tau2_contract + noise)`, `value = shrink *
+/// sum/n`, over the entries the query selects.
+#[test]
+fn the_shrunk_contract_effect_matches_its_formula() {
+    let mut table = ContractTable::new();
+    let (slot, _) = table.touch(0.25f64.to_bits());
+    // Three peers, deliberately unequal: 2, 3 and 5 unit-weight events with
+    // means 1.0, 0.5 and 0.2.
+    let entries: [(u32, f64, f64); 3] = [(1, 2.0, 1.0), (2, 3.0, 0.5), (3, 5.0, 0.2)];
+    for &(peer, count, mean) in &entries {
+        for _ in 0..count as usize {
+            assert!(table.add(slot, (peer, 0), 1.0, mean));
+        }
+    }
+    let components = ContractComponents {
+        sigma2: 0.25,
+        tau2_peer: 0.09,
+        tau2_contract: 0.16,
+    };
+    table.components = Some(components);
+
+    let expected = |selected: &[(u32, f64, f64)]| {
+        let (mut n, mut w2, mut sum, mut sq) = (0.0, 0.0, 0.0, 0.0);
+        for &(_, count, mean) in selected {
+            n += count;
+            w2 += count; // unit weights, so sum w^2 = count
+            sum += count * mean;
+            sq += count * count;
+        }
+        let n2 = n * n;
+        let noise = components.sigma2 * w2 / n2 + components.tau2_peer * sq / n2;
+        let shrink = components.tau2_contract / (components.tau2_contract + noise);
+        shrink * sum / n
+    };
+
+    let shared = table
+        .effect(Some(slot), ContractQuery::Shared, 0.0, 3)
+        .expect("three present peers");
+    assert!(
+        (shared - expected(&entries)).abs() < 1e-12,
+        "shared effect {shared} against {}",
+        expected(&entries)
+    );
+    // Leaving one peer out changes n, the sum and the squared-count sum.
+    let left_out = table
+        .effect(Some(slot), ContractQuery::LeaveOut(Some((1, 0))), 0.0, 2)
+        .expect("two present peers remain");
+    assert!(
+        (left_out - expected(&entries[1..])).abs() < 1e-12,
+        "leave-one-out effect {left_out} against {}",
+        expected(&entries[1..])
+    );
+
+    // The `tau2_peer` term's purpose, stated behaviourally: the same total
+    // evidence concentrated in ONE peer must be shrunk harder than the same
+    // evidence spread over four, because one peer's many failures are not
+    // evidence about a contract. Without that term the two are shrunk
+    // identically, since `w2/n^2` is the same in both.
+    let effect_with = |peers: u32| {
+        let mut table = ContractTable::new();
+        let (slot, _) = table.touch(0.25f64.to_bits());
+        for i in 0..20u32 {
+            assert!(table.add(slot, (i % peers, 0), 1.0, 1.0));
+        }
+        table.components = Some(components);
+        table
+            .effect(Some(slot), ContractQuery::Shared, 0.0, 1)
+            .expect("entries are present")
+    };
+    let (concentrated, spread) = (effect_with(1), effect_with(4));
+    assert!(
+        concentrated < 0.85 * spread,
+        "one peer's evidence must be shrunk harder than four peers': \
+         {concentrated} against {spread}"
     );
 }
 
