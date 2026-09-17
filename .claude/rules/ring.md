@@ -230,11 +230,19 @@ labels) is deployed:
   (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
       score and seconds error for both models on the same events. This is
       calibration of each model's estimate for the peer actually tried. It
-      does NOT measure ranking: the dataset records only the chosen peer and
-      its outcome, with no candidate sets and no exploration, so how a peer
-      the other model would have chosen would have fared is unobserved.
-      Offline ranking evaluation would need a per-decision candidate log
-      with exploration (future work).
+      does NOT measure ranking: route lines record only the chosen peer and
+      its outcome. FREENET_ROUTING_DATASET_CANDIDATES=1 adds a `decision`
+      line per routing decision (both models' estimates and ranks for every
+      scored candidate; router/dataset.rs "Candidate sets"), which supports
+      ranking comparisons over the candidates the ACTING model chose among.
+      There is still no exploration, so how a peer the acting model did not
+      select would have fared is unobserved (future work). The by-value join
+      from outcome to decision is biased in two known directions (module doc
+      "Joining"): report both measures it names with any result. Size
+      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. With
+      FREENET_ROUTING_HIERARCHICAL on, use a candidates rate of 0.01 or less:
+      a captured decision there costs about 8x an uncaptured one under the
+      router read lock (+35% per decision at 0.05, about +7% at 0.01).
   (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
       FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
       which gateway has the flag halfway through the window. The two gateways

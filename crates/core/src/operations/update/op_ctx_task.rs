@@ -233,7 +233,11 @@ async fn drive_client_update(
     } else {
         op_manager
             .ring
-            .closest_potentially_hosting(&key, [sender_addr].as_slice())
+            .closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &key,
+                [sender_addr].as_slice(),
+            )
             // Bootstrap fallback (#4361 / #4365): with an empty ring there
             // is no routing candidate, so route the UPDATE via a configured
             // gateway instead of handling it locally. In the hosting case
@@ -1148,9 +1152,11 @@ async fn drive_relay_request_update(
     let self_addr = op_manager.ring.connection_manager.peer_addr()?;
     let skip_list = vec![self_addr, sender_addr];
 
-    let next_target = op_manager
-        .ring
-        .closest_potentially_hosting(&key, skip_list.as_slice());
+    let next_target = op_manager.ring.closest_potentially_hosting(
+        crate::router::dataset::DecisionLog::Unlogged,
+        &key,
+        skip_list.as_slice(),
+    );
 
     let forward_target = match next_target {
         Some(t) => t,
@@ -1158,7 +1164,12 @@ async fn drive_relay_request_update(
             // Mirrors update.rs:560-590: no peers + no local contract.
             let candidates = op_manager
                 .ring
-                .k_closest_potentially_hosting(&key, skip_list.as_slice(), 5)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &key,
+                    skip_list.as_slice(),
+                    5,
+                )
                 .into_iter()
                 .filter_map(|loc| loc.socket_addr())
                 .map(|addr| format!("{:.8}", addr))

@@ -2846,6 +2846,22 @@ impl Router {
         target_location: Location,
         clock: PredictionClock,
     ) -> Result<RoutingPrediction, RoutingError> {
+        self.predict_with_model(peer, target_location, clock, hierarchical_routing_enabled())
+            .map(|(prediction, _)| prediction)
+    }
+
+    /// The prediction routing would act on with the hierarchical estimator in
+    /// or out of routing (`use_hierarchical`), whatever the flag is actually set
+    /// to, and which stages the hierarchical estimator supplied itself. Routing
+    /// passes the flag; the candidate log (`dataset`) also asks for the other
+    /// model.
+    fn predict_with_model(
+        &self,
+        peer: &PeerKeyLocation,
+        target_location: Location,
+        clock: PredictionClock,
+        use_hierarchical: bool,
+    ) -> Result<(RoutingPrediction, dataset::HierarchicalStages), RoutingError> {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
         }
@@ -2879,7 +2895,7 @@ impl Router {
         // can estimate, taking precedence over both the legacy blend and the
         // residual correction. Computed ONLY when enabled: this runs once per
         // candidate per routing decision.
-        let hierarchical = if hierarchical_routing_enabled() {
+        let hierarchical = if use_hierarchical {
             self.hierarchical
                 .estimate(peer, target_location, distance, clock.estimator_hours)
         } else {
@@ -2951,15 +2967,23 @@ impl Router {
             failure_estimate * failure_cost_multiplier
         };
 
-        Ok(RoutingPrediction {
-            failure_probability: failure_estimate,
-            xfer_speed: TransferSpeed {
-                bytes_per_second: xfer_speed,
+        let stages = dataset::HierarchicalStages {
+            failure: hierarchical_failure.is_some(),
+            response_time: hierarchical_time.is_some(),
+            transfer_speed: hierarchical_speed.is_some(),
+        };
+        Ok((
+            RoutingPrediction {
+                failure_probability: failure_estimate,
+                xfer_speed: TransferSpeed {
+                    bytes_per_second: xfer_speed,
+                },
+                time_to_response_start,
+                expected_total_time,
+                renegade_failure_adjustment,
             },
-            time_to_response_start,
-            expected_total_time,
-            renegade_failure_adjustment,
-        })
+            stages,
+        ))
     }
 
     /// Like `select_k_best_peers` but also returns a `RoutingDecisionInfo` for telemetry.
@@ -2969,6 +2993,32 @@ impl Router {
         target_location: Location,
         k: usize,
     ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
+        let (selected, decision, _) =
+            self.select_k_best_peers_capturing(peers, target_location, k, false);
+        (selected, decision)
+    }
+
+    /// [`Self::select_k_best_peers_with_telemetry`], and with `capture` also the
+    /// candidate set for the routing dataset's `decision` line: every scored
+    /// candidate with BOTH models' predictions, taken from the decision as it
+    /// is made. `None` without `capture`, and for a distance-based decision.
+    ///
+    /// Capturing costs one extra prediction per candidate (the model that is
+    /// not routing) under the caller's router READ lock; see the cost notes in
+    /// [`dataset`]'s "Candidate sets". Without `capture` the path is the plain
+    /// routing decision. Building and sending the record is left to the
+    /// caller, after the lock is released.
+    pub(crate) fn select_k_best_peers_capturing<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+        capture: bool,
+    ) -> (
+        Vec<&'a PeerKeyLocation>,
+        RoutingDecisionInfo,
+        Option<dataset::DecisionCapture<'a>>,
+    ) {
         let total_routing_events = self.failure_estimator.len();
 
         if k == 0 {
@@ -2980,6 +3030,7 @@ impl Router {
                     candidates: Vec::new(),
                     total_routing_events,
                 },
+                None,
             );
         }
 
@@ -3027,11 +3078,17 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, None)
         } else {
             let (closest, candidates_available) =
                 self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
+            let acting_hierarchical = hierarchical_routing_enabled();
+            let mut captured: Vec<dataset::CapturedCandidate<'a>> = if capture {
+                Vec::with_capacity(closest.len())
+            } else {
+                Vec::new()
+            };
 
             // `closest` is distance-sorted, so the enumerate index IS the
             // distance rank. Carrying it through the re-sort is how the rank
@@ -3047,20 +3104,64 @@ impl Router {
                             .location()
                             .map(|loc| target_location.distance(loc).as_f64())
                             .unwrap_or(0.5);
-                        match self.predict_routing_outcome(peer, target_location) {
-                            Ok(pred) => (distance_rank, *peer, distance, Some(pred)),
-                            Err(_) => {
-                                fallback_count += 1;
-                                (distance_rank, *peer, distance, None)
-                            }
+                        let prediction = if capture {
+                            // Both models on one clock reading; the acting one
+                            // is exactly what routing sorts below.
+                            let clock = self.prediction_clock();
+                            let acting = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    clock,
+                                    acting_hierarchical,
+                                )
+                                .ok();
+                            let other = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    clock,
+                                    !acting_hierarchical,
+                                )
+                                .ok();
+                            let (legacy, hierarchical) = if acting_hierarchical {
+                                (other, acting)
+                            } else {
+                                (acting, other)
+                            };
+                            let estimate =
+                                |p: &(RoutingPrediction, dataset::HierarchicalStages)| {
+                                    dataset::ModelEstimate {
+                                        failure_probability: p.0.failure_probability,
+                                        time_to_response_start_s: p.0.time_to_response_start,
+                                        transfer_speed_bps: p.0.xfer_speed.bytes_per_second,
+                                        expected_total_time: p.0.expected_total_time,
+                                    }
+                                };
+                            captured.push(dataset::CapturedCandidate {
+                                peer,
+                                legacy: legacy.as_ref().map(estimate),
+                                hierarchical: hierarchical.as_ref().map(estimate),
+                                hierarchical_stages: hierarchical
+                                    .map(|(_, stages)| stages)
+                                    .unwrap_or_default(),
+                                selected_position: None,
+                            });
+                            acting.map(|(prediction, _)| prediction)
+                        } else {
+                            self.predict_routing_outcome(peer, target_location).ok()
+                        };
+                        if prediction.is_none() {
+                            fallback_count += 1;
                         }
+                        (distance_rank, *peer, distance, prediction)
                     })
                     .collect();
 
             // Sort: peers with predictions by expected_total_time, others at the end
             scored.sort_by(|a, b| {
-                let time_a = a.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                let time_b = b.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_a = dataset::cost_order_key(a.3.map(|p| p.expected_total_time));
+                let time_b = dataset::cost_order_key(b.3.map(|p| p.expected_total_time));
                 time_a.total_cmp(&time_b)
             });
 
@@ -3089,6 +3190,28 @@ impl Router {
                 .collect();
 
             scored.truncate(k);
+            // The selection, marked on the capture by the distance rank each
+            // returned peer carried through the sort: from the decision itself.
+            let capture = capture.then(|| {
+                for (position, (distance_rank, _, _, _)) in scored.iter().enumerate() {
+                    if let Some(candidate) = captured.get_mut(*distance_rank) {
+                        candidate.selected_position = Some(position);
+                    }
+                }
+                dataset::DecisionCapture {
+                    contract_location: target_location,
+                    acting_model: if acting_hierarchical {
+                        dataset::RoutingModel::Hierarchical
+                    } else {
+                        dataset::RoutingModel::Legacy
+                    },
+                    prediction_fallback: fallback_count > 0,
+                    k,
+                    candidates_available,
+                    prior_failure_events: total_routing_events,
+                    candidates: captured,
+                }
+            });
             let selected: Vec<&'a PeerKeyLocation> =
                 scored.into_iter().map(|(_, peer, _, _)| peer).collect();
 
@@ -3098,7 +3221,7 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, capture)
         }
     }
 
@@ -5611,6 +5734,345 @@ mod tests {
             snapshot.saturated, 25,
             "40 candidates cut to a 25-peer window discards 15 unscored every time"
         );
+    }
+
+    /// The routing dataset's candidate log must be the candidate set the router
+    /// actually scored and the selection it actually made, taken from the
+    /// decision itself — not a list re-derived afterwards from the peers it was
+    /// offered (the "metric re-derived at the call site" trap).
+    #[test]
+    fn decision_capture_is_the_candidate_set_the_router_scored() {
+        // Learning on, so the hierarchical estimator has something to say.
+        let learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]);
+        // 40 peers against the default 25-peer window, each with its own key
+        // (`PeerKeyLocation::random()` shares one) and a distinct location.
+        let peers: Vec<PeerKeyLocation> =
+            (0..40u32).map(|i| peer_in_subnet(i * 1543 + 7)).collect();
+        let contract = Location::new(0.5);
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    // Reliability unrelated to distance, so cost order is not
+                    // distance order.
+                    outcome: if (index * 7 + round) % 5 < index % 4 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 13 * index as u64),
+                            payload_size: 5000,
+                            payload_transfer_time: Duration::from_millis(50),
+                        }
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        drop(learn);
+
+        let mut distance_order: Vec<&PeerKeyLocation> = peers.iter().collect();
+        distance_order.sort_by_key(|peer| contract.distance(peer.location().unwrap()));
+        let window = router.consider_n_closest_peers;
+        assert!(peers.len() > window, "the window must discard some peers");
+
+        // Each model's estimates from the pass where it acted, to compare with
+        // the pass where it was only logged.
+        let mut acted: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        let mut logged: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        for acting_hierarchical in [false, true] {
+            let _flag = force_hierarchical_routing(acting_hierarchical);
+            let k = 3;
+            let (selected, decision, capture) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, true);
+            let capture = capture.expect("a prediction-based decision is captured");
+            assert_eq!(capture.k, k);
+            assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+            assert!(!capture.prediction_fallback);
+            assert!(matches!(
+                decision.strategy,
+                RoutingStrategy::PredictionBased
+            ));
+            assert!(
+                capture.candidates.iter().all(|c| c.hierarchical_stages
+                    == dataset::HierarchicalStages {
+                        failure: true,
+                        response_time: true,
+                        transfer_speed: true,
+                    }),
+                "every stage is warm for every peer here"
+            );
+            let legacy: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.legacy.unwrap())
+                .collect();
+            let hierarchical: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.hierarchical.unwrap())
+                .collect();
+            acted.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    hierarchical.clone()
+                } else {
+                    legacy.clone()
+                },
+            ));
+            logged.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    legacy
+                } else {
+                    hierarchical
+                },
+            ));
+            let (uncaptured, _, none) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, false);
+            assert!(none.is_none(), "nothing is captured when not asked");
+            assert_eq!(
+                selected, uncaptured,
+                "capturing must not change the selection"
+            );
+
+            assert_eq!(
+                capture.acting_model,
+                if acting_hierarchical {
+                    dataset::RoutingModel::Hierarchical
+                } else {
+                    dataset::RoutingModel::Legacy
+                }
+            );
+            assert_eq!(capture.candidates_available, peers.len());
+            assert_eq!(capture.candidates.len(), decision.candidates.len());
+            let captured_peers: Vec<&PeerKeyLocation> =
+                capture.candidates.iter().map(|c| c.peer).collect();
+            assert_eq!(
+                captured_peers,
+                distance_order[..window],
+                "the scored window, in distance order"
+            );
+            // The selection as the router returned it, position by position.
+            for (position, peer) in selected.iter().enumerate() {
+                let marked: Vec<&PeerKeyLocation> = capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position == Some(position))
+                    .map(|c| c.peer)
+                    .collect();
+                assert_eq!(marked, vec![*peer], "selected position {position}");
+            }
+            assert_eq!(
+                capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position.is_some())
+                    .count(),
+                k
+            );
+            assert!(
+                capture
+                    .candidates
+                    .iter()
+                    .all(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+                "both models predict every candidate"
+            );
+
+            let record = capture.into_record(OpType::Get, 1);
+            assert_eq!(record.op, "GET");
+            assert_eq!(record.candidates_omitted, 0);
+            // The acting model's estimates are the ones the router sorted: its
+            // j-th ranked candidate carries exactly the decision's j-th cost.
+            for candidate in &record.candidates {
+                let (rank, estimate) = if acting_hierarchical {
+                    (candidate.rank_hierarchical, candidate.hierarchical)
+                } else {
+                    (candidate.rank_legacy, candidate.legacy)
+                };
+                let routed = decision.candidates[rank]
+                    .prediction
+                    .as_ref()
+                    .expect("prediction-based");
+                let estimate = estimate.unwrap();
+                assert_eq!(
+                    estimate.expected_total_time.to_bits(),
+                    routed.expected_total_time.to_bits()
+                );
+                assert_eq!(
+                    estimate.failure_probability.to_bits(),
+                    routed.failure_probability.to_bits()
+                );
+                assert_eq!(candidate.selected_position.is_some(), rank < k);
+            }
+            let chosen_acting = if acting_hierarchical {
+                record.chosen_rank_hierarchical
+            } else {
+                record.chosen_rank_legacy
+            };
+            assert_eq!(chosen_acting, Some(0));
+            assert!(
+                record
+                    .candidates
+                    .iter()
+                    .any(|c| c.rank_legacy != c.rank_hierarchical),
+                "the two models must disagree somewhere, or which model is which is untested"
+            );
+        }
+
+        // The model that was only logged must carry what it would route on when
+        // it acts: legacy logged in the hierarchical pass matches legacy acting
+        // in the legacy pass, and the other way round. Close, not bit-equal:
+        // the passes read their clocks moments apart.
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 + 1e-6 * a.abs().max(b.abs());
+        for (logged_in_hierarchical_pass, logged_estimates) in &logged {
+            let (_, acting_estimates) = acted
+                .iter()
+                .find(|(pass, _)| pass != logged_in_hierarchical_pass)
+                .unwrap();
+            for (logged, acting) in logged_estimates.iter().zip(acting_estimates) {
+                for (field, a, b) in [
+                    (
+                        "failure",
+                        logged.failure_probability,
+                        acting.failure_probability,
+                    ),
+                    (
+                        "time",
+                        logged.time_to_response_start_s,
+                        acting.time_to_response_start_s,
+                    ),
+                    (
+                        "speed",
+                        logged.transfer_speed_bps,
+                        acting.transfer_speed_bps,
+                    ),
+                    (
+                        "cost",
+                        logged.expected_total_time,
+                        acting.expected_total_time,
+                    ),
+                ] {
+                    assert!(close(a, b), "{field}: logged {a} vs acting {b}");
+                }
+            }
+        }
+    }
+
+    /// Cold stages and candidates neither model can predict are recorded as
+    /// such, from the decision.
+    #[test]
+    fn decision_capture_records_cold_stages_and_unpredictable_candidates() {
+        let learn = force_hierarchical_routing(true);
+        let mut router = Router::new(&[]);
+        let peers: Vec<PeerKeyLocation> =
+            (0..10u32).map(|i| peer_in_subnet(i * 977 + 11)).collect();
+        let contract = Location::new(0.5);
+        // Untimed outcomes only, so no timing stage has any data.
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    outcome: if (index + round) % 3 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        drop(learn);
+        let _flag = force_hierarchical_routing(false);
+        // No location, so no failure estimate: the router ranks it last.
+        let unknown = PeerKeyLocation::with_unknown_addr(
+            crate::transport::TransportKeypair::new().public().clone(),
+        );
+        let mut offered = peers.clone();
+        offered.push(unknown.clone());
+
+        let (_, decision, capture) =
+            router.select_k_best_peers_capturing(offered.iter(), contract, 2, true);
+        let capture = capture.expect("prediction-based with some fallback");
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionFallback
+        ));
+        assert!(capture.prediction_fallback);
+        assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+
+        let blind = capture
+            .candidates
+            .iter()
+            .find(|c| c.peer == &unknown)
+            .expect("in the window");
+        assert!(blind.legacy.is_none() && blind.hierarchical.is_none());
+        assert_eq!(
+            blind.hierarchical_stages,
+            dataset::HierarchicalStages::default()
+        );
+        assert!(blind.selected_position.is_none());
+
+        for candidate in capture.candidates.iter().filter(|c| c.peer != &unknown) {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages {
+                    failure: true,
+                    response_time: false,
+                    transfer_speed: false,
+                },
+                "failure is learned, timing is cold"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            // A cold stage is the legacy fallback, not a hierarchical number.
+            assert_eq!(
+                hierarchical.time_to_response_start_s,
+                legacy.time_to_response_start_s
+            );
+            assert_eq!(hierarchical.transfer_speed_bps, legacy.transfer_speed_bps);
+        }
+        let record = capture.into_record(OpType::Get, 1);
+        let blind = record
+            .candidates
+            .iter()
+            .find(|c| c.peer == dataset::peer_hash(&unknown))
+            .unwrap();
+        assert_eq!(blind.distance, None);
+        assert_eq!(blind.rank_legacy, record.candidates.len() - 1);
+
+        // A router that never ran the hierarchical estimator (flag off, no
+        // recording): every hierarchical stage is cold, so its logged estimate
+        // is the legacy one throughout and says so.
+        let mut unlearned = Router::new(&[]);
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                unlearned.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    outcome: if (index + round) % 3 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        let (_, _, capture) =
+            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true);
+        for candidate in capture.expect("prediction-based").candidates {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages::default(),
+                "nothing learned, nothing supplied"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            assert_eq!(hierarchical.failure_probability, legacy.failure_probability);
+        }
     }
 
     #[test]
