@@ -10875,6 +10875,61 @@ pub(crate) mod candidate_log_wiring_tests {
         assert_eq!(lines[2]["op"], "PUT");
     }
 
+    /// Pacing must run on the ring's injected clock: under a paused runtime
+    /// only that clock moves, so a capture refused as paced is allowed again
+    /// once virtual time passes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_pacing_reads_the_injected_clock() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-paced", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        // A 40 KB budget released over an hour: the burst is 2.5 KB, less
+        // than one captured decision.
+        let recorder = Arc::new(
+            RoutingDataset::open_with_decisions(
+                &path,
+                dataset::DEFAULT_MAX_BYTES,
+                40_000,
+                3_600_000,
+            )
+            .unwrap(),
+        );
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let none: Vec<SocketAddr> = Vec::new();
+        let get = || {
+            ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            )
+        };
+        let first = get();
+        // Wait until the writer has charged the capture.
+        dataset::lines_eventually(&path, |lines| lines.iter().any(|l| l["kind"] == "decision"));
+        assert_eq!(get(), first);
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(get(), first);
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision_uncaptured",
+                "decision",
+                "peers"
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[2]["reason"], "paced");
+    }
+
     /// A captured decision for `peer` alone, as a warm router would write it.
     pub(crate) fn live_capture(
         peer: &PeerKeyLocation,

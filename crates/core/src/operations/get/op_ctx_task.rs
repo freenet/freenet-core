@@ -9143,6 +9143,14 @@ mod route_attempt_driver_tests {
             },
         );
 
+        // The consulted host is a live capture, so the consult must close it.
+        let (recorder, _dir, path) = crate::ring::candidate_log_wiring_tests::recorder();
+        let _log = crate::router::dataset::force_candidate_log(recorder.clone(), 1.0);
+        recorder.record_decision(crate::ring::candidate_log_wiring_tests::live_capture(
+            &host,
+            crate::node::network_status::OpType::Get,
+            crate::ring::Location::from(&instance_id),
+        ));
         let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
         let targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = targets.clone();
@@ -9194,6 +9202,18 @@ mod route_attempt_driver_tests {
         assert_eq!(
             by_peer(failure_window(&op_manager)),
             by_peer(vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)]),
+        );
+        let lines =
+            crate::ring::candidate_log_wiring_tests::lines_through_sentinel(&recorder, &path);
+        let consults: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["reason"] == "terminal_consult")
+            .collect();
+        assert_eq!(consults.len(), 1, "{lines:?}");
+        assert_eq!(consults[0]["op"], "GET");
+        assert_eq!(
+            consults[0]["selected"],
+            serde_json::json!([crate::router::dataset::peer_hash(&host)])
         );
     }
 

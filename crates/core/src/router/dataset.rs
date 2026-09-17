@@ -132,27 +132,35 @@
 //!
 //! **Lost decisions are marked where they were lost.** Decision records that
 //! never reach the file (queue bound, full channel) are counted apart from route
-//! drops. Once any decision-kind record has been sent, every send to the channel
-//! is serialised with the decision bookkeeping, and a loss puts a
-//! `"kind":"decisions_dropped"` record into the channel ahead of the NEXT record
-//! of any kind: after everything enqueued before the loss, before everything
-//! enqueued after it. If the mark itself cannot be enqueued, the record behind
-//! it is dropped too, so nothing ever lands on the wrong side of a missing mark.
+//! drops. While capture is active, every send to the channel is serialised with
+//! the decision bookkeeping, and a loss puts a `"kind":"decisions_dropped"`
+//! record into the channel ahead of the NEXT record of any kind: after
+//! everything enqueued before the loss, before everything enqueued after it. No
+//! record of any kind is enqueued between a loss and its mark; if the mark
+//! cannot be enqueued, the record behind it is dropped too.
 //!
-//! **Cost.** Measured in a release build (25-candidate window): a captured
-//! decision costs about +10% under the router READ lock while legacy routes
-//! (about 356 to 391 µs) but about 10x while the hierarchical estimator routes
-//! (about 40 to 400 µs), because the legacy stack's per-candidate Renegade
-//! queries then run only for the log. That is why the switch samples: at rate
-//! `r` the added read-lock time averages `r` times that (at `0.05`, about +2 µs
-//! and +18 µs per decision respectively), and a single captured decision holds
-//! the lock no longer than every legacy-routed decision already does. Building
-//! a record takes about 6 µs after the lock is released and serialising it
-//! about 23 µs on the writer thread; a line is about 16 KB. An uncaptured
-//! decision adds nothing under the router lock. Once decisions are logged, route
-//! records sent under the router WRITE lock also take the recorder's own
-//! bookkeeping mutex (held for a table lookup and a `try_send`, never across
-//! I/O); nothing changes for a node that has not enabled candidate logging.
+//! **Cost.** Measured in a release build (40 connected peers, a 25-candidate
+//! window, interleaved scenarios, against `main` at the merge base):
+//! - Candidate logging off, or only the dataset on: no measurable difference
+//!   from `main`, and no recorder mutex is taken (pinned by a test).
+//! - A CAPTURED decision costs about +35% under the router READ lock while
+//!   legacy routes, but about 8x while the hierarchical estimator routes
+//!   (about 45 to 370 µs), because the legacy stack's per-candidate Renegade
+//!   queries then run only for the log. An uncaptured decision costs nothing
+//!   measurable under that lock.
+//! - So at rate `r` the added read-lock time averages about `r` times the
+//!   captured cost: on a hierarchical-routed node about +35% per decision at
+//!   `0.05` but about +7% at `0.01`. **Soaks with
+//!   `FREENET_ROUTING_HIERARCHICAL` on should use a rate of 0.01 or less**;
+//!   legacy-routed nodes tolerate `0.05`.
+//! - Building a record takes about 6 µs after the lock is released, serialising
+//!   it about 23 µs on the writer thread; a line is about 16 KB.
+//! - While capture is active, route records sent under the router WRITE lock
+//!   take the recorder mutex (a table lookup and a `try_send`, never I/O):
+//!   about 0.15 µs uncontended, and at worst about 16 µs p99 / 85 µs max with
+//!   four threads logging decisions flat out, against an `add_event` hold of
+//!   about 1 ms p99. Once capture stops, and for an uncaptured decision none of
+//!   whose selections can be live (a lock-free check), the mutex is not taken.
 //!
 //! **Joining a decision to its outcome.** No identifier is threaded through the
 //! operation, so the join is by value, within one run (split on `start`): a
@@ -270,6 +278,10 @@ pub(crate) const PACE_BURST_BYTES: u64 = 8 * 1024 * 1024;
 /// (see the module doc). An evicted one gets an `expired` line, so eviction
 /// costs data, never correctness.
 pub(crate) const MAX_LIVE_CAPTURED_SELECTIONS: usize = 16_384;
+
+/// Slots in the lock-free membership counters that let an uncaptured decision
+/// skip the recorder mutex when none of its selections can be a live capture.
+const LIVE_SLOTS: usize = 1 << 16;
 
 /// Most candidates written for one decision. Above the default window (25), so
 /// it only binds when an operator widens `consider_n_closest_peers`.
@@ -697,11 +709,29 @@ struct DecisionOrder {
     /// Selections whose most recent decision-kind record was a capture. An
     /// uncaptured decision needs a line only for these: for any other
     /// selection the most recent line is already uncaptured (or absent), so
-    /// the join discards (or never finds) its outcome anyway.
-    live: lru::LruCache<LiveSelection, ()>,
+    /// the join discards (or never finds) its outcome anyway. Built on the
+    /// first capture, so a recorder that never captures allocates nothing.
+    live: Option<lru::LruCache<LiveSelection, ()>>,
+    /// Capacity `live` is built with.
+    live_capacity: usize,
     /// A decision-kind record was lost and no `decisions_dropped` mark has
     /// reached the channel since.
     unmarked_drop: bool,
+}
+
+/// The membership-counter slot of a selection: FNV-1a over op, contract bits
+/// and peer hash.
+fn live_slot(op: &str, contract_bits: u64, peer: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in op
+        .bytes()
+        .chain(contract_bits.to_le_bytes())
+        .chain(peer.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) & (LIVE_SLOTS - 1)
 }
 
 /// Rank of every candidate under one model: a stable sort of distance order by
@@ -903,6 +933,12 @@ pub(crate) struct RoutingDataset {
     /// `order` so a drop mark precedes whatever follows the drop.
     decisions_active: AtomicBool,
     order: parking_lot::Mutex<DecisionOrder>,
+    /// How many live selections hash to each slot, maintained under `order`
+    /// and read without it: a zero means no selection in that slot is live.
+    /// A selection is counted BEFORE its capture reaches the channel and
+    /// uncounted only AFTER its closing line is enqueued, so a lock-free zero
+    /// is always a state some serialised order of the decisions agrees with.
+    live_slots: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>,
 }
 
 impl std::fmt::Debug for RoutingDataset {
@@ -981,12 +1017,11 @@ impl RoutingDataset {
             pace_ms: 0,
             decisions_active: AtomicBool::new(false),
             order: parking_lot::Mutex::new(DecisionOrder {
-                live: lru::LruCache::new(
-                    std::num::NonZeroUsize::new(MAX_LIVE_CAPTURED_SELECTIONS)
-                        .unwrap_or(std::num::NonZeroUsize::MIN),
-                ),
+                live: None,
+                live_capacity: MAX_LIVE_CAPTURED_SELECTIONS,
                 unmarked_drop: false,
             }),
+            live_slots: std::sync::OnceLock::new(),
         };
         (dataset, rx)
     }
@@ -1009,79 +1044,153 @@ impl RoutingDataset {
 
     /// Queue a captured decision, and remember its selected peers as live.
     pub(crate) fn record_decision(&self, record: DecisionRecord) {
-        let selections: Vec<LiveSelection> = record
+        let selections: Vec<(LiveSelection, usize)> = record
             .candidates
             .iter()
             .filter(|candidate| candidate.selected_position.is_some())
             .map(|candidate| {
+                let bits = record.contract_location.to_bits();
                 (
-                    record.op,
-                    record.contract_location.to_bits(),
-                    candidate.peer.clone(),
+                    (record.op, bits, candidate.peer.clone()),
+                    live_slot(record.op, bits, &candidate.peer),
                 )
             })
             .collect();
         self.decisions_active.store(true, Ordering::Relaxed);
+        let counters = self.live_slots.get_or_init(|| {
+            (0..LIVE_SLOTS)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        });
         let mut order = self.order.lock();
-        // A record that cannot be queued is lost before any mark is placed,
-        // so a mark always has a record behind it rather than a second loss.
+        // A record that cannot be queued is lost before any mark is placed, so
+        // no record of any kind is enqueued between a loss and its mark.
         if self.decisions.queued.load(Ordering::Relaxed) >= MAX_QUEUED_DECISIONS
             || !self.mark_drops(&mut order)
         {
             self.lose_decision(&mut order);
             return;
         }
+        let capacity =
+            std::num::NonZeroUsize::new(order.live_capacity).unwrap_or(std::num::NonZeroUsize::MIN);
+        let live = order
+            .live
+            .get_or_insert_with(|| lru::LruCache::new(capacity));
+        // This capture's already-live selections become most recent first, so
+        // the evictions below can never close a selection it just logged.
+        let fresh: Vec<bool> = selections
+            .iter()
+            .map(|(selection, _)| {
+                let known = live.contains(selection);
+                if known {
+                    live.promote(selection);
+                }
+                !known
+            })
+            .collect();
+        // Counted before the record reaches the channel (see `live_slots`).
+        for ((_, slot), fresh) in selections.iter().zip(&fresh) {
+            if *fresh {
+                counters[*slot].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if !self.enqueue_decision(Record::Decision(Box::new(record))) {
+            for ((_, slot), fresh) in selections.iter().zip(&fresh) {
+                if *fresh {
+                    counters[*slot].fetch_sub(1, Ordering::Relaxed);
+                }
+            }
             order.unmarked_drop = true;
             return;
         }
-        for selection in selections {
-            let full = order.live.len() == order.live.cap().get();
-            if full && !order.live.contains(&selection) {
-                if let Some(((op, contract_bits, peer), ())) = order.live.pop_lru() {
-                    let expired = UncapturedDecision {
-                        t_ms: now_ms(),
-                        op,
-                        contract_location: f64::from_bits(contract_bits),
-                        reason: UncapturedReason::Expired,
-                        selected: vec![peer],
-                    };
-                    if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(expired))) {
-                        order.unmarked_drop = true;
-                    }
-                }
+        for ((selection, _), fresh) in selections.into_iter().zip(fresh) {
+            if !fresh {
+                continue;
             }
-            order.live.put(selection, ());
+            let Some(live) = order.live.as_mut() else {
+                break;
+            };
+            let evicted = if live.len() == live.cap().get() {
+                live.pop_lru()
+            } else {
+                None
+            };
+            live.put(selection, ());
+            if let Some(((op, contract_bits, peer), ())) = evicted {
+                let slot = live_slot(op, contract_bits, &peer);
+                let expired = UncapturedDecision {
+                    t_ms: now_ms(),
+                    op,
+                    contract_location: f64::from_bits(contract_bits),
+                    reason: UncapturedReason::Expired,
+                    selected: vec![peer],
+                };
+                if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(expired))) {
+                    order.unmarked_drop = true;
+                }
+                // Uncounted only after its closing line (see `live_slots`).
+                counters[slot].fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Queue an uncaptured decision, but only for its selections that are live
     /// captures: those are the only outcomes it could otherwise mis-join. The
     /// rest write nothing, which is what keeps these lines bounded by the
-    /// number of captures rather than by the decision rate.
+    /// number of captures rather than by the decision rate. When no selection
+    /// can be live, it returns without taking the recorder mutex.
     pub(crate) fn record_uncaptured(&self, mut record: UncapturedDecision) {
-        self.decisions_active.store(true, Ordering::Relaxed);
-        let mut order = self.order.lock();
+        let Some(counters) = self.live_slots.get() else {
+            // Nothing has ever been captured.
+            return;
+        };
         let contract_bits = record.contract_location.to_bits();
-        record.selected.retain(|peer| {
-            order
-                .live
-                .pop(&(record.op, contract_bits, peer.clone()))
-                .is_some()
-        });
+        let slots: Vec<usize> = record
+            .selected
+            .iter()
+            .map(|peer| live_slot(record.op, contract_bits, peer))
+            .collect();
+        if slots
+            .iter()
+            .all(|slot| counters[*slot].load(Ordering::Relaxed) == 0)
+        {
+            return;
+        }
+        let candidates: Vec<(LiveSelection, usize)> = record
+            .selected
+            .iter()
+            .zip(&slots)
+            .map(|(peer, slot)| ((record.op, contract_bits, peer.clone()), *slot))
+            .collect();
+        let mut order = self.order.lock();
+        let Some(live) = order.live.as_mut() else {
+            return;
+        };
+        let mut closed: Vec<usize> = Vec::new();
+        record.selected = candidates
+            .into_iter()
+            .filter_map(|(selection, slot)| {
+                live.pop(&selection).map(|()| {
+                    closed.push(slot);
+                    selection.2
+                })
+            })
+            .collect();
         if record.selected.is_empty() {
             return;
         }
-        // A record that cannot be queued is lost before any mark is placed,
-        // so a mark always has a record behind it rather than a second loss.
+        // A record that cannot be queued is lost before any mark is placed, so
+        // no record of any kind is enqueued between a loss and its mark.
         if self.decisions.queued.load(Ordering::Relaxed) >= MAX_QUEUED_DECISIONS
             || !self.mark_drops(&mut order)
         {
             self.lose_decision(&mut order);
-            return;
-        }
-        if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(record))) {
+        } else if !self.enqueue_decision(Record::DecisionUncaptured(Box::new(record))) {
             order.unmarked_drop = true;
+        }
+        // Uncounted only after the closing line, or its loss mark, is decided.
+        for slot in closed {
+            counters[slot].fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -1143,7 +1252,11 @@ impl RoutingDataset {
         // Once decisions are being logged, a pending drop mark must reach the
         // channel before this record, or the record is lost with it: a route
         // line ahead of the mark would let its outcome join across the gap.
-        if self.decisions_active.load(Ordering::Relaxed) {
+        // Once capture has stopped, nothing after this point can join (the
+        // `decisions_truncated` line precedes it), so no mark is needed.
+        if self.decisions_active.load(Ordering::Relaxed)
+            && !self.decisions.stopped.load(Ordering::Relaxed)
+        {
             let mut order = self.order.lock();
             if !self.mark_drops(&mut order) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1236,7 +1349,10 @@ impl Writer {
         decisions: &DecisionState,
     ) -> Result<(), WriteError> {
         if decisions.stopped.load(Ordering::Relaxed) {
-            decisions.dropped.fetch_add(1, Ordering::Relaxed);
+            // A drop mark is not a decision: after the stop it is simply moot.
+            if !matches!(line, Line::DecisionsDropped { .. }) {
+                decisions.dropped.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
         let Some(bytes) = encode(line) else {
@@ -2757,6 +2873,312 @@ mod tests {
         );
     }
 
+    /// A recorder whose writer is driven by hand, so a test can fill the
+    /// channel, lose records and drain in a chosen order.
+    struct Manual {
+        dataset: RoutingDataset,
+        rx: Receiver<Record>,
+        writer: Writer,
+        dropped: AtomicU64,
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Manual {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("routing.jsonl");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let (dataset, rx) = RoutingDataset::unstarted();
+            Manual {
+                dataset,
+                rx,
+                writer: Writer {
+                    out: BufWriter::new(file),
+                    written: 0,
+                    max_bytes: u64::MAX,
+                    reported_dropped: 0,
+                    decision_limit: u64::MAX,
+                    decision_written: 0,
+                },
+                dropped: AtomicU64::new(0),
+                path,
+                _dir: dir,
+            }
+        }
+
+        fn drain(&mut self) {
+            for record in self.rx.try_iter() {
+                let record = taken(record, &self.dataset.decisions);
+                assert!(
+                    self.writer
+                        .record(&record, &self.dropped, &self.dataset.decisions)
+                        .is_ok()
+                );
+            }
+            assert!(self.writer.flush().is_ok());
+        }
+
+        /// Leave exactly `free` slots in the (drained) channel.
+        fn fill_leaving(&self, free: usize) {
+            for _ in 0..CHANNEL_CAPACITY - free {
+                self.dataset.record_route(route("0000000000000001"));
+            }
+        }
+
+        /// Lose one decision record to the queue bound, without using the
+        /// channel, leaving a mark pending.
+        fn lose_one(&self, peers: &[PeerKeyLocation]) {
+            let queued = &self.dataset.decisions.queued;
+            let before = queued.swap(MAX_QUEUED_DECISIONS, Ordering::Relaxed);
+            self.dataset
+                .record_decision(selecting(peers, &[peers.len() - 1]));
+            queued.store(before, Ordering::Relaxed);
+        }
+
+        /// Kinds of the last `n` lines.
+        fn tail(&self, n: usize) -> Vec<String> {
+            let lines = read_lines(&self.path);
+            lines[lines.len().saturating_sub(n)..]
+                .iter()
+                .map(|line| line["kind"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    /// A closing line lost AFTER its selection left the live table must still
+    /// be marked, or the next route for that selection joins the old capture.
+    #[test]
+    fn a_lost_uncaptured_line_is_marked() {
+        let mut m = Manual::new();
+        let peers = peers(2);
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.drain();
+        let queued = &m.dataset.decisions.queued;
+        queued.store(MAX_QUEUED_DECISIONS, Ordering::Relaxed);
+        m.dataset.record_uncaptured(uncaptured(&[&peers[0]]));
+        queued.store(0, Ordering::Relaxed);
+        m.dataset.record_route(route("00000000000000aa"));
+        m.drain();
+        assert_eq!(m.tail(3), ["decision", "decisions_dropped", "route"]);
+    }
+
+    /// A mark can take the last channel slot and leave the record behind it
+    /// refused: that second loss needs a mark of its own.
+    #[test]
+    fn a_decision_refused_after_its_mark_is_marked_again() {
+        let mut m = Manual::new();
+        let peers = peers(2);
+        m.fill_leaving(1);
+        m.lose_one(&peers);
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.drain();
+        m.dataset.record_route(route("00000000000000aa"));
+        m.drain();
+        assert_eq!(
+            m.tail(3),
+            ["decisions_dropped", "decisions_dropped", "route"]
+        );
+        assert_eq!(kinds_of(&read_lines(&m.path), "decision"), 0);
+    }
+
+    #[test]
+    fn an_uncaptured_line_refused_after_its_mark_is_marked_again() {
+        let mut m = Manual::new();
+        let peers = peers(2);
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.drain();
+        m.fill_leaving(1);
+        m.lose_one(&peers);
+        m.dataset.record_uncaptured(uncaptured(&[&peers[0]]));
+        m.drain();
+        m.dataset.record_route(route("00000000000000aa"));
+        m.drain();
+        assert_eq!(
+            m.tail(3),
+            ["decisions_dropped", "decisions_dropped", "route"]
+        );
+        assert_eq!(kinds_of(&read_lines(&m.path), "decision_uncaptured"), 0);
+    }
+
+    #[test]
+    fn a_refused_expired_line_is_marked() {
+        let mut m = Manual::new();
+        let peers = peers(3);
+        m.dataset.order.lock().live_capacity = 2;
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.dataset.record_decision(selecting(&peers, &[1]));
+        m.drain();
+        m.fill_leaving(1);
+        // Takes the last slot; closing the evicted selection is refused.
+        m.dataset.record_decision(selecting(&peers, &[2]));
+        m.drain();
+        m.dataset.record_route(route("00000000000000aa"));
+        m.drain();
+        assert_eq!(m.tail(3), ["decision", "decisions_dropped", "route"]);
+        assert_eq!(kinds_of(&read_lines(&m.path), "decision_uncaptured"), 0);
+    }
+
+    /// A multi-peer capture must not evict, and so close, a selection it has
+    /// just logged itself.
+    #[test]
+    fn eviction_never_closes_a_selection_of_the_capture_being_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let peers = peers(3);
+        run_records(
+            &path,
+            Limits {
+                max_bytes: DEFAULT_MAX_BYTES,
+                decision_max_bytes: DEFAULT_CANDIDATES_MAX_BYTES,
+            },
+            |dataset| {
+                dataset.order.lock().live_capacity = 2;
+                dataset.record_decision(selecting(&peers, &[0]));
+                dataset.record_decision(selecting(&peers, &[1]));
+                // Peer 0 is the least recently captured, but this capture
+                // selects it again.
+                dataset.record_decision(selecting(&peers, &[2, 0]));
+            },
+        );
+        let lines = read_lines(&path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision",
+                "decision",
+                "decision_uncaptured"
+            ]
+        );
+        assert_eq!(lines[4]["reason"], "expired");
+        assert_eq!(
+            lines[4]["selected"],
+            serde_json::json!([peer_hash(&peers[1])])
+        );
+    }
+
+    /// A drop mark reaching the writer after capture stopped is moot, not a
+    /// lost decision.
+    #[test]
+    fn a_mark_after_capture_stopped_is_not_a_lost_decision() {
+        let mut m = Manual::new();
+        m.dataset.decisions.stopped.store(true, Ordering::Relaxed);
+        let decisions = &m.dataset.decisions;
+        assert!(
+            m.writer
+                .record(
+                    &Record::DecisionsDropped { t_ms: 1, total: 7 },
+                    &m.dropped,
+                    decisions
+                )
+                .is_ok()
+        );
+        assert_eq!(decisions.dropped.load(Ordering::Relaxed), 0);
+        let peers = peers(1);
+        assert!(
+            m.writer
+                .record(
+                    &Record::Decision(Box::new(decision(&peers))),
+                    &m.dropped,
+                    decisions
+                )
+                .is_ok()
+        );
+        assert_eq!(decisions.dropped.load(Ordering::Relaxed), 1);
+    }
+
+    /// Whether `f` returns while this thread holds the recorder mutex, i.e.
+    /// whether it runs without taking it.
+    fn runs_without_the_mutex(
+        dataset: &Arc<RoutingDataset>,
+        f: impl FnOnce(&RoutingDataset) + Send + 'static,
+    ) -> bool {
+        let guard = dataset.order.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = dataset.clone();
+        let worker = std::thread::spawn(move || {
+            f(&shared);
+            // The receiver may have timed out and gone; that is the answer.
+            tx.send(()).ok();
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(guard);
+        worker.join().unwrap();
+        returned
+    }
+
+    /// Candidate logging off, or only the dataset on: nothing may take the
+    /// recorder mutex or build the live table.
+    #[test]
+    fn the_dataset_alone_never_takes_the_decision_machinery() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder =
+            Arc::new(RoutingDataset::open(&dir.path().join("r.jsonl"), DEFAULT_MAX_BYTES).unwrap());
+        let peers = peers(1);
+        let peer = peers[0].clone();
+        assert!(runs_without_the_mutex(&recorder, |r| r.record_route(route("00000000000000aa"))));
+        assert!(runs_without_the_mutex(&recorder, |r| r.record_peers(1, Vec::new())));
+        // With nothing captured an uncaptured decision has nothing to close.
+        assert!(runs_without_the_mutex(&recorder, move |r| r
+            .record_uncaptured(uncaptured(&[&peer]))));
+        {
+            let _off = force_candidate_log(recorder.clone(), 0.0);
+            record_bypass(
+                crate::node::network_status::OpType::Get,
+                crate::ring::Location::new(0.5),
+                &peers[0],
+                UncapturedReason::BootstrapGateway,
+            );
+            assert!(candidate_log(tokio::time::Instant::now).is_none());
+        }
+        assert!(!recorder.decisions_active.load(Ordering::Relaxed));
+        assert!(
+            recorder.live_slots.get().is_none(),
+            "no membership counters allocated"
+        );
+        assert!(
+            recorder.order.lock().live.is_none(),
+            "no live table allocated"
+        );
+    }
+
+    /// The steady state at a low sampling rate: most decisions are uncaptured
+    /// and select nothing live, and they must not contend for the mutex; nor
+    /// may route sends once capture has stopped.
+    #[test]
+    fn uncaptured_decisions_and_late_route_sends_skip_the_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder =
+            Arc::new(RoutingDataset::open(&dir.path().join("r.jsonl"), DEFAULT_MAX_BYTES).unwrap());
+        let peers = peers(3);
+        recorder.record_decision(selecting(&peers, &[0]));
+        let other = peers[1].clone();
+        assert!(
+            runs_without_the_mutex(&recorder, move |r| r
+                .record_uncaptured(uncaptured(&[&other]))),
+            "a selection that is not live needs no lock"
+        );
+        let live = peers[0].clone();
+        assert!(
+            !runs_without_the_mutex(&recorder, move |r| r
+                .record_uncaptured(uncaptured(&[&live]))),
+            "a live selection does take it (the check is not vacuous)"
+        );
+        assert!(!runs_without_the_mutex(&recorder, |r| r.record_route(route("00000000000000aa"))));
+        recorder.decisions.stopped.store(true, Ordering::Relaxed);
+        assert!(
+            runs_without_the_mutex(&recorder, |r| r.record_route(route("00000000000000bb"))),
+            "after capture stops, route sends are lock-free again"
+        );
+    }
+
     /// Decision lines must never be able to stop the route recording they
     /// enrich — nor, through `is_recording`, the hierarchical estimator that is
     /// computed only while the recorder records.
@@ -2829,8 +3251,7 @@ mod tests {
                 decision_max_bytes: DEFAULT_CANDIDATES_MAX_BYTES,
             },
             |dataset| {
-                dataset.order.lock().live =
-                    lru::LruCache::new(std::num::NonZeroUsize::new(2).unwrap());
+                dataset.order.lock().live_capacity = 2;
                 for index in 0..3 {
                     dataset.record_decision(selecting(&peers, &[index]));
                 }

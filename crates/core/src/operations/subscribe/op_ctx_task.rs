@@ -4273,8 +4273,14 @@ mod route_attempt_driver_tests {
                 is_response: true,
             },
         );
+        // The consulted host becomes a live capture once the relay's own
+        // selection (which lists it as an alternative, and so closes any
+        // earlier capture of it) is logged: the consult must then close it.
+        let (recorder, _dir, path) = crate::ring::candidate_log_wiring_tests::recorder();
+        let _log = crate::router::dataset::force_candidate_log(recorder.clone(), 1.0);
         let targets = Arc::new(Mutex::new(Vec::new()));
         let seen = targets.clone();
+        let (live_recorder, live_host) = (recorder.clone(), host.clone());
         serve_attempts(
             op_manager.clone(),
             rx,
@@ -4289,6 +4295,13 @@ mod route_attempt_driver_tests {
                 let mut seen = seen.lock();
                 seen.push(target);
                 let answer = if seen.len() == 1 {
+                    live_recorder.record_decision(
+                        crate::ring::candidate_log_wiring_tests::live_capture(
+                            &live_host,
+                            crate::node::network_status::OpType::Subscribe,
+                            crate::ring::Location::from(&instance_id),
+                        ),
+                    );
                     Answer::Reply(not_found(msg, instance_id))
                 } else {
                     Answer::Reply(subscribed(msg, instance_id))
@@ -4314,6 +4327,18 @@ mod route_attempt_driver_tests {
         );
         let failures = failed_addrs(&op_manager);
         assert!(failures.is_empty(), "{label}: {failures:?}");
+        let lines =
+            crate::ring::candidate_log_wiring_tests::lines_through_sentinel(&recorder, &path);
+        let consults: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["reason"] == "terminal_consult")
+            .collect();
+        assert_eq!(consults.len(), 1, "{lines:?}");
+        assert_eq!(consults[0]["op"], "SUBSCRIBE");
+        assert_eq!(
+            consults[0]["selected"],
+            serde_json::json!([crate::router::dataset::peer_hash(&host)])
+        );
     }
 
     fn subscribed(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {

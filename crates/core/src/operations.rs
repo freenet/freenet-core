@@ -1769,9 +1769,16 @@ mod terminal_consult_tests {
 /// are not (`Unlogged`), and which routes bypass ring selection
 /// (`record_bypass`) decide whether a replay can join an outcome to the decision
 /// that produced it. A wrong classification fails nothing at runtime: outcomes
-/// silently join the wrong decision. The GET sites also have a behavioural test
-/// (`get::op_ctx_task::candidate_log_call_site_tests`); these pins cover every
-/// site, and fail when a site is added without being classified here.
+/// silently join the wrong decision, and `Unlogged` is not a safe default (a
+/// routing decision wrongly left unlogged lets its outcome join an older
+/// capture). The GET sites also have a behavioural test
+/// (`get::op_ctx_task::candidate_log_call_site_tests`).
+///
+/// The pins read code only: comments, string and char literal contents, and
+/// `#[cfg(test)]` modules are removed first, and identifiers are matched by
+/// suffix so an imported short path counts the same as a full one. Every
+/// selection call in a file must be in the table, with its log argument
+/// classified.
 #[cfg(test)]
 mod routing_dataset_call_site_pins {
     const GET: &str = include_str!("operations/get/op_ctx_task.rs");
@@ -1780,89 +1787,208 @@ mod routing_dataset_call_site_pins {
     const SUBSCRIBE: &str = include_str!("operations/subscribe.rs");
     const UPDATE: &str = include_str!("operations/update/op_ctx_task.rs");
 
-    /// Production code only: everything before the file's first test module,
-    /// with `//` comments removed (so a commented-out call does not count) and
-    /// all whitespace removed (so rustfmt's line breaks do not matter).
+    const SELECTION: &str = "closest_potentially_hosting(";
+    const JOINABLE: &str = "DecisionLog::Joinable(";
+    const UNLOGGED: &str = "DecisionLog::Unlogged";
+    const BYPASS: &str = "record_bypass(";
+
+    /// Code with comments removed and string / char literal contents emptied,
+    /// newlines kept. Raw strings, escapes, nested block comments and
+    /// lifetimes are handled.
+    fn mask(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if c == b'r'
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+            {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'"') {
+                    out.push('r');
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                loop {
+                    if j >= b.len() {
+                        break;
+                    }
+                    if b[j] == b'"'
+                        && b[j + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|x| **x == b'#')
+                            .count()
+                            == hashes
+                    {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j;
+            } else if c == b'"' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j + 1;
+            } else if c == b'\'' {
+                // A char literal ('x', '\n', '\u{..}'), otherwise a lifetime.
+                if b.get(i + 1) == Some(&b'\\') {
+                    let mut j = i + 2;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    out.push_str("' '");
+                    i = j + 1;
+                } else if b.get(i + 2) == Some(&b'\'') {
+                    out.push_str("' '");
+                    i += 3;
+                } else {
+                    out.push('\'');
+                    i += 1;
+                }
+            } else {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The index of the brace closing the one opened at `open`.
+    fn matching_brace(code: &str, open: usize) -> usize {
+        let mut depth = 0;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// Masked production code: `#[cfg(test)] mod name;` and
+    /// `#[cfg(test)] mod name { .. }` removed wherever they appear.
     fn production(src: &str) -> String {
-        let end = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
-        squash(&src[..end])
+        let mut code = mask(src);
+        while let Some(at) = code.find("#[cfg(test)]") {
+            let rest = &code[at..];
+            let item = rest["#[cfg(test)]".len()..].trim_start();
+            let item_at = code.len() - item.len();
+            let end = if item.starts_with("mod ") || item.starts_with("pub(crate) mod ") {
+                let semi = item.find(';');
+                let brace = item.find('{');
+                match (semi, brace) {
+                    (Some(semi), Some(brace)) if semi < brace => item_at + semi + 1,
+                    (Some(semi), None) => item_at + semi + 1,
+                    (_, Some(brace)) => matching_brace(&code, item_at + brace) + 1,
+                    (None, None) => panic!("malformed test module"),
+                }
+            } else {
+                // Some other test-only item: remove just the attribute.
+                at + "#[cfg(test)]".len()
+            };
+            code.replace_range(at..end, "");
+        }
+        code
     }
 
-    /// The body of the one function called `name` in `src`'s production code,
-    /// from its signature to its closing brace at the signature's indentation.
-    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
-        let end_of_production = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
-        let production = &src[..end_of_production];
-        // `fn name(` or a generic `fn name<`.
-        let signatures: Vec<usize> = production
-            .match_indices(&format!("fn {name}"))
-            .map(|(at, _)| at)
-            .filter(|&at| {
-                matches!(
-                    production[at + 3 + name.len()..].chars().next(),
-                    Some('(') | Some('<')
-                )
-            })
-            .filter(|&at| {
-                let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
-                let prefix = production[line_start..at].trim_start();
-                prefix.is_empty() || prefix.ends_with("async ") || prefix.starts_with("pub")
-            })
-            .collect();
-        assert_eq!(signatures.len(), 1, "exactly one production `fn {name}(`");
-        let at = signatures[0];
-        let line_start = production[..at].rfind('\n').map_or(0, |n| n + 1);
-        let indent: String = production[line_start..]
-            .chars()
-            .take_while(|c| *c == ' ')
-            .collect();
-        let close = format!("\n{indent}}}\n");
-        let end = production[at..]
-            .find(&close)
-            .unwrap_or_else(|| panic!("no closing brace for `fn {name}(`"));
-        &production[at..at + end]
-    }
-
-    /// Comments and whitespace removed, and rustfmt's trailing commas before a
-    /// closing parenthesis, so a call reads the same however it was wrapped.
     fn squash(code: &str) -> String {
-        code.lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+        code.chars()
+            .filter(|c| !c.is_whitespace())
             .collect::<String>()
             .replace(",)", ")")
     }
 
-    const JOINABLE: &str = "crate::router::dataset::DecisionLog::Joinable(";
-    const UNLOGGED: &str = "crate::router::dataset::DecisionLog::Unlogged";
-    const BYPASS: &str = "crate::router::dataset::record_bypass(";
-
-    fn joinable(op: &str) -> String {
-        format!("{JOINABLE}crate::node::network_status::OpType::{op})")
+    /// The body of the one production function called `name`.
+    fn fn_body(production: &str, name: &str) -> String {
+        let signatures: Vec<usize> = production
+            .match_indices(&format!("fn {name}"))
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                let before_ok = at == 0 || !production.as_bytes()[at - 1].is_ascii_alphanumeric();
+                let next = production[at + 3 + name.len()..].chars().next();
+                before_ok && matches!(next, Some('(') | Some('<'))
+            })
+            .collect();
+        assert_eq!(signatures.len(), 1, "exactly one production `fn {name}`");
+        let open = signatures[0] + production[signatures[0]..].find('{').unwrap();
+        squash(&production[open..=matching_brace(production, open)])
     }
 
-    fn reason(name: &str) -> String {
-        // The last argument of `record_bypass(..)`.
-        format!("crate::router::dataset::UncapturedReason::{name})")
+    /// `Joinable(..)` arguments naming `op`.
+    fn joinable_for(code: &str, op: &str) -> usize {
+        code.match_indices(JOINABLE)
+            .filter(|(at, _)| {
+                let argument = &code[at + JOINABLE.len()..];
+                let argument = &argument[..argument.find(')').unwrap_or(argument.len())];
+                argument.ends_with(&format!("OpType::{op}"))
+            })
+            .count()
     }
 
     struct Site {
         name: &'static str,
-        /// `Joinable(op)` arguments.
+        selections: usize,
         joinable: usize,
         unlogged: usize,
-        /// `record_bypass` calls, by reason.
         bypasses: &'static [&'static str],
     }
 
     const fn site(
         name: &'static str,
+        selections: usize,
         joinable: usize,
         unlogged: usize,
         bypasses: &'static [&'static str],
     ) -> Site {
         Site {
             name,
+            selections,
             joinable,
             unlogged,
             bypasses,
@@ -1870,18 +1996,24 @@ mod routing_dataset_call_site_pins {
     }
 
     fn check(file: &str, src: &str, op: &str, sites: &[Site]) {
+        let production = production(src);
         for site in sites {
-            let body = squash(fn_body(src, site.name));
+            let body = fn_body(&production, site.name);
             let context = format!("{file}::{}", site.name);
             assert_eq!(
-                body.matches(&joinable(op)).count(),
+                body.matches(SELECTION).count(),
+                site.selections,
+                "{context}: selections"
+            );
+            assert_eq!(
+                joinable_for(&body, op),
                 site.joinable,
-                "{context}: Joinable({op}) selections"
+                "{context}: Joinable({op})"
             );
             assert_eq!(
                 body.matches(JOINABLE).count(),
                 site.joinable,
-                "{context}: every Joinable selection is for {op}"
+                "{context}: Joinable of another op"
             );
             assert_eq!(
                 body.matches(UNLOGGED).count(),
@@ -1893,26 +2025,44 @@ mod routing_dataset_call_site_pins {
                 site.bypasses.len(),
                 "{context}: bypass lines"
             );
-            for name in site.bypasses {
+            for reason in site.bypasses {
                 assert!(
-                    body.contains(&reason(name)),
-                    "{context}: bypass reason {name}"
+                    body.contains(&format!("UncapturedReason::{reason})")),
+                    "{context}: bypass reason {reason}"
                 );
             }
         }
-        // Every classified site in the file is in the table above.
-        let whole = production(src);
-        let expect = |f: fn(&Site) -> usize| sites.iter().map(f).sum::<usize>();
+        let whole = squash(&production);
+        let total = |f: fn(&Site) -> usize| sites.iter().map(f).sum::<usize>();
+        assert_eq!(
+            whole.matches(SELECTION).count(),
+            total(|s| s.selections),
+            "{file}: a selection call outside the table"
+        );
         assert_eq!(
             whole.matches(JOINABLE).count(),
-            expect(|s| s.joinable),
-            "{file}: a Joinable site missing from the table"
+            total(|s| s.joinable),
+            "{file}: a Joinable outside the table"
+        );
+        assert_eq!(
+            whole.matches(UNLOGGED).count(),
+            total(|s| s.unlogged),
+            "{file}: an Unlogged outside the table"
         );
         assert_eq!(
             whole.matches(BYPASS).count(),
-            expect(|s| s.bypasses.len()),
-            "{file}: a bypass site missing from the table"
+            total(|s| s.bypasses.len()),
+            "{file}: a bypass outside the table"
         );
+        // Every selection call states how it logs, as its first argument.
+        for (at, _) in whole.match_indices(SELECTION) {
+            let argument = &whole[at + SELECTION.len()..];
+            let argument = &argument[..argument.find(',').unwrap_or(argument.len())];
+            assert!(
+                argument.contains(JOINABLE) || argument.ends_with(UNLOGGED) || argument == "log_as",
+                "{file}: selection with unclassified log argument `{argument}`"
+            );
+        }
     }
 
     #[test]
@@ -1922,18 +2072,19 @@ mod routing_dataset_call_site_pins {
             GET,
             "Get",
             &[
-                site("drive_client_get_inner", 0, 1, &[]),
-                site("fallback_target", 0, 1, &[]),
-                site("advance_to_next_peer", 0, 1, &[]),
-                site("drive_sub_op_get", 0, 1, &[]),
-                site("first_hop_candidate", 0, 1, &[]),
+                site("drive_client_get_inner", 1, 0, 1, &[]),
+                site("fallback_target", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("first_hop_candidate", 1, 0, 1, &[]),
                 site(
                     "relay_advance_to_next_peer",
+                    1,
                     1,
                     0,
                     &["PinnedFirstHop", "BootstrapGateway"],
                 ),
-                site("drive_relay_get_inner", 0, 0, &["TerminalConsult"]),
+                site("drive_relay_get_inner", 0, 0, 0, &["TerminalConsult"]),
             ],
         );
     }
@@ -1945,12 +2096,12 @@ mod routing_dataset_call_site_pins {
             PUT,
             "Put",
             &[
-                site("drive_client_put_inner", 0, 1, &[]),
-                site("advance_to_next_peer", 0, 1, &[]),
-                site("drive_relay_put", 1, 0, &["BootstrapGateway"]),
-                site("drive_relay_put_streaming", 1, 0, &["BootstrapGateway"]),
-                site("drive_relay_probe", 0, 1, &[]),
-                site("drive_relay_probe_reconcile", 0, 1, &[]),
+                site("drive_client_put_inner", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_relay_put", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_put_streaming", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_probe", 1, 0, 1, &[]),
+                site("drive_relay_probe_reconcile", 1, 0, 1, &[]),
             ],
         );
     }
@@ -1962,10 +2113,12 @@ mod routing_dataset_call_site_pins {
             SUBSCRIBE_DRIVER,
             "Subscribe",
             &[
-                site("run_executor_subscribe", 0, 1, &[]),
-                site("drive_client_subscribe_inner", 1, 0, &[]),
-                site("advance_to_next_peer", 1, 0, &[]),
-                site("drive_relay_subscribe", 1, 0, &["TerminalConsult"]),
+                // The pre-check's `Unlogged` is its argument to
+                // `prepare_initial_request`.
+                site("run_executor_subscribe", 0, 0, 1, &[]),
+                site("drive_client_subscribe_inner", 0, 1, 0, &[]),
+                site("advance_to_next_peer", 1, 1, 0, &[]),
+                site("drive_relay_subscribe", 1, 1, 0, &["TerminalConsult"]),
             ],
         );
         check(
@@ -1974,6 +2127,7 @@ mod routing_dataset_call_site_pins {
             "Subscribe",
             &[site(
                 "prepare_initial_request",
+                1,
                 0,
                 // The three bypass guards compare against `Unlogged`.
                 3,
@@ -1984,13 +2138,13 @@ mod routing_dataset_call_site_pins {
                 ],
             )],
         );
-        // The selection logs as its caller says, and a pre-check writes no
-        // bypass lines either.
-        let body = squash(fn_body(SUBSCRIBE, "prepare_initial_request"));
-        assert!(body.contains("k_closest_potentially_hosting(log_as,"));
+        let body = fn_body(&production(SUBSCRIBE), "prepare_initial_request");
+        assert!(body.contains(&format!("{SELECTION}log_as,")));
         assert_eq!(
-            body.matches(&format!("iflog_as!={UNLOGGED}{{{BYPASS}"))
-                .count(),
+            body.matches(&format!(
+                "iflog_as!=crate::router::dataset::{UNLOGGED}{{crate::router::dataset::{BYPASS}"
+            ))
+            .count(),
             3,
             "every bypass is skipped for a pre-check"
         );
@@ -2003,9 +2157,41 @@ mod routing_dataset_call_site_pins {
             UPDATE,
             "Update",
             &[
-                site("drive_client_update", 0, 1, &[]),
-                site("drive_relay_request_update", 0, 2, &[]),
+                site("drive_client_update", 1, 0, 1, &[]),
+                site("drive_relay_request_update", 2, 0, 2, &[]),
             ],
         );
+    }
+
+    /// The masking the pins rely on: comments, literals and test modules do
+    /// not count, and production code after a `mod tests;` does.
+    #[test]
+    fn the_pins_read_code_only() {
+        let src = r#"
+fn a() {
+    // x.closest_potentially_hosting(DecisionLog::Unlogged, k)
+    /* x.closest_potentially_hosting(DecisionLog::Unlogged, k) /* nested */ */
+    let s = "closest_potentially_hosting(";
+    let c = '{';
+    y.closest_potentially_hosting(DecisionLog::Joinable(OpType::Get), k); // record_bypass(
+}
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod more {
+    fn b() { z.closest_potentially_hosting(DecisionLog::Unlogged, k); }
+}
+fn c<'a>(x: &'a str) { record_bypass(o, l, p, UncapturedReason::TerminalConsult); }
+"#;
+        let code = squash(&production(src));
+        assert_eq!(code.matches(SELECTION).count(), 1);
+        assert_eq!(code.matches(UNLOGGED).count(), 0);
+        assert_eq!(joinable_for(&code, "Get"), 1);
+        assert_eq!(
+            code.matches(BYPASS).count(),
+            1,
+            "code after `mod tests;` is production"
+        );
+        assert_eq!(fn_body(&production(src), "c").matches(BYPASS).count(), 1);
     }
 }
