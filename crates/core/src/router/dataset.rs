@@ -939,6 +939,10 @@ pub(crate) struct RoutingDataset {
     /// uncounted only AFTER its closing line is enqueued, so a lock-free zero
     /// is always a state some serialised order of the decisions agrees with.
     live_slots: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>,
+    /// Times `order` has been locked, so tests can tell deterministically
+    /// whether a call took it.
+    #[cfg(test)]
+    order_locks: AtomicU64,
 }
 
 impl std::fmt::Debug for RoutingDataset {
@@ -1022,6 +1026,8 @@ impl RoutingDataset {
                 unmarked_drop: false,
             }),
             live_slots: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            order_locks: AtomicU64::new(0),
         };
         (dataset, rx)
     }
@@ -1056,13 +1062,18 @@ impl RoutingDataset {
                 )
             })
             .collect();
+        // A peer listed twice is one selection: counting it twice would leak a
+        // count and evict an unrelated capture.
+        let mut selections = selections;
+        let mut seen = std::collections::HashSet::new();
+        selections.retain(|(selection, _)| seen.insert(selection.clone()));
         self.decisions_active.store(true, Ordering::Relaxed);
         let counters = self.live_slots.get_or_init(|| {
             (0..LIVE_SLOTS)
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect()
         });
-        let mut order = self.order.lock();
+        let mut order = self.lock_order();
         // A record that cannot be queued is lost before any mark is placed, so
         // no record of any kind is enqueued between a loss and its mark.
         if self.decisions.queued.load(Ordering::Relaxed) >= MAX_QUEUED_DECISIONS
@@ -1076,8 +1087,16 @@ impl RoutingDataset {
         let live = order
             .live
             .get_or_insert_with(|| lru::LruCache::new(capacity));
-        // This capture's already-live selections become most recent first, so
-        // the evictions below can never close a selection it just logged.
+        // The table always holds at least one whole capture, so the evictions
+        // below only ever take entries older than this capture's selections.
+        if let Some(needed) = std::num::NonZeroUsize::new(selections.len()) {
+            if live.cap() < needed {
+                live.resize(needed);
+            }
+        }
+        // This capture's already-live selections become most recent first; with
+        // the capacity above, the evictions below can then never close a
+        // selection this capture logs.
         let fresh: Vec<bool> = selections
             .iter()
             .map(|(selection, _)| {
@@ -1162,7 +1181,7 @@ impl RoutingDataset {
             .zip(&slots)
             .map(|(peer, slot)| ((record.op, contract_bits, peer.clone()), *slot))
             .collect();
-        let mut order = self.order.lock();
+        let mut order = self.lock_order();
         let Some(live) = order.live.as_mut() else {
             return;
         };
@@ -1202,6 +1221,35 @@ impl RoutingDataset {
         let limit = self.decisions.limit.load(Ordering::Relaxed);
         self.decisions.written.load(Ordering::Relaxed)
             < paced_allowance(limit, elapsed, self.pace_ms)
+    }
+
+    fn lock_order(&self) -> parking_lot::MutexGuard<'_, DecisionOrder> {
+        #[cfg(test)]
+        self.order_locks.fetch_add(1, Ordering::Relaxed);
+        self.order.lock()
+    }
+
+    /// Test-only: the membership counters agree with the live table, i.e.
+    /// every live selection is counted exactly once and nothing else is.
+    #[cfg(test)]
+    fn assert_counters_match_live(&self) {
+        let order = self.order.lock();
+        let live = order.live.as_ref().map_or(0, |live| live.len());
+        let counted: u64 = self.live_slots.get().map_or(0, |slots| {
+            slots
+                .iter()
+                .map(|slot| u64::from(slot.load(Ordering::Relaxed)))
+                .sum()
+        });
+        assert_eq!(counted, live as u64, "membership counters vs live table");
+        if let (Some(live), Some(slots)) = (order.live.as_ref(), self.live_slots.get()) {
+            for ((op, bits, peer), ()) in live.iter() {
+                assert!(
+                    slots[live_slot(op, *bits, peer)].load(Ordering::Relaxed) > 0,
+                    "a live selection reads as a zero"
+                );
+            }
+        }
     }
 
     /// Put a `decisions_dropped` mark in the channel if a loss is unmarked.
@@ -1257,7 +1305,7 @@ impl RoutingDataset {
         if self.decisions_active.load(Ordering::Relaxed)
             && !self.decisions.stopped.load(Ordering::Relaxed)
         {
-            let mut order = self.order.lock();
+            let mut order = self.lock_order();
             if !self.mark_drops(&mut order) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -3094,24 +3142,12 @@ mod tests {
         assert_eq!(decisions.dropped.load(Ordering::Relaxed), 1);
     }
 
-    /// Whether `f` returns while this thread holds the recorder mutex, i.e.
-    /// whether it runs without taking it.
-    fn runs_without_the_mutex(
-        dataset: &Arc<RoutingDataset>,
-        f: impl FnOnce(&RoutingDataset) + Send + 'static,
-    ) -> bool {
-        let guard = dataset.order.lock();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let shared = dataset.clone();
-        let worker = std::thread::spawn(move || {
-            f(&shared);
-            // The receiver may have timed out and gone; that is the answer.
-            tx.send(()).ok();
-        });
-        let returned = rx.recv_timeout(Duration::from_secs(2)).is_ok();
-        drop(guard);
-        worker.join().unwrap();
-        returned
+    /// Whether `f` ran without locking the recorder mutex: counted, not timed,
+    /// so it cannot flake on a loaded machine or pass for the wrong reason.
+    fn runs_without_the_mutex(dataset: &RoutingDataset, f: impl FnOnce(&RoutingDataset)) -> bool {
+        let before = dataset.order_locks.load(Ordering::Relaxed);
+        f(dataset);
+        dataset.order_locks.load(Ordering::Relaxed) == before
     }
 
     /// Candidate logging off, or only the dataset on: nothing may take the
@@ -3171,11 +3207,136 @@ mod tests {
                 .record_uncaptured(uncaptured(&[&live]))),
             "a live selection does take it (the check is not vacuous)"
         );
+        let closed = peers[0].clone();
+        assert!(
+            runs_without_the_mutex(&recorder, move |r| r
+                .record_uncaptured(uncaptured(&[&closed]))),
+            "once closed, the selection is no longer live"
+        );
         assert!(!runs_without_the_mutex(&recorder, |r| r.record_route(route("00000000000000aa"))));
         recorder.decisions.stopped.store(true, Ordering::Relaxed);
         assert!(
             runs_without_the_mutex(&recorder, |r| r.record_route(route("00000000000000bb"))),
             "after capture stops, route sends are lock-free again"
+        );
+    }
+
+    /// A capture whose record lists `peer` twice.
+    fn selecting_twice(peers: &[PeerKeyLocation], index: usize) -> DecisionRecord {
+        let mut record = selecting(peers, &[index]);
+        let mut again = record
+            .candidates
+            .iter()
+            .find(|c| c.selected_position == Some(0))
+            .unwrap()
+            .clone();
+        again.selected_position = Some(1);
+        record.candidates.push(again);
+        record
+    }
+
+    fn closed_line(path: &Path, peer: &PeerKeyLocation, reason: &str) -> bool {
+        read_lines(path).iter().any(|line| {
+            line["kind"] == "decision_uncaptured"
+                && line["reason"] == reason
+                && line["selected"] == serde_json::json!([peer_hash(peer)])
+        })
+    }
+
+    // The membership counters must track the live table exactly: a count left
+    // behind is a leak, a count removed early is a FALSE ZERO that lets an
+    // uncaptured decision skip the line it owes. Each test below checks the
+    // invariant after every operation.
+
+    #[test]
+    fn counters_survive_eviction_and_closing() {
+        let mut m = Manual::new();
+        let peers = peers(3);
+        m.dataset.order.lock().live_capacity = 2;
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.dataset.assert_counters_match_live();
+        m.dataset.record_decision(selecting(&peers, &[1]));
+        m.dataset.assert_counters_match_live();
+        // Evicts 0.
+        m.dataset.record_decision(selecting(&peers, &[2]));
+        m.dataset.assert_counters_match_live();
+        // 2 is live, so this closes it: a false zero for 2 would skip the line.
+        m.dataset.record_uncaptured(uncaptured(&[&peers[2]]));
+        m.dataset.assert_counters_match_live();
+        m.dataset.record_uncaptured(uncaptured(&[&peers[1]]));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        assert!(closed_line(&m.path, &peers[0], "expired"));
+        assert!(closed_line(&m.path, &peers[2], "sampled_out"));
+        assert!(closed_line(&m.path, &peers[1], "sampled_out"));
+    }
+
+    #[test]
+    fn counters_survive_refused_captures() {
+        let mut m = Manual::new();
+        let peers = peers(2);
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.drain();
+        // A refused recapture of a live selection must not uncount it.
+        m.fill_leaving(0);
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        m.dataset.record_route(route("00000000000000aa")); // places the mark
+        m.drain();
+        // A refused fresh capture must be uncounted again.
+        m.fill_leaving(0);
+        m.dataset.record_decision(selecting(&peers, &[1]));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        m.dataset
+            .record_uncaptured(uncaptured(&[&peers[0], &peers[1]]));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        let lines = read_lines(&m.path);
+        let last = lines.last().unwrap();
+        assert_eq!(last["kind"], "decision_uncaptured");
+        assert_eq!(
+            last["selected"],
+            serde_json::json!([peer_hash(&peers[0])]),
+            "0 is still owed its closing line; the refused 1 was never live"
+        );
+    }
+
+    #[test]
+    fn a_peer_listed_twice_is_one_selection() {
+        let mut m = Manual::new();
+        let peers = peers(3);
+        m.dataset.order.lock().live_capacity = 2;
+        m.dataset.record_decision(selecting(&peers, &[1]));
+        m.dataset.record_decision(selecting_twice(&peers, 0));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        assert_eq!(
+            kinds_of(&read_lines(&m.path), "decision_uncaptured"),
+            0,
+            "one selection fits beside the other without evicting it"
+        );
+    }
+
+    #[test]
+    fn a_capture_larger_than_the_table_never_closes_its_own_selections() {
+        let mut m = Manual::new();
+        let peers = peers(4);
+        m.dataset.order.lock().live_capacity = 2;
+        m.dataset.record_decision(selecting(&peers, &[0]));
+        m.dataset.record_decision(selecting(&peers, &[1, 2, 3]));
+        m.dataset.assert_counters_match_live();
+        m.drain();
+        for own in &peers[1..4] {
+            assert!(
+                !closed_line(&m.path, own, "expired"),
+                "closed its own selection"
+            );
+        }
+        assert!(
+            closed_line(&m.path, &peers[0], "expired"),
+            "the older capture is evicted"
         );
     }
 

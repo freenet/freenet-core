@@ -1793,10 +1793,13 @@ mod routing_dataset_call_site_pins {
     const BYPASS: &str = "record_bypass(";
 
     /// Code with comments removed and string / char literal contents emptied,
-    /// newlines kept. Raw strings, escapes, nested block comments and
-    /// lifetimes are handled.
+    /// newlines kept. Raw strings (with or without a `b`/`c` prefix), escapes
+    /// including `'\''`, non-ASCII char literals, nested block comments and
+    /// lifetimes are handled. Fails CLOSED: an unterminated comment or literal
+    /// panics rather than silently masking the rest of the file.
     fn mask(src: &str) -> String {
         let b = src.as_bytes();
+        let ident = |at: usize| at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
         let mut out = String::with_capacity(src.len());
         let mut i = 0;
         while i < b.len() {
@@ -1807,7 +1810,8 @@ mod routing_dataset_call_site_pins {
                 }
             } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
                 let mut depth = 0;
-                while i < b.len() {
+                loop {
+                    assert!(i < b.len(), "pin lexer: unterminated block comment");
                     if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
                         depth += 1;
                         i += 2;
@@ -1824,26 +1828,27 @@ mod routing_dataset_call_site_pins {
                         i += 1;
                     }
                 }
-            } else if c == b'r'
-                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-                && matches!(b.get(i + 1), Some(b'"') | Some(b'#'))
+            } else if !ident(i)
+                && (c == b'r' || ((c == b'b' || c == b'c') && b.get(i + 1) == Some(&b'r')))
+                && {
+                    let r = if c == b'r' { i } else { i + 1 };
+                    let mut j = r + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    b.get(j) == Some(&b'"')
+                }
             {
-                let mut j = i + 1;
+                let r = if c == b'r' { i } else { i + 1 };
+                let mut j = r + 1;
                 let mut hashes = 0;
                 while b.get(j) == Some(&b'#') {
                     hashes += 1;
                     j += 1;
                 }
-                if b.get(j) != Some(&b'"') {
-                    out.push('r');
-                    i += 1;
-                    continue;
-                }
                 j += 1;
                 loop {
-                    if j >= b.len() {
-                        break;
-                    }
+                    assert!(j < b.len(), "pin lexer: unterminated raw string");
                     if b[j] == b'"'
                         && b[j + 1..]
                             .iter()
@@ -1861,33 +1866,51 @@ mod routing_dataset_call_site_pins {
                 i = j;
             } else if c == b'"' {
                 let mut j = i + 1;
-                while j < b.len() && b[j] != b'"' {
+                loop {
+                    assert!(j < b.len(), "pin lexer: unterminated string");
                     if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'"' {
+                        break;
+                    } else {
                         j += 1;
                     }
-                    j += 1;
                 }
                 out.push_str("\"\"");
                 i = j + 1;
             } else if c == b'\'' {
-                // A char literal ('x', '\n', '\u{..}'), otherwise a lifetime.
                 if b.get(i + 1) == Some(&b'\\') {
-                    let mut j = i + 2;
+                    // An escape: skip the escaped byte (which may itself be a
+                    // quote), then up to the closing quote (for `\u{..}`).
+                    let mut j = i + 3;
                     while j < b.len() && b[j] != b'\'' {
                         j += 1;
                     }
+                    assert!(j < b.len(), "pin lexer: unterminated char literal");
                     out.push_str("' '");
                     i = j + 1;
-                } else if b.get(i + 2) == Some(&b'\'') {
-                    out.push_str("' '");
-                    i += 3;
                 } else {
-                    out.push('\'');
-                    i += 1;
+                    // One (possibly multi-byte) char then a quote is a char
+                    // literal; anything else is a lifetime.
+                    let width = match b.get(i + 1) {
+                        Some(lead) if *lead >= 0xF0 => 4,
+                        Some(lead) if *lead >= 0xE0 => 3,
+                        Some(lead) if *lead >= 0xC0 => 2,
+                        _ => 1,
+                    };
+                    if b.get(i + 1 + width) == Some(&b'\'') {
+                        out.push_str("' '");
+                        i += 2 + width;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                    }
                 }
             } else {
-                out.push(c as char);
-                i += 1;
+                // Copy whole UTF-8 characters.
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
         out
@@ -1912,9 +1935,18 @@ mod routing_dataset_call_site_pins {
     }
 
     /// Masked production code: `#[cfg(test)] mod name;` and
-    /// `#[cfg(test)] mod name { .. }` removed wherever they appear.
+    /// `#[cfg(test)] mod name { .. }` removed wherever they appear. Other
+    /// `#[cfg(test)]` forms (a test-only `fn`, `#[cfg(any(test, ..))]`, an
+    /// attribute between `#[cfg(test)]` and `mod`) stay counted as production:
+    /// a site there makes a pin fail by over-counting, never pass vacuously.
+    /// Unbalanced braces panic, so a lexer gap fails closed.
     fn production(src: &str) -> String {
         let mut code = mask(src);
+        assert_eq!(
+            code.matches('{').count(),
+            code.matches('}').count(),
+            "pin lexer: unbalanced braces after masking"
+        );
         while let Some(at) = code.find("#[cfg(test)]") {
             let rest = &code[at..];
             let item = rest["#[cfg(test)]".len()..].trim_start();
@@ -1937,11 +1969,33 @@ mod routing_dataset_call_site_pins {
         code
     }
 
+    /// Whitespace removed, rustfmt's trailing commas dropped, and a turbofish
+    /// on a selection call removed, so `k_closest_potentially_hosting::<K>(`
+    /// counts like any other call.
     fn squash(code: &str) -> String {
-        code.chars()
+        let mut code = code
+            .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
-            .replace(",)", ")")
+            .replace(",)", ")");
+        let turbofish = "closest_potentially_hosting::<";
+        while let Some(at) = code.find(turbofish) {
+            let open = at + turbofish.len() - 1;
+            let mut depth = 0;
+            let close = code[open..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '<' => depth += 1,
+                        '>' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(open + i)
+                })
+                .expect("pin lexer: unterminated turbofish");
+            code.replace_range(open - 2..=close, "");
+        }
+        code
     }
 
     /// The body of the one production function called `name`.
@@ -2193,5 +2247,43 @@ fn c<'a>(x: &'a str) { record_bypass(o, l, p, UncapturedReason::TerminalConsult)
             "code after `mod tests;` is production"
         );
         assert_eq!(fn_body(&production(src), "c").matches(BYPASS).count(), 1);
+    }
+
+    /// Literals that once mis-lexed, each followed by a brace and a site that
+    /// must still count; and a turbofish call.
+    #[test]
+    fn the_pin_lexer_handles_awkward_literals_and_turbofish() {
+        let src = r##"
+fn a() {
+    let q = ['\'', '{'];
+    let arrow = ['→', '{'];
+    let esc = '\u{7d}';
+    let raw = br"\";
+    let craw = cr#"\"#;
+    let brace = "}";
+    x.k_closest_potentially_hosting::<ContractInstanceId>(DecisionLog::Unlogged, k, s, 1);
+}
+"##;
+        let code = production(src);
+        assert_eq!(fn_body(&code, "a").matches(SELECTION).count(), 1);
+        assert_eq!(squash(&code).matches(UNLOGGED).count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_string() {
+        let _ = mask("fn a() { let s = \"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated raw string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_raw_string() {
+        let _ = mask("fn a() { let s = br#\"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unbalanced braces")]
+    fn the_pin_lexer_fails_closed_on_unbalanced_braces() {
+        let _ = production("fn a() { if x { }");
     }
 }
