@@ -2721,26 +2721,84 @@ fn evicting_a_peer_clears_its_contract_entries() {
         "only the evicted peer's entry is cleared"
     );
 
-    // Through a stage: after churn that evicts peers, no contract entry holds
-    // a generation the peer table no longer has.
+    // Through a stage, and BETWEEN refits, which is the only window in which
+    // this is observable: a refit rebuilds the table from the prepared
+    // window, which holds only live peers, so it wipes stale entries on its
+    // own. A mutation removing `evict_peers` survives any version of this
+    // test that refits after the eviction, and the first version did.
     let _guard = GlobalRng::seed_guard(0x4485_c00f);
     let mut stage: Stage<u32> = Stage::new(Target::Failure, 64);
     let dead = 0.37;
-    let mut steps = background(0.0, 1.0, 0..30);
+    // Peers 0 to 5 fail the dead contract EARLY and are never seen again, so
+    // they are the least-recently-used and the first to be evicted. Peers 6
+    // to 63 carry the rest of the traffic, filling the 64-slot table.
+    let mut steps = background(0.0, 0.4, 6..64);
     for peer in 0..6u32 {
-        steps.extend(on_contract(peer, dead, true, 8, 0.5, 0.25));
+        steps.extend(on_contract(peer, dead, true, 8, 0.02, 0.05));
     }
-    // 300 fresh peers through a 64-slot table, so the early ones are evicted.
-    steps.extend(background(1.0, 2.0, 100..400));
-    feed(&mut [&mut stage], steps);
+    let now = feed(&mut [&mut stage], steps);
     assert!(
-        stage.diagnostics().peer_evictions > 0,
-        "the churn must evict peers, or this test proves nothing"
+        stage.peers.index.len() >= 60,
+        "the peer table must be nearly full, or nothing evicts: {}",
+        stage.peers.index.len()
     );
-    let table = stage
+    assert!(
+        stage.sorted.len() > EAGER_REFIT_BELOW,
+        "the window must be past the eager-refit size, or every event refits"
+    );
+    let node = stage
         .contracts
         .as_ref()
-        .expect("the failure stage has a term");
+        .expect("term")
+        .table
+        .lookup(&dead.to_bits())
+        .expect("the dead contract is tracked");
+    let used = |stage: &Stage<u32>| {
+        stage.contracts.as_ref().expect("term").nodes[node]
+            .entries
+            .iter()
+            .filter(|entry| entry.used())
+            .count()
+    };
+    assert!(
+        used(&stage) >= 5,
+        "the contract must hold several peers, or this test proves nothing: {}",
+        used(&stage)
+    );
+    // Twenty brand-new peers, on a DIFFERENT contract so they cannot refill
+    // the dead contract's node, through a nearly-full 64-slot table. Twenty
+    // events is fewer than the 50-event refit interval, so no refit
+    // intervenes.
+    let mut scratch = Scratch::default();
+    let mut evicted = Vec::new();
+    for (index, peer) in (1_000..1_020u32).enumerate() {
+        stage.observe(
+            &mut scratch,
+            &peer,
+            0.6,
+            0.05,
+            1.0,
+            now + 0.001 * (index + 1) as f64,
+        );
+        evicted.extend(scratch.evicted.iter().copied());
+    }
+    assert!(
+        stage.since_refit > 0
+            && stage.since_refit < refit_interval(WINDOW_EVENTS, stage.sorted.len()),
+        "no refit may intervene, or the rebuild hides the defect: since_refit {}",
+        stage.since_refit
+    );
+    assert!(
+        !evicted.is_empty(),
+        "the new peers must evict, or this test proves nothing"
+    );
+    assert_eq!(
+        used(&stage),
+        0,
+        "every peer of the dead contract was evicted, so its node must be empty"
+    );
+    // And no node anywhere holds a generation the peer table no longer has.
+    let table = stage.contracts.as_ref().expect("term");
     for (node_index, node) in table.nodes.iter().enumerate() {
         for entry in node.entries.iter().filter(|e| e.used()) {
             assert_eq!(
