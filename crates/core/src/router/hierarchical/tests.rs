@@ -2608,6 +2608,74 @@ fn live_learning_subtracts_the_other_peers_contract_effect() {
     );
 }
 
+/// The LEARN site's bound, in the style of the test above, which is the only
+/// shape that can observe it.
+///
+/// Three attempts were needed and the two failures are the point. A refit
+/// REBUILDS the levels from the window, so once one has run the level sums
+/// carry the refit's adjustments and the learn site is invisible in them; and
+/// the table-level test of `explaining_bound` says nothing about either
+/// caller. What works is this test's neighbour's shape: drive `observe`
+/// directly, keep the count below a refit interval so nothing is recomputed,
+/// and use peers that appear nowhere else so the level sums isolate the
+/// injected events.
+///
+/// The mirror of the neighbour: three peers SUCCEED on a contract, so its
+/// effect is NEGATIVE, and then one more peer FAILS there. That peer's
+/// residual is positive, the effect opposes it, and the bound must remove
+/// NOTHING. Reverting the learn site to `residual - effect` subtracts a
+/// negative number, which charges the peer MORE than its own residual.
+#[test]
+fn the_learn_site_never_charges_a_peer_more_than_its_own_residual() {
+    let _guard = GlobalRng::seed_guard(0x4485_c1c0);
+    let mut steps = background_pooled(0.0, 3.0, 0..30);
+    // An earlier dead contract, so the table has components at the last refit
+    // and `tau2_contract` is positive when the events below are learned.
+    for peer in 10..16 {
+        steps.extend(on_contract(peer, 0.33, true, 8, 2.7, 0.25));
+    }
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    let now = feed(&mut [&mut with_term, &mut without_term], steps);
+
+    let served = 0.44;
+    let mut scratch = Scratch::default();
+    // Peers outside the background range, so the level sums isolate these
+    // events. Nine SUCCESSES (y = 0.0) from three peers, then one FAILURE.
+    for (index, peer) in [81u32, 82, 83, 81, 82, 83, 81, 82, 83].iter().enumerate() {
+        let hours = now + 0.001 * (index + 1) as f64;
+        for stage in [&mut with_term, &mut without_term] {
+            stage.observe(&mut scratch, peer, served, 0.05, 0.0, hours);
+        }
+    }
+    let hours = now + 0.011;
+    for stage in [&mut with_term, &mut without_term] {
+        stage.observe(&mut scratch, &84, served, 0.05, 1.0, hours);
+    }
+    assert!(with_term.since_refit < refit_interval(WINDOW_EVENTS, with_term.sorted.len()));
+
+    // The effect must be NEGATIVE and non-trivial, or the bound has nothing to
+    // refuse and this test proves nothing.
+    let adjustment = f64::from(with_term.fresh.last().unwrap().adjustment);
+    assert!(
+        adjustment < -0.01,
+        "three other peers SUCCEEDING on the contract must give it a clearly          negative effect, got {adjustment}"
+    );
+
+    // Peer 84's residual is positive (it failed), so the bound removes nothing
+    // and the two stages must agree exactly.
+    let slot = with_term.peers.lookup(&84).unwrap();
+    let control = without_term.levels[0].nodes[slot].peer.sum;
+    let applied = with_term.levels[0].nodes[slot].peer.sum;
+    assert!(
+        control > 0.05,
+        "sanity: the failure must be worth something in the control, or the          equality below holds trivially: {control}"
+    );
+    assert!(
+        (applied - control).abs() < 1e-9,
+        "an effect opposing the residual's sign must remove nothing at the          LEARN site: with the term {applied}, control {control}, effect          {adjustment}"
+    );
+}
+
 /// The presence cut: evidence that has decayed away stops explaining its
 /// contract, instead of counting at full strength forever (the Kish factor a
 /// query reads is scale free, so nothing else would retire it).

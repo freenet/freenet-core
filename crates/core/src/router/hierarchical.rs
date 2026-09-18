@@ -2821,20 +2821,48 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 // fires on, which the round-3 review was right to flag.
                 // `stored` is overwritten at every same-sign refit and refits
                 // run every [`REFIT_EVERY`] events, so a recovering contract's
-                // effect is already near zero by the refit at which its sign
-                // finally turns over: what gets frozen is small, not the
-                // storm-era value. The measured firing population is in the PR
-                // (a split by direction, with the mean signed change each
-                // direction makes to the peer levels). The scenario test
-                // pins the large-value case, which is the guard's best case
-                // and not its common one.
+                // effect can already be near zero by the refit at which its
+                // sign finally turns over.
+                //
+                // MEASURED, on the four recorded gateway streams at
+                // `9ad70135b`, because the review asked what the guard does to
+                // the population it actually reaches. 238 firings out of
+                // 1,546,012 refit-loop visits (0.0154%), and the review's
+                // reading holds for two thirds of them and not for the rest:
+                //
+                // - `stored > 0` with a fresh `effect < 0`: 159 firings
+                //   (66.8%). The frozen value has mean magnitude 0.0114 and
+                //   median 0.0055, SMALLER than the fresh effect it displaces
+                //   (mean 0.0273). Here the guard is blocking a fresh effect
+                //   rather than preserving an era value, which is the review's
+                //   point.
+                // - `stored < 0` with a fresh `effect > 0`: 79 firings
+                //   (33.2%). The frozen value has mean magnitude 0.0657 and
+                //   median 0.0708, LARGER than the fresh effect (mean 0.0603),
+                //   so for this third the frozen value is not near zero.
+                //
+                // Mean signed change to what the peer levels learn, positive
+                // meaning the levels learn LESS than without the guard:
+                // +0.0273 for the first group and -0.0477 for the second, a
+                // pooled net of +0.58 over all 238 firings. EVERY firing is on
+                // a SUCCESS event (negative residual); the guard did not fire
+                // once on a failure on any stream. The per-visit figures do
+                // NOT capture the guard's effect on later refits through what
+                // `stored` then holds, which would need a counterfactual
+                // replay. Full tables in the PR.
+                //
+                // The scenario test pins the large-value case, which is the
+                // guard's best case and, on this evidence, its minority one.
                 //
                 // `<= 0.0` rather than `< 0.0`: an effect of exactly zero is
                 // not agreement, and overwriting a non-zero stored value with
                 // it would erase the era estimate the rule exists to keep.
                 // Reachable only through an exactly-zero decayed residual sum,
                 // since `effect` returns `None` rather than `Some(0.0)` when
-                // `tau2_contract` is zero.
+                // `tau2_contract` is zero. MEASURED at zero firings on all
+                // four recorded streams, so on that traffic this is a
+                // robustness change and not a behaviour change. A zero on four
+                // streams is not a proof of unreachability.
                 Some(effect) if stored != 0.0 && effect * stored <= 0.0 => stored,
                 Some(effect) => {
                     source.adjustment = effect as f32;
