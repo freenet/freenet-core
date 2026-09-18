@@ -251,16 +251,34 @@ WHEN touching either stack:
     nowhere; and recomputing expected_total_time from the recorded
     failure_probability reproduces it only to within the slope.
   → The contract term must export enough to tell "it worked and helped
-    nothing" from "it never activated": hierarchical_contract_estimable_refits
-    and _contract_tau2 in the snapshot are that signal. Do not add a mechanism
-    whose activation nothing reports.
+    nothing" from "it never activated". _contract_estimable_refits is NECESSARY
+    and not sufficient for that: the effect is also refused per query below the
+    present-peer bar, and on the recorded soak most failures are on contracts
+    that never reach it, so a node estimable at every refit that moves no
+    forecast would read as active. The counters that answer the question are
+    _contract_effects_applied and _contract_forecast_offsets; read
+    _contract_tau2 beside _contract_qualifying_contracts, because tau2_contract
+    has no minimum group count and a value resting on one contract is otherwise
+    indistinguishable from one resting on eighty. All of these reach the
+    snapshot, the peer-detail dashboard and the OTLP body (telemetry.rs is
+    hand-mirrored: a new RouterSnapshotInfo field is invisible to the collector
+    unless added there). Do not add a mechanism whose activation nothing
+    reports, and do not mistake "the mechanism could act" for "the mechanism
+    acted".
 
 PROMOTION GATE. The Brier-first gate below is SUPERSEDED for the estimator
 decision by /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17,
 approved by Ian), and the reason matters: the accuracy gap against legacy was
-almost entirely failed relayed GETs for contracts nobody can serve, which
-cannot change which peer is picked, so a Brier-at-most-1.00 gate was measuring
-the wrong thing. PLAN-v2 measures, in order, M1 within-contract RANKING
+almost entirely CONTRACT-LEVEL calibration on failed relayed GETs for contracts
+nobody can serve, which a Brier-parity gate weights heavily and which affects
+candidate ORDERING only indirectly. Do NOT write that a contract-level change
+"cannot change which peer is picked": that inference is false and this file
+carried it until 2026-09-17. A quantity common to every candidate cannot
+reorder the candidates' failure PROBABILITIES, but routing ranks by
+`t + transfer + 3*t*p`, so a common change of `d` moves candidate i's cost by
+`3*t_i*d`, which differs across candidates whose response times differ. See
+`hierarchical.rs`, "Contract term", Forecast, and the test
+`a_shared_contract_effect_reweights_peers_that_differ_in_response_time`. PLAN-v2 measures, in order, M1 within-contract RANKING
 (delta C-index, non-inferiority margin -0.05), M2 dead-contract POLLUTION (the
 excess forecast on successes of recently storm-tainted peers, bar
 max(legacy, 0) + 0.02), and M3 failure Brier only as a non-inferiority check

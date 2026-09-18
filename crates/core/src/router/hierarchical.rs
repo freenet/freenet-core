@@ -56,6 +56,14 @@
 //! stages are bounded (below) and need [`MIN_CURVE_POINTS_LOG`] points; the log
 //! curves are not floored at zero; and peers are bounded.
 //!
+//! Two LATER differences, added after that re-validation and NOT covered by
+//! it, which is where the next reader will look for them: the per-stage
+//! forgetting menus ([`FAILURE_HORIZONS_HOURS`] against
+//! [`LOG_HORIZONS_HOURS`]), and the contract term described below. The
+//! bake-off's harness draws a fresh contract per event, so it cannot exercise
+//! the contract term at all; see "Provenance" above for what that means for
+//! the condition it satisfies.
+//!
 //! # The model, per stage
 //!
 //! Each stage models one target on its own scale: failure as a probability
@@ -157,6 +165,16 @@
 //! - M2 scores only forecasts that are too high on successes, so an
 //!   over-correction reads as an improvement, and M3's interval cannot resolve
 //!   a level shift of the size the explain-away coverage asymmetry implies.
+//!   Two figures circulated for that shift and they are NOT in conflict: over
+//!   gateway-1's 3,880 tuning events the signed adjustment sums are -37.723 on
+//!   successes and +44.208 on failures, so the NET is
+//!   `(44.208 - 37.723)/3880 = +0.00167` and the total PERTURBATION magnitude
+//!   is `(44.208 + 37.723)/3880 = +0.02112`. They are the difference and the
+//!   sum of the same two sums. The second is the round-1 estimate of about
+//!   +0.024, which that review labelled an approximate upper estimate with the
+//!   shrinkage ignored. Neither is the number the decision should rest on; see
+//!   [`CONTRACT_MIN_OTHER_PEERS`] for the outcome-conditional means, which are
+//!   what tracks outcome and so what actually distorts the peer levels.
 //! - the gate replays the recorded CLAMPED forecast, and the unbounded value
 //!   is recorded nowhere, so no offline tool can reproduce the router's order
 //!   among candidates whose forecasts all clamp.
@@ -249,11 +267,14 @@
 //! the curve's blocks, a constant amount of arithmetic for the selected
 //! horizon, and for the failure stage a second hash lookup plus a scan of one
 //! contract's [`CONTRACT_ENTRIES`] entries for the shared effect. That second
-//! lookup is per CANDIDATE although its value is one number per decision
-//! (measured at about 15 microseconds per decision at 200 candidates, under
-//! the router's read lock); hoisting it needs an estimator API that takes the
-//! contract once per decision rather than once per candidate, which is left
-//! for a follow-up.
+//! lookup is per CANDIDATE although its value is one number per decision;
+//! hoisting it needs an estimator API that takes the contract once per
+//! decision rather than once per candidate, which is left for a follow-up.
+//! The number in tree is `routing_estimate_cost_per_candidate`, which measures
+//! the whole three-stage estimate WITH the term active and prints it; an
+//! earlier version of this note quoted about 15 microseconds per decision at
+//! 200 candidates for the redundant lookup alone, which was a reviewer's
+//! estimate that nothing here produces, and it is withdrawn.
 //!
 //! A refit is linear in the window, plus one sort of it for the contract
 //! table's rebuild, and once the window is full runs every [`refit_interval`]
@@ -1170,6 +1191,34 @@ const CONTRACT_HORIZON_HOURS: f64 = 0.5;
 /// that 83.5% of gateway-1's failures and 95.4% of gateway-2's are on
 /// contracts that can never be adjusted or offset. The mechanism therefore
 /// covers a small share of the failure population, not the population.
+///
+/// **The number the bar asymmetry should be judged on, and the number that
+/// cannot judge it.** Measured on gateway-1's tuning stream, the mean
+/// adjustment is -0.010665 over 3,537 successes and +0.128886 over 343
+/// failures, an outcome differential of +0.1396. The levels learn
+/// `residual - effect`, so a peer with failure rate `f` has its learned
+/// residual shifted by `0.010665 - 0.139551 * f`: the slope of learned
+/// residual against true failure rate is attenuated to about 0.86, a 14%
+/// shrink of the peer-level signal, and the healthiest peers carry a +0.0107
+/// pedestal against a base failure rate of 0.0884. Both are two orders of
+/// magnitude larger than the NET shift of +0.00167 over all events, and both
+/// are invisible in it, because a common level shift is the least harmful
+/// component: it moves every peer equally, is partly returned by
+/// `shared_effect`, and M2 cancels it exactly by construction. Both figures
+/// are upper bounds at the level input. Counter-evidence, which cuts the other
+/// way and must be reported with them: on the gate window the candidate's
+/// clean-peer success mean is 0.0262 against legacy's 0.0268, so the pedestal
+/// is not detectable at the forecast there.
+///
+/// **And do not cite M3's PASS as reassurance about the bar asymmetry.** The
+/// asymmetry lands on the OPENING event of each contract episode, because a
+/// contract reaches three present entries only after the third peer's first
+/// event while learning needs two others, which is exactly the "dead
+/// contract's FIRST failures" the refit exists to clear. Those events are in
+/// the rejected explain-away-only configuration, and M3 is arithmetically
+/// incapable of seeing them: 63 events in 15,141 rows is 0.42%, so a penalty
+/// of that configuration's size moves the Brier ratio by about 0.003 against a
+/// confidence-interval half-width of 0.07.
 const CONTRACT_MIN_OTHER_PEERS: usize = 2;
 
 /// One peer's forgotten residual moments on one contract.
@@ -1665,6 +1714,14 @@ struct Event {
     /// The contract effect last subtracted from this event's residual before
     /// it entered the levels. Kept when a later refit finds no present
     /// evidence for the contract (module docs, "Contract term").
+    ///
+    /// `f32` to keep [`Event`] inside its byte budget. The rounding is about
+    /// 6e-8 relative, four orders below the smallest effect that changes a
+    /// forecast, but it is a ROUNDING: two refits that compute the same `f64`
+    /// effect store the same `f32`, while `stored != 0.0` in the sign-flip
+    /// guard tests the rounded value, so an effect below about 1e-45 stores as
+    /// 0 and is treated as "never adjusted". That is far below
+    /// [`CONTRACT_PRESENCE`]-scale effects and is noted rather than guarded.
     adjustment: f32,
     band: u8,
 }
@@ -2355,7 +2412,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
     /// Each event INSIDE the presence window is then adjusted by its peer's
     /// leave-out effect as of this refit, which clears a dead contract's FIRST
     /// failures (learned before any other peer had failed there) from the peer
-    /// levels. Two cases keep the adjustment the event last had instead:
+    /// levels. THREE cases keep the adjustment the event last had instead:
     ///
     /// - the contract has no present evidence from other peers. Otherwise a
     ///   storm's failures would be charged back to the peers once the storm's
@@ -2373,6 +2430,14 @@ impl<K: Hash + Eq + Clone> Stage<K> {
     ///   decayed weight, was rejected because it un-explains a storm's older
     ///   failures as they age, which is what the kept adjustment exists to
     ///   prevent.
+    /// - the event's contract SLOT has been evicted and reused, so `prepare`
+    ///   reports it as having no contract and it cannot be adjusted by
+    ///   whatever now occupies the slot.
+    ///
+    /// And one case keeps it while still recomputing everything else: an
+    /// effect whose SIGN is opposite to the stored one, which means the
+    /// contract has changed regime since the event (see the sign-flip guard
+    /// below, and [`explaining_bound`]).
     fn apply_contract_term(
         &mut self,
         prepared: &mut [Prepared],
@@ -2652,9 +2717,17 @@ pub(crate) const RANKING_OVERSHOOT_SLOPE: f64 = 1e-6;
 /// `failure * multiplier`, so the cost went negative: the dashboard's
 /// expected-total-time formatter prints "N/A" outside `0..1e9`, and negative
 /// expected times reached the routing dataset and telemetry. A negative value
-/// also cannot be the tie this mechanism exists for, which is at 1: below 0
-/// the peers being separated are all already the best available, and the
-/// remaining terms of the cost formula separate them.
+/// also cannot be the tie this mechanism exists for, which is at 1. What is
+/// given up is real and should be stated rather than explained away: on the
+/// gate window 3,805 of 15,848 scored rows (24%) have an unbounded forecast
+/// below 0 and now tie at exactly 0, against 231 that clamp at 1. On the TIMED
+/// branch the remaining terms of the cost formula still separate those peers;
+/// on the no-timing branch, which is the common one because the timing stage
+/// needs 30 timed successes, there are no remaining terms and they tie
+/// outright, falling back to the caller's order. The alternative, carrying the
+/// downward overshoot at the same slope, makes the cost NEGATIVE on that same
+/// branch, which the dashboard renders as "N/A" and which reaches the routing
+/// dataset; that was measured and is the worse of the two.
 pub(crate) fn ranking_failure_probability(unbounded: f64) -> f64 {
     let clamped = unbounded.clamp(0.0, 1.0);
     clamped + RANKING_OVERSHOOT_SLOPE * (unbounded - clamped).max(0.0)
