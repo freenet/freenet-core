@@ -1120,6 +1120,13 @@ pub(crate) struct RouterSnapshotInfo {
     /// on their traffic.
     #[serde(default)]
     pub hierarchical_contract_floor_bound_refits: u64,
+    /// Estimable refits on which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced NOTHING although the
+    /// refit counted as estimable. Read alongside
+    /// `hierarchical_contract_estimable_refits`: their difference is the
+    /// refits on which the term could act at all.
+    #[serde(default)]
+    pub hierarchical_contract_den_below_two_refits: u64,
     /// Contracts that qualified for `tau2_contract` at the last refit, and
     /// present entries that informed the components. `tau2_contract` requires
     /// at least two, so this is also how the term's WARM-UP silence is
@@ -3614,6 +3621,8 @@ impl Router {
             hierarchical_contract_effects_applied: hierarchical[0].contract_effects_applied,
             hierarchical_contract_forecast_offsets: hierarchical[0].contract_forecast_offsets,
             hierarchical_contract_floor_bound_refits: hierarchical[0].contract_floor_bound_refits,
+            hierarchical_contract_den_below_two_refits: hierarchical[0]
+                .contract_den_below_two_refits,
             hierarchical_contract_qualifying_contracts: hierarchical[0]
                 .contract_qualifying_contracts,
             hierarchical_contract_qualifying_entries: hierarchical[0].contract_qualifying_entries,
@@ -5317,6 +5326,16 @@ mod tests {
                 snapshot.hierarchical_contract_qualifying_entries,
                 diagnostics.contract_qualifying_entries,
             ),
+            // I3 of the 2026-09-18 round-3 testing review: this field was
+            // wired to the snapshot and to the OTLP body but was absent from
+            // this loop, so hard-coding it to zero, or reading it from the
+            // wrong stage, survived. The telemetry test only checks the JSON
+            // key against a hand-set value.
+            (
+                "floor_bound_refits",
+                snapshot.hierarchical_contract_floor_bound_refits,
+                diagnostics.contract_floor_bound_refits,
+            ),
         ] {
             assert!(
                 from_snapshot > 0,
@@ -5332,6 +5351,23 @@ mod tests {
             snapshot.hierarchical_contract_pairs_refused_last_refit,
             diagnostics.contract_pairs_refused_last_refit,
             "the refit gauge must be the failure stage's own value"
+        );
+        // Equality only, deliberately: a stream whose contracts all qualify
+        // from the first refit has a legitimate zero here, so asserting
+        // non-zero would make this test depend on the warm-up shape of its own
+        // traffic. The transposition is what this pins.
+        assert_eq!(
+            snapshot.hierarchical_contract_den_below_two_refits,
+            diagnostics.contract_den_below_two_refits,
+            "the den-gate count must be the failure stage's own value"
+        );
+        assert!(
+            snapshot.hierarchical_contract_den_below_two_refits
+                <= snapshot.hierarchical_contract_estimable_refits,
+            "the den gate is evaluated only on estimable refits, so its count \
+             cannot exceed them: {} against {}",
+            snapshot.hierarchical_contract_den_below_two_refits,
+            snapshot.hierarchical_contract_estimable_refits
         );
         assert!(
             snapshot

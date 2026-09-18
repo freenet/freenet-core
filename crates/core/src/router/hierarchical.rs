@@ -387,15 +387,31 @@ const NODE_MIN: f64 = 1e-12;
 ///
 /// What it buys, which is the whole point: the noise a query subtracts is
 /// `sigma2 * w2/n^2 + ...`, so it falls as `1 / n_eff`. Two barely-replicated
-/// cells therefore give a floor of about 0.25 and a heavily shrunk effect,
-/// while a dead contract with several peers and many events each gives a floor
-/// an order of magnitude smaller against a much larger `n_eff`, leaving the
-/// effect close to full strength. Pinned in both regimes by
-/// `the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract`.
+/// cells give a floor of about 0.25 and a heavily shrunk effect, while a dead
+/// contract with several peers and many events each gives a floor of about 0.1
+/// against a much larger `n_eff`, leaving the effect close to full strength.
+///
+/// Note where the leverage actually is, because an earlier version of this
+/// paragraph put it in the wrong place: the FLOOR itself differs by only about
+/// 2.5x between those regimes (0.25 at `n_eff` 2 against 0.1 at `n_eff` 8).
+/// The order of magnitude is in the NOISE term, because `w2/n^2` falls with
+/// evidence as well, and it is their product that separates the two cases.
+/// Pinned in both regimes by
+/// `the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract`,
+/// which measures the surviving fraction of the raw mean rather than the floor.
 fn bernoulli_variance_floor(effective_n: f64) -> f64 {
     // NaN or a non-positive effective size means no usable evidence, so take
     // the Bernoulli maximum. Written with `is_finite` rather than a negated
     // comparison so clippy's partial-order lint is satisfied.
+    //
+    // UNREACHABLE from the only current caller, which calls this per entry
+    // only after `replicated()` has already required an effective size of at
+    // least `MIN_EFFECTIVE_N`. It is kept because the function is a named,
+    // documented formula rather than an inlined expression, and returning the
+    // Bernoulli maximum is the right answer for a caller that has no evidence
+    // at all. It is not dead code to be deleted on a coverage argument, and it
+    // is deliberately not pinned by a test, because a test of it would assert
+    // only that this branch exists.
     if !effective_n.is_finite() || effective_n <= 0.0 {
         return 0.25;
     }
@@ -1245,22 +1261,32 @@ const CONTRACT_HORIZON_HOURS: f64 = 0.5;
 /// evidence the mechanism is unbiased: a coverage difference in either
 /// direction shifts what the peer levels learn.
 ///
-/// **The number the bar asymmetry should be judged on, and the number that
-/// cannot judge it.** Measured on gateway-1's tuning stream, the mean
-/// adjustment is -0.010665 over 3,537 successes and +0.128886 over 343
-/// failures, an outcome differential of +0.1396. The levels learn
-/// `residual - effect`, so a peer with failure rate `f` has its learned
-/// residual shifted by `0.010665 - 0.139551 * f`: the slope of learned
-/// residual against true failure rate is attenuated to about 0.86, a 14%
-/// shrink of the peer-level signal, and the healthiest peers carry a +0.0107
-/// pedestal against a base failure rate of 0.0884. Both are two orders of
-/// magnitude larger than the NET shift of +0.00167 over all events, and both
-/// are invisible in it, because a common level shift is the least harmful
-/// component: it moves every peer equally, is partly returned by
-/// `shared_effect`, and M2 cancels it exactly by construction. Both figures
-/// are upper bounds at the level input. Counter-evidence, which cuts the other
-/// way and must be reported with them: on the gate window the candidate's
-/// clean-peer success mean is 0.0262 against legacy's 0.0268, so the pedestal
+/// **The number the bar asymmetry should be judged on.** An earlier version of
+/// this paragraph gave -0.010665 over 3,537 successes and +0.128886 over 343
+/// failures, and compared their differential against a net shift of +0.00167.
+/// Every one of those figures came from the LIVE learn path, which is the
+/// population `c7d8a3965` retracted for covering only a small fraction of the
+/// adjustment an event ends up carrying; leaving the conditional means on that
+/// population while retracting the net was inconsistent, and the comparison
+/// overstated itself by about 15x. Re-measured over the LAST REFIT's prepared
+/// window, which is the population the mechanism actually reaches, pooled over
+/// the four gate streams at the shipping model:
+///
+/// - successes: the adjustment is non-zero on 17.3% of them, mean **-0.012622**
+///   over all of them;
+/// - failures: non-zero on 44.4%, mean **+0.357436** over all of them;
+/// - outcome differential **+0.370058**, against a NET amount subtracted per
+///   event of **+0.026273**, so the differential is about **14x** the net, not
+///   the two orders of magnitude previously claimed.
+///
+/// The levels learn `residual - effect`, so an outcome-correlated adjustment
+/// attenuates the slope of learned residual against true failure rate, and
+/// that is the harm this bar is judged on. The net shift is the least harmful
+/// component by comparison: it moves every peer equally, is partly returned by
+/// `shared_effect`, and M2 cancels it exactly by construction. These are still
+/// upper bounds at the level input. Counter-evidence, which cuts the other way
+/// and must be reported with them: on the gate window the candidate's
+/// clean-peer success mean is 0.0258 against legacy's 0.0268, so the pedestal
 /// is not detectable at the forecast there.
 ///
 /// **And do not cite M3's PASS as reassurance about the bar asymmetry.** The
@@ -1322,6 +1348,10 @@ struct ContractComponents {
     /// if traffic ever makes the measured value bind instead, that must be
     /// visible without a replay rig.
     floor_bound: bool,
+    /// Whether fewer than two contracts qualified, so `tau2_contract` is zero
+    /// and every `effect` query on this refit returns `None`. An estimable
+    /// refit that produced nothing.
+    den_below_two: bool,
     /// Contracts that qualified for `tau2_contract` (the `den` of its average)
     /// and present entries that informed any component. Diagnostic only, never
     /// read by the model. `tau2_contract` has NO minimum group count, so
@@ -1382,7 +1412,18 @@ struct ContractTable {
     /// soak most failures are on contracts that never reach it. Read it with
     /// `effects_applied` and `forecast_offsets`, which count what moved.
     estimable_refits: u64,
-    /// Learned residuals actually adjusted by a contract effect.
+    /// Learned residuals actually adjusted by a contract effect, counted only
+    /// where the BOUNDED value was non-zero, so an effect the bound took to
+    /// zero does not advance it. Before the 2026-09-18 round-3 review this
+    /// incremented whenever an effect was available, which made it an
+    /// availability count wearing the name of an application count, and that
+    /// is routine rather than rare: a failure event on a mostly-successful
+    /// contract gets a negative effect that the bound clamps to zero.
+    ///
+    /// SCOPE, which the name does not carry: this counts the LIVE learn path
+    /// only. `apply_contract_term` re-adjusts every windowed event at each
+    /// refit and increments nothing, so this is not the total number of
+    /// residuals the term has ever moved.
     effects_applied: u64,
     /// Scored forecasts that actually carried a contract offset. Counted at
     /// learn time, where every event produces a forecast, because the routing
@@ -1391,6 +1432,11 @@ struct ContractTable {
     /// Estimable refits at which [`bernoulli_variance_floor`] was the binding
     /// value for `sigma2` rather than the measured within-cell variance.
     floor_bound_refits: u64,
+    /// Estimable refits at which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced NOTHING although the
+    /// refit counted as estimable. The gate's own frequency: without it a
+    /// reader cannot tell an estimable refit that acted from one that did not.
+    den_below_two_refits: u64,
 }
 
 impl ContractTable {
@@ -1408,6 +1454,7 @@ impl ContractTable {
             effects_applied: 0,
             forecast_offsets: 0,
             floor_bound_refits: 0,
+            den_below_two_refits: 0,
         }
     }
 
@@ -1668,6 +1715,44 @@ impl ContractTable {
         // each seen repeatedly on one contract. See
         // [`bernoulli_variance_floor`]. Contract table only: the timing stages
         // model logs rather than probabilities and have no contract table.
+        //
+        // EVERY SITE OF THIS SHAPE, and which one this change touches. The
+        // round-3 review was right that the sentence above explains the timing
+        // stages and not the failure stage's own peer levels, so here is the
+        // enumeration the repo's rules ask for.
+        //
+        // 1. THIS site, `ContractTable::compute_components`'s `sigma2`.
+        //    FIXED, by [`bernoulli_variance_floor`].
+        // 2. `Level::compute_components`'s `sigma2`, which the failure
+        //    stage's peer and (peer, band) levels use. Same 0/1 target, same
+        //    structural zero from unanimous cells, still floored at the
+        //    `MIN_SIGMA2` numerical sentinel. NOT FIXED, and the reason is
+        //    NOT that the argument fails to apply: it applies exactly. It is
+        //    that those levels are the estimator the #5655 bake-off and every
+        //    number in the promotion gate were measured on, so changing their
+        //    variance floor changes the baseline this PR is judged against and
+        //    belongs in its own change with its own re-score. Recorded on
+        //    #5700 rather than left as an unstated choice.
+        // 3. The same `Level::compute_components` reached by the response-time
+        //    and transfer-speed stages. NOT FIXED and should not be: those
+        //    targets are logs of positive quantities, so there is no Bernoulli
+        //    variance to floor on, and the timing forecasts are required to
+        //    stay bit-identical.
+        // 4. `tau2_peer` below, gated at `den > 0.0` while `tau2_contract` is
+        //    gated at `den >= 2.0`. The argument for the tighter gate ("a
+        //    between-group variance estimated from one group is not a
+        //    variance") does apply to a `tau2_peer` resting on a single
+        //    leave-one-out contrast. NOT FIXED here, for two reasons worth
+        //    stating separately: tightening it changes behaviour and so
+        //    invalidates the gate row this PR reports, and the two `den`s are
+        //    not the same quantity (this one sums `1 + rest_sq/rest.n^2` over
+        //    every replicated present entry in the WHOLE table, not one term
+        //    per contract), so "at least two" is not the same threshold and
+        //    the right value needs measuring rather than copying. Because it
+        //    is a table-wide sum, a single-contrast `den` is reachable only
+        //    when the entire table holds one replicated present entry, which
+        //    is the same warm-up regime as the `den >= 2.0` gate below.
+        //    Recorded on #5700 as a decision for the lead, not silently kept.
         let floor = floor_acc / df;
         let measured = ss / df;
         let sigma2 = measured.max(floor);
@@ -1750,8 +1835,26 @@ impl ContractTable {
         // An earlier version of this comment said "on the recorded gateway
         // streams this costs nothing (52 to 76 qualifying contracts
         // measured)". 52.0 is gw1-h1's MEAN `den`, so that was right about the
-        // steady state and silent about the warm-up. `qualifying_contracts` is
-        // exported, and is how the warm-up silence is observed on a live node.
+        // steady state and silent about the warm-up.
+        //
+        // WHAT IS MEASURED, AND WHAT IS NOT GUARANTEED. On the four recorded
+        // streams every firing happened to be consecutive from the first refit
+        // and none recurred. That is an OBSERVATION about those streams, on
+        // two of the four, and NOT a property of the gate: `den` is recomputed
+        // from the current window at every refit, so a peer relaying one hot
+        // contract, or a node quiet enough that only one contract clears the
+        // replication bar in a window, sits at `den = 1` indefinitely with the
+        // term off. Do not read "warm-up" as a bound on how long this lasts.
+        //
+        // `den_below_two_refits` counts the firings and `qualifying_contracts`
+        // reports the current value, so both the frequency and the regime are
+        // observable on a live node without a replay rig. Note that a firing
+        // still counts as an ESTIMABLE refit: `components` is `Some` with
+        // `tau2_contract` at zero, and `effect` then returns `None` for every
+        // query, so the term produced nothing on those refits although
+        // `estimable_refits` and `floor_bound_refits` both advanced. The three
+        // counters have to be read together; `estimable_refits` alone
+        // overstates what the term did.
         let tau2_contract = if den >= 2.0 {
             (acc / den).max(0.0)
         } else {
@@ -1766,6 +1869,7 @@ impl ContractTable {
                 tau2_peer,
                 tau2_contract,
                 floor_bound,
+                den_below_two: den < 2.0,
                 qualifying_contracts: den as u64,
                 qualifying_entries: entries_present,
             })
@@ -2136,6 +2240,10 @@ pub(crate) struct StageDiagnostics {
     /// forecasts that actually carried a contract offset. These, not
     /// `contract_estimable_refits`, distinguish a term that worked from one
     /// that was estimable and moved nothing.
+    ///
+    /// `contract_effects_applied` counts only where the bound left a non-zero
+    /// adjustment, and only on the LIVE learn path: the per-refit re-adjustment
+    /// of the whole window is not counted anywhere.
     pub contract_effects_applied: u64,
     pub contract_forecast_offsets: u64,
     /// Estimable refits at which the Bernoulli evidence floor was the binding
@@ -2143,6 +2251,10 @@ pub(crate) struct StageDiagnostics {
     /// the recorded gateway streams this equals `contract_estimable_refits`;
     /// a reader whose traffic differs should be able to see that here.
     pub contract_floor_bound_refits: u64,
+    /// Estimable refits on which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced nothing. Subtract this
+    /// from `contract_estimable_refits` for the refits that could act.
+    pub contract_den_below_two_refits: u64,
     /// Contracts that qualified for `tau2_contract` at the last refit, and
     /// present entries that informed the components.
     pub contract_qualifying_contracts: u64,
@@ -2419,8 +2531,18 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                         // The RAW effect is stored, so a later refit can see
                         // the estimate this event was explained by; the BOUND
                         // is applied where it is used.
-                        adjusted = residual - explaining_bound(effect, residual);
-                        table.effects_applied += 1;
+                        let bounded = explaining_bound(effect, residual);
+                        adjusted = residual - bounded;
+                        // Counted only when the residual actually MOVED. An
+                        // effect the bound takes to zero (one that opposes the
+                        // residual's sign) leaves the levels learning exactly
+                        // what they would have learned without the term, and
+                        // counting it made this an availability count, which
+                        // is what `ring.md` tells the reader it is not.
+                        // `forecast_offsets` already counts only what moved.
+                        if bounded != 0.0 {
+                            table.effects_applied += 1;
+                        }
                         if let Some(event) = self.fresh.last_mut() {
                             event.adjustment = effect as f32;
                         }
@@ -2666,6 +2788,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         if let Some(components) = table.components {
             table.estimable_refits += 1;
             table.floor_bound_refits += u64::from(components.floor_bound);
+            table.den_below_two_refits += u64::from(components.den_below_two);
         }
         for event in prepared.iter_mut() {
             let Some(source) = sorted.get_mut(event.source as usize) else {
@@ -2684,14 +2807,35 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 .flatten();
             let stored = f64::from(source.adjustment);
             let adjustment = match fresh {
-                // A contract effect that has changed SIGN describes a
-                // different regime from the one this event was learned in:
-                // the usual cause is a contract that has recovered while this
-                // event is still inside the presence window, where the fresh
-                // successes outweigh the decayed storm. Keep the value from
-                // the event's own era rather than re-scoring it against a
-                // state it never saw.
-                Some(effect) if stored != 0.0 && effect * stored < 0.0 => stored,
+                // THE RULE, stated generally: an event keeps the adjustment
+                // from its own era whenever the fresh estimate no longer
+                // agrees in sign with it. A refit that disagrees in sign is
+                // describing a different regime from the one the event was
+                // learned in, and re-scoring the event against a state it
+                // never saw would move the levels on evidence the event does
+                // not carry.
+                //
+                // An earlier version of this comment named one cause, a
+                // contract recovering while the event is still inside the
+                // presence window, and that is NOT the case the guard usually
+                // fires on, which the round-3 review was right to flag.
+                // `stored` is overwritten at every same-sign refit and refits
+                // run every [`REFIT_EVERY`] events, so a recovering contract's
+                // effect is already near zero by the refit at which its sign
+                // finally turns over: what gets frozen is small, not the
+                // storm-era value. The measured firing population is in the PR
+                // (a split by direction, with the mean signed change each
+                // direction makes to the peer levels). The scenario test
+                // pins the large-value case, which is the guard's best case
+                // and not its common one.
+                //
+                // `<= 0.0` rather than `< 0.0`: an effect of exactly zero is
+                // not agreement, and overwriting a non-zero stored value with
+                // it would erase the era estimate the rule exists to keep.
+                // Reachable only through an exactly-zero decayed residual sum,
+                // since `effect` returns `None` rather than `Some(0.0)` when
+                // `tau2_contract` is zero.
+                Some(effect) if stored != 0.0 && effect * stored <= 0.0 => stored,
                 Some(effect) => {
                     source.adjustment = effect as f32;
                     effect
@@ -2779,6 +2923,10 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 .contracts
                 .as_ref()
                 .map_or(0, |table| table.floor_bound_refits),
+            contract_den_below_two_refits: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.den_below_two_refits),
             contract_qualifying_contracts: self
                 .contracts
                 .as_ref()
@@ -2854,7 +3002,12 @@ pub(crate) struct Estimate {
 ///   alternative not taken here, because it changes what the stored value
 ///   means on every path at once.
 fn explaining_bound(adjustment: f64, residual: f64) -> f64 {
-    if !adjustment.is_finite() {
+    // BOTH sides are checked, not only the adjustment. `f64::clamp` asserts
+    // `min <= max`, so a NaN residual would panic in the branches below rather
+    // than return a harmless zero. No caller can currently pass one (a
+    // residual is `y - prior` with a finite validated `y`), but this function
+    // reads as total and a later caller will assume it is.
+    if !adjustment.is_finite() || !residual.is_finite() {
         return 0.0;
     }
     if residual >= 0.0 {
@@ -2924,7 +3077,15 @@ pub(crate) struct HierarchicalRouting {
     non_speed_samples: u64,
     last_saturation_log: Option<f64>,
     evictions_at_last_log: u64,
-    refusals_at_last_log: u64,
+    /// The MONOTONE refusal total at the last notice, and the only value the
+    /// `_since_last_notice` delta may be computed against.
+    refused_at_last_log: u64,
+    /// The composite saturation reading at the last notice, used ONLY to decide
+    /// whether anything changed. It is NOT monotone, because
+    /// [`ContractTable::pairs_refused_last_refit`] is a gauge that resets at
+    /// every refit, so subtracting it from a later total underflows. Keeping
+    /// the two apart is the fix for that; see [`Self::log_saturation`].
+    saturation_at_last_log: u64,
 }
 
 impl std::fmt::Debug for HierarchicalRouting {
@@ -2950,7 +3111,8 @@ impl HierarchicalRouting {
             non_speed_samples: 0,
             last_saturation_log: None,
             evictions_at_last_log: 0,
-            refusals_at_last_log: 0,
+            refused_at_last_log: 0,
+            saturation_at_last_log: 0,
         }
     }
 
@@ -3042,8 +3204,28 @@ impl HierarchicalRouting {
         // live refusals: a node whose only saturation is refit drops, or
         // displacement of live entries, would otherwise stay silent while the
         // message advertises "contract entries full".
+        //
+        // `saturation` is a CHANGE DETECTOR, not a total, and the two must not
+        // be confused. `refused_last_refit` is a gauge that
+        // [`Stage::refit`] resets at every refit, so `saturation` can FALL, and
+        // subtracting a stored `saturation` from a later `refused` underflows:
+        // in a debug or test build that is a panic inside `observe` under the
+        // router's write lock, and in release it wraps to about 1.8e19 in a
+        // telemetry field. The monotone total is tracked separately in
+        // `refused_at_last_log` and is the only value the delta below is
+        // computed against. Pinned by
+        // `a_second_saturation_notice_reports_a_real_delta_and_does_not_underflow`.
+        // The monotone total is checked as well as the composite, because a
+        // composite that happens to be unchanged does not mean nothing
+        // happened: one new live refusal against a gauge one lower leaves
+        // `saturation` identical and would suppress a notice about a real
+        // refusal. Pinned by
+        // `a_new_live_refusal_is_not_suppressed_by_a_falling_refit_gauge`.
         let saturation = refused + refused_last_refit + displaced;
-        if evictions == self.evictions_at_last_log && saturation == self.refusals_at_last_log {
+        if evictions == self.evictions_at_last_log
+            && refused == self.refused_at_last_log
+            && saturation == self.saturation_at_last_log
+        {
             return;
         }
         let due = self
@@ -3057,7 +3239,7 @@ impl HierarchicalRouting {
             evictions_since_last_notice = evictions - self.evictions_at_last_log,
             peer_capacity = self.failure.peers.capacity,
             contract_residuals_refused_total = refused,
-            contract_residuals_refused_since_last_notice = refused - self.refusals_at_last_log,
+            contract_residuals_refused_since_last_notice = refused - self.refused_at_last_log,
             contract_pairs_refused_last_refit = refused_last_refit,
             contract_entries_displaced_total = displaced,
             contract_entries = CONTRACT_ENTRIES,
@@ -3066,7 +3248,8 @@ impl HierarchicalRouting {
         );
         self.last_saturation_log = Some(time);
         self.evictions_at_last_log = evictions;
-        self.refusals_at_last_log = saturation;
+        self.refused_at_last_log = refused;
+        self.saturation_at_last_log = saturation;
     }
 
     pub(crate) fn total_evictions(&self) -> u64 {

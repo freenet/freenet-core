@@ -4490,23 +4490,21 @@ mod tests {
         }
     }
 
-    /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.
-    ///
-    /// These are the fields that make a summarize/delta rate interpretable —
-    /// without them, the only production signal is a handler-entry span that
-    /// counts cache hits and WASM invocations identically, which is how five
-    /// consecutive storm fixes were sized against an undifferentiated number.
-    /// Losing one to the hand-mirroring footgun would re-blind us in exactly the
-    /// way this change exists to fix, so the assertion covers the FULL set: a
-    /// partially-mirrored addition fails here rather than shipping half-visible.
-    ///
-    /// Every value below is DISTINCT, so a copy-paste slip that mirrors one
-    /// field's value under another field's key fails too — an all-`Some(1)`
-    /// fixture would pass under that mutation.
     /// The contract term's activation counters must reach the OTLP body, or
     /// the live safety watch cannot tell a term that worked from one that
     /// never activated. Distinct values per field, so mirroring one field's
     /// value under another field's key fails too.
+    ///
+    /// This covers the counters the COLLECTOR needs, which is NOT the whole
+    /// set the snapshot carries: `_residuals_refused`,
+    /// `_pairs_refused_last_refit`, `_entries_displaced` and
+    /// `_den_below_two_refits` are dashboard-only by choice. The first three
+    /// describe table SATURATION, which is read while looking at one node's
+    /// peer-detail page rather than aggregated across the fleet, and the
+    /// fourth is derivable from the two that are exported here
+    /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
+    /// question ever needs one of them, add it to the mirrored block above and
+    /// to this list together.
     #[test]
     fn router_snapshot_json_includes_contract_term_activation() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -4543,6 +4541,19 @@ mod tests {
         );
     }
 
+    /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.
+    ///
+    /// These are the fields that make a summarize/delta rate interpretable —
+    /// without them, the only production signal is a handler-entry span that
+    /// counts cache hits and WASM invocations identically, which is how five
+    /// consecutive storm fixes were sized against an undifferentiated number.
+    /// Losing one to the hand-mirroring footgun would re-blind us in exactly the
+    /// way this change exists to fix, so the assertion covers the FULL set: a
+    /// partially-mirrored addition fails here rather than shipping half-visible.
+    ///
+    /// Every value below is DISTINCT, so a copy-paste slip that mirrors one
+    /// field's value under another field's key fails too — an all-`Some(1)`
+    /// fixture would pass under that mutation.
     #[test]
     fn router_snapshot_json_includes_contract_exec_counters() {
         use arbitrary::{Arbitrary, Unstructured};

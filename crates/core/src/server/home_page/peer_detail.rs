@@ -115,9 +115,19 @@ fn fmt_contract_term(rs: &crate::router::RouterSnapshotInfo) -> String {
         "; evidence floor bound at {} of {} estimable refits",
         rs.hierarchical_contract_floor_bound_refits, rs.hierarchical_contract_estimable_refits
     );
+    // The den gate's own frequency. An estimable refit on which fewer than two
+    // contracts qualified produced NOTHING, so without this the refit count
+    // above overstates what the term did.
+    let den = match rs.hierarchical_contract_den_below_two_refits {
+        0 => String::new(),
+        below => format!(
+            "; {below} of those refits had fewer than two qualifying contracts, so the term \
+             was off"
+        ),
+    };
     format!(
         "{} residuals adjusted, {} forecasts offset; estimable at {} refits; \
-         {tau2}{floor}",
+         {tau2}{floor}{den}",
         rs.hierarchical_contract_effects_applied,
         rs.hierarchical_contract_forecast_offsets,
         rs.hierarchical_contract_estimable_refits,

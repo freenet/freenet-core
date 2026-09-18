@@ -257,12 +257,22 @@ WHEN touching either stack:
     that never reach it, so a node estimable at every refit that moves no
     forecast would read as active. The counters that answer the question are
     _contract_effects_applied and _contract_forecast_offsets; read
-    _contract_tau2 beside _contract_qualifying_contracts, because tau2_contract
-    has no minimum group count and a value resting on one contract is otherwise
-    indistinguishable from one resting on eighty. All of these reach the
-    snapshot, the peer-detail dashboard and the OTLP body (telemetry.rs is
-    hand-mirrored: a new RouterSnapshotInfo field is invisible to the collector
-    unless added there). Do not add a mechanism whose activation nothing
+    _contract_tau2 beside _contract_qualifying_contracts, because a value
+    resting on two contracts is otherwise indistinguishable from one resting on
+    eighty, and beside _contract_den_below_two_refits, which counts the refits
+    on which fewer than two contracts qualified so the term was off despite
+    counting as estimable. Know what _contract_effects_applied does NOT cover:
+    it counts the LIVE learn path only, and only where the explaining bound
+    left a non-zero adjustment, so it is not a total of every residual the term
+    has moved (the per-refit re-adjustment of the whole window is counted
+    nowhere). All of these reach the
+    snapshot and the peer-detail dashboard; the OTLP body carries the ones a
+    fleet-wide question needs (_effects_applied, _forecast_offsets,
+    _estimable_refits, _qualifying_contracts, _floor_bound_refits, _contracts,
+    _tau2) and NOT the saturation gauges or _den_below_two_refits, which are
+    dashboard-only by choice and listed as such on the telemetry pin
+    (telemetry.rs is hand-mirrored: a new RouterSnapshotInfo field is invisible
+    to the collector unless added there). Do not add a mechanism whose activation nothing
     reports, and do not mistake "the mechanism could act" for "the mechanism
     acted".
 

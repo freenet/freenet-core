@@ -2164,6 +2164,7 @@ fn the_forecast_bar_is_one_peer_higher_than_the_learning_bar() {
         tau2_peer: 0.0,
         tau2_contract: 0.16,
         floor_bound: false,
+        den_below_two: false,
         qualifying_contracts: 2,
         qualifying_entries: 4,
     });
@@ -3582,6 +3583,7 @@ fn the_shrunk_contract_effect_matches_its_formula() {
         tau2_peer: 0.09,
         tau2_contract: 0.16,
         floor_bound: false,
+        den_below_two: false,
         qualifying_contracts: 1,
         qualifying_entries: 3,
     };
@@ -3858,11 +3860,21 @@ fn tau2_contract_is_the_second_moment_about_zero_not_about_a_grand_mean() {
         (tc - about_zero).abs() < 0.03,
         "tau2_contract must be the second moment about ZERO ({about_zero}), got {tc}"
     );
+    // The threshold sits MIDWAY between the two hypotheses, and that is
+    // load-bearing. It was `about_the_grand_mean + 3.0 * 0.03`, which for
+    // these parameters is 0.13 and therefore EXACTLY `about_zero`: the test
+    // asked the estimator to land strictly above its own expectation, which
+    // is a coin flip on the RNG stream (the SD of this average is about
+    // 0.0043, so it was green and deterministic, and any unrelated change to
+    // `normal()` call order, the seed base or the loop counts had about even
+    // odds of turning it red as a false regression). The coincidence looked
+    // deliberate and was not. I5 of the 2026-09-18 round-3 testing review.
+    let midway = 0.5 * (about_zero + about_the_grand_mean);
     assert!(
-        tc > about_the_grand_mean + 3.0 * 0.03,
+        tc > midway,
         "and must be well clear of the variance about the grand mean \
          ({about_the_grand_mean}), or this test cannot tell the two forms \
-         apart: got {tc}"
+         apart: got {tc}, needed above the midpoint {midway}"
     );
 }
 
@@ -4713,4 +4725,70 @@ fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
     );
     let (selected, _) = router.select_k_best_peers_with_telemetry([&worse, &better], dead, 1);
     assert_eq!(selected, vec![&better]);
+}
+
+/// H1 of the 2026-09-18 round-3 review. `log_saturation`'s notice reports
+/// `refused - <stored>`, and the stored value had become the COMPOSITE
+/// saturation reading, which includes `pairs_refused_last_refit`: a gauge the
+/// refit resets. The composite therefore falls, and the subtraction underflows
+/// the first time a second notice is due, which is a panic in this build and a
+/// wrap to about 1.8e19 in the release telemetry field this work is gated on.
+///
+/// Nothing reached it because every test either feeds one instant or never
+/// crosses `SATURATION_LOG_INTERVAL_HOURS`. This test crosses it, with the
+/// gauge falling between the two notices, which is the whole fault condition.
+#[test]
+fn a_second_saturation_notice_reports_a_real_delta_and_does_not_underflow() {
+    let mut estimator = HierarchicalRouting::new(200);
+    let table = estimator
+        .failure
+        .contracts
+        .as_mut()
+        .expect("the failure stage carries a contract table");
+    // A composite reading well ABOVE the monotone total, which is the state
+    // the old code stored and then subtracted from a later total.
+    table.refused = 3;
+    table.pairs_refused_last_refit = 40;
+    table.displaced = 7;
+    estimator.log_saturation(0.0);
+    assert_eq!(
+        estimator.refused_at_last_log, 3,
+        "the delta must be tracked against the monotone total, not the composite"
+    );
+    assert_eq!(estimator.saturation_at_last_log, 50);
+
+    // The refit resets the gauge, and two more live refusals arrive. Under the
+    // old code the notice computed 5 - 50.
+    let table = estimator.failure.contracts.as_mut().expect("table");
+    table.pairs_refused_last_refit = 0;
+    table.refused = 5;
+    estimator.log_saturation(SATURATION_LOG_INTERVAL_HOURS + 0.001);
+    assert_eq!(
+        estimator.refused_at_last_log, 5,
+        "the second notice must advance the monotone total"
+    );
+    assert_eq!(estimator.saturation_at_last_log, 12);
+}
+
+/// Same review, the second half of H1: the change gate read the composite
+/// alone, so one new live refusal against a gauge one lower left the composite
+/// identical and suppressed a notice about a real refusal.
+#[test]
+fn a_new_live_refusal_is_not_suppressed_by_a_falling_refit_gauge() {
+    let mut estimator = HierarchicalRouting::new(200);
+    let table = estimator.failure.contracts.as_mut().expect("table");
+    table.refused = 3;
+    table.pairs_refused_last_refit = 10;
+    estimator.log_saturation(0.0);
+    assert_eq!(estimator.saturation_at_last_log, 13);
+
+    // +1 refusal, -1 gauge: the composite is unchanged at 13.
+    let table = estimator.failure.contracts.as_mut().expect("table");
+    table.refused = 4;
+    table.pairs_refused_last_refit = 9;
+    estimator.log_saturation(SATURATION_LOG_INTERVAL_HOURS + 0.001);
+    assert_eq!(
+        estimator.refused_at_last_log, 4,
+        "a new live refusal must not be suppressed by an unchanged composite"
+    );
 }
