@@ -1248,6 +1248,39 @@ const CONTRACT_HORIZON_HOURS: f64 = 0.5;
 /// contracts that can never be adjusted or offset. The mechanism therefore
 /// covers a small share of the failure population, not the population.
 ///
+/// **A SECOND, INDEPENDENT REASON THE TERM IS SILENT, which is not part of
+/// that figure.** Measured 2026-09-18, and it had been written down nowhere:
+/// *a contract whose peers DISAGREE sharply contributes its spread to
+/// `tau2_peer`, not to `tau2_contract`, so the term produces no effect for
+/// that contract unless OTHER contracts supply the between-contract
+/// variance.* A table holding only a contract where one peer fails and two
+/// succeed gives `tau2_contract` exactly 0 with two qualifying contracts and a
+/// pooled `tau2_peer` of 0.2275: the noise the estimator subtracts exceeds the
+/// between-contract contrast, and `effect` then returns `None` for every
+/// query. That is the estimator behaving as designed, but note which case it
+/// removes, because it is the unlucky one: one peer failing a contract other
+/// peers serve is exactly the shape the leave-one-out exists for.
+///
+/// It is a DIFFERENT gate from the present-peer bar above, so it compounds
+/// rather than overlaps: the 83.5% and 95.4% figures count failures whose
+/// contract never reaches [`CONTRACT_MIN_OTHER_PEERS`] present peers, while
+/// this one applies to the remainder, where the peers ARE present. How much of
+/// that remainder it removes is NOT measured: the counters for it
+/// (`den_below_two_refits`, and `tau2_contract` reaching exactly zero) are
+/// per-REFIT and cannot be converted to a share of failure events. So the true
+/// coverage is at most what the present-peer bar leaves, and by an unmeasured
+/// margin less.
+///
+/// **What the per-refit counters say about it**, which is the part that IS
+/// measured. Over 796 refits on the four recorded streams, 595 were estimable;
+/// of those, 158 had fewer than two qualifying contracts and a further 152 had
+/// `den >= 2` with `tau2_contract` computing to exactly zero. **So the term
+/// could act on 285 of 796 refits, 35.8%.** Do not quote the estimable count
+/// on its own: "estimable at 595 refits" reads as the term working everywhere
+/// and it is not. Read `estimable_refits` with `den_below_two_refits` beside
+/// it, and remember the remaining gap (an estimable refit with `den >= 2`
+/// whose `tau2_contract` is still zero) is visible only as a zero `tau2`.
+///
 /// **The coverage asymmetry is a property of the WINDOW's traffic, not of the
 /// mechanism.** This is the most important thing measured about it, and it was
 /// found only by re-running the counters on the gate streams rather than the
@@ -1345,7 +1378,9 @@ struct ContractComponents {
     /// count, because it is the signal that tells a future reader whether the
     /// reasoning behind the floor still holds on their traffic: on the
     /// recorded gateway streams it bound on 595 of 595 estimable refits, and
-    /// if traffic ever makes the measured value bind instead, that must be
+    /// on 285 of the 285 of those on which `tau2_contract` was non-zero, so
+    /// the figure does not depend on whether the inert refits are counted. If
+    /// traffic ever makes the measured value bind instead, that must be
     /// visible without a replay rig.
     floor_bound: bool,
     /// Whether fewer than two contracts qualified, so `tau2_contract` is zero
@@ -1686,7 +1721,11 @@ impl ContractTable {
         //
         // MEASURED on the recorded gateway streams: the floor is the binding
         // value on 595 of 595 estimable refits, with the measured `ss / df`
-        // 23 to 623 times smaller. That is a statement about the DATA, not a
+        // 23 to 623 times smaller. Note that 595 is the ESTIMABLE count and
+        // not the count of refits on which the term could act, which is 285 of
+        // 796 (see [`CONTRACT_MIN_OTHER_PEERS`]); restricting to those 285 the
+        // floor still bound on all of them, so the conclusion does not rest on
+        // pooling the inert refits. That is a statement about the DATA, not a
         // flaw: `ss / df` estimates a within-(contract, peer) variance from
         // cells that are mostly unanimous and mostly tiny, so it converges on
         // zero for a reason unrelated to the true variance, and that

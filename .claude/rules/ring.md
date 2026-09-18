@@ -265,7 +265,17 @@ WHEN touching either stack:
     it counts the LIVE learn path only, and only where the explaining bound
     left a non-zero adjustment, so it is not a total of every residual the term
     has moved (the per-refit re-adjustment of the whole window is counted
-    nowhere). All of these reach the
+    nowhere). Do NOT quote _contract_estimable_refits on its own as the term's
+    activity: on the recorded streams 595 of 796 refits were estimable but the
+    term could act on only 285 of them (158 with fewer than two qualifying
+    contracts, a further 152 with tau2_contract computing to exactly zero), so
+    the estimable count reads as "working everywhere" and overstates by 2x.
+    A related property of the estimator, measured 2026-09-18 and previously
+    written down nowhere: a contract whose peers DISAGREE sharply contributes
+    its spread to tau2_peer rather than tau2_contract, so the term is silent on
+    it unless other contracts supply the between-contract variance. That is a
+    different gate from the present-peer bar and compounds with it. All of
+    these reach the
     snapshot and the peer-detail dashboard; the OTLP body carries the ones a
     fleet-wide question needs (_effects_applied, _forecast_offsets,
     _estimable_refits, _qualifying_contracts, _floor_bound_refits, _contracts,
