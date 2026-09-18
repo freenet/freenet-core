@@ -1212,6 +1212,15 @@ struct ContractComponents {
     tau2_peer: f64,
     /// Between-contract variance of contract effects about the curve.
     tau2_contract: f64,
+    /// Contracts that qualified for `tau2_contract` (the `den` of its average)
+    /// and present entries that informed any component. Diagnostic only, never
+    /// read by the model. `tau2_contract` has NO minimum group count, so
+    /// without these a value resting on ONE contract reads the same as one
+    /// resting on eighty, and the one-contract regime is the measured reality
+    /// on quiet traffic and in every stage-level test that draws a unique
+    /// contract per event.
+    qualifying_contracts: u64,
+    qualifying_entries: u64,
 }
 
 /// Which entries of a contract a query reads.
@@ -1238,17 +1247,37 @@ struct ContractTable {
     /// Live residuals not recorded because every entry of their contract held
     /// a larger weight. The events still train the levels and the curve.
     refused: u64,
-    /// `(contract, peer)` pairs a REFIT dropped because the contract had more
-    /// than [`CONTRACT_ENTRIES`] peers in the window and the pair was not
-    /// among the heaviest. Counted separately from `refused`: the two paths
-    /// see different epochs, different weights and different admitted peer
-    /// sets, so neither count stands in for the other.
-    refused_at_refit: u64,
-    /// Refits after which the variance components were estimable, i.e. after
-    /// which the term can produce an effect at all. The only signal that
-    /// distinguishes a node on which the term worked from one on which it
-    /// never activated.
+    /// `(contract, peer)` pairs the LAST refit dropped because their contract
+    /// had more than [`CONTRACT_ENTRIES`] peers in the window and they were
+    /// not among the heaviest.
+    ///
+    /// A GAUGE, not a total, and deliberately so: a persistently over-full
+    /// contract contributes the same drops at EVERY refit, about a hundred
+    /// times over a full window, so a cumulative count would read roughly 100x
+    /// the number of distinct pairs ever dropped, next to `refused`, which is
+    /// once per event. Reset at each refit.
+    pairs_refused_last_refit: u64,
+    /// Live entries DISPLACED by a heavier newcomer, whose accumulated moments
+    /// were discarded. Counted rather than merged: merging would attribute the
+    /// displaced peer's residuals to the newcomer, which is the attribution
+    /// error the whole term exists to avoid. This is the only
+    /// evidence-destroying path with no repair, and between refits it can push
+    /// a contract's present-entry count below the minimum and switch the term
+    /// off for that contract for up to one refit interval.
+    displaced: u64,
+    /// Refits after which the variance components were estimable.
+    ///
+    /// NOT on its own an "is the term doing anything" signal: `effect` also
+    /// returns `None` per query below the present-peer bar, and on the recorded
+    /// soak most failures are on contracts that never reach it. Read it with
+    /// `effects_applied` and `forecast_offsets`, which count what moved.
     estimable_refits: u64,
+    /// Learned residuals actually adjusted by a contract effect.
+    effects_applied: u64,
+    /// Scored forecasts that actually carried a contract offset. Counted at
+    /// learn time, where every event produces a forecast, because the routing
+    /// query path takes `&self` under a read lock and cannot count.
+    forecast_offsets: u64,
 }
 
 impl ContractTable {
@@ -1260,8 +1289,11 @@ impl ContractTable {
             components: None,
             evicted: Vec::new(),
             refused: 0,
-            refused_at_refit: 0,
+            pairs_refused_last_refit: 0,
+            displaced: 0,
             estimable_refits: 0,
+            effects_applied: 0,
+            forecast_offsets: 0,
         }
     }
 
@@ -1314,6 +1346,7 @@ impl ContractTable {
         if self.nodes.len() <= slot {
             self.nodes.resize(slot + 1, ContractNode::default());
         }
+        let mut displaced = false;
         let entries = &mut self.nodes[slot].entries;
         let index = match entries
             .iter()
@@ -1333,6 +1366,7 @@ impl ContractTable {
                         if entries[smallest].moments.n >= weight {
                             return false;
                         }
+                        displaced = true;
                         smallest
                     }
                 };
@@ -1345,6 +1379,7 @@ impl ContractTable {
             }
         };
         entries[index].moments.add(weight, residual);
+        self.displaced += u64::from(displaced);
         true
     }
 
@@ -1427,8 +1462,10 @@ impl ContractTable {
     fn compute_components(&self) -> Option<ContractComponents> {
         let present = |e: &ContractEntry| e.used() && e.moments.n >= CONTRACT_PRESENCE;
         let (mut ss, mut df) = (0.0, 0.0);
+        let mut entries_present = 0u64;
         for node in &self.nodes {
             for e in node.entries.iter().filter(|e| present(e)) {
+                entries_present += 1;
                 if e.moments.replicated() {
                     ss += (e.moments.sumsq - e.moments.sum * e.moments.sum / e.moments.n).max(0.0);
                     df += e.moments.n - e.moments.w2 / e.moments.n;
@@ -1438,6 +1475,23 @@ impl ContractTable {
         if df < 2.0 {
             return None;
         }
+        // NOTE, from the 2026-09-17 round-2 review (finding F) and the
+        // measurement that answered it. The review proposed refusing whenever
+        // `ss / df` lands on the `MIN_SIGMA2` sentinel, on the grounds that
+        // the sentinel means "no within-cell information" and the shrinkage
+        // then applies the raw other-peer mean at full strength. That was
+        // implemented and MEASURED, and it switches the term off on its own
+        // target case: a contract several peers fail unanimously at one
+        // distance has IDENTICAL residuals in every cell, so `ss` is exactly
+        // 0 by construction, and under that fix the whole contract-term suite
+        // goes dark. It is reverted; the write-up and the decision left to the
+        // lead are in the PR. What remains true: where the evidence is
+        // unanimous the effect IS applied unshrunk, which is defensible
+        // (unanimous evidence is not noisy) and is bounded by
+        // [`CONTRACT_MIN_OTHER_PEERS`] and [`CONTRACT_PRESENCE`] rather than
+        // by the shrinkage. Pinned by
+        // `unanimous_evidence_is_applied_unshrunk_and_bounded_by_the_peer_bar`,
+        // and the regime is visible through `qualifying_contracts`.
         let sigma2 = (ss / df).max(MIN_SIGMA2);
 
         // tau2_peer: each replicated entry against the SUM of the other present
@@ -1499,6 +1553,8 @@ impl ContractTable {
                 sigma2,
                 tau2_peer,
                 tau2_contract,
+                qualifying_contracts: den as u64,
+                qualifying_entries: entries_present,
             })
     }
 
@@ -1845,15 +1901,26 @@ pub(crate) struct StageDiagnostics {
     /// Residuals the contract table did not record LIVE because every entry
     /// of their contract held a larger weight.
     pub contract_residuals_refused: u64,
-    /// `(contract, peer)` pairs a REFIT dropped for being outside the
-    /// contract's heaviest [`CONTRACT_ENTRIES`]. Counted separately from the
-    /// live refusals: the two paths admit different peer sets.
-    pub contract_refit_pairs_refused: u64,
+    /// `(contract, peer)` pairs the LAST refit dropped for being outside
+    /// their contract's heaviest [`CONTRACT_ENTRIES`]. A GAUGE, not a total.
+    pub contract_pairs_refused_last_refit: u64,
+    /// Live entries displaced by a heavier newcomer, whose accumulated moments
+    /// were discarded. The only evidence-destroying path with no repair.
+    pub contract_entries_displaced: u64,
     /// Refits after which the contract term's variance components were
-    /// estimable. Zero on a node where the term never activated, which is
-    /// otherwise indistinguishable from one where it activated and changed
-    /// nothing.
+    /// estimable. Necessary for the term to do anything and NOT sufficient:
+    /// `effect` also returns nothing per query below the present-peer bar.
     pub contract_estimable_refits: u64,
+    /// Learned residuals actually adjusted by a contract effect, and scored
+    /// forecasts that actually carried a contract offset. These, not
+    /// `contract_estimable_refits`, distinguish a term that worked from one
+    /// that was estimable and moved nothing.
+    pub contract_effects_applied: u64,
+    pub contract_forecast_offsets: u64,
+    /// Contracts that qualified for `tau2_contract` at the last refit, and
+    /// present entries that informed the components.
+    pub contract_qualifying_contracts: u64,
+    pub contract_qualifying_entries: u64,
     /// Between-contract variance of the contract term at the last refit;
     /// `None` when the components are not estimable. The term produces no
     /// effect at all while this is absent or zero.
@@ -2056,7 +2123,13 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         let prior = self.prior(distance);
         if let Some(prior) = prior {
             let slot = self.peers.lookup(peer);
-            let prior = self.forecast_prior(prior, contract_location, now);
+            let offset_prior = self.forecast_prior(prior, contract_location, now);
+            if offset_prior != prior {
+                if let Some(table) = self.contracts.as_mut() {
+                    table.forecast_offsets += 1;
+                }
+            }
+            let prior = offset_prior;
             let forecasts: [Forecast; HORIZONS] =
                 std::array::from_fn(|level| self.forecast_with(level, slot, band, prior, now));
             let selected = forecasts[self.selected()];
@@ -2117,7 +2190,11 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                     if let Some(effect) =
                         table.leave_out_effect(Some(contract_slot as usize), Some(peer_id), now)
                     {
-                        adjusted = residual - effect;
+                        // The RAW effect is stored, so a later refit can see
+                        // the estimate this event was explained by; the BOUND
+                        // is applied where it is used.
+                        adjusted = residual - explaining_bound(effect, residual);
+                        table.effects_applied += 1;
                         if let Some(event) = self.fresh.last_mut() {
                             event.adjustment = effect as f32;
                         }
@@ -2313,6 +2390,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             return;
         };
         table.reset(now);
+        table.pairs_refused_last_refit = 0;
         events.clear();
         for event in prepared.iter() {
             if event.contract_slot == u32::MAX || event.slot == u32::MAX {
@@ -2348,7 +2426,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 }
                 pairs.push((peer_slot, generation, moments));
             }
-            table.refused_at_refit += table.rebuild_node(contract_slot, pairs) as u64;
+            table.pairs_refused_last_refit += table.rebuild_node(contract_slot, pairs) as u64;
         }
         table.components = table.compute_components();
         if table.components.is_some() {
@@ -2366,16 +2444,26 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 })
                 .flatten();
             let present = ((event.time - now) / CONTRACT_HORIZON_HOURS).exp() >= CONTRACT_PRESENCE;
-            let effect = (present && event.contract_slot != u32::MAX)
+            let fresh = (present && event.contract_slot != u32::MAX)
                 .then(|| table.leave_out_effect(Some(event.contract_slot as usize), peer, now))
                 .flatten();
-            match effect {
+            let stored = f64::from(source.adjustment);
+            let adjustment = match fresh {
+                // A contract effect that has changed SIGN describes a
+                // different regime from the one this event was learned in:
+                // the usual cause is a contract that has recovered while this
+                // event is still inside the presence window, where the fresh
+                // successes outweigh the decayed storm. Keep the value from
+                // the event's own era rather than re-scoring it against a
+                // state it never saw.
+                Some(effect) if stored != 0.0 && effect * stored < 0.0 => stored,
                 Some(effect) => {
                     source.adjustment = effect as f32;
-                    event.residual -= effect;
+                    effect
                 }
-                None => event.residual -= source.adjustment as f64,
-            }
+                None => stored,
+            };
+            event.residual -= explaining_bound(adjustment, event.residual);
         }
     }
 
@@ -2435,14 +2523,33 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 .as_ref()
                 .map_or(0, |table| table.table.evictions),
             contract_residuals_refused: self.contracts.as_ref().map_or(0, |table| table.refused),
-            contract_refit_pairs_refused: self
+            contract_pairs_refused_last_refit: self
                 .contracts
                 .as_ref()
-                .map_or(0, |table| table.refused_at_refit),
+                .map_or(0, |table| table.pairs_refused_last_refit),
+            contract_entries_displaced: self.contracts.as_ref().map_or(0, |table| table.displaced),
             contract_estimable_refits: self
                 .contracts
                 .as_ref()
                 .map_or(0, |table| table.estimable_refits),
+            contract_effects_applied: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.effects_applied),
+            contract_forecast_offsets: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.forecast_offsets),
+            contract_qualifying_contracts: self
+                .contracts
+                .as_ref()
+                .and_then(|table| table.components)
+                .map_or(0, |c| c.qualifying_contracts),
+            contract_qualifying_entries: self
+                .contracts
+                .as_ref()
+                .and_then(|table| table.components)
+                .map_or(0, |c| c.qualifying_entries),
             contract_tau2: self
                 .contracts
                 .as_ref()
@@ -2479,6 +2586,43 @@ pub(crate) struct Estimate {
     /// Effective transfer speed in bytes/s: the reciprocal of `E[1/speed]`, so
     /// that `bytes / speed` is the expected transfer time.
     pub transfer_speed_bps: Option<f64>,
+}
+
+/// The part of `residual` a contract adjustment is allowed to remove.
+///
+/// Explaining away may neutralise an event's evidence but must never INVERT
+/// it: a failure must not be learned as evidence of success, nor a success as
+/// evidence of failure. So the adjustment is clamped into the closed interval
+/// between 0 and the event's own residual, and the adjusted residual therefore
+/// keeps the residual's sign or is exactly zero.
+///
+/// Two defects this bounds, both from the 2026-09-17 round-2 review:
+///
+/// - a contract that RECOVERS while an event is still inside the presence
+///   window makes `leave_out_effect` return a value of the OPPOSITE sign,
+///   dominated by the fresh successes. Subtracting that from a storm-era
+///   failure charges the peer MORE than its own raw residual, which is worse
+///   than not having the term at all. The sign-flip guard in
+///   [`Stage::apply_contract_term`] is the first line against this; the bound
+///   is the backstop, and it also covers the live path, where there is no
+///   stored value to compare against.
+/// - a stored adjustment is an absolute offset in residual space, while
+///   `prepare` re-anchors every residual on the CURRENT curve at each refit,
+///   so a frozen adjustment and the residual it is subtracted from drift onto
+///   different baselines. The bound does not remove that drift; it stops the
+///   drift from inverting an event's evidence, which is the harmful end of it.
+///   Storing the adjustment curve-relative would remove it and is the
+///   alternative not taken here, because it changes what the stored value
+///   means on every path at once.
+fn explaining_bound(adjustment: f64, residual: f64) -> f64 {
+    if !adjustment.is_finite() {
+        return 0.0;
+    }
+    if residual >= 0.0 {
+        adjustment.clamp(0.0, residual)
+    } else {
+        adjustment.clamp(residual, 0.0)
+    }
 }
 
 /// Slope of [`ranking_failure_probability`] above 1.
@@ -2639,12 +2783,20 @@ impl HierarchicalRouting {
         // Read the counters directly. `diagnostics()` builds a 15-field struct
         // and walks the peer index, and this runs per learned event under the
         // router's write lock.
-        let (refused, refused_at_refit) = self
-            .failure
-            .contracts
-            .as_ref()
-            .map_or((0, 0), |table| (table.refused, table.refused_at_refit));
-        if evictions == self.evictions_at_last_log && refused == self.refusals_at_last_log {
+        let (refused, refused_last_refit, displaced) =
+            self.failure.contracts.as_ref().map_or((0, 0, 0), |table| {
+                (
+                    table.refused,
+                    table.pairs_refused_last_refit,
+                    table.displaced,
+                )
+            });
+        // Gate on every saturation the message names, not only evictions and
+        // live refusals: a node whose only saturation is refit drops, or
+        // displacement of live entries, would otherwise stay silent while the
+        // message advertises "contract entries full".
+        let saturation = refused + refused_last_refit + displaced;
+        if evictions == self.evictions_at_last_log && saturation == self.refusals_at_last_log {
             return;
         }
         let due = self
@@ -2659,14 +2811,15 @@ impl HierarchicalRouting {
             peer_capacity = self.failure.peers.capacity,
             contract_residuals_refused_total = refused,
             contract_residuals_refused_since_last_notice = refused - self.refusals_at_last_log,
-            contract_refit_pairs_refused_total = refused_at_refit,
+            contract_pairs_refused_last_refit = refused_last_refit,
+            contract_entries_displaced_total = displaced,
             contract_entries = CONTRACT_ENTRIES,
             "hierarchical routing estimator: peer table full, evicting least-recently-used \
              peers, or contract entries full"
         );
         self.last_saturation_log = Some(time);
         self.evictions_at_last_log = evictions;
-        self.refusals_at_last_log = refused;
+        self.refusals_at_last_log = saturation;
     }
 
     pub(crate) fn total_evictions(&self) -> u64 {

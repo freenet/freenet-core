@@ -83,6 +83,39 @@ impl Computation {
     }
 }
 
+/// The contract term's activation, in the order a reader needs it: whether it
+/// could produce an effect at all, and then whether it actually did.
+///
+/// The estimable-refit count on its own does NOT answer "is the term doing
+/// anything": the effect is also refused per query when a contract has too few
+/// present peers, and on the recorded soak most failures are on contracts that
+/// never reach that bar. So the applied counts come first in the sentence.
+/// `tau2_contract` is shown with the number of contracts it rests on, because
+/// it has no minimum group count and one contract reads the same as eighty.
+fn fmt_contract_term(rs: &crate::router::RouterSnapshotInfo) -> String {
+    if rs.hierarchical_contract_estimable_refits == 0 {
+        return format!(
+            "never estimable ({} contracts tracked, {} evicted) &mdash; the term has not been \
+             able to produce an effect on this node",
+            rs.hierarchical_contracts, rs.hierarchical_contract_evictions
+        );
+    }
+    let tau2 = match rs.hierarchical_contract_tau2 {
+        Some(value) => format!(
+            "between-contract variance {value:.4} over {} contracts, {} entries",
+            rs.hierarchical_contract_qualifying_contracts,
+            rs.hierarchical_contract_qualifying_entries
+        ),
+        None => "no components at the last refit".to_string(),
+    };
+    format!(
+        "{} residuals adjusted, {} forecasts offset; estimable at {} refits; {tau2}",
+        rs.hierarchical_contract_effects_applied,
+        rs.hierarchical_contract_forecast_offsets,
+        rs.hierarchical_contract_estimable_refits,
+    )
+}
+
 /// Render one hierarchical reading according to whether it is live.
 fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> String {
     match state {
@@ -359,6 +392,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
                     <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
                     <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
+                    <div class="info-label">Contract term: did it move anything?</div><div class="info-value">{contract_term}</div>
                     <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
                     <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
                     <div class="info-label">Response-time error, RMS seconds</div><div class="info-value">{timing_error}</div>
@@ -448,6 +482,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     rs.hierarchical_peer_capacity,
                 )
             }),
+            contract_term = hierarchical_reading(state, || fmt_contract_term(rs)),
             hierarchical_eval =
                 hierarchical_reading(state, || { rs.hierarchical_failure_evaluated.to_string() }),
             timing_error = hierarchical_reading(state, || fmt_seconds_error(
@@ -908,6 +943,7 @@ mod tests {
             "hierarchical_eval =",
             "hierarchical_horizon =",
             "hierarchical_evictions =",
+            "contract_term =",
             "shape_response =",
             "shape_transfer =",
             "timing_error =",

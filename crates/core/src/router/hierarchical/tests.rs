@@ -1626,6 +1626,27 @@ fn routing_estimate_cost_per_candidate() {
             .is_some_and(|components| components.tau2_contract > 0.0),
         "the term must be active, or this measures a cost it is absent from"
     );
+    // Estimable components are necessary and not sufficient: the effect is
+    // also refused per query below the present-peer bar, so assert a queried
+    // contract really carries an offset.
+    let now = WINDOW_EVENTS as f64 / 600.0;
+    let offered = contracts
+        .iter()
+        .filter(|contract| {
+            routing
+                .failure
+                .contracts
+                .as_ref()
+                .and_then(|table| table.shared_effect(contract.to_bits(), now))
+                .is_some()
+        })
+        .count();
+    assert!(
+        offered > contracts.len() / 4,
+        "the queried contracts must actually carry an offset, or the cost \
+         excludes the work being measured: {offered} of {}",
+        contracts.len()
+    );
     let queries = 25_000;
     let start = std::time::Instant::now();
     let mut available = 0;
@@ -2421,9 +2442,9 @@ fn the_refit_keeps_a_contracts_heaviest_peers_not_the_nearest() {
     // live ones. Four pairs are outside the heaviest eight at every refit.
     let diagnostics = stage.diagnostics();
     assert!(
-        diagnostics.contract_refit_pairs_refused >= 4,
+        diagnostics.contract_pairs_refused_last_refit >= 4,
         "the refit's discards must be counted: {}",
-        diagnostics.contract_refit_pairs_refused
+        diagnostics.contract_pairs_refused_last_refit
     );
 }
 
@@ -2691,6 +2712,199 @@ fn an_event_outside_the_presence_window_keeps_its_stored_adjustment() {
         fresh > 0.1,
         "an event inside the presence window must still be adjusted: {fresh}"
     );
+}
+
+/// H1 of the 2026-09-17 round-2 review: a contract that RECOVERS while a
+/// storm-era event is still inside the presence window.
+///
+/// The trace the review gives: contract C is dead, peer P fails it, refits
+/// during the storm set P's event's adjustment to a large POSITIVE value
+/// (correct, the failure is explained away). C then recovers and several peers
+/// succeed on it. At the next refit P's event is still inside the presence
+/// window, so it is re-scored, `leave_out_effect` now returns a value
+/// dominated by the fresh successes, and the adjustment is overwritten with a
+/// NEGATIVE number. `residual -= adjustment` then RAISES what the levels
+/// learn: the dead-contract failure is charged back to the peer with interest.
+/// The finding-4 fix made that permanent, because once the event leaves the
+/// presence window the wrong value is frozen and re-applied at every later
+/// refit.
+///
+/// Two guards, both asserted here: the sign-flip guard keeps the value from
+/// the event's own era, and [`explaining_bound`] makes it impossible for any
+/// adjustment to invert an event's evidence whatever else goes wrong.
+///
+/// No previous test reached this: the two that age a contract out use
+/// `background`, which draws a unique contract per event, so the dead contract
+/// never receives fresh evidence.
+#[test]
+fn a_contract_that_recovers_does_not_charge_its_storm_failures_back() {
+    let _guard = GlobalRng::seed_guard(0x4485_c016);
+    let dead = 0.37;
+    // A high baseline failure rate at every distance, so the curve sits well
+    // above zero and a SUCCESS carries a real negative residual. With
+    // `background`'s 2% floor the curve is near zero at the test's distance,
+    // successes are worth about -0.03 against a failure's +0.97, and no amount
+    // of recovery can outweigh the storm, so the defect is unreachable.
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    let filler: Vec<Step> = (0..1_800)
+        .map(|i| Step {
+            peer: GlobalRng::random_range(10..40u32),
+            contract: uniform(),
+            distance: uniform() * 0.5,
+            failed: uniform() < 0.3,
+            hours: i as f64 / 900.0,
+        })
+        .collect();
+    feed(&mut [&mut with_term, &mut without_term], filler);
+
+    // The storm: peers 0 to 5 all fail the contract over six minutes.
+    // Four OTHER contracts stay dead throughout, which is what keeps
+    // `tau2_contract` positive while the contract under test recovers. With
+    // `background`'s unique contract per event, the contract under test is
+    // otherwise the only qualifying group, and a recovered contract's own
+    // mean then drives the between-contract variance to zero and switches the
+    // term off before the defect can be reached.
+    let mut storm = Vec::new();
+    for peer in 0..6u32 {
+        storm.extend(on_contract(peer, dead, true, 6, 2.0, 0.1));
+    }
+    for (index, other) in [0.34f64, 0.345, 0.35, 0.355].iter().enumerate() {
+        for peer in 30..36u32 {
+            storm.extend(on_contract(
+                peer + index as u32 * 6,
+                *other,
+                true,
+                6,
+                2.0,
+                0.5,
+            ));
+        }
+    }
+    feed(&mut [&mut with_term, &mut without_term], storm);
+    let slot = stage_slot(&with_term, 0);
+    let seq = with_term
+        .sorted
+        .iter()
+        .filter(|event| event.slot == slot && event.time >= 2.0)
+        .map(|event| event.seq)
+        .next()
+        .expect("peer 0's storm event is in the window");
+    let event_at = move |stage: &Stage<u32>| {
+        *stage
+            .sorted
+            .iter()
+            .find(|event| event.seq == seq)
+            .expect("the event is still in the window")
+    };
+    let storm_adjustment = event_at(&with_term).adjustment;
+    assert!(
+        storm_adjustment > 0.3,
+        "the storm must explain the failure away, or this test proves nothing: \
+         {storm_adjustment}"
+    );
+
+    // The recovery, INSIDE the presence window: 0.35 h after the event, which
+    // is 0.7 contract horizons, so the event's own weight is still 0.50,
+    // comfortably above the 0.05 presence cut, while the fresh successes are
+    // several times heavier than the decayed storm.
+    let mut recovery = Vec::new();
+    for peer in 6..12u32 {
+        recovery.extend(on_contract(peer, dead, false, 8, 2.45, 0.05));
+    }
+    let now = feed(&mut [&mut with_term, &mut without_term], recovery);
+    let event = event_at(&with_term);
+    let age = now - event.time;
+    assert!(
+        (-age / CONTRACT_HORIZON_HOURS).exp() > CONTRACT_PRESENCE,
+        "the storm event must still be INSIDE the presence window, or the \
+         freeze hides the overwrite: age {age} h"
+    );
+    let table = with_term
+        .contracts
+        .as_ref()
+        .expect("the failure stage has a term");
+    let node = table
+        .table
+        .lookup(&dead.to_bits())
+        .expect("the dead contract is still tracked");
+    let present = table.nodes[node]
+        .entries
+        .iter()
+        .filter(|entry| entry.used())
+        .count();
+    let fresh_effect = table
+        .leave_out_effect(
+            Some(event.contract_slot as usize),
+            Some((event.slot, event.generation)),
+            now,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the recovered contract still has present evidence: node {node}, \
+                 {present} used entries, live {}, components {:?}",
+                table.live(event.contract_slot, event.contract_generation),
+                table.components
+            )
+        });
+    assert!(
+        fresh_effect < 0.0,
+        "the recovery must make the CURRENT effect negative, or this test \
+         cannot reach the defect: {fresh_effect}"
+    );
+
+    // The guard: the stored adjustment keeps the storm's sign and magnitude.
+    let after = event_at(&with_term).adjustment;
+    assert_eq!(
+        after.to_bits(),
+        storm_adjustment.to_bits(),
+        "an effect that has changed sign describes a different regime, so the \
+         event must keep the value from its own era (was {storm_adjustment}, \
+         current effect {fresh_effect})"
+    );
+
+    // And the property that matters, whatever the adjustment: peer 0 must
+    // never be charged MORE than the control stage charges it, which is what
+    // a negative adjustment would do.
+    let charged = without_term.levels[0].nodes[slot as usize].peer.sum;
+    let applied = with_term.levels[0].nodes[slot as usize].peer.sum;
+    assert!(
+        applied <= charged + 1e-9,
+        "explaining away must never charge a peer MORE than its raw residuals: \
+         with term {applied}, control {charged}"
+    );
+}
+
+/// The backstop for the above, as an invariant rather than a scenario: an
+/// adjustment may neutralise an event's evidence and must never invert it.
+#[test]
+fn an_adjustment_can_neutralise_evidence_but_never_invert_it() {
+    // A failure's residual is positive; a negative effect must not be applied,
+    // and an over-large positive one is capped at the residual.
+    assert_eq!(explaining_bound(-0.4, 0.9), 0.0);
+    assert_eq!(explaining_bound(0.5, 0.9), 0.5);
+    assert_eq!(explaining_bound(1.4, 0.9), 0.9);
+    // A success's residual is negative, and the mirror image holds.
+    assert_eq!(explaining_bound(0.4, -0.3), 0.0);
+    assert_eq!(explaining_bound(-0.2, -0.3), -0.2);
+    assert_eq!(explaining_bound(-0.9, -0.3), -0.3);
+    // Non-finite adjustments remove nothing.
+    assert_eq!(explaining_bound(f64::NAN, 0.9), 0.0);
+    assert_eq!(explaining_bound(f64::INFINITY, 0.9), 0.0);
+    // The invariant, over a grid: the adjusted residual keeps the residual's
+    // sign or is exactly zero, and never grows in magnitude.
+    for residual in [-1.0, -0.3, -1e-9, 0.0, 1e-9, 0.3, 1.0] {
+        for adjustment in [-2.0, -0.5, 0.0, 0.5, 2.0] {
+            let adjusted = residual - explaining_bound(adjustment, residual);
+            assert!(
+                adjusted * residual >= 0.0,
+                "{residual} - bound({adjustment}) = {adjusted} inverted the evidence"
+            );
+            assert!(
+                adjusted.abs() <= residual.abs() + 1e-12,
+                "{residual} - bound({adjustment}) = {adjusted} grew the evidence"
+            );
+        }
+    }
 }
 
 /// Finding 5 of the 2026-09-17 review: peer eviction cleared the levels and
@@ -2978,11 +3192,135 @@ fn contract_components_need_within_cell_replication() {
     // One replicated cell is still not enough: the gate is on the POOLED
     // degrees of freedom, and one unit-weight cell of two events carries 1.
     let (slot, _) = table.touch(0);
-    assert!(table.add(slot, (0, 0), 1.0, 0.5));
+    assert!(table.add(slot, (0, 0), 1.0, 0.9));
     assert_eq!(table.compute_components(), None);
-    // A second one crosses it.
-    assert!(table.add(slot, (1, 0), 1.0, 0.5));
+    // A second one crosses it, and now there is within-cell variance to
+    // estimate, so components exist.
+    assert!(table.add(slot, (1, 0), 1.0, 0.9));
     assert!(table.compute_components().is_some());
+}
+
+/// What the shrinkage does and does not protect against, pinned because the
+/// 2026-09-17 round-2 review (finding F) proposed changing it and the change
+/// turned out to disable the mechanism on its own target case.
+///
+/// The observation is correct: when every `(contract, peer)` cell holds
+/// IDENTICAL residuals, the pooled within-cell variance is exactly 0, `sigma2`
+/// lands on the [`MIN_SIGMA2`] sentinel, the noise term is about 1e-10,
+/// `shrink` is about 1, and the other-peer mean is applied at FULL strength.
+///
+/// What the review's proposed fix, refusing on the sentinel, does to that: a
+/// contract several peers fail UNANIMOUSLY at one distance has identical
+/// residuals by construction, which is the storm the term exists for, so
+/// refusing there switches the term off on its target case. Measured: with
+/// that refusal in place the whole contract-term suite goes dark.
+///
+/// So the behaviour is kept and pinned here instead. Unanimous evidence is
+/// applied unshrunk; what bounds it is [`CONTRACT_MIN_OTHER_PEERS`] and
+/// [`CONTRACT_PRESENCE`], not the shrinkage. The regime is visible through
+/// `qualifying_contracts` and `qualifying_entries`.
+#[test]
+fn unanimous_evidence_is_applied_unshrunk_and_bounded_by_the_peer_bar() {
+    let mut table = ContractTable::new();
+    for contract in 0..40u64 {
+        let (slot, _) = table.touch(contract);
+        for peer in 0..CONTRACT_ENTRIES as u32 {
+            // Two events per cell with IDENTICAL values: replicated, so they
+            // pass `df >= 2`, and zero within-cell variance, so `ss` is 0.
+            for _ in 0..2 {
+                assert!(table.add(slot, (peer, 0), 1.0, 0.5 + f64::from(peer) * 0.1));
+            }
+        }
+    }
+    table.components = table.compute_components();
+    let components = table
+        .components
+        .expect("replicated cells cross the df gate");
+    assert_eq!(
+        components.sigma2, MIN_SIGMA2,
+        "identical residuals leave no within-cell variance, so sigma2 is the \
+         sentinel and not a measurement"
+    );
+    assert!(
+        components.qualifying_contracts >= 40,
+        "the components must rest on the whole table here: {}",
+        components.qualifying_contracts
+    );
+    let slot = table.table.lookup(&0).expect("contract 0 is tracked");
+    let raw = {
+        let (mut n, mut sum) = (0.0, 0.0);
+        for e in table.nodes[slot].entries.iter().filter(|e| e.used()) {
+            n += e.moments.n;
+            sum += e.moments.sum;
+        }
+        sum / n
+    };
+    let effect = table
+        .effect(Some(slot), ContractQuery::Shared, 0.0, 1)
+        .expect("present entries");
+    assert!(
+        (effect - raw).abs() < 0.02 * raw.abs(),
+        "unanimous evidence is applied essentially unshrunk: {effect} against \
+         a raw mean of {raw}"
+    );
+    // The bar, not the shrinkage, is what stops thin evidence being applied:
+    // one present peer never produces a shared effect.
+    let mut thin = ContractTable::new();
+    let (slot, _) = thin.touch(0);
+    for _ in 0..2 {
+        assert!(thin.add(slot, (0, 0), 1.0, 0.9));
+    }
+    thin.components = table.components;
+    assert_eq!(
+        thin.effect(
+            Some(slot),
+            ContractQuery::Shared,
+            0.0,
+            CONTRACT_MIN_OTHER_PEERS + 1
+        ),
+        None,
+        "one present peer must not reach the forecast bar however large its \
+         residuals are"
+    );
+
+    // With genuine within-cell variance the effect IS shrunk, so the
+    // shrinkage is alive and this test is not asserting it away.
+    let _guard = GlobalRng::seed_guard(0x4485_ce10);
+    let mut noisy = ContractTable::new();
+    for contract in 0..40u64 {
+        let (slot, _) = noisy.touch(contract);
+        for peer in 0..CONTRACT_ENTRIES as u32 {
+            for _ in 0..8 {
+                assert!(noisy.add(slot, (peer, 0), 1.0, 0.5 + 0.6 * normal()));
+            }
+        }
+    }
+    noisy.components = noisy.compute_components();
+    let components = noisy
+        .components
+        .expect("genuine within-cell variance is estimable");
+    assert!(
+        components.sigma2 > MIN_SIGMA2 * 1e6,
+        "{}",
+        components.sigma2
+    );
+    let slot = noisy.table.lookup(&0).expect("contract 0 is tracked");
+    let raw = {
+        let (mut n, mut sum) = (0.0, 0.0);
+        for e in noisy.nodes[slot].entries.iter().filter(|e| e.used()) {
+            n += e.moments.n;
+            sum += e.moments.sum;
+        }
+        sum / n
+    };
+    let effect = noisy
+        .effect(Some(slot), ContractQuery::Shared, 0.0, 1)
+        .expect("present entries");
+    assert!(
+        effect.abs() < 0.98 * raw.abs(),
+        "with real within-cell variance the effect must be SHRUNK: {effect} \
+         against {raw}"
+    );
 }
 
 /// Finding 8: the shrunk effect's arithmetic, pinned exactly. This is the
@@ -3009,6 +3347,8 @@ fn the_shrunk_contract_effect_matches_its_formula() {
         sigma2: 0.25,
         tau2_peer: 0.09,
         tau2_contract: 0.16,
+        qualifying_contracts: 1,
+        qualifying_entries: 3,
     };
     table.components = Some(components);
 
@@ -3065,6 +3405,172 @@ fn the_shrunk_contract_effect_matches_its_formula() {
         concentrated < 0.85 * spread,
         "one peer's evidence must be shrunk harder than four peers': \
          {concentrated} against {spread}"
+    );
+}
+
+/// Kish counting at the CONTRACT level, the twin of
+/// `kish_counting_recovers_tau2_at_a_short_horizon` for the peer levels.
+///
+/// Every other contract-component test adds at weight 1.0, where `w2 == n`
+/// and `effective_n() == n`, so the decayed-evidence arithmetic collapses to
+/// raw counts and four separate substitutions of `n` for `w2` survive the
+/// suite. The contract table runs the SHORTEST horizon in the system
+/// ([`CONTRACT_HORIZON_HOURS`], 0.5 h), so it is the level most exposed to the
+/// error the module docs describe: counting the raw weight sum overstates a
+/// short horizon's evidence by about 2x.
+///
+/// The weights here are the ones `apply_contract_term` really uses,
+/// `table.weight(t)` against an epoch of `now`. The event rate is deliberately
+/// low, about 2.5 units of weight per cell, because that is where the
+/// degrees-of-freedom term `n - w2/n` differs most from the raw `n - 1`.
+#[test]
+fn kish_counting_at_the_contract_level_recovers_the_components() {
+    let (hours, rate) = (6.0, 5.0);
+    let (sigma, tau_peer, tau_contract) = (1.0, 0.5, 0.4);
+    let seeds = 6u64;
+    let (mut s2, mut tp, mut tc) = (0.0, 0.0, 0.0);
+    for seed in 0..seeds {
+        let _guard = GlobalRng::seed_guard(0x4485_cd00 + seed);
+        let mut table = ContractTable::new();
+        table.reset(hours);
+        for contract in 0..80u64 {
+            let (slot, _) = table.touch(contract);
+            let contract_effect = tau_contract * normal();
+            for peer in 0..CONTRACT_ENTRIES as u32 {
+                let peer_effect = tau_peer * normal();
+                for _ in 0..(rate * hours) as usize {
+                    let t = uniform() * hours;
+                    assert!(table.add(
+                        slot,
+                        (peer, 0),
+                        table.weight(t),
+                        contract_effect + peer_effect + sigma * normal(),
+                    ));
+                }
+            }
+        }
+        // The scenario must actually exercise Kish counting, or the test is
+        // the unit-weight one again: the raw weight sum must overstate the
+        // effective size by roughly the 2x the module docs name.
+        let e = table.nodes[0].entries[0].moments;
+        assert!(
+            e.w2 / e.n < 0.75,
+            "the weights must be genuinely decayed, or this is the unit-weight \
+             test again (unit weights give w2/n exactly 1): w2/n {}",
+            e.w2 / e.n
+        );
+        let c = table
+            .compute_components()
+            .expect("a full table has components");
+        s2 += c.sigma2 / seeds as f64;
+        tp += c.tau2_peer / seeds as f64;
+        tc += c.tau2_contract / seeds as f64;
+    }
+    assert!((s2 - sigma * sigma).abs() < 0.06, "sigma2 {s2}");
+    assert!((tp - tau_peer * tau_peer).abs() < 0.08, "tau2_peer {tp}");
+    assert!(
+        (tc - tau_contract * tau_contract).abs() < 0.06,
+        "tau2_contract {tc}"
+    );
+}
+
+/// The other half of Kish counting, which a tolerance cannot catch: a cell
+/// whose RAW weight sum clears [`MIN_EFFECTIVE_N`] but whose effective size
+/// does not must NOT count as replicated. Under decay that is the ordinary
+/// case, because one recent event plus a tail of old ones sums to more than it
+/// is worth.
+#[test]
+fn raw_weight_above_the_replication_floor_is_not_replication() {
+    // One heavy event and two light ones: raw sum 2.1, effective size 1.2.
+    let mut moments = Moments::default();
+    for weight in [1.9, 0.1, 0.1] {
+        moments.add(weight, 1.0);
+    }
+    assert!(
+        moments.n > MIN_EFFECTIVE_N,
+        "the raw sum must clear the floor, or this test proves nothing: {}",
+        moments.n
+    );
+    assert!(
+        moments.effective_n() < MIN_EFFECTIVE_N,
+        "{}",
+        moments.effective_n()
+    );
+    assert!(!moments.replicated());
+
+    // And at the contract level: a table in which EVERY cell has that shape
+    // carries no within-cell replication, so there is no sigma2 to estimate.
+    let mut table = ContractTable::new();
+    for contract in 0..40u64 {
+        let (slot, _) = table.touch(contract);
+        for peer in 0..CONTRACT_ENTRIES as u32 {
+            for weight in [1.9, 0.1, 0.1] {
+                assert!(table.add(slot, (peer, 0), weight, 1.0));
+            }
+        }
+    }
+    // The per-contract totals ARE replicated, so nothing else stops this.
+    let total: f64 = table.nodes[0].entries.iter().map(|e| e.moments.n).sum();
+    assert!(total > 16.0, "{total}");
+    assert_eq!(
+        table.compute_components(),
+        None,
+        "raw weight above the floor is not within-cell replication"
+    );
+}
+
+/// `tau2_contract` contrasts each contract's mean with ZERO, not with a grand
+/// mean over contracts, and this is the case that tells the two apart: a
+/// population of contracts whose effects are all shifted POSITIVE.
+///
+/// Against zero the estimator recovers the second moment `E[c^2] = mean^2 +
+/// var`; against a grand mean it would recover only `var`, the spread about
+/// the shift. The distinction is the whole point of the convention and it
+/// bites in exactly the regime this PR targets: under network-wide degradation
+/// the grand mean is pulled up by the same dead contracts it is meant to
+/// measure, `tau2_contract` collapses toward zero, `shrink` goes to zero with
+/// it, and the term silently stops producing any effect.
+///
+/// The existing tests cannot see this: the recovery test draws zero-centred
+/// effects, where the two forms agree, and the negative control has no
+/// contract effect at all.
+#[test]
+fn tau2_contract_is_the_second_moment_about_zero_not_about_a_grand_mean() {
+    let (shift, spread, sigma) = (0.3, 0.2, 0.5);
+    let seeds = 8u64;
+    let mut tc = 0.0;
+    for seed in 0..seeds {
+        let _guard = GlobalRng::seed_guard(0x4485_cdc0 + seed);
+        let mut table = ContractTable::new();
+        for contract in 0..120u64 {
+            let (slot, _) = table.touch(contract);
+            // Every contract sits ABOVE zero, so the grand mean is about
+            // `shift` and the spread about it is much smaller than the spread
+            // about zero.
+            let contract_effect = shift + spread * normal();
+            for peer in 0..CONTRACT_ENTRIES as u32 {
+                for _ in 0..30 {
+                    assert!(table.add(slot, (peer, 0), 1.0, contract_effect + sigma * normal()));
+                }
+            }
+        }
+        tc += table
+            .compute_components()
+            .expect("a full table has components")
+            .tau2_contract
+            / seeds as f64;
+    }
+    let about_zero = shift * shift + spread * spread;
+    let about_the_grand_mean = spread * spread;
+    assert!(
+        (tc - about_zero).abs() < 0.03,
+        "tau2_contract must be the second moment about ZERO ({about_zero}), got {tc}"
+    );
+    assert!(
+        tc > about_the_grand_mean + 3.0 * 0.03,
+        "and must be well clear of the variance about the grand mean \
+         ({about_the_grand_mean}), or this test cannot tell the two forms \
+         apart: got {tc}"
     );
 }
 
@@ -3375,7 +3881,7 @@ fn a_shared_contract_effect_reweights_peers_that_differ_in_response_time() {
         // binds, the RANKING value moves by the slope rather than by the
         // effect, so the shared effect is no longer a common delta. That is a
         // separate mechanism, pinned by
-        // `estimate_ranks_peers_whose_forecasts_clamp_at_one`.
+        // `routing_cost_ranks_peers_whose_forecasts_clamp_at_one`.
         let unclamped = |estimate: &Estimate| {
             estimate
                 .failure_probability
