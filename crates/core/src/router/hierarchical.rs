@@ -369,6 +369,35 @@ const MIN_EFFECTIVE_N: f64 = 2.0;
 /// treated as absent, as in the validated reference (`NODE_MIN`).
 const NODE_MIN: f64 = 1e-12;
 
+/// Smallest within-cell variance a Bernoulli outcome can credibly have after
+/// `n_eff` effective observations.
+///
+/// A cell whose observations are unanimous has a sample variance of exactly 0,
+/// and for a 0/1 target that is not evidence that the underlying probability is
+/// degenerate: it is what a moderate `p` looks like in a small sample. The
+/// Laplace-smoothed rate after `k` successes in `n` trials is `(k+1)/(n+2)`, so
+/// a unanimous sample gives `p~ = (n+1)/(n+2)` and a variance of
+/// `p~(1-p~) = (n+1)/(n+2)^2`, which is bounded above by and close to
+/// `1/(n+2)`. That is the form used here: parameter-free, monotone decreasing
+/// in evidence, and it needs nothing the entries do not already carry.
+///
+/// What it buys, which is the whole point: the noise a query subtracts is
+/// `sigma2 * w2/n^2 + ...`, so it falls as `1 / n_eff`. Two barely-replicated
+/// cells therefore give a floor of about 0.25 and a heavily shrunk effect,
+/// while a dead contract with several peers and many events each gives a floor
+/// an order of magnitude smaller against a much larger `n_eff`, leaving the
+/// effect close to full strength. Pinned in both regimes by
+/// `the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract`.
+fn bernoulli_variance_floor(effective_n: f64) -> f64 {
+    // NaN or a non-positive effective size means no usable evidence, so take
+    // the Bernoulli maximum. Written with `is_finite` rather than a negated
+    // comparison so clippy's partial-order lint is satisfied.
+    if !effective_n.is_finite() || effective_n <= 0.0 {
+        return 0.25;
+    }
+    1.0 / (effective_n + 2.0)
+}
+
 /// A peer is left out of `tau2_peer` when the rest of the root holds less than
 /// this share of its weight: the leave-one-out sums would be cancellation noise.
 const ROOT_REST_FLOOR: f64 = 1e-6;
@@ -1541,13 +1570,16 @@ impl ContractTable {
     fn compute_components(&self) -> Option<ContractComponents> {
         let present = |e: &ContractEntry| e.used() && e.moments.n >= CONTRACT_PRESENCE;
         let (mut ss, mut df) = (0.0, 0.0);
+        let mut floor_acc = 0.0;
         let mut entries_present = 0u64;
         for node in &self.nodes {
             for e in node.entries.iter().filter(|e| present(e)) {
                 entries_present += 1;
                 if e.moments.replicated() {
+                    let cell_df = e.moments.n - e.moments.w2 / e.moments.n;
                     ss += (e.moments.sumsq - e.moments.sum * e.moments.sum / e.moments.n).max(0.0);
-                    df += e.moments.n - e.moments.w2 / e.moments.n;
+                    df += cell_df;
+                    floor_acc += cell_df * bernoulli_variance_floor(e.moments.effective_n());
                 }
             }
         }
@@ -1571,7 +1603,20 @@ impl ContractTable {
         // by the shrinkage. Pinned by
         // `unanimous_evidence_is_applied_unshrunk_and_bounded_by_the_peer_bar`,
         // and the regime is visible through `qualifying_contracts`.
-        let sigma2 = (ss / df).max(MIN_SIGMA2);
+        // The failure target is a PROBABILITY, so the within-cell variance of
+        // an outcome is `p(1-p)`, never zero: unanimity in a small sample is
+        // the expected appearance of a moderate `p`, not evidence of a
+        // degenerate one. `MIN_SIGMA2` is a numerical sentinel standing in for
+        // that statistical quantity, which is why it behaves so badly here (a
+        // contract several peers fail unanimously at one distance has
+        // IDENTICAL residuals, so `ss` is exactly 0 by construction). Floor it
+        // on evidence QUANTITY instead, which is what separates the two cases:
+        // the degenerate one is a couple of barely-replicated cells crossing
+        // `df >= 2` in a table of any size, the target one is several peers
+        // each seen repeatedly on one contract. See
+        // [`bernoulli_variance_floor`]. Contract table only: the timing stages
+        // model logs rather than probabilities and have no contract table.
+        let sigma2 = (ss / df).max(floor_acc / df);
 
         // tau2_peer: each replicated entry against the SUM of the other present
         // entries of its contract (leave-one-out, summed rather than
@@ -1623,7 +1668,20 @@ impl ContractTable {
             acc += mean * mean - noise;
             den += 1.0;
         }
-        let tau2_contract = if den > 0.0 { (acc / den).max(0.0) } else { 0.0 };
+        // At least TWO qualifying contracts, for the same reason as the
+        // `df >= 2.0` gate two blocks above: a between-group variance
+        // estimated from ONE group is not a variance, it is that group's own
+        // mean, and it then un-shrinks every other contract's effect. On the
+        // recorded gateway streams this costs nothing (52 to 76 qualifying
+        // contracts measured); on the quietest nodes it correctly switches the
+        // term off, which is the honest outcome when one contract cannot tell
+        // you how contracts vary. `qualifying_contracts` is exported so the
+        // regime stays visible.
+        let tau2_contract = if den >= 2.0 {
+            (acc / den).max(0.0)
+        } else {
+            0.0
+        };
 
         [sigma2, tau2_peer, tau2_contract]
             .iter()
