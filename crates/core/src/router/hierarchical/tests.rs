@@ -2146,6 +2146,66 @@ fn a_peer_failing_a_contract_others_serve_is_charged_to_that_peer() {
     );
 }
 
+/// The two bars are DIFFERENT, and the difference is the point: learning
+/// needs [`CONTRACT_MIN_OTHER_PEERS`] peers EXCLUDING the acting peer, while a
+/// forecast offset needs one more, INCLUDING it.
+///
+/// Pinned as a unit fact because the stage-level test below cannot see it: it
+/// asserts the acting peer's own adjustment, which is the LEARNING path.
+/// Mutations of `shared_effect`'s `min_peers` therefore survived it (measured,
+/// 2026-09-17 round-2 mutation run at `282be3a67`), and this closes them.
+#[test]
+fn the_forecast_bar_is_one_peer_higher_than_the_learning_bar() {
+    let mut table = ContractTable::new();
+    let key = 0.25f64.to_bits();
+    let (slot, _) = table.touch(key);
+    table.components = Some(ContractComponents {
+        sigma2: 0.25,
+        tau2_peer: 0.0,
+        tau2_contract: 0.16,
+        qualifying_contracts: 2,
+        qualifying_entries: 4,
+    });
+    // Exactly CONTRACT_MIN_OTHER_PEERS present peers on the contract.
+    for peer in 0..CONTRACT_MIN_OTHER_PEERS as u32 {
+        assert!(table.add(slot, (peer, 0), 1.0, 0.9));
+        assert!(table.add(slot, (peer, 0), 1.0, 0.9));
+    }
+    // Learning: a third peer's residual IS adjusted, because the two present
+    // peers are both "other" peers to it.
+    assert!(
+        table
+            .leave_out_effect(Some(slot), Some((99, 0)), 0.0)
+            .is_some(),
+        "two other present peers must reach the LEARNING bar"
+    );
+    // Forecast: the same two peers are NOT enough, because the bar counts the
+    // candidate too.
+    assert_eq!(
+        table.shared_effect(key, 0.0),
+        None,
+        "two present peers must NOT reach the FORECAST bar, which is one higher"
+    );
+    // One more present peer, and the forecast offset appears.
+    assert!(table.add(slot, (50, 0), 1.0, 0.9));
+    assert!(table.add(slot, (50, 0), 1.0, 0.9));
+    assert!(
+        table.shared_effect(key, 0.0).is_some(),
+        "three present peers must reach the forecast bar"
+    );
+    // And one present peer reaches neither.
+    let mut thin = ContractTable::new();
+    let (thin_slot, _) = thin.touch(key);
+    thin.components = table.components;
+    assert!(thin.add(thin_slot, (0, 0), 1.0, 0.9));
+    assert_eq!(thin.shared_effect(key, 0.0), None);
+    assert_eq!(
+        thin.leave_out_effect(Some(thin_slot), Some((99, 0)), 0.0),
+        None,
+        "one other present peer must not reach the learning bar either"
+    );
+}
+
 /// The minimum-other-peers rule: one other failing peer cannot tell a dead
 /// contract from a bad peer, so it explains nothing. A second one does.
 #[test]
