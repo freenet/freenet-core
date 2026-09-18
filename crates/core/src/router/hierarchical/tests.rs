@@ -5173,3 +5173,106 @@ fn an_effect_the_bound_refuses_does_not_count_as_applied() {
         "and one agreeing with it does, so the two cases are distinguishable"
     );
 }
+
+/// C1 of the 2026-09-18 round-3 testing review, at the CALL SITES rather than
+/// on the helper.
+///
+/// `explaining_bound` had an exhaustive unit test and both of its call sites
+/// were still unpinned: reverting the learn site to `residual - effect` or the
+/// refit site to `residual -= adjustment` left the whole suite green (measured
+/// twice, at `450462896` and again at `9ad70135b` after the first attempt at
+/// closing it, which asserted on the helper and therefore did not touch this).
+/// A guard on one layer says nothing about the layer above it.
+///
+/// The case the bound exists for needs three things at once, which is why no
+/// existing test reached it: the term has to be ACTIVE (a real between-contract
+/// spread, or every effect is `None`), the acting peer's residual has to have
+/// the OPPOSITE sign to its contract's effect, and the comparison has to be
+/// against a control stage rather than against a recomputed expectation.
+///
+/// Peer 0 FAILS a contract that four other peers SUCCEED on. Its residual is
+/// positive and the leave-one-out effect is negative, so the bound must remove
+/// NOTHING: peer 0's level sum has to equal the no-term control exactly. Drop
+/// either bound and the negative effect is subtracted instead, which charges
+/// peer 0 MORE than its own residuals justify, and the equality fails.
+#[test]
+fn neither_bound_call_site_may_charge_a_peer_more_than_its_own_residual() {
+    let _guard = GlobalRng::seed_guard(0x4485_c1b0);
+    let target = 0.61;
+
+    // A real between-contract spread: eight contracts everyone fails and eight
+    // everyone succeeds on. Without this `tau2_contract` is zero and every
+    // effect is `None`, which is the regime
+    // `a_peer_failing_a_contract_others_serve_is_charged_to_that_peer` turned
+    // out to be in.
+    let mut steps = Vec::new();
+    for index in 0..8u32 {
+        let failing = 0.05 + 0.01 * f64::from(index);
+        let winning = 0.30 + 0.01 * f64::from(index);
+        for peer in 10..13u32 {
+            steps.extend(on_contract(peer, failing, true, 6, 0.0, 0.4));
+            steps.extend(on_contract(peer, winning, false, 6, 0.0, 0.4));
+        }
+    }
+    // The target contract: four peers succeed on it, so its effect is negative.
+    for peer in 20..24u32 {
+        steps.extend(on_contract(peer, target, false, 6, 0.5, 0.3));
+    }
+    // Then peer 0 fails there. Peer 0 appears NOWHERE else, so its level sum is
+    // exactly these events' adjusted residuals.
+    steps.extend(on_contract(0, target, true, 4, 0.9, 0.1));
+    // More traffic, so at least one refit re-adjusts the window and the refit
+    // call site is exercised as well as the learn one.
+    for index in 0..8u32 {
+        let failing = 0.05 + 0.01 * f64::from(index);
+        let winning = 0.30 + 0.01 * f64::from(index);
+        for peer in 10..13u32 {
+            steps.extend(on_contract(peer, failing, true, 6, 1.1, 0.4));
+            steps.extend(on_contract(peer, winning, false, 6, 1.1, 0.4));
+        }
+    }
+
+    let (mut with_term, mut without_term) = failure_stage_pair();
+    feed(&mut [&mut with_term, &mut without_term], steps);
+
+    // The term must be active, or this test cannot see the bound at all.
+    let table = with_term.contracts.as_ref().expect("a contract table");
+    let components = table.components.expect("components at the last refit");
+    assert!(
+        components.tau2_contract > 0.0,
+        "the contracts must differ or every effect is None: {components:?}"
+    );
+    let slot = table
+        .table
+        .lookup(&target.to_bits())
+        .expect("the target contract is tracked");
+    let peer_zero = with_term
+        .peers
+        .lookup(&0)
+        .and_then(|index| with_term.peers.generation(index).map(|g| (index as u32, g)));
+    let effect = table
+        .effect(Some(slot), ContractQuery::LeaveOut(peer_zero), 1.5, 1)
+        .expect("four other peers are present on the target");
+    assert!(
+        effect < -0.01,
+        "leaving peer 0 out leaves four successes, so the effect must be \
+         clearly negative or the bound has nothing to refuse: {effect}"
+    );
+
+    // Peer 0's residuals are POSITIVE (it failed), the effect is NEGATIVE, so
+    // the bound removes nothing and the two stages must agree exactly.
+    let slot_with = with_term.peers.lookup(&0).expect("peer 0 is tracked");
+    let slot_without = without_term.peers.lookup(&0).expect("peer 0 is tracked");
+    let applied = with_term.levels[0].nodes[slot_with].peer.sum;
+    let control = without_term.levels[0].nodes[slot_without].peer.sum;
+    assert!(
+        control > 0.05,
+        "sanity: peer 0's own failures must be worth something in the control, \
+         or the equality below holds trivially: {control}"
+    );
+    assert!(
+        (applied - control).abs() < 1e-9,
+        "an effect opposing peer 0's residuals must remove nothing at EITHER \
+         call site: with the term {applied}, control {control}, effect {effect}"
+    );
+}
