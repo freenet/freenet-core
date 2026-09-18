@@ -3583,6 +3583,63 @@ fn kish_counting_at_the_contract_level_recovers_the_components() {
     );
 }
 
+/// Every term of `compute_components`, pinned by exact arithmetic on a
+/// hand-computable table.
+///
+/// A recovery test cannot pin the NOISE forms, and the 2026-09-17 round-2
+/// mutation run proved it: substituting the raw count for the Kish count in
+/// `tau2_contract`'s noise moved the recovered value from 0.1874 to 0.1612
+/// against a truth of 0.16, so the mutant was CLOSER to the truth than the
+/// correct code and no tolerance around the truth could separate them. The
+/// sampling variance of a weighted mean is `sigma2 * sum w^2 / (sum w)^2`,
+/// which is `sigma2 / n_eff` and not `sigma2 / n`; that is a statement about
+/// the estimator, so it is pinned as one.
+///
+/// Two contracts, two peers each, two events per cell with weights 2 and 2 and
+/// values 1 and 0. Every quantity below is exact in binary floating point.
+#[test]
+fn contract_components_match_their_formulae_exactly() {
+    let mut table = ContractTable::new();
+    for contract in 0..2u64 {
+        let (slot, _) = table.touch(contract);
+        for peer in 0..2u32 {
+            assert!(table.add(slot, (peer, 0), 2.0, 1.0));
+            assert!(table.add(slot, (peer, 0), 2.0, 0.0));
+        }
+    }
+    let c = table.compute_components().expect("components exist");
+
+    // Per cell: n = 4, w2 = 8, sum = 2, sumsq = 2, so the within-cell sum of
+    // squares is 2 - 2^2/4 = 1 and the degrees of freedom are 4 - 8/4 = 2.
+    // Four cells: ss = 4, df = 8, sigma2 = 0.5. The Bernoulli floor is
+    // 1/(n_eff + 2) = 1/4 per cell, so 0.25 pooled, and the measured value
+    // wins.
+    assert_eq!(c.sigma2, 0.5);
+
+    // Every cell has the same mean, so every leave-one-out contrast is exactly
+    // zero and the estimator is minus the mean noise, floored at 0.
+    assert_eq!(c.tau2_peer, 0.0);
+
+    // Per contract: n = 8, w2 = 16, sum = 4, sum of squared counts 32, so the
+    // mean is 0.5 and the noise is sigma2 * w2/n^2 = 0.5 * 16/64 = 0.125.
+    // acc = 0.5^2 - 0.125 = 0.125 per contract, den = 2, so tau2_contract is
+    // 0.125. Substituting the raw count gives sigma2/n = 0.0625 and therefore
+    // 0.1875, which this assertion rejects.
+    assert_eq!(c.tau2_contract, 0.125);
+    assert_eq!(c.qualifying_contracts, 2);
+    assert_eq!(c.qualifying_entries, 4);
+
+    // Non-vacuity: the two noise forms must genuinely differ here, or the
+    // assertion above would hold for both.
+    let (n, w2) = (8.0f64, 16.0f64);
+    assert!(
+        (w2 / (n * n) - 1.0 / n).abs() > 0.05,
+        "the Kish and raw forms must differ on this table: {} against {}",
+        w2 / (n * n),
+        1.0 / n
+    );
+}
+
 /// The other half of Kish counting, which a tolerance cannot catch: a cell
 /// whose RAW weight sum clears [`MIN_EFFECTIVE_N`] but whose effective size
 /// does not must NOT count as replicated. Under decay that is the ordinary
