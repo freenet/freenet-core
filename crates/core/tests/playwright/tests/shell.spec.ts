@@ -160,6 +160,32 @@ test("shell page loads and embeds the sandboxed iframe", async ({ page }) => {
   ).toEqual([]);
 });
 
+// Media contracts (a video/audio app) need the Fullscreen API. A sandboxed
+// iframe does NOT get fullscreen unless the embedder delegates the feature via
+// allow="fullscreen"; without it every <video> fullscreen control is greyed
+// out and document.fullscreenEnabled is false in the nested context. The Rust
+// pin (path_handlers.rs) checks the attribute STRING; only a real browser can
+// see whether the feature is actually enabled inside the frame, which is why
+// this lives here.
+test("the sandboxed contract iframe is granted fullscreen (media apps)", async ({
+  page,
+}) => {
+  await page.goto(shellUrl!);
+  await fixtureFrame(page);
+
+  // Shape: the iframe delegates the fullscreen Permissions-Policy feature.
+  const allow = await page.locator("iframe#app").getAttribute("allow");
+  expect(allow, `iframe allow: ${allow}`).toContain("fullscreen");
+
+  // Behaviour: the Fullscreen API is actually enabled inside the sandboxed
+  // frame. This is the assertion that goes red if allow="fullscreen" is
+  // dropped — document.fullscreenEnabled reads false in a nested context whose
+  // embedder did not delegate the feature, and the substring pin cannot see it.
+  const appFrame = page.frames().find((f) => f.url().includes("__sandbox=1"));
+  expect(appFrame, "sandboxed contract frame not found").toBeTruthy();
+  expect(await appFrame!.evaluate(() => document.fullscreenEnabled)).toBe(true);
+});
+
 test("same-origin permission poll fetch is allowed by the shell CSP (#3842)", async ({
   page,
 }) => {
