@@ -2740,6 +2740,50 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "network_efficiency_v1".to_string(),
                     serde_json::json!(snapshot.network_efficiency_v1),
                 );
+                // Contract-term activation counters (#4485, #5700). PLAN-v2's
+                // live safety watch has to tell "the term is working" from
+                // "the term never activated" on a deployed gateway, and the
+                // estimable-refit count alone cannot: the effect is also
+                // refused per query below the present-peer bar. So the two
+                // APPLIED counts are mirrored beside it, with the
+                // between-contract variance and the number of contracts it
+                // rests on (it has no minimum group count). Same hand-mirroring
+                // footgun as everything else in this block: a new
+                // `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_contract_term_activation`.
+                for (name, value) in [
+                    (
+                        "hierarchical_contract_effects_applied",
+                        snapshot.hierarchical_contract_effects_applied,
+                    ),
+                    (
+                        "hierarchical_contract_forecast_offsets",
+                        snapshot.hierarchical_contract_forecast_offsets,
+                    ),
+                    (
+                        "hierarchical_contract_estimable_refits",
+                        snapshot.hierarchical_contract_estimable_refits,
+                    ),
+                    (
+                        "hierarchical_contract_qualifying_contracts",
+                        snapshot.hierarchical_contract_qualifying_contracts,
+                    ),
+                    (
+                        "hierarchical_contract_floor_bound_refits",
+                        snapshot.hierarchical_contract_floor_bound_refits,
+                    ),
+                    (
+                        "hierarchical_contracts",
+                        snapshot.hierarchical_contracts as u64,
+                    ),
+                ] {
+                    obj.insert(name.to_string(), serde_json::json!(value));
+                }
+                obj.insert(
+                    "hierarchical_contract_tau2".to_string(),
+                    serde_json::json!(snapshot.hierarchical_contract_tau2),
+                );
                 // Contract-exec WASM counters: the cache-hit / WASM-miss split
                 // that makes a summarize or delta rate interpretable at all.
                 // Same hand-mirroring footgun as everything else in this block —
@@ -4444,6 +4488,57 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// The contract term's activation counters must reach the OTLP body, or
+    /// the live safety watch cannot tell a term that worked from one that
+    /// never activated. Distinct values per field, so mirroring one field's
+    /// value under another field's key fails too.
+    ///
+    /// This covers the counters the COLLECTOR needs, which is NOT the whole
+    /// set the snapshot carries: `_residuals_refused`,
+    /// `_pairs_refused_last_refit`, `_entries_displaced` and
+    /// `_den_below_two_refits` are dashboard-only by choice. The first three
+    /// describe table SATURATION, which is read while looking at one node's
+    /// peer-detail page rather than aggregated across the fleet, and the
+    /// fourth is derivable from the two that are exported here
+    /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
+    /// question ever needs one of them, add it to the mirrored block above and
+    /// to this list together.
+    #[test]
+    fn router_snapshot_json_includes_contract_term_activation() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hierarchical_contract_effects_applied = 201;
+        info.hierarchical_contract_forecast_offsets = 202;
+        info.hierarchical_contract_estimable_refits = 203;
+        info.hierarchical_contract_qualifying_contracts = 204;
+        info.hierarchical_contract_floor_bound_refits = 206;
+        info.hierarchical_contracts = 205;
+        info.hierarchical_contract_tau2 = Some(0.25);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hierarchical_contract_effects_applied", 201),
+            ("hierarchical_contract_forecast_offsets", 202),
+            ("hierarchical_contract_estimable_refits", 203),
+            ("hierarchical_contract_qualifying_contracts", 204),
+            ("hierarchical_contract_floor_bound_refits", 206),
+            ("hierarchical_contracts", 205),
+        ] {
+            assert_eq!(
+                json.get(key).and_then(|v| v.as_u64()),
+                Some(want),
+                "{key} must reach the OTLP body"
+            );
+        }
+        assert_eq!(
+            json.get("hierarchical_contract_tau2")
+                .and_then(|v| v.as_f64()),
+            Some(0.25),
+            "hierarchical_contract_tau2 must reach the OTLP body"
+        );
     }
 
     /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.

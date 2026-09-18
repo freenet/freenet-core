@@ -1077,6 +1077,69 @@ pub(crate) struct RouterSnapshotInfo {
     /// Per-stage peer-table capacity, derived from `max_connections`.
     #[serde(default)]
     pub hierarchical_peer_capacity: usize,
+    /// Contracts held by the failure stage's contract term (#4485, #5700).
+    #[serde(default)]
+    pub hierarchical_contracts: usize,
+    /// Contracts evicted from that table, least-recently-used in batches.
+    #[serde(default)]
+    pub hierarchical_contract_evictions: u64,
+    /// Residuals the contract table did not record LIVE, because every entry
+    /// of their contract already held a larger decayed weight. The events
+    /// still train the curve and the peer levels.
+    #[serde(default)]
+    pub hierarchical_contract_residuals_refused: u64,
+    /// `(contract, peer)` pairs the LAST refit dropped for being outside a
+    /// contract's heaviest eight. A GAUGE, not a total: a persistently
+    /// over-full contract contributes the same drops at every refit, so a
+    /// cumulative count would read about 100x the distinct pairs ever dropped.
+    #[serde(default)]
+    pub hierarchical_contract_pairs_refused_last_refit: u64,
+    /// Live contract entries displaced by a heavier newcomer, whose
+    /// accumulated moments were discarded. Counted rather than merged,
+    /// because merging would attribute one peer's residuals to another.
+    #[serde(default)]
+    pub hierarchical_contract_entries_displaced: u64,
+    /// Refits after which the contract term's variance components were
+    /// estimable. NECESSARY for the term to do anything and not sufficient:
+    /// `effect` also returns nothing per query below the present-peer bar, and
+    /// on the recorded soak most failures are on contracts that never reach
+    /// it. The two counters below are what say whether anything moved.
+    #[serde(default)]
+    pub hierarchical_contract_estimable_refits: u64,
+    /// Learned residuals actually adjusted by a contract effect.
+    #[serde(default)]
+    pub hierarchical_contract_effects_applied: u64,
+    /// Scored forecasts that actually carried a contract offset.
+    #[serde(default)]
+    pub hierarchical_contract_forecast_offsets: u64,
+    /// Estimable refits at which the Bernoulli evidence floor was the binding
+    /// value for the contract term's `sigma2`, rather than the measured
+    /// within-cell variance. On the recorded gateway streams the floor bound
+    /// on every estimable refit, because cells there are mostly unanimous and
+    /// mostly tiny; this counter is how a reader sees whether that still holds
+    /// on their traffic.
+    #[serde(default)]
+    pub hierarchical_contract_floor_bound_refits: u64,
+    /// Estimable refits on which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced NOTHING although the
+    /// refit counted as estimable. Read alongside
+    /// `hierarchical_contract_estimable_refits`: their difference is the
+    /// refits on which the term could act at all.
+    #[serde(default)]
+    pub hierarchical_contract_den_below_two_refits: u64,
+    /// Contracts that qualified for `tau2_contract` at the last refit, and
+    /// present entries that informed the components. `tau2_contract` requires
+    /// at least two, so this is also how the term's WARM-UP silence is
+    /// observed: a freshly started node has one qualifying contract for its
+    /// first several thousand events and the term is off until it has two.
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_contracts: u64,
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_entries: u64,
+    /// Between-contract variance at the last refit; `None` when the components
+    /// are not estimable. The term produces no effect while it is absent or 0.
+    #[serde(default)]
+    pub hierarchical_contract_tau2: Option<f64>,
     /// Whether the hierarchical estimator is being computed NOW: only when it
     /// routes or the routing dataset is recording. When false, every
     /// `hierarchical_*` reading (and the timing error readings) is either empty
@@ -2941,6 +3004,17 @@ impl Router {
                 (legacy.failure, legacy.renegade_failure_adjustment)
             }),
         };
+        // The failure value the cost formula ranks by. For the hierarchical
+        // estimator it keeps the order of the forecasts BEFORE the [0, 1] bound,
+        // so peers whose forecasts all clamp at 1 are not tied (see
+        // `hierarchical::ranking_failure_probability`); it differs from the
+        // reported probability only ABOVE that bound, and then by at most 1e-6
+        // per unit of overshoot, so it is never negative and cannot make this
+        // cost negative. Legacy ranks by its own probability.
+        let failure_for_cost = match hierarchical_failure {
+            Some(probability) => hierarchical.failure_ranking.unwrap_or(probability),
+            None => failure_estimate,
+        };
         let time_to_response_start = hierarchical_time
             .or_else(|| legacy.map(|legacy| legacy.time_to_response_start))
             .unwrap_or(0.0);
@@ -2962,9 +3036,9 @@ impl Router {
             };
             time_to_response_start
                 + transfer_time
-                + (time_to_response_start * failure_estimate * failure_cost_multiplier)
+                + (time_to_response_start * failure_for_cost * failure_cost_multiplier)
         } else {
-            failure_estimate * failure_cost_multiplier
+            failure_for_cost * failure_cost_multiplier
         };
 
         let stages = dataset::HierarchicalStages {
@@ -3537,6 +3611,22 @@ impl Router {
             hierarchical_failure_events: hierarchical[0].window_events,
             hierarchical_peer_evictions: self.hierarchical.total_evictions(),
             hierarchical_peer_capacity: hierarchical[0].peer_capacity,
+            hierarchical_contracts: hierarchical[0].contracts,
+            hierarchical_contract_evictions: hierarchical[0].contract_evictions,
+            hierarchical_contract_residuals_refused: hierarchical[0].contract_residuals_refused,
+            hierarchical_contract_pairs_refused_last_refit: hierarchical[0]
+                .contract_pairs_refused_last_refit,
+            hierarchical_contract_entries_displaced: hierarchical[0].contract_entries_displaced,
+            hierarchical_contract_estimable_refits: hierarchical[0].contract_estimable_refits,
+            hierarchical_contract_effects_applied: hierarchical[0].contract_effects_applied,
+            hierarchical_contract_forecast_offsets: hierarchical[0].contract_forecast_offsets,
+            hierarchical_contract_floor_bound_refits: hierarchical[0].contract_floor_bound_refits,
+            hierarchical_contract_den_below_two_refits: hierarchical[0]
+                .contract_den_below_two_refits,
+            hierarchical_contract_qualifying_contracts: hierarchical[0]
+                .contract_qualifying_contracts,
+            hierarchical_contract_qualifying_entries: hierarchical[0].contract_qualifying_entries,
+            hierarchical_contract_tau2: hierarchical[0].contract_tau2,
             hierarchical_computed: hierarchical_computed(dataset),
             hierarchical_failure_active: hierarchical[0].active,
             routing_dataset_stopped: dataset.is_some_and(|dataset| !dataset.is_recording()),
@@ -4387,6 +4477,7 @@ mod tests {
                 failure: Some(0.1),
                 estimate: hierarchical::Estimate {
                     failure_probability: Some(0.1),
+                    failure_ranking: Some(0.1),
                     time_to_response_start_secs: Some(0.2),
                     transfer_speed_bps: None,
                 },
@@ -5134,6 +5225,161 @@ mod tests {
             "a cold estimator falls back to legacy"
         );
         assert!(prediction.failure_probability.is_finite());
+    }
+
+    /// The contract term's counters reach the snapshot the dashboard, the
+    /// tracing event and the OTLP body read, and they MOVE on real traffic.
+    ///
+    /// Finding 10 of the 2026-09-17 round-1 review, and its round-2 follow-up:
+    /// the first version of this test snapshotted a fresh `Router::new(&[])`,
+    /// so three of its six assertions were `0 == 0` and would have passed for
+    /// a hard-coded zero or a transposed field. It now drives traffic that
+    /// saturates every counter and asserts each is non-zero THROUGH the
+    /// snapshot, in the shape of the sibling test below.
+    #[test]
+    fn contract_term_counters_reach_the_snapshot() {
+        use crate::node::network_status::OpType;
+
+        let _learn = force_hierarchical_routing(true);
+        let _guard = crate::config::GlobalRng::seed_guard(0x4485_5417);
+        // Cold: absent rather than wrong, and every field still agrees with
+        // the stage's own diagnostic.
+        let cold = Router::new(&[]);
+        let snapshot = cold.snapshot();
+        assert_eq!(snapshot.hierarchical_contracts, 0);
+        assert_eq!(snapshot.hierarchical_contract_estimable_refits, 0);
+        assert_eq!(snapshot.hierarchical_contract_effects_applied, 0);
+        assert_eq!(snapshot.hierarchical_contract_tau2, None);
+
+        // Warm: a small contract pool with more peers per contract than the
+        // eight entries a contract keeps, so displacement, live refusal and
+        // refit dropping all occur, and a dead contract so the term activates.
+        let mut router = Router::new(&[]).with_max_connections(16);
+        let peers: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        let contracts: Vec<Location> = (0..6).map(|i| Location::new(i as f64 / 6.0)).collect();
+        let dead = Location::new(0.37);
+        for index in 0..3_000 {
+            let (peer, contract, outcome) = if index % 3 == 0 {
+                (&peers[index % peers.len()], dead, RouteOutcome::Failure)
+            } else {
+                (
+                    &peers[index % peers.len()],
+                    contracts[index % contracts.len()],
+                    if index % 7 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                )
+            };
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome,
+                op_type: Some(OpType::Get),
+            });
+        }
+        let snapshot = router.snapshot();
+        let diagnostics = router.hierarchical.diagnostics()[0];
+
+        // Each field must be NON-ZERO through the snapshot, so a hard-coded
+        // zero or a field that is never populated fails here, and must equal
+        // the stage's own diagnostic, so a transposition fails too.
+        for (name, from_snapshot, from_stage) in [
+            (
+                "contracts",
+                snapshot.hierarchical_contracts as u64,
+                diagnostics.contracts as u64,
+            ),
+            (
+                "residuals_refused",
+                snapshot.hierarchical_contract_residuals_refused,
+                diagnostics.contract_residuals_refused,
+            ),
+            (
+                "entries_displaced",
+                snapshot.hierarchical_contract_entries_displaced,
+                diagnostics.contract_entries_displaced,
+            ),
+            (
+                "estimable_refits",
+                snapshot.hierarchical_contract_estimable_refits,
+                diagnostics.contract_estimable_refits,
+            ),
+            (
+                "effects_applied",
+                snapshot.hierarchical_contract_effects_applied,
+                diagnostics.contract_effects_applied,
+            ),
+            (
+                "forecast_offsets",
+                snapshot.hierarchical_contract_forecast_offsets,
+                diagnostics.contract_forecast_offsets,
+            ),
+            (
+                "qualifying_contracts",
+                snapshot.hierarchical_contract_qualifying_contracts,
+                diagnostics.contract_qualifying_contracts,
+            ),
+            (
+                "qualifying_entries",
+                snapshot.hierarchical_contract_qualifying_entries,
+                diagnostics.contract_qualifying_entries,
+            ),
+            // I3 of the 2026-09-18 round-3 testing review: this field was
+            // wired to the snapshot and to the OTLP body but was absent from
+            // this loop, so hard-coding it to zero, or reading it from the
+            // wrong stage, survived. The telemetry test only checks the JSON
+            // key against a hand-set value.
+            (
+                "floor_bound_refits",
+                snapshot.hierarchical_contract_floor_bound_refits,
+                diagnostics.contract_floor_bound_refits,
+            ),
+        ] {
+            assert!(
+                from_snapshot > 0,
+                "hierarchical_contract_{name} must be non-zero on this traffic, \
+                 or the assertion cannot tell a wired field from an unwired one"
+            );
+            assert_eq!(
+                from_snapshot, from_stage,
+                "hierarchical_contract_{name} must be the failure stage's own value"
+            );
+        }
+        assert_eq!(
+            snapshot.hierarchical_contract_pairs_refused_last_refit,
+            diagnostics.contract_pairs_refused_last_refit,
+            "the refit gauge must be the failure stage's own value"
+        );
+        // Equality only, deliberately: a stream whose contracts all qualify
+        // from the first refit has a legitimate zero here, so asserting
+        // non-zero would make this test depend on the warm-up shape of its own
+        // traffic. The transposition is what this pins.
+        assert_eq!(
+            snapshot.hierarchical_contract_den_below_two_refits,
+            diagnostics.contract_den_below_two_refits,
+            "the den-gate count must be the failure stage's own value"
+        );
+        assert!(
+            snapshot.hierarchical_contract_den_below_two_refits
+                <= snapshot.hierarchical_contract_estimable_refits,
+            "the den gate is evaluated only on estimable refits, so its count \
+             cannot exceed them: {} against {}",
+            snapshot.hierarchical_contract_den_below_two_refits,
+            snapshot.hierarchical_contract_estimable_refits
+        );
+        assert!(
+            snapshot
+                .hierarchical_contract_tau2
+                .is_some_and(|tau2| tau2 > 0.0),
+            "between-contract variance must be estimated: {:?}",
+            snapshot.hierarchical_contract_tau2
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_tau2,
+            diagnostics.contract_tau2
+        );
     }
 
     /// The peer tables are sized from the configured connection cap, and

@@ -204,7 +204,18 @@ Two prediction stacks exist in router.rs; exactly one reaches routing.
     blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
     the residual correction in place of the blend.
   HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
-    peer > (peer, band) empirical-Bayes hierarchy, horizon chosen online.
+    peer > (peer, band) empirical-Bayes hierarchy, forgetting horizon chosen
+    online from a PER-STAGE menu (FAILURE_HORIZONS_HOURS for failure,
+    LOG_HORIZONS_HOURS for response time and transfer speed; the failure menu
+    is the shorter one, so a failure burst is tracked faster). The FAILURE
+    stage also carries a CONTRACT-LEVEL TERM: a second hierarchy, contract >
+    (contract, peer), whose effect is subtracted from what the peer levels
+    learn (from OTHER peers only, so a peer's own failures never explain
+    themselves away) and added back to a forecast (from all present peers).
+    It exists because a failure on a contract nobody can serve was learned as
+    evidence about the peer that was asked, which raised that peer's forecasts
+    for every other contract (#5700). It is on unconditionally wherever the
+    estimator is computed; there is no separate flag for it.
     Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
     over BOTH legacy variants for every stage it can estimate (a cold stage
     falls back to legacy). Computed at all only when that flag is on or
@@ -224,9 +235,86 @@ WHEN touching either stack:
     dashboard shows "not computed now" rather than frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
+  → PAIRED VALUES, failure probability: the estimator returns TWO failure
+    numbers per candidate and they are not interchangeable.
+    failure_probability is clamped to [0, 1] and is what is REPORTED and
+    RECORDED (RoutingPrediction, the dataset, telemetry, the dashboard);
+    failure_ranking (hierarchical::ranking_failure_probability) is what the
+    cost formula RANKS BY, and it keeps the order of the forecasts above 1 so
+    that several peers clamped at 1 are not tied. They differ only above 1,
+    and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
+    the ranking value is pinned at 0 deliberately: carrying the downward
+    overshoot made the no-timing cost branch (failure * 3.0) negative for the
+    healthiest peers, which the dashboard prints as "N/A". Consequences to
+    keep in mind: an offline tool CANNOT reproduce the router's order among
+    candidates that all clamp, because the unbounded value is recorded
+    nowhere; and recomputing expected_total_time from the recorded
+    failure_probability reproduces it only to within the slope.
+  → The contract term must export enough to tell "it worked and helped
+    nothing" from "it never activated". _contract_estimable_refits is NECESSARY
+    and not sufficient for that: the effect is also refused per query below the
+    present-peer bar, and on the recorded soak most failures are on contracts
+    that never reach it, so a node estimable at every refit that moves no
+    forecast would read as active. The counters that answer the question are
+    _contract_effects_applied and _contract_forecast_offsets; read
+    _contract_tau2 beside _contract_qualifying_contracts, because a value
+    resting on two contracts is otherwise indistinguishable from one resting on
+    eighty, and beside _contract_den_below_two_refits, which counts the refits
+    on which fewer than two contracts qualified so the term was off despite
+    counting as estimable. Know what _contract_effects_applied does NOT cover:
+    it counts the LIVE learn path only, and only where the explaining bound
+    left a non-zero adjustment, so it is not a total of every residual the term
+    has moved (the per-refit re-adjustment of the whole window is counted
+    nowhere). Do NOT quote _contract_estimable_refits on its own as the term's
+    activity: on the recorded streams 595 of 796 refits were estimable but the
+    term could act on only 285 of them (158 with fewer than two qualifying
+    contracts, a further 152 with tau2_contract computing to exactly zero), so
+    the estimable count reads as "working everywhere" and overstates by 2x.
+    A related property of the estimator, measured 2026-09-18 and previously
+    written down nowhere: a contract whose peers DISAGREE sharply contributes
+    its spread to tau2_peer rather than tau2_contract, so the term is silent on
+    it unless other contracts supply the between-contract variance. That is a
+    different gate from the present-peer bar and compounds with it. All of
+    these reach the
+    snapshot and the peer-detail dashboard; the OTLP body carries the ones a
+    fleet-wide question needs (_effects_applied, _forecast_offsets,
+    _estimable_refits, _qualifying_contracts, _floor_bound_refits, _contracts,
+    _tau2) and NOT the saturation gauges or _den_below_two_refits, which are
+    dashboard-only by choice and listed as such on the telemetry pin
+    (telemetry.rs is hand-mirrored: a new RouterSnapshotInfo field is invisible
+    to the collector unless added there). Do not add a mechanism whose activation nothing
+    reports, and do not mistake "the mechanism could act" for "the mechanism
+    acted".
 
-PROMOTION GATE, in two parts, both on data collected after #5653 (failure
-labels) is deployed:
+PROMOTION GATE. The Brier-first gate below is SUPERSEDED for the estimator
+decision by /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17,
+approved by Ian), and the reason matters: the accuracy gap against legacy was
+almost entirely CONTRACT-LEVEL calibration on failed relayed GETs for contracts
+nobody can serve, which a Brier-parity gate weights heavily and which affects
+candidate ORDERING only indirectly. Do NOT write that a contract-level change
+"cannot change which peer is picked": that inference is false and this file
+carried it until 2026-09-17. A quantity common to every candidate cannot
+reorder the candidates' failure PROBABILITIES, but routing ranks by
+`t + transfer + 3*t*p`, so a common change of `d` moves candidate i's cost by
+`3*t_i*d`, which differs across candidates whose response times differ. See
+`hierarchical.rs`, "Contract term", Forecast, and the test
+`a_shared_contract_effect_reweights_peers_that_differ_in_response_time`. PLAN-v2 measures, in order, M1 within-contract RANKING
+(delta C-index, non-inferiority margin -0.05), M2 dead-contract POLLUTION (the
+excess forecast on successes of recently storm-tainted peers, bar
+max(legacy, 0) + 0.02), and M3 failure Brier only as a non-inferiority check
+(CI upper bound at most 1.10), plus the section 6 conditions: timing forecasts
+bit-identical to the shipped estimator, the #5655 bake-off still passing,
+quiet-node replays reported, and unit and simulation tests. PLAN-v2 also
+records that M1 cannot resolve on the recorded data at that margin, so the
+offline stage decides on M2, M3 and section 6 and REPORTS M1; and that the
+retracted M1b displacement measure is confounded by which model did the
+routing and must never be pooled across arms. Two properties of the offline
+gate to keep in view when reading a result from it: it scores the recorded
+CLAMPED forecast, so it is blind to the ranking value described above, and M2
+scores only forecasts that are too high on successes, so an over-correction
+reads as an improvement.
+
+The original two-part gate, still the shape of the LIVE half:
   (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
       score and seconds error for both models on the same events. This is
       calibration of each model's estimate for the peer actually tried. It

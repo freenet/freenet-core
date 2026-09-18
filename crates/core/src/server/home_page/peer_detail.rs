@@ -83,6 +83,57 @@ impl Computation {
     }
 }
 
+/// The contract term's activation, in the order a reader needs it: whether it
+/// could produce an effect at all, and then whether it actually did.
+///
+/// The estimable-refit count on its own does NOT answer "is the term doing
+/// anything": the effect is also refused per query when a contract has too few
+/// present peers, and on the recorded soak most failures are on contracts that
+/// never reach that bar. So the applied counts come first in the sentence.
+/// `tau2_contract` is shown with the number of contracts it rests on, because
+/// it has no minimum group count and one contract reads the same as eighty.
+fn fmt_contract_term(rs: &crate::router::RouterSnapshotInfo) -> String {
+    if rs.hierarchical_contract_estimable_refits == 0 {
+        return format!(
+            "never estimable ({} contracts tracked, {} evicted) &mdash; the term has not been \
+             able to produce an effect on this node",
+            rs.hierarchical_contracts, rs.hierarchical_contract_evictions
+        );
+    }
+    let tau2 = match rs.hierarchical_contract_tau2 {
+        Some(value) => format!(
+            "between-contract variance {value:.4} over {} contracts, {} entries",
+            rs.hierarchical_contract_qualifying_contracts,
+            rs.hierarchical_contract_qualifying_entries
+        ),
+        None => "no components at the last refit".to_string(),
+    };
+    // The floor's binding frequency: on the recorded gateway streams it bound
+    // on every estimable refit, because cells there are mostly unanimous and
+    // mostly tiny. A reader whose traffic differs needs to see that here.
+    let floor = format!(
+        "; evidence floor bound at {} of {} estimable refits",
+        rs.hierarchical_contract_floor_bound_refits, rs.hierarchical_contract_estimable_refits
+    );
+    // The den gate's own frequency. An estimable refit on which fewer than two
+    // contracts qualified produced NOTHING, so without this the refit count
+    // above overstates what the term did.
+    let den = match rs.hierarchical_contract_den_below_two_refits {
+        0 => String::new(),
+        below => format!(
+            "; {below} of those refits had fewer than two qualifying contracts, so the term \
+             was off"
+        ),
+    };
+    format!(
+        "{} residuals adjusted, {} forecasts offset; estimable at {} refits; \
+         {tau2}{floor}{den}",
+        rs.hierarchical_contract_effects_applied,
+        rs.hierarchical_contract_forecast_offsets,
+        rs.hierarchical_contract_estimable_refits,
+    )
+}
+
 /// Render one hierarchical reading according to whether it is live.
 fn hierarchical_reading(state: Computation, live: impl FnOnce() -> String) -> String {
     match state {
@@ -348,7 +399,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 <h3 style="margin-top: 1em;">Which layer is doing the work?</h3>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Each layer&rsquo;s <strong>skill</strong> against simply assuming the average failure rate. <strong>0 means no better than that assumption; negative means worse.</strong> Skill rather than a raw score because failures are rare, and on a rare event a raw score mostly measures the rarity: at a {base_rate} failure rate, a forecast that never predicts failure at all scores {clim_brier} and looks excellent.</p>
                 <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The first rows are <strong>two routes from the same starting point</strong>, not one running total. Both begin at the distance-only estimate. The established route adds a per-peer offset and then the Renegade blend; the correction route instead learns what the distance-only estimate gets wrong for this exact peer and contract, and <strong>replaces</strong> the per-peer offset rather than stacking on it. Compare the end points, not the rows in order.</p>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer and for the peer on this part of the ring, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It replaces all of the above rather than adding to any of them, and is planned to replace them for good once it has proven itself. It is only computed while it routes or while the routing dataset is being recorded. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">The hierarchical row is a <strong>separate, self-contained model</strong>, not a step after the others. It fits its own distance curve over a longer window, then adds an offset for the peer, for the peer on this part of the ring, and &mdash; on the failure stage only &mdash; for the contract itself, each weighted by how much evidence stands behind it: a peer seen a handful of times barely moves the estimate, and a peer seen many times moves it only as far as the measured spread between peers justifies &mdash; if peers turn out not to differ, not at all. It replaces all of the above rather than adding to any of them, and is planned to replace them for good once it has proven itself. It is only computed while it routes or while the routing dataset is being recorded. It is new, so compare its score with the established route&rsquo;s before trusting it.</p>
                 <div class="info-grid">
                     <div class="info-label">Both routes start at: distance only</div><div class="info-value">{skill_global}</div>
                     <div class="info-label">&#8627; established: + per-peer offset</div><div class="info-value">{skill_adjusted}</div>
@@ -359,6 +410,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Scored predictions: hierarchical</div><div class="info-value">{hierarchical_eval}</div>
                     <div class="info-label">Hierarchical forgetting horizon</div><div class="info-value">{hierarchical_horizon}</div>
                     <div class="info-label">Hierarchical peer-table evictions</div><div class="info-value">{hierarchical_evictions}</div>
+                    <div class="info-label">Contract term: did it move anything?</div><div class="info-value">{contract_term}</div>
                     <div class="info-label">Hierarchical response-time log residuals</div><div class="info-value">{shape_response}</div>
                     <div class="info-label">Hierarchical transfer-speed log residuals</div><div class="info-value">{shape_transfer}</div>
                     <div class="info-label">Response-time error, RMS seconds</div><div class="info-value">{timing_error}</div>
@@ -448,6 +500,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     rs.hierarchical_peer_capacity,
                 )
             }),
+            contract_term = hierarchical_reading(state, || fmt_contract_term(rs)),
             hierarchical_eval =
                 hierarchical_reading(state, || { rs.hierarchical_failure_evaluated.to_string() }),
             timing_error = hierarchical_reading(state, || fmt_seconds_error(
@@ -908,6 +961,7 @@ mod tests {
             "hierarchical_eval =",
             "hierarchical_horizon =",
             "hierarchical_evictions =",
+            "contract_term =",
             "shape_response =",
             "shape_transfer =",
             "timing_error =",
@@ -924,6 +978,92 @@ mod tests {
                 "{binding} must render through hierarchical_reading"
             );
         }
+    }
+
+    /// `fmt_contract_term`'s branches, each of which was untested. The
+    /// floor-versus-estimable clause is the one that matters: a transposition
+    /// of the two counts renders a sentence claiming the floor bound MORE
+    /// often than there were refits to bind on, and nothing would have caught
+    /// it. A round-3 testing-review item.
+    #[test]
+    fn the_contract_term_row_reports_each_regime_distinctly() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let base = || {
+            let mut u = Unstructured::new(&[0u8; 4096]);
+            let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+                .expect("construct RouterSnapshotInfo for test");
+            info.hierarchical_contracts = 12;
+            info.hierarchical_contract_evictions = 3;
+            info.hierarchical_contract_estimable_refits = 0;
+            info.hierarchical_contract_effects_applied = 0;
+            info.hierarchical_contract_forecast_offsets = 0;
+            info.hierarchical_contract_floor_bound_refits = 0;
+            info.hierarchical_contract_den_below_two_refits = 0;
+            info.hierarchical_contract_qualifying_contracts = 0;
+            info.hierarchical_contract_qualifying_entries = 0;
+            info.hierarchical_contract_tau2 = None;
+            info
+        };
+
+        // (a) never estimable: the row must say so and must not print counts
+        // that would read as activity.
+        let never = fmt_contract_term(&base());
+        assert!(
+            never.contains("never estimable") && never.contains("12 contracts tracked"),
+            "{never}"
+        );
+
+        // (b) estimable with no components at the last refit.
+        let mut info = base();
+        info.hierarchical_contract_estimable_refits = 40;
+        info.hierarchical_contract_floor_bound_refits = 40;
+        info.hierarchical_contract_effects_applied = 7;
+        info.hierarchical_contract_forecast_offsets = 9;
+        let no_components = fmt_contract_term(&info);
+        assert!(
+            no_components.contains("no components at the last refit"),
+            "{no_components}"
+        );
+
+        // (c) components present, the floor binding on every estimable refit,
+        // and the den gate silent. The two counts must appear in the order
+        // "bound at N of M", so a transposition reads wrongly and fails here.
+        info.hierarchical_contract_tau2 = Some(0.125);
+        info.hierarchical_contract_qualifying_contracts = 41;
+        info.hierarchical_contract_qualifying_entries = 323;
+        let full = fmt_contract_term(&info);
+        assert!(
+            full.contains("evidence floor bound at 40 of 40 estimable refits"),
+            "{full}"
+        );
+        assert!(
+            full.contains("between-contract variance 0.1250 over 41 contracts"),
+            "{full}"
+        );
+        assert!(
+            !full.contains("fewer than two qualifying contracts"),
+            "the den gate did not fire, so the row must not mention it: {full}"
+        );
+
+        // The transposition, stated as its own assertion so the failure names
+        // the defect rather than a missing substring.
+        let mut swapped = info.clone();
+        swapped.hierarchical_contract_floor_bound_refits = 40;
+        swapped.hierarchical_contract_estimable_refits = 11;
+        let swapped_row = fmt_contract_term(&swapped);
+        assert!(
+            swapped_row.contains("bound at 40 of 11"),
+            "the row prints floor-bound BEFORE estimable, so a swap is visible \
+             as an impossible fraction: {swapped_row}"
+        );
+
+        // (d) the den gate firing on some of the estimable refits.
+        info.hierarchical_contract_den_below_two_refits = 12;
+        let gated = fmt_contract_term(&info);
+        assert!(
+            gated.contains("12 of those refits had fewer than two qualifying contracts"),
+            "{gated}"
+        );
     }
 
     #[test]
