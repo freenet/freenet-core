@@ -3318,6 +3318,70 @@ fn tau2_peer_is_floored_at_zero() {
     );
 }
 
+/// `tau2_contract` needs at least TWO qualifying contracts, the same rule as
+/// the degrees-of-freedom gate below and for the same reason: a between-group
+/// variance estimated from one group is not a variance, it is that group's own
+/// mean, and it then un-shrinks every other contract's effect.
+///
+/// Untested when the gate was added, and the 2026-09-17 mutation run at
+/// `041e31e09` proved it: lowering the gate back to `den > 0.0` left the whole
+/// suite green.
+#[test]
+fn tau2_contract_needs_two_qualifying_contracts() {
+    // One qualifying contract among two hundred singletons. A singleton
+    // contract's total is not replicated, so it never qualifies; the one with
+    // two replicated cells crosses `df >= 2` on its own.
+    let build = |qualifying: u64| {
+        let mut table = ContractTable::new();
+        for contract in 0..200u64 {
+            let (slot, _) = table.touch(contract);
+            if contract < qualifying {
+                for peer in 0..2u32 {
+                    assert!(table.add(slot, (peer, 0), 1.0, 0.9));
+                    assert!(table.add(slot, (peer, 0), 1.0, 0.5));
+                }
+            } else {
+                assert!(table.add(slot, (0, 0), 1.0, 0.9));
+            }
+        }
+        table
+            .compute_components()
+            .expect("the df gate is crossed in both cases")
+    };
+
+    let one = build(1);
+    assert_eq!(
+        one.qualifying_contracts, 1,
+        "the scenario must reach exactly one qualifying contract, or this test \
+         proves nothing"
+    );
+    assert_eq!(
+        one.tau2_contract, 0.0,
+        "one qualifying contract cannot tell you how contracts vary, so the \
+         term must be off rather than resting on that contract's own mean"
+    );
+
+    let two = build(2);
+    assert_eq!(two.qualifying_contracts, 2);
+    assert!(
+        two.tau2_contract > 0.0,
+        "two qualifying contracts must produce a between-contract variance: {}",
+        two.tau2_contract
+    );
+    // And with the term off, no query can produce an effect however much
+    // evidence the queried contract itself has.
+    let mut off = ContractTable::new();
+    let key = 0u64;
+    let (slot, _) = off.touch(key);
+    for peer in 0..4u32 {
+        for _ in 0..8 {
+            assert!(off.add(slot, (peer, 0), 1.0, 0.9));
+        }
+    }
+    off.components = Some(one);
+    assert_eq!(off.shared_effect(key, 0.0), None);
+}
+
 /// The degrees-of-freedom gate had no test: a mutation lowering `df < 2.0`
 /// to `df < 0.0` survived the whole suite. Without it a table in which no
 /// `(contract, peer)` cell has any within-cell replication still produces
