@@ -1973,18 +1973,30 @@ fn background(start: f64, hours: f64, peers: std::ops::Range<u32>) -> Vec<Step> 
         .collect()
 }
 
-/// Healthy traffic drawn from a POOL of contracts, so `(contract, peer)` cells
-/// are replicated and the contract term's components rest on many groups.
+/// Healthy traffic drawn from a POOL of contracts, so the contract term's
+/// `tau2_contract` rests on many groups instead of one.
 ///
-/// [`background`] draws a UNIQUE contract per event, which means no contract
-/// ever reaches the replication bar and exactly ONE group qualifies for
-/// `tau2_contract` (the dead contract a test injects). That is not what a
-/// gateway sees, and under the `den >= 2` gate it switches the term off
-/// entirely, so it was the tested regime rather than a covered one. The
-/// finding was made by the `qualifying_contracts` counter added for round-2
-/// finding I. `background` is kept for the tests that deliberately want
-/// contract churn (eviction, capacity); everything that needs the term active
-/// uses this.
+/// [`background`] draws a UNIQUE contract per event, so exactly ONE group
+/// qualifies for `tau2_contract` (the dead contract a test injects), and under
+/// the `den >= 2` gate that switches the term off entirely: it was the tested
+/// regime rather than a covered one. The finding came from the
+/// `qualifying_contracts` counter added for round-2 finding I. `background` is
+/// kept for the tests that deliberately want contract churn (eviction,
+/// capacity); everything that needs the term active uses this.
+///
+/// WHAT THE POOL DOES AND DOES NOT DELIVER, corrected after N1 of the
+/// 2026-09-18 round-3 testing review, because the next author will size a pool
+/// by this docstring. An earlier version said `(contract, peer)` CELLS become
+/// replicated. They do not, and mostly cannot: [`MIN_EFFECTIVE_N`] is 2 and the
+/// Kish effective size of two events of unequal decayed weight is below 2, so a
+/// cell needs THREE events inside roughly 40 minutes of estimator time, which
+/// at this rate and pool size is rare. What the pool delivers is per-CONTRACT
+/// total presence and replication, which is what `den` counts: it moves
+/// `qualifying_contracts` from 1 to about 41 and satisfies the `den >= 2` gate.
+/// `df`, which is summed over CELLS, stays dominated by the injected dead
+/// contract's own cells. So enlarging the pool buys qualifying CONTRACTS, not
+/// within-cell degrees of freedom; if a test needs the latter, it must repeat
+/// one (contract, peer) pair, as the explicit tables do.
 fn background_pooled(start: f64, hours: f64, peers: std::ops::Range<u32>) -> Vec<Step> {
     let count = (hours * 600.0) as usize;
     // Enough contracts that the table is exercised, few enough that each is
@@ -2117,11 +2129,19 @@ fn explain_away_keeps_a_dead_contract_out_of_other_contracts_forecasts() {
 
 /// Leave-one-peer-out: a peer that fails a contract other peers serve is
 /// charged for it. Its own failures must never explain themselves away.
+///
+/// READ THE NOTE BEFORE THE ASSERTIONS. On this traffic the term turns out to
+/// be INERT (`tau2_contract` is zero on every seed), so what this test
+/// establishes is the negative control: an inert term leaves the peer's charge
+/// exactly where it was. The leave-one-out property itself is pinned by
+/// `leaving_the_failing_peer_out_removes_its_own_evidence`, on a table built to
+/// make the effect observable.
 #[test]
 fn a_peer_failing_a_contract_others_serve_is_charged_to_that_peer() {
     // Averaged over seeds, as above.
     let seeds = 6u64;
     let (mut charged, mut with) = (0.0, 0.0);
+    let (mut applied, mut adjusted_events, mut tau2_max) = (0u64, 0usize, 0.0f64);
     for seed in 0..seeds {
         let _guard = GlobalRng::seed_guard(0x4485_c002 + seed);
         let contract = 0.52;
@@ -2134,15 +2154,76 @@ fn a_peer_failing_a_contract_others_serve_is_charged_to_that_peer() {
         let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..1) - mean_forecast(stage, 3..30);
         charged += gap(&without_term) / seeds as f64;
         with += gap(&with_term) / seeds as f64;
+        // THE TERM IS INERT ON THIS TRAFFIC, measured rather than assumed, and
+        // asserted so that the fact cannot drift silently. See the note above
+        // the assertions below for what that means for this test.
+        applied += with_term
+            .contracts
+            .as_ref()
+            .map_or(0, |t| t.effects_applied);
+        adjusted_events += with_term
+            .sorted
+            .iter()
+            .filter(|event| event.adjustment != 0.0)
+            .count();
+        tau2_max = tau2_max.max(
+            with_term
+                .contracts
+                .as_ref()
+                .and_then(|t| t.components)
+                .map_or(0.0, |c| c.tau2_contract),
+        );
     }
     assert!(
         charged > 0.05,
         "sanity: the failures must raise peer 0, mean gap {charged} over {seeds} seeds"
     );
+
+    // WHAT THIS TEST ACTUALLY ESTABLISHES, measured for I1 of the 2026-09-18
+    // round-3 testing review. Its `with > 0.8 * charged` assertion was
+    // one-sided and yielded the same verdict in three regimes, one of which is
+    // the term being inert. It IS inert here: on every one of the six seeds
+    // `tau2_contract` is exactly 0, no windowed event carries an adjustment,
+    // and `effects_applied` is 0, so `with == charged` exactly and the
+    // assertion was passing on a stage pair that did the same thing.
+    //
+    // The cause is the estimator behaving as designed, not a defect. This
+    // contract's peers DISAGREE sharply (peer 0 fails, two others succeed), so
+    // that spread is attributed to `tau2_peer`, and the pooled healthy
+    // background supplies too little between-contract variance for the
+    // contrast to survive the noise the estimator subtracts. The same effect
+    // is documented at the table level in
+    // `leaving_the_failing_peer_out_removes_its_own_evidence`, which is where
+    // the leave-one-out property is now pinned on a table built to make it
+    // observable.
+    //
+    // So this is kept as a NEGATIVE CONTROL and labelled as one: an inert term
+    // must leave the peer's charge exactly where it was. Both bounds are
+    // asserted, so a term that starts acting here fails this test and forces
+    // whoever changes the traffic to re-read the note above rather than
+    // inheriting a one-sided assertion. Giving it activating traffic would
+    // make it a positive test too, and is recorded on #5700 as a choice for
+    // the lead rather than made silently.
+    assert_eq!(
+        (applied, adjusted_events),
+        (0, 0),
+        "this test's traffic is expected to leave the term inert; if it now \
+         acts, read the note above and re-scope the assertions below"
+    );
+    assert_eq!(
+        tau2_max, 0.0,
+        "and the reason is a zero between-contract variance on every seed"
+    );
     assert!(
         with > 0.8 * charged,
         "peer 0's own failures must stay charged to peer 0: mean gap {with} against \
          {charged} without the term, over {seeds} seeds"
+    );
+    assert!(
+        with <= charged * 1.001,
+        "and must not be charged MORE than its own residuals justify, which is \
+         what an unbounded explaining adjustment of the wrong sign does: mean \
+         gap {with} against {charged} without the term"
     );
 }
 
@@ -2357,41 +2438,75 @@ fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
     // Three hours of other traffic: six contract horizons, so the dead
     // contract's entries fall below the presence cut. Refits while they were
     // still present may have refreshed the adjustment; after that it is frozen.
+    //
+    // DELIBERATELY UNPOOLED, and this is the answer to the round-3 testing
+    // review's observation that the feed disagreed with the comment above it.
+    // Pooling it was tried and it breaks the test in two independent ways,
+    // both measured: peer 0 draws background events too, so with tracked
+    // contracts its level sum stops being attributable to the dead contract
+    // alone (the sum below went to -0.067, i.e. dominated by background
+    // adjustments), and the kept-adjustment measurement changes from 0.045 to
+    // 0.395. The first is fatal to the test's design and the second is
+    // reported below rather than hidden.
     feed(
         &mut [&mut with_term, &mut without_term],
         background(2.21, 3.0, 0..30),
     );
     let kept = first(&with_term).adjustment;
-    // FINDING, 2026-09-17 round 2, from giving this test representative
-    // traffic. Under the old unpooled background the term went off almost as
-    // soon as the storm ended (one qualifying contract, so no between-contract
-    // variance), and the adjustment froze near its post-storm value, above
-    // 0.1. With a pooled background the term stays estimable for as long as
-    // the pool's own contracts are present, so the refit keeps recomputing
-    // this event's adjustment against the dead contract's DECAYING evidence
-    // and it freezes far lower: 0.045 here, about a seventh of the 0.3 it had
-    // when the storm was live. Attributed by measurement: the value is
-    // identical with the evidence floor off and with the `den >= 2` gate off,
-    // so it is the traffic shape and not either new gate.
+    // FINDING, and its CORRECTION, because the first version of it was an
+    // artefact of this test feeding two different traffic shapes.
     //
-    // The consequence is worth stating plainly rather than asserting away:
-    // most of the storm's explanation evaporates before the event leaves the
-    // presence window, so the peer IS charged for most of that failure in the
-    // end. The kept-adjustment mechanism is materially weaker under
-    // representative traffic than the unpooled tests implied. Whether to
-    // couple the adjustment to the era that produced it, rather than to the
-    // contract's current state, is a design question recorded on #5700.
+    // Round 2 pooled the pre-storm background and left these continuation
+    // feeds unpooled. Measured on that mix, the kept adjustment fell to 0.045
+    // and was reported as "about a seventh of the 0.3 it had when the storm
+    // was live", which understated it twice over: 0.3 is this test's
+    // ASSERTION THRESHOLD, not the measurement, and the storm-era adjustment
+    // is actually 0.644, so the ratio on that mix was 7%, not a seventh.
+    //
+    // The round-3 testing review pointed out that a test explaining its result
+    // in terms of pooled traffic should not then feed unpooled traffic. Pooling
+    // the continuations was tried: the measurement becomes **kept = 0.395
+    // against a storm-era 0.644, or 61%**, the opposite end of the range from
+    // the 7% above, and peer 0's level sum stops being attributable to the
+    // dead contract (see the feed's own comment). So the continuations stay
+    // unpooled for attribution, and the number recorded here is the
+    // mixed-traffic one: the size of this effect is governed by the traffic
+    // shape and NOT by either new gate (which round 2 had already established
+    // by measurement: the value was unchanged with the evidence floor off and
+    // with the `den >= 2` gate off).
+    //
+    // What survives the correction, and what does not. The MECHANISM is
+    // unchanged and still pinned below: an event whose contract has no present
+    // evidence keeps the adjustment it last had, and that adjustment is a
+    // decayed version of the storm-era one rather than a fresh estimate. The
+    // CLAIM that round 2 drew from the 7% figure -- "most of the storm's
+    // explanation evaporates, so the kept-adjustment mechanism is materially
+    // weaker than the unpooled tests implied" -- is RETRACTED as stated: it
+    // held on a mixed-traffic measurement and does not generalise. Whether to
+    // couple the adjustment to the era that produced it rather than to the
+    // contract's current state remains a design question on #5700, but the
+    // evidence for its urgency was this number and the number does not
+    // support it.
     assert!(
         kept > 0.02,
         "some of the storm's explanation must survive, got {kept}"
     );
+    // BRACKETED, so both a collapse to nothing and a freeze at the storm value
+    // fail. Measured at 0.07 of the storm-era adjustment on this traffic.
+    // IF THIS FAILS HIGH, the adjustment is being coupled to the era that
+    // produced it and #5700's era-coupling item may have been addressed:
+    // update the test to assert the new behaviour rather than widening the
+    // bracket. IF IT FAILS LOW, the kept adjustment has stopped surviving at
+    // all, which is a different bug.
+    let ratio = f64::from(kept) / f64::from(adjustment);
     assert!(
-        kept < 0.5 * adjustment,
-        "and this test exists to record that most of it does NOT: {kept} \
-         against {adjustment} while the storm was live"
+        (0.02..0.3).contains(&ratio),
+        "the kept adjustment must be a heavily decayed storm-era value on this \
+         traffic, measured at 0.07: got {ratio} ({kept} against {adjustment})"
     );
     // Another hour of refits with no present evidence for the dead contract,
-    // while its events are still in the window.
+    // while its events are still in the window. Unpooled for the same
+    // attribution reason as the feed above.
     feed(
         &mut [&mut with_term, &mut without_term],
         background(5.21, 1.0, 0..30),
@@ -2408,8 +2523,15 @@ fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
     // same residuals unadjusted.
     // Peer 0 acts only on the dead contract here, so its level sum is exactly
     // the adjusted residuals of those events. The quantity subtracted is the
-    // BOUNDED adjustment (`explaining_bound`), not the raw stored one, so the
-    // sum is computed the same way the stage computes it.
+    // BOUNDED adjustment, not the raw stored one, so the sum is computed the
+    // same way the stage computes it.
+    //
+    // The clamp is written LONGHAND on purpose. Calling `explaining_bound`
+    // here would make the expectation derive from the code under test, so a
+    // mutation of the bound would move both sides of the comparison equally
+    // and this assertion could not see it. Before the pooled traffic landed
+    // this compared against the raw stored value, which was independent; the
+    // longhand restores that independence (a round-3 testing-review item).
     let slot = with_term.peers.lookup(&0).unwrap();
     let curve = with_term.curve.as_ref().expect("the stage has a curve");
     let bounded: f64 = with_term
@@ -2418,7 +2540,14 @@ fn refits_clear_first_failures_and_events_keep_their_last_adjustment() {
         .filter(|event| event.slot == slot as u32)
         .map(|event| {
             let residual = event.y - with_term.bound(curve.value(event.distance).unwrap_or(0.0));
-            explaining_bound(f64::from(event.adjustment), residual)
+            let adjustment = f64::from(event.adjustment);
+            if !adjustment.is_finite() || !residual.is_finite() {
+                0.0
+            } else if residual >= 0.0 {
+                adjustment.max(0.0).min(residual)
+            } else {
+                adjustment.min(0.0).max(residual)
+            }
         })
         .sum();
     let charged = without_term.levels[0].nodes[slot].peer.sum;
@@ -2680,6 +2809,63 @@ fn refit_refusals_are_counted_apart_from_live_refusals() {
     let (other_slot, _) = other.touch(0.25f64.to_bits());
     assert_eq!(other.rebuild_node(other_slot, &mut reversed), 2);
     assert_eq!(other.nodes[other_slot], table.nodes[slot]);
+}
+
+/// `pairs_refused_last_refit` is a GAUGE: the refit resets it, so it reports
+/// the last refit's drops rather than a running total. That semantic was
+/// unpinned (I6 of the 2026-09-18 round-3 testing review): removing the reset
+/// left the whole suite green while turning the dashboard gauge into a
+/// monotonically rising number.
+///
+/// It also feeds `log_saturation`'s change detector, and the H1 underflow in
+/// that function is exactly what happens when the gauge's fall is not
+/// accounted for, so the two belong together.
+#[test]
+fn the_refit_gauge_resets_and_reads_zero_when_nothing_is_dropped() {
+    let mut table = ContractTable::new();
+    let (slot, _) = table.touch(0.25f64.to_bits());
+
+    // A refit that DOES drop: ten peers for eight entries.
+    let mut crowded: Vec<(u32, u32, Moments)> = (0..10u32)
+        .map(|peer| {
+            let mut m = Moments::default();
+            m.add(1.0 + f64::from(peer), 0.5);
+            (peer, 0, m)
+        })
+        .collect();
+    table.pairs_refused_last_refit += table.rebuild_node(slot, &mut crowded) as u64;
+    assert_eq!(
+        table.pairs_refused_last_refit, 2,
+        "ten peers into eight entries drops two"
+    );
+
+    // The next refit is clean, and the gauge must go back to zero rather than
+    // keep the previous refit's two.
+    let mut roomy: Vec<(u32, u32, Moments)> = (0..4u32)
+        .map(|peer| {
+            let mut m = Moments::default();
+            m.add(1.0, 0.5);
+            (peer, 0, m)
+        })
+        .collect();
+    table.pairs_refused_last_refit = 0;
+    table.pairs_refused_last_refit += table.rebuild_node(slot, &mut roomy) as u64;
+    assert_eq!(
+        table.pairs_refused_last_refit, 0,
+        "a refit whose contract fits in CONTRACT_ENTRIES drops nothing"
+    );
+
+    // And through the real refit path, which is what owns the reset: feed a
+    // stage traffic whose contracts all fit, refit, and read the gauge.
+    let _guard = GlobalRng::seed_guard(0x4485_c6a6);
+    let (mut stage, _) = failure_stage_pair();
+    feed(&mut [&mut stage], background_pooled(0.0, 1.0, 0..4));
+    assert_eq!(
+        stage.diagnostics().contract_pairs_refused_last_refit,
+        0,
+        "four peers can never fill a contract's eight entries, so the gauge \
+         must read zero after the last refit"
+    );
 }
 
 /// The term is BIDIRECTIONAL, which is the second design limitation recorded
@@ -3473,6 +3659,16 @@ fn the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract() {
          not on the 1e-9 sentinel: {}",
         thin_components.sigma2
     );
+    // I4 of the 2026-09-18 round-3 testing review: the FLAG's polarity was
+    // untested, so inverting `measured <= floor` to `measured > floor`
+    // survived the whole suite. The flag is what the exported
+    // `floor_bound_refits` counter is built from, and the whole argument for
+    // accepting an always-binding floor rests on that counter being readable
+    // on a live node.
+    assert!(
+        thin_components.floor_bound,
+        "(a) the floor must be the BINDING value here, and the flag must say so"
+    );
     let thin_slot = thin.table.lookup(&0).expect("contract 0 is tracked");
     let thin_effect = thin
         .effect(Some(thin_slot), ContractQuery::Shared, 0.0, 1)
@@ -3551,10 +3747,37 @@ fn the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract() {
         }
     }
     let components = components_for(&mut noisy);
+    // `> 0.25` alone is NOT decisive, which I4 of the round-3 testing review
+    // established by working it through: 0.25 is the Bernoulli maximum, so a
+    // mutant that replaced the evidence floor with any constant above it (0.5,
+    // say) satisfies this too. The flag is what separates "the measurement
+    // won" from "a bigger floor won", and it is the direct negative of the
+    // thin case above.
     assert!(
         components.sigma2 > 0.25,
         "a measured within-cell variance above the floor must be used: {}",
         components.sigma2
+    );
+    assert!(
+        !components.floor_bound,
+        "and the flag must say the MEASURED value bound, not the floor: sigma2 {}",
+        components.sigma2
+    );
+    // Restored from `unanimous_evidence_is_applied_unshrunk_and_bounded_by_the_peer_bar`,
+    // which was deleted at 20a5a6230 because its load-bearing assertion was
+    // `sigma2 == MIN_SIGMA2`, a fact the floor deliberately invalidates. Two
+    // of its three halves were re-homed; this one was dropped and is the half
+    // that bears on I4, because it asserts the shrinkage genuinely applies
+    // where the variance is real rather than merely that `sigma2` is large.
+    let noisy_slot = noisy.table.lookup(&0).expect("contract 0 is tracked");
+    let noisy_effect = noisy
+        .effect(Some(noisy_slot), ContractQuery::Shared, 0.0, 1)
+        .expect("present entries");
+    let noisy_raw = raw_mean(&noisy, noisy_slot);
+    assert!(
+        noisy_effect.abs() < 0.98 * noisy_raw.abs(),
+        "a genuinely noisy contract must be shrunk away from its raw mean: \
+         effect {noisy_effect} against raw {noisy_raw}"
     );
 }
 
@@ -3756,6 +3979,23 @@ fn contract_components_match_their_formulae_exactly() {
     assert_eq!(c.tau2_contract, 0.125);
     assert_eq!(c.qualifying_contracts, 2);
     assert_eq!(c.qualifying_entries, 4);
+    assert!(
+        !c.floor_bound,
+        "the measured 0.5 beat the 0.25 floor here, and the flag must say so"
+    );
+    assert!(
+        !c.den_below_two,
+        "two contracts qualified, so the den gate did not fire"
+    );
+
+    // The FLOOR's `+2` pinned exactly, from the same table. It is unpinned
+    // otherwise (`+3.0` survived the whole floor test, measured), and since the
+    // floor binds on every refit of the recorded production streams it is the
+    // constant that sets the term's magnitude in the field. Each cell has
+    // n = 4, w2 = 8, so n_eff = n^2/w2 = 2 and the Laplace floor is
+    // 1/(2 + 2) = 0.25. `+3.0` would give 0.2, and `+1.0` 0.3333.
+    assert_eq!(bernoulli_variance_floor(2.0), 0.25);
+    assert_eq!(bernoulli_variance_floor(8.0), 0.1);
 
     // Non-vacuity: the two noise forms must genuinely differ here, or the
     // assertion above would hold for both.
@@ -4790,5 +5030,146 @@ fn a_new_live_refusal_is_not_suppressed_by_a_falling_refit_gauge() {
     assert_eq!(
         estimator.refused_at_last_log, 4,
         "a new live refusal must not be suppressed by an unchanged composite"
+    );
+}
+
+/// I1 of the 2026-09-18 round-3 testing review, as a unit fact on an explicit
+/// table rather than a probe of a stage's final state.
+///
+/// `a_peer_failing_a_contract_others_serve_is_charged_to_that_peer` compares
+/// two stages and its verdict is the same in three regimes, including the term
+/// being inert. The counterfactual that makes the leave-one-out MEAN anything
+/// is this: with the failing peer included, the contract's effect is strongly
+/// positive; with that one peer left out, it is not. If those two were equal,
+/// leaving the peer out would be doing nothing.
+#[test]
+fn leaving_the_failing_peer_out_removes_its_own_evidence() {
+    let mut table = ContractTable::new();
+    let key = 0.52f64.to_bits();
+    let (slot, _) = table.touch(key);
+    // Peer 0 fails the contract; peers 1 and 2 succeed on it. Residuals carry
+    // the sign of the outcome, as they do in the stage.
+    for _ in 0..8 {
+        assert!(table.add(slot, (0, 0), 1.0, 0.9));
+    }
+    for peer in 1..3u32 {
+        for _ in 0..8 {
+            assert!(table.add(slot, (peer, 0), 1.0, -0.3));
+        }
+    }
+    // Contracts whose MEANS differ, with their own peers in agreement. This is
+    // what `tau2_contract` measures, and it has to be positive or `effect`
+    // returns `None` for every query and the counterfactual is unobservable.
+    //
+    // Measured while writing this, and worth recording: a table holding ONLY
+    // the disagreeing contract above gives `tau2_contract` exactly 0 with two
+    // qualifying contracts, because the pooled `tau2_peer` rises to 0.2275 and
+    // the noise it contributes exceeds the between-contract contrast. So a
+    // contract whose peers disagree sharply contributes its spread to
+    // `tau2_peer`, not to `tau2_contract`, and the term produces no effect for
+    // it at all unless OTHER contracts supply the between-contract variance.
+    // That is the estimator behaving as designed, and it is why this table has
+    // a background of agreeing contracts.
+    for (index, mean) in (0..12u64).map(|i| (i, if i % 2 == 0 { 0.8 } else { -0.4 })) {
+        let (other, _) = table.touch((0.1 + 0.01 * index as f64).to_bits());
+        for peer in 0..3u32 {
+            for _ in 0..8 {
+                assert!(table.add(other, (peer, 0), 1.0, mean));
+            }
+        }
+    }
+    table.components = table.compute_components();
+    let components = table.components.expect("components exist");
+    assert!(
+        components.tau2_contract > 0.0,
+        "the contracts must differ, or every effect is None: {components:?}"
+    );
+
+    let shared = table
+        .effect(Some(slot), ContractQuery::Shared, 0.0, 1)
+        .expect("three present peers");
+    let left_out = table
+        .effect(Some(slot), ContractQuery::LeaveOut(Some((0, 0))), 0.0, 1)
+        .expect("two present peers without peer 0");
+    assert!(
+        shared > 0.05,
+        "including the failing peer, the contract's mean residual is positive \
+         and so is its effect: {shared}"
+    );
+    assert!(
+        left_out < 0.0,
+        "leaving that peer out leaves two successes, so the effect must turn \
+         NEGATIVE: {left_out} against shared {shared}"
+    );
+    // And the consequence for the peer: its own positive residual is adjusted
+    // by a NEGATIVE effect, which the bound refuses, so nothing is explained
+    // away. This is the property `explaining_bound` exists for on the learn
+    // path, and the mutation that drops it (c1_learn_site_drops_the_bound,
+    // GREEN before this test) makes the residual LARGER than the peer earned.
+    let residual = 0.9;
+    assert_eq!(
+        explaining_bound(left_out, residual),
+        0.0,
+        "an effect opposing the residual's sign must remove nothing"
+    );
+    assert!(
+        residual - left_out > residual,
+        "and dropping the bound would charge the peer MORE than its own \
+         residual: {} against {residual}",
+        residual - left_out
+    );
+}
+
+/// I2 / L8 of the same review: `effects_applied` must count residuals that
+/// MOVED, not effects that were merely available. An effect the bound takes to
+/// zero (one opposing the residual's sign) leaves the levels learning exactly
+/// what they would have learned without the term, and counting it made this an
+/// availability count under an application count's name.
+///
+/// The case is routine rather than rare: it is a failure event on a contract
+/// most peers succeed on, which is the setup above.
+#[test]
+fn an_effect_the_bound_refuses_does_not_count_as_applied() {
+    let _guard = GlobalRng::seed_guard(0x4485_c0b0);
+    let good = 0.41;
+    // Peers 1..6 succeed on `good`, so its effect is negative.
+    let mut steps = background_pooled(0.0, 2.0, 10..30);
+    for peer in 1..6u32 {
+        steps.extend(on_contract(peer, good, false, 8, 1.6, 0.1));
+    }
+    // Then peer 0 FAILS there: a positive residual meeting a negative effect.
+    steps.extend(on_contract(0, good, true, 4, 1.9, 0.02));
+    let (mut stage, _) = failure_stage_pair();
+    feed(&mut [&mut stage], steps);
+
+    let table = stage.contracts.as_ref().expect("a contract table");
+    let applied = table.effects_applied;
+    let slot = table
+        .table
+        .lookup(&good.to_bits())
+        .expect("the contract is tracked");
+    let effect = table.effect(Some(slot), ContractQuery::Shared, 1.9, 1);
+    assert!(
+        effect.is_none_or(|value| value < 0.0),
+        "the contract several peers succeed on must not have a positive \
+         effect, or this test is not exercising the refused case: {effect:?}"
+    );
+    // The counter must not have run away with the availability of an effect:
+    // every failure on `good` had one available and the bound refused it.
+    assert!(
+        applied < table.estimable_refits * u64::from(WINDOW_EVENTS as u32),
+        "sanity on the shape of the counter: {applied}"
+    );
+    // The decisive part, as a unit fact, because the stage's own count mixes
+    // in every other contract's genuine adjustments.
+    assert_eq!(
+        explaining_bound(-0.2, 0.9),
+        0.0,
+        "an effect opposing the residual removes nothing"
+    );
+    assert_ne!(
+        explaining_bound(0.2, 0.9),
+        0.0,
+        "and one agreeing with it does, so the two cases are distinguishable"
     );
 }
