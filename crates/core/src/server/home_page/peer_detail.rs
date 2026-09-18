@@ -980,6 +980,92 @@ mod tests {
         }
     }
 
+    /// `fmt_contract_term`'s branches, each of which was untested. The
+    /// floor-versus-estimable clause is the one that matters: a transposition
+    /// of the two counts renders a sentence claiming the floor bound MORE
+    /// often than there were refits to bind on, and nothing would have caught
+    /// it. A round-3 testing-review item.
+    #[test]
+    fn the_contract_term_row_reports_each_regime_distinctly() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let base = || {
+            let mut u = Unstructured::new(&[0u8; 4096]);
+            let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+                .expect("construct RouterSnapshotInfo for test");
+            info.hierarchical_contracts = 12;
+            info.hierarchical_contract_evictions = 3;
+            info.hierarchical_contract_estimable_refits = 0;
+            info.hierarchical_contract_effects_applied = 0;
+            info.hierarchical_contract_forecast_offsets = 0;
+            info.hierarchical_contract_floor_bound_refits = 0;
+            info.hierarchical_contract_den_below_two_refits = 0;
+            info.hierarchical_contract_qualifying_contracts = 0;
+            info.hierarchical_contract_qualifying_entries = 0;
+            info.hierarchical_contract_tau2 = None;
+            info
+        };
+
+        // (a) never estimable: the row must say so and must not print counts
+        // that would read as activity.
+        let never = fmt_contract_term(&base());
+        assert!(
+            never.contains("never estimable") && never.contains("12 contracts tracked"),
+            "{never}"
+        );
+
+        // (b) estimable with no components at the last refit.
+        let mut info = base();
+        info.hierarchical_contract_estimable_refits = 40;
+        info.hierarchical_contract_floor_bound_refits = 40;
+        info.hierarchical_contract_effects_applied = 7;
+        info.hierarchical_contract_forecast_offsets = 9;
+        let no_components = fmt_contract_term(&info);
+        assert!(
+            no_components.contains("no components at the last refit"),
+            "{no_components}"
+        );
+
+        // (c) components present, the floor binding on every estimable refit,
+        // and the den gate silent. The two counts must appear in the order
+        // "bound at N of M", so a transposition reads wrongly and fails here.
+        info.hierarchical_contract_tau2 = Some(0.125);
+        info.hierarchical_contract_qualifying_contracts = 41;
+        info.hierarchical_contract_qualifying_entries = 323;
+        let full = fmt_contract_term(&info);
+        assert!(
+            full.contains("evidence floor bound at 40 of 40 estimable refits"),
+            "{full}"
+        );
+        assert!(
+            full.contains("between-contract variance 0.1250 over 41 contracts"),
+            "{full}"
+        );
+        assert!(
+            !full.contains("fewer than two qualifying contracts"),
+            "the den gate did not fire, so the row must not mention it: {full}"
+        );
+
+        // The transposition, stated as its own assertion so the failure names
+        // the defect rather than a missing substring.
+        let mut swapped = info.clone();
+        swapped.hierarchical_contract_floor_bound_refits = 40;
+        swapped.hierarchical_contract_estimable_refits = 11;
+        let swapped_row = fmt_contract_term(&swapped);
+        assert!(
+            swapped_row.contains("bound at 40 of 11"),
+            "the row prints floor-bound BEFORE estimable, so a swap is visible \
+             as an impossible fraction: {swapped_row}"
+        );
+
+        // (d) the den gate firing on some of the estimable refits.
+        info.hierarchical_contract_den_below_two_refits = 12;
+        let gated = fmt_contract_term(&info);
+        assert!(
+            gated.contains("12 of those refits had fewer than two qualifying contracts"),
+            "{gated}"
+        );
+    }
+
     #[test]
     fn hierarchical_readings_are_labelled_live_frozen_or_absent() {
         let live = || "0.123".to_string();

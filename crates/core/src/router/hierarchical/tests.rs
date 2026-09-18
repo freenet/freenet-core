@@ -5218,22 +5218,62 @@ fn neither_bound_call_site_may_charge_a_peer_more_than_its_own_residual() {
     for peer in 20..24u32 {
         steps.extend(on_contract(peer, target, false, 6, 0.5, 0.3));
     }
-    // Then peer 0 fails there. Peer 0 appears NOWHERE else, so its level sum is
-    // exactly these events' adjusted residuals.
-    steps.extend(on_contract(0, target, true, 4, 0.9, 0.1));
-    // More traffic, so at least one refit re-adjusts the window and the refit
-    // call site is exercised as well as the learn one.
+    // A second background block BEFORE peer 0 acts, so the refit that precedes
+    // its events has already seen the target contract and `tau2_contract` is
+    // positive when they are LEARNED. Without this the learn-site branch never
+    // fires for peer 0 and only the refit site is exercised: measured, and it
+    // is why the first version of this test killed one mutation and not the
+    // other.
     for index in 0..8u32 {
         let failing = 0.05 + 0.01 * f64::from(index);
         let winning = 0.30 + 0.01 * f64::from(index);
         for peer in 10..13u32 {
-            steps.extend(on_contract(peer, failing, true, 6, 1.1, 0.4));
-            steps.extend(on_contract(peer, winning, false, 6, 1.1, 0.4));
+            steps.extend(on_contract(peer, failing, true, 6, 0.85, 0.3));
+            steps.extend(on_contract(peer, winning, false, 6, 0.85, 0.3));
         }
     }
+    // Then peer 0 fails there. Peer 0 appears NOWHERE else, so its level sum is
+    // exactly these events' adjusted residuals.
+    steps.extend(on_contract(0, target, true, 4, 1.2, 0.1));
 
     let (mut with_term, mut without_term) = failure_stage_pair();
     feed(&mut [&mut with_term, &mut without_term], steps);
+
+    // PHASE 1 measures the LEARN site. A refit REBUILDS the levels from the
+    // window, so after one has run the level sums carry the refit's
+    // adjustments and the learn site is invisible in them. Measuring here,
+    // with no further traffic, is the only way to see it: the first version of
+    // this test fed everything in one go and therefore killed the refit-site
+    // mutation and not the learn-site one.
+    {
+        let slot_with = with_term.peers.lookup(&0).expect("peer 0 is tracked");
+        let slot_without = without_term.peers.lookup(&0).expect("peer 0 is tracked");
+        let applied = with_term.levels[0].nodes[slot_with].peer.sum;
+        let control = without_term.levels[0].nodes[slot_without].peer.sum;
+        assert!(
+            control > 0.05,
+            "sanity: peer 0's own failures must be worth something in the \
+             control at the learn site, or the equality holds trivially: {control}"
+        );
+        assert!(
+            (applied - control).abs() < 1e-9,
+            "LEARN SITE: an effect opposing peer 0's residuals must remove \
+             nothing: with the term {applied}, control {control}"
+        );
+    }
+
+    // PHASE 2 forces a refit, which re-adjusts the whole window and rebuilds
+    // the levels, and measures the REFIT site on the same events.
+    let mut more = Vec::new();
+    for index in 0..8u32 {
+        let failing = 0.05 + 0.01 * f64::from(index);
+        let winning = 0.30 + 0.01 * f64::from(index);
+        for peer in 10..13u32 {
+            more.extend(on_contract(peer, failing, true, 6, 1.4, 0.3));
+            more.extend(on_contract(peer, winning, false, 6, 1.4, 0.3));
+        }
+    }
+    feed(&mut [&mut with_term, &mut without_term], more);
 
     // The term must be active, or this test cannot see the bound at all.
     let table = with_term.contracts.as_ref().expect("a contract table");
@@ -5267,12 +5307,12 @@ fn neither_bound_call_site_may_charge_a_peer_more_than_its_own_residual() {
     let control = without_term.levels[0].nodes[slot_without].peer.sum;
     assert!(
         control > 0.05,
-        "sanity: peer 0's own failures must be worth something in the control, \
-         or the equality below holds trivially: {control}"
+        "sanity: peer 0's own failures must be worth something in the control \
+         at the refit site too: {control}"
     );
     assert!(
         (applied - control).abs() < 1e-9,
-        "an effect opposing peer 0's residuals must remove nothing at EITHER \
-         call site: with the term {applied}, control {control}, effect {effect}"
+        "REFIT SITE: an effect opposing peer 0's residuals must remove \
+         nothing: with the term {applied}, control {control}, effect {effect}"
     );
 }
