@@ -165,16 +165,20 @@
 //! - M2 scores only forecasts that are too high on successes, so an
 //!   over-correction reads as an improvement, and M3's interval cannot resolve
 //!   a level shift of the size the explain-away coverage asymmetry implies.
-//!   Two figures circulated for that shift and they are NOT in conflict: over
-//!   gateway-1's 3,880 tuning events the signed adjustment sums are -37.723 on
-//!   successes and +44.208 on failures, so the NET is
-//!   `(44.208 - 37.723)/3880 = +0.00167` and the total PERTURBATION magnitude
-//!   is `(44.208 + 37.723)/3880 = +0.02112`. They are the difference and the
-//!   sum of the same two sums. The second is the round-1 estimate of about
-//!   +0.024, which that review labelled an approximate upper estimate with the
-//!   shrinkage ignored. Neither is the number the decision should rest on; see
-//!   [`CONTRACT_MIN_OTHER_PEERS`] for the outcome-conditional means, which are
-//!   what tracks outcome and so what actually distorts the peer levels.
+//!   The size of that shift was measured three times and the first two
+//!   answers were wrong about DIFFERENT things, so the sequence is recorded.
+//!   A first measurement gave +0.00167 per event and was reported as
+//!   contradicting the review's estimate of about +0.024. It did not: it
+//!   covered only the LIVE learn path, which is a small fraction of the
+//!   adjustment an event ends up carrying. Measured over the last refit's
+//!   whole prepared window, which is the population the mechanism actually
+//!   reaches, the net amount subtracted per event is **+0.0235 on the gate
+//!   window** and **-0.0331 on the gateway-1 tuning events**, both the same
+//!   order as the review's figure, which is therefore corroborated in
+//!   magnitude. The SIGN differs between the two windows, so no single signed
+//!   number describes both. See [`CONTRACT_MIN_OTHER_PEERS`] for the
+//!   outcome-conditional means and for the finding that the coverage
+//!   asymmetry itself reverses between windows.
 //! - the gate replays the recorded CLAMPED forecast, and the unbounded value
 //!   is recorded nowhere, so no offline tool can reproduce the router's order
 //!   among candidates whose forecasts all clamp.
@@ -1227,6 +1231,19 @@ const CONTRACT_HORIZON_HOURS: f64 = 0.5;
 /// that 83.5% of gateway-1's failures and 95.4% of gateway-2's are on
 /// contracts that can never be adjusted or offset. The mechanism therefore
 /// covers a small share of the failure population, not the population.
+///
+/// **The coverage asymmetry is a property of the WINDOW's traffic, not of the
+/// mechanism.** This is the most important thing measured about it, and it was
+/// found only by re-running the counters on the gate streams rather than the
+/// tuning streams. Pooled over the four gate streams, the adjustment lands on
+/// 12.1% of successes and **23.9% of failures**, a ratio of 0.51x; on the
+/// tuning window the same counters give 22.4% and 14.9%, a ratio of 1.51x the
+/// other way. Per stream the direction ranges from 0.16x (failures adjusted
+/// six times as often as successes) to 3.12x. So a figure measured on one
+/// window does not describe another, and the round-1 finding is correct about
+/// the tuning window and does not carry to the gate window. That is not
+/// evidence the mechanism is unbiased: a coverage difference in either
+/// direction shifts what the peer levels learn.
 ///
 /// **The number the bar asymmetry should be judged on, and the number that
 /// cannot judge it.** Measured on gateway-1's tuning stream, the mean
