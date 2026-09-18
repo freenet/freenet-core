@@ -2163,6 +2163,7 @@ fn the_forecast_bar_is_one_peer_higher_than_the_learning_bar() {
         sigma2: 0.25,
         tau2_peer: 0.0,
         tau2_contract: 0.16,
+        floor_bound: false,
         qualifying_contracts: 2,
         qualifying_entries: 4,
     });
@@ -3580,6 +3581,7 @@ fn the_shrunk_contract_effect_matches_its_formula() {
         sigma2: 0.25,
         tau2_peer: 0.09,
         tau2_contract: 0.16,
+        floor_bound: false,
         qualifying_contracts: 1,
         qualifying_entries: 3,
     };

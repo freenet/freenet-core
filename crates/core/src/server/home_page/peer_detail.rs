@@ -108,8 +108,16 @@ fn fmt_contract_term(rs: &crate::router::RouterSnapshotInfo) -> String {
         ),
         None => "no components at the last refit".to_string(),
     };
+    // The floor's binding frequency: on the recorded gateway streams it bound
+    // on every estimable refit, because cells there are mostly unanimous and
+    // mostly tiny. A reader whose traffic differs needs to see that here.
+    let floor = format!(
+        "; evidence floor bound at {} of {} estimable refits",
+        rs.hierarchical_contract_floor_bound_refits, rs.hierarchical_contract_estimable_refits
+    );
     format!(
-        "{} residuals adjusted, {} forecasts offset; estimable at {} refits; {tau2}",
+        "{} residuals adjusted, {} forecasts offset; estimable at {} refits; \
+         {tau2}{floor}",
         rs.hierarchical_contract_effects_applied,
         rs.hierarchical_contract_forecast_offsets,
         rs.hierarchical_contract_estimable_refits,

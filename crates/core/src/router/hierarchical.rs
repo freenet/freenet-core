@@ -1314,6 +1314,14 @@ struct ContractComponents {
     tau2_peer: f64,
     /// Between-contract variance of contract effects about the curve.
     tau2_contract: f64,
+    /// Whether [`bernoulli_variance_floor`] was the BINDING value for
+    /// `sigma2`, rather than the measured `ss / df`. Exported as a per-refit
+    /// count, because it is the signal that tells a future reader whether the
+    /// reasoning behind the floor still holds on their traffic: on the
+    /// recorded gateway streams it bound on 595 of 595 estimable refits, and
+    /// if traffic ever makes the measured value bind instead, that must be
+    /// visible without a replay rig.
+    floor_bound: bool,
     /// Contracts that qualified for `tau2_contract` (the `den` of its average)
     /// and present entries that informed any component. Diagnostic only, never
     /// read by the model. `tau2_contract` has NO minimum group count, so
@@ -1380,6 +1388,9 @@ struct ContractTable {
     /// learn time, where every event produces a forecast, because the routing
     /// query path takes `&self` under a read lock and cannot count.
     forecast_offsets: u64,
+    /// Estimable refits at which [`bernoulli_variance_floor`] was the binding
+    /// value for `sigma2` rather than the measured within-cell variance.
+    floor_bound_refits: u64,
 }
 
 impl ContractTable {
@@ -1396,6 +1407,7 @@ impl ContractTable {
             estimable_refits: 0,
             effects_applied: 0,
             forecast_offsets: 0,
+            floor_bound_refits: 0,
         }
     }
 
@@ -1603,23 +1615,46 @@ impl ContractTable {
         if df < 2.0 {
             return None;
         }
-        // NOTE, from the 2026-09-17 round-2 review (finding F) and the
-        // measurement that answered it. The review proposed refusing whenever
-        // `ss / df` lands on the `MIN_SIGMA2` sentinel, on the grounds that
-        // the sentinel means "no within-cell information" and the shrinkage
-        // then applies the raw other-peer mean at full strength. That was
-        // implemented and MEASURED, and it switches the term off on its own
-        // target case: a contract several peers fail unanimously at one
-        // distance has IDENTICAL residuals in every cell, so `ss` is exactly
-        // 0 by construction, and under that fix the whole contract-term suite
-        // goes dark. It is reverted; the write-up and the decision left to the
-        // lead are in the PR. What remains true: where the evidence is
-        // unanimous the effect IS applied unshrunk, which is defensible
-        // (unanimous evidence is not noisy) and is bounded by
-        // [`CONTRACT_MIN_OTHER_PEERS`] and [`CONTRACT_PRESENCE`] rather than
-        // by the shrinkage. Pinned by
-        // `unanimous_evidence_is_applied_unshrunk_and_bounded_by_the_peer_bar`,
-        // and the regime is visible through `qualifying_contracts`.
+        // WHY `sigma2` IS FLOORED, and the direction of the error it costs.
+        // Settled 2026-09-17 after the round-2 review (finding F) and the
+        // measurements that answered it; keep this argument with the code.
+        //
+        // The review first proposed REFUSING whenever `ss / df` lands on the
+        // `MIN_SIGMA2` sentinel. That was implemented and measured, and it
+        // switches the term off on its own target case: a contract several
+        // peers fail unanimously at one distance has IDENTICAL residuals in
+        // every cell, so `ss` is exactly 0 by construction, and the whole
+        // contract-term suite went dark. `ss = 0` cannot distinguish "no
+        // within-cell information" from "unanimous evidence".
+        //
+        // What separates them is evidence QUANTITY, which is where the noise
+        // term already looks. The failure target is a PROBABILITY, so an
+        // outcome's within-cell variance is `p(1-p)` and never zero, and
+        // unanimity in a small sample is what a moderate `p` looks like.
+        // `MIN_SIGMA2` is a numerical sentinel standing in for that
+        // statistical quantity, which is why it behaved so badly.
+        // [`bernoulli_variance_floor`] replaces it. `max(measured, floor)`
+        // keeps the empirical estimate available: if a cell ever holds many
+        // MIXED outcomes, `ss / df` rises above the floor and binds instead.
+        //
+        // MEASURED on the recorded gateway streams: the floor is the binding
+        // value on 595 of 595 estimable refits, with the measured `ss / df`
+        // 23 to 623 times smaller. That is a statement about the DATA, not a
+        // flaw: `ss / df` estimates a within-(contract, peer) variance from
+        // cells that are mostly unanimous and mostly tiny, so it converges on
+        // zero for a reason unrelated to the true variance, and that
+        // structural zero is what made the unshrunk path reachable.
+        // `floor_bound_refits` exports the frequency, so a future reader can
+        // see whether this still holds on their traffic without a rig.
+        //
+        // THE ERROR HAS A DIRECTION, and a reader needs to know it: for a
+        // genuinely dead contract the true Bernoulli variance goes to zero as
+        // `p` goes to 1, while the Laplace floor stays at `1/(n_eff + 2)`. So
+        // the floor OVER-shrinks exactly the case the term exists for. The
+        // size is tolerable at realistic evidence, which is what
+        // `the_evidence_floor_shrinks_thin_evidence_and_spares_a_dead_contract`
+        // pins: at six peers with eight events each the effect keeps 99.7% of
+        // the raw mean, against 92.3% for two barely-replicated cells.
         // The failure target is a PROBABILITY, so the within-cell variance of
         // an outcome is `p(1-p)`, never zero: unanimity in a small sample is
         // the expected appearance of a moderate `p`, not evidence of a
@@ -1633,7 +1668,14 @@ impl ContractTable {
         // each seen repeatedly on one contract. See
         // [`bernoulli_variance_floor`]. Contract table only: the timing stages
         // model logs rather than probabilities and have no contract table.
-        let sigma2 = (ss / df).max(floor_acc / df);
+        let floor = floor_acc / df;
+        let measured = ss / df;
+        let sigma2 = measured.max(floor);
+        // Written as `<=` rather than as a negated `>`, so clippy's
+        // partial-order lint is satisfied; a NaN measured value also reads as
+        // floor-bound, which is the right answer because `max` then returns
+        // the floor.
+        let floor_bound = !measured.is_finite() || measured <= floor;
 
         // tau2_peer: each replicated entry against the SUM of the other present
         // entries of its contract (leave-one-out, summed rather than
@@ -1707,6 +1749,7 @@ impl ContractTable {
                 sigma2,
                 tau2_peer,
                 tau2_contract,
+                floor_bound,
                 qualifying_contracts: den as u64,
                 qualifying_entries: entries_present,
             })
@@ -2079,6 +2122,11 @@ pub(crate) struct StageDiagnostics {
     /// that was estimable and moved nothing.
     pub contract_effects_applied: u64,
     pub contract_forecast_offsets: u64,
+    /// Estimable refits at which the Bernoulli evidence floor was the binding
+    /// value for `sigma2` rather than the measured within-cell variance. On
+    /// the recorded gateway streams this equals `contract_estimable_refits`;
+    /// a reader whose traffic differs should be able to see that here.
+    pub contract_floor_bound_refits: u64,
     /// Contracts that qualified for `tau2_contract` at the last refit, and
     /// present entries that informed the components.
     pub contract_qualifying_contracts: u64,
@@ -2599,8 +2647,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             table.pairs_refused_last_refit += table.rebuild_node(contract_slot, pairs) as u64;
         }
         table.components = table.compute_components();
-        if table.components.is_some() {
+        if let Some(components) = table.components {
             table.estimable_refits += 1;
+            table.floor_bound_refits += u64::from(components.floor_bound);
         }
         for event in prepared.iter_mut() {
             let Some(source) = sorted.get_mut(event.source as usize) else {
@@ -2710,6 +2759,10 @@ impl<K: Hash + Eq + Clone> Stage<K> {
                 .contracts
                 .as_ref()
                 .map_or(0, |table| table.forecast_offsets),
+            contract_floor_bound_refits: self
+                .contracts
+                .as_ref()
+                .map_or(0, |table| table.floor_bound_refits),
             contract_qualifying_contracts: self
                 .contracts
                 .as_ref()

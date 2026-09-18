@@ -2770,6 +2770,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.hierarchical_contract_qualifying_contracts,
                     ),
                     (
+                        "hierarchical_contract_floor_bound_refits",
+                        snapshot.hierarchical_contract_floor_bound_refits,
+                    ),
+                    (
                         "hierarchical_contracts",
                         snapshot.hierarchical_contracts as u64,
                     ),
@@ -4513,6 +4517,7 @@ mod tests {
         info.hierarchical_contract_forecast_offsets = 202;
         info.hierarchical_contract_estimable_refits = 203;
         info.hierarchical_contract_qualifying_contracts = 204;
+        info.hierarchical_contract_floor_bound_refits = 206;
         info.hierarchical_contracts = 205;
         info.hierarchical_contract_tau2 = Some(0.25);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
@@ -4521,6 +4526,7 @@ mod tests {
             ("hierarchical_contract_forecast_offsets", 202),
             ("hierarchical_contract_estimable_refits", 203),
             ("hierarchical_contract_qualifying_contracts", 204),
+            ("hierarchical_contract_floor_bound_refits", 206),
             ("hierarchical_contracts", 205),
         ] {
             assert_eq!(

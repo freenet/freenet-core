@@ -1112,10 +1112,19 @@ pub(crate) struct RouterSnapshotInfo {
     /// Scored forecasts that actually carried a contract offset.
     #[serde(default)]
     pub hierarchical_contract_forecast_offsets: u64,
+    /// Estimable refits at which the Bernoulli evidence floor was the binding
+    /// value for the contract term's `sigma2`, rather than the measured
+    /// within-cell variance. On the recorded gateway streams the floor bound
+    /// on every estimable refit, because cells there are mostly unanimous and
+    /// mostly tiny; this counter is how a reader sees whether that still holds
+    /// on their traffic.
+    #[serde(default)]
+    pub hierarchical_contract_floor_bound_refits: u64,
     /// Contracts that qualified for `tau2_contract` at the last refit, and
-    /// present entries that informed the components. `tau2_contract` has NO
-    /// minimum group count, so without these a value resting on one contract
-    /// reads the same as one resting on eighty.
+    /// present entries that informed the components. `tau2_contract` requires
+    /// at least two, so this is also how the term's WARM-UP silence is
+    /// observed: a freshly started node has one qualifying contract for its
+    /// first several thousand events and the term is off until it has two.
     #[serde(default)]
     pub hierarchical_contract_qualifying_contracts: u64,
     #[serde(default)]
@@ -3604,6 +3613,7 @@ impl Router {
             hierarchical_contract_estimable_refits: hierarchical[0].contract_estimable_refits,
             hierarchical_contract_effects_applied: hierarchical[0].contract_effects_applied,
             hierarchical_contract_forecast_offsets: hierarchical[0].contract_forecast_offsets,
+            hierarchical_contract_floor_bound_refits: hierarchical[0].contract_floor_bound_refits,
             hierarchical_contract_qualifying_contracts: hierarchical[0]
                 .contract_qualifying_contracts,
             hierarchical_contract_qualifying_entries: hierarchical[0].contract_qualifying_entries,
