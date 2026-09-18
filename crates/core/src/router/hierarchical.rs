@@ -1133,6 +1133,13 @@ const CONTRACT_ENTRIES: usize = 8;
 
 /// Contracts tracked, with batched least-recently-used eviction.
 ///
+/// Note for whoever reads the eviction counter: a contract enters the table on
+/// `touch`, which happens for EVERY learned event before the residual is
+/// computed, so a contract whose event was then rejected (no curve yet, or a
+/// rebase forced a refit first) still occupies a slot and can still be
+/// evicted. On a cold node the eviction count therefore includes contracts
+/// that never contributed anything.
+///
 /// Measured on the same soak: at most 214 distinct contracts in one hour and
 /// 1,259 in a whole file (about a day). An evicted contract loses only its
 /// explanation: its windowed events keep the adjustment they last had.
@@ -1452,6 +1459,17 @@ impl ContractTable {
     ///
     /// `pairs` is sorted in place. Ties in weight are broken by peer slot, so
     /// the result does not depend on the order pairs were accumulated in.
+    ///
+    /// A KNOWN asymmetry this creates, stated because it is invisible at the
+    /// query site: a peer whose pair was dropped here has no entry, so
+    /// `ContractQuery::LeaveOut` excludes nothing for it and it receives the
+    /// effect of ALL the kept eight, while a peer that was kept receives the
+    /// leave-one-out effect of the other seven. Two classes of peer on one
+    /// contract are therefore estimated by slightly different estimators. The
+    /// dropped peer is by construction the lightest, so the difference is
+    /// small, and the count of drops is exported
+    /// (`pairs_refused_last_refit`), but it is not zero and it is not
+    /// corrected.
     fn rebuild_node(&mut self, slot: usize, pairs: &mut [(u32, u32, Moments)]) -> usize {
         if self.nodes.len() <= slot {
             self.nodes.resize(slot + 1, ContractNode::default());
@@ -1486,8 +1504,20 @@ impl ContractTable {
     /// One pass over the nodes per eviction batch, not per evicted peer.
     /// Counterpart of [`Level::evict`], which does the same bookkeeping for
     /// the peer levels.
+    ///
+    /// COST, because this runs on the LEARN path under the router's write lock
+    /// and the lock measurement in the PR covers the refit rather than this.
+    /// The bound is `nodes.len() * CONTRACT_ENTRIES * evicted.len()`
+    /// comparisons, so at a full table and the largest batch a peer table of
+    /// capacity 4096 produces (`capacity / 64` = 64) it is 1024 * 8 * 64, about
+    /// 500k integer comparisons. In production `max_connections` is 200, so
+    /// the peer capacity is 400 and the batch is 6, giving about 49k. It runs
+    /// only when the peer table is full and a newcomer arrives, and the early
+    /// return below means a node with no contract nodes pays nothing. It has
+    /// not been measured directly; that gap is stated in the PR rather than
+    /// papered over.
     fn evict_peers(&mut self, evicted: &[usize]) {
-        if evicted.is_empty() {
+        if evicted.is_empty() || self.nodes.is_empty() {
             return;
         }
         for node in &mut self.nodes {
