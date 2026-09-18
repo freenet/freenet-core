@@ -1730,12 +1730,28 @@ impl ContractTable {
         // At least TWO qualifying contracts, for the same reason as the
         // `df >= 2.0` gate two blocks above: a between-group variance
         // estimated from ONE group is not a variance, it is that group's own
-        // mean, and it then un-shrinks every other contract's effect. On the
-        // recorded gateway streams this costs nothing (52 to 76 qualifying
-        // contracts measured); on the quietest nodes it correctly switches the
-        // term off, which is the honest outcome when one contract cannot tell
-        // you how contracts vary. `qualifying_contracts` is exported so the
-        // regime stays visible.
+        // mean, and it then un-shrinks every other contract's effect.
+        //
+        // WHAT THIS COSTS, measured PER REFIT over the recorded gateway files
+        // rather than on average, because a gate is a threshold and an average
+        // hides it. `den < 2` fires on 62 of gw1-h1's 283 refits (21.9%) and
+        // 96 of gw1-rc's 236 (40.7%), and never on the two gw2 streams. Every
+        // firing is CONSECUTIVE FROM THE FIRST REFIT and none recurs
+        // afterwards, with `den` exactly 1 throughout and never 0. So this is
+        // a WARM-UP property: the term is off for a freshly started node's
+        // first 62 to 96 refits, several thousand events, and then never
+        // again. During that window the node genuinely holds fewer than two
+        // qualifying contracts, so the alternative is a between-contract
+        // variance estimated from one contract, which is the defect this
+        // gates. It sits alongside the estimator's other warm-up rules
+        // ([`MIN_CURVE_POINTS_FAILURE`], [`EAGER_REFIT_BELOW`]), and every
+        // node loses this state on restart in any case.
+        //
+        // An earlier version of this comment said "on the recorded gateway
+        // streams this costs nothing (52 to 76 qualifying contracts
+        // measured)". 52.0 is gw1-h1's MEAN `den`, so that was right about the
+        // steady state and silent about the warm-up. `qualifying_contracts` is
+        // exported, and is how the warm-up silence is observed on a live node.
         let tau2_contract = if den >= 2.0 {
             (acc / den).max(0.0)
         } else {
