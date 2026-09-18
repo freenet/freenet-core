@@ -2114,6 +2114,23 @@ fn explain_away_keeps_a_dead_contract_out_of_other_contracts_forecasts() {
         let gap = |stage: &Stage<u32>| mean_forecast(stage, 0..6) - mean_forecast(stage, 6..30);
         polluted += gap(&without_term) / seeds as f64;
         explained += gap(&with_term) / seeds as f64;
+        // N1 of the 2026-09-18 round-3 testing review. This test was switched
+        // from `background` to `background_pooled` so that more than one
+        // contract qualifies and the term can act at all; asserting that here
+        // makes a future traffic-shape change NAME ITS OWN CAUSE instead of
+        // showing up as a weakened gap. What the pool buys is per-CONTRACT
+        // replication and nothing else, which is the correction in
+        // `background_pooled`'s own docstring.
+        let qualifying = with_term
+            .contracts
+            .as_ref()
+            .and_then(|table| table.components)
+            .map_or(0, |components| components.qualifying_contracts);
+        assert!(
+            qualifying >= 2,
+            "the pooled background must keep at least two contracts qualifying, \
+             or `tau2_contract` is zero and the term is off: {qualifying}"
+        );
     }
     assert!(
         polluted > 0.3,
