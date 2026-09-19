@@ -5,6 +5,14 @@ mod residual;
 mod routing_predictor;
 mod util;
 
+/// Simulation coverage for the hierarchical estimator (#4485), gated on
+/// `simulation_tests` like the other in-crate simulation cases. The module name
+/// is load-bearing: CI's simulation job selects in-crate simulation tests with
+/// `-E 'kind(test) | (kind(lib) & test(sim_e2e_tests))'`, so a differently-named
+/// module would compile and never run (#4301).
+#[cfg(all(test, feature = "simulation_tests"))]
+mod sim_e2e_tests;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
