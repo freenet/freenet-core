@@ -200,56 +200,29 @@ WHEN routing fails (no peers):
 ```
 Two prediction stacks exist in router.rs; exactly one reaches routing.
 
-  HIERARCHICAL (default; router/hierarchical.rs): EB-shrunk isotonic prior,
-    root > peer > (peer, band) empirical-Bayes hierarchy, horizon chosen
-    online. Takes precedence over BOTH legacy variants for every stage it can
-    estimate (a cold stage falls back to legacy). FREENET_ROUTING_HIERARCHICAL=0
-    (false/no/off) is the per-node kill switch; on any node where the flag
-    resolves OFF (0/false/no/off, or any unrecognised or non-UTF-8 value) it
-    is computed at all only while FREENET_ROUTING_DATASET is recording.
-  LEGACY (only where the flag resolves OFF, and as the cold-stage
-    fallback): isotonic curve + per-peer EWMA + fixed-weight Renegade blend
-    (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1 the
-    residual correction in place of the blend.
+  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
+    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
+    the residual correction in place of the blend.
+  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
+    peer > (peer, band) empirical-Bayes hierarchy, forgetting horizon chosen
+    online from a PER-STAGE menu (FAILURE_HORIZONS_HOURS for failure,
+    LOG_HORIZONS_HOURS for response time and transfer speed; the failure menu
+    is the shorter one, so a failure burst is tracked faster). The FAILURE
+    stage also carries a CONTRACT-LEVEL TERM: a second hierarchy, contract >
+    (contract, peer), whose effect is subtracted from what the peer levels
+    learn (from OTHER peers only, so a peer's own failures never explain
+    themselves away) and added back to a forecast (from all present peers).
+    It exists because a failure on a contract nobody can serve was learned as
+    evidence about the peer that was asked, which raised that peer's forecasts
+    for every other contract (#5700). It is on unconditionally wherever the
+    estimator is computed; there is no separate flag for it.
+    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
+    over BOTH legacy variants for every stage it can estimate (a cold stage
+    falls back to legacy). Computed at all only when that flag is on or
+    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
 
 WHEN touching either stack:
-  → Flags parse fail-safe. Default-off flags (parse_routing_flag, e.g.
-    RESIDUAL_CORRECTION) enable only on 1/true/yes/on. The default-on
-    HIERARCHICAL flag (parse_default_on_routing_flag, wired through
-    resolve_hierarchical_flag) is ON when unset, empty or whitespace-only, or
-    1/true/yes/on; OFF on 0/false/no/off; and OFF with a warn! on ANY other
-    non-empty or non-UTF-8 value: setting a default-on flag at all almost
-    always means "off", and ambiguous input falls back to the proven legacy
-    stack.
-  → The resolved mode is logged ONCE, on first use (first route event,
-    prediction or dashboard snapshot — not at boot). Every line starts
-    "hierarchical routing estimator: "; the soak's crossover check greps
-    them, and the exact lines (message and value field) are pinned end to
-    end (real env var, real OnceLock, child processes) by
-    hierarchical_routing_enabled_follows_the_environment. The enabled and
-    "disabled via" lines are INFO, so they are in the main freenet log
-    (freenet.*.log; on the gateways /home/freenet/.local/state/freenet/),
-    NOT freenet.error.*, whose floor is WARN; only the unrecognised-value
-    WARN line reaches the error log. A file-logging node's journal has no
-    mode line at all: stdout carries the console layer only on a TTY or
-    with FREENET_LOG_TO_CONSOLE.
-  → Routing-behaviour guards must cover BOTH stacks. Router::new(&history)
-    never feeds the hierarchical estimator, so a history-built router
-    routes on the cold-start fallback (bit-identical to a flag-OFF node
-    today, by equivalence only). The tests' Training::WarmHierarchical
-    trains through add_event with a frozen clock and asserts every FAILURE
-    probability, and every timing estimate the estimator supplies, came
-    from the hierarchical estimate. Its timing stages warm only after 30
-    timed successes (the speed stage counts only those with a non-zero
-    payload), so a guard whose property depends on timing must train that
-    many and call assert_hierarchical_timing_decides (the realistic,
-    transition phase-3 and #4230 steady-state twins do); otherwise its
-    timing is legacy. Timing that correlates with distance is itself a
-    locality signal and can pre-solve a locality property, so a guard of
-    the FAILURE stage should train timing that carries no distance signal
-    — and none per peer either, which is the same hazard one level down.
-    Where both stacks agree bit for bit (all-success data), add a
-    LEGACY_STAGE_EVALUATIONS delta check. Give a new guard both modes.
+  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected
@@ -257,34 +230,110 @@ WHEN touching either stack:
     InstantTimeSrc reading tokio's clock: it advances under a paused tokio
     runtime (direct sim runner) but NOT under hosting_time_source_override.
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
-  → With the default (on) it is always computed, because it routes. Only
-    where the flag resolves OFF (0/false/no/off, or any unrecognised or
-    non-UTF-8 value) is it computed solely while the
-    routing dataset is RECORDING (a stopped recorder stops it); readings
-    then freeze, and the dashboard shows "not computed now" rather than
-    frozen values
+  → It is computed only while its flag is on or the routing dataset is
+    RECORDING (a stopped recorder stops it); readings then freeze, and the
+    dashboard shows "not computed now" rather than frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
+  → PAIRED VALUES, failure probability: the estimator returns TWO failure
+    numbers per candidate and they are not interchangeable.
+    failure_probability is clamped to [0, 1] and is what is REPORTED and
+    RECORDED (RoutingPrediction, the dataset, telemetry, the dashboard);
+    failure_ranking (hierarchical::ranking_failure_probability) is what the
+    cost formula RANKS BY, and it keeps the order of the forecasts above 1 so
+    that several peers clamped at 1 are not tied. They differ only above 1,
+    and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
+    the ranking value is pinned at 0 deliberately: carrying the downward
+    overshoot made the no-timing cost branch (failure * 3.0) negative for the
+    healthiest peers, which the dashboard prints as "N/A". Consequences to
+    keep in mind: an offline tool CANNOT reproduce the router's order among
+    candidates that all clamp, because the unbounded value is recorded
+    nowhere; and recomputing expected_total_time from the recorded
+    failure_probability reproduces it only to within the slope.
+  → The contract term must export enough to tell "it worked and helped
+    nothing" from "it never activated". _contract_estimable_refits is NECESSARY
+    and not sufficient for that: the effect is also refused per query below the
+    present-peer bar, and on the recorded soak most failures are on contracts
+    that never reach it, so a node estimable at every refit that moves no
+    forecast would read as active. The counters that answer the question are
+    _contract_effects_applied and _contract_forecast_offsets; read
+    _contract_tau2 beside _contract_qualifying_contracts, because a value
+    resting on two contracts is otherwise indistinguishable from one resting on
+    eighty, and beside _contract_den_below_two_refits, which counts the refits
+    on which fewer than two contracts qualified so the term was off despite
+    counting as estimable. Know what _contract_effects_applied does NOT cover:
+    it counts the LIVE learn path only, and only where the explaining bound
+    left a non-zero adjustment, so it is not a total of every residual the term
+    has moved (the per-refit re-adjustment of the whole window is counted
+    nowhere). Do NOT quote _contract_estimable_refits on its own as the term's
+    activity: on the recorded streams 595 of 796 refits were estimable but the
+    term could act on only 285 of them (158 with fewer than two qualifying
+    contracts, a further 152 with tau2_contract computing to exactly zero), so
+    the estimable count reads as "working everywhere" and overstates by 2x.
+    A related property of the estimator, measured 2026-09-18 and previously
+    written down nowhere: a contract whose peers DISAGREE sharply contributes
+    its spread to tau2_peer rather than tau2_contract, so the term is silent on
+    it unless other contracts supply the between-contract variance. That is a
+    different gate from the present-peer bar and compounds with it. All of
+    these reach the
+    snapshot and the peer-detail dashboard; the OTLP body carries the ones a
+    fleet-wide question needs (_effects_applied, _forecast_offsets,
+    _estimable_refits, _qualifying_contracts, _floor_bound_refits, _contracts,
+    _tau2) and NOT the saturation gauges or _den_below_two_refits, which are
+    dashboard-only by choice and listed as such on the telemetry pin
+    (telemetry.rs is hand-mirrored: a new RouterSnapshotInfo field is invisible
+    to the collector unless added there). Do not add a mechanism whose activation nothing
+    reports, and do not mistake "the mechanism could act" for "the mechanism
+    acted".
 
-PROMOTION GATE, run by the 2026-09 two-gateway soak; the default flip
-(#5682) merges only after it passes. Two parts, both on data collected after
-#5653 (failure labels) is deployed:
+PROMOTION GATE. The Brier-first gate below is SUPERSEDED for the estimator
+decision by /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17,
+approved by Ian), and the reason matters: the accuracy gap against legacy was
+almost entirely CONTRACT-LEVEL calibration on failed relayed GETs for contracts
+nobody can serve, which a Brier-parity gate weights heavily and which affects
+candidate ORDERING only indirectly. Do NOT write that a contract-level change
+"cannot change which peer is picked": that inference is false and this file
+carried it until 2026-09-17. A quantity common to every candidate cannot
+reorder the candidates' failure PROBABILITIES, but routing ranks by
+`t + transfer + 3*t*p`, so a common change of `d` moves candidate i's cost by
+`3*t_i*d`, which differs across candidates whose response times differ. See
+`hierarchical.rs`, "Contract term", Forecast, and the test
+`a_shared_contract_effect_reweights_peers_that_differ_in_response_time`. PLAN-v2 measures, in order, M1 within-contract RANKING
+(delta C-index, non-inferiority margin -0.05), M2 dead-contract POLLUTION (the
+excess forecast on successes of recently storm-tainted peers, bar
+max(legacy, 0) + 0.02), and M3 failure Brier only as a non-inferiority check
+(CI upper bound at most 1.10), plus the section 6 conditions: timing forecasts
+bit-identical to the shipped estimator, the #5655 bake-off still passing,
+quiet-node replays reported, and unit and simulation tests. PLAN-v2 also
+records that M1 cannot resolve on the recorded data at that margin, so the
+offline stage decides on M2, M3 and section 6 and REPORTS M1; and that the
+retracted M1b displacement measure is confounded by which model did the
+routing and must never be pooled across arms. Two properties of the offline
+gate to keep in view when reading a result from it: it scores the recorded
+CLAMPED forecast, so it is blind to the ranking value described above, and M2
+scores only forecasts that are too high on successes, so an over-correction
+reads as an improvement.
+
+The original two-part gate, still the shape of the LIVE half:
   (a) OFFLINE CALIBRATION, on the routing dataset: prequential failure Brier
       score and seconds error for both models on the same events. This is
       calibration of each model's estimate for the peer actually tried. It
-      does NOT measure ranking: the dataset records only the chosen peer and
-      its outcome, with no candidate sets and no exploration, so how a peer
-      the other model would have chosen would have fared is unobserved.
-      Offline ranking evaluation would need a per-decision candidate log
-      with exploration (future work).
-  (b) ON-FIELD CROSSOVER between gateways: one gateway on the hierarchical
-      estimator against the other on legacy, then SWAP the arms halfway
-      through the window. On a post-flip build unset means ON, so the legacy
-      arm needs an EXPLICIT FREENET_ROUTING_HIERARCHICAL=0; confirm it from
-      that node's main freenet log (freenet.*.log; not freenet.error.*,
-      and not the journal on a file-logging gateway, since the line is
-      INFO): "hierarchical routing estimator: disabled via
-      FREENET_ROUTING_HIERARCHICAL", before trusting the arm. The two gateways
+      does NOT measure ranking: route lines record only the chosen peer and
+      its outcome. FREENET_ROUTING_DATASET_CANDIDATES=1 adds a `decision`
+      line per routing decision (both models' estimates and ranks for every
+      scored candidate; router/dataset.rs "Candidate sets"), which supports
+      ranking comparisons over the candidates the ACTING model chose among.
+      There is still no exploration, so how a peer the acting model did not
+      select would have fared is unobserved (future work). The by-value join
+      from outcome to decision is biased in two known directions (module doc
+      "Joining"): report both measures it names with any result. Size
+      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. With
+      FREENET_ROUTING_HIERARCHICAL on, use a candidates rate of 0.01 or less:
+      a captured decision there costs about 8x an uncaptured one under the
+      router read lock (+35% per decision at 0.05, about +7% at 0.01).
+  (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
+      FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
+      which gateway has the flag halfway through the window. The two gateways
       differ in connection population (address age, bootstrap-list position),
       so a one-gateway-per-arm comparison is confounded by gateway identity;
       compare WITHIN-gateway differences (flag on vs off on the same gateway)

@@ -7,6 +7,11 @@ mod assets;
 mod cards;
 mod contract_detail;
 mod estimator;
+
+/// Re-exported for the router test that pins the hierarchical cost to the
+/// range this formatter can print.
+#[cfg(test)]
+pub(crate) use estimator::fmt_prediction_time;
 mod favicon;
 mod peer_detail;
 

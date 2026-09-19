@@ -174,12 +174,17 @@ pub(super) enum InitialRequest {
 /// is bypassed entirely and `holder` is used as the target directly (a directed
 /// subscribe, e.g. driven by a received `SubscribeHint`). The peer-not-joined
 /// check still applies. There are no alternatives in this mode.
+///
+/// `log_as` says whether this selection is the one that routes, for the routing
+/// dataset: a pre-check whose network result is discarded passes `Unlogged`,
+/// and then writes no bypass lines either.
 pub(super) async fn prepare_initial_request(
     op_manager: &OpManager,
     id: Transaction,
     instance_id: ContractInstanceId,
     is_renewal: bool,
     first_hop: Option<PeerKeyLocation>,
+    log_as: crate::router::dataset::DecisionLog,
 ) -> Result<InitialRequest, OpError> {
     let own_addr = match op_manager.ring.connection_manager.peer_addr() {
         Ok(addr) => addr,
@@ -230,12 +235,22 @@ pub(super) async fn prepare_initial_request(
             phase = "directed_first_hop",
             "Using caller-supplied first hop for subscription (bypassing ring selection)"
         );
+        if log_as != crate::router::dataset::DecisionLog::Unlogged {
+            crate::router::dataset::record_bypass(
+                crate::node::network_status::OpType::Subscribe,
+                crate::ring::Location::from(&instance_id),
+                &holder,
+                crate::router::dataset::UncapturedReason::DirectedFirstHop,
+            );
+        }
         (holder, Vec::new())
     } else {
-        let mut candidates =
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
+        let mut candidates = op_manager.ring.k_closest_potentially_hosting(
+            log_as,
+            &instance_id,
+            &visited,
+            MAX_BREADTH,
+        );
 
         // First try the best candidates from k_closest_potentially_hosting.
         // If that returns empty, fall back to any available connection.
@@ -274,6 +289,14 @@ pub(super) async fn prepare_initial_request(
                         phase = "fallback_routing",
                         "Using fallback connection for subscription (k_closest returned empty)"
                     );
+                    if log_as != crate::router::dataset::DecisionLog::Unlogged {
+                        crate::router::dataset::record_bypass(
+                            crate::node::network_status::OpType::Subscribe,
+                            crate::ring::Location::from(&instance_id),
+                            &target,
+                            crate::router::dataset::UncapturedReason::AnyConnectionFallback,
+                        );
+                    }
                     target
                 }
                 None => {
@@ -295,6 +318,14 @@ pub(super) async fn prepare_initial_request(
                             phase = "bootstrap_gateway",
                             "subscribe: ring empty — routing initial request via configured gateway"
                         );
+                        if log_as != crate::router::dataset::DecisionLog::Unlogged {
+                            crate::router::dataset::record_bypass(
+                                crate::node::network_status::OpType::Subscribe,
+                                crate::ring::Location::from(&instance_id),
+                                &gateway,
+                                crate::router::dataset::UncapturedReason::BootstrapGateway,
+                            );
+                        }
                         gateway
                     } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                         // No gateway either - fall back to local completion only if isolated.

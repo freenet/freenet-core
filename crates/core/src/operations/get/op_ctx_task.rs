@@ -401,7 +401,12 @@ async fn drive_client_get_inner(
     }
     let initial_target = op_manager
         .ring
-        .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+        .k_closest_potentially_hosting(
+            crate::router::dataset::DecisionLog::Unlogged,
+            &instance_id,
+            tried.as_slice(),
+            1,
+        )
         .into_iter()
         .next();
     let current_target = match initial_target {
@@ -1301,7 +1306,12 @@ impl GetRetryDriver<'_> {
             asked.extend(self.op_manager.ring.connection_manager.get_own_addr());
             self.op_manager
                 .ring
-                .k_closest_potentially_hosting(&self.instance_id, asked.as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &self.instance_id,
+                    asked.as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .and_then(|peer| peer.socket_addr().map(|addr| (peer, addr)))
@@ -2359,7 +2369,12 @@ fn advance_to_next_peer(
 
     let peer = match op_manager
         .ring
-        .k_closest_potentially_hosting(instance_id, tried.as_slice(), 1)
+        .k_closest_potentially_hosting(
+            crate::router::dataset::DecisionLog::Unlogged,
+            instance_id,
+            tried.as_slice(),
+            1,
+        )
         .into_iter()
         .next()
     {
@@ -2672,7 +2687,12 @@ async fn drive_sub_op_get(
     let initial_target = initial_target.or_else(|| {
         op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, tried.as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                tried.as_slice(),
+                1,
+            )
             .into_iter()
             .next()
     });
@@ -3275,9 +3295,10 @@ impl crate::util::Contains<SocketAddr> for AdmitOnly {
 /// events the router records a one-peer window, with that peer at rank 0, in
 /// its selection-rank diagnostics (`SelectionRankStats`) on every call: once
 /// per candidate the fallback probes, and once more at the relay's re-check.
-/// That is a diagnostic side effect only, not a routing-dataset or route
-/// event, and it happens only after the guesses run out, on rings of three
-/// peers or fewer. Probing a peer that has not advertised readiness also emits
+/// That is a diagnostic side effect only, not a route event, and it happens
+/// only after the guesses run out, on rings of three peers or fewer. The
+/// probe passes `DecisionLog::Unlogged`, so it writes no routing-dataset
+/// decision line; the relay records a pinned hop as a bypass instead. Probing a peer that has not advertised readiness also emits
 /// that function's `warn!` about falling back to not-yet-ready peers, which
 /// reads as a ring-wide shortage and is not one here: every other peer was
 /// removed by `AdmitOnly`, not by the readiness filter. A direct
@@ -3298,7 +3319,12 @@ fn first_hop_candidate(
 ) -> Option<PeerKeyLocation> {
     op_manager
         .ring
-        .k_closest_potentially_hosting(instance_id, AdmitOnly(addr), 1)
+        .k_closest_potentially_hosting(
+            crate::router::dataset::DecisionLog::Unlogged,
+            instance_id,
+            AdmitOnly(addr),
+            1,
+        )
         .into_iter()
         .next()
         .filter(|peer| peer.socket_addr() == Some(addr))
@@ -3349,7 +3375,14 @@ fn relay_advance_to_next_peer(
     let closest = |skip: VisitedPeers| {
         op_manager
             .ring
-            .k_closest_potentially_hosting(instance_id, skip, 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Joinable(
+                    crate::node::network_status::OpType::Get,
+                ),
+                instance_id,
+                skip,
+                1,
+            )
             .into_iter()
             .next()
     };
@@ -3379,6 +3412,17 @@ fn relay_advance_to_next_peer(
             closest(skip)
         }
     };
+    // A pinned hop was chosen by the retry driver, not by ring selection: its
+    // `first_hop_candidate` probe is not a routing decision, so the routing
+    // dataset gets a bypass line instead (see `router::dataset`).
+    if let Some(peer) = &pinned {
+        crate::router::dataset::record_bypass(
+            crate::node::network_status::OpType::Get,
+            crate::ring::Location::from(instance_id),
+            peer,
+            crate::router::dataset::UncapturedReason::PinnedFirstHop,
+        );
+    }
     let peer = match pinned
         .or_else(excluding)
         .or_else(|| closest(new_visited.clone()))
@@ -3400,6 +3444,12 @@ fn relay_advance_to_next_peer(
                         %instance_id,
                         gateway = %addr,
                         "GET relay advance: ring empty — forwarding to configured gateway"
+                    );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Get,
+                        crate::ring::Location::from(instance_id),
+                        &gw,
+                        crate::router::dataset::UncapturedReason::BootstrapGateway,
                     );
                     tried.push(addr);
                     Some((gw, addr))
@@ -4096,6 +4146,12 @@ where
                         %instance_id,
                         target = %consult_addr,
                         "GET relay: terminus consulting advertised host off routing path"
+                    );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Get,
+                        crate::ring::Location::from(&instance_id),
+                        &consult_peer,
+                        crate::router::dataset::UncapturedReason::TerminalConsult,
                     );
                     (consult_peer, consult_addr)
                 } else {
@@ -8803,7 +8859,12 @@ mod route_attempt_driver_tests {
         // forwards to: the stream is claimed from, and labelled against, it.
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -8906,7 +8967,12 @@ mod route_attempt_driver_tests {
             let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
             let initial = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -9054,7 +9120,12 @@ mod route_attempt_driver_tests {
         let upstream = peers[0].clone();
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own, addr(&upstream)].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");
@@ -9072,6 +9143,14 @@ mod route_attempt_driver_tests {
             },
         );
 
+        // The consulted host is a live capture, so the consult must close it.
+        let (recorder, _dir, path) = crate::ring::candidate_log_wiring_tests::recorder();
+        let _log = crate::router::dataset::force_candidate_log(recorder.clone(), 1.0);
+        recorder.record_decision(crate::ring::candidate_log_wiring_tests::live_capture(
+            &host,
+            crate::node::network_status::OpType::Get,
+            crate::ring::Location::from(&instance_id),
+        ));
         let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
         let targets = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = targets.clone();
@@ -9124,6 +9203,18 @@ mod route_attempt_driver_tests {
             by_peer(failure_window(&op_manager)),
             by_peer(vec![(Some(greedy_addr), 1.0), (Some(host_addr), 0.0)]),
         );
+        let lines =
+            crate::ring::candidate_log_wiring_tests::lines_through_sentinel(&recorder, &path);
+        let consults: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["reason"] == "terminal_consult")
+            .collect();
+        assert_eq!(consults.len(), 1, "{lines:?}");
+        assert_eq!(consults[0]["op"], "GET");
+        assert_eq!(
+            consults[0]["selected"],
+            serde_json::json!([crate::router::dataset::peer_hash(&host)])
+        );
     }
 
     /// `entries` sorted by peer address, for assertions about which peers got
@@ -9169,7 +9260,12 @@ mod route_attempt_driver_tests {
                         // `drive_client_get_inner` just evaluated it.
                         let first = view
                             .ring
-                            .k_closest_potentially_hosting(instance_id, [own].as_slice(), 1)
+                            .k_closest_potentially_hosting(
+                                crate::router::dataset::DecisionLog::Unlogged,
+                                instance_id,
+                                [own].as_slice(),
+                                1,
+                            )
                             .into_iter()
                             .next()
                             .expect("a candidate");
@@ -9240,7 +9336,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -10091,7 +10192,12 @@ mod route_attempt_driver_tests {
         let instance_id = ContractInstanceId::new([53u8; 32]);
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, addr(&upstream)].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own, addr(&upstream)].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");
@@ -10299,7 +10405,12 @@ mod route_attempt_driver_tests {
             let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
             let initial = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10309,7 +10420,12 @@ mod route_attempt_driver_tests {
             // (current) are distinguishable.
             let second = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own, addr(&initial)].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    [own, addr(&initial)].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10428,7 +10544,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let initial = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -10591,7 +10712,12 @@ mod route_attempt_driver_tests {
             let instance_id = ContractInstanceId::new([79u8; 32]);
             let best = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, [own].as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    [own].as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -10670,7 +10796,12 @@ mod route_attempt_driver_tests {
             let closest = |skip: &[SocketAddr]| {
                 op_manager
                     .ring
-                    .k_closest_potentially_hosting(&instance_id, skip, 1)
+                    .k_closest_potentially_hosting(
+                        crate::router::dataset::DecisionLog::Unlogged,
+                        &instance_id,
+                        skip,
+                        1,
+                    )
                     .into_iter()
                     .next()
                     .unwrap()
@@ -10798,7 +10929,12 @@ mod route_attempt_driver_tests {
                 skip.push(own);
                 let next = op_manager
                     .ring
-                    .k_closest_potentially_hosting(&instance_id, skip.as_slice(), 1)
+                    .k_closest_potentially_hosting(
+                        crate::router::dataset::DecisionLog::Unlogged,
+                        &instance_id,
+                        skip.as_slice(),
+                        1,
+                    )
                     .into_iter()
                     .next()
                     .expect("a ring peer");
@@ -10923,7 +11059,12 @@ mod route_attempt_driver_tests {
             skip.push(own);
             let next = op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, skip.as_slice(), 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    skip.as_slice(),
+                    1,
+                )
                 .into_iter()
                 .next()
                 .expect("a ring peer");
@@ -11265,7 +11406,12 @@ mod route_attempt_driver_tests {
         let router_pick = run
             .op_manager
             .ring
-            .k_closest_potentially_hosting(&run.instance_id, [own, y].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &run.instance_id,
+                [own, y].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .and_then(|peer| peer.socket_addr());
@@ -11318,7 +11464,12 @@ mod route_attempt_driver_tests {
         let router_pick = run
             .op_manager
             .ring
-            .k_closest_potentially_hosting(&run.instance_id, [own, u].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &run.instance_id,
+                [own, u].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .and_then(|peer| peer.socket_addr());
@@ -11504,7 +11655,12 @@ mod route_attempt_driver_tests {
         let closest = |skip: &[SocketAddr]| {
             op_manager
                 .ring
-                .k_closest_potentially_hosting(&instance_id, skip, 1)
+                .k_closest_potentially_hosting(
+                    crate::router::dataset::DecisionLog::Unlogged,
+                    &instance_id,
+                    skip,
+                    1,
+                )
                 .into_iter()
                 .next()
                 .unwrap()
@@ -11779,6 +11935,92 @@ mod route_attempt_driver_tests {
         assert!(
             relay[dispatch..dispatch + 300].contains(".clear_hop(&incoming_tx);"),
             "a failed local dispatch must clear the hop"
+        );
+    }
+}
+
+/// Which GET selections write routing-dataset decision lines: only the relay's
+/// (and the originator's loopback relay's) next-hop choice, never the client
+/// driver's guess or a `first_hop_candidate` probe, and a pinned hop as a
+/// bypass rather than as the probe's one-candidate "decision".
+#[cfg(test)]
+mod candidate_log_call_site_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+    use crate::ring::candidate_log_wiring_tests::{lines_through_sentinel, recorder};
+    use crate::router::dataset;
+
+    #[tokio::test]
+    async fn only_the_relay_next_hop_logs_and_a_pinned_hop_logs_as_a_bypass() {
+        let (op_manager, _rx, peers, _guards) =
+            op_manager_with_peers("get-candidate-sites", 4).await;
+        let instance_id = ContractInstanceId::new([43u8; 32]);
+        let contract = crate::ring::Location::from(&instance_id);
+        {
+            let mut router = op_manager.ring.router.write();
+            for i in 0..120 {
+                router.add_event(crate::router::RouteEvent {
+                    peer: peers[i % peers.len()].clone(),
+                    contract_location: contract,
+                    outcome: crate::router::RouteOutcome::SuccessUntimed,
+                    op_type: Some(crate::node::network_status::OpType::Get),
+                });
+            }
+        }
+        let (recorder, _dir, path) = recorder();
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+
+        let relay = |pin: Option<SocketAddr>| {
+            let tx = Transaction::new::<GetMsg>();
+            let mut visited = VisitedPeers::new(&tx);
+            visited.mark_visited(own);
+            let mut tried = vec![own];
+            let mut retries = 0;
+            relay_advance_to_next_peer(
+                &op_manager,
+                &instance_id,
+                &mut tried,
+                &mut retries,
+                &visited,
+                &[],
+                pin,
+            )
+            .expect("a next hop")
+        };
+        // Not routing decisions.
+        let mut tried = vec![own];
+        let mut retries = 0;
+        assert!(advance_to_next_peer(&op_manager, &instance_id, &mut tried, &mut retries).is_ok());
+        // The relay's own next hop: a captured GET decision.
+        let (routed, routed_addr) = relay(None);
+        // A probe of that peer, then the same peer pinned: a bypass, which
+        // supersedes the capture.
+        assert!(first_hop_candidate(&op_manager, &instance_id, routed_addr).is_some());
+        let (pinned, _) = relay(Some(routed_addr));
+        assert_eq!(pinned, routed);
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["start", "decision", "decision_uncaptured", "peers"],
+            "{lines:?}"
+        );
+        assert_eq!(lines[1]["op"], "GET");
+        let chosen = lines[1]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["selected_position"] == 0)
+            .unwrap()["peer"]
+            .clone();
+        assert_eq!(chosen, dataset::peer_hash(&routed));
+        assert_eq!(lines[2]["reason"], "pinned_first_hop");
+        assert_eq!(lines[2]["op"], "GET");
+        assert_eq!(
+            lines[2]["selected"],
+            serde_json::json!([dataset::peer_hash(&pinned)])
         );
     }
 }
