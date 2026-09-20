@@ -234,7 +234,13 @@ WHEN touching either stack:
     stack.
   → The resolved mode is logged ONCE, on first use (first route event,
     prediction or dashboard snapshot — not at boot). Every line starts
-    "hierarchical routing estimator: "; the soak's crossover check greps
+    "hierarchical routing estimator: ", but do NOT grep that prefix alone
+    to read a node's mode: the peer-table saturation notice
+    (hierarchical.rs) shares it, is INFO too, is emitted up to hourly, and
+    post-flip every node runs the estimator so it appears fleet-wide. Grep
+    a mode string: "estimator: enabled (default)", "estimator: enabled via",
+    "estimator: disabled via", or "estimator: disabled, " for the
+    unrecognised-value case. The soak's crossover check greps
     them, and the exact lines (message and value field) are pinned end to
     end (real env var, real OnceLock, child processes) by
     hierarchical_routing_enabled_follows_the_environment. The enabled and
@@ -368,10 +374,14 @@ The original two-part gate, still the shape of the LIVE half:
       select would have fared is unobserved (future work). The by-value join
       from outcome to decision is biased in two known directions (module doc
       "Joining"): report both measures it names with any result. Size
-      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. With
-      FREENET_ROUTING_HIERARCHICAL on, use a candidates rate of 0.01 or less:
-      a captured decision there costs about 8x an uncaptured one under the
-      router read lock (+35% per decision at 0.05, about +7% at 0.01).
+      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. Use a
+      candidates rate of 0.01 or less on any node ROUTING HIERARCHICALLY,
+      which since the default flip is every node that has not been given an
+      explicit FREENET_ROUTING_HIERARCHICAL=0: a captured decision there costs
+      about 8x an uncaptured one under the router read lock (+35% per decision
+      at 0.05, about +7% at 0.01). Do NOT read the old "with the flag on"
+      phrasing as a condition an operator has to have opted into; unset is on.
+      0.05 remains tolerable only on a node explicitly pinned to legacy.
   (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
       FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
       which gateway has the flag halfway through the window. On a post-flip

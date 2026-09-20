@@ -1606,9 +1606,16 @@ const HIERARCHICAL_ENV: &str = "FREENET_ROUTING_HIERARCHICAL";
 /// `std::env::var(..).ok()` would collapse it to `None` and silently turn the
 /// estimator ON, the opposite of what an operator who set the variable meant.
 ///
-/// Every line starts with `hierarchical routing estimator: ` so one grep finds
-/// the mode whichever branch was taken. These strings are grepped by the soak's
-/// crossover verification and pinned by
+/// Every line starts with `hierarchical routing estimator: `, but do NOT grep
+/// that prefix alone to determine a node's mode: the peer-table saturation
+/// notice in `hierarchical.rs` shares it, is also INFO, is emitted up to
+/// hourly, and since the default flip every node runs the estimator, so it now
+/// appears fleet-wide. Grep one of the three mode strings instead, which are
+/// mutually exclusive and emitted once per process:
+/// `estimator: enabled (default)`, `estimator: enabled via`,
+/// `estimator: disabled via`, or `estimator: disabled, ` for the
+/// unrecognised-value case. These strings are grepped by the soak's crossover
+/// verification and pinned by
 /// `hierarchical_routing_enabled_follows_the_environment`; change them together.
 /// INFO (and WARN), never debug: release builds compile out everything below
 /// INFO (`release_max_level_info`). Being INFO, the enabled and `disabled via`
@@ -1626,7 +1633,23 @@ fn resolve_hierarchical_flag(raw: Option<&std::ffi::OsStr>) -> bool {
     let value = raw.map(|raw| raw.to_string_lossy()).unwrap_or_default();
     match flag {
         DefaultOnFlag::Default => {
-            tracing::info!("hierarchical routing estimator: enabled (default)")
+            // Emit `value` whenever the variable was SET but still resolved to
+            // the default, which happens for an empty or whitespace-only
+            // value. Without it a node started with
+            // `FREENET_ROUTING_HIERARCHICAL= ` logs a line byte-identical to
+            // one where the variable is absent, so an operator who believes
+            // they disabled the estimator cannot tell from the log that their
+            // value was ignored. `Default` is the only branch that can be
+            // reached both with and without the variable present, so it is the
+            // only one that needs the distinction.
+            if raw.is_some() {
+                tracing::info!(
+                    value = %value,
+                    "hierarchical routing estimator: enabled (default)"
+                )
+            } else {
+                tracing::info!("hierarchical routing estimator: enabled (default)")
+            }
         }
         DefaultOnFlag::Enabled => tracing::info!(
             value = %value,
@@ -5204,13 +5227,20 @@ mod tests {
              FREENET_ROUTING_HIERARCHICAL has an unrecognised value (use 0/false/no/off to \
              disable, 1/true/yes/on or unset to enable)";
         // (raw value, expected "mode|LEVEL|message", expected `value` field as
-        // it follows the message in the captured line; the default line has
-        // none).
+        // it follows the message in the captured line).
+        //
+        // Only the UNSET case carries no `value` field. An empty or
+        // whitespace-only value resolves to the default too, but it was SET,
+        // and the field is what lets an operator see from the log that the
+        // value they supplied was ignored rather than absent. These three
+        // cases are the pin on that distinction: drop the `raw.is_some()`
+        // branch in `resolve_hierarchical_flag` and the second and third go
+        // red while the first stays green.
         #[allow(unused_mut)]
         let mut cases: Vec<(Option<std::ffi::OsString>, &str, &str)> = vec![
             (None, ENABLED_DEFAULT, ""),
-            (Some("".into()), ENABLED_DEFAULT, ""),
-            (Some("   ".into()), ENABLED_DEFAULT, ""),
+            (Some("".into()), ENABLED_DEFAULT, " value="),
+            (Some("   ".into()), ENABLED_DEFAULT, " value=   "),
             (Some("1".into()), ENABLED_EXPLICIT, " value=1"),
             (Some("0".into()), DISABLED_EXPLICIT, " value=0"),
             (Some("off".into()), DISABLED_EXPLICIT, " value=off"),
