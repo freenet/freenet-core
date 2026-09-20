@@ -708,11 +708,15 @@ fn run_ab() -> BTreeMap<u64, (ArmMetrics, ArmMetrics)> {
         .collect()
 }
 
-fn column(
-    runs: &BTreeMap<u64, (ArmMetrics, ArmMetrics)>,
-    on: bool,
-    f: fn(&ArmMetrics) -> f64,
-) -> Vec<f64> {
+/// One metric read off an arm. Named rather than written inline so the
+/// non-inferiority table below stays inside `clippy::type_complexity`.
+type Metric = fn(&ArmMetrics) -> f64;
+
+/// A gated metric: its name, how to read it, and whether it lives on `[0, 1]`
+/// (which decides how its noise margin is floored).
+type Check = (&'static str, Metric, bool);
+
+fn column(runs: &BTreeMap<u64, (ArmMetrics, ArmMetrics)>, on: bool, f: Metric) -> Vec<f64> {
     runs.values()
         .map(|(o, n)| if on { f(n) } else { f(o) })
         .collect()
@@ -810,7 +814,7 @@ fn hierarchical_routing_simulation_ab() {
     // Re-derive them if `SEEDS`, `ROUNDS` or the network size change, and say
     // so here when you do.
     // ---------------------------------------------------------------
-    let checks: [(&str, fn(&ArmMetrics) -> f64, bool); 6] = [
+    let checks: [Check; 6] = [
         (
             "replicated GET success rate",
             |m| m.replicated_get_rate(),
