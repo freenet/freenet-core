@@ -107,12 +107,26 @@ const SCARCE_CONTRACTS: u8 = 3;
 const TWIN_CONTRACTS: u8 = 2;
 
 /// Rounds of the read workload. Each round issues, from every non-gateway node,
-/// one GET and one SUBSCRIBE against a replicated contract and one GET against
-/// a scarce one, so every contract is asked for by every peer many times over.
-const ROUNDS: usize = 12;
+/// one GET and one SUBSCRIBE against a replicated contract and one GET each
+/// against a scarce and a twin-held one, so every contract is asked for by
+/// every peer many times over.
+const ROUNDS: usize = 10;
 
 /// Regular (non-gateway) nodes.
-const NODES: usize = 7;
+const NODES: usize = 9;
+
+/// Connection cap, and the reason it is well below the peer count.
+///
+/// At `max_connections = 10` with eight peers every node is connected to every
+/// other, so a read reaches any holder in one hop and routing never has a
+/// decision to make. Measured on exactly that configuration: every GET class
+/// returned 1.000 in both arms, `failure_events` were plentiful but almost all
+/// successes, and the contract term stayed inert. A cap of five over ten peers
+/// leaves a genuine topology, so reads for a single-holder contract travel,
+/// collect `NotFound`s on the way, and produce the trained failure labels the
+/// term needs.
+const MAX_CONNECTIONS: usize = 5;
+const MIN_CONNECTIONS: usize = 2;
 
 /// Seeds the A/B runs over. Three is few, and the spread across them is
 /// reported rather than hidden: it is what the non-inferiority margins are
@@ -489,11 +503,13 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
 
     let mut sim = rt.block_on(async {
         SimNetwork::new(
-            &network, 1, // gateways
-            NODES, 7,  // max_htl
-            3,  // rnd_if_htl_above
-            10, // max_connections
-            2,  // min_connections
+            &network,
+            1, // gateways
+            NODES,
+            7, // max_htl
+            3, // rnd_if_htl_above
+            MAX_CONNECTIONS,
+            MIN_CONNECTIONS,
             seed,
         )
         .await
