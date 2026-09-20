@@ -100,21 +100,11 @@ const REPLICATED_CONTRACTS: u8 = 4;
 /// docs). These are what give the contract term something to explain away.
 const SCARCE_CONTRACTS: u8 = 3;
 
-/// Contracts held ONLY by two nodes that are crashed part-way through the run.
-/// Before the crash their reads succeed; after it, every attempt routed to a
-/// holder TIMES OUT, and a timeout is trained as a `Failure` immediately
-/// (unlike an ambiguous `NotFound`). Several peers therefore accumulate
-/// failures on the SAME contract while the other contracts keep succeeding,
-/// which is the only shape that gives `tau2_contract` a between-contract
-/// contrast larger than the noise the estimator subtracts. Without this class
-/// the term is estimable but computes `tau2_contract` to exactly zero — see
-/// `contract_term_activation_is_reported`.
-const DEAD_CONTRACTS: u8 = 2;
-
-/// Round at which the two holders of the dead contracts are crashed.
-/// Early enough to leave most of the run failing, late enough that the
-/// contracts were genuinely reachable first.
-const CRASH_ROUND: usize = 3;
+/// Contracts held by exactly TWO nodes, so a read for them travels but has two
+/// possible terminals. Between them and [`SCARCE_CONTRACTS`] the workload
+/// spans three replication levels, which is what gives the contract term a
+/// between-contract contrast to find at all.
+const TWIN_CONTRACTS: u8 = 2;
 
 /// Rounds of the read workload. Each round issues, from every non-gateway node,
 /// one GET and one SUBSCRIBE against a replicated contract and one GET against
@@ -133,7 +123,7 @@ const SEEDS: [u64; 3] = [0x5EED_0001, 0x5EED_0002, 0x5EED_0003];
 /// can never collide.
 const REPLICATED_SEED_BASE: u8 = 0x10;
 const SCARCE_SEED_BASE: u8 = 0x40;
-const DEAD_SEED_BASE: u8 = 0x70;
+const TWIN_SEED_BASE: u8 = 0x70;
 
 /// Everything one arm of the A/B produced.
 #[derive(Debug, Clone, Default)]
@@ -148,14 +138,9 @@ struct ArmMetrics {
     /// The same for the single-holder contracts.
     scarce_get_ok: u64,
     scarce_get_total: u64,
-    /// The same for the contracts whose only holders are crashed part-way
-    /// through. These are EXPECTED to fail after the crash; the rate is
-    /// reported and compared between arms, not asserted against a floor.
-    dead_get_ok: u64,
-    dead_get_total: u64,
-    /// Packets dropped because their peer was crashed. Zero would mean the
-    /// scripted crash never took effect and the dead class is not dead.
-    crash_packets_dropped: u64,
+    /// The same for the two-holder contracts.
+    twin_get_ok: u64,
+    twin_get_total: u64,
     /// Successful client GETs that actually traversed the network
     /// (`hop_count >= 1`), over both classes. A run whose GETs are all served
     /// locally exercises no routing at all, so this is reported beside the
@@ -213,8 +198,8 @@ impl ArmMetrics {
         rate(self.scarce_get_ok, self.scarce_get_total)
     }
 
-    fn dead_get_rate(&self) -> f64 {
-        rate(self.dead_get_ok, self.dead_get_total)
+    fn twin_get_rate(&self) -> f64 {
+        rate(self.twin_get_ok, self.twin_get_total)
     }
 
     fn subscribe_rate(&self) -> f64 {
@@ -245,7 +230,7 @@ fn mean(values: &[f64]) -> f64 {
 /// The workload, identical for both arms and both derived only from the network
 /// name, so nothing about it can differ between the ON and OFF runs.
 ///
-/// Returns the operations, the replicated contract keys and the scarce ones.
+/// Returns the operations, then the replicated, scarce and twin contract keys.
 fn build_workload(
     network: &str,
 ) -> (
@@ -261,7 +246,7 @@ fn build_workload(
     let mut operations = Vec::new();
     let mut replicated = Vec::new();
     let mut scarce = Vec::new();
-    let mut dead = Vec::new();
+    let mut twin = Vec::new();
 
     // Replicated contracts: PUT from the gateway with subscribe, so they
     // propagate and their reads mostly succeed.
@@ -295,20 +280,29 @@ fn build_workload(
         ));
     }
 
-    // Dead contracts: held by the last two nodes and by nobody else. Both are
-    // crashed at `CRASH_ROUND`, after which reads for these contracts time out
-    // at the holders. Seeded on BOTH so more than one peer fails on the same
-    // contract, which is what separates a dead CONTRACT from a bad PEER.
-    let dead_holders: Vec<NodeLabel> = nodes[NODES - 2..].to_vec();
-    for i in 0..DEAD_CONTRACTS {
-        let contract = SimOperation::create_test_contract(DEAD_SEED_BASE + i);
-        dead.push(contract.key());
-        for holder in &dead_holders {
+    // Twin contracts: seeded on the last two nodes and nowhere else, so a read
+    // for them travels but has two possible terminals.
+    //
+    // An earlier version of this class CRASHED both holders part-way through
+    // the run, on the theory that reads timing out at both would look like a
+    // dead contract. Measured, it did the opposite: every-hop placement had
+    // already left copies along the earlier successful routes, so the reads
+    // kept succeeding (72/72 after the crash), and what the crash actually
+    // produced was two bad PEERS. The estimator attributed it to them, which
+    // is correct and is exactly what the leave-one-out is for -- and
+    // `effects_applied` fell from 19 to 1 against the uncrashed workload. A
+    // crashed peer is not a dead contract; do not re-add the crash expecting
+    // one.
+    let twin_holders: Vec<NodeLabel> = nodes[NODES - 2..].to_vec();
+    for i in 0..TWIN_CONTRACTS {
+        let contract = SimOperation::create_test_contract(TWIN_SEED_BASE + i);
+        twin.push(contract.key());
+        for holder in &twin_holders {
             operations.push(ScheduledOperation::new(
                 holder.clone(),
                 SimOperation::SeedHostedContract {
                     contract: contract.clone(),
-                    state: SimOperation::create_test_state(DEAD_SEED_BASE + i),
+                    state: SimOperation::create_test_state(TWIN_SEED_BASE + i),
                 },
             ));
         }
@@ -319,14 +313,6 @@ fn build_workload(
     // one — which is what `CONTRACT_MIN_OTHER_PEERS` requires before the term
     // can adjust anything.
     for round in 0..ROUNDS {
-        if round == CRASH_ROUND {
-            for holder in &dead_holders {
-                operations.push(ScheduledOperation::new(
-                    holder.clone(),
-                    SimOperation::CrashNode,
-                ));
-            }
-        }
         for (n, node) in nodes.iter().enumerate() {
             let replicated_key = replicated[(round + n) % replicated.len()];
             let scarce_key = scarce[(round + n) % scarce.len()];
@@ -359,16 +345,16 @@ fn build_workload(
             }
         }
 
-        // Dead-contract reads, from every node that is not itself a holder.
+        // Twin-contract reads, from every node that is not itself a holder.
         for (n, node) in nodes.iter().enumerate() {
-            if dead_holders.contains(node) {
+            if twin_holders.contains(node) {
                 continue;
             }
-            let dead_key = dead[(round + n) % dead.len()];
+            let twin_key = twin[(round + n) % twin.len()];
             operations.push(ScheduledOperation::new(
                 node.clone(),
                 SimOperation::Get {
-                    contract_id: *dead_key.id(),
+                    contract_id: *twin_key.id(),
                     return_contract_code: true,
                     subscribe: false,
                 },
@@ -377,7 +363,7 @@ fn build_workload(
         operations.push(ScheduledOperation::new(
             gateway.clone(),
             SimOperation::Get {
-                contract_id: *dead[round % dead.len()].id(),
+                contract_id: *twin[round % twin.len()].id(),
                 return_contract_code: true,
                 subscribe: false,
             },
@@ -398,7 +384,7 @@ fn build_workload(
         ));
     }
 
-    (operations, replicated, scarce, dead)
+    (operations, replicated, scarce, twin)
 }
 
 /// Latency of the first successful GET, and how many terminal GET events
@@ -488,7 +474,7 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
         "hier-sim-{tag}-{}-{seed:x}",
         if hierarchical { "on" } else { "off" }
     );
-    let (operations, replicated, scarce, dead) = build_workload(&network);
+    let (operations, replicated, scarce, twin) = build_workload(&network);
 
     // Each scheduled operation consumes 3 virtual seconds in the controlled
     // runner, so the wall must exceed startup + 3 * ops + the post-op settle.
@@ -530,7 +516,7 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     );
 
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
-    collect_metrics(&network, &logs, &result, &replicated, &scarce, &dead)
+    collect_metrics(&network, &logs, &result, &replicated, &scarce, &twin)
 }
 
 fn collect_metrics(
@@ -539,14 +525,14 @@ fn collect_metrics(
     result: &ControlledSimulationResult,
     replicated: &[ContractKey],
     scarce: &[ContractKey],
-    dead: &[ContractKey],
+    twin: &[ContractKey],
 ) -> ArmMetrics {
     let mut metrics = ArmMetrics::default();
 
     let replicated_ids: HashSet<ContractInstanceId> =
         replicated.iter().map(|key| *key.id()).collect();
     let scarce_ids: HashSet<ContractInstanceId> = scarce.iter().map(|key| *key.id()).collect();
-    let dead_ids: HashSet<ContractInstanceId> = dead.iter().map(|key| *key.id()).collect();
+    let twin_ids: HashSet<ContractInstanceId> = twin.iter().map(|key| *key.id()).collect();
 
     // Client GET outcomes, one per client operation, deduplicated per
     // transaction exactly as `crate::tracing::summarize_client_get_outcomes`
@@ -590,9 +576,9 @@ fn collect_metrics(
         } else if scarce_ids.contains(instance_id) {
             metrics.scarce_get_total += 1;
             metrics.scarce_get_ok += u64::from(ok);
-        } else if dead_ids.contains(instance_id) {
-            metrics.dead_get_total += 1;
-            metrics.dead_get_ok += u64::from(ok);
+        } else if twin_ids.contains(instance_id) {
+            metrics.twin_get_total += 1;
+            metrics.twin_get_ok += u64::from(ok);
         }
     }
 
@@ -600,7 +586,6 @@ fn collect_metrics(
     metrics.first_success_latency_ms = latency;
     metrics.ops_before_first_success = preceding;
 
-    metrics.crash_packets_dropped = result.crash_packets_dropped;
     let (failures, successes) = result.aggregate_route_outcome_totals();
     metrics.route_failures = failures;
     metrics.route_successes = successes;
@@ -644,7 +629,7 @@ fn collect_metrics(
 
     eprintln!(
         "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) \
-         dead_get {}/{} ({:.3}) crash_drops {} net_ok {} \
+         twin_get {}/{} ({:.3}) net_ok {} \
          subscribe {}/{} ({:.3}) \
          sub_edges {} hosting_edges {} first_success {:?}ms after {} terminals \
          route ok/fail {}/{} | hierarchical nodes {}/{} failure_events {} contracts {} \
@@ -655,10 +640,9 @@ fn collect_metrics(
         metrics.scarce_get_ok,
         metrics.scarce_get_total,
         metrics.scarce_get_rate(),
-        metrics.dead_get_ok,
-        metrics.dead_get_total,
-        metrics.dead_get_rate(),
-        metrics.crash_packets_dropped,
+        metrics.twin_get_ok,
+        metrics.twin_get_total,
+        metrics.twin_get_rate(),
         metrics.network_get_successes,
         metrics.subscribe_ok,
         metrics.subscribe_total,
@@ -745,13 +729,6 @@ fn hierarchical_routing_simulation_ab() {
             "seed {seed:x}: the estimator routed but its failure stage learned nothing, so \
              nothing it forecast was informed by this run"
         );
-        assert!(
-            on.crash_packets_dropped > 0 && off.crash_packets_dropped > 0,
-            "seed {seed:x}: the scripted crash dropped no packets (on {} / off {}), so the dead \
-             contracts were never dead and the failure workload did not happen",
-            on.crash_packets_dropped,
-            off.crash_packets_dropped
-        );
     }
 
     // ---------------------------------------------------------------
@@ -771,6 +748,11 @@ fn hierarchical_routing_simulation_ab() {
                 m.scarce_get_total >= 10,
                 "seed {seed:x} arm {arm}: only {} client GETs for scarce contracts",
                 m.scarce_get_total
+            );
+            assert!(
+                m.twin_get_total >= 10,
+                "seed {seed:x} arm {arm}: only {} client GETs for twin-held contracts",
+                m.twin_get_total
             );
             assert!(
                 m.subscribe_total >= 10,
@@ -805,13 +787,14 @@ fn hierarchical_routing_simulation_ab() {
     // Re-derive them if `SEEDS`, `ROUNDS` or the network size change, and say
     // so here when you do.
     // ---------------------------------------------------------------
-    let checks: [(&str, fn(&ArmMetrics) -> f64, bool); 5] = [
+    let checks: [(&str, fn(&ArmMetrics) -> f64, bool); 6] = [
         (
             "replicated GET success rate",
             |m| m.replicated_get_rate(),
             true,
         ),
         ("scarce GET success rate", |m| m.scarce_get_rate(), true),
+        ("twin-held GET success rate", |m| m.twin_get_rate(), true),
         ("subscribe success rate", |m| m.subscribe_rate(), true),
         ("subscription edges", |m| m.subscription_edges as f64, false),
         (
@@ -846,14 +829,6 @@ fn hierarchical_routing_simulation_ab() {
             ));
         }
     }
-    // The dead class is reported, never gated: its reads are meant to fail
-    // after the crash, so a rate near zero in both arms is the intended result
-    // and a comparison of it says nothing.
-    eprintln!(
-        "[ab] dead GET success rate (reported, not gated) | off {:?} | on {:?}",
-        column(&runs, false, |m| m.dead_get_rate()),
-        column(&runs, true, |m| m.dead_get_rate()),
-    );
     eprintln!(
         "[ab] first-GET-success latency ms | off {:?} | on {:?}",
         runs.values()
