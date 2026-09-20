@@ -200,12 +200,9 @@ WHEN routing fails (no peers):
 ```
 Two prediction stacks exist in router.rs; exactly one reaches routing.
 
-  LEGACY (default): isotonic curve + per-peer EWMA + fixed-weight Renegade
-    blend (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1
-    the residual correction in place of the blend.
-  HIERARCHICAL (router/hierarchical.rs): EB-shrunk isotonic prior, root >
-    peer > (peer, band) empirical-Bayes hierarchy, forgetting horizon chosen
-    online from a PER-STAGE menu (FAILURE_HORIZONS_HOURS for failure,
+  HIERARCHICAL (default; router/hierarchical.rs): EB-shrunk isotonic prior,
+    root > peer > (peer, band) empirical-Bayes hierarchy, forgetting horizon
+    chosen online from a PER-STAGE menu (FAILURE_HORIZONS_HOURS for failure,
     LOG_HORIZONS_HOURS for response time and transfer speed; the failure menu
     is the shorter one, so a failure burst is tracked faster). The FAILURE
     stage also carries a CONTRACT-LEVEL TERM: a second hierarchy, contract >
@@ -216,13 +213,60 @@ Two prediction stacks exist in router.rs; exactly one reaches routing.
     evidence about the peer that was asked, which raised that peer's forecasts
     for every other contract (#5700). It is on unconditionally wherever the
     estimator is computed; there is no separate flag for it.
-    Routes only with FREENET_ROUTING_HIERARCHICAL=1, and then takes precedence
-    over BOTH legacy variants for every stage it can estimate (a cold stage
-    falls back to legacy). Computed at all only when that flag is on or
-    FREENET_ROUTING_DATASET is recording — never as an everyone-pays shadow.
+    Takes precedence over BOTH legacy variants for every stage it can
+    estimate (a cold stage falls back to legacy). FREENET_ROUTING_HIERARCHICAL=0
+    (false/no/off) is the per-node kill switch; on any node where the flag
+    resolves OFF (0/false/no/off, or any unrecognised or non-UTF-8 value) it
+    is computed at all only while FREENET_ROUTING_DATASET is recording.
+  LEGACY (only where the flag resolves OFF, and as the cold-stage
+    fallback): isotonic curve + per-peer EWMA + fixed-weight Renegade blend
+    (routing_predictor.rs), or with FREENET_ROUTING_RESIDUAL_CORRECTION=1 the
+    residual correction in place of the blend.
 
 WHEN touching either stack:
-  → Flags parse fail-safe (parse_routing_flag): only 1/true/yes/on enable
+  → Flags parse fail-safe. Default-off flags (parse_routing_flag, e.g.
+    RESIDUAL_CORRECTION) enable only on 1/true/yes/on. The default-on
+    HIERARCHICAL flag (parse_default_on_routing_flag, wired through
+    resolve_hierarchical_flag) is ON when unset, empty or whitespace-only, or
+    1/true/yes/on; OFF on 0/false/no/off; and OFF with a warn! on ANY other
+    non-empty or non-UTF-8 value: setting a default-on flag at all almost
+    always means "off", and ambiguous input falls back to the proven legacy
+    stack.
+  → The resolved mode is logged ONCE, on first use (first route event,
+    prediction or dashboard snapshot — not at boot). Every line starts
+    "hierarchical routing estimator: ", but do NOT grep that prefix alone
+    to read a node's mode: the peer-table saturation notice
+    (hierarchical.rs) shares it, is INFO too, is emitted up to hourly, and
+    post-flip every node runs the estimator so it appears fleet-wide. Grep
+    a mode string: "estimator: enabled (default)", "estimator: enabled via",
+    "estimator: disabled via", or "estimator: disabled, " for the
+    unrecognised-value case. The soak's crossover check greps
+    them, and the exact lines (message and value field) are pinned end to
+    end (real env var, real OnceLock, child processes) by
+    hierarchical_routing_enabled_follows_the_environment. The enabled and
+    "disabled via" lines are INFO, so they are in the main freenet log
+    (freenet.*.log; on the gateways /home/freenet/.local/state/freenet/),
+    NOT freenet.error.*, whose floor is WARN; only the unrecognised-value
+    WARN line reaches the error log. A file-logging node's journal has no
+    mode line at all: stdout carries the console layer only on a TTY or
+    with FREENET_LOG_TO_CONSOLE.
+  → Routing-behaviour guards must cover BOTH stacks. Router::new(&history)
+    never feeds the hierarchical estimator, so a history-built router
+    routes on the cold-start fallback (bit-identical to a flag-OFF node
+    today, by equivalence only). The tests' Training::WarmHierarchical
+    trains through add_event with a frozen clock and asserts every FAILURE
+    probability, and every timing estimate the estimator supplies, came
+    from the hierarchical estimate. Its timing stages warm only after 30
+    timed successes (the speed stage counts only those with a non-zero
+    payload), so a guard whose property depends on timing must train that
+    many and call assert_hierarchical_timing_decides (the realistic,
+    transition phase-3 and #4230 steady-state twins do); otherwise its
+    timing is legacy. Timing that correlates with distance is itself a
+    locality signal and can pre-solve a locality property, so a guard of
+    the FAILURE stage should train timing that carries no distance signal
+    — and none per peer either, which is the same hazard one level down.
+    Where both stacks agree bit for bit (all-success data), add a
+    LEGACY_STAGE_EVALUATIONS delta check. Give a new guard both modes.
   → Flag off must stay bit-identical to legacy (pinned by
     disabled_hierarchical_estimator_leaves_every_prediction_bit_identical)
   → The hierarchical estimator's time comes from the router's injected
@@ -230,9 +274,12 @@ WHEN touching either stack:
     InstantTimeSrc reading tokio's clock: it advances under a paused tokio
     runtime (direct sim runner) but NOT under hosting_time_source_override.
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
-  → It is computed only while its flag is on or the routing dataset is
-    RECORDING (a stopped recorder stops it); readings then freeze, and the
-    dashboard shows "not computed now" rather than frozen values
+  → With the default (on) it is always computed, because it routes. Only
+    where the flag resolves OFF (0/false/no/off, or any unrecognised or
+    non-UTF-8 value) is it computed solely while the
+    routing dataset is RECORDING (a stopped recorder stops it); readings
+    then freeze, and the dashboard shows "not computed now" rather than
+    frozen values
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
   → PAIRED VALUES, failure probability: the estimator returns TWO failure
@@ -327,13 +374,23 @@ The original two-part gate, still the shape of the LIVE half:
       select would have fared is unobserved (future work). The by-value join
       from outcome to decision is biased in two known directions (module doc
       "Joining"): report both measures it names with any result. Size
-      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. With
-      FREENET_ROUTING_HIERARCHICAL on, use a candidates rate of 0.01 or less:
-      a captured decision there costs about 8x an uncaptured one under the
-      router read lock (+35% per decision at 0.05, about +7% at 0.01).
+      ..._CANDIDATES_MAX_BYTES and ..._PACE_HOURS to the soak's length. Use a
+      candidates rate of 0.01 or less on any node ROUTING HIERARCHICALLY,
+      which since the default flip is every node that has not been given an
+      explicit FREENET_ROUTING_HIERARCHICAL=0: a captured decision there costs
+      about 8x an uncaptured one under the router read lock (+35% per decision
+      at 0.05, about +7% at 0.01). Do NOT read the old "with the flag on"
+      phrasing as a condition an operator has to have opted into; unset is on.
+      0.05 remains tolerable only on a node explicitly pinned to legacy.
   (b) ON-FIELD CROSSOVER between gateways: gateway-2 with
       FREENET_ROUTING_HIERARCHICAL on against gateway-1 on legacy, then SWAP
-      which gateway has the flag halfway through the window. The two gateways
+      which gateway has the flag halfway through the window. On a post-flip
+      build unset means ON, so the legacy arm needs an EXPLICIT
+      FREENET_ROUTING_HIERARCHICAL=0; confirm it from that node's main freenet
+      log (freenet.*.log; not freenet.error.*, and not the journal on a
+      file-logging gateway, since the line is INFO): "hierarchical routing
+      estimator: disabled via FREENET_ROUTING_HIERARCHICAL", before trusting
+      the arm. The two gateways
       differ in connection population (address age, bootstrap-list position),
       so a one-gateway-per-arm comparison is confounded by gateway identity;
       compare WITHIN-gateway differences (flag on vs off on the same gateway)

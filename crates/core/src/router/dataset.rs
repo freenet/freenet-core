@@ -150,9 +150,13 @@
 //!   measurable under that lock.
 //! - So at rate `r` the added read-lock time averages about `r` times the
 //!   captured cost: on a hierarchical-routed node about +35% per decision at
-//!   `0.05` but about +7% at `0.01`. **Soaks with
-//!   `FREENET_ROUTING_HIERARCHICAL` on should use a rate of 0.01 or less**;
-//!   legacy-routed nodes tolerate `0.05`.
+//!   `0.05` but about +7% at `0.01`. **Soaks on a node that routes
+//!   hierarchically should use a rate of 0.01 or less**, which since the
+//!   default flip means every node that has not been given an explicit
+//!   `FREENET_ROUTING_HIERARCHICAL=0`. `0.05` is tolerable only on a node
+//!   explicitly pinned to the legacy stack. This condition used to read "with
+//!   `FREENET_ROUTING_HIERARCHICAL` on", which an operator who had set nothing
+//!   would correctly read as not applying to them; unset is now on.
 //! - Building a record takes about 6 µs after the lock is released, serialising
 //!   it about 23 µs on the writer thread; a line is about 16 KB.
 //! - While capture is active, route records sent under the router WRITE lock
