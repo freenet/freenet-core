@@ -100,6 +100,22 @@ const REPLICATED_CONTRACTS: u8 = 4;
 /// docs). These are what give the contract term something to explain away.
 const SCARCE_CONTRACTS: u8 = 3;
 
+/// Contracts held ONLY by two nodes that are crashed part-way through the run.
+/// Before the crash their reads succeed; after it, every attempt routed to a
+/// holder TIMES OUT, and a timeout is trained as a `Failure` immediately
+/// (unlike an ambiguous `NotFound`). Several peers therefore accumulate
+/// failures on the SAME contract while the other contracts keep succeeding,
+/// which is the only shape that gives `tau2_contract` a between-contract
+/// contrast larger than the noise the estimator subtracts. Without this class
+/// the term is estimable but computes `tau2_contract` to exactly zero — see
+/// `contract_term_activation_is_reported`.
+const DEAD_CONTRACTS: u8 = 2;
+
+/// Round at which the two holders of the dead contracts are crashed.
+/// Early enough to leave most of the run failing, late enough that the
+/// contracts were genuinely reachable first.
+const CRASH_ROUND: usize = 3;
+
 /// Rounds of the read workload. Each round issues, from every non-gateway node,
 /// one GET and one SUBSCRIBE against a replicated contract and one GET against
 /// a scarce one, so every contract is asked for by every peer many times over.
@@ -117,6 +133,7 @@ const SEEDS: [u64; 3] = [0x5EED_0001, 0x5EED_0002, 0x5EED_0003];
 /// can never collide.
 const REPLICATED_SEED_BASE: u8 = 0x10;
 const SCARCE_SEED_BASE: u8 = 0x40;
+const DEAD_SEED_BASE: u8 = 0x70;
 
 /// Everything one arm of the A/B produced.
 #[derive(Debug, Clone, Default)]
@@ -131,6 +148,14 @@ struct ArmMetrics {
     /// The same for the single-holder contracts.
     scarce_get_ok: u64,
     scarce_get_total: u64,
+    /// The same for the contracts whose only holders are crashed part-way
+    /// through. These are EXPECTED to fail after the crash; the rate is
+    /// reported and compared between arms, not asserted against a floor.
+    dead_get_ok: u64,
+    dead_get_total: u64,
+    /// Packets dropped because their peer was crashed. Zero would mean the
+    /// scripted crash never took effect and the dead class is not dead.
+    crash_packets_dropped: u64,
     /// Successful client GETs that actually traversed the network
     /// (`hop_count >= 1`), over both classes. A run whose GETs are all served
     /// locally exercises no routing at all, so this is reported beside the
@@ -188,6 +213,10 @@ impl ArmMetrics {
         rate(self.scarce_get_ok, self.scarce_get_total)
     }
 
+    fn dead_get_rate(&self) -> f64 {
+        rate(self.dead_get_ok, self.dead_get_total)
+    }
+
     fn subscribe_rate(&self) -> f64 {
         rate(self.subscribe_ok, self.subscribe_total)
     }
@@ -217,7 +246,14 @@ fn mean(values: &[f64]) -> f64 {
 /// name, so nothing about it can differ between the ON and OFF runs.
 ///
 /// Returns the operations, the replicated contract keys and the scarce ones.
-fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, Vec<ContractKey>) {
+fn build_workload(
+    network: &str,
+) -> (
+    Vec<ScheduledOperation>,
+    Vec<ContractKey>,
+    Vec<ContractKey>,
+    Vec<ContractKey>,
+) {
     let gateway = NodeLabel::gateway(network, 0);
     // Node labels are 1-indexed and start after the gateways.
     let nodes: Vec<NodeLabel> = (1..=NODES).map(|n| NodeLabel::node(network, n)).collect();
@@ -225,6 +261,7 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
     let mut operations = Vec::new();
     let mut replicated = Vec::new();
     let mut scarce = Vec::new();
+    let mut dead = Vec::new();
 
     // Replicated contracts: PUT from the gateway with subscribe, so they
     // propagate and their reads mostly succeed.
@@ -245,7 +282,7 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
     // the network. Reads for them must travel, and the peers tried on the way
     // answer NotFound — which becomes a trained Failure once the operation
     // proves the contract exists.
-    let holder = nodes.last().expect("NODES > 0").clone();
+    let holder = nodes[NODES - 3].clone();
     for i in 0..SCARCE_CONTRACTS {
         let contract = SimOperation::create_test_contract(SCARCE_SEED_BASE + i);
         scarce.push(contract.key());
@@ -258,11 +295,38 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
         ));
     }
 
+    // Dead contracts: held by the last two nodes and by nobody else. Both are
+    // crashed at `CRASH_ROUND`, after which reads for these contracts time out
+    // at the holders. Seeded on BOTH so more than one peer fails on the same
+    // contract, which is what separates a dead CONTRACT from a bad PEER.
+    let dead_holders: Vec<NodeLabel> = nodes[NODES - 2..].to_vec();
+    for i in 0..DEAD_CONTRACTS {
+        let contract = SimOperation::create_test_contract(DEAD_SEED_BASE + i);
+        dead.push(contract.key());
+        for holder in &dead_holders {
+            operations.push(ScheduledOperation::new(
+                holder.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(DEAD_SEED_BASE + i),
+                },
+            ));
+        }
+    }
+
     // The read workload. Every requester asks for every contract repeatedly, so
     // each contract accumulates several peers in the contract table rather than
     // one — which is what `CONTRACT_MIN_OTHER_PEERS` requires before the term
     // can adjust anything.
     for round in 0..ROUNDS {
+        if round == CRASH_ROUND {
+            for holder in &dead_holders {
+                operations.push(ScheduledOperation::new(
+                    holder.clone(),
+                    SimOperation::CrashNode,
+                ));
+            }
+        }
         for (n, node) in nodes.iter().enumerate() {
             let replicated_key = replicated[(round + n) % replicated.len()];
             let scarce_key = scarce[(round + n) % scarce.len()];
@@ -295,6 +359,30 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
             }
         }
 
+        // Dead-contract reads, from every node that is not itself a holder.
+        for (n, node) in nodes.iter().enumerate() {
+            if dead_holders.contains(node) {
+                continue;
+            }
+            let dead_key = dead[(round + n) % dead.len()];
+            operations.push(ScheduledOperation::new(
+                node.clone(),
+                SimOperation::Get {
+                    contract_id: *dead_key.id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Get {
+                contract_id: *dead[round % dead.len()].id(),
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+
         // And once from the gateway, which is connected to every node and so
         // is the router most likely to accumulate the THREE distinct present
         // peers per contract that `CONTRACT_MIN_OTHER_PEERS` requires before
@@ -310,7 +398,7 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
         ));
     }
 
-    (operations, replicated, scarce)
+    (operations, replicated, scarce, dead)
 }
 
 /// Latency of the first successful GET, and how many terminal GET events
@@ -400,7 +488,7 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
         "hier-sim-{tag}-{}-{seed:x}",
         if hierarchical { "on" } else { "off" }
     );
-    let (operations, replicated, scarce) = build_workload(&network);
+    let (operations, replicated, scarce, dead) = build_workload(&network);
 
     // Each scheduled operation consumes 3 virtual seconds in the controlled
     // runner, so the wall must exceed startup + 3 * ops + the post-op settle.
@@ -442,7 +530,7 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     );
 
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
-    collect_metrics(&network, &logs, &result, &replicated, &scarce)
+    collect_metrics(&network, &logs, &result, &replicated, &scarce, &dead)
 }
 
 fn collect_metrics(
@@ -451,12 +539,14 @@ fn collect_metrics(
     result: &ControlledSimulationResult,
     replicated: &[ContractKey],
     scarce: &[ContractKey],
+    dead: &[ContractKey],
 ) -> ArmMetrics {
     let mut metrics = ArmMetrics::default();
 
     let replicated_ids: HashSet<ContractInstanceId> =
         replicated.iter().map(|key| *key.id()).collect();
     let scarce_ids: HashSet<ContractInstanceId> = scarce.iter().map(|key| *key.id()).collect();
+    let dead_ids: HashSet<ContractInstanceId> = dead.iter().map(|key| *key.id()).collect();
 
     // Client GET outcomes, one per client operation, deduplicated per
     // transaction exactly as `crate::tracing::summarize_client_get_outcomes`
@@ -500,6 +590,9 @@ fn collect_metrics(
         } else if scarce_ids.contains(instance_id) {
             metrics.scarce_get_total += 1;
             metrics.scarce_get_ok += u64::from(ok);
+        } else if dead_ids.contains(instance_id) {
+            metrics.dead_get_total += 1;
+            metrics.dead_get_ok += u64::from(ok);
         }
     }
 
@@ -507,6 +600,7 @@ fn collect_metrics(
     metrics.first_success_latency_ms = latency;
     metrics.ops_before_first_success = preceding;
 
+    metrics.crash_packets_dropped = result.crash_packets_dropped;
     let (failures, successes) = result.aggregate_route_outcome_totals();
     metrics.route_failures = failures;
     metrics.route_successes = successes;
@@ -549,7 +643,8 @@ fn collect_metrics(
     }
 
     eprintln!(
-        "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) net_ok {} \
+        "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) \
+         dead_get {}/{} ({:.3}) crash_drops {} net_ok {} \
          subscribe {}/{} ({:.3}) \
          sub_edges {} hosting_edges {} first_success {:?}ms after {} terminals \
          route ok/fail {}/{} | hierarchical nodes {}/{} failure_events {} contracts {} \
@@ -560,6 +655,10 @@ fn collect_metrics(
         metrics.scarce_get_ok,
         metrics.scarce_get_total,
         metrics.scarce_get_rate(),
+        metrics.dead_get_ok,
+        metrics.dead_get_total,
+        metrics.dead_get_rate(),
+        metrics.crash_packets_dropped,
         metrics.network_get_successes,
         metrics.subscribe_ok,
         metrics.subscribe_total,
@@ -585,8 +684,12 @@ fn collect_metrics(
     metrics
 }
 
-/// Run both arms over every seed once, so a caller pays for the simulations
-/// once and several assertions can read the same runs.
+/// Run both arms over every seed once.
+///
+/// One test, not three, and deliberately: CI runs each test in its own
+/// `nextest` process, so three tests asserting on the same A/B would run the
+/// simulations three times over. The assertion blocks below carry their own
+/// messages, so a failure still names its cause.
 fn run_ab() -> BTreeMap<u64, (ArmMetrics, ArmMetrics)> {
     SEEDS
         .iter()
@@ -598,193 +701,224 @@ fn run_ab() -> BTreeMap<u64, (ArmMetrics, ArmMetrics)> {
         .collect()
 }
 
+fn column(
+    runs: &BTreeMap<u64, (ArmMetrics, ArmMetrics)>,
+    on: bool,
+    f: fn(&ArmMetrics) -> f64,
+) -> Vec<f64> {
+    runs.values()
+        .map(|(o, n)| if on { f(n) } else { f(o) })
+        .collect()
+}
+
 #[test]
-fn hierarchical_routing_is_not_worse_than_legacy_in_simulation() {
+fn hierarchical_routing_simulation_ab() {
     let runs = run_ab();
 
-    let off_replicated: Vec<f64> = runs
-        .values()
-        .map(|(off, _)| off.replicated_get_rate())
-        .collect();
-    let on_replicated: Vec<f64> = runs
-        .values()
-        .map(|(_, on)| on.replicated_get_rate())
-        .collect();
-    let off_scarce: Vec<f64> = runs
-        .values()
-        .map(|(off, _)| off.scarce_get_rate())
-        .collect();
-    let on_scarce: Vec<f64> = runs.values().map(|(_, on)| on.scarce_get_rate()).collect();
-    let off_subscribe: Vec<f64> = runs.values().map(|(off, _)| off.subscribe_rate()).collect();
-    let on_subscribe: Vec<f64> = runs.values().map(|(_, on)| on.subscribe_rate()).collect();
-    let off_edges: Vec<f64> = runs
-        .values()
-        .map(|(off, _)| off.subscription_edges as f64)
-        .collect();
-    let on_edges: Vec<f64> = runs
-        .values()
-        .map(|(_, on)| on.subscription_edges as f64)
-        .collect();
-
-    eprintln!(
-        "[ab] replicated_get off {:.3} on {:.3} | scarce_get off {:.3} on {:.3} | \
-         subscribe off {:.3} on {:.3} | sub_edges off {:.1} on {:.1}",
-        mean(&off_replicated),
-        mean(&on_replicated),
-        mean(&off_scarce),
-        mean(&on_scarce),
-        mean(&off_subscribe),
-        mean(&on_subscribe),
-        mean(&off_edges),
-        mean(&on_edges),
-    );
-
-    // Absolute floors first: a comparison between two broken arms is not
-    // evidence. These are deliberately loose — they say the network formed and
-    // served reads, not that it served them well.
+    // ---------------------------------------------------------------
+    // 1. The override really did reach every simulated router.
+    //
+    // Without this the whole comparison could silently be the OFF arm run
+    // twice, and that failure looks exactly like a clean pass. The override is
+    // a thread-local and Turmoil must drive every node on the calling thread;
+    // if node execution ever moves off that thread, this is what says so.
+    // ---------------------------------------------------------------
     for (seed, (off, on)) in &runs {
-        for (arm, metrics) in [("off", off), ("on", on)] {
+        assert!(
+            on.nodes_total > 0,
+            "seed {seed:x}: no node published its Ring"
+        );
+        assert_eq!(
+            on.nodes_routing_hierarchically, on.nodes_total,
+            "seed {seed:x}: the hierarchical override reached only {} of {} routers, so the ON \
+             arm is not an ON arm",
+            on.nodes_routing_hierarchically, on.nodes_total
+        );
+        assert_eq!(
+            off.nodes_routing_hierarchically, 0,
+            "seed {seed:x}: the OFF arm routed hierarchically on {} routers, so the control is \
+             not a control",
+            off.nodes_routing_hierarchically
+        );
+        assert!(
+            on.failure_events > 0,
+            "seed {seed:x}: the estimator routed but its failure stage learned nothing, so \
+             nothing it forecast was informed by this run"
+        );
+        assert!(
+            on.crash_packets_dropped > 0 && off.crash_packets_dropped > 0,
+            "seed {seed:x}: the scripted crash dropped no packets (on {} / off {}), so the dead \
+             contracts were never dead and the failure workload did not happen",
+            on.crash_packets_dropped,
+            off.crash_packets_dropped
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Both arms formed a network and served reads.
+    //
+    // A comparison between two broken arms is not evidence. These floors are
+    // deliberately loose: they say the workload ran, not that it ran well.
+    // ---------------------------------------------------------------
+    for (seed, (off, on)) in &runs {
+        for (arm, m) in [("off", off), ("on", on)] {
             assert!(
-                metrics.replicated_get_total >= 10,
-                "seed {seed:x} arm {arm}: only {} terminal GETs for replicated contracts; \
-                 the workload did not run",
-                metrics.replicated_get_total
+                m.replicated_get_total >= 10,
+                "seed {seed:x} arm {arm}: only {} client GETs for replicated contracts",
+                m.replicated_get_total
             );
             assert!(
-                metrics.subscribe_total >= 10,
-                "seed {seed:x} arm {arm}: only {} terminal SUBSCRIBEs; the workload did not run",
-                metrics.subscribe_total
+                m.scarce_get_total >= 10,
+                "seed {seed:x} arm {arm}: only {} client GETs for scarce contracts",
+                m.scarce_get_total
             );
             assert!(
-                metrics.subscription_edges > 0,
+                m.subscribe_total >= 10,
+                "seed {seed:x} arm {arm}: only {} terminal SUBSCRIBEs",
+                m.subscribe_total
+            );
+            assert!(
+                m.subscription_edges > 0,
                 "seed {seed:x} arm {arm}: no subscription tree formed"
             );
             assert!(
-                metrics.first_success_latency_ms.is_some(),
-                "seed {seed:x} arm {arm}: no operation ever succeeded"
+                m.network_get_successes > 0,
+                "seed {seed:x} arm {arm}: every successful GET was served locally, so this run \
+                 exercised no routing at all"
+            );
+            assert!(
+                m.first_success_latency_ms.is_some(),
+                "seed {seed:x} arm {arm}: no GET ever succeeded"
             );
         }
     }
 
-    // Non-inferiority, per metric, against the OFF arm's own mean.
+    // ---------------------------------------------------------------
+    // 3. Non-inferiority, per metric, against the OFF arm.
     //
-    // MARGIN PROVENANCE. Each margin is the OFF arm's observed seed-to-seed
-    // spread (max minus min over `SEEDS`) rounded up, floored at 0.05. That is
-    // the smallest difference a run of this size can distinguish from seed
-    // noise, so a tighter margin would fail on noise and a looser one would
-    // assert nothing. It is a non-inferiority bar, not a superiority bar: this
-    // change is not expected to improve simulated success rates, only not to
-    // damage them. Re-derive the margins if `SEEDS`, `ROUNDS` or the network
-    // size change, and say so here.
-    let checks: [(&str, &[f64], &[f64]); 4] = [
+    // MARGIN PROVENANCE. Each margin is the OFF arm's own seed-to-seed spread
+    // (max minus min over `SEEDS`) plus a floor. That is the smallest
+    // difference a run of this size can tell from seed noise: a tighter margin
+    // would fail on noise, a looser one would assert nothing. These are
+    // NON-INFERIORITY bars, not superiority bars — the estimator is not
+    // expected to improve simulated success rates, only not to damage them.
+    // Re-derive them if `SEEDS`, `ROUNDS` or the network size change, and say
+    // so here when you do.
+    // ---------------------------------------------------------------
+    let checks: [(&str, fn(&ArmMetrics) -> f64, bool); 5] = [
         (
             "replicated GET success rate",
-            &off_replicated,
-            &on_replicated,
+            |m| m.replicated_get_rate(),
+            true,
         ),
-        ("scarce GET success rate", &off_scarce, &on_scarce),
-        ("subscribe success rate", &off_subscribe, &on_subscribe),
-        ("subscription edges", &off_edges, &on_edges),
+        ("scarce GET success rate", |m| m.scarce_get_rate(), true),
+        ("subscribe success rate", |m| m.subscribe_rate(), true),
+        ("subscription edges", |m| m.subscription_edges as f64, false),
+        (
+            "network-traversed GET successes",
+            |m| m.network_get_successes as f64,
+            false,
+        ),
     ];
-    for (name, off, on) in checks {
+
+    eprintln!("[ab] metric | off per seed | on per seed | off mean | on mean");
+    let mut failures = Vec::new();
+    for (name, metric, is_rate) in checks {
+        let off = column(&runs, false, metric);
+        let on = column(&runs, true, metric);
         let spread = off.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             - off.iter().cloned().fold(f64::INFINITY, f64::min);
-        // Rates live on [0, 1]; the edge count does not, so its margin is a
-        // share of the OFF mean rather than an absolute.
-        let margin = if name == "subscription edges" {
-            (spread + 0.10 * mean(off)).max(1.0)
-        } else {
+        let margin = if is_rate {
             (spread + 0.05).min(0.5)
+        } else {
+            // A count, so the floor is a share of the OFF mean rather than an
+            // absolute on [0, 1].
+            (spread + 0.10 * mean(&off)).max(1.0)
         };
-        let (off_mean, on_mean) = (mean(off), mean(on));
-        assert!(
-            on_mean >= off_mean - margin,
-            "{name}: hierarchical routing is worse than legacy beyond the noise margin — \
-             on {on_mean:.3} vs off {off_mean:.3}, margin {margin:.3} \
-             (off per seed {off:?}, on per seed {on:?})"
-        );
-    }
-}
-
-/// The override really does reach every simulated node's router.
-///
-/// Without this the A/B above could silently run the OFF arm twice — the
-/// failure mode that made the whole comparison worthless would look exactly
-/// like a clean pass. It is checked on its own so a break here names the cause
-/// rather than surfacing as an inexplicably tiny A/B difference.
-#[test]
-fn hierarchical_estimator_is_actually_active_under_the_flag() {
-    let seed = SEEDS[0];
-    let on = run_arm("active", seed, true);
-    let off = run_arm("active", seed, false);
-
-    assert!(on.nodes_total > 0, "no node published its Ring");
-    assert_eq!(
-        on.nodes_routing_hierarchically, on.nodes_total,
-        "the hierarchical override did not reach every router: {} of {} nodes routed \
-         hierarchically. The override is a thread-local and Turmoil must drive every node on \
-         the calling thread; if node execution moved off that thread, this A/B measures the \
-         legacy estimator twice.",
-        on.nodes_routing_hierarchically, on.nodes_total
-    );
-    assert_eq!(
-        off.nodes_routing_hierarchically, 0,
-        "the OFF arm routed hierarchically on {} nodes, so the control is not a control",
-        off.nodes_routing_hierarchically
-    );
-    assert!(
-        on.failure_events > 0,
-        "the estimator routed but its failure stage learned nothing ({} windowed events), so \
-         nothing it forecast was informed by this run",
-        on.failure_events
-    );
-}
-
-/// Whether the contract term (#5700) engaged at all, and if not, which of its
-/// preconditions was missing.
-///
-/// This is deliberately a REPORT with one weak assertion rather than a
-/// threshold. The term's activation depends on the traffic reaching several
-/// preconditions at once — a replicated `(contract, peer)` table, at least two
-/// qualifying contracts, and genuine between-contract variance in failure
-/// residuals — and a simulation of this size is not guaranteed to reach them.
-/// What must not happen is that a future reader assumes it did: the counters
-/// are printed, and the assertion only pins that the table was populated, which
-/// is what says the workload's contracts really did repeat. If the term itself
-/// never activates here, this test is measuring the horizon menu and the cost
-/// path and NOT the contract term, and the printed counters say so.
-#[test]
-fn contract_term_activation_is_reported() {
-    let seed = SEEDS[0];
-    let on = run_arm("term", seed, true);
-
-    eprintln!(
-        "[contract-term] tracked {} contracts, estimable_refits {}, den<2 refits {}, \
-         effects_applied {}, forecast_offsets {}, qualifying_max {}, tau2 {:?}, \
-         route ok/fail {}/{}",
-        on.contracts_tracked,
-        on.contract_estimable_refits,
-        on.contract_den_below_two_refits,
-        on.contract_effects_applied,
-        on.contract_forecast_offsets,
-        on.contract_qualifying_contracts_max,
-        on.contract_tau2,
-        on.route_successes,
-        on.route_failures,
-    );
-
-    assert!(
-        on.contracts_tracked > 0,
-        "the failure stage's contract table is empty, so the workload's contracts did not \
-         repeat at any single router — the mechanism cannot be exercised by this workload"
-    );
-
-    if !on.contract_term_activated() {
+        let (off_mean, on_mean) = (mean(&off), mean(&on));
         eprintln!(
-            "[contract-term] NOT ACTIVATED. estimable_refits {} of which {} had fewer than two \
-             qualifying contracts; tau2 {:?}. This run measured the horizon menu and the cost \
-             path only.",
-            on.contract_estimable_refits, on.contract_den_below_two_refits, on.contract_tau2,
+            "[ab] {name} | {off:?} | {on:?} | {off_mean:.3} | {on_mean:.3} | margin {margin:.3}"
         );
+        if on_mean < off_mean - margin {
+            failures.push(format!(
+                "{name}: on {on_mean:.3} vs off {off_mean:.3}, worse by more than the {margin:.3} \
+                 noise margin (off per seed {off:?}, on per seed {on:?})"
+            ));
+        }
+    }
+    // The dead class is reported, never gated: its reads are meant to fail
+    // after the crash, so a rate near zero in both arms is the intended result
+    // and a comparison of it says nothing.
+    eprintln!(
+        "[ab] dead GET success rate (reported, not gated) | off {:?} | on {:?}",
+        column(&runs, false, |m| m.dead_get_rate()),
+        column(&runs, true, |m| m.dead_get_rate()),
+    );
+    eprintln!(
+        "[ab] first-GET-success latency ms | off {:?} | on {:?}",
+        runs.values()
+            .map(|(o, _)| o.first_success_latency_ms)
+            .collect::<Vec<_>>(),
+        runs.values()
+            .map(|(_, n)| n.first_success_latency_ms)
+            .collect::<Vec<_>>(),
+    );
+    eprintln!(
+        "[ab] terminal GETs before first success | off {:?} | on {:?}",
+        runs.values()
+            .map(|(o, _)| o.ops_before_first_success)
+            .collect::<Vec<_>>(),
+        runs.values()
+            .map(|(_, n)| n.ops_before_first_success)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        failures.is_empty(),
+        "hierarchical routing is worse than legacy beyond the noise margin:\n{}",
+        failures.join("\n")
+    );
+
+    // ---------------------------------------------------------------
+    // 4. Contract term: a REPORT, plus the one thing that must hold.
+    //
+    // Whether the term engages depends on the traffic clearing several
+    // preconditions at once — a replicated (contract, peer) table, at least two
+    // qualifying contracts, and a between-contract contrast in failure
+    // residuals larger than the noise the estimator subtracts. A simulation of
+    // this size is not guaranteed to reach them, and pretending otherwise is
+    // the failure this block exists to prevent: the counters are printed so a
+    // reader can see for themselves. The assertion pins only that the contract
+    // table was POPULATED, which is what says the workload's contracts really
+    // did repeat at a single router. If the term itself never activates, this
+    // case is measuring the horizon menu and the cost path and NOT the contract
+    // term, and the printed line says so in those words.
+    // ---------------------------------------------------------------
+    for (seed, (_, on)) in &runs {
+        eprintln!(
+            "[contract-term] seed {seed:x}: tracked {} contracts, estimable_refits {}, \
+             den<2 refits {}, effects_applied {}, forecast_offsets {}, qualifying_max {}, \
+             tau2 {:?}, route ok/fail {}/{}",
+            on.contracts_tracked,
+            on.contract_estimable_refits,
+            on.contract_den_below_two_refits,
+            on.contract_effects_applied,
+            on.contract_forecast_offsets,
+            on.contract_qualifying_contracts_max,
+            on.contract_tau2,
+            on.route_successes,
+            on.route_failures,
+        );
+        assert!(
+            on.contracts_tracked > 0,
+            "seed {seed:x}: the failure stage's contract table is empty, so the workload's \
+             contracts did not repeat at any single router and the mechanism cannot be \
+             exercised by this workload at all"
+        );
+        if !on.contract_term_activated() {
+            eprintln!(
+                "[contract-term] seed {seed:x}: NOT ACTIVATED — this run measured the horizon \
+                 menu and the cost path only, not the contract term."
+            );
+        }
     }
 }
