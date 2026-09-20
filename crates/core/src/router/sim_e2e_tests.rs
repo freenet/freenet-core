@@ -88,6 +88,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use crate::node::testing_impl::{
     ControlledSimulationResult, NodeLabel, ScheduledOperation, SimNetwork, SimOperation,
 };
+use crate::tracing::event_kind::{EventKind, GetEvent, GetTerminalOutcome};
 
 /// Contracts PUT through the network and subscribed, so they end up held in
 /// several places and their reads mostly succeed.
@@ -102,10 +103,10 @@ const SCARCE_CONTRACTS: u8 = 3;
 /// Rounds of the read workload. Each round issues, from every non-gateway node,
 /// one GET and one SUBSCRIBE against a replicated contract and one GET against
 /// a scarce one, so every contract is asked for by every peer many times over.
-const ROUNDS: usize = 7;
+const ROUNDS: usize = 12;
 
 /// Regular (non-gateway) nodes.
-const NODES: usize = 5;
+const NODES: usize = 7;
 
 /// Seeds the A/B runs over. Three is few, and the spread across them is
 /// reported rather than hidden: it is what the non-inferiority margins are
@@ -120,12 +121,21 @@ const SCARCE_SEED_BASE: u8 = 0x40;
 /// Everything one arm of the A/B produced.
 #[derive(Debug, Clone, Default)]
 struct ArmMetrics {
-    /// Terminal GET outcomes for the widely-replicated contracts.
+    /// Client-visible GET outcomes for the widely-replicated contracts, one
+    /// per client operation, taken from `GetEvent::ClientTerminal` (the
+    /// authoritative terminal: the inline `GetSuccess` path misses local
+    /// serves and streamed successes entirely, which is why the first version
+    /// of this test read 0/0 here while the workload was plainly running).
     replicated_get_ok: u64,
     replicated_get_total: u64,
-    /// Terminal GET outcomes for the single-holder contracts.
+    /// The same for the single-holder contracts.
     scarce_get_ok: u64,
     scarce_get_total: u64,
+    /// Successful client GETs that actually traversed the network
+    /// (`hop_count >= 1`), over both classes. A run whose GETs are all served
+    /// locally exercises no routing at all, so this is reported beside the
+    /// rates rather than left implicit.
+    network_get_successes: u64,
     /// Terminal SUBSCRIBE outcomes, all contracts.
     subscribe_ok: u64,
     subscribe_total: u64,
@@ -284,13 +294,27 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
                 ));
             }
         }
+
+        // And once from the gateway, which is connected to every node and so
+        // is the router most likely to accumulate the THREE distinct present
+        // peers per contract that `CONTRACT_MIN_OTHER_PEERS` requires before
+        // the contract term can adjust or offset anything.
+        let scarce_key = scarce[round % scarce.len()];
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Get {
+                contract_id: *scarce_key.id(),
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
     }
 
     (operations, replicated, scarce)
 }
 
-/// Latency of the first terminal success, and how many terminal events preceded
-/// it, in transaction-GENERATION order.
+/// Latency of the first successful GET, and how many terminal GET events
+/// preceded it, in transaction-GENERATION order.
 ///
 /// The ordering is `Transaction::created_at_ms`, which under
 /// `GlobalSimulationTime` is a deterministic monotonic counter incremented once
@@ -298,15 +322,18 @@ fn build_workload(network: &str) -> (Vec<ScheduledOperation>, Vec<ContractKey>, 
 /// rustdoc says so). The returned latency IS virtual milliseconds: `elapsed_ms`
 /// comes from `Transaction::elapsed`, which reads
 /// `GlobalSimulationTime::read_time_ms`. The log's `datetime` field is
-/// `Utc::now()` and is deliberately not used anywhere here.
-fn first_success_latency_ms(logs: &[crate::tracing::NetLogMessage]) -> (Option<u64>, u64) {
+/// `Utc::now()` and is deliberately not used anywhere here, so nothing in this
+/// module depends on wall-clock time.
+///
+/// Restricted to GETs because only the inline GET terminals carry an
+/// `elapsed_ms` this module can reach through a public accessor; mixing in
+/// SUBSCRIBE terminals gave a first event with no latency at all, which read
+/// as "nothing ever succeeded".
+fn first_get_success(logs: &[crate::tracing::NetLogMessage]) -> (Option<u64>, u64) {
     let mut terminal: Vec<(u64, bool, Option<u64>)> = logs
         .iter()
         .filter_map(|log| {
-            let ok = match (log.kind.get_outcome(), log.kind.subscribe_outcome()) {
-                (Some(ok), _) | (_, Some(ok)) => ok,
-                (None, None) => return None,
-            };
+            let ok = log.kind.get_outcome()?;
             Some((log.tx.created_at_ms(), ok, log.kind.get_elapsed_ms()))
         })
         .collect();
@@ -322,6 +349,39 @@ fn first_success_latency_ms(logs: &[crate::tracing::NetLogMessage]) -> (Option<u
     (None, preceding)
 }
 
+/// Reset every piece of per-thread simulation state the harness relies on.
+///
+/// This is `setup_deterministic_state` from
+/// `crates/core/tests/simulation_integration.rs`, which the in-crate governance
+/// simulation does not call because it runs one simulation per test. This module
+/// runs SEVERAL on one thread, and two of them are supposed to be the same run
+/// with one flag flipped, so without this the second arm inherits the first
+/// arm's RNG and counter state and the A/B compares two different networks.
+/// All of it is thread-local, so parallel tests stay isolated.
+///
+/// It must run BEFORE `SimNetwork::new`, not just before the simulation: node
+/// transport keypairs are generated during construction.
+fn reset_simulation_state(seed: u64) {
+    use crate::config::{
+        GlobalRng, GlobalSimulationTime, GlobalTestMetrics, SimulationTransportOpt,
+    };
+
+    GlobalRng::set_seed(seed);
+    const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+    GlobalTestMetrics::reset();
+    SimulationTransportOpt::disable();
+    crate::contract::clear_crdt_contracts();
+    crate::client_events::RequestId::reset_counter();
+    crate::client_events::ClientId::reset_counter();
+    crate::contract::reset_event_id_counter();
+    crate::node::reset_channel_id_counter();
+    crate::transport::StreamId::reset_counter();
+    crate::transport::reset_nonce_counter();
+    crate::test_utils::reset_global_node_index();
+}
+
 /// Run one arm: the whole workload with the estimator forced on or off.
 ///
 /// `tag` distinguishes the callers. Lib tests run on parallel threads, the
@@ -332,6 +392,9 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     // THIS thread, so it reaches all of them. `nodes_routing_hierarchically`
     // below is the check that this is still true.
     let _flag = super::force_hierarchical_routing(hierarchical);
+    // Both arms must start from identical thread-local state, or they are not
+    // the same network with one flag flipped.
+    reset_simulation_state(seed);
 
     let network = format!(
         "hier-sim-{tag}-{}-{seed:x}",
@@ -364,6 +427,10 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     // The production `ContractExecutor` path, as the repo's testing rules ask
     // for; `MockRuntime` has its own implementation that can drift (#3141).
     sim.use_mock_wasm = true;
+    // Start the read workload against a FORMED ring in both arms. Without this
+    // the early rounds fail for topology reasons that have nothing to do with
+    // the estimator, which adds seed noise to exactly the rates being compared.
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
 
     let logs_handle = sim.event_logs_handle();
     let result = sim.run_controlled_simulation(seed, operations, sim_duration, post_op_wait);
@@ -391,28 +458,52 @@ fn collect_metrics(
         replicated.iter().map(|key| *key.id()).collect();
     let scarce_ids: HashSet<ContractInstanceId> = scarce.iter().map(|key| *key.id()).collect();
 
+    // Client GET outcomes, one per client operation, deduplicated per
+    // transaction exactly as `crate::tracing::summarize_client_get_outcomes`
+    // does. That helper is not used directly because it does not split by
+    // contract, and the split is the whole point here: the replicated
+    // contracts measure ordinary read health while the scarce ones measure
+    // reads that must actually travel.
+    let mut per_tx: std::collections::HashMap<
+        crate::message::Transaction,
+        (GetTerminalOutcome, Option<usize>, ContractInstanceId),
+    > = std::collections::HashMap::new();
     for log in logs {
-        let key_id = log.kind.contract_key().map(|key| *key.id());
-        if let Some(ok) = log.kind.get_outcome() {
-            match key_id {
-                Some(id) if replicated_ids.contains(&id) => {
-                    metrics.replicated_get_total += 1;
-                    metrics.replicated_get_ok += u64::from(ok);
-                }
-                Some(id) if scarce_ids.contains(&id) => {
-                    metrics.scarce_get_total += 1;
-                    metrics.scarce_get_ok += u64::from(ok);
-                }
-                _ => {}
+        if let EventKind::Get(GetEvent::ClientTerminal {
+            outcome,
+            is_sub_op,
+            hop_count,
+            instance_id,
+            ..
+        }) = &log.kind
+        {
+            // Sub-op GETs (repair, renewal, related-fetch) are not client
+            // demand and are excluded, as the production summary excludes them.
+            if *is_sub_op {
+                continue;
             }
+            per_tx.insert(log.tx, (*outcome, *hop_count, *instance_id));
         }
         if let Some(ok) = log.kind.subscribe_outcome() {
             metrics.subscribe_total += 1;
             metrics.subscribe_ok += u64::from(ok);
         }
     }
+    for (outcome, hop_count, instance_id) in per_tx.values() {
+        let ok = matches!(outcome, GetTerminalOutcome::Success);
+        if ok && hop_count.unwrap_or(0) >= 1 {
+            metrics.network_get_successes += 1;
+        }
+        if replicated_ids.contains(instance_id) {
+            metrics.replicated_get_total += 1;
+            metrics.replicated_get_ok += u64::from(ok);
+        } else if scarce_ids.contains(instance_id) {
+            metrics.scarce_get_total += 1;
+            metrics.scarce_get_ok += u64::from(ok);
+        }
+    }
 
-    let (latency, preceding) = first_success_latency_ms(logs);
+    let (latency, preceding) = first_get_success(logs);
     metrics.first_success_latency_ms = latency;
     metrics.ops_before_first_success = preceding;
 
@@ -458,7 +549,8 @@ fn collect_metrics(
     }
 
     eprintln!(
-        "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) subscribe {}/{} ({:.3}) \
+        "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) net_ok {} \
+         subscribe {}/{} ({:.3}) \
          sub_edges {} hosting_edges {} first_success {:?}ms after {} terminals \
          route ok/fail {}/{} | hierarchical nodes {}/{} failure_events {} contracts {} \
          estimable_refits {} den<2 {} effects {} offsets {} qualifying_max {} tau2 {:?}",
@@ -468,6 +560,7 @@ fn collect_metrics(
         metrics.scarce_get_ok,
         metrics.scarce_get_total,
         metrics.scarce_get_rate(),
+        metrics.network_get_successes,
         metrics.subscribe_ok,
         metrics.subscribe_total,
         metrics.subscribe_rate(),
