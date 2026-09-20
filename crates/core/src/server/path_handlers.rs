@@ -5,8 +5,12 @@
 //! proxies WebSocket connections via postMessage, while the contract runs in an
 //! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox
 //!                   allow-downloads allow-modals"
-//!         allow="clipboard-read; clipboard-write">`
+//!         allow="clipboard-read; clipboard-write; fullscreen *">`
 //! with an opaque origin that cannot access other contracts' data.
+//! The `*` on `fullscreen` is required: a bare `fullscreen` means `fullscreen 'src'`,
+//! which cannot match this frame's opaque origin in Firefox or WebKit (only Chromium
+//! resolves `'src'` against the src URL). It grants nothing extra — the frame only
+//! ever loads this node's own contract bytes.
 //! Popups ESCAPE the sandbox: a new tab opened from the iframe is a normal
 //! top-level document at the node's real origin, which re-wraps the target
 //! contract in a fresh shell + sandboxed frame. That is what makes
@@ -6041,10 +6045,14 @@ mod tests {
             ),
             "iframe sandbox attribute missing or wrong allowlist"
         );
-        // Iframe must grant clipboard via permissions-policy
+        // Iframe must grant clipboard + fullscreen via permissions-policy.
+        // (Substring pin only — the behavioural guard that fullscreen is
+        // actually enabled inside the sandboxed frame is the Playwright test
+        // `the sandboxed contract iframe is granted fullscreen` in shell.spec.ts;
+        // a substring cannot observe document.fullscreenEnabled.)
         assert!(
-            html.contains(r#"allow="clipboard-read; clipboard-write""#),
-            "iframe permissions-policy missing clipboard grants"
+            html.contains(r#"allow="clipboard-read; clipboard-write; fullscreen *""#),
+            "iframe permissions-policy missing clipboard/fullscreen grants"
         );
         // Iframe src must include __sandbox=1
         assert!(
