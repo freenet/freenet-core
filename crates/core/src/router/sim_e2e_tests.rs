@@ -32,10 +32,17 @@
 //! process-per-test and not under plain `cargo test`. The thread-local reaches
 //! every simulated node because `run_controlled_simulation` drives Turmoil on
 //! the calling thread, so both arms can run in one process with no env var at
-//! all. `hierarchical_estimator_is_actually_active_under_the_flag` pins that the
-//! override really does reach the routers, so a future change that moves node
-//! execution off this thread fails here instead of silently measuring the OFF
-//! arm twice.
+//! all.
+//!
+//! That thread-local is load-bearing, so a change that moves node execution off
+//! the calling thread must FAIL here rather than silently measure the OFF arm
+//! twice. The assertion that achieves it is `off.failure_events == 0` in
+//! [`assert_seed`], NOT the `nodes_routing_hierarchically` counter beside it:
+//! the counter is read on this thread and so is a readback of the thread-local
+//! itself, while `failure_events` is estimator state written by whatever thread
+//! ran the node. Section 1 of [`assert_seed`] spells out why the difference
+//! matters, and it matters more since the process default became ON, because a
+//! fall-through now lands on the estimator rather than off it.
 //!
 //! The module is named `sim_e2e_tests` for a mechanical reason: CI's simulation
 //! job selects in-crate simulation tests with
@@ -74,13 +81,14 @@
 //! It is a simulation of a handful of nodes over a few hundred events. It
 //! cannot speak to the gate's offline measures (M1/M2/M3 in `PLAN-v2.md`),
 //! which are scored on recorded gateway traffic, and it cannot resolve small
-//! differences: the margins below are chosen from the observed seed-to-seed
-//! spread of the OFF arm, which is what bounds what a run of this size can see.
+//! differences: the margins below are floors sized from the largest per-seed
+//! arm-to-arm difference measured over four passes, which is what bounds what a
+//! run of this size can see.
 //! It answers one narrow question the gate asks and nothing else: does routing
 //! with the estimator on still form a network, serve reads and build a
 //! subscription tree, and does the contract term ever engage.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
@@ -128,9 +136,12 @@ const NODES: usize = 9;
 const MAX_CONNECTIONS: usize = 5;
 const MIN_CONNECTIONS: usize = 2;
 
-/// Seeds the A/B runs over. Three is few, and the spread across them is
-/// reported rather than hidden: it is what the non-inferiority margins are
-/// derived from.
+/// Seeds the A/B runs over, ONE PER TEST. Three is few, and the spread across
+/// them is reported rather than hidden.
+///
+/// Each seed is asserted on its own rather than pooled into a mean. Pooling
+/// let one seed collapse while the other two absorbed it: see the margin
+/// provenance note in [`assert_seed`].
 const SEEDS: [u64; 3] = [0x5EED_0001, 0x5EED_0002, 0x5EED_0003];
 
 /// Contract-id seed space is split so a replicated contract and a scarce one
@@ -160,9 +171,15 @@ struct ArmMetrics {
     /// locally exercises no routing at all, so this is reported beside the
     /// rates rather than left implicit.
     network_get_successes: u64,
-    /// Terminal SUBSCRIBE outcomes, all contracts.
+    /// Terminal SUBSCRIBE outcomes, all contracts, ONE PER TRANSACTION.
     subscribe_ok: u64,
     subscribe_total: u64,
+    /// Raw terminal-SUBSCRIBE log events, before the per-transaction
+    /// deduplication above. Reported, never gated on: the gap between this and
+    /// `subscribe_total` is the size of the route-length weighting the
+    /// deduplication removes, and printing it is what stops that bias
+    /// reappearing unnoticed.
+    subscribe_raw_events: u64,
     /// Subscription tree: `(contract, node)` pairs where the node ended the run
     /// actually receiving updates for that contract. Read from the live `Ring`s,
     /// not from the logs, so it is a state assertion rather than an event count.
@@ -230,14 +247,6 @@ fn rate(ok: u64, total: u64) -> f64 {
         0.0
     } else {
         ok as f64 / total as f64
-    }
-}
-
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        0.0
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
     }
 }
 
@@ -567,6 +576,32 @@ fn collect_metrics(
         crate::message::Transaction,
         (GetTerminalOutcome, Option<usize>, ContractInstanceId),
     > = std::collections::HashMap::new();
+
+    // Terminal SUBSCRIBE outcomes, also deduplicated per transaction, and for a
+    // sharper reason than tidiness.
+    //
+    // `SubscribeEvent::SubscribeSuccess` is emitted at EVERY node that
+    // establishes the subscription as the response bubbles back toward the
+    // requester, while `SubscribeTimeout` is emitted once, at the originator.
+    // Counting raw events therefore weights successes by route length and
+    // failures not at all. Route length is precisely what the routing model
+    // under test changes, so the raw rate is confounded by the variable this
+    // A/B exists to hold everything else constant against: a model that routes
+    // over longer paths would score a HIGHER subscribe rate for that reason
+    // alone. Measured, not assumed; the printed `raw` count beside the
+    // deduplicated one is the evidence.
+    //
+    // Last write wins, exactly as the GET path above and
+    // `crate::tracing::summarize_client_get_outcomes` do. The logs are in
+    // emission order and the response travels back toward the originator, so
+    // the last terminal recorded for a transaction is the one nearest the
+    // client. Deliberately NOT a "success beats failure" precedence rule:
+    // that would count a transaction as a success when a downstream node
+    // established a subscription but the originator still timed out, which is
+    // an overstatement in the same direction as the bias being removed.
+    let mut subscribe_per_tx: std::collections::HashMap<crate::message::Transaction, bool> =
+        std::collections::HashMap::new();
+
     for log in logs {
         if let EventKind::Get(GetEvent::ClientTerminal {
             outcome,
@@ -584,10 +619,14 @@ fn collect_metrics(
             per_tx.insert(log.tx, (*outcome, *hop_count, *instance_id));
         }
         if let Some(ok) = log.kind.subscribe_outcome() {
-            metrics.subscribe_total += 1;
-            metrics.subscribe_ok += u64::from(ok);
+            metrics.subscribe_raw_events += 1;
+            subscribe_per_tx.insert(log.tx, ok);
         }
     }
+
+    metrics.subscribe_total = subscribe_per_tx.len() as u64;
+    metrics.subscribe_ok = subscribe_per_tx.values().filter(|ok| **ok).count() as u64;
+
     for (outcome, hop_count, instance_id) in per_tx.values() {
         let ok = matches!(outcome, GetTerminalOutcome::Success);
         if ok && hop_count.unwrap_or(0) >= 1 {
@@ -653,7 +692,7 @@ fn collect_metrics(
     eprintln!(
         "[{network}] replicated_get {}/{} ({:.3}) scarce_get {}/{} ({:.3}) \
          twin_get {}/{} ({:.3}) net_ok {} \
-         subscribe {}/{} ({:.3}) \
+         subscribe {}/{} ({:.3}) raw_subscribe_events {} \
          sub_edges {} hosting_edges {} first_success {:?}ms after {} terminals \
          route ok/fail {}/{} | hierarchical nodes {}/{} failure_events {} contracts {} \
          estimable_refits {} den<2 {} effects {} offsets {} qualifying_max {} tau2 {:?}",
@@ -670,6 +709,7 @@ fn collect_metrics(
         metrics.subscribe_ok,
         metrics.subscribe_total,
         metrics.subscribe_rate(),
+        metrics.subscribe_raw_events,
         metrics.subscription_edges,
         metrics.hosting_edges,
         metrics.first_success_latency_ms,
@@ -691,21 +731,31 @@ fn collect_metrics(
     metrics
 }
 
-/// Run both arms over every seed once.
+/// Run both arms over ONE seed.
 ///
-/// One test, not three, and deliberately: CI runs each test in its own
-/// `nextest` process, so three tests asserting on the same A/B would run the
-/// simulations three times over. The assertion blocks below carry their own
-/// messages, so a failure still names its cause.
-fn run_ab() -> BTreeMap<u64, (ArmMetrics, ArmMetrics)> {
-    SEEDS
-        .iter()
-        .map(|&seed| {
-            let off = run_arm("ab", seed, false);
-            let on = run_arm("ab", seed, true);
-            (seed, (off, on))
-        })
-        .collect()
+/// SPLIT PER SEED, and the reason is worth keeping because the earlier form of
+/// this file argued the opposite. A single test running all three seeds
+/// measured 177.741s on the CI runner against the `ci` profile's 240s cap
+/// (`.config/nextest.toml`, `slow-timeout = { period = "120s",
+/// terminate-after = 2 }`), so 1.35x headroom, and 267-278s locally. That is
+/// less headroom than the three simulation tests in that same file's #5176
+/// block, which were given an override at ~1.6x. The `Simulation` job runs on
+/// `merge_group` as well as `pull_request`, and `retries = 2` means a breach
+/// costs three full runs, so a systematically slower runner would stall the
+/// merge queue rather than red one PR.
+///
+/// Splitting divides the work instead of buying more time: one seed's two arms
+/// per test, so each is about a third of the runtime with real headroom under
+/// the DEFAULT cap and no override to maintain, nextest runs the three in
+/// parallel, and a failure names its seed instead of the whole case.
+///
+/// The earlier comment here warned that three tests would run the simulations
+/// three times over. That was true of three tests each asserting on the same
+/// full A/B; it is not true of three tests each owning one seed.
+fn run_seed(seed: u64) -> (ArmMetrics, ArmMetrics) {
+    let off = run_arm("ab", seed, false);
+    let on = run_arm("ab", seed, true);
+    (off, on)
 }
 
 /// One metric read off an arm. Named rather than written inline so the
@@ -716,47 +766,64 @@ type Metric = fn(&ArmMetrics) -> f64;
 /// (which decides how its noise margin is floored).
 type Check = (&'static str, Metric, bool);
 
-fn column(runs: &BTreeMap<u64, (ArmMetrics, ArmMetrics)>, on: bool, f: Metric) -> Vec<f64> {
-    runs.values()
-        .map(|(o, n)| if on { f(n) } else { f(o) })
-        .collect()
-}
-
-#[test]
-fn hierarchical_routing_simulation_ab() {
-    let runs = run_ab();
-
+/// Everything asserted about one seed's pair of arms.
+fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
     // ---------------------------------------------------------------
     // 1. The override really did reach every simulated router.
     //
     // Without this the whole comparison could silently be the OFF arm run
-    // twice, and that failure looks exactly like a clean pass. The override is
-    // a thread-local and Turmoil must drive every node on the calling thread;
-    // if node execution ever moves off that thread, this is what says so.
+    // twice, and that failure looks exactly like a clean pass.
+    //
+    // `nodes_routing_hierarchically` ALONE cannot establish that, and it is
+    // important not to believe it does. It comes from `Router::snapshot()`,
+    // which evaluates `hierarchical_routing_enabled()` at call time, and under
+    // `cfg(test)` that reads the CALLING thread's `TEST_HIERARCHICAL_OVERRIDE`.
+    // `collect_metrics` runs on the test thread inside `run_arm`'s guard
+    // scope, so that counter is a readback of the thread-local this thread just
+    // set, multiplied by the node count. It says nothing about the threads the
+    // routers actually ran on. If turmoil ever polls host futures off the
+    // calling thread, those routers fall through to the PROCESS default, which
+    // is now ON, and both arms would route hierarchically while both of those
+    // assertions still passed: permanently green, comparing ON against ON.
+    //
+    // `failure_events` is what closes that hole, because it crosses threads.
+    // It reads `hierarchical[0].window_events`, estimator state populated by
+    // `add_event` on whichever thread ran it. With the flag off and no
+    // `FREENET_ROUTING_DATASET` the estimator is never fed at all (see
+    // `hierarchical_computed`), so the OFF arm must show exactly zero. If the
+    // OFF arm's routers silently fell through to the process default, this is
+    // the assertion that fails.
     // ---------------------------------------------------------------
-    for (seed, (off, on)) in &runs {
-        assert!(
-            on.nodes_total > 0,
-            "seed {seed:x}: no node published its Ring"
-        );
-        assert_eq!(
-            on.nodes_routing_hierarchically, on.nodes_total,
-            "seed {seed:x}: the hierarchical override reached only {} of {} routers, so the ON \
-             arm is not an ON arm",
-            on.nodes_routing_hierarchically, on.nodes_total
-        );
-        assert_eq!(
-            off.nodes_routing_hierarchically, 0,
-            "seed {seed:x}: the OFF arm routed hierarchically on {} routers, so the control is \
-             not a control",
-            off.nodes_routing_hierarchically
-        );
-        assert!(
-            on.failure_events > 0,
-            "seed {seed:x}: the estimator routed but its failure stage learned nothing, so \
-             nothing it forecast was informed by this run"
-        );
-    }
+    assert!(
+        on.nodes_total > 0,
+        "seed {seed:x}: no node published its Ring"
+    );
+    assert_eq!(
+        on.nodes_routing_hierarchically, on.nodes_total,
+        "seed {seed:x}: the hierarchical override reached only {} of {} routers, so the ON \
+         arm is not an ON arm",
+        on.nodes_routing_hierarchically, on.nodes_total
+    );
+    assert_eq!(
+        off.nodes_routing_hierarchically, 0,
+        "seed {seed:x}: the OFF arm routed hierarchically on {} routers, so the control is \
+         not a control",
+        off.nodes_routing_hierarchically
+    );
+    assert!(
+        on.failure_events > 0,
+        "seed {seed:x}: the estimator routed but its failure stage learned nothing, so \
+         nothing it forecast was informed by this run"
+    );
+    assert_eq!(
+        off.failure_events, 0,
+        "seed {seed:x}: the OFF arm's failure stage ingested {} events, so its routers were \
+         computing the hierarchical estimator. Either the estimator is being fed with the \
+         flag off, or the OFF arm's nodes ran on a thread that did not carry the override \
+         and fell through to the process default (which is ON). Both make this an ON-vs-ON \
+         comparison that every other assertion here would pass.",
+        off.failure_events
+    );
 
     // ---------------------------------------------------------------
     // 2. Both arms formed a network and served reads.
@@ -764,55 +831,70 @@ fn hierarchical_routing_simulation_ab() {
     // A comparison between two broken arms is not evidence. These floors are
     // deliberately loose: they say the workload ran, not that it ran well.
     // ---------------------------------------------------------------
-    for (seed, (off, on)) in &runs {
-        for (arm, m) in [("off", off), ("on", on)] {
-            assert!(
-                m.replicated_get_total >= 10,
-                "seed {seed:x} arm {arm}: only {} client GETs for replicated contracts",
-                m.replicated_get_total
-            );
-            assert!(
-                m.scarce_get_total >= 10,
-                "seed {seed:x} arm {arm}: only {} client GETs for scarce contracts",
-                m.scarce_get_total
-            );
-            assert!(
-                m.twin_get_total >= 10,
-                "seed {seed:x} arm {arm}: only {} client GETs for twin-held contracts",
-                m.twin_get_total
-            );
-            assert!(
-                m.subscribe_total >= 10,
-                "seed {seed:x} arm {arm}: only {} terminal SUBSCRIBEs",
-                m.subscribe_total
-            );
-            assert!(
-                m.subscription_edges > 0,
-                "seed {seed:x} arm {arm}: no subscription tree formed"
-            );
-            assert!(
-                m.network_get_successes > 0,
-                "seed {seed:x} arm {arm}: every successful GET was served locally, so this run \
-                 exercised no routing at all"
-            );
-            assert!(
-                m.first_success_latency_ms.is_some(),
-                "seed {seed:x} arm {arm}: no GET ever succeeded"
-            );
-        }
+    for (arm, m) in [("off", off), ("on", on)] {
+        assert!(
+            m.replicated_get_total >= 10,
+            "seed {seed:x} arm {arm}: only {} client GETs for replicated contracts",
+            m.replicated_get_total
+        );
+        assert!(
+            m.scarce_get_total >= 10,
+            "seed {seed:x} arm {arm}: only {} client GETs for scarce contracts",
+            m.scarce_get_total
+        );
+        assert!(
+            m.twin_get_total >= 10,
+            "seed {seed:x} arm {arm}: only {} client GETs for twin-held contracts",
+            m.twin_get_total
+        );
+        assert!(
+            m.subscribe_total >= 10,
+            "seed {seed:x} arm {arm}: only {} terminal SUBSCRIBE transactions",
+            m.subscribe_total
+        );
+        assert!(
+            m.subscription_edges > 0,
+            "seed {seed:x} arm {arm}: no subscription tree formed"
+        );
+        assert!(
+            m.network_get_successes > 0,
+            "seed {seed:x} arm {arm}: every successful GET was served locally, so this run \
+             exercised no routing at all"
+        );
+        assert!(
+            m.first_success_latency_ms.is_some(),
+            "seed {seed:x} arm {arm}: no GET ever succeeded"
+        );
     }
 
     // ---------------------------------------------------------------
-    // 3. Non-inferiority, per metric, against the OFF arm.
+    // 3. Non-inferiority, per metric, WITHIN this seed.
     //
-    // MARGIN PROVENANCE. Each margin is the OFF arm's own seed-to-seed spread
-    // (max minus min over `SEEDS`) plus a floor. That is the smallest
-    // difference a run of this size can tell from seed noise: a tighter margin
-    // would fail on noise, a looser one would assert nothing. These are
-    // NON-INFERIORITY bars, not superiority bars. The estimator is not
-    // expected to improve simulated success rates, only not to damage them.
-    // Re-derive them if `SEEDS`, `ROUNDS` or the network size change, and say
-    // so here when you do.
+    // MARGIN PROVENANCE. Each margin is a floor alone: 0.05 for a rate, and
+    // for a count the larger of 1 and a tenth of the OFF arm's value. It is
+    // the paired ON-vs-OFF difference on the SAME seed that is compared
+    // against it.
+    //
+    // This replaced an earlier cross-seed form whose margin was the OFF arm's
+    // seed-to-seed spread PLUS these same floors, compared against the two
+    // arms' MEANS. That had two defects, and dropping it fixes both. The
+    // spread was the wrong noise model: the arms share seeds, so seed-to-seed
+    // variation cancels in the paired difference and adding it only widened
+    // the bar, to the point where a metric with a large spread could not fail
+    // the check at all (subscription edges carried a margin of 7.967 of which
+    // 7.0 was spread). And comparing MEANS let one seed collapse while the
+    // other two absorbed it: OFF [0.95, 0.95, 0.95] against ON
+    // [0.95, 0.95, 0.80] sits exactly on the bar and passes, hiding a
+    // 15-point regression on a third of the runs.
+    //
+    // The floors are measured, not invented. Across four passes of the shipped
+    // configuration the largest per-seed ON-vs-OFF difference on any rate was
+    // 0.0077 (subscribe) against this 0.05 floor, and on subscription edges it
+    // was 2 of 70 against a floor of 7.0. Every other metric differed by zero.
+    // These are NON-INFERIORITY bars, not superiority bars: the estimator is
+    // not expected to improve simulated success rates, only not to damage
+    // them. Re-derive them if `SEEDS`, `ROUNDS` or the network size change,
+    // and say so here when you do.
     // ---------------------------------------------------------------
     let checks: [Check; 6] = [
         (
@@ -831,52 +913,36 @@ fn hierarchical_routing_simulation_ab() {
         ),
     ];
 
-    eprintln!("[ab] metric | off per seed | on per seed | off mean | on mean");
+    eprintln!("[ab] seed {seed:x}: metric | off | on | margin");
     let mut failures = Vec::new();
     for (name, metric, is_rate) in checks {
-        let off = column(&runs, false, metric);
-        let on = column(&runs, true, metric);
-        let spread = off.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-            - off.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (off_value, on_value) = (metric(off), metric(on));
         let margin = if is_rate {
-            (spread + 0.05).min(0.5)
+            0.05
         } else {
-            // A count, so the floor is a share of the OFF mean rather than an
-            // absolute on [0, 1].
-            (spread + 0.10 * mean(&off)).max(1.0)
+            (0.10 * off_value).max(1.0)
         };
-        let (off_mean, on_mean) = (mean(&off), mean(&on));
         eprintln!(
-            "[ab] {name} | {off:?} | {on:?} | {off_mean:.3} | {on_mean:.3} | margin {margin:.3}"
+            "[ab] seed {seed:x}: {name} | {off_value:.3} | {on_value:.3} | margin {margin:.3}"
         );
-        if on_mean < off_mean - margin {
+        if on_value < off_value - margin {
             failures.push(format!(
-                "{name}: on {on_mean:.3} vs off {off_mean:.3}, worse by more than the {margin:.3} \
-                 noise margin (off per seed {off:?}, on per seed {on:?})"
+                "{name}: on {on_value:.3} vs off {off_value:.3}, worse by more than the \
+                 {margin:.3} noise margin"
             ));
         }
     }
     eprintln!(
-        "[ab] first-GET-success latency ms | off {:?} | on {:?}",
-        runs.values()
-            .map(|(o, _)| o.first_success_latency_ms)
-            .collect::<Vec<_>>(),
-        runs.values()
-            .map(|(_, n)| n.first_success_latency_ms)
-            .collect::<Vec<_>>(),
+        "[ab] seed {seed:x}: first-GET-success latency ms | off {:?} | on {:?}",
+        off.first_success_latency_ms, on.first_success_latency_ms
     );
     eprintln!(
-        "[ab] terminal GETs before first success | off {:?} | on {:?}",
-        runs.values()
-            .map(|(o, _)| o.ops_before_first_success)
-            .collect::<Vec<_>>(),
-        runs.values()
-            .map(|(_, n)| n.ops_before_first_success)
-            .collect::<Vec<_>>(),
+        "[ab] seed {seed:x}: terminal GETs before first success | off {} | on {}",
+        off.ops_before_first_success, on.ops_before_first_success
     );
     assert!(
         failures.is_empty(),
-        "hierarchical routing is worse than legacy beyond the noise margin:\n{}",
+        "seed {seed:x}: hierarchical routing is worse than legacy beyond the noise margin:\n{}",
         failures.join("\n")
     );
 
@@ -895,32 +961,51 @@ fn hierarchical_routing_simulation_ab() {
     // case is measuring the horizon menu and the cost path and NOT the contract
     // term, and the printed line says so in those words.
     // ---------------------------------------------------------------
-    for (seed, (_, on)) in &runs {
+    eprintln!(
+        "[contract-term] seed {seed:x}: tracked {} contracts, estimable_refits {}, \
+         den<2 refits {}, effects_applied {}, forecast_offsets {}, qualifying_max {}, \
+         tau2 {:?}, route ok/fail {}/{}",
+        on.contracts_tracked,
+        on.contract_estimable_refits,
+        on.contract_den_below_two_refits,
+        on.contract_effects_applied,
+        on.contract_forecast_offsets,
+        on.contract_qualifying_contracts_max,
+        on.contract_tau2,
+        on.route_successes,
+        on.route_failures,
+    );
+    assert!(
+        on.contracts_tracked > 0,
+        "seed {seed:x}: the failure stage's contract table is empty, so the workload's \
+         contracts did not repeat at any single router and the mechanism cannot be \
+         exercised by this workload at all"
+    );
+    if !on.contract_term_activated() {
         eprintln!(
-            "[contract-term] seed {seed:x}: tracked {} contracts, estimable_refits {}, \
-             den<2 refits {}, effects_applied {}, forecast_offsets {}, qualifying_max {}, \
-             tau2 {:?}, route ok/fail {}/{}",
-            on.contracts_tracked,
-            on.contract_estimable_refits,
-            on.contract_den_below_two_refits,
-            on.contract_effects_applied,
-            on.contract_forecast_offsets,
-            on.contract_qualifying_contracts_max,
-            on.contract_tau2,
-            on.route_successes,
-            on.route_failures,
+            "[contract-term] seed {seed:x}: NOT ACTIVATED. This run measured the horizon \
+             menu and the cost path only, not the contract term."
         );
-        assert!(
-            on.contracts_tracked > 0,
-            "seed {seed:x}: the failure stage's contract table is empty, so the workload's \
-             contracts did not repeat at any single router and the mechanism cannot be \
-             exercised by this workload at all"
-        );
-        if !on.contract_term_activated() {
-            eprintln!(
-                "[contract-term] seed {seed:x}: NOT ACTIVATED. This run measured the horizon \
-                 menu and the cost path only, not the contract term."
-            );
-        }
     }
+}
+
+#[test]
+fn hierarchical_routing_simulation_ab_seed_0001() {
+    let seed = SEEDS[0];
+    let (off, on) = run_seed(seed);
+    assert_seed(seed, &off, &on);
+}
+
+#[test]
+fn hierarchical_routing_simulation_ab_seed_0002() {
+    let seed = SEEDS[1];
+    let (off, on) = run_seed(seed);
+    assert_seed(seed, &off, &on);
+}
+
+#[test]
+fn hierarchical_routing_simulation_ab_seed_0003() {
+    let seed = SEEDS[2];
+    let (off, on) = run_seed(seed);
+    assert_seed(seed, &off, &on);
 }
