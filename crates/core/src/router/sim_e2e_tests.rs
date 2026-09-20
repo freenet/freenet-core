@@ -27,7 +27,7 @@
 //! override is a THREAD-LOCAL, and the flag's production path is a process-wide
 //! `OnceLock` over an environment variable. An integration test could only set
 //! the env var, which fixes one value for the whole process and so cannot run
-//! both arms — exactly the cross-test-interference shape
+//! both arms. That is the cross-test-interference shape
 //! `.claude/rules/testing.md` warns about, benign under `nextest`'s
 //! process-per-test and not under plain `cargo test`. The thread-local reaches
 //! every simulated node because `run_controlled_simulation` drives Turmoil on
@@ -50,7 +50,7 @@
 //! **Repeated contracts.** The contract term keys a second hierarchy by the
 //! contract location's bits. A workload that draws a fresh contract per event
 //! never replicates a `(contract, peer)` cell, so the term cannot activate at
-//! all — which is precisely how the #5655 synthetic bake-off ended up vacuous
+//! all, which is precisely how the #5655 synthetic bake-off ended up vacuous
 //! (`PLAN-v2.md` section 6 records the correction). Every request here is drawn
 //! from a small fixed pool, so each contract is asked for repeatedly by several
 //! peers.
@@ -76,7 +76,7 @@
 //! which are scored on recorded gateway traffic, and it cannot resolve small
 //! differences: the margins below are chosen from the observed seed-to-seed
 //! spread of the OFF arm, which is what bounds what a run of this size can see.
-//! It answers one narrow question the gate asks and nothing else — does routing
+//! It answers one narrow question the gate asks and nothing else: does routing
 //! with the estimator on still form a network, serve reads and build a
 //! subscription tree, and does the contract term ever engage.
 
@@ -95,7 +95,7 @@ use crate::tracing::event_kind::{EventKind, GetEvent, GetTerminalOutcome};
 const REPLICATED_CONTRACTS: u8 = 4;
 
 /// Contracts seeded on ONE node only. Reads for these travel, collect
-/// `NotFound`s from peers that do not hold them, and then succeed — which is
+/// `NotFound`s from peers that do not hold them, and then succeed, which is
 /// what turns those `NotFound`s into trained `Failure` labels (see the module
 /// docs). These are what give the contract term something to explain away.
 const SCARCE_CONTRACTS: u8 = 3;
@@ -279,7 +279,7 @@ fn build_workload(
 
     // Scarce contracts: seeded as a genuine host on ONE node, never PUT through
     // the network. Reads for them must travel, and the peers tried on the way
-    // answer NotFound — which becomes a trained Failure once the operation
+    // answer NotFound, which becomes a trained Failure once the operation
     // proves the contract exists.
     let holder = nodes[NODES - 3].clone();
     for i in 0..SCARCE_CONTRACTS {
@@ -324,7 +324,7 @@ fn build_workload(
 
     // The read workload. Every requester asks for every contract repeatedly, so
     // each contract accumulates several peers in the contract table rather than
-    // one — which is what `CONTRACT_MIN_OTHER_PEERS` requires before the term
+    // one, which is what `CONTRACT_MIN_OTHER_PEERS` requires before the term
     // can adjust anything.
     for round in 0..ROUNDS {
         for (n, node) in nodes.iter().enumerate() {
@@ -406,7 +406,7 @@ fn build_workload(
 ///
 /// The ordering is `Transaction::created_at_ms`, which under
 /// `GlobalSimulationTime` is a deterministic monotonic counter incremented once
-/// per ULID generated — an ordering proxy, NOT a virtual-clock reading (its own
+/// per ULID generated: an ordering proxy, NOT a virtual-clock reading (its own
 /// rustdoc says so). The returned latency IS virtual milliseconds: `elapsed_ms`
 /// comes from `Transaction::elapsed`, which reads
 /// `GlobalSimulationTime::read_time_ms`. The log's `datetime` field is
@@ -809,7 +809,7 @@ fn hierarchical_routing_simulation_ab() {
     // (max minus min over `SEEDS`) plus a floor. That is the smallest
     // difference a run of this size can tell from seed noise: a tighter margin
     // would fail on noise, a looser one would assert nothing. These are
-    // NON-INFERIORITY bars, not superiority bars — the estimator is not
+    // NON-INFERIORITY bars, not superiority bars. The estimator is not
     // expected to improve simulated success rates, only not to damage them.
     // Re-derive them if `SEEDS`, `ROUNDS` or the network size change, and say
     // so here when you do.
@@ -884,7 +884,7 @@ fn hierarchical_routing_simulation_ab() {
     // 4. Contract term: a REPORT, plus the one thing that must hold.
     //
     // Whether the term engages depends on the traffic clearing several
-    // preconditions at once — a replicated (contract, peer) table, at least two
+    // preconditions at once: a replicated (contract, peer) table, at least two
     // qualifying contracts, and a between-contract contrast in failure
     // residuals larger than the noise the estimator subtracts. A simulation of
     // this size is not guaranteed to reach them, and pretending otherwise is
@@ -918,7 +918,7 @@ fn hierarchical_routing_simulation_ab() {
         );
         if !on.contract_term_activated() {
             eprintln!(
-                "[contract-term] seed {seed:x}: NOT ACTIVATED — this run measured the horizon \
+                "[contract-term] seed {seed:x}: NOT ACTIVATED. This run measured the horizon \
                  menu and the cost path only, not the contract term."
             );
         }
