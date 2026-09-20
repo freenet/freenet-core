@@ -490,9 +490,15 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     );
     let (operations, replicated, scarce, twin) = build_workload(&network);
 
-    // Each scheduled operation consumes 3 virtual seconds in the controlled
-    // runner, so the wall must exceed startup + 3 * ops + the post-op settle.
-    let op_seconds = 3 * operations.len() as u64;
+    // The controlled runner's default settle between scheduled operations is 3
+    // virtual seconds. These operations run against an already-formed ring and
+    // finish in about a millisecond of virtual time, so 3 s buys nothing and
+    // costs a third of the wall clock: at the default this case took 708 s for
+    // six simulations. One second keeps the operations well separated and
+    // brings that down. Both arms use the same interval, so it cannot bias the
+    // comparison.
+    let op_interval = Duration::from_secs(1);
+    let op_seconds = operations.len() as u64;
     let post_op_wait = Duration::from_secs(60);
     let sim_duration = Duration::from_secs(op_seconds + 180);
 
@@ -521,6 +527,7 @@ fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     // the early rounds fail for topology reasons that have nothing to do with
     // the estimator, which adds seed noise to exactly the rates being compared.
     sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+    sim.with_controlled_op_interval(op_interval);
 
     let logs_handle = sim.event_logs_handle();
     let result = sim.run_controlled_simulation(seed, operations, sim_duration, post_op_wait);
