@@ -1745,6 +1745,49 @@ async fn unpack_if_stale(
     Ok(())
 }
 
+/// Does this filesystem error mean "that asset is not here", as opposed to a
+/// fault on this node?
+///
+/// `NotFound` is the obvious case. `PermissionDenied` is treated the same way
+/// deliberately: it is not our caller's business which unreadable files exist
+/// inside a contract's cache directory, and a 500 would advertise exactly that.
+/// On Unix, raw error 20 (`ENOTDIR`) is the third: it is what `open` returns
+/// when a path component that must be a directory is a regular file — a request
+/// for `app.js/evil` where `app.js` is a file — which is a request for
+/// something that does not exist, spelled differently. There is no
+/// `ErrorKind::NotADirectory` to match on until `io_error_more` stabilises
+/// (rust-lang/rust#86442).
+///
+/// This is the set `ServeDir`/`ServeFile` render as 404 in their `Service::call`
+/// impl, and the set tower-http's own `try_call` documentation tells callers to
+/// map since 0.7.1, which stopped mapping them on our behalf. We call
+/// `try_call`, so before 0.7.1 the 404 arrived for free and this function's job
+/// was being done inside the dependency. See #5718: the `.js` branch below
+/// never went through `ServeFile` at all, so it has been answering 500 for a
+/// missing file the whole time.
+fn asset_is_missing(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let not_a_directory = err.raw_os_error() == Some(20);
+    #[cfg(not(unix))]
+    let not_a_directory = false;
+
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) || not_a_directory
+}
+
+/// The response for an asset that is not in the contract's cache.
+///
+/// A bare 404 with no body, matching what `ServeFile` produced for a missing
+/// file before tower-http 0.7.1. Deliberately reflects nothing from the
+/// request: this is served at the NODE's own origin on the contract-web routes,
+/// which carry no CSP and no `nosniff` (see `errors.rs`), so the body is the
+/// last place to echo a request-derived path back.
+fn asset_not_found_response() -> axum::response::Response {
+    axum::http::StatusCode::NOT_FOUND.into_response()
+}
+
 #[instrument(level = "debug", skip(request_sender, cache))]
 pub(super) async fn variable_content(
     key: String,
@@ -1829,11 +1872,18 @@ pub(super) async fn variable_content(
     // Dioxus embeds paths like "/./assets/app_bg.wasm" inside the JS bundle, which browsers
     // normalize to "/assets/..." (root-relative), bypassing the contract web prefix.
     if file_path.extension().is_some_and(|ext| ext == "js") {
-        let content = tokio::fs::read_to_string(&file_path).await.map_err(|err| {
-            WebSocketApiError::NodeError {
-                error_cause: format!("{err}"),
+        // A missing `.js` is a 404 like any other missing asset. This branch
+        // bypasses `ServeFile`, so it never inherited the dependency's
+        // missing-file mapping and answered 500 until #5718.
+        let content = match tokio::fs::read_to_string(&file_path).await {
+            Ok(content) => content,
+            Err(err) if asset_is_missing(&err) => return Ok(asset_not_found_response()),
+            Err(err) => {
+                return Err(Box::new(WebSocketApiError::NodeError {
+                    error_cause: format!("{err}"),
+                }));
             }
-        })?;
+        };
         let prefix = format!("/{}/contract/web/{key}/", api_version.prefix());
         let rewritten = content
             .replace("\"/./", &format!("\"{prefix}"))
@@ -1848,16 +1898,17 @@ pub(super) async fn variable_content(
     // serve the file
     let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
     let fake_req = axum::http::Request::new(axum::body::Body::empty());
-    serve_file
-        .try_call(fake_req)
-        .await
-        .map_err(|err| {
-            WebSocketApiError::NodeError {
-                error_cause: format!("{err}"),
-            }
-            .into()
-        })
-        .map(|r| r.into_response())
+    match serve_file.try_call(fake_req).await {
+        Ok(response) => Ok(response.into_response()),
+        // `try_call` hands us the raw I/O error. Before tower-http 0.7.1 it
+        // turned a missing file into a 404 itself; it now propagates it, and
+        // mapping every error to `NodeError` would answer 500 for an asset that
+        // is merely absent. See #5718 and `asset_is_missing`.
+        Err(err) if asset_is_missing(&err) => Ok(asset_not_found_response()),
+        Err(err) => Err(Box::new(WebSocketApiError::NodeError {
+            error_cause: format!("{err}"),
+        })),
+    }
 }
 
 /// Escapes characters that are dangerous inside an HTML attribute value.
@@ -4654,6 +4705,129 @@ mod tests {
         );
         let body = response_body(response).await;
         assert_eq!(body, "png-bytes-here", "must serve the primed file bytes");
+
+        clear_cache(&instance_id).await;
+    }
+
+    /// Regression for #5718: a warm, fresh cache that simply does not contain
+    /// the requested asset must answer 404, never 500.
+    ///
+    /// The contract is cached (so no fetch is attempted) and the sibling file
+    /// exists, so the ONLY reason this request fails is that `missing.png` is
+    /// not there — which is Not Found, not a node fault. A 500 here would be
+    /// wrong for browsers, caches and programmatic clients alike, and it would
+    /// put an OS error string on a node-origin page.
+    ///
+    /// This one passes against tower-http 0.7.0, whose `ServeFile::try_call`
+    /// performed the mapping for us. It is load-bearing from 0.7.1 onward,
+    /// which propagates the I/O error instead (see `asset_is_missing`) — it
+    /// fails on the dependency bump without the fix in `variable_content`.
+    #[tokio::test]
+    async fn variable_content_404s_for_a_missing_asset() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x57;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        // A sibling that DOES exist, so a failure here cannot be "the cache
+        // directory was never populated".
+        tokio::fs::write(cache_dir.join("present.png"), b"present")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let response = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/missing.png"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("a missing asset must resolve to a response, not an error")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a missing asset must 404, not 500 (#5718)"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
+    /// Regression for #5718, the half that is broken in released builds: a
+    /// missing `.js` asset must 404 too.
+    ///
+    /// `variable_content` handles `.js` in its own branch — it reads the file
+    /// with `tokio::fs::read_to_string` so it can rewrite root-relative asset
+    /// paths — so it never went through `ServeFile` and never inherited the
+    /// dependency's missing-file mapping. Every missing `.js` answered
+    /// `500 Internal Server Error` with `"No such file or directory (os error
+    /// 2)"`, independent of any dependency version. A Dioxus bundle referencing
+    /// a script that failed to unpack is exactly this case.
+    #[tokio::test]
+    async fn variable_content_404s_for_a_missing_js_asset() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x58;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        // A `.js` that DOES exist and takes the same rewrite branch, so this
+        // test cannot pass merely because the branch is unreachable.
+        tokio::fs::write(cache_dir.join("present.js"), b"console.log('hi');")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let present = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/present.js"),
+            ApiVersion::V1,
+            sender.clone(),
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("the primed script must serve")
+        .into_response();
+        assert_eq!(
+            present.status(),
+            axum::http::StatusCode::OK,
+            "the rewrite branch must still serve a script that IS present"
+        );
+
+        let response = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/missing.js"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("a missing script must resolve to a response, not an error")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a missing .js must 404, not 500 (#5718)"
+        );
 
         clear_cache(&instance_id).await;
     }
