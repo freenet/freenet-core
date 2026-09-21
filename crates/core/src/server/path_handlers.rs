@@ -1748,44 +1748,88 @@ async fn unpack_if_stale(
 /// Does this filesystem error mean "that asset is not here", as opposed to a
 /// fault on this node?
 ///
-/// `NotFound` is the obvious case. `PermissionDenied` is treated the same way
-/// deliberately: it is not our caller's business which unreadable files exist
-/// inside a contract's cache directory, and a 500 would advertise exactly that.
-/// On Unix, raw error 20 (`ENOTDIR`) is the third: it is what `open` returns
-/// when a path component that must be a directory is a regular file — a request
-/// for `app.js/evil` where `app.js` is a file — which is a request for
-/// something that does not exist, spelled differently. There is no
-/// `ErrorKind::NotADirectory` to match on until `io_error_more` stabilises
-/// (rust-lang/rust#86442).
+/// This deliberately MIRRORS tower-http's own `should_return_not_found`
+/// (`serve_dir/mod.rs`) rather than inventing a set: `NotFound`,
+/// `PermissionDenied`, and `NotADirectory`. Keeping it identical is the point —
+/// `ServeDir`/`ServeFile` render exactly these as 404 inside their
+/// `Service::call`, so a request that used to 404 keeps 404ing.
 ///
-/// This is the set `ServeDir`/`ServeFile` render as 404 in their `Service::call`
-/// impl, and the set tower-http's own `try_call` documentation tells callers to
-/// map since 0.7.1, which stopped mapping them on our behalf. We call
-/// `try_call`, so before 0.7.1 the 404 arrived for free and this function's job
-/// was being done inside the dependency. See #5718: the `.js` branch below
-/// never went through `ServeFile` at all, so it has been answering 500 for a
-/// missing file the whole time.
+/// `PermissionDenied` maps to 404 rather than 500 on purpose: it is not a
+/// caller's business which unreadable files exist inside a contract's cache
+/// directory, and a 500 would confirm one is there. It is logged, because
+/// unlike the others it is nearly always an operator problem — see the call
+/// sites.
+///
+/// `NotADirectory` (`ENOTDIR`) is what `open` returns when a path component
+/// that must be a directory is a regular file: a request for `app.js/evil`
+/// where `app.js` is a file. That is a request for something that does not
+/// exist, spelled differently.
+///
+/// We call `try_call`, not `call`, so before tower-http 0.7.1 the 404 arrived
+/// for free and this function's job was being done inside the dependency; 0.7.1
+/// propagates the error instead and documents that callers must map it. See
+/// #5718 — and note the `.js` branch below never went through `ServeFile` at
+/// all, so it answered 500 for a missing file in every released build.
 fn asset_is_missing(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    let not_a_directory = err.raw_os_error() == Some(20);
-    #[cfg(not(unix))]
-    let not_a_directory = false;
-
     matches!(
         err.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-    ) || not_a_directory
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Answer 404 for an absent asset, but say something first when the reason was
+/// not a plain absence.
+///
+/// A `NotFound` is the overwhelmingly common case and is not worth a line. The
+/// other two are different in kind: a `PermissionDenied` on the cache almost
+/// always means an operator problem (a bad `chmod` on the cache root, a
+/// restrictive umask during unpack), and it would otherwise present as every
+/// asset in that contract 404ing quietly and permanently — the failure shape
+/// `.claude/rules/bug-prevention-patterns.md` calls "a refusal that is not
+/// counted renders as a clean zero". `warn!` rather than `debug!` because
+/// `release_max_level_info` compiles the latter out of the builds operators
+/// actually run.
+fn asset_missing_response(file_path: &Path, err: &std::io::Error) -> axum::response::Response {
+    if err.kind() != std::io::ErrorKind::NotFound {
+        tracing::warn!(
+            path = %file_path.display(),
+            error = %err,
+            kind = ?err.kind(),
+            "serving 404 for a webapp asset that exists but could not be read; \
+             check permissions on the webapp cache directory"
+        );
+    }
+    asset_not_found_response()
 }
 
 /// The response for an asset that is not in the contract's cache.
 ///
-/// A bare 404 with no body, matching what `ServeFile` produced for a missing
-/// file before tower-http 0.7.1. Deliberately reflects nothing from the
-/// request: this is served at the NODE's own origin on the contract-web routes,
-/// which carry no CSP and no `nosniff` (see `errors.rs`), so the body is the
-/// last place to echo a request-derived path back.
+/// A bare 404, matching what `ServeFile` produced for a missing file before
+/// tower-http 0.7.1. The caller (`client_api.rs`) adds CORS, `nosniff` and CSP
+/// to this exactly as it does to a success, so the sandboxed iframe sees a real
+/// status rather than an opaque CORS error.
+///
+/// Two deliberate choices:
+///
+/// - **No body.** Nothing request-derived is reflected, so a crafted path
+///   cannot put its own text on a node-origin page.
+/// - **`no-store`.** Reaching here does NOT always mean the asset is
+///   permanently absent: the cache may simply not be populated yet, because
+///   the speculative-fetch lane was saturated or the node could not confirm it
+///   holds the contract (the #3945 fail-closed path). A 404 is cacheable by
+///   default where the 500 this replaced was not, so without this a transient
+///   miss could be remembered by the browser and strand the app once the
+///   bundle does unpack. `errors.rs` sets `no-store` on its transient answers
+///   for the same reason. (#5323 tracks this route having no cache policy at
+///   all; this is not that fix.)
 fn asset_not_found_response() -> axum::response::Response {
-    axum::http::StatusCode::NOT_FOUND.into_response()
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+    )
+        .into_response()
 }
 
 #[instrument(level = "debug", skip(request_sender, cache))]
@@ -1877,7 +1921,9 @@ pub(super) async fn variable_content(
         // missing-file mapping and answered 500 until #5718.
         let content = match tokio::fs::read_to_string(&file_path).await {
             Ok(content) => content,
-            Err(err) if asset_is_missing(&err) => return Ok(asset_not_found_response()),
+            Err(err) if asset_is_missing(&err) => {
+                return Ok(asset_missing_response(&file_path, &err));
+            }
             Err(err) => {
                 return Err(Box::new(WebSocketApiError::NodeError {
                     error_cause: format!("{err}"),
@@ -1904,7 +1950,7 @@ pub(super) async fn variable_content(
         // turned a missing file into a 404 itself; it now propagates it, and
         // mapping every error to `NodeError` would answer 500 for an asset that
         // is merely absent. See #5718 and `asset_is_missing`.
-        Err(err) if asset_is_missing(&err) => Ok(asset_not_found_response()),
+        Err(err) if asset_is_missing(&err) => Ok(asset_missing_response(&file_path, &err)),
         Err(err) => Err(Box::new(WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })),
@@ -2196,7 +2242,7 @@ async fn sandbox_content_body(
     contract_key: &str,
     api_version: ApiVersion,
     page: &str,
-) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
+) -> Result<axum::response::Response, WebSocketApiError> {
     // Sanitize the page path to prevent directory traversal and absolute paths.
     // Path::join with an absolute path replaces the base entirely on Unix, and a
     // Windows drive-relative `C:foo` resolves off the base drive, so we reject
@@ -2218,16 +2264,34 @@ async fn sandbox_content_body(
         web_path = web_path.join("index.html");
     }
     // Ensure the resolved path is still under the contract's cache directory
-    let canonical_base = path
-        .canonicalize()
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("{err}"),
-        })?;
-    let canonical_file = web_path
-        .canonicalize()
-        .map_err(|err| WebSocketApiError::NodeError {
-            error_cause: format!("Page not found: {page} ({err})"),
-        })?;
+    // Same 404-not-500 rule as `variable_content`: an absent bundle is Not
+    // Found, not a node fault. `refresh_cache_if_due` has already run and
+    // owns the "still propagating" answer (503 + retry page), so reaching
+    // here with no cache directory means the fetch was skipped or produced
+    // nothing — not that the contract is still on its way. See #5718.
+    let canonical_base = match path.canonicalize() {
+        Ok(base) => base,
+        Err(err) if asset_is_missing(&err) => {
+            return Ok(asset_missing_response(path, &err));
+        }
+        Err(err) => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: format!("{err}"),
+            });
+        }
+    };
+    let canonical_file = match web_path.canonicalize() {
+        Ok(file) => file,
+        // This arm has always said "Page not found" while rendering 500.
+        Err(err) if asset_is_missing(&err) => {
+            return Ok(asset_missing_response(&web_path, &err));
+        }
+        Err(err) => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: format!("Page not found: {page} ({err})"),
+            });
+        }
+    };
     if !canonical_file.starts_with(&canonical_base) {
         return Err(WebSocketApiError::InvalidParam {
             error_cause: "Path traversal not allowed".to_string(),
@@ -2236,12 +2300,20 @@ async fn sandbox_content_body(
 
     // Open the canonical path (not the user-supplied path) to prevent TOCTOU
     // attacks where a symlink could be swapped between canonicalize and open.
-    let mut key_file =
-        File::open(&canonical_file)
-            .await
-            .map_err(|err| WebSocketApiError::NodeError {
+    // The file can go away between `canonicalize` and `open` (another node
+    // sweeping the cache, a republish mid-read); that race ends in Not Found
+    // too, not a node fault.
+    let mut key_file = match File::open(&canonical_file).await {
+        Ok(file) => file,
+        Err(err) if asset_is_missing(&err) => {
+            return Ok(asset_missing_response(&canonical_file, &err));
+        }
+        Err(err) => {
+            return Err(WebSocketApiError::NodeError {
                 error_cause: format!("{err}"),
-            })?;
+            });
+        }
+    };
     let mut buf = vec![];
     key_file
         .read_to_end(&mut buf)
@@ -2279,7 +2351,7 @@ async fn sandbox_content_body(
         body = format!("{injected_scripts}{body}");
     }
 
-    Ok(Html(body))
+    Ok(Html(body).into_response())
 }
 
 /// JavaScript that mints (or loads) the durable per-user token in hosted mode.
@@ -4830,6 +4902,65 @@ mod tests {
         );
 
         clear_cache(&instance_id).await;
+    }
+
+    /// Regression for #5718, sibling handler: a missing HTML page must 404 too.
+    ///
+    /// `sandbox_content_body` serves the iframe's HTML and had the same defect
+    /// as the `.js` branch of `variable_content` — and more pointedly, its
+    /// error literally read `"Page not found: {page}"` while `errors.rs`
+    /// rendered it as `500 Internal Server Error`. A deep link to a page that
+    /// is not in the bundle is Not Found.
+    ///
+    /// Asserts the present page still serves, so this cannot pass by the
+    /// handler being broken for everything.
+    #[tokio::test]
+    async fn sandbox_content_404s_for_a_missing_page() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = "3a59test";
+        tokio::fs::write(
+            dir.path().join("index.html"),
+            "<html><body>hi</body></html>",
+        )
+        .await
+        .unwrap();
+
+        let present = sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
+            .await
+            .expect("the present page must serve");
+        assert_eq!(
+            present.status(),
+            axum::http::StatusCode::OK,
+            "a page that IS in the bundle must still serve 200"
+        );
+
+        let missing = sandbox_content_body(dir.path(), key, ApiVersion::V1, "nope.html")
+            .await
+            .expect("a missing page must resolve to a response, not an error");
+        assert_eq!(
+            missing.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a missing HTML page must 404, not 500 (#5718)"
+        );
+    }
+
+    /// A bundle that was never unpacked answers 404 rather than 500 — the
+    /// cache directory itself is absent. `refresh_cache_if_due` runs before
+    /// this and owns the "still propagating" answer, so this state means the
+    /// fetch was skipped or produced nothing.
+    #[tokio::test]
+    async fn sandbox_content_404s_when_the_bundle_was_never_unpacked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let absent = dir.path().join("no-such-contract-dir");
+
+        let response = sandbox_content_body(&absent, "3a5atest", ApiVersion::V1, "index.html")
+            .await
+            .expect("an unpacked-bundle miss must resolve to a response, not an error");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "an absent cache directory must 404, not 500 (#5718)"
+        );
     }
 
     /// Security regression: a `../`-style traversal in the (decoded) asset path
