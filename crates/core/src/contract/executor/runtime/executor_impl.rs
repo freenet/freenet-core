@@ -97,6 +97,73 @@ where
         Some(ContractKey::from_id_and_code(*instance_id, code_hash))
     }
 
+    /// The stored parameters for `key`, but only if they are the parameters its
+    /// instance id was derived from.
+    ///
+    /// The params row is keyed by instance id alone, and every operation that
+    /// arrives without code runs the contract with what it finds there. A row
+    /// whose parameters do not derive the instance id, under the code hash the
+    /// instance->code index holds for it, is treated as absent rather than
+    /// used. The next verified container for the instance rewrites it.
+    ///
+    /// With no index row there is no code hash to check against and nothing to
+    /// protect: every path that runs or serves a contract resolves its code
+    /// through that index, so such a contract cannot be run either way. The
+    /// params are returned unchecked, which keeps that case's existing errors.
+    /// That relies on one contract's operations being serialized node-wide (the
+    /// contract-handling loop runs them one at a time), so the instance cannot
+    /// gain an index row part-way through an operation that read its parameters
+    /// here, such as the initial-state install that writes them back.
+    pub(in crate::contract::executor) async fn verified_stored_params(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<Parameters<'static>>, ExecutorError> {
+        let Some(params) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            return Ok(None);
+        };
+        let Some(code_hash) = self.runtime.code_hash_from_id(key.id()) else {
+            return Ok(Some(params));
+        };
+        let encoded_code_hash =
+            ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
+        match ContractKey::from_params(encoded_code_hash.clone(), params.clone()) {
+            Ok(derived) if derived.id() == key.id() => Ok(Some(params)),
+            _ => {
+                // WARN, not debug: a row that fails this check means the node was
+                // holding parameters it cannot vouch for, which an operator should
+                // be able to see in a release build. Once per contract per process,
+                // because the refusal repeats on every read (summaries run on each
+                // interest heartbeat). Bounded; past the bound it keeps warning
+                // rather than going quiet.
+                const REPORTED_CAP: usize = 4096;
+                static REPORTED: std::sync::LazyLock<dashmap::DashSet<ContractInstanceId>> =
+                    std::sync::LazyLock::new(dashmap::DashSet::new);
+                let first_report = REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
+                if first_report {
+                    tracing::warn!(
+                        contract = %key,
+                        code_hash = %encoded_code_hash,
+                        params_len = params.as_ref().len(),
+                        "Stored parameters for this contract do not derive its instance id, \
+                         so this node will not run or serve it. Re-PUT the contract (for \
+                         example `fdev publish` of the same contract) to repair them"
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        "Stored contract parameters still do not derive the instance id"
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
     pub(in crate::contract::executor) async fn bridged_fetch_contract(
         &mut self,
         key: ContractKey,
@@ -287,37 +354,22 @@ where
                 "Upserting contract state"
             );
         }
+        // A container's params are persisted further down, once `store_contract`
+        // has verified the container; see the `ensure_params` call there.
         let params = if let Some(code) = &code {
-            let p = code.params();
-            // Ensure params are persisted to state_store so they survive restarts.
-            // The code path (PUT via GET) always provides params in the container,
-            // but state_store.store() is only called for new contracts. If the contract
-            // already exists (merge path), commit_state_update() calls state_store.update()
-            // which doesn't write params. Persisting here covers all cases.
-            if let Err(e) = self.state_store.ensure_params(key, p.clone()).await {
+            code.params()
+        } else {
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
                 tracing::warn!(
                     contract = %key,
-                    error = %e,
-                    "Failed to persist contract parameters to state_store"
+                    is_delta = matches!(update, Either::Right(_)),
+                    "Contract parameters not found in state_store"
                 );
-            }
-            p
-        } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        contract = %key,
-                        is_delta = matches!(update, Either::Right(_)),
-                        "Contract parameters not found in state_store"
-                    );
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
         };
 
         // Track if we stored a new contract. `charged_wasm` carries the blob
@@ -431,6 +483,27 @@ where
             } else {
                 (false, false, None)
             };
+
+        // Persist the container's params so they survive restarts. The code path
+        // (PUT via GET) always provides params in the container, but
+        // state_store.store() is only called for new contracts; if the contract
+        // already exists (merge path), commit_state_update() calls
+        // state_store.update(), which doesn't write params.
+        //
+        // This must follow verification. Every branch above that had a container
+        // passed it through `store_contract`, which returns an error (propagated
+        // by `?`) unless the key is derived from the container's code and params,
+        // and the params row is keyed by instance id alone. So only params that
+        // verification has bound to this instance id may be written to it.
+        if code.is_some() {
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+        }
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
@@ -1459,17 +1532,12 @@ where
             return Ok(cached_summary);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // Summarize-storm falsifier (spec step 8 / #4440): count the actual WASM
         // `summarize_state` invocation — the SLOW-path miss the state-hash cache
@@ -1591,17 +1659,12 @@ where
             return Ok(cached_delta);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // The delta twin of the summarize slow-path counter: a true cache miss
         // that actually runs the contract's WASM `get_state_delta`. Recorded at
@@ -1668,15 +1731,10 @@ where
         &self,
         key: &ContractKey,
     ) -> Result<Option<ContractContainer>, ExecutorError> {
-        let Some(parameters) = self
-            .state_store
-            .get_params(key)
-            .await
-            .map_err(ExecutorError::other)?
-        else {
+        let Some(parameters) = self.verified_stored_params(key).await? else {
             tracing::debug!(
                 contract = %key,
-                "Contract parameters not in state_store, cannot fetch contract"
+                "No usable contract parameters in state_store, cannot fetch contract"
             );
             return Ok(None);
         };

@@ -19,6 +19,26 @@ impl Executor<Runtime> {
         let params = contract.params();
 
         if self.get_local_contract(key.id()).await.is_ok() {
+            // The container's key and params drive the merge and the commit below,
+            // so verify they belong together first. `store_contract` is the store's
+            // guarded ingress: it refuses a key not derived from the container's code
+            // and params, and for already-stored code it only re-indexes the instance.
+            self.runtime
+                .contract_store
+                .store_contract(contract.clone())
+                .map_err(ExecutorError::other)?;
+            // Now verified, persist the container's params. The merge below commits
+            // through `state_store.update`, which writes state only, so without this
+            // a re-PUT could not repair a params row that `verified_stored_params`
+            // refuses.
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+
             // Contract already exists — merge states locally and broadcast async.
             //
             // We intentionally do NOT delegate to perform_contract_update here because
@@ -177,16 +197,12 @@ impl Executor<Runtime> {
         // added for #4978 repairs such a row once the index does know it.
         let key = self.bridged_lookup_key(key.id()).unwrap_or(key);
         let parameters = {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    RequestError::ContractError(StdContractError::Update {
-                        cause: "missing contract parameters".into(),
-                        key,
-                    })
-                })?
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
+                RequestError::ContractError(StdContractError::Update {
+                    cause: "missing contract parameters".into(),
+                    key,
+                })
+            })?
         };
 
         let current_state = self
