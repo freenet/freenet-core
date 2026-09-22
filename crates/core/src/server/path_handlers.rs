@@ -1767,6 +1767,13 @@ async fn unpack_if_stale(
 /// where `app.js` is a file. That is a request for something that does not
 /// exist, spelled differently.
 ///
+/// `IsADirectory` (`EISDIR`) is the mirror: reading a path that turned out to
+/// be a directory. `ServeFile` never hits this (it checks `metadata().is_dir()`
+/// before opening), but the `.js` branch below calls
+/// `tokio::fs::read_to_string` directly, so a bundle that happens to contain a
+/// directory literally named e.g. `app.js` would otherwise 500 instead of
+/// 404ing like every other "not a plain file" case here.
+///
 /// We call `try_call`, not `call`, so before tower-http 0.7.1 the 404 arrived
 /// for free and this function's job was being done inside the dependency; 0.7.1
 /// propagates the error instead and documents that callers must map it. See
@@ -1778,6 +1785,7 @@ fn asset_is_missing(err: &std::io::Error) -> bool {
         std::io::ErrorKind::NotFound
             | std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::IsADirectory
     )
 }
 
@@ -1796,7 +1804,17 @@ fn asset_is_missing(err: &std::io::Error) -> bool {
 /// plain absence". It is client-shaped: a request for `app.js/anything`
 /// produces `ENOTDIR` every time, and nothing on these routes is rate limited,
 /// so warning on it would hand any remote caller an unthrottled log-spam lever.
-/// `NotFound` is the ordinary case and is not worth a line either.
+/// **`IsADirectory` is also not logged**: it means the bundle itself contains a
+/// directory where an asset name was expected, which is a property of the
+/// published contract, not of this node, so there is nothing an operator here
+/// could act on. `NotFound` is the ordinary case and is not worth a line
+/// either.
+///
+/// This function is for a LEAF path — one derived from a client-supplied
+/// sub-path, where `NotADirectory`/`IsADirectory` are request- or
+/// bundle-shaped rather than evidence of node-side corruption. Do not reuse it
+/// for a STRUCTURAL path (the contract's cache directory root itself); see
+/// [`structural_path_missing_response`].
 ///
 /// The path is formatted with `?` (Debug), never `%` (Display). It ends in a
 /// percent-DECODED segment taken from the request, so a `%0A` in the URL
@@ -1808,6 +1826,40 @@ fn asset_missing_response(file_path: &Path, err: &std::io::Error) -> axum::respo
             path = ?file_path,
             "serving 404 for a webapp asset that exists but could not be read; \
              check permissions on the webapp cache directory"
+        );
+    }
+    asset_not_found_response()
+}
+
+/// Like [`asset_missing_response`], but for canonicalizing a STRUCTURAL path —
+/// the contract's cache directory itself — rather than a client-supplied leaf.
+///
+/// `PermissionDenied` is logged for the same reason as the leaf case. But
+/// `NotADirectory` here is logged TOO, unlike the leaf case: it cannot be
+/// request-shaped, because nothing about this path varies per request (it is
+/// derived from the already-validated contract instance id, not from a
+/// client-supplied sub-path), so it cannot be an unthrottled log-spam lever.
+/// It can only mean the cache root's own layout is wrong — corruption, a lost
+/// race with an in-flight unpack (`unpack_if_stale`'s non-atomic
+/// `remove_dir_all` + `create_dir_all` + unpack), or an operator error — the
+/// same "every asset in that contract 404s quietly and permanently" failure
+/// shape `asset_missing_response` exists to surface, so it gets the same
+/// treatment. Before #5718 this path always answered 500 (visibly, if
+/// unlogged); silently reclassifying it as an ordinary-looking 404 without
+/// also logging it would trade a visible signal for an invisible one.
+fn structural_path_missing_response(
+    file_path: &Path,
+    err: &std::io::Error,
+) -> axum::response::Response {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
+    ) {
+        tracing::warn!(
+            path = ?file_path,
+            kind = ?err.kind(),
+            "serving 404 because a contract's webapp cache directory could not be \
+             resolved; check the webapp cache root for corruption or a permissions problem"
         );
     }
     asset_not_found_response()
@@ -2292,8 +2344,12 @@ async fn sandbox_content_body(
     // nothing — not that the contract is still on its way. See #5718.
     let canonical_base = match path.canonicalize() {
         Ok(base) => base,
+        // `path` is the contract's cache directory itself, not a client-shaped
+        // leaf — use the structural variant so a corrupted/racing cache root
+        // is logged rather than silently blending into an ordinary 404. See
+        // `structural_path_missing_response`.
         Err(err) if asset_is_missing(&err) => {
-            return Ok(asset_missing_response(path, &err));
+            return Ok(structural_path_missing_response(path, &err));
         }
         Err(err) => {
             return Err(WebSocketApiError::NodeError {
@@ -4911,7 +4967,93 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND,
             "ENOTDIR must 404, not 500 (#5718)"
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "the ENOTDIR 404 must not be cacheable either (#5718)"
+        );
 
+        clear_cache(&instance_id).await;
+    }
+
+    /// A `PermissionDenied` asset must be byte-for-byte indistinguishable from
+    /// an ordinary missing one: `asset_missing_response`'s doc comment says
+    /// "it is not a caller's business which unreadable files exist inside a
+    /// contract's cache directory", but nothing before this test actually
+    /// exercised that branch, so the claim was unverified (Codex/skeptical
+    /// review of #5721 flagged the gap). This locks the response status,
+    /// headers and body so a future change cannot let the two cases diverge
+    /// and leak "this one exists but I can't read it" to a remote caller.
+    ///
+    /// Unix-only: `PermissionDenied` from a 0o000 file requires POSIX
+    /// permission bits and is meaningless as a concept for the process owner
+    /// on some other platforms (notably: root can read anything regardless of
+    /// mode, so this would be flaky under a root test runner too — CI here
+    /// does not run as root).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn variable_content_404s_identically_for_a_permission_denied_asset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x5a;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let asset_path = cache_dir.join("secret.png");
+        tokio::fs::write(&asset_path, b"unreadable").await.unwrap();
+        tokio::fs::set_permissions(&asset_path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let response = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/secret.png"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("an unreadable asset must resolve to a response, not an error")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "PermissionDenied must 404, not 500 or 403 — it must not confirm the file exists"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "must carry the same Cache-Control as every other asset 404 (#5718)"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reading the 404 body must not fail");
+        assert!(
+            body.is_empty(),
+            "the response body must not differ from an ordinary miss either"
+        );
+
+        // Restore permissions so the temp dir can be cleaned up.
+        tokio::fs::set_permissions(&asset_path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
         clear_cache(&instance_id).await;
     }
 
@@ -5031,6 +5173,14 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND,
             "a missing HTML page must 404, not 500 (#5718)"
         );
+        assert_eq!(
+            missing
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "a missing sandbox page's 404 must not be cacheable either (#5718)"
+        );
     }
 
     /// A bundle that was never unpacked answers 404 rather than 500 — the
@@ -5049,6 +5199,48 @@ mod tests {
             response.status(),
             axum::http::StatusCode::NOT_FOUND,
             "an absent cache directory must 404, not 500 (#5718)"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "an absent-bundle 404 must not be cacheable either (#5718)"
+        );
+    }
+
+    /// A CORRUPTED cache root — an ancestor path component that should be a
+    /// directory turns out to be a regular file — must still 404 rather than
+    /// 500, via `structural_path_missing_response` rather than
+    /// `asset_missing_response` (skeptical review of #5721: the base-directory
+    /// canonicalize is a distinct call site from the leaf, and needs its own
+    /// pin because it is reachable with a DIFFERENT io::Error kind mix than
+    /// "bundle never unpacked" above — `NotADirectory`, not `NotFound`).
+    #[tokio::test]
+    async fn sandbox_content_404s_for_a_corrupted_cache_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A regular file standing where a directory component is expected.
+        let not_a_dir = dir.path().join("not-a-directory");
+        tokio::fs::write(&not_a_dir, b"oops").await.unwrap();
+        let corrupted_base = not_a_dir.join("contract-instance-id");
+
+        let response =
+            sandbox_content_body(&corrupted_base, "3a5btest", ApiVersion::V1, "index.html")
+                .await
+                .expect("a corrupted cache root must resolve to a response, not an error");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a corrupted cache root must 404, not 500 (#5718 follow-up)"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "must carry the same Cache-Control as every other asset 404"
         );
     }
 
