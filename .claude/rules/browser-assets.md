@@ -1,3 +1,16 @@
+---
+paths:
+  # Match the CI filter that triggers this rule's own test suite:
+  # playwright-shell.yml fires on crates/core/src/server/**, so anything
+  # narrower leaves files that run the Playwright job without loading the rule
+  # that explains it (34 such files when this was scoped to path_handlers +
+  # client_api alone, including every *.test.mjs and home_page/assets/).
+  - "crates/core/src/server/**"
+  - "crates/core/tests/playwright/**"
+  - "crates/core/tests/playwright_shell.rs"
+  - ".github/workflows/playwright-shell.yml"
+---
+
 # Browser Assets (JS the node injects into pages)
 
 Applies to `crates/core/src/server/path_handlers/assets/` — `shell_bridge.js`,

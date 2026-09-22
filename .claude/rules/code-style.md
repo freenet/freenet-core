@@ -28,22 +28,11 @@ paths:
 
 ### WHEN handling errors
 
-```
-Is this production code?
-  → YES: Use explicit match/if-let, never .unwrap()
-  → Use thiserror for custom error types
-
-Is this test code?
-  → .unwrap() and .expect("reason") are acceptable
-```
-
-**Production pattern:**
-```rust
-match operation() {
-    Ok(result) => process(result),
-    Err(e) => return Err(e.into()),
-}
-```
+- **Production code: avoid `.unwrap()`.** Use explicit `match`/`if let` and propagate.
+  Where a call is infallible by construction, say why in a comment - the codebase has
+  such cases, and an unexplained `.unwrap()` is indistinguishable from an oversight.
+- **Test code: `.unwrap()` and `.expect("reason")` are fine.**
+- Use `thiserror` for custom error types.
 
 ### WHEN writing async code
 
@@ -319,19 +308,10 @@ CORRECT:
 
 ### WHEN you need time/rng/sockets in `crates/core/`
 
-```
-Need current time?
-  → DO NOT use: std::time::Instant::now(), tokio::time::sleep()
-  → USE: TimeSource trait (crates/core/src/simulation/)
-
-Need randomness?
-  → DO NOT use: rand::random(), rand::thread_rng()
-  → USE: GlobalRng (crates/core/src/config.rs)
-
-Need network socket in tests?
-  → DO NOT use: tokio::net::UdpSocket
-  → USE: Socket trait (crates/core/src/transport/)
-```
+DST requirements (TimeSource, GlobalRng, Socket trait) are canonical in
+`.claude/rules/testing.md` — see "When writing new code in `crates/core/`".
+Two narrow, deliberate exceptions to the TimeSource/GlobalRng rule exist and
+are documented here because they don't live anywhere else:
 
 #### Exception: real wall-clock comparison against `boot_time::Instant`
 
