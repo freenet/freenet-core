@@ -1,3 +1,13 @@
+---
+paths:
+  - "crates/core/src/server/path_handlers.rs"
+  - "crates/core/src/server/path_handlers/**"
+  - "crates/core/src/server/client_api.rs"
+  - "crates/core/tests/playwright/**"
+  - "crates/core/tests/playwright_shell.rs"
+  - ".github/workflows/playwright-shell.yml"
+---
+
 # Browser Assets (JS the node injects into pages)
 
 Applies to `crates/core/src/server/path_handlers/assets/` — `shell_bridge.js`,

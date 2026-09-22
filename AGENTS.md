@@ -146,8 +146,6 @@ This is a recurring meta-pattern where a fix introduces cleanup with
 exemptions, then a follow-up discovers the exemptions themselves are
 buggy (permanently refreshable, missing TTL enforcement).
 Exemptions in GC deserve the same scrutiny as the original bug.
-
-See: docs/weekly-fix-review-2025-02.md (befb0bd → 0b88945 cycle)
 ```
 
 ### WHEN you discover outdated or missing documentation
@@ -178,103 +176,23 @@ cargo test -p freenet          # Test all
 cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 ```
 
-### Repository Structure
-
-```
-crates/
-├── core/             # Runtime (node, transport, contracts, operations)
-├── fdev/             # Developer CLI
-├── freenet-macros/   # Test macros
-└── release-agent/    # HTTP service on each gateway for triggering
-                      # auto-updates from the release workflow (#4073)
-apps/                 # Example applications
-docs/architecture/    # Design docs
-```
-
-### Core Modules (`crates/core/src/`)
-
-| Module | Purpose |
-|--------|---------|
-| `node/` | Event loop, coordination |
-| `operations/` | State machines (GET, PUT, UPDATE, SUBSCRIBE, CONNECT) |
-| `contract/` | WASM execution |
-| `transport/` | UDP networking, encryption |
-| `ring/` | DHT topology |
-| `simulation/` | DST framework |
-
-### Key Abstractions
-
-| Need | Use | Location |
-|------|-----|----------|
-| Time | `TimeSource` | `crates/core/src/simulation/` |
-| RNG | `GlobalRng` | `crates/core/src/config.rs` |
-| Sockets | `Socket` trait | `crates/core/src/transport/` |
-
-## Documentation
-
-### Architecture Docs
-
-| Topic | Location |
-|-------|----------|
-| Architecture | `docs/architecture/README.md` |
-| Ring/DHT | `docs/architecture/ring/README.md` |
-| Operations | `docs/architecture/operations/README.md` |
-| Transport | `docs/architecture/transport/README.md` |
-| Testing | `docs/architecture/testing/README.md` |
-
-### Module Rules (path-scoped)
-
-| Module | Rules |
-|--------|-------|
-| Ring/Router | `.claude/rules/ring.md` |
-| Operations | `.claude/rules/operations.md` |
-| Transport | `.claude/rules/transport.md` |
-| Contracts | `.claude/rules/contracts.md` |
-| Browser assets (injected JS + its HTML/CSP wrappers) | `.claude/rules/browser-assets.md` |
-| All of `crates/core/` and `scripts/` | `.claude/rules/bug-prevention-patterns.md` |
-
-### General Rules
-
-| Topic | Location |
-|-------|----------|
-| Code style | `.claude/rules/code-style.md` |
-| Git workflow | `.claude/rules/git-workflow.md` |
-| DST testing | `.claude/rules/testing.md` |
-| Deployment | `.claude/rules/deployment.md` |
+Module and rule-file pointers are in "BEFORE modifying any file" above;
+`.claude/rules/*.md` are path-scoped and load automatically for the files
+they cover. Architecture design docs live under `docs/architecture/<topic>/README.md`
+(ring, operations, transport, testing).
 
 ## Release Workflow & RELEASE_PAT
 
 The release pipeline (`.github/workflows/release.yml` →
 `.github/workflows/cross-compile.yml` → downstream `gateway-update.yml` /
-`release-announce.yml` / `docker-publish.yml`) relies on a `RELEASE_PAT` repo secret to fire
-all the workflow events that make releases zero-touch.
-
-### Why a PAT is required
-
-GitHub's `GITHUB_TOKEN` deliberately suppresses workflow-triggering
-events as an anti-recursion safeguard:
-
-> When you use the repository's `GITHUB_TOKEN` to perform tasks,
-> events triggered by the `GITHUB_TOKEN` will not create a new
-> workflow run.
-
-That means any `gh` call inside a workflow that *should* wake up
-another workflow has to authenticate with a personal access token
-(PAT) instead. Two concrete failure modes hit the v0.2.57 release:
-
-1. **Bump PR has 0 check-runs.** `release.yml` opens the
-   `release/vX.Y.Z` PR via `gh pr create`. With `GITHUB_TOKEN`, no
-   `pull_request` event fires, so `ci.yml` never runs and the PR's
-   required checks never go green. Workaround was
-   `gh pr close && gh pr reopen`, which broke `wait_for_pr` polling.
-
-2. **`release.published` doesn't fire downstream workflows.**
-   `cross-compile.yml`'s `attach-to-release` job ends with
-   `gh release edit --draft=false`. With `GITHUB_TOKEN`, the
-   `release.published` event is suppressed, so `gateway-update.yml`,
-   `release-announce.yml` and `docker-publish.yml` don't auto-fire.
-   v0.2.57 had to trigger
-   them manually via `workflow_dispatch`.
+`release-announce.yml` / `docker-publish.yml`) relies on a `RELEASE_PAT` repo
+secret to fire all the workflow events that make releases zero-touch: GitHub's
+`GITHUB_TOKEN` deliberately suppresses events it triggers from starting a new
+workflow run (anti-recursion safeguard), so without a PAT the bump-PR's own
+CI never runs and `release.published` never fires the downstream workflows —
+the pipeline still completes, but requires manual `workflow_dispatch` for
+each step it should have chained automatically (this bit the v0.2.57
+release).
 
 ### Configuring the secret
 
