@@ -28,7 +28,9 @@ paths:
 
 ### WHEN handling errors
 
-- **Production code: never `.unwrap()`.** Use explicit `match`/`if let` and propagate.
+- **Production code: avoid `.unwrap()`.** Use explicit `match`/`if let` and propagate.
+  Where a call is infallible by construction, say why in a comment - the codebase has
+  such cases, and an unexplained `.unwrap()` is indistinguishable from an oversight.
 - **Test code: `.unwrap()` and `.expect("reason")` are fine.**
 - Use `thiserror` for custom error types.
 

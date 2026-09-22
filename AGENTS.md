@@ -33,7 +33,7 @@ When unsure which bucket a change is in, open an issue first.
    → operations/      → Check .claude/rules/operations.md
    → transport/       → Check .claude/rules/transport.md
    → contract/wasm_runtime/ → Check .claude/rules/contracts.md
-   → server/path_handlers* or server/client_api* → Check .claude/rules/browser-assets.md
+   → anything under server/ → Check .claude/rules/browser-assets.md
      (the injected JS, plus the HTML/CSP wrappers that decide what it may do)
    → bin/, build.rs, any Cargo.toml, apps/freenet-ping/, *.service, package.nix
                       → Check .claude/rules/deployment.md
@@ -178,11 +178,11 @@ cargo test -p freenet          # Test all
 cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 ```
 
-Module and rule-file pointers are in "BEFORE modifying any file" above;
-`.claude/rules/*.md` are path-scoped and load automatically for the files
-they cover. Architecture design docs live under `docs/architecture/` (start at its
-`README.md`, then `<topic>/README.md`)
-(ring, operations, transport, testing).
+Module and rule-file pointers are in "BEFORE modifying any file" above. Most
+`.claude/rules/*.md` are path-scoped and load automatically for the files they
+cover; `git-workflow.md` is deliberately unscoped because it is cross-cutting.
+Architecture design docs live under `docs/architecture/` — start at its
+`README.md`, then `<topic>/README.md`.
 
 ## Release Workflow & RELEASE_PAT
 
@@ -198,7 +198,8 @@ v0.2.57 release, and they have DIFFERENT remedies:
    never runs and its required checks never turn green. `ci.yml` has no
    `workflow_dispatch`, so it cannot be started by hand. The old workaround,
    closing and reopening the PR, breaks `wait_for_pr` polling
-   (`release.yml:285`), whose output feeds five downstream jobs.
+   (`release.yml:285`), whose `release_sha` output `verify_publishable` and
+   `create_release` depend on.
 2. **`release.published` does not fire downstream workflows.** Those DO expose
    `workflow_dispatch`, so they can be triggered per step by hand.
 
