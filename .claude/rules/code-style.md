@@ -26,6 +26,12 @@ paths:
    → YES: See .claude/rules/testing.md for DST requirements
 ```
 
+### WHEN handling errors
+
+- **Production code: never `.unwrap()`.** Use explicit `match`/`if let` and propagate.
+- **Test code: `.unwrap()` and `.expect("reason")` are fine.**
+- Use `thiserror` for custom error types.
+
 ### WHEN writing async code
 
 ```
