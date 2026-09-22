@@ -189,13 +189,18 @@ they cover. Architecture design docs live under `docs/architecture/` (start at i
 The release pipeline (`.github/workflows/release.yml` →
 `.github/workflows/cross-compile.yml` → downstream `gateway-update.yml` /
 `release-announce.yml` / `docker-publish.yml`) relies on a `RELEASE_PAT` repo
-secret to fire all the workflow events that make releases zero-touch: GitHub's
+secret to fire all the workflow events that keep releases zero-touch. GitHub's
 `GITHUB_TOKEN` deliberately suppresses events it triggers from starting a new
-workflow run (anti-recursion safeguard), so without a PAT the bump-PR's own
-CI never runs and `release.published` never fires the downstream workflows —
-the pipeline still completes, but requires manual `workflow_dispatch` for
-each step it should have chained automatically (this bit the v0.2.57
-release).
+workflow run (anti-recursion safeguard). Two distinct failure modes hit the
+v0.2.57 release, and they have DIFFERENT remedies:
+
+1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
+   never runs and its required checks never turn green. `ci.yml` has no
+   `workflow_dispatch`, so it cannot be started by hand. The old workaround,
+   closing and reopening the PR, breaks `wait_for_pr` polling
+   (`release.yml:285`), whose output feeds five downstream jobs.
+2. **`release.published` does not fire downstream workflows.** Those DO expose
+   `workflow_dispatch`, so they can be triggered per step by hand.
 
 ### Configuring the secret
 
