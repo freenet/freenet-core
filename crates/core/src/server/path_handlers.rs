@@ -5125,6 +5125,62 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
+    /// Pins the `IsADirectory` (EISDIR) arm added to `asset_is_missing` in
+    /// 24f06c4c: a bundle that contains a DIRECTORY literally named `app.js`
+    /// (unusual, but the `.js` branch is a direct `tokio::fs::read_to_string`
+    /// with no `metadata().is_dir()` guard, unlike `ServeFile`) must still
+    /// 404, not 500. Flagged as untested by the automated rule review of
+    /// #5721 — the classification arm existed with no regression test behind
+    /// it.
+    #[tokio::test]
+    async fn variable_content_404s_for_a_js_path_that_is_a_directory() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x5b;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        // `app.js` is a DIRECTORY, not a file — reading it as a file fails
+        // with EISDIR, not ENOENT.
+        tokio::fs::create_dir_all(cache_dir.join("app.js"))
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let response = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/app.js"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("a directory named *.js must resolve to a response, not an error")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "EISDIR on the .js branch must 404, not 500"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "must carry the same Cache-Control as every other asset 404 (#5718)"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
     /// Regression for #5718, sibling handler: a missing HTML page must 404 too.
     ///
     /// `sandbox_content_body` serves the iframe's HTML and had the same defect
