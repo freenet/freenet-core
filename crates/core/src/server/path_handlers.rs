@@ -1748,11 +1748,13 @@ async fn unpack_if_stale(
 /// Does this filesystem error mean "that asset is not here", as opposed to a
 /// fault on this node?
 ///
-/// This deliberately MIRRORS tower-http's own `should_return_not_found`
-/// (`serve_dir/mod.rs`) rather than inventing a set: `NotFound`,
-/// `PermissionDenied`, and `NotADirectory`. Keeping it identical is the point —
-/// `ServeDir`/`ServeFile` render exactly these as 404 inside their
-/// `Service::call`, so a request that used to 404 keeps 404ing.
+/// The set is `NotFound`, `PermissionDenied` and `NotADirectory`, chosen to
+/// match tower-http's own `should_return_not_found` (`serve_dir/mod.rs`) so a
+/// request that used to 404 inside `ServeDir`/`ServeFile`'s `Service::call`
+/// keeps 404ing. It is not byte-identical: tower-http still spells the third
+/// one `#[cfg(unix)] raw_os_error() == Some(20)`, so on Windows it does NOT
+/// 404 `ERROR_DIRECTORY` and this does. That is the better behaviour and
+/// nothing pins the pairing, so do not assume the two stay in step.
 ///
 /// `PermissionDenied` maps to 404 rather than 500 on purpose: it is not a
 /// caller's business which unreadable files exist inside a contract's cache
@@ -1779,24 +1781,31 @@ fn asset_is_missing(err: &std::io::Error) -> bool {
     )
 }
 
-/// Answer 404 for an absent asset, but say something first when the reason was
-/// not a plain absence.
+/// Answer 404 for an absent asset, and say something first in the one case
+/// that is an operator problem rather than an ordinary miss.
 ///
-/// A `NotFound` is the overwhelmingly common case and is not worth a line. The
-/// other two are different in kind: a `PermissionDenied` on the cache almost
-/// always means an operator problem (a bad `chmod` on the cache root, a
-/// restrictive umask during unpack), and it would otherwise present as every
-/// asset in that contract 404ing quietly and permanently — the failure shape
-/// `.claude/rules/bug-prevention-patterns.md` calls "a refusal that is not
-/// counted renders as a clean zero". `warn!` rather than `debug!` because
-/// `release_max_level_info` compiles the latter out of the builds operators
-/// actually run.
+/// **Only `PermissionDenied` is logged.** It almost always means a bad `chmod`
+/// on the cache root or a restrictive umask during unpack, and it would
+/// otherwise present as every asset in that contract 404ing quietly and
+/// permanently — the failure shape `.claude/rules/bug-prevention-patterns.md`
+/// calls "a refusal that is not counted renders as a clean zero". `warn!`
+/// rather than `debug!` because `release_max_level_info` compiles the latter
+/// out of the builds operators actually run.
+///
+/// **`NotADirectory` is deliberately NOT logged**, though it is equally "not a
+/// plain absence". It is client-shaped: a request for `app.js/anything`
+/// produces `ENOTDIR` every time, and nothing on these routes is rate limited,
+/// so warning on it would hand any remote caller an unthrottled log-spam lever.
+/// `NotFound` is the ordinary case and is not worth a line either.
+///
+/// The path is formatted with `?` (Debug), never `%` (Display). It ends in a
+/// percent-DECODED segment taken from the request, so a `%0A` in the URL
+/// reaches us as a real newline; Debug escapes control characters, Display
+/// would let it forge log lines.
 fn asset_missing_response(file_path: &Path, err: &std::io::Error) -> axum::response::Response {
-    if err.kind() != std::io::ErrorKind::NotFound {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
         tracing::warn!(
-            path = %file_path.display(),
-            error = %err,
-            kind = ?err.kind(),
+            path = ?file_path,
             "serving 404 for a webapp asset that exists but could not be read; \
              check permissions on the webapp cache directory"
         );
@@ -1945,6 +1954,14 @@ pub(super) async fn variable_content(
     let mut serve_file = tower_http::services::fs::ServeFile::new(&file_path);
     let fake_req = axum::http::Request::new(axum::body::Body::empty());
     match serve_file.try_call(fake_req).await {
+        // tower-http 0.7.0 answers a missing file with its OWN bare 404 here
+        // (0.7.1 returns `Err` instead — see below). That response carries no
+        // `Cache-Control`, so without this the miss would be cacheable on one
+        // dependency version and not the other. Normalise it: whichever way
+        // the dependency reports the miss, the client gets the same answer.
+        Ok(response) if response.status() == axum::http::StatusCode::NOT_FOUND => {
+            Ok(asset_not_found_response())
+        }
         Ok(response) => Ok(response.into_response()),
         // `try_call` hands us the raw I/O error. Before tower-http 0.7.1 it
         // turned a missing file into a 404 itself; it now propagates it, and
@@ -2228,9 +2245,13 @@ pub(super) async fn serve_sandbox_content(
 
     let path = cache.entry_dir(&instance_id);
     if !path.exists() {
-        return Err(WebSocketApiError::NodeError {
-            error_cause: format!("Contract not cached yet: {key}"),
-        });
+        // The reachable half of the absent-bundle case, and a 500 until #5718.
+        // `refresh_cache_if_due` above owns "still propagating" (it raises
+        // `ContractNotFound`, which renders as the 503 retry page), so getting
+        // here means it declined to fetch — the speculative lane was saturated,
+        // or the node could not confirm it holds the contract. `variable_content`
+        // answers 404 in exactly that state; this now agrees with it.
+        return Ok(asset_not_found_response());
     }
     sandbox_content_body(&path, &key, api_version, page).await
 }
@@ -4832,6 +4853,64 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND,
             "a missing asset must 404, not 500 (#5718)"
         );
+        // A 404 is cacheable by default where the 500 it replaces was not, and
+        // this one can mean "not fetched YET" (saturated lane / fail-closed),
+        // so a browser must not remember it and strand the app once the bundle
+        // unpacks.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "the asset 404 must not be cacheable (#5718)"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
+    /// `ENOTDIR` is a miss, not a node fault: `app.js/anything` asks for a
+    /// path under a regular file, which cannot exist.
+    ///
+    /// This pins the `ErrorKind::NotADirectory` arm of `asset_is_missing`,
+    /// which replaced a `#[cfg(unix)]` raw-errno-20 check. Without that arm the
+    /// request renders 500 with the OS error string.
+    #[tokio::test]
+    async fn variable_content_404s_for_a_path_under_a_file() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x59;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join("app.js"), b"console.log('hi');")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let response = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/app.js/nested.png"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("a path under a regular file must resolve to a response")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "ENOTDIR must 404, not 500 (#5718)"
+        );
 
         clear_cache(&instance_id).await;
     }
@@ -4932,6 +5011,16 @@ mod tests {
             present.status(),
             axum::http::StatusCode::OK,
             "a page that IS in the bundle must still serve 200"
+        );
+        // The Ok type widened from `Html<String>` to `Response`; the HTML
+        // content type came from `Html`'s `IntoResponse` impl, so pin it.
+        assert_eq!(
+            present
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "the sandbox page must still be served as HTML"
         );
 
         let missing = sandbox_content_body(dir.path(), key, ApiVersion::V1, "nope.html")
