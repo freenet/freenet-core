@@ -35,6 +35,8 @@ When unsure which bucket a change is in, open an issue first.
    → contract/wasm_runtime/ → Check .claude/rules/contracts.md
    → server/path_handlers* or server/client_api* → Check .claude/rules/browser-assets.md
      (the injected JS, plus the HTML/CSP wrappers that decide what it may do)
+   → bin/, build.rs, any Cargo.toml, apps/freenet-ping/, *.service, package.nix
+                      → Check .claude/rules/deployment.md
 
 3. Is this Rust code?
    → Check .claude/rules/code-style.md
@@ -178,7 +180,8 @@ cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 
 Module and rule-file pointers are in "BEFORE modifying any file" above;
 `.claude/rules/*.md` are path-scoped and load automatically for the files
-they cover. Architecture design docs live under `docs/architecture/<topic>/README.md`
+they cover. Architecture design docs live under `docs/architecture/` (start at its
+`README.md`, then `<topic>/README.md`)
 (ring, operations, transport, testing).
 
 ## Release Workflow & RELEASE_PAT
