@@ -3,6 +3,7 @@ paths:
   - "crates/core/src/server/path_handlers.rs"
   - "crates/core/src/server/path_handlers/**"
   - "crates/core/src/server/client_api.rs"
+  - "crates/core/src/server/client_api/**"
   - "crates/core/tests/playwright/**"
   - "crates/core/tests/playwright_shell.rs"
   - ".github/workflows/playwright-shell.yml"
