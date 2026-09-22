@@ -5300,6 +5300,63 @@ mod tests {
         );
     }
 
+    /// Pins `sandbox_content_body`'s `File::open(&canonical_file)` error arm
+    /// (flagged as untested by the automated rule review of #5721): every
+    /// other test that reaches `sandbox_content_body`'s missing-asset paths
+    /// fails earlier, at one of the two `canonicalize()` calls, so this arm
+    /// — added for the TOCTOU race described in its own comment ("the file
+    /// can go away between `canonicalize` and `open`") — had zero coverage.
+    ///
+    /// A literal delete-between-canonicalize-and-open race is not
+    /// deterministically reproducible without adding test-only
+    /// synchronization instrumentation to production code (the two calls are
+    /// separated by a real cross-thread yield — `File::open` runs on the
+    /// blocking pool — but nothing pins WHEN a concurrent deletion would land
+    /// inside that window, so a test built on real timing would be
+    /// inherently flaky). `PermissionDenied` reaches the exact same match arm
+    /// through the exact same `asset_is_missing`/`asset_missing_response`
+    /// classification, deterministically: the file resolves fine to a
+    /// canonical path (so both `canonicalize()` calls succeed and the
+    /// boundary check passes), and only the subsequent `open()` fails. That
+    /// is the same class of "not a caller's business which unreadable files
+    /// exist" case `asset_missing_response`'s own doc comment describes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_content_404s_for_an_unreadable_page() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let page_path = dir.path().join("secret.html");
+        tokio::fs::write(&page_path, b"<html>shh</html>")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&page_path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .unwrap();
+
+        let response = sandbox_content_body(dir.path(), "3a5ctest", ApiVersion::V1, "secret.html")
+            .await
+            .expect("an unreadable page must resolve to a response, not an error");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "PermissionDenied on File::open must 404, not 500 or 403"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "must carry the same Cache-Control as every other asset 404"
+        );
+
+        // Restore permissions so the temp dir can be cleaned up.
+        tokio::fs::set_permissions(&page_path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+    }
+
     /// Security regression: a `../`-style traversal in the (decoded) asset path
     /// must NOT read a file outside the contract's cache directory.
     ///
