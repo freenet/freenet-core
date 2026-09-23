@@ -729,6 +729,12 @@ impl ExecutorError {
     /// Returns true if the error is due to a missing delegate (not found in store).
     /// This is expected during legacy migration probes and should be logged at
     /// warn level rather than error.
+    ///
+    /// It also decides what the CLIENT sees (#5727): the executor loop returns it
+    /// as a failure, and `client_events::missing_delegate_client_error` keeps it
+    /// as the typed `DelegateError::Missing` rather than an `OperationError`
+    /// string, which in turn lets the websocket `DelegateRateLimiter` back off
+    /// repeated requests for the same missing key.
     pub fn is_missing_delegate(&self) -> bool {
         matches!(
             &self.inner,

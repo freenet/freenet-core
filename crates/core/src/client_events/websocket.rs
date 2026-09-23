@@ -93,6 +93,22 @@ fn to_key_array(key: &[u8]) -> Option<[u8; 32]> {
     key.try_into().ok()
 }
 
+/// Whether a delegate request is gated by the per-key backoff (#3305).
+///
+/// `RegisterDelegate` is exempt. It is the remedy for the failure the backoff
+/// most often records: since #5727 a network-mode node answers a request to an
+/// unregistered delegate with `DelegateError::Missing`, which starts a backoff
+/// on that key, and a client that probes a key and then registers it would
+/// otherwise have the registration refused as rate limited. A registration is
+/// not the retry loop the backoff exists to stop, and its success clears the
+/// backoff for the key.
+fn is_subject_to_delegate_backoff(req: &freenet_stdlib::client_api::DelegateRequest<'_>) -> bool {
+    !matches!(
+        req,
+        freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. }
+    )
+}
+
 /// Extract the delegate key bytes from a `DelegateError`, if available.
 ///
 /// Most `DelegateError` variants carry a `DelegateKey`; `ExecutionError` and
@@ -1870,7 +1886,9 @@ async fn process_client_request(
     // flooding the event loop (which caused "node not available" for all clients,
     // #3332) and avoids blocking the connection's event loop with a sleep (which
     // would stall pings, subscriptions, and other responses).
-    if let ClientRequest::DelegateOp(ref delegate_req) = req {
+    if let ClientRequest::DelegateOp(ref delegate_req) = req
+        && is_subject_to_delegate_backoff(delegate_req)
+    {
         let key_bytes: &[u8] = delegate_req.key().bytes();
         if let Some(remaining) = rate_limiter.check_backoff(key_bytes) {
             tracing::warn!(
@@ -3484,6 +3502,39 @@ mod tests {
     ///
     /// Pins the variant rather than the wording, except for a substring that
     /// makes the cause legible in a log.
+    /// #5727 made network mode answer an unregistered delegate with
+    /// `DelegateError::Missing`, which starts a per-key backoff. Registering
+    /// that key is the remedy, so a registration must not be refused by the
+    /// backoff; every other delegate request stays gated.
+    #[test]
+    fn register_delegate_is_exempt_from_delegate_backoff() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        let code = DelegateCode::from(vec![0u8, 1, 2, 3]);
+        let params = Parameters::from(vec![]);
+        let container =
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
+        let key = container.key().clone();
+        let register = DelegateRequest::RegisterDelegate {
+            delegate: container,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
+        };
+        assert!(
+            !is_subject_to_delegate_backoff(&register),
+            "a registration must not be refused by a backoff that a Missing \
+             answer for the same key started"
+        );
+        let app = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        assert!(is_subject_to_delegate_backoff(&app));
+        assert!(is_subject_to_delegate_backoff(
+            &DelegateRequest::UnregisterDelegate(key)
+        ));
+    }
+
     #[test]
     fn throttled_request_is_not_reported_as_a_missing_delegate() {
         let key = DelegateKey::new([7u8; 32], CodeHash::new([7u8; 32]));

@@ -449,11 +449,23 @@ where
                     }
                     (_, Ok(None)) => continue,
                     (cli_id, Err(err)) => {
-                        tracing::error!(
-                            client_id = %cli_id,
-                            error = %err,
-                            "Sending error response to client"
-                        );
+                        // A missing delegate is routine migration-probe traffic
+                        // (#5727), already warned about once by the executor
+                        // loop; logging it here at error would put one line per
+                        // probe into the error log used for triage.
+                        if is_missing_delegate_client_error(&err) {
+                            tracing::debug!(
+                                client_id = %cli_id,
+                                error = %err,
+                                "Sending missing-delegate response to client"
+                            );
+                        } else {
+                            tracing::error!(
+                                client_id = %cli_id,
+                                error = %err,
+                                "Sending error response to client"
+                            );
+                        }
                         if let Err(send_err) = client_events.send(cli_id, Err(err)).await {
                             tracing::debug!(
                                 client_id = %cli_id,
@@ -495,11 +507,6 @@ fn delegate_request_outcome(
             }
             Ok(values)
         }
-        // Genuine delegate execution failure (#5263). Previously this arm
-        // didn't exist: a failure was indistinguishable from
-        // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
-        // client silently received an empty successful response instead of
-        // an error.
         // Not registered on this node (#5727). Answered with the typed
         // `DelegateError::Missing` — see `missing_delegate_client_error` — and
         // NOT logged at error: migration walks probe predecessor delegates that
@@ -517,6 +524,11 @@ fn delegate_request_outcome(
             );
             Err(Error::Executor(exec_err))
         }
+        // Genuine delegate execution failure (#5263). Previously this arm
+        // didn't exist: a failure was indistinguishable from
+        // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
+        // client silently received an empty successful response instead of
+        // an error.
         Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))) => {
             tracing::error!(
                 client_id = %client_id,
@@ -576,6 +588,17 @@ fn missing_delegate_client_error(err: Error) -> Result<ClientError, Error> {
         // error in a function that has no opinion about it.
         other => Err(other),
     }
+}
+
+/// True for the typed missing-delegate client error `missing_delegate_client_error`
+/// produces (#5727), so the send path can keep it out of the error log.
+fn is_missing_delegate_client_error(err: &ClientError) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::RequestError(freenet_stdlib::client_api::RequestError::DelegateError(
+            freenet_stdlib::client_api::DelegateError::Missing(_)
+        ))
+    )
 }
 
 #[inline]
@@ -2574,6 +2597,31 @@ mod delegate_request_outcome_tests {
             );
         };
         assert_eq!(k, &key(), "Missing must name the requested delegate");
+    }
+
+    /// The send path's log-level decision (#5727): only the typed missing
+    /// delegate is kept out of the error log; every other client error,
+    /// including other delegate errors, still logs at error.
+    #[test]
+    fn only_typed_missing_is_treated_as_routine_by_the_send_path() {
+        use freenet_stdlib::client_api::{DelegateError, RequestError};
+        let missing: ClientError =
+            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(key())))
+                .into();
+        assert!(is_missing_delegate_client_error(&missing));
+        let exec: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
+            DelegateError::ExecutionError("trap".into()),
+        ))
+        .into();
+        assert!(!is_missing_delegate_client_error(&exec));
+        let op: ClientError = ErrorKind::OperationError {
+            cause: "missing delegate".into(),
+        }
+        .into();
+        assert!(
+            !is_missing_delegate_client_error(&op),
+            "must match the typed variant, not text that mentions it"
+        );
     }
 
     /// The narrowness of the above: any OTHER error keeps its current path to
