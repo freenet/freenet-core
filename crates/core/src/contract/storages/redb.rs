@@ -2167,7 +2167,9 @@ impl ReDb {
             // The scan is skipped when this call already freed one of the
             // delegate's own rows (a cap eviction): its count is then unchanged
             // by the insert. That keeps the scan out of the path a delegate at
-            // its cap drives on every subscribe.
+            // its cap drives on every subscribe. It cannot let the count grow;
+            // a count ALREADY over the cap (not produced by this code, e.g. an
+            // older version's rows) is trimmed by restore at the next boot.
             if !present && !freed_own_row && tbl.len()? >= per_delegate_cap as u64 {
                 let mine = Self::delegate_key64(delegate);
                 let mut own_rows: Vec<Vec<u8>> = Vec::new();

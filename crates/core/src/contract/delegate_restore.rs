@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::OpManager;
+use crate::util::backoff::ExponentialBackoff;
 use crate::wasm_runtime::{delegate_interest, delegate_subscriptions};
 
 /// Delay before the first attempt, so the node has had time to join the ring.
@@ -54,6 +55,10 @@ pub(crate) const BETWEEN_ATTEMPTS: Duration = Duration::from_millis(250);
 
 /// Backoff between retry rounds: doubles from `FIRST_ATTEMPT_DELAY` up to this.
 pub(crate) const MAX_ROUND_DELAY: Duration = Duration::from_secs(300);
+
+/// The delay before each round (`delay(round)`), before jitter.
+const ROUND_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new(FIRST_ATTEMPT_DELAY, MAX_ROUND_DELAY);
 
 /// Retry rounds per boot before giving up until the next boot. The delays
 /// BETWEEN rounds sum to under an hour; each round additionally takes as long
@@ -173,9 +178,8 @@ async fn reestablish(
     shutdown: CancellationToken,
 ) {
     let total = pending.len();
-    let mut delay = FIRST_ATTEMPT_DELAY;
     for round in 0..MAX_ROUNDS {
-        if sleep_or_shutdown(&shutdown, jitter(delay)).await {
+        if sleep_or_shutdown(&shutdown, jitter(ROUND_BACKOFF.delay(round))).await {
             return;
         }
         let mut failed = Vec::new();
@@ -210,7 +214,6 @@ async fn reestablish(
             "Some restored delegate subscriptions could not be re-established yet"
         );
         pending = failed;
-        delay = (delay * 2).min(MAX_ROUND_DELAY);
     }
     tracing::warn!(
         total,
@@ -651,13 +654,13 @@ mod tests {
     /// (the attempts' own duration is bounded by the subscribe driver).
     #[test]
     fn inter_round_delay_schedule_is_bounded() {
-        let mut delay = FIRST_ATTEMPT_DELAY;
         let mut total = Duration::ZERO;
-        for _ in 0..MAX_ROUNDS {
+        for round in 0..MAX_ROUNDS {
+            let delay = ROUND_BACKOFF.delay(round);
+            assert!(delay <= MAX_ROUND_DELAY);
             total += delay;
-            delay = (delay * 2).min(MAX_ROUND_DELAY);
         }
-        assert!(delay <= MAX_ROUND_DELAY);
+        assert_eq!(ROUND_BACKOFF.delay(0), FIRST_ATTEMPT_DELAY);
         assert!(total < Duration::from_secs(60 * 60), "schedule {total:?}");
     }
 }
