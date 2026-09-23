@@ -564,11 +564,16 @@ fn delegate_request_outcome(
 /// registered here" from "this node failed", which is the distinction a
 /// migration walk over predecessor delegates needs. Deliberately narrow: other
 /// executor request errors keep their current shape.
+#[allow(clippy::wildcard_enum_match_arm)] // see the wildcard arm below
 fn missing_delegate_client_error(err: Error) -> Result<ClientError, Error> {
     match err {
         Error::Executor(exec_err) if exec_err.is_missing_delegate() => {
             Ok(ErrorKind::RequestError(exec_err.unwrap_request()).into())
         }
+        // The wildcard IS the contract here: every other error, including any
+        // variant added later, passes through untouched to the existing
+        // flattening. Listing today's variants would make a new one a compile
+        // error in a function that has no opinion about it.
         other => Err(other),
     }
 }
@@ -2560,12 +2565,15 @@ mod delegate_request_outcome_tests {
         .expect_err("a missing delegate must not be answered as a success");
         let client_err = missing_delegate_client_error(err)
             .expect("a missing-delegate error must stay typed for the client");
-        match client_err.kind() {
-            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k))) => {
-                assert_eq!(k, &key(), "Missing must name the requested delegate");
-            }
-            other => panic!("expected RequestError(DelegateError::Missing), got {other:?}"),
-        }
+        let ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k))) =
+            client_err.kind()
+        else {
+            panic!(
+                "expected RequestError(DelegateError::Missing), got {:?}",
+                client_err.kind()
+            );
+        };
+        assert_eq!(k, &key(), "Missing must name the requested delegate");
     }
 
     /// The narrowness of the above: any OTHER error keeps its current path to
