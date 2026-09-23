@@ -7,10 +7,10 @@ use std::sync::Arc;
 use either::Either;
 use freenet_stdlib::prelude::*;
 
-pub(crate) mod delegate_app_registry;
-pub(crate) mod delegate_capabilities;
 #[cfg(test)]
 mod capability_loop_tests;
+pub(crate) mod delegate_app_registry;
+pub(crate) mod delegate_capabilities;
 mod delegate_park;
 mod executor;
 mod fair_queue;
@@ -3373,7 +3373,9 @@ fn seed_node_started(
         "Scheduling NodeStarted for background delegates"
     );
     for key in targets {
-        let offset = std::time::Duration::from_millis(crate::config::GlobalRng::random_u64() % smear_ms.max(1));
+        let offset = std::time::Duration::from_millis(
+            crate::config::GlobalRng::random_u64() % smear_ms.max(1),
+        );
         schedule.push(
             now + delegate_capabilities::NODE_STARTED_MIN_DELAY + offset,
             delegate_capabilities::LifecycleRun {
@@ -4344,19 +4346,21 @@ fn admit_unprompted_ops(
             }
         }
     });
-    updates.retain(|req| match caps.admit_op(delegate_key, Some(&req.contract_id)) {
-        Ok(()) => true,
-        Err(refusal) => {
-            inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
-                UpdateContractResponse {
-                    contract_id: req.contract_id,
-                    result: Err(refusal.message().to_string()),
-                    context: req.context.clone(),
-                },
-            ));
-            false
-        }
-    });
+    updates.retain(
+        |req| match caps.admit_op(delegate_key, Some(&req.contract_id)) {
+            Ok(()) => true,
+            Err(refusal) => {
+                inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
+                    UpdateContractResponse {
+                        contract_id: req.contract_id,
+                        result: Err(refusal.message().to_string()),
+                        context: req.context.clone(),
+                    },
+                ));
+                false
+            }
+        },
+    );
     subscribes.retain(|req| match caps.admit_op(delegate_key, None) {
         Ok(()) => true,
         Err(refusal) => {
@@ -4421,7 +4425,9 @@ fn capability_hook(
             // No manifest (every delegate built before manifests): nothing to do.
             let manifest = delegate_capabilities::read_manifest(&key, delegate.code().data())?;
             let params = match delegate {
-                DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => d.params().as_ref().to_vec(),
+                DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
+                    d.params().as_ref().to_vec()
+                }
                 // `#[non_exhaustive]`; registration refuses unknown versions.
                 _ => return None,
             };
@@ -4634,7 +4640,9 @@ where
     )
     .await;
     caps.charge_duty(&key, caps.now().saturating_duration_since(started));
-    caps.stats.lifecycle_delivered.fetch_add(1, Ordering::Relaxed);
+    caps.stats
+        .lifecycle_delivered
+        .fetch_add(1, Ordering::Relaxed);
     tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
 
     match outcome {
@@ -4691,7 +4699,10 @@ async fn dispatch_delegate_request<CH, P>(
     }
 
     let hook = capability_hook(
-        contract_handler.executor().delegate_capabilities().is_some(),
+        contract_handler
+            .executor()
+            .delegate_capabilities()
+            .is_some(),
         &req,
         origin_contract.as_ref(),
         connection_scope,

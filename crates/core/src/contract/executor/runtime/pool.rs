@@ -604,11 +604,13 @@ impl RuntimePool {
         };
 
         #[cfg(feature = "redb")]
-        let capability_storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
-            Arc::new(shared_state_store.inner().clone());
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(shared_state_store.inner().clone());
         #[cfg(not(feature = "redb"))]
-        let capability_storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
-            Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
         let delegate_capabilities =
             crate::contract::delegate_capabilities::DelegateCapabilities::new(capability_storage);
         op_manager.set_delegate_capabilities(delegate_capabilities.clone());

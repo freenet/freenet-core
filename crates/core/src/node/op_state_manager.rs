@@ -807,7 +807,9 @@ impl OpManager {
         &self,
         caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
     ) {
-        let _ = self.delegate_capabilities.set(caps);
+        if self.delegate_capabilities.set(caps).is_err() {
+            tracing::debug!("delegate capabilities already set; ignoring repeat wiring");
+        }
     }
 
     pub(crate) fn delegate_capabilities(

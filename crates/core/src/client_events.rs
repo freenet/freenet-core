@@ -1704,6 +1704,9 @@ async fn process_open_request(
                                         "UnsubscribeContractResponse"
                                     }
                                     InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
+                                    // Appended in stdlib 0.12.0. The contract
+                                    // loop refuses it from a client.
+                                    InboundDelegateMsg::Lifecycle(_) => "Lifecycle",
                                     _ => "Unknown",
                                 })
                                 .collect();

@@ -300,12 +300,14 @@ impl CapabilityStorage for crate::contract::storages::redb::ReDb {
 }
 
 /// In-process storage. See [`CapabilityStorage`].
+#[cfg(any(test, not(feature = "redb")))]
 #[derive(Default)]
 pub(crate) struct MemoryCapabilityStorage {
     records: Mutex<HashMap<DelegateKey, Vec<u8>>>,
     grants: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
 }
 
+#[cfg(any(test, not(feature = "redb")))]
 impl CapabilityStorage for MemoryCapabilityStorage {
     fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
         self.records.lock().insert(key.clone(), value.to_vec());
@@ -663,7 +665,8 @@ pub(crate) struct DelegateCapabilities {
 
 impl std::fmt::Debug for DelegateCapabilities {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DelegateCapabilities").finish_non_exhaustive()
+        f.debug_struct("DelegateCapabilities")
+            .finish_non_exhaustive()
     }
 }
 
@@ -815,9 +818,12 @@ impl DelegateCapabilities {
         let is_new = existing.is_none();
         let mut rec = match existing {
             Some(rec) => rec,
+            // An unattested registration can never be delivered to (it binds
+            // no app), so it gets no record: a record is created only by an
+            // app's registration.
+            None if app.is_none() => return None,
             None => {
-                let count = self.storage.all_records().map(|r| r.len()).unwrap_or(0);
-                if count >= MAX_CAPABILITY_RECORDS {
+                if !self.make_room_for_record() {
                     tracing::warn!(
                         delegate = %key,
                         max = MAX_CAPABILITY_RECORDS,
@@ -851,8 +857,7 @@ impl DelegateCapabilities {
                 );
             }
         }
-        if (changed || is_new) && !self.store_record(key, &rec)
-        {
+        if (changed || is_new) && !self.store_record(key, &rec) {
             return None;
         }
 
@@ -881,6 +886,39 @@ impl DelegateCapabilities {
         prompt
     }
 
+    /// Keep the record table under [`MAX_CAPABILITY_RECORDS`]. At the cap, drop
+    /// one record none of whose apps holds any grant (it could not be
+    /// delivered to anyway, and its app will re-create it when it registers
+    /// again), so registrations with junk manifests cannot crowd out a
+    /// delegate the user approved. `false` when every record is granted.
+    fn make_room_for_record(&self) -> bool {
+        let records = match self.storage.all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to count delegate capability records");
+                return false;
+            }
+        };
+        if records.len() < MAX_CAPABILITY_RECORDS {
+            return true;
+        }
+        let victim = records.into_iter().find_map(|(key, bytes)| {
+            let granted = DelegateRecord::decode(&bytes).is_some_and(|rec| {
+                rec.apps.iter().any(|app| {
+                    rec.manifest
+                        .known_capabilities()
+                        .iter()
+                        .any(|cap| self.is_granted(app, *cap))
+                })
+            });
+            (!granted).then_some(key)
+        });
+        match victim {
+            Some(key) => self.storage.remove_record(&key).is_ok(),
+            None => false,
+        }
+    }
+
     /// Forget a delegate that was unregistered. Grants belong to apps and stay.
     pub(crate) fn on_unregistered(&self, key: &DelegateKey) {
         if let Err(e) = self.storage.remove_record(key) {
@@ -906,7 +944,9 @@ impl DelegateCapabilities {
         match self.lifecycle_tx.try_send(run) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(run)) => {
-                self.stats.lifecycle_queue_full.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .lifecycle_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     delegate = %run.key,
                     event = ?run.event,
@@ -1000,7 +1040,11 @@ impl DelegateCapabilities {
     /// the event must not be delivered: no record, the manifest does not list
     /// the kind, or no bound app holds the Background grant. Checked again at
     /// delivery, so a revocation between queueing and running takes effect.
-    pub(crate) fn delivery_params(&self, key: &DelegateKey, kind: LifecycleKind) -> Option<Vec<u8>> {
+    pub(crate) fn delivery_params(
+        &self,
+        key: &DelegateKey,
+        kind: LifecycleKind,
+    ) -> Option<Vec<u8>> {
         let rec = self.load_record(key)?;
         if !rec.manifest.wants_lifecycle(kind)
             || !self.any_bound_app_granted(&rec, Capability::Background)
@@ -1268,7 +1312,10 @@ mod tests {
                 event: LifecycleEvent::Installed
             }]
         );
-        assert_eq!(c.delivery_params(&key(1), LifecycleKind::Installed), Some(b"p".to_vec()));
+        assert_eq!(
+            c.delivery_params(&key(1), LifecycleKind::Installed),
+            Some(b"p".to_vec())
+        );
         c.mark_installed_delivered(&key(1));
 
         // Re-registration: no prompt, no second Installed.
@@ -1311,6 +1358,10 @@ mod tests {
         let mut rx = c.take_lifecycle_rx().unwrap();
         let wasm = wasm_with_manifest(&background_manifest());
         assert_eq!(c.on_registered(&key(1), &wasm, &[], None), None);
+        assert!(
+            c.storage.all_records().unwrap().is_empty(),
+            "no record for no app"
+        );
         assert!(drain(&mut rx).is_empty());
         assert!(c.node_started_targets().is_empty());
         assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
@@ -1334,6 +1385,40 @@ mod tests {
         assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
     }
 
+    /// At the record cap, a never-granted record makes room; a granted one
+    /// is never evicted to make room.
+    #[test]
+    fn the_record_cap_evicts_only_ungranted_records() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let granted = key(0);
+        let p = c.on_registered(&granted, &wasm, &[], Some(app(0))).unwrap();
+        c.record_answer(&p, true);
+        for n in 1..MAX_CAPABILITY_RECORDS as u32 {
+            let k = DelegateKey::new(
+                *blake3::hash(&n.to_le_bytes()).as_bytes(),
+                CodeHash::new([1; 32]),
+            );
+            let _ = c.on_registered(&k, &wasm, &[], Some(app(1)));
+        }
+        assert_eq!(
+            c.storage.all_records().unwrap().len(),
+            MAX_CAPABILITY_RECORDS
+        );
+        let newcomer = key(250);
+        let _ = c.on_registered(&newcomer, &wasm, &[], Some(app(2)));
+        let records = c.storage.all_records().unwrap();
+        assert_eq!(records.len(), MAX_CAPABILITY_RECORDS);
+        assert!(
+            records.iter().any(|(k, _)| *k == granted),
+            "the granted record stays"
+        );
+        assert!(
+            records.iter().any(|(k, _)| *k == newcomer),
+            "the newcomer got in"
+        );
+    }
+
     #[test]
     fn app_bindings_are_capped() {
         let (c, _) = caps();
@@ -1344,10 +1429,7 @@ mod tests {
         let rec = c.load_record(&key(1)).unwrap();
         assert_eq!(rec.apps.len(), MAX_APPS_PER_DELEGATE);
         // An app over the cap is not bound, so it is not prompted either.
-        assert_eq!(
-            c.on_registered(&key(1), &wasm, &[], Some(app(200))),
-            None
-        );
+        assert_eq!(c.on_registered(&key(1), &wasm, &[], Some(app(200))), None);
     }
 
     /// Delivery requires the manifest to list the kind, whatever the grant.
@@ -1361,7 +1443,10 @@ mod tests {
         let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
         c.record_answer(&p, true);
         assert_eq!(c.delivery_params(&key(1), LifecycleKind::Installed), None);
-        assert!(c.delivery_params(&key(1), LifecycleKind::NodeStarted).is_some());
+        assert!(
+            c.delivery_params(&key(1), LifecycleKind::NodeStarted)
+                .is_some()
+        );
         // A manifest listing lifecycle kinds without Background (only possible
         // by hand, the macro refuses it) never gets them.
         let wasm = wasm_with_manifest(&DelegateManifest::new(
@@ -1426,7 +1511,10 @@ mod tests {
         );
         assert_eq!(c.admit_op(&key(2), None), Ok(()));
         assert_eq!(c.admit_op(&key(3), None), Ok(()));
-        assert_eq!(c.admit_op(&key(4), None), Err(BudgetRefusal::NodeNetworkOps));
+        assert_eq!(
+            c.admit_op(&key(4), None),
+            Err(BudgetRefusal::NodeNetworkOps)
+        );
         assert_eq!(c.stats.refused_node_ops.load(Ordering::Relaxed), 1);
         assert_eq!(c.stats.refused_delegate_ops.load(Ordering::Relaxed), 1);
         assert_eq!(c.stats.refused_contract_writes.load(Ordering::Relaxed), 1);
@@ -1463,9 +1551,15 @@ mod tests {
         sched.push(t0 + Duration::from_secs(5), run(2), 3);
         assert_eq!(sched.next_deadline(), Some(t0 + Duration::from_secs(5)));
         assert_eq!(sched.pop_due(t0), None);
-        assert_eq!(sched.pop_due(t0 + Duration::from_secs(6)), Some((run(2), 3)));
+        assert_eq!(
+            sched.pop_due(t0 + Duration::from_secs(6)),
+            Some((run(2), 3))
+        );
         assert_eq!(sched.pop_due(t0 + Duration::from_secs(6)), None);
-        assert_eq!(sched.pop_due(t0 + Duration::from_secs(10)), Some((run(1), 0)));
+        assert_eq!(
+            sched.pop_due(t0 + Duration::from_secs(10)),
+            Some((run(1), 0))
+        );
         assert_eq!(sched.len(), 0);
         assert_eq!(sched.next_deadline(), None);
     }
@@ -1476,12 +1570,16 @@ mod tests {
         let dir = crate::util::tests::get_temp_dir();
         let wasm = wasm_with_manifest(&background_manifest());
         {
-            let db = crate::contract::storages::Storage::new(dir.path()).await.unwrap();
+            let db = crate::contract::storages::Storage::new(dir.path())
+                .await
+                .unwrap();
             let c = DelegateCapabilities::new(Arc::new(db));
             let p = c.on_registered(&key(1), &wasm, b"x", Some(app(1))).unwrap();
             c.record_answer(&p, true);
         }
-        let db = crate::contract::storages::Storage::new(dir.path()).await.unwrap();
+        let db = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .unwrap();
         let c = DelegateCapabilities::new(Arc::new(db));
         assert!(matches!(
             c.grant(&app(1), Capability::Background),

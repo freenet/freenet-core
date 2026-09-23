@@ -104,10 +104,13 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use crate::client_events::websocket::{
     host_header_ip_in_cidrs, is_allowed_host, is_localhost_origin, is_loopback_source,
 };
+use crate::contract::delegate_capabilities::{AppIdentity, Grant, capability_description};
 use crate::contract::user_input::{
     CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot, emit_prompt_event, prompt_events,
 };
+use crate::server::client_api::hosted_export::ExportOpManagerHandle;
 use crate::server::{AllowedHosts, AllowedSourceCidrs};
+use freenet_stdlib::prelude::{Capability, ContractInstanceId};
 
 /// Register permission prompt routes.
 ///
@@ -124,6 +127,9 @@ pub(super) fn routes() -> Router {
         .route("/permission/pending", get(pending_prompts))
         .route("/permission/events", get(permission_events))
         .route("/permission/events/ws", get(permission_events_ws))
+        .route("/permission/grants", get(list_grants))
+        .route("/permission/grants/revoke", post(revoke_grant))
+        .route("/permission/apps", get(apps_page))
         .route("/permission/{nonce}", get(permission_page))
         .route("/permission/{nonce}/respond", post(permission_respond))
 }
@@ -523,6 +529,174 @@ async fn permission_page(
             delegate_trunc_html = delegate_trunc_html,
             message = message,
             buttons_html = buttons_html,
+        )),
+    )
+}
+
+// ==================== Apps and permissions (capability grants) ====================
+
+/// The user's remembered answers to node-enforced capability prompts
+/// (`contract::delegate_capabilities`), for the "Apps and permissions" page.
+///
+/// Same gate as `/permission/pending`: loopback peers only, and a foreign
+/// Origin gets an empty list rather than the real one.
+async fn list_grants(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
+    op_manager: Option<Extension<ExportOpManagerHandle>>,
+) -> axum::response::Response {
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+    let trusted = match headers.get("origin") {
+        Some(value) => value
+            .to_str()
+            .map(|s| is_origin_trusted(&headers, s, allowed_hosts, allowed_source_cidrs))
+            .unwrap_or(false),
+        None => true,
+    };
+    if !trusted {
+        return Json(serde_json::json!([])).into_response();
+    }
+    match capabilities_of(op_manager) {
+        Some(caps) => Json(grants_json(&caps)).into_response(),
+        None => Json(serde_json::json!([])).into_response(),
+    }
+}
+
+fn capabilities_of(
+    op_manager: Option<Extension<ExportOpManagerHandle>>,
+) -> Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+    op_manager
+        .and_then(|Extension(h)| h.current())
+        .and_then(|om| om.delegate_capabilities())
+}
+
+fn grants_json(
+    caps: &crate::contract::delegate_capabilities::DelegateCapabilities,
+) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = caps
+        .grants()
+        .into_iter()
+        .map(|(app, cap, grant)| {
+            let (state, at_ms, until_ms) = match grant {
+                Grant::Granted { at_ms } => ("granted", at_ms, None),
+                Grant::Denied { at_ms, until_ms } => ("denied", at_ms, Some(until_ms)),
+            };
+            serde_json::json!({
+                "app": app.display(),
+                "capability": serde_json::to_value(cap).unwrap_or(serde_json::Value::Null),
+                "description": capability_description(cap),
+                "state": state,
+                "at_ms": at_ms,
+                "until_ms": until_ms,
+            })
+        })
+        .collect();
+    serde_json::json!(rows)
+}
+
+#[derive(Deserialize)]
+struct RevokeGrantRequest {
+    /// The app's contract instance id, as `/permission/grants` lists it.
+    app: String,
+    /// The capability's manifest name, e.g. `"background"`.
+    capability: String,
+}
+
+/// Forget one remembered answer. A revoked Background grant stops unprompted
+/// runs at once (delivery re-checks the grant), and the app is asked again the
+/// next time it registers a delegate that wants it.
+///
+/// State-changing, so the same gate as `/permission/{nonce}/respond`:
+/// loopback peer, and an Origin that is present and trusted (CSRF). This is
+/// the design #4090 lacked when an earlier grant endpoint was reverted.
+async fn revoke_grant(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
+    op_manager: Option<Extension<ExportOpManagerHandle>>,
+    Json(body): Json<RevokeGrantRequest>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "forbidden"})),
+        );
+    }
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "missing origin"})),
+        );
+    };
+    if !is_origin_trusted(&headers, origin, allowed_hosts, allowed_source_cidrs) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "forbidden"})),
+        );
+    }
+    let Some(caps) = capabilities_of(op_manager) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "node not ready"})),
+        );
+    };
+    revoke_with(&caps, body)
+}
+
+fn revoke_with(
+    caps: &crate::contract::delegate_capabilities::DelegateCapabilities,
+    body: RevokeGrantRequest,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let Ok(id) = body.app.parse::<ContractInstanceId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid app"})),
+        );
+    };
+    let Ok(cap) = serde_json::from_value::<Capability>(serde_json::Value::String(body.capability))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid capability"})),
+        );
+    };
+    if caps.revoke(&AppIdentity::WebApp(id), cap) {
+        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "not revocable"})),
+        )
+    }
+}
+
+/// The "Apps and permissions" page: lists remembered answers with a Revoke
+/// button each. Data comes from `/permission/grants`; revocation posts to
+/// `/permission/grants/revoke`.
+async fn apps_page() -> impl IntoResponse {
+    let headers = [
+        ("X-Frame-Options", "DENY"),
+        (
+            "Content-Security-Policy",
+            "frame-ancestors 'none'; default-src 'self' 'unsafe-inline'",
+        ),
+        ("Cache-Control", "no-store"),
+    ];
+    (
+        headers,
+        Html(include_str!(
+            "permission_prompts/assets/apps_permissions.html"
         )),
     )
 }
@@ -4460,5 +4634,125 @@ mod tests {
             baseline,
             "the slot must be released when replay gives up too"
         );
+    }
+}
+
+#[cfg(test)]
+mod grant_endpoint_tests {
+    use super::*;
+    use crate::contract::delegate_capabilities::DelegateCapabilities;
+
+    fn loopback() -> Extension<ConnectInfo<SocketAddr>> {
+        Extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+    }
+
+    fn lan() -> Extension<ConnectInfo<SocketAddr>> {
+        Extension(ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 12345))))
+    }
+
+    fn origin(o: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("origin", o.parse().unwrap());
+        h
+    }
+
+    fn body(app: &str) -> Json<RevokeGrantRequest> {
+        Json(RevokeGrantRequest {
+            app: app.to_string(),
+            capability: "background".to_string(),
+        })
+    }
+
+    /// Revoking is a capability: it needs a loopback peer AND a present,
+    /// trusted Origin (CSRF), checked before anything touches the node.
+    #[tokio::test]
+    async fn revoke_is_gated_like_respond() {
+        let app = ContractInstanceId::new([1; 32]).to_string();
+        for (ci, headers, expected) in [
+            (
+                lan(),
+                origin("http://localhost:7509"),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            (
+                loopback(),
+                HeaderMap::new(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            (
+                loopback(),
+                origin("https://evil.example"),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            // Gate passed; no node behind the handle.
+            (
+                loopback(),
+                origin("http://localhost:7509"),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, _) = revoke_grant(Some(ci), headers, None, None, None, body(&app)).await;
+            assert_eq!(status, expected);
+        }
+    }
+
+    /// A foreign Origin reads an empty list, never the real one.
+    #[tokio::test]
+    async fn listing_is_withheld_from_a_foreign_origin() {
+        use axum::body::to_bytes;
+        let resp = list_grants(
+            Some(loopback()),
+            origin("https://evil.example"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(&bytes[..], b"[]");
+        let resp = list_grants(Some(lan()), HeaderMap::new(), None, None, None).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn list_and_revoke_round_trip() {
+        use crate::contract::delegate_capabilities::{AppIdentity, CapabilityPrompt, Grant};
+        let caps = DelegateCapabilities::in_memory();
+        let id = ContractInstanceId::new([2; 32]);
+        let prompt = CapabilityPrompt {
+            app: AppIdentity::WebApp(id),
+            delegate: freenet_stdlib::prelude::DelegateKey::new(
+                [3; 32],
+                freenet_stdlib::prelude::CodeHash::new([3; 32]),
+            ),
+            capabilities: vec![Capability::Background],
+        };
+        caps.record_answer(&prompt, true);
+        let listed = grants_json(&caps);
+        assert_eq!(listed[0]["app"], id.to_string());
+        assert_eq!(listed[0]["capability"], "background");
+        assert_eq!(listed[0]["state"], "granted");
+
+        let (status, _) = revoke_with(&caps, body(&id.to_string()).0);
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            caps.grant(&AppIdentity::WebApp(id), Capability::Background)
+                .is_none()
+        );
+        assert!(!matches!(
+            caps.grant(&AppIdentity::WebApp(id), Capability::Background),
+            Some(Grant::Granted { .. })
+        ));
+
+        let (status, _) = revoke_with(&caps, body("not-an-id").0);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let (status, _) = revoke_with(
+            &caps,
+            RevokeGrantRequest {
+                app: id.to_string(),
+                capability: "teleport".to_string(),
+            },
+        );
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     }
 }

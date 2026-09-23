@@ -4916,6 +4916,7 @@ async fn unsubscribe_contract_request_fails_the_run_rather_than_being_dropped()
 /// `"<event>:<parameters>"`.
 const TEST_DELEGATE_LIFECYCLE: &str = "test_delegate_lifecycle";
 
+#[allow(clippy::wildcard_enum_match_arm)]
 fn app_payloads(outbound: &[OutboundDelegateMsg]) -> Vec<Vec<u8>> {
     outbound
         .iter()

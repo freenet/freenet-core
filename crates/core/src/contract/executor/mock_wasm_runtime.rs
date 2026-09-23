@@ -525,7 +525,9 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // `#[non_exhaustive]` and is listed alongside the known variants so a
         // future one is not silently swallowed.
         let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
-            DelegateRequest::ApplicationMessages { inbound, params, .. } => (
+            DelegateRequest::ApplicationMessages {
+                inbound, params, ..
+            } => (
                 inbound.iter().map(inbound_kind).collect(),
                 params.as_ref().to_vec(),
             ),

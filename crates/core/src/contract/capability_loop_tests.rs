@@ -10,12 +10,11 @@ use std::time::Duration;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::*;
 
+use super::MockWasmContractHandler;
 use super::delegate_capabilities::{
-    AppIdentity, BudgetLimits, DelegateCapabilities, Grant, LifecycleRun,
-    MemoryCapabilityStorage,
+    AppIdentity, BudgetLimits, DelegateCapabilities, Grant, LifecycleRun, MemoryCapabilityStorage,
 };
 use super::executor::mock_wasm_runtime::ScriptedRun;
-use super::MockWasmContractHandler;
 use super::handler::{self, ContractHandlerEvent};
 use super::user_input::{self, CallerIdentity, UserInputPrompter};
 use super::{ContractError, contract_handling};
@@ -114,7 +113,10 @@ fn container(manifest: &DelegateManifest, params: &[u8]) -> DelegateContainer {
     ))))
 }
 
-fn register(delegate: DelegateContainer, origin: Option<ContractInstanceId>) -> ContractHandlerEvent {
+fn register(
+    delegate: DelegateContainer,
+    origin: Option<ContractInstanceId>,
+) -> ContractHandlerEvent {
     ContractHandlerEvent::DelegateRequest {
         req: DelegateRequest::RegisterDelegate {
             delegate,
@@ -127,7 +129,10 @@ fn register(delegate: DelegateContainer, origin: Option<ContractInstanceId>) -> 
     }
 }
 
-fn app_messages(key: &DelegateKey, inbound: Vec<InboundDelegateMsg<'static>>) -> ContractHandlerEvent {
+fn app_messages(
+    key: &DelegateKey,
+    inbound: Vec<InboundDelegateMsg<'static>>,
+) -> ContractHandlerEvent {
     ContractHandlerEvent::DelegateRequest {
         req: DelegateRequest::ApplicationMessages {
             key: key.clone(),
@@ -169,13 +174,14 @@ impl Loop {
     /// Round-trip an event through the loop, so everything queued before it
     /// has had at least one loop iteration.
     async fn sync(&self) {
-        let _ = self
-            .send
-            .send_to_handler(ContractHandlerEvent::GetQuery {
-                instance_id: ContractInstanceId::new([0xEE; 32]),
-                return_contract_code: false,
-            })
-            .await;
+        drop(
+            self.send
+                .send_to_handler(ContractHandlerEvent::GetQuery {
+                    instance_id: ContractInstanceId::new([0xEE; 32]),
+                    return_contract_code: false,
+                })
+                .await,
+        );
     }
 }
 
@@ -212,6 +218,7 @@ async fn wait_until(label: &str, mut cond: impl FnMut() -> bool) {
     panic!("timed out waiting for: {label}");
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 fn answer(event: ContractHandlerEvent) -> Result<Vec<OutboundDelegateMsg>, String> {
     match event {
         ContractHandlerEvent::DelegateResponse(r) => r.map_err(|e| e.to_string()),
@@ -229,26 +236,45 @@ async fn a_client_cannot_forge_a_host_only_message() {
     let reply = ScriptedRun::from(vec![OutboundDelegateMsg::ApplicationMessage(
         ApplicationMessage::new(b"ran".to_vec()),
     )]);
-    let lp = start("forged_lifecycle", caps.clone(), vec![reply.clone(), reply], CapabilityPrompter::answering(None)).await;
+    let lp = start(
+        "forged_lifecycle",
+        caps.clone(),
+        vec![reply.clone(), reply],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
     let key = DelegateKey::new([3; 32], CodeHash::new([3; 32]));
     for forged in [
         InboundDelegateMsg::Lifecycle(LifecycleEvent::Installed),
         InboundDelegateMsg::WakeupFired { tag: vec![1] },
     ] {
-        let resp = answer(lp.send.send_to_handler(app_messages(&key, vec![forged])).await.unwrap());
-        assert!(resp.is_err(), "forged host-only message must be refused, got {resp:?}");
+        let resp = answer(
+            lp.send
+                .send_to_handler(app_messages(&key, vec![forged]))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            resp.is_err(),
+            "forged host-only message must be refused, got {resp:?}"
+        );
     }
     assert!(
         lp.observations.lock().unwrap().is_empty(),
         "the delegate must not have run"
     );
-    assert_eq!(caps.stats.forged_lifecycle_refused.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        caps.stats.forged_lifecycle_refused.load(Ordering::Relaxed),
+        2
+    );
     // An ordinary message still runs.
     let ok = answer(
         lp.send
             .send_to_handler(app_messages(
                 &key,
-                vec![InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(b"hi".to_vec()))],
+                vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(b"hi".to_vec()),
+                )],
             ))
             .await
             .unwrap(),
@@ -271,28 +297,66 @@ async fn allow_at_registration_delivers_installed_once_with_registered_params() 
     let lp = start(
         "cap_allow",
         caps.clone(),
-        vec![ScriptedRun::default(), ScriptedRun::default(), ScriptedRun::default()],
+        vec![
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+        ],
         prompter,
     )
     .await;
 
-    let resp = answer(lp.send.send_to_handler(register(delegate.clone(), Some(app(1)))).await.unwrap());
+    let resp = answer(
+        lp.send
+            .send_to_handler(register(delegate.clone(), Some(app(1))))
+            .await
+            .unwrap(),
+    );
     assert!(resp.is_ok(), "{resp:?}");
     wait_until("Installed delivered", || !lp.lifecycle_runs().is_empty()).await;
-    assert_eq!(lp.lifecycle_runs(), vec![(key.clone(), b"reg-params".to_vec())]);
+    assert_eq!(
+        lp.lifecycle_runs(),
+        vec![(key.clone(), b"reg-params".to_vec())]
+    );
     assert!(matches!(
         caps.grant(&AppIdentity::WebApp(app(1)), Capability::Background),
         Some(Grant::Granted { .. })
     ));
     assert_eq!(asked.load(Ordering::SeqCst), 1);
 
-    let resp = answer(lp.send.send_to_handler(register(delegate, Some(app(1)))).await.unwrap());
+    let resp = answer(
+        lp.send
+            .send_to_handler(register(delegate, Some(app(1))))
+            .await
+            .unwrap(),
+    );
     assert!(resp.is_ok(), "{resp:?}");
     lp.sync().await;
     lp.sync().await;
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "a granted app is never asked again");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "a granted app is never asked again"
+    );
     assert_eq!(lp.lifecycle_runs().len(), 1, "Installed is delivered once");
     assert_eq!(caps.stats.lifecycle_delivered.load(Ordering::Relaxed), 1);
+
+    // Even if Installed is queued again (two apps granting at once, a
+    // re-registration racing the first delivery), delivery re-checks the
+    // flag and runs it at most once.
+    for _ in 0..2 {
+        assert!(caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::Installed,
+        }));
+    }
+    lp.sync().await;
+    lp.sync().await;
+    assert_eq!(
+        lp.lifecycle_runs().len(),
+        1,
+        "a re-queued Installed is not re-run"
+    );
 }
 
 /// "Not now" is remembered as a denial and nothing is delivered. A remote
@@ -311,10 +375,16 @@ async fn not_now_delivers_nothing_and_a_remote_registration_binds_no_app() {
         prompter,
     )
     .await;
-    let resp = answer(lp.send.send_to_handler(register(delegate.clone(), Some(app(2)))).await.unwrap());
+    let resp = answer(
+        lp.send
+            .send_to_handler(register(delegate.clone(), Some(app(2))))
+            .await
+            .unwrap(),
+    );
     assert!(resp.is_ok());
     wait_until("the prompt to be answered", || {
-        caps.grant(&AppIdentity::WebApp(app(2)), Capability::Background).is_some()
+        caps.grant(&AppIdentity::WebApp(app(2)), Capability::Background)
+            .is_some()
     })
     .await;
     assert!(matches!(
@@ -343,8 +413,15 @@ async fn not_now_delivers_nothing_and_a_remote_registration_binds_no_app() {
     );
     assert!(resp.is_ok(), "{resp:?}");
     lp.sync().await;
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "a remote registration prompts nobody");
-    assert!(caps.grant(&AppIdentity::WebApp(app(3)), Capability::Background).is_none());
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "a remote registration prompts nobody"
+    );
+    assert!(
+        caps.grant(&AppIdentity::WebApp(app(3)), Capability::Background)
+            .is_none()
+    );
 }
 
 /// Registration answers the client at once while the capability prompt waits
@@ -377,7 +454,10 @@ async fn a_pending_capability_prompt_does_not_block_registration() {
     .expect("registration must not wait for the user's answer")
     .unwrap();
     assert!(answer(resp).is_ok());
-    wait_until("the prompt to be raised", || asked.load(Ordering::SeqCst) == 1).await;
+    wait_until("the prompt to be raised", || {
+        asked.load(Ordering::SeqCst) == 1
+    })
+    .await;
     assert!(lp.lifecycle_runs().is_empty(), "nothing before the answer");
     gate.add_permits(1);
     wait_until("Installed after Allow", || lp.lifecycle_runs().len() == 1).await;
@@ -397,33 +477,75 @@ async fn node_started_reaches_only_granted_delegates() {
     let denied = container(&started_only, b"denied");
     let unattested = container(&started_only, b"unattested");
     let p = caps
-        .on_registered(granted.key(), &manifest_module(&started_only), b"granted", Some(AppIdentity::WebApp(app(5))))
+        .on_registered(
+            granted.key(),
+            &manifest_module(&started_only),
+            b"granted",
+            Some(AppIdentity::WebApp(app(5))),
+        )
         .unwrap();
     caps.record_answer(&p, true);
     let p = caps
-        .on_registered(denied.key(), &manifest_module(&started_only), b"denied", Some(AppIdentity::WebApp(app(6))))
+        .on_registered(
+            denied.key(),
+            &manifest_module(&started_only),
+            b"denied",
+            Some(AppIdentity::WebApp(app(6))),
+        )
         .unwrap();
     caps.record_answer(&p, false);
-    assert!(caps
-        .on_registered(unattested.key(), &manifest_module(&started_only), b"unattested", None)
-        .is_none());
+    assert!(
+        caps.on_registered(
+            unattested.key(),
+            &manifest_module(&started_only),
+            b"unattested",
+            None
+        )
+        .is_none()
+    );
 
     let lp = start(
         "cap_node_started",
         caps.clone(),
-        vec![ScriptedRun::default(), ScriptedRun::default(), ScriptedRun::default()],
+        vec![
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+        ],
         CapabilityPrompter::answering(None),
     )
     .await;
     // Past the smear window (virtual time).
-    tokio::time::sleep(super::delegate_capabilities::NODE_STARTED_MIN_DELAY
-        + super::delegate_capabilities::NODE_STARTED_SMEAR
-        + Duration::from_secs(1))
+    tokio::time::sleep(
+        super::delegate_capabilities::NODE_STARTED_MIN_DELAY
+            + super::delegate_capabilities::NODE_STARTED_SMEAR
+            + Duration::from_secs(1),
+    )
     .await;
     lp.sync().await;
     assert_eq!(
         lp.lifecycle_runs(),
         vec![(granted.key().clone(), b"granted".to_vec())]
+    );
+
+    // A run that reaches the queue for an ungranted delegate (a grant revoked
+    // after it was queued) is re-checked at delivery and not run.
+    for key in [denied.key(), unattested.key()] {
+        assert!(caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            },
+        }));
+    }
+    lp.sync().await;
+    lp.sync().await;
+    assert_eq!(lp.lifecycle_runs().len(), 1);
+    assert_eq!(
+        caps.stats
+            .lifecycle_dropped_not_granted
+            .load(Ordering::Relaxed),
+        2
     );
 }
 
@@ -442,21 +564,35 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
     let delegate = container(&manifest, b"p");
     let key = delegate.key().clone();
     let p = caps
-        .on_registered(&key, &manifest_module(&manifest), b"p", Some(AppIdentity::WebApp(app(7))))
+        .on_registered(
+            &key,
+            &manifest_module(&manifest),
+            b"p",
+            Some(AppIdentity::WebApp(app(7))),
+        )
         .unwrap();
     caps.record_answer(&p, true);
 
     let two_gets = || {
         ScriptedRun::from(vec![
-            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new([0x51; 32]))),
-            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new([0x52; 32]))),
+            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
+                ContractInstanceId::new([0x51; 32]),
+            )),
+            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
+                ContractInstanceId::new([0x52; 32]),
+            )),
         ])
     };
     // client run (2 GETs) + its follow-up, lifecycle run (2 GETs) + follow-up
     let lp = start(
         "cap_budget",
         caps.clone(),
-        vec![two_gets(), ScriptedRun::default(), two_gets(), ScriptedRun::default()],
+        vec![
+            two_gets(),
+            ScriptedRun::default(),
+            two_gets(),
+            ScriptedRun::default(),
+        ],
         CapabilityPrompter::answering(None),
     )
     .await;
@@ -466,7 +602,9 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
         lp.send
             .send_to_handler(app_messages(
                 &key,
-                vec![InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(b"go".to_vec()))],
+                vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(b"go".to_vec()),
+                )],
             ))
             .await
             .unwrap(),
@@ -477,7 +615,9 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
     // Unprompted: the second GET is refused.
     assert!(lp.caps.queue(LifecycleRun {
         key: key.clone(),
-        event: LifecycleEvent::NodeStarted { down_since_ms: None },
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
     }));
     wait_until("the lifecycle run and its follow-up", || {
         lp.observations.lock().unwrap().len() == 4
@@ -504,15 +644,28 @@ async fn a_spent_duty_budget_defers_lifecycle_runs() {
     let delegate = container(&manifest, b"p");
     let key = delegate.key().clone();
     let p = caps
-        .on_registered(&key, &manifest_module(&manifest), b"p", Some(AppIdentity::WebApp(app(8))))
+        .on_registered(
+            &key,
+            &manifest_module(&manifest),
+            b"p",
+            Some(AppIdentity::WebApp(app(8))),
+        )
         .unwrap();
     caps.record_answer(&p, true);
     caps.charge_duty(&key, Duration::from_secs(10));
 
-    let lp = start("cap_duty", caps.clone(), vec![ScriptedRun::default()], CapabilityPrompter::answering(None)).await;
+    let lp = start(
+        "cap_duty",
+        caps.clone(),
+        vec![ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
     assert!(caps.queue(LifecycleRun {
         key,
-        event: LifecycleEvent::NodeStarted { down_since_ms: None },
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
     }));
     wait_until("the deferral", || {
         caps.stats.lifecycle_deferred_duty.load(Ordering::Relaxed) == 1

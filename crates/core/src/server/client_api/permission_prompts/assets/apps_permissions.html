@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freenet - Apps and permissions</title>
+<style>
+  :root { --bg: #0f1419; --fg: #e6e8eb; --card: #1a2028; --accent: #3b82f6;
+          --border: #2d3748; --muted: #6b7280; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f5f5f5; --fg: #1a1a1a; --card: #fff; --accent: #2563eb;
+            --border: #d1d5db; --muted: #6b7280; }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); padding: 24px 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+          padding: 24px; max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+  p.intro { color: var(--muted); font-size: 14px; margin-bottom: 16px; line-height: 1.5; }
+  .row { display: flex; gap: 12px; align-items: center; padding: 12px 0;
+         border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .row .what { flex: 1; min-width: 220px; font-size: 14px; line-height: 1.4; }
+  .row .app { font-family: monospace; font-size: 12px; color: var(--muted); word-break: break-all; }
+  button { padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px;
+           background: var(--card); color: var(--fg); cursor: pointer; font-size: 14px; }
+  .empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Apps and permissions</h1>
+  <p class="intro">Your answers to the permissions Freenet asked you for on behalf of apps.
+  Freenet asks once and remembers. Revoking an answer stops the permission now; the app
+  will ask again the next time you open it.</p>
+  <div id="list"><div class="empty">Loading...</div></div>
+</div>
+<script>
+(function () {
+  var list = document.getElementById('list');
+  function row(g) {
+    var r = document.createElement('div');
+    r.className = 'row';
+    var what = document.createElement('div');
+    what.className = 'what';
+    var line = document.createElement('div');
+    line.textContent = (g.state === 'granted' ? 'Allowed: ' : 'Declined: ') + g.description;
+    var app = document.createElement('div');
+    app.className = 'app';
+    app.textContent = 'Freenet app ' + g.app;
+    what.appendChild(line);
+    what.appendChild(app);
+    var btn = document.createElement('button');
+    btn.textContent = g.state === 'granted' ? 'Revoke' : 'Forget';
+    btn.onclick = function () {
+      btn.disabled = true;
+      fetch('/permission/grants/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app: g.app, capability: g.capability })
+      }).then(load, load);
+    };
+    r.appendChild(what);
+    r.appendChild(btn);
+    return r;
+  }
+  function load() {
+    fetch('/permission/grants').then(function (r) { return r.json(); }).then(function (grants) {
+      list.textContent = '';
+      if (!grants.length) {
+        var e = document.createElement('div');
+        e.className = 'empty';
+        e.textContent = 'No app has asked for a permission yet.';
+        list.appendChild(e);
+        return;
+      }
+      grants.forEach(function (g) { list.appendChild(row(g)); });
+    }, function () {
+      list.textContent = 'Could not load permissions.';
+    });
+  }
+  load();
+})();
+</script>
+</body>
+</html>
