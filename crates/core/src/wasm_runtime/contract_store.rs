@@ -527,11 +527,18 @@ impl ContractStore {
         // self-discharging — each hold carries its own node's closure — so this
         // module keeps no `crate::ring` dependency.
         //
-        // Persisted too (#5493): a surviving row would re-subscribe to, and
-        // re-fetch, the removed contract at every boot.
+        // IN MEMORY ONLY (#5493). This runs for storage reasons, not because a
+        // delegate withdrew its subscription: hosting-cache eviction, PUT
+        // rollback (including a transient related-contract fetch failure), the
+        // disk-budget and init-tracker rejections. Erasing the persisted row
+        // here would turn any of those into a permanent loss of the delegate's
+        // subscription, and restored pairs are exposed to eviction until their
+        // interest is re-established. The row stays; the next boot re-subscribes,
+        // which is what the delegate asked for. Only `UnregisterDelegate` (and
+        // restore's unregistered-delegate backstop) deletes rows.
         super::delegate_subscriptions::remove_contract(
             key.id(),
-            super::delegate_subscriptions::Durability::Persist(&self.db),
+            super::delegate_subscriptions::Durability::InMemoryOnly,
         );
         super::delegate_interest::release_contract(key.id());
 

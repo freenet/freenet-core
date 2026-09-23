@@ -47,6 +47,11 @@
 //! global handle would send one node's durable writes to another node's
 //! database.
 //!
+//! A row is deleted only when the delegate is unregistered (or, as a
+//! backstop, when restore finds its delegate gone). Subscriptions dropped for
+//! any other reason (cap eviction aside, which replaces the row) keep their
+//! row, so the next boot re-subscribes: see [`Durability`].
+//!
 //! [`restore_from_storage`] replays the durable set into memory at startup
 //! (`NetworkContractHandler::build`), through the SAME admission path a live
 //! subscribe uses, so the per-delegate cap applies on restore exactly as on
@@ -211,11 +216,16 @@ static CAP_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// Whether a registry mutation is mirrored to the node's durable store.
 ///
 /// Every writer takes one, so each call site states its choice instead of
-/// inheriting a default. `InMemoryOnly` is correct in exactly two places:
+/// inheriting a default. The rule: a persisted row is deleted only when the
+/// DELEGATE's intent is gone (it was unregistered). `InMemoryOnly` is used
+/// wherever a subscription is dropped for any other reason:
 ///
 ///  * the delegate-notification channel closing, which happens when the node is
 ///    shutting down, so erasing the durable rows there would erase every
 ///    delegate's subscriptions on every clean shutdown;
+///  * contract removal from the store (`ContractStore::remove_contract`), which
+///    is storage housekeeping (eviction, PUT rollback, budget rejection), not
+///    the delegate unsubscribing;
 ///  * executors with no durable store (mock and simulation runtimes, unit
 ///    tests).
 #[derive(Clone, Copy)]
@@ -636,11 +646,11 @@ fn remove_delegate_in_memory(delegate: &DelegateKey) {
 /// Drop every subscription to `contract` (contract removed, or its notification
 /// channel closed).
 ///
-/// Contract removal passes [`Durability::Persist`]: the contract is gone from
-/// this node, and a surviving row would re-subscribe to it (and re-fetch it
-/// from the network) at every boot. The notification-channel-closed path
-/// passes [`Durability::InMemoryOnly`], because that channel closes on node
-/// shutdown, and the subscriptions must survive exactly that.
+/// Both production callers pass [`Durability::InMemoryOnly`] (see
+/// [`Durability`]): contract removal is storage housekeeping, not the delegate
+/// unsubscribing, and the notification channel closes on node shutdown, which
+/// the subscriptions must survive. The `Persist` form exists for completeness
+/// and tests.
 pub(crate) fn remove_contract(contract: &ContractInstanceId, durability: Durability<'_>) {
     let Durability::Persist(db) = durability else {
         remove_contract_in_memory(contract);
@@ -854,10 +864,20 @@ pub(crate) fn is_subscribed(contract: &ContractInstanceId, delegate: &DelegateKe
 ///
 /// | Row | Outcome |
 /// |---|---|
-/// | malformed (bad length or format byte) | deleted from disk, skipped |
-/// | delegate no longer registered | deleted from disk, skipped: nothing is left to unregister it, so it would be replayed at every boot |
-/// | beyond [`MAX_DURABLE_DELEGATE_SUBSCRIPTIONS`] | deleted from disk, skipped |
+/// | wrong key length | deleted from disk, skipped |
+/// | unknown format byte | skipped, NOT deleted: a later version may have written it, and a rollback to this binary must not destroy it |
+/// | beyond [`MAX_DURABLE_DELEGATE_SUBSCRIPTIONS`] | skipped, NOT deleted, for the same forward-compatibility reason |
+/// | delegate no longer registered | deleted from disk, skipped: nothing is left to unregister it, so it would be replayed at every boot. Definitive because `DelegateStore::new` (run by `RuntimePool::new`, earlier in `build`) has already repaired the index from the `.reg` backups |
 /// | delegate over its per-delegate cap | admitted through [`subscribe_in_memory`], which evicts exactly as a live subscribe would; the evicted row is deleted from disk |
+///
+/// Restored pairs all carry the same recency stamp (restore time), so the
+/// first cap eviction after a restart picks by iteration order rather than by
+/// last notification. Persisting the stamp would mean a write per
+/// notification, which is not worth it for a tie-break at the cap.
+///
+/// An UPGRADED delegate is a new key: its predecessor's rows stay with the
+/// predecessor while that key is registered, and are dropped once it is not.
+/// Nothing migrates them (no migration primitive, by design).
 ///
 /// A contract that is not in the local store is deliberately KEPT: a live
 /// subscribe for a contract this node has never seen is the primary use case
@@ -884,7 +904,7 @@ pub(crate) fn restore_from_storage(db: &Storage) -> Vec<(ContractInstanceId, Del
 #[cfg(feature = "redb")]
 mod durable {
     use super::*;
-    use crate::contract::storages::redb::MAX_DURABLE_DELEGATE_SUBSCRIPTIONS;
+    use crate::contract::storages::redb::{DurableRecord, MAX_DURABLE_DELEGATE_SUBSCRIPTIONS};
 
     /// Warnings on the write path are throttled like the cap-eviction warning,
     /// for the same reason: a delegate subscribing in a loop at the node-wide
@@ -903,8 +923,23 @@ mod durable {
             evicted,
             MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
         ) {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(DurableRecord::Recorded) => {}
+            Ok(DurableRecord::RecordedDisplacing(displaced)) => {
+                let total = NOT_PERSISTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if total == 1 || total % 64 == 0 {
+                    tracing::warn!(
+                        %delegate,
+                        %contract,
+                        displaced_delegate = %displaced,
+                        ceiling = MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
+                        not_persisted_total = total,
+                        "Durable delegate-subscription table is at its node-wide ceiling; \
+                         dropped one persisted row of the delegate holding the most, which \
+                         still works now but will not survive a restart"
+                    );
+                }
+            }
+            Ok(DurableRecord::Refused) => {
                 let total = NOT_PERSISTED.fetch_add(1, Ordering::Relaxed) + 1;
                 if total == 1 || total % 64 == 0 {
                     tracing::warn!(
@@ -966,8 +1001,8 @@ mod durable {
 
         let mut to_delete = loaded.malformed;
         let malformed = to_delete.len();
-        let excess = loaded.excess.len();
-        to_delete.extend(loaded.excess);
+        let unknown_version = loaded.unknown_version;
+        let excess = loaded.excess;
 
         let mut restored = Vec::new();
         let mut unregistered = 0usize;
@@ -1009,12 +1044,13 @@ mod durable {
                  re-examined at the next boot");
         }
 
-        if !restored.is_empty() || !to_delete.is_empty() {
+        if !restored.is_empty() || !to_delete.is_empty() || unknown_version > 0 || excess > 0 {
             tracing::info!(
                 restored = restored.len(),
                 dropped_unregistered_delegate = unregistered,
                 dropped_malformed = malformed,
-                dropped_over_ceiling = excess,
+                skipped_unknown_version = unknown_version,
+                skipped_over_ceiling = excess,
                 dropped_over_delegate_cap = cap_evicted,
                 "Restored persisted delegate subscriptions"
             );
@@ -1700,6 +1736,7 @@ mod tests {
         // Contract ids here start at 40000: 20000..20320 belongs to the
         // concurrency test's fillers, and the registry is process-global.
         use super::*;
+        use crate::contract::storages::redb::DurableRecord;
 
         async fn open_db() -> (Storage, tempfile::TempDir) {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1797,33 +1834,78 @@ mod tests {
             cleanup(&other);
         }
 
+        /// `Persist` removal clears every delegate's row for the contract;
+        /// `InMemoryOnly` (what both production callers use: contract removal
+        /// is storage housekeeping, and the channel-closed path runs at
+        /// shutdown) clears none, so the next boot restores the pair.
         #[tokio::test]
-        async fn contract_removal_clears_rows_but_a_closed_notification_channel_does_not() {
+        async fn contract_removal_in_memory_only_keeps_rows_for_the_next_boot() {
             let (db, _dir) = open_db().await;
             let a = dkey(105);
             let b = dkey(106);
             register(&db, &a);
             register(&db, &b);
-            let removed = cid(40030);
-            let shutdown = cid(40031);
-            subscribe(removed, &a, Durability::Persist(&db));
-            subscribe(removed, &b, Durability::Persist(&db));
-            subscribe(shutdown, &a, Durability::Persist(&db));
+            let persisted_removal = cid(40030);
+            let housekeeping = cid(40031);
+            subscribe(persisted_removal, &a, Durability::Persist(&db));
+            subscribe(persisted_removal, &b, Durability::Persist(&db));
+            subscribe(housekeeping, &a, Durability::Persist(&db));
 
-            remove_contract(&removed, Durability::Persist(&db));
-            // The channel-closed path, which runs on node shutdown.
-            remove_contract(&shutdown, Durability::InMemoryOnly);
+            remove_contract(&persisted_removal, Durability::Persist(&db));
+            remove_contract(&housekeeping, Durability::InMemoryOnly);
 
-            assert_eq!(
-                rows(&db),
-                vec![(shutdown, a.clone())],
-                "contract removal must clear every delegate's row for it; a shutdown must clear none"
-            );
-            assert!(!is_subscribed(&shutdown, &a));
-            assert_eq!(restore_from_storage(&db), vec![(shutdown, a.clone())]);
-            assert!(is_subscribed(&shutdown, &a));
+            assert_eq!(rows(&db), vec![(housekeeping, a.clone())]);
+            assert!(!is_subscribed(&housekeeping, &a));
+            assert_eq!(restore_from_storage(&db), vec![(housekeeping, a.clone())]);
+            assert!(is_subscribed(&housekeeping, &a));
             cleanup(&a);
             cleanup(&b);
+        }
+
+        /// Body of `sig` in `src`, from its opening brace to the matching
+        /// close, with comment lines dropped so prose cannot satisfy a pin.
+        fn fn_body(src: &str, sig: &str) -> String {
+            let start = src.find(sig).unwrap_or_else(|| panic!("`{sig}` not found"));
+            let open = start + src[start..].find('{').expect("no body");
+            let mut depth = 0i32;
+            for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return src[open..open + i]
+                                .lines()
+                                .filter(|l| !l.trim_start().starts_with("//"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in `{sig}`");
+        }
+
+        /// Pin: the two removal paths that are NOT the delegate withdrawing
+        /// its intent must not erase persisted rows. A `Persist` here would
+        /// make eviction, a PUT rollback, or every clean shutdown delete
+        /// subscriptions permanently. Mutation-checked by switching either
+        /// call site to `Persist`.
+        #[test]
+        fn housekeeping_and_shutdown_removals_do_not_erase_persisted_rows() {
+            let store = fn_body(include_str!("contract_store.rs"), "pub fn remove_contract(");
+            assert!(store.contains("delegate_subscriptions::remove_contract("));
+            assert!(store.contains("Durability::InMemoryOnly"));
+            assert!(!store.contains("Durability::Persist"));
+
+            let notify = fn_body(
+                include_str!("../contract/executor/runtime/executor_impl.rs"),
+                "fn send_delegate_contract_notifications(",
+            );
+            assert!(notify.contains("delegate_subscriptions::remove_contract("));
+            assert!(notify.contains("Durability::InMemoryOnly"));
+            assert!(!notify.contains("Durability::Persist"));
         }
 
         #[tokio::test]
@@ -1911,10 +1993,12 @@ mod tests {
             cleanup(&d);
         }
 
-        /// Corrupt rows never crash restore and never block the valid ones;
-        /// they are deleted so they are not re-read at every boot.
+        /// Corrupt rows never crash restore and never block the valid ones.
+        /// A wrong-length row is garbage under any format and is deleted; an
+        /// unknown format byte may come from a later version, so it is skipped
+        /// but KEPT (an auto-update rollback must not destroy newer data).
         #[tokio::test]
-        async fn restore_skips_and_deletes_malformed_rows() {
+        async fn restore_skips_bad_rows_deleting_only_undecodable_ones() {
             let (db, _dir) = open_db().await;
             let d = dkey(110);
             register(&db, &d);
@@ -1930,7 +2014,11 @@ mod tests {
 
             let restored = restore_from_storage(&db);
             assert_eq!(restored, vec![(cid(44000), d.clone())]);
-            assert_eq!(db.delegate_subscription_row_count(), 1);
+            assert_eq!(
+                db.delegate_subscription_row_count(),
+                2,
+                "the short key goes; the unknown-version row stays"
+            );
             cleanup(&d);
         }
 
@@ -1958,43 +2046,58 @@ mod tests {
             assert!(rows(&db).is_empty());
         }
 
-        /// The node-wide ceiling: past it a new subscription still works in
-        /// memory but is not written, and an eviction in the same call is still
-        /// applied.
+        /// The node-wide ceiling is fair, not first-come: a newcomer displaces
+        /// a row of the delegate holding the most, while that delegate holds
+        /// more than one row more than the newcomer; after that it is refused.
         #[tokio::test]
-        async fn the_node_wide_ceiling_bounds_what_is_persisted() {
+        async fn the_node_wide_ceiling_is_bounded_and_fair() {
             let (db, _dir) = open_db().await;
-            let d = dkey(113);
-            assert!(
-                db.record_delegate_subscription(&cid(46000), &d, None, 2)
-                    .unwrap()
-            );
-            assert!(
-                db.record_delegate_subscription(&cid(46001), &d, None, 2)
-                    .unwrap()
-            );
-            assert!(
-                !db.record_delegate_subscription(&cid(46002), &d, None, 2)
+            let heavy = dkey(113);
+            let newcomer = dkey(114);
+            for i in 0..4u16 {
+                assert_eq!(
+                    db.record_delegate_subscription(&cid(46000 + i), &heavy, None, 4)
+                        .unwrap(),
+                    DurableRecord::Recorded
+                );
+            }
+            assert_eq!(db.delegate_subscription_row_count(), 4);
+            // heavy 4 vs newcomer 0, then heavy 3 vs newcomer 1: displaces.
+            for i in 0..2u16 {
+                assert_eq!(
+                    db.record_delegate_subscription(&cid(46100 + i), &newcomer, None, 4)
+                        .unwrap(),
+                    DurableRecord::RecordedDisplacing(heavy.clone())
+                );
+            }
+            // heavy 2 vs newcomer 2: fair, so refused.
+            assert_eq!(
+                db.record_delegate_subscription(&cid(46102), &newcomer, None, 4)
                     .unwrap(),
-                "a third row must be refused at a ceiling of 2"
+                DurableRecord::Refused
             );
-            assert_eq!(db.delegate_subscription_row_count(), 2);
+            assert_eq!(
+                db.delegate_subscription_row_count(),
+                4,
+                "never above the ceiling"
+            );
             // Re-recording an existing row at the ceiling is not a refusal.
-            assert!(
-                db.record_delegate_subscription(&cid(46000), &d, None, 2)
-                    .unwrap()
+            assert_eq!(
+                db.record_delegate_subscription(&cid(46100), &newcomer, None, 4)
+                    .unwrap(),
+                DurableRecord::Recorded
             );
             // An eviction frees its slot in the same transaction.
-            assert!(
-                db.record_delegate_subscription(&cid(46002), &d, Some(&cid(46000)), 2)
-                    .unwrap()
+            assert_eq!(
+                db.record_delegate_subscription(&cid(46102), &newcomer, Some(&cid(46100)), 4)
+                    .unwrap(),
+                DurableRecord::Recorded
             );
             let loaded = db.load_delegate_subscriptions(1).unwrap();
             assert_eq!(loaded.valid.len(), 1);
             assert_eq!(
-                loaded.excess.len(),
-                1,
-                "rows past max_rows are reported, not dropped silently"
+                loaded.excess, 3,
+                "rows past max_rows are counted and left in place"
             );
         }
     }

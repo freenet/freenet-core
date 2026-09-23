@@ -294,23 +294,44 @@ pub(crate) const DELEGATE_SUBSCRIPTION_ROW_V1: u8 = 1;
 /// legitimate use (River holds single digits per user, Harvest 4-5 per seller),
 /// and 4096 * 96 bytes is under 400 KiB on disk.
 ///
-/// Above it a NEW subscription still works for the life of the process; it is
-/// only not persisted, and that is logged. Refusing the in-memory subscription
-/// instead would turn a durability bound into a functional one.
+/// At the ceiling the table stays FAIR rather than first-come: a new row
+/// displaces one row of the delegate holding the most, provided that delegate
+/// holds more than one row more than the newcomer's (see
+/// [`ReDb::record_delegate_subscription`]). Otherwise the new subscription still
+/// works for the life of the process and is only not persisted, which is
+/// logged. Refusing the in-memory subscription instead would turn a durability
+/// bound into a functional one.
 pub(crate) const MAX_DURABLE_DELEGATE_SUBSCRIPTIONS: u64 = 4096;
+
+/// What [`ReDb::record_delegate_subscription`] did with the new row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DurableRecord {
+    /// Written (or already present).
+    Recorded,
+    /// Written at the ceiling by displacing one row of this delegate, the one
+    /// holding the most rows. The displaced subscription still works in memory
+    /// but will not survive a restart.
+    RecordedDisplacing(DelegateKey),
+    /// Not written: at the ceiling and no delegate holds disproportionately more
+    /// than this one.
+    Refused,
+}
 
 /// What [`ReDb::load_delegate_subscriptions`] found.
 #[derive(Debug, Default)]
 pub(crate) struct DurableDelegateSubscriptions {
     /// Well-formed rows, in key order, at most `max_rows` of them.
     pub valid: Vec<(ContractInstanceId, DelegateKey)>,
-    /// Raw keys of rows that could not be decoded (wrong key length or unknown
-    /// format byte). The caller deletes these so they are not re-read forever.
+    /// Raw keys of rows with the wrong key length: garbage under any format,
+    /// so the caller deletes them rather than re-reading them forever.
     pub malformed: Vec<Vec<u8>>,
-    /// Raw keys of well-formed rows beyond `max_rows`. Only reachable if the
-    /// table was written by something that did not honour the ceiling; the
-    /// caller deletes them so the table converges back under it.
-    pub excess: Vec<Vec<u8>>,
+    /// Count of rows with a correct key but an unknown format byte. Skipped and
+    /// deliberately NOT deleted: a later version may have written them, and an
+    /// auto-update rollback to this binary must not destroy its data.
+    pub unknown_version: usize,
+    /// Count of well-formed rows beyond `max_rows`. Skipped, NOT deleted, for
+    /// the same reason (a later version may have raised the ceiling).
+    pub excess: usize,
 }
 
 /// Metadata about a hosted contract, persisted to survive restarts.
@@ -2086,11 +2107,11 @@ impl ReDb {
         (lo, hi)
     }
 
-    fn decode_delegate_subscription_row(
-        key: &[u8],
-        value: &[u8],
-    ) -> Option<(ContractInstanceId, DelegateKey)> {
-        if key.len() != 96 || value != [DELEGATE_SUBSCRIPTION_ROW_V1] {
+    /// Decode a row KEY. `None` only for a wrong length; the value (format
+    /// byte) is judged separately so an unknown version can be skipped without
+    /// being deleted.
+    fn decode_delegate_subscription_key(key: &[u8]) -> Option<(ContractInstanceId, DelegateKey)> {
+        if key.len() != 96 {
             return None;
         }
         let contract: [u8; 32] = key[..32].try_into().ok()?;
@@ -2107,18 +2128,21 @@ impl ReDb {
     /// it, so the cap can never be exceeded on disk by a crash between two
     /// writes.
     ///
-    /// Returns `Ok(false)` when the row was NOT written because the table is at
-    /// `max_rows` (the eviction, if any, is still applied).
+    /// At `max_rows` the table stays fair: the delegate holding the most rows
+    /// gives one up to the newcomer if it holds more than one row more than the
+    /// newcomer's delegate does; otherwise the new row is refused. The scan
+    /// that decides this runs only at the ceiling, over at most `max_rows`
+    /// rows. The eviction, if any, is applied in every case.
     pub(crate) fn record_delegate_subscription(
         &self,
         contract: &ContractInstanceId,
         delegate: &DelegateKey,
         evicted: Option<&ContractInstanceId>,
         max_rows: u64,
-    ) -> Result<bool, redb::Error> {
+    ) -> Result<DurableRecord, redb::Error> {
         let row = Self::delegate_subscription_row_key(contract, delegate);
         let txn = self.begin_write()?;
-        let recorded;
+        let outcome;
         {
             let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
             if let Some(evicted) = evicted {
@@ -2126,16 +2150,52 @@ impl ReDb {
                 tbl.remove(evicted_row.as_slice())?;
             }
             if tbl.get(row.as_slice())?.is_some() {
-                recorded = true;
-            } else if tbl.len()? >= max_rows {
-                recorded = false;
-            } else {
+                outcome = DurableRecord::Recorded;
+            } else if tbl.len()? < max_rows {
                 tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
-                recorded = true;
+                outcome = DurableRecord::Recorded;
+            } else {
+                // Fair share at the ceiling. Count rows per delegate and find
+                // the heaviest holder, remembering one of its rows to give up.
+                let mine = Self::delegate_key64(delegate);
+                let mut counts: std::collections::HashMap<[u8; 64], (usize, Vec<u8>)> =
+                    std::collections::HashMap::new();
+                for entry in tbl.iter()? {
+                    let (k, _) = entry?;
+                    let key = k.value();
+                    if key.len() != 96 {
+                        continue;
+                    }
+                    let mut holder = [0u8; 64];
+                    holder.copy_from_slice(&key[32..]);
+                    let slot = counts.entry(holder).or_insert((0, Vec::new()));
+                    slot.0 += 1;
+                    slot.1 = key.to_vec();
+                }
+                let my_count = counts.get(&mine).map_or(0, |(n, _)| *n);
+                let heaviest = counts
+                    .iter()
+                    .max_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| a.0.cmp(b.0)))
+                    .map(|(holder, (n, victim))| (*holder, *n, victim.clone()));
+                match heaviest {
+                    Some((holder, n, victim)) if holder != mine && n > my_count + 1 => {
+                        tbl.remove(victim.as_slice())?;
+                        tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
+                        let mut dk = [0u8; 32];
+                        dk.copy_from_slice(&holder[..32]);
+                        let mut ch = [0u8; 32];
+                        ch.copy_from_slice(&holder[32..]);
+                        outcome = DurableRecord::RecordedDisplacing(DelegateKey::new(
+                            dk,
+                            CodeHash::new(ch),
+                        ));
+                    }
+                    _ => outcome = DurableRecord::Refused,
+                }
             }
         }
         Self::commit_guarded(txn)?;
-        Ok(recorded)
+        Ok(outcome)
     }
 
     /// Drop exactly one persisted `(contract, delegate)` row. Reached only
@@ -2235,9 +2295,10 @@ impl ReDb {
 
     /// Read the persisted subscriptions, at most `max_rows` valid ones.
     ///
-    /// Never fails on a bad ROW: malformed rows are reported in
-    /// [`DurableDelegateSubscriptions::malformed`] for the caller to delete, and
-    /// well-formed rows past `max_rows` in `excess`. Fails only when the table
+    /// Never fails on a bad ROW: wrong-length rows are reported in
+    /// [`DurableDelegateSubscriptions::malformed`] for the caller to delete;
+    /// unknown-version rows and rows past `max_rows` are counted and left in
+    /// place (forward compatibility). Fails only when the table
     /// itself cannot be read, and a caller must treat that as "unknown", not as
     /// "empty" (deleting on a transient read error would drop every delegate's
     /// subscriptions).
@@ -2250,10 +2311,13 @@ impl ReDb {
             let mut out = DurableDelegateSubscriptions::default();
             for entry in tbl.iter()? {
                 let (k, v) = entry?;
-                match Self::decode_delegate_subscription_row(k.value(), v.value()) {
-                    Some(pair) if out.valid.len() < max_rows => out.valid.push(pair),
-                    Some(_) => out.excess.push(k.value().to_vec()),
+                match Self::decode_delegate_subscription_key(k.value()) {
                     None => out.malformed.push(k.value().to_vec()),
+                    Some(_) if v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] => {
+                        out.unknown_version += 1
+                    }
+                    Some(pair) if out.valid.len() < max_rows => out.valid.push(pair),
+                    Some(_) => out.excess += 1,
                 }
             }
             Ok(out)
