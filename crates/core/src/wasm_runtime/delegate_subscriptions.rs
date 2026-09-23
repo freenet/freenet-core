@@ -1697,6 +1697,8 @@ mod tests {
     /// durable table is all that is left.
     #[cfg(feature = "redb")]
     mod durability {
+        // Contract ids here start at 40000: 20000..20320 belongs to the
+        // concurrency test's fillers, and the registry is process-global.
         use super::*;
 
         async fn open_db() -> (Storage, tempfile::TempDir) {
@@ -1729,7 +1731,7 @@ mod tests {
         async fn a_persisted_subscription_is_restored_after_a_restart() {
             let (db, _dir) = open_db().await;
             let d = dkey(100);
-            let c = cid(20000);
+            let c = cid(40000);
             register(&db, &d);
 
             assert_eq!(
@@ -1759,17 +1761,17 @@ mod tests {
             let gone = dkey(101);
             let kept = dkey(102);
             register(&db, &kept);
-            subscribe(cid(20010), &gone, Durability::Persist(&db));
-            subscribe(cid(20011), &kept, Durability::Persist(&db));
+            subscribe(cid(40010), &gone, Durability::Persist(&db));
+            subscribe(cid(40011), &kept, Durability::Persist(&db));
             lose_memory(&gone);
             lose_memory(&kept);
 
             let restored = restore_from_storage(&db);
-            assert_eq!(restored, vec![(cid(20011), kept.clone())]);
-            assert!(!is_subscribed(&cid(20010), &gone));
+            assert_eq!(restored, vec![(cid(40011), kept.clone())]);
+            assert!(!is_subscribed(&cid(40010), &gone));
             assert_eq!(
                 rows(&db),
-                vec![(cid(20011), kept.clone())],
+                vec![(cid(40011), kept.clone())],
                 "a row nothing can ever unregister must be deleted, not replayed every boot"
             );
             cleanup(&kept);
@@ -1782,15 +1784,15 @@ mod tests {
             let other = dkey(104);
             register(&db, &d);
             register(&db, &other);
-            subscribe(cid(20020), &d, Durability::Persist(&db));
-            subscribe(cid(20021), &d, Durability::Persist(&db));
-            subscribe(cid(20020), &other, Durability::Persist(&db));
+            subscribe(cid(40020), &d, Durability::Persist(&db));
+            subscribe(cid(40021), &d, Durability::Persist(&db));
+            subscribe(cid(40020), &other, Durability::Persist(&db));
 
             remove_delegate(&d, Durability::Persist(&db));
-            assert_eq!(rows(&db), vec![(cid(20020), other.clone())]);
+            assert_eq!(rows(&db), vec![(cid(40020), other.clone())]);
 
             lose_memory(&other);
-            assert_eq!(restore_from_storage(&db), vec![(cid(20020), other.clone())]);
+            assert_eq!(restore_from_storage(&db), vec![(cid(40020), other.clone())]);
             assert_eq!(subscription_count(&d), 0);
             cleanup(&other);
         }
@@ -1802,8 +1804,8 @@ mod tests {
             let b = dkey(106);
             register(&db, &a);
             register(&db, &b);
-            let removed = cid(20030);
-            let shutdown = cid(20031);
+            let removed = cid(40030);
+            let shutdown = cid(40031);
             subscribe(removed, &a, Durability::Persist(&db));
             subscribe(removed, &b, Durability::Persist(&db));
             subscribe(shutdown, &a, Durability::Persist(&db));
@@ -1828,7 +1830,7 @@ mod tests {
         async fn a_repeat_subscribe_does_not_write() {
             let (db, _dir) = open_db().await;
             let d = dkey(107);
-            let c = cid(20040);
+            let c = cid(40040);
             subscribe(c, &d, Durability::Persist(&db));
             // Delete the row behind the registry's back. A repeat subscribe
             // that wrote would put it back; one that does not, will not.
@@ -1851,15 +1853,15 @@ mod tests {
             let d = dkey(108);
             register(&db, &d);
             for i in 0..MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE {
-                subscribe(cid(21000 + i as u16), &d, Durability::Persist(&db));
+                subscribe(cid(41000 + i as u16), &d, Durability::Persist(&db));
             }
-            let outcome = subscribe(cid(22000), &d, Durability::Persist(&db));
+            let outcome = subscribe(cid(42000), &d, Durability::Persist(&db));
             let SubscribeOutcome::RegisteredEvicting(evicted) = outcome else {
                 panic!("expected an eviction at the cap, got {outcome:?}");
             };
             let on_disk = rows(&db);
             assert_eq!(on_disk.len(), MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE);
-            assert!(on_disk.contains(&(cid(22000), d.clone())));
+            assert!(on_disk.contains(&(cid(42000), d.clone())));
             assert!(
                 !on_disk.contains(&(evicted, d.clone())),
                 "an evicted subscription left on disk would displace a newer one at the next boot"
@@ -1878,7 +1880,7 @@ mod tests {
             register(&db, &d);
             let over = MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE + 10;
             for i in 0..over {
-                let c = cid(23000 + i as u16);
+                let c = cid(43000 + i as u16);
                 let mut key = Vec::new();
                 key.extend_from_slice(c.as_ref());
                 key.extend_from_slice(d.as_ref());
@@ -1916,7 +1918,7 @@ mod tests {
             let (db, _dir) = open_db().await;
             let d = dkey(110);
             register(&db, &d);
-            subscribe(cid(24000), &d, Durability::Persist(&db));
+            subscribe(cid(44000), &d, Durability::Persist(&db));
             lose_memory(&d);
             db.insert_raw_delegate_subscription_row(&[1, 2, 3], &[1])
                 .expect("short key");
@@ -1927,7 +1929,7 @@ mod tests {
             assert_eq!(db.delegate_subscription_row_count(), 3);
 
             let restored = restore_from_storage(&db);
-            assert_eq!(restored, vec![(cid(24000), d.clone())]);
+            assert_eq!(restored, vec![(cid(44000), d.clone())]);
             assert_eq!(db.delegate_subscription_row_count(), 1);
             cleanup(&d);
         }
@@ -1948,11 +1950,11 @@ mod tests {
             let old = dkey(111);
             let new = dkey(112);
             register(&db, &new);
-            subscribe(cid(25000), &old, Durability::Persist(&db));
+            subscribe(cid(45000), &old, Durability::Persist(&db));
             lose_memory(&old);
 
             assert!(restore_from_storage(&db).is_empty());
-            assert!(!is_subscribed(&cid(25000), &new));
+            assert!(!is_subscribed(&cid(45000), &new));
             assert!(rows(&db).is_empty());
         }
 
@@ -1964,27 +1966,27 @@ mod tests {
             let (db, _dir) = open_db().await;
             let d = dkey(113);
             assert!(
-                db.record_delegate_subscription(&cid(26000), &d, None, 2)
+                db.record_delegate_subscription(&cid(46000), &d, None, 2)
                     .unwrap()
             );
             assert!(
-                db.record_delegate_subscription(&cid(26001), &d, None, 2)
+                db.record_delegate_subscription(&cid(46001), &d, None, 2)
                     .unwrap()
             );
             assert!(
-                !db.record_delegate_subscription(&cid(26002), &d, None, 2)
+                !db.record_delegate_subscription(&cid(46002), &d, None, 2)
                     .unwrap(),
                 "a third row must be refused at a ceiling of 2"
             );
             assert_eq!(db.delegate_subscription_row_count(), 2);
             // Re-recording an existing row at the ceiling is not a refusal.
             assert!(
-                db.record_delegate_subscription(&cid(26000), &d, None, 2)
+                db.record_delegate_subscription(&cid(46000), &d, None, 2)
                     .unwrap()
             );
             // An eviction frees its slot in the same transaction.
             assert!(
-                db.record_delegate_subscription(&cid(26002), &d, Some(&cid(26000)), 2)
+                db.record_delegate_subscription(&cid(46002), &d, Some(&cid(46000)), 2)
                     .unwrap()
             );
             let loaded = db.load_delegate_subscriptions(1).unwrap();
