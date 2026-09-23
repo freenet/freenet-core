@@ -2133,12 +2133,25 @@ impl ReDb {
     /// newcomer's delegate does; otherwise the new row is refused. The scan
     /// that decides this runs only at the ceiling, over at most `max_rows`
     /// rows. The eviction, if any, is applied in every case.
+    ///
+    /// The per-delegate cap is also enforced ON DISK (`per_delegate_cap`).
+    /// Rows outlive their in-memory entry when a contract is removed for
+    /// housekeeping (the row is kept so the next boot re-subscribes), and the
+    /// in-memory cap cannot see those rows, so without this a delegate's rows
+    /// could grow past its cap one eviction at a time. When a new row would
+    /// take the delegate to the cap, one of its rows whose subscription is no
+    /// longer live in memory (`is_live` false) is dropped first. The scan runs
+    /// only when the whole table already holds at least `per_delegate_cap`
+    /// rows, so a node with few subscriptions never pays it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_delegate_subscription(
         &self,
         contract: &ContractInstanceId,
         delegate: &DelegateKey,
         evicted: Option<&ContractInstanceId>,
         max_rows: u64,
+        per_delegate_cap: usize,
+        is_live: &dyn Fn(&ContractInstanceId) -> bool,
     ) -> Result<DurableRecord, redb::Error> {
         let row = Self::delegate_subscription_row_key(contract, delegate);
         let txn = self.begin_write()?;
@@ -2149,7 +2162,42 @@ impl ReDb {
                 let evicted_row = Self::delegate_subscription_row_key(evicted, delegate);
                 tbl.remove(evicted_row.as_slice())?;
             }
-            if tbl.get(row.as_slice())?.is_some() {
+            let present = tbl.get(row.as_slice())?.is_some();
+            if !present && tbl.len()? >= per_delegate_cap as u64 {
+                let mine = Self::delegate_key64(delegate);
+                let mut own_rows: Vec<Vec<u8>> = Vec::new();
+                for entry in tbl.iter()? {
+                    let (k, v) = entry?;
+                    let key = k.value();
+                    // Only this version's rows: another version's are never
+                    // dropped by this binary (forward compatibility).
+                    if key.len() == 96
+                        && key[32..] == mine
+                        && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                    {
+                        own_rows.push(key.to_vec());
+                    }
+                }
+                if own_rows.len() >= per_delegate_cap {
+                    let stale = own_rows.iter().find(|key| {
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(&key[..32]);
+                        !is_live(&ContractInstanceId::new(id))
+                    });
+                    // Every row live is only reachable if memory is at the cap
+                    // too, in which case the admission above evicted one and
+                    // `evicted` already freed a row; fall back to the first
+                    // row so the cap holds regardless.
+                    if let Some(victim) = stale.or(own_rows.first()) {
+                        tbl.remove(victim.as_slice())?;
+                    }
+                }
+            }
+            if present {
+                // Includes a row another version wrote for this pair: it is
+                // left as is (never overwritten), so after a rollback this
+                // binary does not restore that one pair. Accepted: a rollback
+                // is transient and the alternative destroys newer data.
                 outcome = DurableRecord::Recorded;
             } else if tbl.len()? < max_rows {
                 tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
@@ -2157,28 +2205,48 @@ impl ReDb {
             } else {
                 // Fair share at the ceiling. Count rows per delegate and find
                 // the heaviest holder, remembering one of its rows to give up.
+                // Only this version's rows count and can be displaced: another
+                // version's are never dropped by this binary.
                 let mine = Self::delegate_key64(delegate);
-                let mut counts: std::collections::HashMap<[u8; 64], (usize, Vec<u8>)> =
+                let mut counts: std::collections::HashMap<[u8; 64], usize> =
                     std::collections::HashMap::new();
                 for entry in tbl.iter()? {
-                    let (k, _) = entry?;
+                    let (k, v) = entry?;
                     let key = k.value();
-                    if key.len() != 96 {
+                    if key.len() != 96 || v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] {
                         continue;
                     }
                     let mut holder = [0u8; 64];
                     holder.copy_from_slice(&key[32..]);
-                    let slot = counts.entry(holder).or_insert((0, Vec::new()));
-                    slot.0 += 1;
-                    slot.1 = key.to_vec();
+                    *counts.entry(holder).or_insert(0) += 1;
                 }
-                let my_count = counts.get(&mine).map_or(0, |(n, _)| *n);
+                let my_count = counts.get(&mine).copied().unwrap_or(0);
                 let heaviest = counts
                     .iter()
-                    .max_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| a.0.cmp(b.0)))
-                    .map(|(holder, (n, victim))| (*holder, *n, victim.clone()));
-                match heaviest {
-                    Some((holder, n, victim)) if holder != mine && n > my_count + 1 => {
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                    .map(|(holder, n)| (*holder, *n));
+                // Second pass only when a displacement will happen, to find one
+                // of the heaviest holder's rows without allocating per row.
+                let victim = match heaviest {
+                    Some((holder, n)) if holder != mine && n > my_count + 1 => {
+                        let mut found = None;
+                        for entry in tbl.iter()? {
+                            let (k, v) = entry?;
+                            let key = k.value();
+                            if key.len() == 96
+                                && key[32..] == holder
+                                && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                            {
+                                found = Some(key.to_vec());
+                                break;
+                            }
+                        }
+                        found.map(|victim| (holder, victim))
+                    }
+                    _ => None,
+                };
+                match victim {
+                    Some((holder, victim)) => {
                         tbl.remove(victim.as_slice())?;
                         tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
                         let mut dk = [0u8; 32];
@@ -2190,7 +2258,7 @@ impl ReDb {
                             CodeHash::new(ch),
                         ));
                     }
-                    _ => outcome = DurableRecord::Refused,
+                    None => outcome = DurableRecord::Refused,
                 }
             }
         }

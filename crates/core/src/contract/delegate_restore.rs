@@ -121,11 +121,17 @@ fn select_for_reestablish(
     pairs: Vec<(ContractInstanceId, DelegateKey)>,
     cap: usize,
 ) -> Vec<(ContractInstanceId, DelegateKey)> {
+    // A HashMap for lookup, but a Vec for order: HashMap iteration order is
+    // per-process random, which would make simulation runs non-deterministic.
+    let mut index: std::collections::HashMap<DelegateKey, usize> = std::collections::HashMap::new();
     let mut by_delegate: Vec<(DelegateKey, Vec<ContractInstanceId>)> = Vec::new();
     for (contract, delegate) in pairs {
-        match by_delegate.iter_mut().find(|(d, _)| d == &delegate) {
-            Some((_, contracts)) => contracts.push(contract),
-            None => by_delegate.push((delegate, vec![contract])),
+        match index.get(&delegate) {
+            Some(&i) => by_delegate[i].1.push(contract),
+            None => {
+                index.insert(delegate.clone(), by_delegate.len());
+                by_delegate.push((delegate, vec![contract]));
+            }
         }
     }
     shuffle(&mut by_delegate);

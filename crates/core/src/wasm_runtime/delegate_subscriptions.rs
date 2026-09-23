@@ -871,8 +871,8 @@ pub(crate) fn is_subscribed(contract: &ContractInstanceId, delegate: &DelegateKe
 /// | delegate over its per-delegate cap | admitted through [`subscribe_in_memory`], which evicts exactly as a live subscribe would; the evicted row is deleted from disk |
 ///
 /// Restored pairs all carry the same recency stamp (restore time), so the
-/// first cap eviction after a restart picks by iteration order rather than by
-/// last notification. Persisting the stamp would mean a write per
+/// first cap eviction after a restart picks by key order rather than by last
+/// notification. Persisting the stamp would mean a write per
 /// notification, which is not worth it for a tie-break at the cap.
 ///
 /// An UPGRADED delegate is a new key: its predecessor's rows stay with the
@@ -909,7 +909,7 @@ mod durable {
     /// Warnings on the write path are throttled like the cap-eviction warning,
     /// for the same reason: a delegate subscribing in a loop at the node-wide
     /// ceiling would otherwise produce one log write per subscribe.
-    static NOT_PERSISTED: AtomicU64 = AtomicU64::new(0);
+    static CEILING_LOSSES: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn record(
         db: &Storage,
@@ -922,17 +922,19 @@ mod durable {
             delegate,
             evicted,
             MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
+            MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
+            &|c| is_subscribed(c, delegate),
         ) {
             Ok(DurableRecord::Recorded) => {}
             Ok(DurableRecord::RecordedDisplacing(displaced)) => {
-                let total = NOT_PERSISTED.fetch_add(1, Ordering::Relaxed) + 1;
+                let total = CEILING_LOSSES.fetch_add(1, Ordering::Relaxed) + 1;
                 if total == 1 || total % 64 == 0 {
                     tracing::warn!(
                         %delegate,
                         %contract,
                         displaced_delegate = %displaced,
                         ceiling = MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
-                        not_persisted_total = total,
+                        ceiling_losses_total = total,
                         "Durable delegate-subscription table is at its node-wide ceiling; \
                          dropped one persisted row of the delegate holding the most, which \
                          still works now but will not survive a restart"
@@ -940,13 +942,13 @@ mod durable {
                 }
             }
             Ok(DurableRecord::Refused) => {
-                let total = NOT_PERSISTED.fetch_add(1, Ordering::Relaxed) + 1;
+                let total = CEILING_LOSSES.fetch_add(1, Ordering::Relaxed) + 1;
                 if total == 1 || total % 64 == 0 {
                     tracing::warn!(
                         %delegate,
                         %contract,
                         ceiling = MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
-                        not_persisted_total = total,
+                        ceiling_losses_total = total,
                         "Durable delegate-subscription table is at its node-wide ceiling; \
                          this subscription works now but will NOT survive a restart"
                     );
@@ -2046,6 +2048,28 @@ mod tests {
             assert!(rows(&db).is_empty());
         }
 
+        /// The per-delegate cap holds on disk even for rows whose in-memory
+        /// entry was dropped by housekeeping: a new row that would take the
+        /// delegate past the cap first drops one of its no-longer-live rows.
+        #[tokio::test]
+        async fn the_per_delegate_cap_holds_on_disk_across_housekeeping_removals() {
+            let (db, _dir) = open_db().await;
+            let d = dkey(115);
+            let live = |c: &ContractInstanceId| *c != cid(47000);
+            for i in 0..2u16 {
+                db.record_delegate_subscription(&cid(47000 + i), &d, None, 4096, 2, &live)
+                    .unwrap();
+            }
+            // cid(47000) is no longer live (housekeeping dropped it from memory).
+            db.record_delegate_subscription(&cid(47002), &d, None, 4096, 2, &live)
+                .unwrap();
+            let mut on_disk: Vec<_> = rows(&db).into_iter().map(|(c, _)| c).collect();
+            on_disk.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            let mut expected = vec![cid(47001), cid(47002)];
+            expected.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            assert_eq!(on_disk, expected, "the stale row goes, the live one stays");
+        }
+
         /// The node-wide ceiling is fair, not first-come: a newcomer displaces
         /// a row of the delegate holding the most, while that delegate holds
         /// more than one row more than the newcomer; after that it is refused.
@@ -2056,8 +2080,15 @@ mod tests {
             let newcomer = dkey(114);
             for i in 0..4u16 {
                 assert_eq!(
-                    db.record_delegate_subscription(&cid(46000 + i), &heavy, None, 4)
-                        .unwrap(),
+                    db.record_delegate_subscription(
+                        &cid(46000 + i),
+                        &heavy,
+                        None,
+                        4,
+                        usize::MAX,
+                        &|_| true
+                    )
+                    .unwrap(),
                     DurableRecord::Recorded
                 );
             }
@@ -2065,15 +2096,29 @@ mod tests {
             // heavy 4 vs newcomer 0, then heavy 3 vs newcomer 1: displaces.
             for i in 0..2u16 {
                 assert_eq!(
-                    db.record_delegate_subscription(&cid(46100 + i), &newcomer, None, 4)
-                        .unwrap(),
+                    db.record_delegate_subscription(
+                        &cid(46100 + i),
+                        &newcomer,
+                        None,
+                        4,
+                        usize::MAX,
+                        &|_| true
+                    )
+                    .unwrap(),
                     DurableRecord::RecordedDisplacing(heavy.clone())
                 );
             }
             // heavy 2 vs newcomer 2: fair, so refused.
             assert_eq!(
-                db.record_delegate_subscription(&cid(46102), &newcomer, None, 4)
-                    .unwrap(),
+                db.record_delegate_subscription(
+                    &cid(46102),
+                    &newcomer,
+                    None,
+                    4,
+                    usize::MAX,
+                    &|_| true
+                )
+                .unwrap(),
                 DurableRecord::Refused
             );
             assert_eq!(
@@ -2083,14 +2128,28 @@ mod tests {
             );
             // Re-recording an existing row at the ceiling is not a refusal.
             assert_eq!(
-                db.record_delegate_subscription(&cid(46100), &newcomer, None, 4)
-                    .unwrap(),
+                db.record_delegate_subscription(
+                    &cid(46100),
+                    &newcomer,
+                    None,
+                    4,
+                    usize::MAX,
+                    &|_| true
+                )
+                .unwrap(),
                 DurableRecord::Recorded
             );
             // An eviction frees its slot in the same transaction.
             assert_eq!(
-                db.record_delegate_subscription(&cid(46102), &newcomer, Some(&cid(46100)), 4)
-                    .unwrap(),
+                db.record_delegate_subscription(
+                    &cid(46102),
+                    &newcomer,
+                    Some(&cid(46100)),
+                    4,
+                    usize::MAX,
+                    &|_| true
+                )
+                .unwrap(),
                 DurableRecord::Recorded
             );
             let loaded = db.load_delegate_subscriptions(1).unwrap();
