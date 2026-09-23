@@ -91,7 +91,11 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        crate::wasm_runtime::delegate_subscriptions::subscribe(instance_id, &delegate);
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            instance_id,
+            &delegate,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
         Self {
             instance_id,
             delegate,
@@ -101,7 +105,11 @@ impl SubscriptionGuard {
 
 impl Drop for SubscriptionGuard {
     fn drop(&mut self) {
-        crate::wasm_runtime::delegate_subscriptions::unsubscribe(&self.instance_id, &self.delegate);
+        crate::wasm_runtime::delegate_subscriptions::unsubscribe(
+            &self.instance_id,
+            &self.delegate,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 }
 
@@ -175,21 +183,29 @@ struct Harness {
     notifications: crate::node::EventLoopNotificationsReceiver,
     _op_manager: Arc<OpManager>,
     _op_manager_guards: Box<dyn std::any::Any>,
-    _temp_dir: tempfile::TempDir,
+    _temp_dir: Option<tempfile::TempDir>,
 }
 
 async fn build_harness(id: &str) -> Result<Harness, Box<dyn std::error::Error>> {
+    let temp_dir = crate::util::tests::get_temp_dir();
+    let mut harness = build_harness_at(id, temp_dir.path()).await?;
+    harness._temp_dir = Some(temp_dir);
+    Ok(harness)
+}
+
+/// Build a harness over stores rooted at `dir`, which the caller owns, so a
+/// second harness can reopen the SAME redb after the first is dropped: a node
+/// restart, as far as the stores can tell.
+async fn build_harness_at(
+    id: &str,
+    dir: &std::path::Path,
+) -> Result<Harness, Box<dyn std::error::Error>> {
     let (op_manager, notifications, op_manager_guards) = build_op_manager(id).await;
 
-    let temp_dir = crate::util::tests::get_temp_dir();
-    let db = crate::contract::storages::Storage::new(temp_dir.path()).await?;
-    let contract_store = ContractStore::new(temp_dir.path().join("contract"), 10_000, db.clone())?;
-    let delegate_store = DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())?;
-    let secrets_store = SecretsStore::new(
-        temp_dir.path().join("secrets"),
-        Default::default(),
-        db.clone(),
-    )?;
+    let db = crate::contract::storages::Storage::new(dir).await?;
+    let contract_store = ContractStore::new(dir.join("contract"), 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(dir.join("delegate"), 10_000, db.clone())?;
+    let secrets_store = SecretsStore::new(dir.join("secrets"), Default::default(), db.clone())?;
     let state_store = StateStore::new(db, 10_000_000)?;
     let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)?;
 
@@ -207,7 +223,7 @@ async fn build_harness(id: &str) -> Result<Harness, Box<dyn std::error::Error>> 
         notifications,
         _op_manager: op_manager,
         _op_manager_guards: op_manager_guards,
-        _temp_dir: temp_dir,
+        _temp_dir: None,
     })
 }
 
@@ -324,6 +340,73 @@ async fn local_put_notifies_subscribed_delegates() -> Result<(), Box<dyn std::er
          reconstruction"
     );
 
+    Ok(())
+}
+
+/// #5493, end to end at the executor layer: a delegate subscription made on
+/// one "boot" survives a restart and the delegate is notified of an update
+/// made after it.
+///
+/// "Restart" is real where it matters: the first executor and every store
+/// holding the redb are DROPPED, the process-global registry is emptied (what a
+/// process exit does to it), and a second executor REOPENS the same database
+/// file. The only thing that can carry the subscription across is the durable
+/// table, and the only thing that can put it back is `restore_from_storage`,
+/// which is what `NetworkContractHandler::build` calls at startup (that wiring
+/// is pinned in `contract::delegate_restore`).
+///
+/// Mutation-checked: with the `restore_from_storage` call below removed, or
+/// with the first subscribe made `InMemoryOnly` (the pre-#5493 behaviour), no
+/// notification arrives and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegate_subscription_survives_a_restart_and_is_notified_after_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::wasm_runtime::delegate_subscriptions::{self as subs, Durability};
+
+    let contract = load(MOCK_ALIGNED_CONTRACT, params(9)).await;
+    let contract_key = contract.key();
+    let delegate = DelegateKey::new([0x5Au8; 32], CodeHash::new([0x5Au8; 32]));
+    let dir = crate::util::tests::get_temp_dir();
+
+    // Boot 1: the delegate is registered and subscribes.
+    {
+        let harness = build_harness_at("durable-delegate-sub-boot-1", dir.path()).await?;
+        let db = harness.executor.state_store.inner().clone();
+        db.store_delegate_index(&delegate, delegate.code_hash())?;
+        subs::subscribe(*contract_key.id(), &delegate, Durability::Persist(&db));
+        assert!(subs::is_subscribed(contract_key.id(), &delegate));
+        drop(db);
+        drop(harness);
+    }
+
+    // The process exits: the in-memory registry is gone.
+    subs::remove_delegate(&delegate, Durability::InMemoryOnly);
+    assert!(!subs::is_subscribed(contract_key.id(), &delegate));
+
+    // Boot 2: reopen the same database and run the startup restore.
+    let mut harness = build_harness_at("durable-delegate-sub-boot-2", dir.path()).await?;
+    let restored = subs::restore_from_storage(harness.executor.state_store.inner());
+    assert_eq!(restored, vec![(*contract_key.id(), delegate.clone())]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    harness.executor.set_delegate_notification_tx(tx);
+    let state = WrappedState::new(b"updated after the restart".to_vec());
+    put(&mut harness.executor, contract.clone(), state.clone()).await?;
+
+    let notification = expect_notification(
+        &mut rx,
+        "a delegate subscription persisted before a restart must be restored and \
+         must deliver a notification for a state change made after it (#5493)",
+    )
+    .await;
+    assert_eq!(notification.delegate_key, delegate);
+    assert_eq!(notification.contract_id, *contract_key.id());
+    let delivered: &[u8] = notification.new_state.as_ref().as_ref();
+    assert_eq!(delivered, state.as_ref());
+
+    subs::remove_delegate(&delegate, Durability::InMemoryOnly);
+    drop(harness);
+    drop(dir);
     Ok(())
 }
 

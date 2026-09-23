@@ -3228,6 +3228,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         crate::wasm_runtime::delegate_subscriptions::subscribe(
             subscribe_req.contract_id,
             &delegate_key,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
         );
         Ok(())
     } else {
@@ -3357,7 +3358,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     }
 
     // --- Step 5: Cleanup on delegate unregister ---
-    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+        &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
 
     // Verify cleanup
     assert!(
@@ -3454,6 +3458,7 @@ async fn test_notification_application_message_routed_to_registered_app()
     crate::wasm_runtime::delegate_subscriptions::subscribe(
         subscribe_req.contract_id,
         &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
     );
     // Feed the subscribe response back so the delegate finishes subscribing.
     let _ = runtime.inbound_app_message(
@@ -3557,7 +3562,10 @@ async fn test_notification_application_message_routed_to_registered_app()
         "after disconnect no app should remain registered"
     );
 
-    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+        &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
     std::mem::drop(temp_dir);
     Ok(())
 }
@@ -3593,8 +3601,16 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
     // Simulate delegate subscriptions
     let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
     let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
-    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_a);
-    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_b);
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        contract_instance_id,
+        &delegate_key_a,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        contract_instance_id,
+        &delegate_key_b,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
 
     // Verify subscriptions exist
     assert_eq!(

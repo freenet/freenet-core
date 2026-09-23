@@ -2502,7 +2502,15 @@ where
                     // Receiver is gone; clean up all subscriptions for this contract
                     // to prevent repeated failed sends on future state updates,
                     // and release the interest they took (#5542).
-                    crate::wasm_runtime::delegate_subscriptions::remove_contract(&instance_id);
+                    //
+                    // IN MEMORY ONLY. This channel closes when the node shuts
+                    // down, and the persisted subscriptions must survive
+                    // exactly that (#5493): erasing them here would erase every
+                    // delegate's subscriptions on every clean shutdown.
+                    crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                        &instance_id,
+                        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+                    );
                     crate::wasm_runtime::delegate_interest::release_contract(&instance_id);
                     return;
                 }

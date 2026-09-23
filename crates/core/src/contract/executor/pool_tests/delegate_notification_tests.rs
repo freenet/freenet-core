@@ -97,7 +97,11 @@ struct SubscriptionGuard {
 
 impl SubscriptionGuard {
     fn register(instance_id: ContractInstanceId, delegate: DelegateKey) -> Self {
-        crate::wasm_runtime::delegate_subscriptions::subscribe(instance_id, &delegate);
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            instance_id,
+            &delegate,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
         Self {
             instance_id,
             delegate,
@@ -112,7 +116,11 @@ impl Drop for SubscriptionGuard {
         // test's subscription if the keys ever collided, which is the shape
         // `.claude/rules/testing.md` warns about for shared globals. Mirrors
         // how production cleans up in `runtime/delegates.rs`.
-        crate::wasm_runtime::delegate_subscriptions::unsubscribe(&self.instance_id, &self.delegate);
+        crate::wasm_runtime::delegate_subscriptions::unsubscribe(
+            &self.instance_id,
+            &self.delegate,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 }
 

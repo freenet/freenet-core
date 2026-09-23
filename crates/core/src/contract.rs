@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::*;
 
 pub(crate) mod delegate_app_registry;
 mod delegate_park;
+mod delegate_restore;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
@@ -805,7 +806,7 @@ fn contract_op_response_msg(
 /// process. In the in-process multi-node harness that means every node ever
 /// built. A hold that cannot upgrade has nothing left to release, because the
 /// `InterestManager` it would decrement went with the `OpManager`.
-fn delegate_interest_release_closure(
+pub(crate) fn delegate_interest_release_closure(
     op_manager: &std::sync::Arc<crate::node::OpManager>,
 ) -> crate::wasm_runtime::delegate_interest::InterestRelease {
     let weak = std::sync::Arc::downgrade(op_manager);
@@ -952,7 +953,14 @@ where
         // subscription's hold has to be given back — `subscribe` does that
         // itself (see `SubscribeOutcome::RegisteredEvicting`), because a caller
         // that ignores the outcome compiles fine and two of the three do.
-        crate::wasm_runtime::delegate_subscriptions::subscribe(pending.contract_id, delegate_key);
+        let durable_store = contract_handler.executor().delegate_subscription_store();
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            pending.contract_id,
+            delegate_key,
+            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                durable_store.as_ref(),
+            ),
+        );
         // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
         //
         // `run_executor_subscribe` ended in
@@ -1011,13 +1019,19 @@ where
                 // WEAK, so an outstanding hold never keeps a shut-down node's
                 // `OpManager` alive. A hold that cannot upgrade has nothing
                 // left to release.
-                crate::wasm_runtime::delegate_interest::record(
+                if !crate::wasm_runtime::delegate_interest::record(
                     pending.contract_id,
                     delegate_key.clone(),
                     key,
                     delegate_interest_release_closure(&op_manager),
                     op_manager.node_identity,
-                );
+                ) {
+                    // This node already held the pair's obligation (the
+                    // boot-time restore recorded it while this subscribe was
+                    // in flight, #5493), so the refcount this subscribe took
+                    // is unaccounted for. Give it back rather than leak it.
+                    op_manager.interest_manager.remove_local_client(&key);
+                }
             }
             None => {
                 // No `OpManager` means no `run_executor_subscribe` ran, so no
@@ -2156,13 +2170,18 @@ where
                                         )
                                         .await;
                                     }
-                                    crate::wasm_runtime::delegate_interest::record(
+                                    if !crate::wasm_runtime::delegate_interest::record(
                                         contract_id,
                                         delegate_key.clone(),
                                         full_key,
                                         delegate_interest_release_closure(&op_manager),
                                         op_manager.node_identity,
-                                    );
+                                    ) {
+                                        // Already held (boot-time restore won
+                                        // the race across the await above,
+                                        // #5493): return the extra refcount.
+                                        op_manager.interest_manager.remove_local_client(&full_key);
+                                    }
                                     true
                                 }
                                 // No `OpManager` means no eviction pressure worth
@@ -2176,9 +2195,14 @@ where
                             interest_registered,
                             "Delegate subscribed to a contract this node already holds"
                         );
+                        let durable_store =
+                            contract_handler.executor().delegate_subscription_store();
                         crate::wasm_runtime::delegate_subscriptions::subscribe(
                             contract_id,
                             delegate_key,
+                            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                                durable_store.as_ref(),
+                            ),
                         );
                         Ok(())
                     } else if parking.is_some()
@@ -8598,8 +8622,14 @@ mod hol_4391_tests {
         let bad_id = ContractInstanceId::new([23u8; 32]);
         // Global registry: use ids unique to this test so it does not race the
         // rest of the suite.
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let (mut handler, _send) = build_handler(vec![]).await;
         let _ = apply_resolved_contract_op(
@@ -8638,8 +8668,14 @@ mod hol_4391_tests {
             "a FAILED subscribe must not install a hook: it would advertise a \
              delivery path that was never established"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
@@ -8801,7 +8837,10 @@ mod hol_4391_tests {
                 .into(),
             );
         }
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
@@ -8846,7 +8885,10 @@ mod hol_4391_tests {
         );
 
         handle.abort();
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one
@@ -8908,7 +8950,10 @@ mod hol_4391_tests {
                 )]
                 .into(),
             );
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
 
         let handle = GlobalExecutor::spawn(contract_handling(
@@ -8979,7 +9024,10 @@ mod hol_4391_tests {
 
         handle.abort();
         for key in [banned_key, allowed_key] {
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
     }
 
@@ -9356,7 +9404,10 @@ mod hol_4391_tests {
         // The key `add_local_client` was called with: the FULL key, carrying the
         // real code hash, because the subscribe op knew it.
         let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         // Stand in for what `run_executor_subscribe` did before returning Ok.
         assert!(
@@ -9392,7 +9443,10 @@ mod hol_4391_tests {
              subscription is dropped, even though the contract body never \
              landed and the full `ContractKey` could not be resolved (#5542)"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get
