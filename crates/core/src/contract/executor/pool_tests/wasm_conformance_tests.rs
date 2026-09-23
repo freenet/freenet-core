@@ -83,6 +83,7 @@ fn setup_mock() -> MockWasmRuntime {
         delegate_calls: Default::default(),
         delegate_contexts: Default::default(),
         delegate_observations: Default::default(),
+        unregistered_delegates: Default::default(),
     }
 }
 

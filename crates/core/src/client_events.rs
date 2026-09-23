@@ -345,14 +345,17 @@ where
                             );
                             (cli_id, Err(ErrorKind::EmptyRing.into()))
                         }
-                        Err(err) => {
-                            tracing::error!(
-                                client_id = %cli_id,
-                                error = %err,
-                                "Operation error"
-                            );
-                            (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into()))
-                        }
+                        Err(err) => match missing_delegate_client_error(err) {
+                            Ok(typed) => (cli_id, Err(typed)),
+                            Err(err) => {
+                                tracing::error!(
+                                    client_id = %cli_id,
+                                    error = %err,
+                                    "Operation error"
+                                );
+                                (cli_id, Err(ErrorKind::OperationError { cause: format!("{err}").into() }.into()))
+                            }
+                        },
                     }
                 });
             },
@@ -497,6 +500,23 @@ fn delegate_request_outcome(
         // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
         // client silently received an empty successful response instead of
         // an error.
+        // Not registered on this node (#5727). Answered with the typed
+        // `DelegateError::Missing` — see `missing_delegate_client_error` — and
+        // NOT logged at error: migration walks probe predecessor delegates that
+        // most nodes never ran, so this is routine traffic, not a node fault.
+        // The executor loop already warned ("Delegate not found in store").
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err)))
+            if exec_err.is_missing_delegate() =>
+        {
+            tracing::debug!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                outcome = "missing",
+                "DelegateRequest for a delegate not registered on this node"
+            );
+            Err(Error::Executor(exec_err))
+        }
         Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))) => {
             tracing::error!(
                 client_id = %client_id,
@@ -529,6 +549,27 @@ fn delegate_request_outcome(
             );
             Err(Error::Op(OpError::UnexpectedOpState))
         }
+    }
+}
+
+/// Keeps a missing-delegate failure TYPED on its way to the client (#5727).
+///
+/// Returns the client error `freenet local` sends for the same request —
+/// `RequestError::DelegateError(DelegateError::Missing(key))` — when `err` is
+/// that failure, and hands every other error back unchanged for the generic
+/// `OperationError { cause }` flattening.
+///
+/// Without this the missing-delegate answer would reach a network-mode client
+/// only as a string, so it still could not tell "this delegate is not
+/// registered here" from "this node failed", which is the distinction a
+/// migration walk over predecessor delegates needs. Deliberately narrow: other
+/// executor request errors keep their current shape.
+fn missing_delegate_client_error(err: Error) -> Result<ClientError, Error> {
+    match err {
+        Error::Executor(exec_err) if exec_err.is_missing_delegate() => {
+            Ok(ErrorKind::RequestError(exec_err.unwrap_request()).into())
+        }
+        other => Err(other),
     }
 }
 
@@ -2498,6 +2539,70 @@ mod delegate_request_outcome_tests {
 
     fn key() -> DelegateKey {
         DelegateKey::new([3u8; 32], CodeHash::new([0u8; 32]))
+    }
+
+    /// #5727: a missing delegate reaches a network-mode client as the typed
+    /// `RequestError::DelegateError(DelegateError::Missing(key))`, the answer
+    /// `freenet local` gives, not as an `OperationError` string and not as an
+    /// empty success. Drives both steps the loop in `client_event_handling`
+    /// takes: `delegate_request_outcome` then `missing_delegate_client_error`.
+    #[test]
+    fn missing_delegate_reaches_the_client_as_typed_missing() {
+        use freenet_stdlib::client_api::{DelegateError, RequestError};
+        let exec_err = crate::contract::ExecutorError::request(DelegateError::Missing(key()));
+        let err = delegate_request_outcome(
+            Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))),
+            ClientId::next(),
+            RequestId::new(),
+            &key(),
+            Some("ApplicationMessages"),
+        )
+        .expect_err("a missing delegate must not be answered as a success");
+        let client_err = missing_delegate_client_error(err)
+            .expect("a missing-delegate error must stay typed for the client");
+        match client_err.kind() {
+            ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(k))) => {
+                assert_eq!(k, &key(), "Missing must name the requested delegate");
+            }
+            other => panic!("expected RequestError(DelegateError::Missing), got {other:?}"),
+        }
+    }
+
+    /// The narrowness of the above: any OTHER error keeps its current path to
+    /// the generic `OperationError` flattening. A mutation that typed every
+    /// executor error (or every error) would change what existing clients see
+    /// for unrelated failures.
+    #[test]
+    fn non_missing_errors_are_not_retyped() {
+        use freenet_stdlib::client_api::DelegateError;
+        let generic = Error::Executor(crate::contract::ExecutorError::other(anyhow::anyhow!(
+            "boom"
+        )));
+        assert!(
+            matches!(
+                missing_delegate_client_error(generic),
+                Err(Error::Executor(_))
+            ),
+            "a generic executor error must be handed back unchanged"
+        );
+        let exec_failure = Error::Executor(crate::contract::ExecutorError::request(
+            DelegateError::ExecutionError("trap".into()),
+        ));
+        assert!(
+            matches!(
+                missing_delegate_client_error(exec_failure),
+                Err(Error::Executor(_))
+            ),
+            "a typed delegate EXECUTION error is not a missing delegate and keeps \
+             its current shape"
+        );
+        assert!(
+            matches!(
+                missing_delegate_client_error(Error::EmptyRing),
+                Err(Error::EmptyRing)
+            ),
+            "a non-executor error must be handed back unchanged"
+        );
     }
 
     #[test]
