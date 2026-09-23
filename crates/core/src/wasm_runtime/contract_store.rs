@@ -526,7 +526,13 @@ impl ContractStore {
         // release the local interest they took (#5542). The release is
         // self-discharging — each hold carries its own node's closure — so this
         // module keeps no `crate::ring` dependency.
-        super::delegate_subscriptions::remove_contract(key.id());
+        //
+        // Persisted too (#5493): a surviving row would re-subscribe to, and
+        // re-fetch, the removed contract at every boot.
+        super::delegate_subscriptions::remove_contract(
+            key.id(),
+            super::delegate_subscriptions::Durability::Persist(&self.db),
+        );
         super::delegate_interest::release_contract(key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every

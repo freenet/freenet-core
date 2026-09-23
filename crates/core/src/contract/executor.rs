@@ -1134,6 +1134,16 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn op_manager_handle(&self) -> Option<Arc<OpManager>> {
         None
     }
+
+    /// The node's durable store, for mirroring delegate subscriptions to disk
+    /// so they survive a restart (#5493).
+    ///
+    /// `None` for mock/test executors with no durable store; their delegate
+    /// subscriptions are in-memory only, which is the behaviour before
+    /// durability existed.
+    fn delegate_subscription_store(&self) -> Option<crate::contract::storages::Storage> {
+        None
+    }
 }
 
 /// Tracks contracts that have undergone corrupted-state recovery.

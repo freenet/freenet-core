@@ -288,7 +288,13 @@ impl Executor<Runtime> {
                 // for the per-delegate cap is cleared too — a stale entry there
                 // would hold cap budget for a delegate that no longer exists,
                 // and nothing ages it out.
-                crate::wasm_runtime::delegate_subscriptions::remove_delegate(&key);
+                // Persisted rows go too, or the next boot would restore them.
+                crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+                    &key,
+                    crate::wasm_runtime::delegate_subscriptions::Durability::Persist(
+                        self.state_store.inner(),
+                    ),
+                );
                 // ...and give back the local interest those subscriptions took
                 // (#5542). Dropping the subscription without this leaves
                 // `local_interests` permanently above zero for the contract, so

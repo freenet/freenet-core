@@ -182,6 +182,16 @@ impl ContractHandler for NetworkContractHandler {
         // bug. See .claude/rules/hosting-invariants.md (invariant 1).
         op_manager.rehydrate_local_hosting_interest();
 
+        // Restore persisted delegate subscriptions (#5493). AFTER the hosting
+        // cache and interest rehydration above, so a restored subscribe that
+        // hits a locally hosted contract sees it as local; BEFORE this
+        // function returns, which is before the event loop exists, so no
+        // delegate can run while its subscriptions are still missing. The
+        // registry half is synchronous; the network half is paced in the
+        // background (`delegate_restore`). Inert when nothing was persisted.
+        let restored = crate::wasm_runtime::delegate_subscriptions::restore_from_storage(&storage);
+        super::delegate_restore::spawn_reestablish(op_manager.clone(), restored);
+
         Ok(Self { executor, channel })
     }
 
