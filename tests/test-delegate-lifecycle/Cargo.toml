@@ -1,0 +1,18 @@
+[package]
+name = "test-delegate-lifecycle"
+version = "0.1.0"
+edition = "2024"
+description = "Test delegate declaring a manifest (lifecycle events + Background) for delegate_capabilities"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.12.0", features = ["contract"] }
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]

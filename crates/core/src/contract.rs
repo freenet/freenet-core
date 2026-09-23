@@ -9,6 +9,8 @@ use freenet_stdlib::prelude::*;
 
 pub(crate) mod delegate_app_registry;
 pub(crate) mod delegate_capabilities;
+#[cfg(test)]
+mod capability_loop_tests;
 mod delegate_park;
 mod executor;
 mod fair_queue;

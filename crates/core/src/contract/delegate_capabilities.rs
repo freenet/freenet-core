@@ -774,6 +774,7 @@ impl DelegateCapabilities {
     /// Returns the prompt to raise, if the app lacks a capability the manifest
     /// asks for and has not declined it recently. Queues `Installed` when it
     /// is due.
+    #[cfg(test)]
     pub(crate) fn on_registered(
         &self,
         key: &DelegateKey,
@@ -1136,6 +1137,7 @@ impl LifecycleSchedule {
         self.heap.peek().map(|std::cmp::Reverse((due, _))| *due)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.runs.len()
     }

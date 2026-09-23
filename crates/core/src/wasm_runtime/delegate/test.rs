@@ -4910,3 +4910,74 @@ async fn unsubscribe_contract_request_fails_the_run_rather_than_being_dropped()
 
     Ok(())
 }
+
+/// Declares `manifest(lifecycle = [Installed, NodeStarted], capabilities =
+/// [Background])` and answers each lifecycle event with
+/// `"<event>:<parameters>"`.
+const TEST_DELEGATE_LIFECYCLE: &str = "test_delegate_lifecycle";
+
+fn app_payloads(outbound: &[OutboundDelegateMsg]) -> Vec<Vec<u8>> {
+    outbound
+        .iter()
+        .filter_map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(msg) => Some(msg.payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The manifest survives a real build of a real delegate and is what the node
+/// reads at registration, and a delegate built against stdlib 0.12 decodes
+/// `InboundDelegateMsg::Lifecycle` (tag 10).
+#[tokio::test]
+async fn a_manifest_delegate_decodes_lifecycle_events() -> Result<(), Box<dyn std::error::Error>> {
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_LIFECYCLE).await?;
+
+    let manifest = DelegateManifest::from_wasm(delegate.code().data())?
+        .expect("the #[delegate(manifest(..))] section must be in the built module");
+    assert!(manifest.wants_lifecycle(LifecycleKind::Installed));
+    assert!(manifest.wants_lifecycle(LifecycleKind::NodeStarted));
+    assert!(manifest.wants_capability(Capability::Background));
+
+    for (event, expected) in [
+        (LifecycleEvent::Installed, b"installed:".to_vec()),
+        (
+            LifecycleEvent::NodeStarted {
+                down_since_ms: Some(1_700_000_000_000),
+            },
+            b"node_started:".to_vec(),
+        ),
+    ] {
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::Lifecycle(event)],
+        )?;
+        assert_eq!(app_payloads(&outbound), vec![expected]);
+    }
+    Ok(())
+}
+
+/// Why delivery is gated on the manifest: a delegate built against an older
+/// stdlib (this fixture pins 0.3.x) cannot decode tag 10 at all, and has no
+/// manifest the node could mistake for an opt-in.
+#[tokio::test]
+async fn a_delegate_without_a_manifest_cannot_decode_lifecycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    assert_eq!(DelegateManifest::from_wasm(delegate.code().data())?, None);
+    let result = runtime.inbound_app_message(
+        delegate.key(),
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::Lifecycle(LifecycleEvent::Installed)],
+    );
+    assert!(
+        result.is_err(),
+        "an old delegate must fail to decode a Lifecycle message, got {result:?}"
+    );
+    Ok(())
+}
