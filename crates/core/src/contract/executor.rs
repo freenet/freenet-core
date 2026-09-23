@@ -1134,6 +1134,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn op_manager_handle(&self) -> Option<Arc<OpManager>> {
         None
     }
+
+    /// This node's delegate capability state (manifests, grants, lifecycle
+    /// queue, unprompted-run budget), if the executor has one. `None` for
+    /// executors that do not implement capabilities: lifecycle events are
+    /// then never delivered and unprompted runs are not budgeted, which is
+    /// exactly the behaviour before capabilities existed.
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
 }
 
 /// Tracks contracts that have undergone corrupted-state recovery.

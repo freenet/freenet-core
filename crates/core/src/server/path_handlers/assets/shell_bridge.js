@@ -1732,9 +1732,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // this request" with no way for the user to tell who authored it. The
     // text below the label is delegate-controlled; the label tells the user
     // that. See the trust-model rationale in permission_prompts.rs.
+    // `author` is set by the node from the path that raised the prompt, never
+    // from delegate output; only the node's own capability prompts say
+    // "Freenet asks:". Anything else, including a missing field, is treated
+    // as delegate-authored.
     var msgLabel = document.createElement('div');
     msgLabel.className = 'fn-msg-label';
-    msgLabel.textContent = 'Delegate says:';
+    msgLabel.textContent = p.author === 'node' ? 'Freenet asks:' : 'Delegate says:';
     card.appendChild(msgLabel);
     // Try to render the delegate-supplied message as pretty-printed JSON
     // when it parses as JSON. Falls back to a plain paragraph for plain

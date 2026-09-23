@@ -229,6 +229,11 @@ pub(crate) struct OpManager {
     ///
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    /// This node's delegate capability state, set once by the executor pool
+    /// when it is built, so the HTTP server can answer "Apps and permissions"
+    /// requests. `None` until then (and on executors without capabilities).
+    delegate_capabilities:
+        Arc<OnceLock<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>>,
     /// Registry for handling race conditions between stream fragments and metadata messages.
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
@@ -368,6 +373,7 @@ impl Clone for OpManager {
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
+            delegate_capabilities: self.delegate_capabilities.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
             attempt_hop_registry: self.attempt_hop_registry.clone(),
@@ -591,6 +597,7 @@ impl OpManager {
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
             request_router,
+            delegate_capabilities: Arc::new(OnceLock::new()),
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
             attempt_hop_registry: Arc::new(
@@ -795,6 +802,20 @@ impl OpManager {
     /// This is called from client_event_handling after the request_router is created.
     /// Without this, completed operations leave stale entries in the request router's
     /// resource_to_transaction map, causing subsequent requests to hang forever.
+    /// Set once by the executor pool; later calls are ignored.
+    pub(crate) fn set_delegate_capabilities(
+        &self,
+        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        let _ = self.delegate_capabilities.set(caps);
+    }
+
+    pub(crate) fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities.get().cloned()
+    }
+
     pub fn set_request_router(&self, router: Arc<RequestRouter>) {
         if self.request_router.set(router).is_err() {
             tracing::warn!("Request router already set - ignoring duplicate set");

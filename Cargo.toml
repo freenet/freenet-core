@@ -186,6 +186,16 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
+# 0.12.0 adds delegate manifests (a `freenet-manifest` WASM custom section,
+# read with `DelegateManifest::from_wasm`) and `InboundDelegateMsg::Lifecycle`
+# at tag 10 (stdlib #136). Core delivers `Lifecycle` ONLY to a delegate whose
+# manifest lists that kind and whose app holds the Background grant
+# (`contract::delegate_capabilities`), and refuses it (and `WakeupFired`) in a
+# client's `ApplicationMessages`.
+#
+# 0.11.0 removed seven delegate host imports no released core provided; core
+# never registered them, so nothing here changes.
+#
 # 0.10.0 adds three delegate wire variants, all APPENDED so existing tags are
 # unchanged (stdlib #98/#82). Core matches them explicitly rather than sweeping
 # them into a wildcard, but implements none of them yet:
@@ -230,7 +240,7 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Exposure is FBS-only: `client_events/websocket.rs` falls back to
 # Flatbuffers when no encoding is specified, and every first-party client
 # (fdev, riverctl, River UI, the test harness) explicitly pins native.
-freenet-stdlib = "0.10.0"
+freenet-stdlib = "0.12.0"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

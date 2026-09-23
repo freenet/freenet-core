@@ -1,0 +1,1491 @@
+//! Node-enforced delegate capabilities: manifests, consent-once grants per app,
+//! lifecycle events, and the budget that bounds unprompted delegate runs.
+//!
+//! # What this is for
+//!
+//! A delegate normally runs only when an open app sends it a message. A
+//! delegate that must act with no tab open (a shop answering a buyer while the
+//! seller is away) declares it in a manifest embedded in its WASM
+//! (`#[delegate(manifest(lifecycle = [..], capabilities = [Background]))]`,
+//! read with `DelegateManifest::from_wasm`). The node then:
+//!
+//! 1. asks the user ONCE, at registration, whether the registering app may run
+//!    in the background (a node-authored "Freenet asks" prompt, not a
+//!    delegate-authored one), and remembers the answer per app;
+//! 2. delivers `LifecycleEvent::Installed` once per delegate per node, and
+//!    `LifecycleEvent::NodeStarted` after each start, only to delegates whose
+//!    manifest lists that kind AND whose app holds the grant;
+//! 3. bounds what unprompted runs (lifecycle and contract-notification runs)
+//!    may cost: loop time for lifecycle runs, and network operations for both.
+//!
+//! # App identity
+//!
+//! A grant belongs to an [`AppIdentity`], today always the web app's contract
+//! instance id, attested by the connection that registered the delegate (a
+//! loopback client holding a token for that app; non-local registrations carry
+//! no app and get no grants). The instance id, not the verifying key in the
+//! container's parameters, because the key alone is public: a different
+//! container WASM carrying the same key as its parameter, but skipping the
+//! signature check, would otherwise inherit the app's grants. The instance id
+//! is `hash(container code, key)`, so it survives UI updates (state updates)
+//! and delegate re-keys (the binding is made again at registration), and it
+//! changes only on a container-WASM re-key, which also changes the app's URL.
+//! The trade-off: that re-key re-prompts. The identity is a tagged enum so a
+//! verified-key variant can be added later without a storage migration.
+//!
+//! The attestation is the same one the delegate's `MessageOrigin::WebApp`
+//! already rests on, so a grant is no weaker than what an app's delegate
+//! already trusts its caller to be.
+//!
+//! # Platform delegates
+//!
+//! One delegate may serve several apps. It keeps a set of up to
+//! [`MAX_APPS_PER_DELEGATE`] bound apps, and background delivery is enabled if
+//! ANY bound app holds the grant. There is no first-writer ownership, so a
+//! later app cannot be locked out, and an app the user never approved gains
+//! nothing: the grant it would need is its own.
+//!
+//! # Prompts
+//!
+//! Only for capabilities not yet granted to the registering app. "Allow" is
+//! stored; "Not now" is stored as a denial with a [`DENIAL_COOL_OFF`]; no
+//! answer (timeout) stores nothing, so the next registration asks again.
+//! Revocation removes the grant.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use freenet_stdlib::prelude::{
+    Capability, ContractInstanceId, DelegateKey, DelegateManifest, LifecycleEvent, LifecycleKind,
+};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
+
+/// Apps one delegate can be bound to. Above this a new binding is not recorded
+/// (the delegate keeps working in the foreground for that app).
+pub(crate) const MAX_APPS_PER_DELEGATE: usize = 8;
+
+/// How long a "Not now" suppresses the prompt for that app.
+pub(crate) const DENIAL_COOL_OFF: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Largest registered-parameters blob kept for lifecycle runs. A delegate with
+/// larger parameters gets no lifecycle events (logged at registration).
+pub(crate) const MAX_STORED_PARAMS_BYTES: usize = 64 * 1024;
+
+/// Delegates with a capability record, node-wide. Bounds the table and the
+/// node-start scan. Above it, new manifests are not recorded.
+pub(crate) const MAX_CAPABILITY_RECORDS: usize = 1024;
+
+/// Lifecycle runs waiting for the contract loop. Producers `try_send`; a full
+/// queue drops the run with a counter (an `Installed` stays undelivered and is
+/// retried at the next registration or grant, a `NodeStarted` is lost for this
+/// start).
+pub(crate) const LIFECYCLE_QUEUE_CAPACITY: usize = 256;
+
+/// Stable wire code of each capability in the grant table.
+fn capability_code(cap: Capability) -> Option<u16> {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match cap {
+        Capability::Background => Some(1),
+        // `Unknown` and anything a newer stdlib adds: not grantable here.
+        _ => None,
+    }
+}
+
+fn capability_from_code(code: u16) -> Option<Capability> {
+    match code {
+        1 => Some(Capability::Background),
+        _ => None,
+    }
+}
+
+/// Human wording of a capability in the node's own prompt.
+pub(crate) fn capability_description(cap: Capability) -> &'static str {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match cap {
+        Capability::Background => "keep running in the background when its tab is closed",
+        _ => "use a capability this node does not know",
+    }
+}
+
+/// Who a grant belongs to. See the module docs for why this is the web app's
+/// contract instance id rather than its signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AppIdentity {
+    /// A web app, by its container contract's instance id.
+    WebApp(ContractInstanceId),
+}
+
+impl AppIdentity {
+    const TAG_WEBAPP: u8 = 1;
+    const ENCODED_LEN: usize = 33;
+
+    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        match self {
+            AppIdentity::WebApp(id) => {
+                out[0] = Self::TAG_WEBAPP;
+                out[1..].copy_from_slice(id.as_bytes());
+            }
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        match bytes[0] {
+            Self::TAG_WEBAPP => {
+                let id: [u8; 32] = bytes[1..].try_into().ok()?;
+                Some(AppIdentity::WebApp(ContractInstanceId::new(id)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Display form for prompts and the dashboard.
+    pub(crate) fn display(&self) -> String {
+        match self {
+            AppIdentity::WebApp(id) => id.to_string(),
+        }
+    }
+}
+
+fn grant_key(app: &AppIdentity, code: u16) -> [u8; 35] {
+    let mut k = [0u8; 35];
+    k[..33].copy_from_slice(&app.encode());
+    k[33..].copy_from_slice(&code.to_be_bytes());
+    k
+}
+
+/// The user's answer for one (app, capability).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Grant {
+    Granted { at_ms: u64 },
+    Denied { at_ms: u64, until_ms: u64 },
+}
+
+impl Grant {
+    fn encode(&self) -> [u8; 17] {
+        let mut out = [0u8; 17];
+        match *self {
+            Grant::Granted { at_ms } => {
+                out[0] = 1;
+                out[1..9].copy_from_slice(&at_ms.to_le_bytes());
+            }
+            Grant::Denied { at_ms, until_ms } => {
+                out[0] = 2;
+                out[1..9].copy_from_slice(&at_ms.to_le_bytes());
+                out[9..].copy_from_slice(&until_ms.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 17 {
+            return None;
+        }
+        let at_ms = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+        let until_ms = u64::from_le_bytes(bytes[9..].try_into().ok()?);
+        match bytes[0] {
+            1 => Some(Grant::Granted { at_ms }),
+            2 => Some(Grant::Denied { at_ms, until_ms }),
+            _ => None,
+        }
+    }
+}
+
+/// What the node keeps about one manifest-declaring delegate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegateRecord {
+    pub manifest: DelegateManifest,
+    /// The parameters the delegate was registered with, so lifecycle runs get
+    /// them (a notification run gets empty parameters, #5616; these must not).
+    pub params: Vec<u8>,
+    pub apps: Vec<AppIdentity>,
+    /// `Installed` has been delivered on this node.
+    pub installed_delivered: bool,
+}
+
+/// On-disk form, version-prefixed.
+#[derive(Serialize, Deserialize)]
+struct DelegateRecordV1 {
+    manifest_json: Vec<u8>,
+    params: Vec<u8>,
+    apps: Vec<Vec<u8>>,
+    installed_delivered: bool,
+}
+
+const RECORD_V1: u8 = 1;
+
+impl DelegateRecord {
+    fn encode(&self) -> Vec<u8> {
+        let v1 = DelegateRecordV1 {
+            manifest_json: self.manifest.to_bytes(),
+            params: self.params.clone(),
+            apps: self.apps.iter().map(|a| a.encode().to_vec()).collect(),
+            installed_delivered: self.installed_delivered,
+        };
+        let mut out = vec![RECORD_V1];
+        out.extend(bincode::serialize(&v1).expect("record serializes"));
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&version, rest) = bytes.split_first()?;
+        if version != RECORD_V1 {
+            return None;
+        }
+        let v1: DelegateRecordV1 = bincode::deserialize(rest).ok()?;
+        Some(Self {
+            manifest: DelegateManifest::from_bytes(&v1.manifest_json).ok()?,
+            params: v1.params,
+            apps: v1
+                .apps
+                .iter()
+                .filter_map(|a| AppIdentity::decode(a))
+                .collect(),
+            installed_delivered: v1.installed_delivered,
+        })
+    }
+}
+
+/// Raw persistence for records and grants. The ReDb implementation is the
+/// production one; [`MemoryCapabilityStorage`] serves tests and builds without
+/// redb (where grants then last only for the process).
+pub(crate) trait CapabilityStorage: Send + Sync {
+    fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()>;
+    fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>>;
+    fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()>;
+    fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>>;
+    fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+    fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
+    fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()>;
+    fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>>;
+}
+
+#[cfg(feature = "redb")]
+impl CapabilityStorage for crate::contract::storages::redb::ReDb {
+    fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
+        Ok(self.put_delegate_capability_record(key, value)?)
+    }
+    fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.get_delegate_capability_record(key)?)
+    }
+    fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()> {
+        Ok(self.remove_delegate_capability_record(key)?)
+    }
+    fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>> {
+        Ok(self.load_all_delegate_capability_records()?)
+    }
+    fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        Ok(self.put_app_capability_grant(key, value)?)
+    }
+    fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.get_app_capability_grant(key)?)
+    }
+    fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()> {
+        Ok(self.remove_app_capability_grant(key)?)
+    }
+    fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self.load_all_app_capability_grants()?)
+    }
+}
+
+/// In-process storage. See [`CapabilityStorage`].
+#[derive(Default)]
+pub(crate) struct MemoryCapabilityStorage {
+    records: Mutex<HashMap<DelegateKey, Vec<u8>>>,
+    grants: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl CapabilityStorage for MemoryCapabilityStorage {
+    fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
+        self.records.lock().insert(key.clone(), value.to_vec());
+        Ok(())
+    }
+    fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.records.lock().get(key).cloned())
+    }
+    fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()> {
+        self.records.lock().remove(key);
+        Ok(())
+    }
+    fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>> {
+        Ok(self
+            .records
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+    fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        self.grants.lock().insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+    fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.grants.lock().get(key).cloned())
+    }
+    fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()> {
+        self.grants.lock().remove(key);
+        Ok(())
+    }
+    fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .grants
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+}
+
+/// Read a delegate's manifest from its raw WASM module. `None` for no
+/// manifest, and for an unreadable one (logged): a delegate whose manifest
+/// cannot be read is treated as having asked for nothing.
+pub(crate) fn read_manifest(key: &DelegateKey, code: &[u8]) -> Option<DelegateManifest> {
+    match DelegateManifest::from_wasm(code) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                delegate = %key,
+                error = %e,
+                "Delegate manifest section is unreadable; treating the delegate as having none"
+            );
+            None
+        }
+    }
+}
+
+/// A lifecycle event queued for delivery on the contract loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LifecycleRun {
+    pub key: DelegateKey,
+    pub event: LifecycleEvent,
+}
+
+/// A node-authored prompt the caller must raise (from a spawned task, never
+/// inline on the contract loop) and answer with
+/// [`DelegateCapabilities::record_answer`] or
+/// [`DelegateCapabilities::prompt_unanswered`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapabilityPrompt {
+    pub app: AppIdentity,
+    pub delegate: DelegateKey,
+    pub capabilities: Vec<Capability>,
+}
+
+impl CapabilityPrompt {
+    /// The node's own text for the card. Never includes delegate-supplied
+    /// text: the card is labelled as the node's.
+    pub(crate) fn message(&self) -> String {
+        let wants: Vec<&str> = self
+            .capabilities
+            .iter()
+            .map(|c| capability_description(*c))
+            .collect();
+        format!(
+            "The Freenet app {} wants to: {}. You will only be asked once; you can \
+             change this later from the Freenet dashboard.",
+            self.app.display(),
+            wants.join("; ")
+        )
+    }
+
+    pub(crate) const ALLOW_INDEX: usize = 0;
+
+    pub(crate) fn labels() -> Vec<String> {
+        vec!["Allow".to_string(), "Not now".to_string()]
+    }
+}
+
+/// Why an unprompted operation was refused. Every refusal is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BudgetRefusal {
+    /// The delegate's own per-minute network-operation allowance is spent.
+    DelegateNetworkOps,
+    /// The node-wide per-minute network-operation allowance is spent.
+    NodeNetworkOps,
+    /// Too many PUT/UPDATEs to one contract from this delegate this minute.
+    ContractWrites,
+}
+
+impl BudgetRefusal {
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            BudgetRefusal::DelegateNetworkOps => {
+                "refused: this delegate's budget for unprompted network operations is spent; retry later"
+            }
+            BudgetRefusal::NodeNetworkOps => {
+                "refused: this node's budget for unprompted delegate network operations is spent; retry later"
+            }
+            BudgetRefusal::ContractWrites => {
+                "refused: too many unprompted writes to this contract from this delegate; retry later"
+            }
+        }
+    }
+}
+
+/// Limits for unprompted runs. Generous on purpose: a grant is consent, not an
+/// exemption, but existing notification-driven apps must not regress.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BudgetLimits {
+    /// Loop time a delegate may spend in lifecycle runs: refill per second.
+    pub duty_refill_per_sec: Duration,
+    /// ...and bucket size.
+    pub duty_burst: Duration,
+    /// Node-wide loop time for lifecycle runs: refill per second.
+    pub node_duty_refill_per_sec: Duration,
+    /// ...and bucket size.
+    pub node_duty_burst: Duration,
+    /// Network operations (GET/PUT/UPDATE/SUBSCRIBE) per delegate per minute.
+    pub ops_per_delegate_per_min: u32,
+    /// Same, node-wide.
+    pub ops_per_node_per_min: u32,
+    /// PUT/UPDATEs per (delegate, contract) per minute: the #5558
+    /// self-notification loop bound.
+    pub writes_per_contract_per_min: u32,
+}
+
+impl Default for BudgetLimits {
+    fn default() -> Self {
+        Self {
+            // 1% of wall time per delegate, 10% per node, as #5614/the RFC propose.
+            duty_refill_per_sec: Duration::from_millis(10),
+            duty_burst: Duration::from_secs(10),
+            node_duty_refill_per_sec: Duration::from_millis(100),
+            node_duty_burst: Duration::from_secs(30),
+            ops_per_delegate_per_min: 300,
+            ops_per_node_per_min: 3000,
+            writes_per_contract_per_min: 60,
+        }
+    }
+}
+
+/// A token bucket in microseconds. Refill keeps the fractional remainder
+/// (#5614 review F3: a truncating refill loses it and under-fills).
+#[derive(Debug, Clone)]
+struct DutyBucket {
+    tokens_us: u64,
+    last: tokio::time::Instant,
+    /// Carried sub-microsecond refill, in nanoseconds of elapsed time.
+    carry_ns: u128,
+}
+
+impl DutyBucket {
+    fn full(burst: Duration, now: tokio::time::Instant) -> Self {
+        Self {
+            tokens_us: burst.as_micros() as u64,
+            last: now,
+            carry_ns: 0,
+        }
+    }
+
+    fn refill(&mut self, now: tokio::time::Instant, per_sec: Duration, burst: Duration) {
+        let elapsed_ns = now.saturating_duration_since(self.last).as_nanos() + self.carry_ns;
+        self.last = now;
+        // tokens (us) = elapsed (s) * per_sec (us) = elapsed_ns * per_sec_us / 1e9
+        let per_sec_us = per_sec.as_micros();
+        let product = elapsed_ns * per_sec_us;
+        let add = product / 1_000_000_000;
+        self.carry_ns = if per_sec_us == 0 {
+            0
+        } else {
+            (product % 1_000_000_000) / per_sec_us
+        };
+        let cap = burst.as_micros() as u64;
+        self.tokens_us = (self.tokens_us as u128 + add).min(cap as u128) as u64;
+    }
+}
+
+/// A fixed one-minute window counter.
+#[derive(Debug, Clone)]
+struct MinuteWindow {
+    start: tokio::time::Instant,
+    count: u32,
+}
+
+impl MinuteWindow {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            start: now,
+            count: 0,
+        }
+    }
+
+    fn roll(&mut self, now: tokio::time::Instant) {
+        if now.saturating_duration_since(self.start) >= Duration::from_secs(60) {
+            self.start = now;
+            self.count = 0;
+        }
+    }
+}
+
+/// Entries idle for this long are dropped from the per-delegate maps.
+const BUDGET_ENTRY_IDLE_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Debug)]
+struct Budget {
+    limits: BudgetLimits,
+    duty: HashMap<DelegateKey, DutyBucket>,
+    node_duty: DutyBucket,
+    ops: HashMap<DelegateKey, MinuteWindow>,
+    node_ops: MinuteWindow,
+    writes: HashMap<(DelegateKey, ContractInstanceId), MinuteWindow>,
+    last_gc: tokio::time::Instant,
+}
+
+impl Budget {
+    fn new(limits: BudgetLimits, now: tokio::time::Instant) -> Self {
+        Self {
+            limits,
+            duty: HashMap::new(),
+            node_duty: DutyBucket::full(limits.node_duty_burst, now),
+            ops: HashMap::new(),
+            node_ops: MinuteWindow::new(now),
+            writes: HashMap::new(),
+            last_gc: now,
+        }
+    }
+
+    fn gc(&mut self, now: tokio::time::Instant) {
+        if now.saturating_duration_since(self.last_gc) < BUDGET_ENTRY_IDLE_TTL {
+            return;
+        }
+        self.last_gc = now;
+        let limits = self.limits;
+        // A full bucket is indistinguishable from a fresh one: drop it.
+        self.duty.retain(|_, b| {
+            b.refill(now, limits.duty_refill_per_sec, limits.duty_burst);
+            b.tokens_us < limits.duty_burst.as_micros() as u64
+        });
+        self.ops
+            .retain(|_, w| now.saturating_duration_since(w.start) < BUDGET_ENTRY_IDLE_TTL);
+        self.writes
+            .retain(|_, w| now.saturating_duration_since(w.start) < BUDGET_ENTRY_IDLE_TTL);
+    }
+
+    fn duty_available(&mut self, key: &DelegateKey, now: tokio::time::Instant) -> bool {
+        let limits = self.limits;
+        self.node_duty
+            .refill(now, limits.node_duty_refill_per_sec, limits.node_duty_burst);
+        let bucket = self
+            .duty
+            .entry(key.clone())
+            .or_insert_with(|| DutyBucket::full(limits.duty_burst, now));
+        bucket.refill(now, limits.duty_refill_per_sec, limits.duty_burst);
+        bucket.tokens_us > 0 && self.node_duty.tokens_us > 0
+    }
+
+    fn charge_duty(&mut self, key: &DelegateKey, spent: Duration, now: tokio::time::Instant) {
+        let limits = self.limits;
+        let us = spent.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = self
+            .duty
+            .entry(key.clone())
+            .or_insert_with(|| DutyBucket::full(limits.duty_burst, now));
+        bucket.tokens_us = bucket.tokens_us.saturating_sub(us);
+        self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us);
+    }
+
+    fn admit_op(
+        &mut self,
+        key: &DelegateKey,
+        write_to: Option<&ContractInstanceId>,
+        now: tokio::time::Instant,
+    ) -> Result<(), BudgetRefusal> {
+        self.gc(now);
+        let limits = self.limits;
+        self.node_ops.roll(now);
+        if self.node_ops.count >= limits.ops_per_node_per_min {
+            return Err(BudgetRefusal::NodeNetworkOps);
+        }
+        let window = self
+            .ops
+            .entry(key.clone())
+            .or_insert_with(|| MinuteWindow::new(now));
+        window.roll(now);
+        if window.count >= limits.ops_per_delegate_per_min {
+            return Err(BudgetRefusal::DelegateNetworkOps);
+        }
+        if let Some(contract) = write_to {
+            let w = self
+                .writes
+                .entry((key.clone(), *contract))
+                .or_insert_with(|| MinuteWindow::new(now));
+            w.roll(now);
+            if w.count >= limits.writes_per_contract_per_min {
+                return Err(BudgetRefusal::ContractWrites);
+            }
+            w.count += 1;
+        }
+        // Re-borrow: the entry above may have been created in this call.
+        if let Some(window) = self.ops.get_mut(key) {
+            window.count += 1;
+        }
+        self.node_ops.count += 1;
+        Ok(())
+    }
+}
+
+/// Counters exported for observability. Every refusal is counted.
+#[derive(Debug, Default)]
+pub(crate) struct CapabilityStats {
+    pub lifecycle_delivered: AtomicU64,
+    pub lifecycle_queue_full: AtomicU64,
+    pub lifecycle_deferred_duty: AtomicU64,
+    pub lifecycle_dropped_not_granted: AtomicU64,
+    pub refused_delegate_ops: AtomicU64,
+    pub refused_node_ops: AtomicU64,
+    pub refused_contract_writes: AtomicU64,
+    pub forged_lifecycle_refused: AtomicU64,
+}
+
+/// Per-node capability state. Held by the executor (and reachable from the
+/// `OpManager` for the HTTP server); never a process global, because
+/// simulation tests run many nodes in one process.
+pub(crate) struct DelegateCapabilities {
+    storage: Arc<dyn CapabilityStorage>,
+    time: DynTimeSource,
+    lifecycle_tx: mpsc::Sender<LifecycleRun>,
+    lifecycle_rx: Mutex<Option<mpsc::Receiver<LifecycleRun>>>,
+    prompts_in_flight: Mutex<HashSet<AppIdentity>>,
+    budget: Mutex<Budget>,
+    pub(crate) stats: CapabilityStats,
+}
+
+impl std::fmt::Debug for DelegateCapabilities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegateCapabilities").finish_non_exhaustive()
+    }
+}
+
+impl DelegateCapabilities {
+    pub(crate) fn new(storage: Arc<dyn CapabilityStorage>) -> Arc<Self> {
+        Self::with_time_source(
+            storage,
+            Arc::new(InstantTimeSrc::new()),
+            BudgetLimits::default(),
+        )
+    }
+
+    pub(crate) fn with_time_source(
+        storage: Arc<dyn CapabilityStorage>,
+        time: DynTimeSource,
+        limits: BudgetLimits,
+    ) -> Arc<Self> {
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_QUEUE_CAPACITY);
+        let now = time.now();
+        Arc::new(Self {
+            storage,
+            time,
+            lifecycle_tx,
+            lifecycle_rx: Mutex::new(Some(lifecycle_rx)),
+            prompts_in_flight: Mutex::new(HashSet::new()),
+            budget: Mutex::new(Budget::new(limits, now)),
+            stats: CapabilityStats::default(),
+        })
+    }
+
+    /// In-memory, for tests.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Arc<Self> {
+        Self::new(Arc::new(MemoryCapabilityStorage::default()))
+    }
+
+    /// The receiving end, taken once by the contract loop.
+    pub(crate) fn take_lifecycle_rx(&self) -> Option<mpsc::Receiver<LifecycleRun>> {
+        self.lifecycle_rx.lock().take()
+    }
+
+    pub(crate) fn now(&self) -> tokio::time::Instant {
+        self.time.now()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.time
+            .system_time_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn load_record(&self, key: &DelegateKey) -> Option<DelegateRecord> {
+        match self.storage.get_record(key) {
+            Ok(Some(bytes)) => {
+                let rec = DelegateRecord::decode(&bytes);
+                if rec.is_none() {
+                    tracing::warn!(delegate = %key, "Unreadable delegate capability record; ignoring it");
+                }
+                rec
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(delegate = %key, error = %e, "Failed to read delegate capability record");
+                None
+            }
+        }
+    }
+
+    fn store_record(&self, key: &DelegateKey, rec: &DelegateRecord) -> bool {
+        match self.storage.put_record(key, &rec.encode()) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(delegate = %key, error = %e, "Failed to store delegate capability record");
+                false
+            }
+        }
+    }
+
+    /// The stored answer for (app, cap), if any.
+    pub(crate) fn grant(&self, app: &AppIdentity, cap: Capability) -> Option<Grant> {
+        let code = capability_code(cap)?;
+        match self.storage.get_grant(&grant_key(app, code)) {
+            Ok(Some(bytes)) => Grant::decode(&bytes),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read capability grant; treating as not granted");
+                None
+            }
+        }
+    }
+
+    fn is_granted(&self, app: &AppIdentity, cap: Capability) -> bool {
+        matches!(self.grant(app, cap), Some(Grant::Granted { .. }))
+    }
+
+    /// Whether any app bound to this delegate holds `cap`.
+    fn any_bound_app_granted(&self, rec: &DelegateRecord, cap: Capability) -> bool {
+        rec.apps.iter().any(|app| self.is_granted(app, cap))
+    }
+
+    /// Called after a delegate registration SUCCEEDED. `code` is the raw WASM
+    /// module, `app` the attested registering app (`None` for a non-local or
+    /// tokenless registration, which records the manifest but binds no app
+    /// and prompts nobody).
+    ///
+    /// Returns the prompt to raise, if the app lacks a capability the manifest
+    /// asks for and has not declined it recently. Queues `Installed` when it
+    /// is due.
+    pub(crate) fn on_registered(
+        &self,
+        key: &DelegateKey,
+        code: &[u8],
+        params: &[u8],
+        app: Option<AppIdentity>,
+    ) -> Option<CapabilityPrompt> {
+        let manifest = read_manifest(key, code)?;
+        self.on_registered_manifest(key, manifest, params, app)
+    }
+
+    /// [`Self::on_registered`] with the manifest already read.
+    pub(crate) fn on_registered_manifest(
+        &self,
+        key: &DelegateKey,
+        manifest: DelegateManifest,
+        params: &[u8],
+        app: Option<AppIdentity>,
+    ) -> Option<CapabilityPrompt> {
+        let wanted = manifest.known_capabilities();
+        let wants_lifecycle = [LifecycleKind::Installed, LifecycleKind::NodeStarted]
+            .iter()
+            .any(|k| manifest.wants_lifecycle(*k));
+        if wanted.is_empty() && !wants_lifecycle {
+            return None;
+        }
+        if params.len() > MAX_STORED_PARAMS_BYTES {
+            tracing::warn!(
+                delegate = %key,
+                params_bytes = params.len(),
+                max = MAX_STORED_PARAMS_BYTES,
+                "Delegate parameters too large to keep for lifecycle runs; it will get none"
+            );
+            return None;
+        }
+
+        let existing = self.load_record(key);
+        let is_new = existing.is_none();
+        let mut rec = match existing {
+            Some(rec) => rec,
+            None => {
+                let count = self.storage.all_records().map(|r| r.len()).unwrap_or(0);
+                if count >= MAX_CAPABILITY_RECORDS {
+                    tracing::warn!(
+                        delegate = %key,
+                        max = MAX_CAPABILITY_RECORDS,
+                        "Too many manifest-declaring delegates on this node; not recording this one"
+                    );
+                    return None;
+                }
+                DelegateRecord {
+                    manifest: manifest.clone(),
+                    params: params.to_vec(),
+                    apps: Vec::new(),
+                    installed_delivered: false,
+                }
+            }
+        };
+        let mut changed = rec.manifest != manifest || rec.params != params;
+        rec.manifest = manifest;
+        rec.params = params.to_vec();
+        if let Some(app) = app
+            && !rec.apps.contains(&app)
+        {
+            if rec.apps.len() < MAX_APPS_PER_DELEGATE {
+                rec.apps.push(app);
+                changed = true;
+            } else {
+                tracing::warn!(
+                    delegate = %key,
+                    app = %app.display(),
+                    max = MAX_APPS_PER_DELEGATE,
+                    "Delegate is already bound to the maximum number of apps; not binding another"
+                );
+            }
+        }
+        if (changed || is_new) && !self.store_record(key, &rec)
+        {
+            return None;
+        }
+
+        let prompt = app.filter(|a| rec.apps.contains(a)).and_then(|app| {
+            let now_ms = self.now_ms();
+            let missing: Vec<Capability> = wanted
+                .iter()
+                .copied()
+                .filter(|cap| match self.grant(&app, *cap) {
+                    Some(Grant::Granted { .. }) => false,
+                    Some(Grant::Denied { until_ms, .. }) => now_ms >= until_ms,
+                    None => true,
+                })
+                .collect();
+            if missing.is_empty() || !self.prompts_in_flight.lock().insert(app) {
+                return None;
+            }
+            Some(CapabilityPrompt {
+                app,
+                delegate: key.clone(),
+                capabilities: missing,
+            })
+        });
+
+        self.maybe_queue_installed(key, &rec);
+        prompt
+    }
+
+    /// Forget a delegate that was unregistered. Grants belong to apps and stay.
+    pub(crate) fn on_unregistered(&self, key: &DelegateKey) {
+        if let Err(e) = self.storage.remove_record(key) {
+            tracing::warn!(delegate = %key, error = %e, "Failed to remove delegate capability record");
+        }
+    }
+
+    fn maybe_queue_installed(&self, key: &DelegateKey, rec: &DelegateRecord) {
+        if rec.installed_delivered
+            || !rec.manifest.wants_lifecycle(LifecycleKind::Installed)
+            || !self.any_bound_app_granted(rec, Capability::Background)
+        {
+            return;
+        }
+        self.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::Installed,
+        });
+    }
+
+    /// Non-blocking enqueue; a full queue is counted and logged.
+    pub(crate) fn queue(&self, run: LifecycleRun) -> bool {
+        match self.lifecycle_tx.try_send(run) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(run)) => {
+                self.stats.lifecycle_queue_full.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    delegate = %run.key,
+                    event = ?run.event,
+                    "Lifecycle queue full; dropping this lifecycle event"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Store the user's answer to a [`CapabilityPrompt`] and, on Allow, queue
+    /// `Installed` for every delegate of that app that is still waiting for it.
+    pub(crate) fn record_answer(&self, prompt: &CapabilityPrompt, allowed: bool) {
+        let now_ms = self.now_ms();
+        for cap in &prompt.capabilities {
+            let Some(code) = capability_code(*cap) else {
+                continue;
+            };
+            let grant = if allowed {
+                Grant::Granted { at_ms: now_ms }
+            } else {
+                Grant::Denied {
+                    at_ms: now_ms,
+                    until_ms: now_ms.saturating_add(DENIAL_COOL_OFF.as_millis() as u64),
+                }
+            };
+            if let Err(e) = self
+                .storage
+                .put_grant(&grant_key(&prompt.app, code), &grant.encode())
+            {
+                tracing::warn!(error = %e, "Failed to store capability grant");
+            }
+        }
+        self.prompts_in_flight.lock().remove(&prompt.app);
+        if allowed {
+            self.queue_installed_for_app(&prompt.app);
+        }
+    }
+
+    /// The prompt went unanswered (timeout, no tab): store nothing, so the
+    /// next registration asks again.
+    pub(crate) fn prompt_unanswered(&self, prompt: &CapabilityPrompt) {
+        self.prompts_in_flight.lock().remove(&prompt.app);
+    }
+
+    fn queue_installed_for_app(&self, app: &AppIdentity) {
+        let records = match self.storage.all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list delegate capability records");
+                return;
+            }
+        };
+        for (key, bytes) in records {
+            if let Some(rec) = DelegateRecord::decode(&bytes)
+                && rec.apps.contains(app)
+            {
+                self.maybe_queue_installed(&key, &rec);
+            }
+        }
+    }
+
+    /// Revoke a grant (dashboard). Future unprompted deliveries stop; the next
+    /// registration by that app prompts again.
+    pub(crate) fn revoke(&self, app: &AppIdentity, cap: Capability) -> bool {
+        let Some(code) = capability_code(cap) else {
+            return false;
+        };
+        self.storage.remove_grant(&grant_key(app, code)).is_ok()
+    }
+
+    /// Every stored answer, for the dashboard.
+    pub(crate) fn grants(&self) -> Vec<(AppIdentity, Capability, Grant)> {
+        self.storage
+            .all_grants()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if k.len() != 35 {
+                    return None;
+                }
+                let app = AppIdentity::decode(&k[..33])?;
+                let cap = capability_from_code(u16::from_be_bytes([k[33], k[34]]))?;
+                Some((app, cap, Grant::decode(&v)?))
+            })
+            .collect()
+    }
+
+    /// The parameters to run `key` with for an event of `kind`, or `None` if
+    /// the event must not be delivered: no record, the manifest does not list
+    /// the kind, or no bound app holds the Background grant. Checked again at
+    /// delivery, so a revocation between queueing and running takes effect.
+    pub(crate) fn delivery_params(&self, key: &DelegateKey, kind: LifecycleKind) -> Option<Vec<u8>> {
+        let rec = self.load_record(key)?;
+        if !rec.manifest.wants_lifecycle(kind)
+            || !self.any_bound_app_granted(&rec, Capability::Background)
+        {
+            return None;
+        }
+        if kind == LifecycleKind::Installed && rec.installed_delivered {
+            return None;
+        }
+        Some(rec.params)
+    }
+
+    /// Record that `Installed` was handed to the delegate. Set BEFORE the run,
+    /// so a delegate that crashes the node in `Installed` does not get it
+    /// again on every start.
+    pub(crate) fn mark_installed_delivered(&self, key: &DelegateKey) {
+        if let Some(mut rec) = self.load_record(key) {
+            rec.installed_delivered = true;
+            self.store_record(key, &rec);
+        }
+    }
+
+    /// Delegates that get `NodeStarted` on this start.
+    pub(crate) fn node_started_targets(&self) -> Vec<DelegateKey> {
+        let records = match self.storage.all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list delegate capability records at start");
+                return Vec::new();
+            }
+        };
+        records
+            .into_iter()
+            .filter_map(|(key, bytes)| {
+                let rec = DelegateRecord::decode(&bytes)?;
+                (rec.manifest.wants_lifecycle(LifecycleKind::NodeStarted)
+                    && self.any_bound_app_granted(&rec, Capability::Background))
+                .then_some(key)
+            })
+            .collect()
+    }
+
+    /// Whether a lifecycle run for `key` may start now (duty budget).
+    pub(crate) fn duty_available(&self, key: &DelegateKey) -> bool {
+        let now = self.time.now();
+        self.budget.lock().duty_available(key, now)
+    }
+
+    /// Charge loop time spent in an unprompted run.
+    pub(crate) fn charge_duty(&self, key: &DelegateKey, spent: Duration) {
+        let now = self.time.now();
+        self.budget.lock().charge_duty(key, spent, now);
+    }
+
+    /// Admission for one network operation from an unprompted run. `write_to`
+    /// is the target contract for a PUT/UPDATE.
+    pub(crate) fn admit_op(
+        &self,
+        key: &DelegateKey,
+        write_to: Option<&ContractInstanceId>,
+    ) -> Result<(), BudgetRefusal> {
+        let now = self.time.now();
+        let result = self.budget.lock().admit_op(key, write_to, now);
+        if let Err(refusal) = result {
+            let counter = match refusal {
+                BudgetRefusal::DelegateNetworkOps => &self.stats.refused_delegate_ops,
+                BudgetRefusal::NodeNetworkOps => &self.stats.refused_node_ops,
+                BudgetRefusal::ContractWrites => &self.stats.refused_contract_writes,
+            };
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            // First refusal and every 100th after, so a runaway is visible
+            // without flooding the log.
+            if n % 100 == 0 {
+                tracing::warn!(
+                    delegate = %key,
+                    ?refusal,
+                    total = n + 1,
+                    "Refused a network operation from an unprompted delegate run"
+                );
+            }
+        }
+        result
+    }
+}
+
+/// How long NodeStarted runs are spread over after a start, so a node with
+/// many background delegates does not run them all at once while it is also
+/// answering its first client requests.
+pub(crate) const NODE_STARTED_SMEAR: Duration = Duration::from_secs(60);
+
+/// Minimum delay before the first NodeStarted run: lets the node finish its
+/// own start-up work (connections, restored subscriptions) first.
+pub(crate) const NODE_STARTED_MIN_DELAY: Duration = Duration::from_secs(5);
+
+/// Retry delay for a lifecycle run that could not start (delegate parked, or
+/// its duty budget spent).
+pub(crate) const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+/// Attempts before a deferred lifecycle run is dropped (about 15 minutes).
+pub(crate) const LIFECYCLE_MAX_ATTEMPTS: u32 = 60;
+
+/// Lifecycle runs started per loop iteration, so a burst cannot starve client
+/// work (each is a full delegate run).
+pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 2;
+
+/// Lifecycle runs waiting on the loop, ordered by due time. Owned by the
+/// contract loop; bounded by the lifecycle queue capacity plus the node-start
+/// seed (itself bounded by [`MAX_CAPABILITY_RECORDS`]).
+#[derive(Default)]
+pub(crate) struct LifecycleSchedule {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(tokio::time::Instant, u64)>>,
+    runs: HashMap<u64, (LifecycleRun, u32)>,
+    seq: u64,
+}
+
+impl LifecycleSchedule {
+    pub(crate) fn push(&mut self, due: tokio::time::Instant, run: LifecycleRun, attempts: u32) {
+        self.seq += 1;
+        self.heap.push(std::cmp::Reverse((due, self.seq)));
+        self.runs.insert(self.seq, (run, attempts));
+    }
+
+    /// The next run due at or before `now`, with its attempt count.
+    pub(crate) fn pop_due(&mut self, now: tokio::time::Instant) -> Option<(LifecycleRun, u32)> {
+        let std::cmp::Reverse((due, _)) = self.heap.peek()?;
+        if *due > now {
+            return None;
+        }
+        let std::cmp::Reverse((_, seq)) = self.heap.pop()?;
+        self.runs.remove(&seq)
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.heap.peek().map(|std::cmp::Reverse((due, _))| *due)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.runs.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::time_source::SharedMockTimeSource;
+    use freenet_stdlib::prelude::CodeHash;
+
+    fn key(n: u8) -> DelegateKey {
+        DelegateKey::new([n; 32], CodeHash::new([n; 32]))
+    }
+
+    fn app(n: u8) -> AppIdentity {
+        AppIdentity::WebApp(ContractInstanceId::new([n; 32]))
+    }
+
+    /// A WASM module holding only a manifest section.
+    pub(crate) fn wasm_with_manifest(manifest: &DelegateManifest) -> Vec<u8> {
+        let payload = manifest.to_bytes();
+        let name = freenet_stdlib::prelude::MANIFEST_SECTION_NAME.as_bytes();
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.extend_from_slice(&payload);
+        let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let mut len = body.len() as u32;
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            m.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        m.extend(body);
+        m
+    }
+
+    fn background_manifest() -> DelegateManifest {
+        DelegateManifest::new(
+            vec![LifecycleKind::Installed, LifecycleKind::NodeStarted],
+            vec![Capability::Background],
+        )
+    }
+
+    fn caps() -> (Arc<DelegateCapabilities>, SharedMockTimeSource) {
+        let time = SharedMockTimeSource::new();
+        (
+            DelegateCapabilities::with_time_source(
+                Arc::new(MemoryCapabilityStorage::default()),
+                Arc::new(time.clone()),
+                BudgetLimits::default(),
+            ),
+            time,
+        )
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<LifecycleRun>) -> Vec<LifecycleRun> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            out.push(r);
+        }
+        out
+    }
+
+    #[test]
+    fn encodings_round_trip() {
+        let a = app(3);
+        assert_eq!(AppIdentity::decode(&a.encode()), Some(a));
+        assert_eq!(AppIdentity::decode(&[9u8; 33]), None);
+        for g in [
+            Grant::Granted { at_ms: 5 },
+            Grant::Denied {
+                at_ms: 5,
+                until_ms: 99,
+            },
+        ] {
+            assert_eq!(Grant::decode(&g.encode()), Some(g));
+        }
+        let rec = DelegateRecord {
+            manifest: background_manifest(),
+            params: vec![1, 2, 3],
+            apps: vec![app(1), app(2)],
+            installed_delivered: true,
+        };
+        assert_eq!(DelegateRecord::decode(&rec.encode()), Some(rec));
+    }
+
+    #[test]
+    fn no_manifest_records_nothing_and_prompts_nobody() {
+        let (c, _) = caps();
+        let mut rx = c.take_lifecycle_rx().unwrap();
+        let bare = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(c.on_registered(&key(1), &bare, &[], Some(app(1))), None);
+        assert!(c.storage.all_records().unwrap().is_empty());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// Consent once: the first registration prompts, Allow is remembered, a
+    /// re-registration (same app, or a re-keyed delegate of the same app)
+    /// never prompts again, and Installed is queued exactly once.
+    #[test]
+    fn consent_is_asked_once_and_remembered() {
+        let (c, _) = caps();
+        let mut rx = c.take_lifecycle_rx().unwrap();
+        let wasm = wasm_with_manifest(&background_manifest());
+
+        let prompt = c
+            .on_registered(&key(1), &wasm, b"p", Some(app(1)))
+            .expect("first registration asks");
+        assert_eq!(prompt.capabilities, vec![Capability::Background]);
+        assert!(drain(&mut rx).is_empty(), "no Installed before the grant");
+
+        // A second registration while the prompt is open does not stack a card.
+        assert_eq!(c.on_registered(&key(1), &wasm, b"p", Some(app(1))), None);
+
+        c.record_answer(&prompt, true);
+        let runs = drain(&mut rx);
+        assert_eq!(
+            runs,
+            vec![LifecycleRun {
+                key: key(1),
+                event: LifecycleEvent::Installed
+            }]
+        );
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::Installed), Some(b"p".to_vec()));
+        c.mark_installed_delivered(&key(1));
+
+        // Re-registration: no prompt, no second Installed.
+        assert_eq!(c.on_registered(&key(1), &wasm, b"p", Some(app(1))), None);
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::Installed), None);
+
+        // A re-keyed delegate of the same app inherits the grant: no prompt,
+        // and it gets its own Installed straight away.
+        assert_eq!(c.on_registered(&key(2), &wasm, b"q", Some(app(1))), None);
+        assert_eq!(drain(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn not_now_suppresses_the_prompt_for_the_cool_off_only() {
+        let (c, time) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let prompt = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        c.record_answer(&prompt, false);
+        assert_eq!(c.on_registered(&key(1), &wasm, &[], Some(app(1))), None);
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
+        time.advance_time(DENIAL_COOL_OFF + Duration::from_secs(1));
+        assert!(c.on_registered(&key(1), &wasm, &[], Some(app(1))).is_some());
+    }
+
+    #[test]
+    fn an_unanswered_prompt_stores_nothing_and_asks_again() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let prompt = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        c.prompt_unanswered(&prompt);
+        assert_eq!(c.grant(&app(1), Capability::Background), None);
+        assert!(c.on_registered(&key(1), &wasm, &[], Some(app(1))).is_some());
+    }
+
+    /// No attested app, no binding, no prompt and no delivery.
+    #[test]
+    fn an_unattested_registration_gets_nothing() {
+        let (c, _) = caps();
+        let mut rx = c.take_lifecycle_rx().unwrap();
+        let wasm = wasm_with_manifest(&background_manifest());
+        assert_eq!(c.on_registered(&key(1), &wasm, &[], None), None);
+        assert!(drain(&mut rx).is_empty());
+        assert!(c.node_started_targets().is_empty());
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
+    }
+
+    /// A platform delegate is delivered to if ANY bound app holds the grant,
+    /// and a second app's registration neither steals nor needs the first's.
+    #[test]
+    fn a_platform_delegate_runs_if_any_bound_app_is_granted() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let p1 = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        let p2 = c.on_registered(&key(1), &wasm, &[], Some(app(2))).unwrap();
+        c.record_answer(&p1, false);
+        assert!(c.node_started_targets().is_empty());
+        c.record_answer(&p2, true);
+        assert_eq!(c.node_started_targets(), vec![key(1)]);
+        // Revoking the only grant stops delivery.
+        assert!(c.revoke(&app(2), Capability::Background));
+        assert!(c.node_started_targets().is_empty());
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
+    }
+
+    #[test]
+    fn app_bindings_are_capped() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        for n in 0..(MAX_APPS_PER_DELEGATE as u8 + 3) {
+            let _ = c.on_registered(&key(1), &wasm, &[], Some(app(n)));
+        }
+        let rec = c.load_record(&key(1)).unwrap();
+        assert_eq!(rec.apps.len(), MAX_APPS_PER_DELEGATE);
+        // An app over the cap is not bound, so it is not prompted either.
+        assert_eq!(
+            c.on_registered(&key(1), &wasm, &[], Some(app(200))),
+            None
+        );
+    }
+
+    /// Delivery requires the manifest to list the kind, whatever the grant.
+    #[test]
+    fn delivery_requires_the_listed_kind() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&DelegateManifest::new(
+            vec![LifecycleKind::NodeStarted],
+            vec![Capability::Background],
+        ));
+        let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        c.record_answer(&p, true);
+        assert_eq!(c.delivery_params(&key(1), LifecycleKind::Installed), None);
+        assert!(c.delivery_params(&key(1), LifecycleKind::NodeStarted).is_some());
+        // A manifest listing lifecycle kinds without Background (only possible
+        // by hand, the macro refuses it) never gets them.
+        let wasm = wasm_with_manifest(&DelegateManifest::new(
+            vec![LifecycleKind::NodeStarted],
+            vec![],
+        ));
+        assert_eq!(c.on_registered(&key(2), &wasm, &[], Some(app(9))), None);
+        assert_eq!(c.delivery_params(&key(2), LifecycleKind::NodeStarted), None);
+    }
+
+    #[test]
+    fn duty_budget_refuses_when_spent_and_refills_with_remainder() {
+        let time = SharedMockTimeSource::new();
+        let limits = BudgetLimits {
+            duty_refill_per_sec: Duration::from_millis(10),
+            duty_burst: Duration::from_millis(50),
+            ..BudgetLimits::default()
+        };
+        let c = DelegateCapabilities::with_time_source(
+            Arc::new(MemoryCapabilityStorage::default()),
+            Arc::new(time.clone()),
+            limits,
+        );
+        assert!(c.duty_available(&key(1)));
+        c.charge_duty(&key(1), Duration::from_millis(60));
+        assert!(!c.duty_available(&key(1)), "spent past the burst");
+        assert!(c.duty_available(&key(2)), "another delegate is unaffected");
+        // 0.3 ms of refill ten times is 3 us: a truncating refill would add 0.
+        for _ in 0..10 {
+            time.advance_time(Duration::from_micros(30));
+            let _ = c.duty_available(&key(1));
+        }
+        let tokens = c.budget.lock().duty.get(&key(1)).unwrap().tokens_us;
+        assert_eq!(tokens, 3);
+    }
+
+    #[test]
+    fn network_ops_are_bounded_per_delegate_per_node_and_per_contract() {
+        let time = SharedMockTimeSource::new();
+        let limits = BudgetLimits {
+            ops_per_delegate_per_min: 3,
+            ops_per_node_per_min: 5,
+            writes_per_contract_per_min: 2,
+            ..BudgetLimits::default()
+        };
+        let c = DelegateCapabilities::with_time_source(
+            Arc::new(MemoryCapabilityStorage::default()),
+            Arc::new(time.clone()),
+            limits,
+        );
+        let target = ContractInstanceId::new([7; 32]);
+        assert_eq!(c.admit_op(&key(1), Some(&target)), Ok(()));
+        assert_eq!(c.admit_op(&key(1), Some(&target)), Ok(()));
+        assert_eq!(
+            c.admit_op(&key(1), Some(&target)),
+            Err(BudgetRefusal::ContractWrites)
+        );
+        assert_eq!(c.admit_op(&key(1), None), Ok(()));
+        assert_eq!(
+            c.admit_op(&key(1), None),
+            Err(BudgetRefusal::DelegateNetworkOps)
+        );
+        assert_eq!(c.admit_op(&key(2), None), Ok(()));
+        assert_eq!(c.admit_op(&key(3), None), Ok(()));
+        assert_eq!(c.admit_op(&key(4), None), Err(BudgetRefusal::NodeNetworkOps));
+        assert_eq!(c.stats.refused_node_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(c.stats.refused_delegate_ops.load(Ordering::Relaxed), 1);
+        assert_eq!(c.stats.refused_contract_writes.load(Ordering::Relaxed), 1);
+        time.advance_time(Duration::from_secs(61));
+        assert_eq!(c.admit_op(&key(1), Some(&target)), Ok(()));
+    }
+
+    #[test]
+    fn a_full_lifecycle_queue_counts_the_drop() {
+        let (c, _) = caps();
+        let _rx = c.take_lifecycle_rx().unwrap();
+        for n in 0..LIFECYCLE_QUEUE_CAPACITY {
+            assert!(c.queue(LifecycleRun {
+                key: key((n % 250) as u8),
+                event: LifecycleEvent::Installed,
+            }));
+        }
+        assert!(!c.queue(LifecycleRun {
+            key: key(1),
+            event: LifecycleEvent::Installed,
+        }));
+        assert_eq!(c.stats.lifecycle_queue_full.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn schedule_pops_in_due_order_and_not_early() {
+        let mut sched = LifecycleSchedule::default();
+        let t0 = tokio::time::Instant::now();
+        let run = |n| LifecycleRun {
+            key: key(n),
+            event: LifecycleEvent::Installed,
+        };
+        sched.push(t0 + Duration::from_secs(10), run(1), 0);
+        sched.push(t0 + Duration::from_secs(5), run(2), 3);
+        assert_eq!(sched.next_deadline(), Some(t0 + Duration::from_secs(5)));
+        assert_eq!(sched.pop_due(t0), None);
+        assert_eq!(sched.pop_due(t0 + Duration::from_secs(6)), Some((run(2), 3)));
+        assert_eq!(sched.pop_due(t0 + Duration::from_secs(6)), None);
+        assert_eq!(sched.pop_due(t0 + Duration::from_secs(10)), Some((run(1), 0)));
+        assert_eq!(sched.len(), 0);
+        assert_eq!(sched.next_deadline(), None);
+    }
+
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn grants_and_records_survive_a_reopen() {
+        let dir = crate::util::tests::get_temp_dir();
+        let wasm = wasm_with_manifest(&background_manifest());
+        {
+            let db = crate::contract::storages::Storage::new(dir.path()).await.unwrap();
+            let c = DelegateCapabilities::new(Arc::new(db));
+            let p = c.on_registered(&key(1), &wasm, b"x", Some(app(1))).unwrap();
+            c.record_answer(&p, true);
+        }
+        let db = crate::contract::storages::Storage::new(dir.path()).await.unwrap();
+        let c = DelegateCapabilities::new(Arc::new(db));
+        assert!(matches!(
+            c.grant(&app(1), Capability::Background),
+            Some(Grant::Granted { .. })
+        ));
+        assert_eq!(c.node_started_targets(), vec![key(1)]);
+        assert_eq!(c.on_registered(&key(1), &wasm, b"x", Some(app(1))), None);
+    }
+}

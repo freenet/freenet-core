@@ -426,6 +426,7 @@ async fn pending_prompts(
                 .collect();
             serde_json::json!({
                 "nonce": entry.key(),
+                "author": prompt.author.as_str(),
                 "message": message,
                 "labels": labels,
                 "delegate_key": sanitize_display(&prompt.delegate_key, OVERLAY_KEY_CHARS_MAX),
@@ -512,6 +513,10 @@ async fn permission_page(
         // (`include_str!`) instead of a string literal.
         Html(format!(
             include_str!("permission_prompts/assets/permission_prompt.html"),
+            message_label = match entry.author {
+                crate::contract::user_input::PromptAuthor::Delegate => "Delegate says:",
+                crate::contract::user_input::PromptAuthor::Node => "Freenet asks:",
+            },
             caller_title_html = caller_title_html,
             caller_display_html = caller_display_html,
             delegate_full_attr = delegate_full_attr,
@@ -984,6 +989,7 @@ fn snapshot_to_json(snapshot: &PromptSnapshot) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "nonce": snapshot.nonce,
+        "author": snapshot.author.as_str(),
         "message": message,
         "labels": labels,
         "delegate_key": sanitize_display(&snapshot.delegate_key, OVERLAY_KEY_CHARS_MAX),
@@ -1071,6 +1077,7 @@ async fn permission_events(
         .map(|entry| {
             let snapshot = PromptSnapshot {
                 nonce: entry.key().clone(),
+                author: entry.value().author,
                 message: entry.value().message.clone(),
                 labels: entry.value().labels.clone(),
                 delegate_key: entry.value().delegate_key.clone(),
@@ -1223,6 +1230,7 @@ async fn permission_events_ws(
         .map(|entry| {
             let snapshot = PromptSnapshot {
                 nonce: entry.key().clone(),
+                author: entry.value().author,
                 message: entry.value().message.clone(),
                 labels: entry.value().labels.clone(),
                 delegate_key: entry.value().delegate_key.clone(),
@@ -1473,6 +1481,7 @@ mod tests {
         pending.insert(
             nonce.to_string(),
             PendingPrompt {
+                author: crate::contract::user_input::PromptAuthor::Delegate,
                 message: message.to_string(),
                 labels: labels.into_iter().map(String::from).collect(),
                 delegate_key: delegate_key.to_string(),
@@ -1654,6 +1663,7 @@ mod tests {
             pending.insert(
                 "n".to_string(),
                 PendingPrompt {
+                    author: crate::contract::user_input::PromptAuthor::Delegate,
                     message: "m".to_string(),
                     labels,
                     delegate_key: "d".to_string(),
@@ -2197,6 +2207,7 @@ mod tests {
 
         let nonce = "ssetest_added_001".to_string();
         let snapshot = PromptSnapshot {
+            author: crate::contract::user_input::PromptAuthor::Delegate,
             nonce: nonce.clone(),
             message: "approve?".into(),
             labels: vec!["Allow".into(), "Deny".into()],
@@ -2382,6 +2393,7 @@ mod tests {
         // chain MUST deliver after the pre-existing snapshot.
         let live_nonce = "ssetest_order_live".to_string();
         let snapshot = PromptSnapshot {
+            author: crate::contract::user_input::PromptAuthor::Delegate,
             nonce: live_nonce.clone(),
             message: "live".into(),
             labels: vec!["OK".into()],
@@ -4038,6 +4050,7 @@ mod tests {
         wait_subscribers_then_send(
             initial_subs + 1,
             PromptEvent::Added(PromptSnapshot {
+                author: crate::contract::user_input::PromptAuthor::Delegate,
                 nonce: nonce.clone(),
                 message: "approve?".into(),
                 labels: vec!["Allow".into(), "Deny".into()],
@@ -4115,6 +4128,7 @@ mod tests {
     #[test]
     fn ws_envelope_wraps_data_unchanged() {
         let snapshot = PromptSnapshot {
+            author: crate::contract::user_input::PromptAuthor::Delegate,
             nonce: "n1".into(),
             message: "m".into(),
             labels: vec!["OK".into()],
