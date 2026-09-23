@@ -552,19 +552,67 @@ async fn list_grants(
     }
     let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
     let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
-    let trusted = match headers.get("origin") {
+    // A same-origin GET often carries no Origin. Without one, require a Host
+    // naming this machine (or an operator-allowed host), so a DNS-rebound
+    // page, whose Host is its own name, reads nothing: which apps a user has
+    // granted is a fingerprint worth keeping.
+    if !grants_read_trusted(&headers, allowed_hosts, allowed_source_cidrs) {
+        return Json(grants_body(None)).into_response();
+    }
+    Json(grants_body(capabilities_of(op_manager).as_deref())).into_response()
+}
+
+fn grants_read_trusted(
+    headers: &HeaderMap,
+    allowed_hosts: Option<&AllowedHosts>,
+    allowed_source_cidrs: Option<&AllowedSourceCidrs>,
+) -> bool {
+    match headers.get("origin") {
         Some(value) => value
             .to_str()
-            .map(|s| is_origin_trusted(&headers, s, allowed_hosts, allowed_source_cidrs))
+            .map(|s| is_origin_trusted(headers, s, allowed_hosts, allowed_source_cidrs))
             .unwrap_or(false),
-        None => true,
-    };
-    if !trusted {
-        return Json(serde_json::json!([])).into_response();
+        None => {
+            host_is_loopback(headers)
+                || allowed_hosts.is_some_and(|hosts| is_allowed_host(headers, hosts))
+        }
     }
-    match capabilities_of(op_manager) {
-        Some(caps) => Json(grants_json(&caps)).into_response(),
-        None => Json(serde_json::json!([])).into_response(),
+}
+
+/// Whether the Host header names the loopback interface (`localhost`,
+/// `127.0.0.1`, `[::1]`, with any port).
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']')
+            .next()
+            .map(|h| format!("[{h}]"))
+            .unwrap_or_default()
+    } else {
+        host.split(':').next().unwrap_or_default().to_string()
+    };
+    matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// `{ "grants": [...], "stats": {...} }`. The stats are the capability
+/// counters (lifecycle runs delivered, deferred, dropped; budget refusals),
+/// shown on the Apps and permissions page so a refusal is visible somewhere
+/// other than a rotated log.
+fn grants_body(
+    caps: Option<&crate::contract::delegate_capabilities::DelegateCapabilities>,
+) -> serde_json::Value {
+    match caps {
+        Some(caps) => serde_json::json!({
+            "grants": grants_json(caps),
+            "stats": serde_json::to_value(&caps.stats).unwrap_or(serde_json::Value::Null),
+        }),
+        None => serde_json::json!({ "grants": [], "stats": null }),
     }
 }
 
@@ -614,7 +662,7 @@ struct RevokeGrantRequest {
 ///
 /// State-changing, so the same gate as `/permission/{nonce}/respond`:
 /// loopback peer, and an Origin that is present and trusted (CSRF). This is
-/// the design #4090 lacked when an earlier grant endpoint was reverted.
+/// the design the grant endpoint of #4086 lacked (reverted in #4090).
 async fn revoke_grant(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
@@ -4709,9 +4757,53 @@ mod grant_endpoint_tests {
         )
         .await;
         let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-        assert_eq!(&bytes[..], b"[]");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["grants"], serde_json::json!([]));
         let resp = list_grants(Some(lan()), HeaderMap::new(), None, None, None).await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Without an Origin (a same-origin GET), only a Host naming this machine
+    /// or an allowed host may read the list: a DNS-rebound page's Host is its
+    /// own name.
+    #[test]
+    fn a_rebound_host_cannot_read_the_list() {
+        fn host(h: &str) -> HeaderMap {
+            let mut m = HeaderMap::new();
+            m.insert(axum::http::header::HOST, h.parse().unwrap());
+            m
+        }
+        for ok in [
+            "localhost:7509",
+            "127.0.0.1:7509",
+            "[::1]:7509",
+            "LOCALHOST",
+        ] {
+            assert!(grants_read_trusted(&host(ok), None, None), "{ok}");
+        }
+        for bad in [
+            "evil.example:7509",
+            "localhost.evil.example",
+            "127.0.0.2:7509",
+        ] {
+            assert!(!grants_read_trusted(&host(bad), None, None), "{bad}");
+        }
+        assert!(
+            !grants_read_trusted(&HeaderMap::new(), None, None),
+            "no Host"
+        );
+        let allowed: AllowedHosts =
+            std::sync::Arc::new(["node.lan:7509".to_string()].into_iter().collect());
+        assert!(grants_read_trusted(
+            &host("node.lan:7509"),
+            Some(&allowed),
+            None
+        ));
+        assert!(!grants_read_trusted(
+            &origin("https://evil.example"),
+            None,
+            None
+        ));
     }
 
     #[test]

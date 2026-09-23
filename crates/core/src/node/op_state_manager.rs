@@ -797,11 +797,6 @@ impl OpManager {
         self.inflight_client_ops.clone()
     }
 
-    /// Set the request router for cleaning up stale entries when operations complete.
-    ///
-    /// This is called from client_event_handling after the request_router is created.
-    /// Without this, completed operations leave stale entries in the request router's
-    /// resource_to_transaction map, causing subsequent requests to hang forever.
     /// Set once by the executor pool; later calls are ignored.
     pub(crate) fn set_delegate_capabilities(
         &self,
@@ -818,6 +813,11 @@ impl OpManager {
         self.delegate_capabilities.get().cloned()
     }
 
+    /// Set the request router for cleaning up stale entries when operations complete.
+    ///
+    /// This is called from client_event_handling after the request_router is created.
+    /// Without this, completed operations leave stale entries in the request router's
+    /// resource_to_transaction map, causing subsequent requests to hang forever.
     pub fn set_request_router(&self, router: Arc<RequestRouter>) {
         if self.request_router.set(router).is_err() {
             tracing::warn!("Request router already set - ignoring duplicate set");

@@ -47,6 +47,30 @@ A module importing a removed name fails to instantiate; pinned by
 removed_delegate_contract_imports_are_refused_at_instantiation.
 ```
 
+### Delegate manifests, lifecycle events and capability grants
+
+```
+A delegate built against an older stdlib cannot decode an InboundDelegateMsg
+variant added later: delivery fails with a decode error (pinned by
+a_delegate_without_a_manifest_cannot_decode_lifecycle). So:
+
+NEVER deliver a new inbound message kind to a delegate that did not ask for
+it. Ask = its embedded `freenet-manifest` section lists that kind
+(DelegateManifest::from_wasm, read at registration). Lifecycle (tag 10) is
+delivered only when the manifest lists the kind AND a bound app holds the
+user's Background grant; both are re-checked at delivery
+(contract::delegate_capabilities::delivery_params).
+
+A client may not send host-only inbound messages (Lifecycle, WakeupFired):
+dispatch_delegate_request refuses them before exclusion or queueing.
+
+Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
+connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
+"Freenet asks:") and raised off the contract loop. Unprompted runs
+(InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
+delegates without a manifest are untouched.
+```
+
 ### WASM Call Modes
 
 All three guest entry points share ONE body, `call_typed_blocking` in

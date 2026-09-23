@@ -63,7 +63,7 @@ impl UserInputPrompter for CapabilityPrompter {
             matches!(caller, CallerIdentity::WebApp(_)),
             "a capability prompt always names the app"
         );
-        assert!(message.contains("background"), "{message}");
+        assert!(message.contains("Freenet starts"), "{message}");
         self.asked.fetch_add(1, Ordering::SeqCst);
         if let Some(gate) = &self.gate {
             gate.acquire().await.expect("gate").forget();
@@ -199,13 +199,17 @@ async fn start<P: UserInputPrompter + 'static>(
     script_handle.lock().unwrap().extend(script);
     let observations = rt.delegate_observations.clone();
     let handle = GlobalExecutor::spawn(contract_handling(handler, prompter));
-    Loop {
+    let lp = Loop {
         send: Arc::new(send),
         caps,
         script: script_handle,
         observations,
         handle,
-    }
+    };
+    // Let the loop start (and seed NodeStarted from what is granted NOW)
+    // before the test grants anything, so the seed never races the test.
+    lp.sync().await;
+    lp
 }
 
 async fn wait_until(label: &str, mut cond: impl FnMut() -> bool) {
@@ -563,15 +567,6 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
     let manifest = background(vec![LifecycleKind::NodeStarted]);
     let delegate = container(&manifest, b"p");
     let key = delegate.key().clone();
-    let p = caps
-        .on_registered(
-            &key,
-            &manifest_module(&manifest),
-            b"p",
-            Some(AppIdentity::WebApp(app(7))),
-        )
-        .unwrap();
-    caps.record_answer(&p, true);
 
     let two_gets = || {
         ScriptedRun::from(vec![
@@ -596,6 +591,15 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
         CapabilityPrompter::answering(None),
     )
     .await;
+    let p = caps
+        .on_registered(
+            &key,
+            &manifest_module(&manifest),
+            b"p",
+            Some(AppIdentity::WebApp(app(7))),
+        )
+        .unwrap();
+    caps.record_answer(&p, true);
 
     // Client-driven: not budgeted.
     let resp = answer(
@@ -643,6 +647,14 @@ async fn a_spent_duty_budget_defers_lifecycle_runs() {
     let manifest = background(vec![LifecycleKind::NodeStarted]);
     let delegate = container(&manifest, b"p");
     let key = delegate.key().clone();
+
+    let lp = start(
+        "cap_duty",
+        caps.clone(),
+        vec![ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
     let p = caps
         .on_registered(
             &key,
@@ -652,15 +664,7 @@ async fn a_spent_duty_budget_defers_lifecycle_runs() {
         )
         .unwrap();
     caps.record_answer(&p, true);
-    caps.charge_duty(&key, Duration::from_secs(10));
-
-    let lp = start(
-        "cap_duty",
-        caps.clone(),
-        vec![ScriptedRun::default()],
-        CapabilityPrompter::answering(None),
-    )
-    .await;
+    caps.charge_duty(&key, Duration::from_secs(10), true);
     assert!(caps.queue(LifecycleRun {
         key,
         event: LifecycleEvent::NodeStarted {
@@ -674,4 +678,333 @@ async fn a_spent_duty_budget_defers_lifecycle_runs() {
     lp.sync().await;
     assert!(lp.lifecycle_runs().is_empty());
     let _ = user_input::AutoApprovePrompter;
+}
+
+/// `is_unprompted_run` classifies by `InterDelegateDispatch::Suppressed`, so
+/// the budget is only as right as the set of callers passing it. Every
+/// production use of `Suppressed` must sit in a function that runs a delegate
+/// no client asked for, and those functions must be exactly the known ones:
+/// a new caller has to be classified here deliberately.
+#[test]
+fn unprompted_runs_are_exactly_the_suppressed_ones() {
+    let code = super::tests::production_code();
+    let mut callers: Vec<String> = code
+        .match_indices("InterDelegateDispatch::Suppressed")
+        .map(|(idx, _)| {
+            let before = &code[..idx];
+            let start = [before.rfind("\nasync fn "), before.rfind("\nfn ")]
+                .into_iter()
+                .flatten()
+                .max()
+                .expect("every use sits inside a function");
+            let sig = &code[start + 1..];
+            let name_start = sig.find("fn ").expect("fn") + 3;
+            let name_end = sig[name_start..]
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .expect("name end");
+            sig[name_start..name_start + name_end].to_string()
+        })
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert_eq!(
+        callers,
+        vec![
+            "handle_delegate_notification".to_string(),
+            "is_unprompted_run".to_string(),
+            "run_lifecycle".to_string(),
+            "run_queued_notification".to_string(),
+        ],
+        "a new InterDelegateDispatch::Suppressed caller must be classified as an unprompted run (or not) on purpose"
+    );
+}
+
+/// A granted delegate with a Background manifest, recorded in `caps`.
+fn granted(
+    caps: &DelegateCapabilities,
+    lifecycle: Vec<LifecycleKind>,
+    params: &[u8],
+    app_n: u8,
+) -> DelegateKey {
+    let manifest = background(lifecycle);
+    let delegate = container(&manifest, params);
+    let key = delegate.key().clone();
+    let p = caps
+        .on_registered(
+            &key,
+            &manifest_module(&manifest),
+            params,
+            Some(AppIdentity::WebApp(app(app_n))),
+        )
+        .expect("first registration asks");
+    caps.record_answer(&p, true);
+    key
+}
+
+/// The budget applies only to delegates that opted in. A delegate with no
+/// capability record (River, and every delegate built before manifests) runs
+/// its notification exactly as before, however many operations it emits.
+#[tokio::test]
+async fn the_budget_only_applies_to_opted_in_delegates() {
+    let caps = DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits {
+            ops_per_delegate_per_min: 1,
+            ..BudgetLimits::default()
+        },
+    );
+    let opted_in = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 20);
+    let legacy = DelegateKey::new([0x77; 32], CodeHash::new([0x77; 32]));
+    let two_gets = || {
+        ScriptedRun::from(vec![
+            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
+                ContractInstanceId::new([0x61; 32]),
+            )),
+            OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(
+                ContractInstanceId::new([0x62; 32]),
+            )),
+        ])
+    };
+    let (_send, rcv, _) = handler::contract_handler_channel();
+    let mut handler = MockWasmContractHandler::new_test(rcv, None, "cap_opt_in").await;
+    let rt = handler.runtime_mut();
+    rt.capabilities = Some(caps.clone());
+    rt.delegate_script.lock().unwrap().extend([
+        two_gets(),
+        ScriptedRun::default(),
+        two_gets(),
+        ScriptedRun::default(),
+    ]);
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    for key in [&legacy, &opted_in] {
+        super::handle_delegate_notification(
+            &mut handler,
+            super::executor::DelegateNotification {
+                delegate_key: key.clone(),
+                contract_id: ContractInstanceId::new([0x63; 32]),
+                new_state: Arc::new(WrappedState::new(vec![1])),
+            },
+            &prompter,
+            None,
+        )
+        .await;
+        let refused = caps.stats.refused_delegate_ops.load(Ordering::Relaxed);
+        if key == &legacy {
+            assert_eq!(refused, 0, "a delegate without a manifest is not budgeted");
+        } else {
+            assert_eq!(refused, 1, "an opted-in delegate's notification run is");
+        }
+    }
+}
+
+/// Every refusal arm answers the delegate with its own response shape and is
+/// counted: PUT, UPDATE and SUBSCRIBE, not only GET.
+#[tokio::test]
+async fn every_operation_kind_is_answered_when_refused() {
+    let caps = DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits {
+            ops_per_delegate_per_min: 0,
+            ..BudgetLimits::default()
+        },
+    );
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        Arc::new(ContractCode::from(b"budget-put".to_vec())),
+        Parameters::from(vec![]),
+    )));
+    let target = ContractInstanceId::new([0x71; 32]);
+    let ops = ScriptedRun::from(vec![
+        OutboundDelegateMsg::PutContractRequest(PutContractRequest::new(
+            contract,
+            WrappedState::new(vec![1]),
+            RelatedContracts::default(),
+        )),
+        OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+            target,
+            UpdateData::State(State::from(vec![2])),
+        )),
+        OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest::new(target)),
+    ]);
+    let lp = start(
+        "cap_refusal_arms",
+        caps.clone(),
+        vec![ops, ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 21);
+    assert!(caps.queue(LifecycleRun {
+        key,
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
+    }));
+    wait_until("the follow-up run", || {
+        lp.observations.lock().unwrap().len() == 2
+    })
+    .await;
+    let follow_up = lp.observations.lock().unwrap()[1].inbound_kinds.clone();
+    let mut kinds = follow_up.clone();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec![
+            "PutContractResponse",
+            "SubscribeContractResponse",
+            "UpdateContractResponse"
+        ],
+        "{follow_up:?}"
+    );
+    assert_eq!(caps.stats.refused_delegate_ops.load(Ordering::Relaxed), 3);
+}
+
+/// A lifecycle run for a PARKED delegate is deferred, never run into the park
+/// (the per-delegate exclusion of #5544).
+#[tokio::test]
+async fn a_parked_delegate_defers_its_lifecycle_run() {
+    struct HangingDelegatePrompt;
+    impl UserInputPrompter for HangingDelegatePrompt {
+        async fn prompt(
+            &self,
+            _request: &UserInputRequest<'static>,
+            _delegate_key: &str,
+            _caller: CallerIdentity,
+        ) -> Option<(usize, ClientResponse<'static>)> {
+            std::future::pending().await
+        }
+    }
+    let caps = DelegateCapabilities::in_memory();
+    let message = NotificationMessage::try_from(&serde_json::json!({"message": "allow?"}))
+        .expect("notification message");
+    let prompt = ScriptedRun::from(vec![OutboundDelegateMsg::RequestUserInput(
+        UserInputRequest {
+            request_id: 1,
+            message,
+            responses: vec![ClientResponse::new(b"yes".to_vec())],
+        },
+    )]);
+    let lp = start(
+        "cap_parked",
+        caps.clone(),
+        vec![prompt],
+        HangingDelegatePrompt,
+    )
+    .await;
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 22);
+    // Park the delegate: a client run that prompts and never gets an answer.
+    let send = lp.send.clone();
+    let parked_key = key.clone();
+    let _client = tokio::spawn(async move {
+        send.send_to_handler(app_messages(
+            &parked_key,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(b"go".to_vec()),
+            )],
+        ))
+        .await
+    });
+    wait_until("the delegate to park", || {
+        lp.observations.lock().unwrap().len() == 1
+    })
+    .await;
+    assert!(caps.queue(LifecycleRun {
+        key,
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
+    }));
+    wait_until("the deferral", || {
+        caps.stats.lifecycle_deferred_parked.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    lp.sync().await;
+    assert!(lp.lifecycle_runs().is_empty(), "never run into a park");
+}
+
+/// A run that cannot start is retried, then dropped after
+/// `LIFECYCLE_MAX_ATTEMPTS`, and the drop is counted.
+#[tokio::test(start_paused = true)]
+async fn a_run_that_never_starts_is_dropped_and_counted() {
+    let caps = DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits {
+            duty_burst: Duration::from_micros(1),
+            duty_refill_per_sec: Duration::ZERO,
+            ..BudgetLimits::default()
+        },
+    );
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 23);
+    caps.charge_duty(&key, Duration::from_secs(1), true);
+    let lp = start(
+        "cap_dropped",
+        caps.clone(),
+        vec![],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    assert!(caps.queue(LifecycleRun {
+        key,
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
+    }));
+    tokio::time::sleep(
+        super::delegate_capabilities::LIFECYCLE_RETRY_DELAY
+            * (super::delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS + 2),
+    )
+    .await;
+    lp.sync().await;
+    assert_eq!(
+        caps.stats
+            .lifecycle_dropped_attempts
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        caps.stats.lifecycle_deferred_duty.load(Ordering::Relaxed),
+        u64::from(super::delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS)
+    );
+    assert!(lp.lifecycle_runs().is_empty());
+}
+
+/// Only a local connection's unregister drops a delegate's capability record.
+#[tokio::test]
+async fn a_remote_unregister_keeps_the_record() {
+    let caps = DelegateCapabilities::in_memory();
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 24);
+    let lp = start(
+        "cap_unregister",
+        caps.clone(),
+        vec![ScriptedRun::default(), ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    let unregister = |scope| ContractHandlerEvent::DelegateRequest {
+        req: DelegateRequest::UnregisterDelegate(key.clone()),
+        origin_contract: None,
+        connection_scope: scope,
+        user_context: None,
+    };
+    let remote = answer(
+        lp.send
+            .send_to_handler(unregister(crate::client_events::ConnectionScope::Remote))
+            .await
+            .unwrap(),
+    );
+    assert!(remote.is_ok(), "{remote:?}");
+    assert!(
+        caps.is_budgeted(&key),
+        "a remote unregister must not drop the record"
+    );
+    let local = answer(
+        lp.send
+            .send_to_handler(unregister(crate::client_events::ConnectionScope::Local))
+            .await
+            .unwrap(),
+    );
+    assert!(local.is_ok(), "{local:?}");
+    assert!(!caps.is_budgeted(&key), "a local unregister drops it");
 }

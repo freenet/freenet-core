@@ -201,7 +201,13 @@ pub struct RuntimePool {
     /// Manifests, consent-once grants and the unprompted-run budget for this
     /// node's delegates (`contract::delegate_capabilities`). Per node, never
     /// a process global: simulation tests run many nodes in one process.
-    delegate_capabilities: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ///
+    /// `None` in hosted mode: there every client can present any app's token
+    /// from what the node sees as a local connection, and runs have no
+    /// per-user secret namespace, so neither app identity nor a node-wide
+    /// grant means anything there.
+    delegate_capabilities:
+        Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
     /// Sender for delegate notifications (cloned into each executor and replacements).
     delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
@@ -611,9 +617,16 @@ impl RuntimePool {
         let capability_storage: Arc<
             dyn crate::contract::delegate_capabilities::CapabilityStorage,
         > = Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
-        let delegate_capabilities =
-            crate::contract::delegate_capabilities::DelegateCapabilities::new(capability_storage);
-        op_manager.set_delegate_capabilities(delegate_capabilities.clone());
+        let delegate_capabilities = if config.ws_api.hosted_mode {
+            tracing::info!("Hosted mode: delegate capabilities (background runs) are disabled");
+            None
+        } else {
+            let caps = crate::contract::delegate_capabilities::DelegateCapabilities::new(
+                capability_storage,
+            );
+            op_manager.set_delegate_capabilities(caps.clone());
+            Some(caps)
+        };
 
         Ok(Self {
             delegate_capabilities,
@@ -916,7 +929,7 @@ impl ContractExecutor for RuntimePool {
     fn delegate_capabilities(
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
-        Some(self.delegate_capabilities.clone())
+        self.delegate_capabilities.clone()
     }
 
     async fn fetch_contract(

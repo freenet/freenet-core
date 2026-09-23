@@ -108,7 +108,9 @@ fn capability_from_code(code: u16) -> Option<Capability> {
 pub(crate) fn capability_description(cap: Capability) -> &'static str {
     #[allow(clippy::wildcard_enum_match_arm)]
     match cap {
-        Capability::Background => "keep running in the background when its tab is closed",
+        Capability::Background => {
+            "run when it is installed and each time Freenet starts, even with its tab closed"
+        }
         _ => "use a capability this node does not know",
     }
 }
@@ -234,6 +236,8 @@ impl DelegateRecord {
             installed_delivered: self.installed_delivered,
         };
         let mut out = vec![RECORD_V1];
+        // Infallible: plain byte vectors and a bool, no maps or custom
+        // serializers that could refuse.
         out.extend(bincode::serialize(&v1).expect("record serializes"));
         out
     }
@@ -475,7 +479,10 @@ impl Default for BudgetLimits {
 /// (#5614 review F3: a truncating refill loses it and under-fills).
 #[derive(Debug, Clone)]
 struct DutyBucket {
-    tokens_us: u64,
+    /// Signed: a run that overspends leaves the bucket in debt, and the debt
+    /// is paid back before the next run is admitted. Clipping at zero would
+    /// forgive overdraft and let a delegate take far more than its share.
+    tokens_us: i64,
     last: tokio::time::Instant,
     /// Carried sub-microsecond refill, in nanoseconds of elapsed time.
     carry_ns: u128,
@@ -484,7 +491,7 @@ struct DutyBucket {
 impl DutyBucket {
     fn full(burst: Duration, now: tokio::time::Instant) -> Self {
         Self {
-            tokens_us: burst.as_micros() as u64,
+            tokens_us: burst.as_micros().min(i64::MAX as u128) as i64,
             last: now,
             carry_ns: 0,
         }
@@ -502,8 +509,9 @@ impl DutyBucket {
         } else {
             (product % 1_000_000_000) / per_sec_us
         };
-        let cap = burst.as_micros() as u64;
-        self.tokens_us = (self.tokens_us as u128 + add).min(cap as u128) as u64;
+        let cap = burst.as_micros().min(i64::MAX as u128) as i64;
+        let add = add.min(i64::MAX as u128) as i64;
+        self.tokens_us = self.tokens_us.saturating_add(add).min(cap);
     }
 }
 
@@ -566,7 +574,7 @@ impl Budget {
         // A full bucket is indistinguishable from a fresh one: drop it.
         self.duty.retain(|_, b| {
             b.refill(now, limits.duty_refill_per_sec, limits.duty_burst);
-            b.tokens_us < limits.duty_burst.as_micros() as u64
+            (b.tokens_us as i128) < limits.duty_burst.as_micros() as i128
         });
         self.ops
             .retain(|_, w| now.saturating_duration_since(w.start) < BUDGET_ENTRY_IDLE_TTL);
@@ -575,6 +583,7 @@ impl Budget {
     }
 
     fn duty_available(&mut self, key: &DelegateKey, now: tokio::time::Instant) -> bool {
+        self.gc(now);
         let limits = self.limits;
         self.node_duty
             .refill(now, limits.node_duty_refill_per_sec, limits.node_duty_burst);
@@ -586,15 +595,26 @@ impl Budget {
         bucket.tokens_us > 0 && self.node_duty.tokens_us > 0
     }
 
-    fn charge_duty(&mut self, key: &DelegateKey, spent: Duration, now: tokio::time::Instant) {
+    /// `node_wide`: also charge the node bucket. Only lifecycle runs do; a
+    /// notification run charges its delegate alone, so busy notification
+    /// traffic cannot starve every delegate's lifecycle runs.
+    fn charge_duty(
+        &mut self,
+        key: &DelegateKey,
+        spent: Duration,
+        node_wide: bool,
+        now: tokio::time::Instant,
+    ) {
         let limits = self.limits;
-        let us = spent.as_micros().min(u64::MAX as u128) as u64;
+        let us = spent.as_micros().min(i64::MAX as u128) as i64;
         let bucket = self
             .duty
             .entry(key.clone())
             .or_insert_with(|| DutyBucket::full(limits.duty_burst, now));
         bucket.tokens_us = bucket.tokens_us.saturating_sub(us);
-        self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us);
+        if node_wide {
+            self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us);
+        }
     }
 
     fn admit_op(
@@ -638,11 +658,14 @@ impl Budget {
 }
 
 /// Counters exported for observability. Every refusal is counted.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct CapabilityStats {
     pub lifecycle_delivered: AtomicU64,
+    pub lifecycle_failed: AtomicU64,
     pub lifecycle_queue_full: AtomicU64,
     pub lifecycle_deferred_duty: AtomicU64,
+    pub lifecycle_deferred_parked: AtomicU64,
+    pub lifecycle_dropped_attempts: AtomicU64,
     pub lifecycle_dropped_not_granted: AtomicU64,
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
@@ -660,6 +683,10 @@ pub(crate) struct DelegateCapabilities {
     lifecycle_rx: Mutex<Option<mpsc::Receiver<LifecycleRun>>>,
     prompts_in_flight: Mutex<HashSet<AppIdentity>>,
     budget: Mutex<Budget>,
+    /// Keys with a record, mirrored in memory: it decides which delegates the
+    /// unprompted-run budget applies to (checked on every notification run)
+    /// and counts records against the cap without a table scan.
+    recorded: Mutex<HashSet<DelegateKey>>,
     pub(crate) stats: CapabilityStats,
 }
 
@@ -686,7 +713,15 @@ impl DelegateCapabilities {
     ) -> Arc<Self> {
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_QUEUE_CAPACITY);
         let now = time.now();
+        let recorded = match storage.all_records() {
+            Ok(records) => records.into_iter().map(|(k, _)| k).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load delegate capability records");
+                HashSet::new()
+            }
+        };
         Arc::new(Self {
+            recorded: Mutex::new(recorded),
             storage,
             time,
             lifecycle_tx,
@@ -739,7 +774,10 @@ impl DelegateCapabilities {
 
     fn store_record(&self, key: &DelegateKey, rec: &DelegateRecord) -> bool {
         match self.storage.put_record(key, &rec.encode()) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.recorded.lock().insert(key.clone());
+                true
+            }
             Err(e) => {
                 tracing::warn!(delegate = %key, error = %e, "Failed to store delegate capability record");
                 false
@@ -845,6 +883,19 @@ impl DelegateCapabilities {
         if let Some(app) = app
             && !rec.apps.contains(&app)
         {
+            if rec.apps.len() >= MAX_APPS_PER_DELEGATE {
+                // Full: drop a bound app that holds none of the capabilities
+                // this manifest asks for. Refusing instead would let anyone
+                // who can bind eight apps lock the real one out for good.
+                let wanted = rec.manifest.known_capabilities();
+                if let Some(pos) = rec
+                    .apps
+                    .iter()
+                    .position(|a| !wanted.iter().any(|cap| self.is_granted(a, *cap)))
+                {
+                    rec.apps.remove(pos);
+                }
+            }
             if rec.apps.len() < MAX_APPS_PER_DELEGATE {
                 rec.apps.push(app);
                 changed = true;
@@ -853,7 +904,7 @@ impl DelegateCapabilities {
                     delegate = %key,
                     app = %app.display(),
                     max = MAX_APPS_PER_DELEGATE,
-                    "Delegate is already bound to the maximum number of apps; not binding another"
+                    "Delegate is bound to the maximum number of apps, all granted; not binding another"
                 );
             }
         }
@@ -892,6 +943,9 @@ impl DelegateCapabilities {
     /// again), so registrations with junk manifests cannot crowd out a
     /// delegate the user approved. `false` when every record is granted.
     fn make_room_for_record(&self) -> bool {
+        if self.recorded.lock().len() < MAX_CAPABILITY_RECORDS {
+            return true;
+        }
         let records = match self.storage.all_records() {
             Ok(r) => r,
             Err(e) => {
@@ -902,6 +956,7 @@ impl DelegateCapabilities {
         if records.len() < MAX_CAPABILITY_RECORDS {
             return true;
         }
+        // Reached only at the cap: the caller checks the in-memory count first.
         let victim = records.into_iter().find_map(|(key, bytes)| {
             let granted = DelegateRecord::decode(&bytes).is_some_and(|rec| {
                 rec.apps.iter().any(|app| {
@@ -914,13 +969,22 @@ impl DelegateCapabilities {
             (!granted).then_some(key)
         });
         match victim {
-            Some(key) => self.storage.remove_record(&key).is_ok(),
+            Some(key) => {
+                let removed = self.storage.remove_record(&key).is_ok();
+                if removed {
+                    self.recorded.lock().remove(&key);
+                }
+                removed
+            }
             None => false,
         }
     }
 
     /// Forget a delegate that was unregistered. Grants belong to apps and stay.
     pub(crate) fn on_unregistered(&self, key: &DelegateKey) {
+        if !self.recorded.lock().remove(key) {
+            return;
+        }
         if let Err(e) = self.storage.remove_record(key) {
             tracing::warn!(delegate = %key, error = %e, "Failed to remove delegate capability record");
         }
@@ -1023,7 +1087,10 @@ impl DelegateCapabilities {
     pub(crate) fn grants(&self) -> Vec<(AppIdentity, Capability, Grant)> {
         self.storage
             .all_grants()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to list capability grants");
+                Vec::new()
+            })
             .into_iter()
             .filter_map(|(k, v)| {
                 if k.len() != 35 {
@@ -1087,16 +1154,26 @@ impl DelegateCapabilities {
             .collect()
     }
 
+    /// Whether `key`'s unprompted runs are budgeted: only delegates that opted
+    /// into the capability system by declaring a manifest (and were registered
+    /// by an app) are. Every other delegate's notification runs behave exactly
+    /// as before this module existed.
+    pub(crate) fn is_budgeted(&self, key: &DelegateKey) -> bool {
+        self.recorded.lock().contains(key)
+    }
+
     /// Whether a lifecycle run for `key` may start now (duty budget).
     pub(crate) fn duty_available(&self, key: &DelegateKey) -> bool {
         let now = self.time.now();
         self.budget.lock().duty_available(key, now)
     }
 
-    /// Charge loop time spent in an unprompted run.
-    pub(crate) fn charge_duty(&self, key: &DelegateKey, spent: Duration) {
+    /// Charge time spent on the loop in an unprompted run (wall time between
+    /// entering and leaving the run on the loop, including work it awaited
+    /// there). `node_wide` for lifecycle runs only; see `Budget::charge_duty`.
+    pub(crate) fn charge_duty(&self, key: &DelegateKey, spent: Duration, node_wide: bool) {
         let now = self.time.now();
-        self.budget.lock().charge_duty(key, spent, now);
+        self.budget.lock().charge_duty(key, spent, node_wide, now);
     }
 
     /// Admission for one network operation from an unprompted run. `write_to`
@@ -1148,23 +1225,37 @@ pub(crate) const LIFECYCLE_MAX_ATTEMPTS: u32 = 60;
 
 /// Lifecycle runs started per loop iteration, so a burst cannot starve client
 /// work (each is a full delegate run).
-pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 2;
+pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 1;
 
 /// Lifecycle runs waiting on the loop, ordered by due time. Owned by the
-/// contract loop; bounded by the lifecycle queue capacity plus the node-start
-/// seed (itself bounded by [`MAX_CAPABILITY_RECORDS`]).
+/// contract loop.
+/// A run for a `(delegate, kind)` already waiting is not added again, so the
+/// schedule holds at most one run per delegate per kind: bounded by twice the
+/// record cap.
 #[derive(Default)]
 pub(crate) struct LifecycleSchedule {
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(tokio::time::Instant, u64)>>,
     runs: HashMap<u64, (LifecycleRun, u32)>,
+    pending: HashSet<(DelegateKey, LifecycleKind)>,
     seq: u64,
 }
 
 impl LifecycleSchedule {
-    pub(crate) fn push(&mut self, due: tokio::time::Instant, run: LifecycleRun, attempts: u32) {
+    /// `false` if a run of the same kind for the same delegate is already
+    /// waiting (the new one is dropped).
+    pub(crate) fn push(
+        &mut self,
+        due: tokio::time::Instant,
+        run: LifecycleRun,
+        attempts: u32,
+    ) -> bool {
+        if !self.pending.insert((run.key.clone(), run.event.kind())) {
+            return false;
+        }
         self.seq += 1;
         self.heap.push(std::cmp::Reverse((due, self.seq)));
         self.runs.insert(self.seq, (run, attempts));
+        true
     }
 
     /// The next run due at or before `now`, with its attempt count.
@@ -1174,7 +1265,9 @@ impl LifecycleSchedule {
             return None;
         }
         let std::cmp::Reverse((_, seq)) = self.heap.pop()?;
-        self.runs.remove(&seq)
+        let (run, attempts) = self.runs.remove(&seq)?;
+        self.pending.remove(&(run.key.clone(), run.event.kind()));
+        Some((run, attempts))
     }
 
     pub(crate) fn next_deadline(&self) -> Option<tokio::time::Instant> {
@@ -1385,51 +1478,103 @@ mod tests {
         assert_eq!(c.delivery_params(&key(1), LifecycleKind::NodeStarted), None);
     }
 
-    /// At the record cap, a never-granted record makes room; a granted one
-    /// is never evicted to make room.
+    /// At the record cap, a never-granted record makes room; a granted one is
+    /// never evicted to make room.
     #[test]
     fn the_record_cap_evicts_only_ungranted_records() {
         let (c, _) = caps();
         let wasm = wasm_with_manifest(&background_manifest());
-        let granted = key(0);
-        let p = c.on_registered(&granted, &wasm, &[], Some(app(0))).unwrap();
-        c.record_answer(&p, true);
-        for n in 1..MAX_CAPABILITY_RECORDS as u32 {
-            let k = DelegateKey::new(
+        let k = |n: u32| {
+            DelegateKey::new(
                 *blake3::hash(&n.to_le_bytes()).as_bytes(),
                 CodeHash::new([1; 32]),
-            );
-            let _ = c.on_registered(&k, &wasm, &[], Some(app(1)));
+            )
+        };
+        // Fill the table with records of a granted app, plus one ungranted.
+        let p = c.on_registered(&k(0), &wasm, &[], Some(app(0))).unwrap();
+        c.record_answer(&p, true);
+        for n in 1..(MAX_CAPABILITY_RECORDS as u32 - 1) {
+            assert!(c.on_registered(&k(n), &wasm, &[], Some(app(0))).is_none());
         }
+        let ungranted = key(250);
+        let _ = c.on_registered(&ungranted, &wasm, &[], Some(app(9)));
         assert_eq!(
             c.storage.all_records().unwrap().len(),
             MAX_CAPABILITY_RECORDS
         );
-        let newcomer = key(250);
-        let _ = c.on_registered(&newcomer, &wasm, &[], Some(app(2)));
-        let records = c.storage.all_records().unwrap();
-        assert_eq!(records.len(), MAX_CAPABILITY_RECORDS);
-        assert!(
-            records.iter().any(|(k, _)| *k == granted),
-            "the granted record stays"
-        );
-        assert!(
-            records.iter().any(|(k, _)| *k == newcomer),
-            "the newcomer got in"
-        );
+
+        // A newcomer takes the ungranted record's place.
+        let newcomer = key(251);
+        let _ = c.on_registered(&newcomer, &wasm, &[], Some(app(8)));
+        let keys: HashSet<DelegateKey> = c
+            .storage
+            .all_records()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys.len(), MAX_CAPABILITY_RECORDS);
+        assert!(keys.contains(&newcomer));
+        assert!(!keys.contains(&ungranted));
+
+        // Now every record but the newcomer's is granted; grant its app too,
+        // and a further newcomer is refused rather than evicting any of them.
+        let p = c.on_registered(&newcomer, &wasm, &[], Some(app(8)));
+        if let Some(p) = p {
+            c.record_answer(&p, true);
+        } else {
+            let prompt = CapabilityPrompt {
+                app: app(8),
+                delegate: newcomer.clone(),
+                capabilities: vec![Capability::Background],
+            };
+            c.record_answer(&prompt, true);
+        }
+        let late = key(252);
+        assert!(c.on_registered(&late, &wasm, &[], Some(app(7))).is_none());
+        let after: HashSet<DelegateKey> = c
+            .storage
+            .all_records()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(after, keys, "no granted record is evicted");
+        assert!(!c.is_budgeted(&late));
     }
 
+    /// A full app list drops an ungranted binding for a new app, so eight
+    /// bindings cannot lock the real app out.
     #[test]
-    fn app_bindings_are_capped() {
+    fn a_full_app_list_makes_room_by_dropping_an_ungranted_app() {
         let (c, _) = caps();
         let wasm = wasm_with_manifest(&background_manifest());
-        for n in 0..(MAX_APPS_PER_DELEGATE as u8 + 3) {
+        for n in 0..MAX_APPS_PER_DELEGATE as u8 {
             let _ = c.on_registered(&key(1), &wasm, &[], Some(app(n)));
+            c.prompt_unanswered(&CapabilityPrompt {
+                app: app(n),
+                delegate: key(1),
+                capabilities: vec![Capability::Background],
+            });
         }
+        let granted_app = app(0);
+        c.record_answer(
+            &CapabilityPrompt {
+                app: granted_app,
+                delegate: key(1),
+                capabilities: vec![Capability::Background],
+            },
+            true,
+        );
+        let real = app(100);
+        let _ = c.on_registered(&key(1), &wasm, &[], Some(real));
         let rec = c.load_record(&key(1)).unwrap();
         assert_eq!(rec.apps.len(), MAX_APPS_PER_DELEGATE);
-        // An app over the cap is not bound, so it is not prompted either.
-        assert_eq!(c.on_registered(&key(1), &wasm, &[], Some(app(200))), None);
+        assert!(rec.apps.contains(&real), "the new app got a slot");
+        assert!(
+            rec.apps.contains(&granted_app),
+            "the granted app kept its slot"
+        );
     }
 
     /// Delivery requires the manifest to list the kind, whatever the grant.
@@ -1471,16 +1616,33 @@ mod tests {
             limits,
         );
         assert!(c.duty_available(&key(1)));
-        c.charge_duty(&key(1), Duration::from_millis(60));
+        c.charge_duty(&key(1), Duration::from_millis(60), true);
         assert!(!c.duty_available(&key(1)), "spent past the burst");
-        assert!(c.duty_available(&key(2)), "another delegate is unaffected");
-        // 0.3 ms of refill ten times is 3 us: a truncating refill would add 0.
+        // Overdraft is debt, not forgiven: 50 ms burst - 60 ms = -10 ms, and
+        // 10 ms of refill at 10 ms/s takes a full second.
+        time.advance_time(Duration::from_millis(900));
+        assert!(
+            !c.duty_available(&key(1)),
+            "still paying back the overdraft"
+        );
+        time.advance_time(Duration::from_millis(200));
+        assert!(c.duty_available(&key(1)));
+        // The node bucket (10% default refill) was charged by the lifecycle
+        // run; a notification run (node_wide = false) charges only its own
+        // delegate.
+        let node_before = c.budget.lock().node_duty.tokens_us;
+        c.charge_duty(&key(2), Duration::from_millis(40), false);
+        assert_eq!(c.budget.lock().node_duty.tokens_us, node_before);
+        assert!(c.duty_available(&key(3)), "another delegate is unaffected");
+        // 0.3 us of refill per step ten times is 3 us: a truncating refill
+        // would add 0.
+        let start = c.budget.lock().duty.get(&key(1)).unwrap().tokens_us;
         for _ in 0..10 {
             time.advance_time(Duration::from_micros(30));
             let _ = c.duty_available(&key(1));
         }
         let tokens = c.budget.lock().duty.get(&key(1)).unwrap().tokens_us;
-        assert_eq!(tokens, 3);
+        assert_eq!(tokens - start, 3);
     }
 
     #[test]
@@ -1562,6 +1724,24 @@ mod tests {
         );
         assert_eq!(sched.len(), 0);
         assert_eq!(sched.next_deadline(), None);
+
+        // One waiting run per (delegate, kind).
+        assert!(sched.push(t0, run(3), 0));
+        assert!(!sched.push(t0, run(3), 0));
+        assert!(sched.push(
+            t0,
+            LifecycleRun {
+                key: key(3),
+                event: LifecycleEvent::NodeStarted {
+                    down_since_ms: None
+                },
+            },
+            0
+        ));
+        assert_eq!(sched.len(), 2);
+        let _ = sched.pop_due(t0);
+        let _ = sched.pop_due(t0);
+        assert!(sched.push(t0, run(3), 0), "free again once popped");
     }
 
     #[cfg(feature = "redb")]

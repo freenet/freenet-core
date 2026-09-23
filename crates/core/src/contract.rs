@@ -1520,15 +1520,18 @@ where
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
 
-        // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). A run no client
-        // asked for — a contract notification or a lifecycle event — is
-        // admitted per network operation against per-delegate and node-wide
+        // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
+        // opted into capabilities (declared a manifest and was registered by an
+        // app; every other delegate is untouched), a run no client asked for —
+        // a contract notification or a lifecycle event — is admitted per
+        // operation (local or network) against per-delegate and node-wide
         // per-minute allowances, plus a per-(delegate, contract) write bound
         // that caps the #5558 self-notification loop. Refused operations are
         // answered at once with a refusal the delegate can see (GET has no
         // error channel, so it reads as "not found"), and counted.
         if is_unprompted_run(inter_delegate)
             && let Some(caps) = contract_handler.executor().delegate_capabilities()
+            && caps.is_budgeted(delegate_key)
         {
             admit_unprompted_ops(
                 &caps,
@@ -3169,7 +3172,11 @@ where
             let now = lifecycle_now(capabilities.as_deref());
             for _ in 0..delegate_capabilities::LIFECYCLE_QUEUE_CAPACITY {
                 match rx.try_recv() {
-                    Ok(run) => lifecycle_schedule.push(now, run, 0),
+                    Ok(run) => {
+                        // A duplicate of a waiting run is dropped (see
+                        // `LifecycleSchedule::push`).
+                        lifecycle_schedule.push(now, run, 0);
+                    }
                     Err(_) => break,
                 }
             }
@@ -4171,6 +4178,7 @@ async fn handle_delegate_notification<CH, P>(
     let duty_clock = contract_handler
         .executor()
         .delegate_capabilities()
+        .filter(|caps| caps.is_budgeted(&delegate_key))
         .map(|caps| (caps.now(), caps));
     let outcome = handle_delegate_with_contract_requests(
         contract_handler,
@@ -4205,7 +4213,11 @@ async fn handle_delegate_notification<CH, P>(
     )
     .await;
     if let Some((started, caps)) = duty_clock {
-        caps.charge_duty(&delegate_key, caps.now().saturating_duration_since(started));
+        caps.charge_duty(
+            &delegate_key,
+            caps.now().saturating_duration_since(started),
+            false,
+        );
     }
 
     match outcome {
@@ -4447,7 +4459,12 @@ fn capability_hook(
                 app,
             })
         }
-        DelegateRequest::UnregisterDelegate(key) => Some(CapabilityHook::Unregistered(key.clone())),
+        // Only a local connection may drop the record: a remote caller could
+        // otherwise unregister a delegate to reset its Installed flag and its
+        // app bindings (UnregisterDelegate itself is not gated, pre-existing).
+        DelegateRequest::UnregisterDelegate(key) if connection_scope.is_local() => {
+            Some(CapabilityHook::Unregistered(key.clone()))
+        }
         _ => None,
     }
 }
@@ -4586,12 +4603,16 @@ where
     // the duty budget: a delegate that has spent its loop time waits.
     let parked = park.is_parked(&key);
     if parked || !caps.duty_available(&key) {
-        if !parked {
-            caps.stats
-                .lifecycle_deferred_duty
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let counter = if parked {
+            &caps.stats.lifecycle_deferred_parked
+        } else {
+            &caps.stats.lifecycle_deferred_duty
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
         if attempts + 1 >= delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS {
+            caps.stats
+                .lifecycle_dropped_attempts
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 delegate = %key,
                 event = ?run.event,
@@ -4639,15 +4660,25 @@ where
         RunSeed::default(),
     )
     .await;
-    caps.charge_duty(&key, caps.now().saturating_duration_since(started));
-    caps.stats
-        .lifecycle_delivered
-        .fetch_add(1, Ordering::Relaxed);
-    tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
+    caps.charge_duty(&key, caps.now().saturating_duration_since(started), true);
 
     match outcome {
-        DelegateRunOutcome::Parked | DelegateRunOutcome::Failed(_) => {}
-        DelegateRunOutcome::Completed(outbound) => route_notification_outbound(&key, outbound),
+        DelegateRunOutcome::Failed(err) => {
+            caps.stats.lifecycle_failed.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(delegate = %key, event = ?run.event, error = %err, "Lifecycle run failed");
+        }
+        DelegateRunOutcome::Parked => {
+            caps.stats
+                .lifecycle_delivered
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        DelegateRunOutcome::Completed(outbound) => {
+            caps.stats
+                .lifecycle_delivered
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
+            route_notification_outbound(&key, outbound);
+        }
     }
     LifecycleOutcome::Ran
 }
@@ -5241,6 +5272,7 @@ async fn run_queued_notification<CH, P>(
     let duty_clock = contract_handler
         .executor()
         .delegate_capabilities()
+        .filter(|caps| caps.is_budgeted(delegate_key))
         .map(|caps| (caps.now(), caps));
     let outcome = handle_delegate_with_contract_requests(
         contract_handler,
@@ -5260,7 +5292,11 @@ async fn run_queued_notification<CH, P>(
     )
     .await;
     if let Some((started, caps)) = duty_clock {
-        caps.charge_duty(delegate_key, caps.now().saturating_duration_since(started));
+        caps.charge_duty(
+            delegate_key,
+            caps.now().saturating_duration_since(started),
+            false,
+        );
     }
 
     match outcome {
