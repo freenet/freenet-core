@@ -2158,12 +2158,17 @@ impl ReDb {
         let outcome;
         {
             let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut freed_own_row = false;
             if let Some(evicted) = evicted {
                 let evicted_row = Self::delegate_subscription_row_key(evicted, delegate);
-                tbl.remove(evicted_row.as_slice())?;
+                freed_own_row = tbl.remove(evicted_row.as_slice())?.is_some();
             }
             let present = tbl.get(row.as_slice())?.is_some();
-            if !present && tbl.len()? >= per_delegate_cap as u64 {
+            // The scan is skipped when this call already freed one of the
+            // delegate's own rows (a cap eviction): its count is then unchanged
+            // by the insert. That keeps the scan out of the path a delegate at
+            // its cap drives on every subscribe.
+            if !present && !freed_own_row && tbl.len()? >= per_delegate_cap as u64 {
                 let mine = Self::delegate_key64(delegate);
                 let mut own_rows: Vec<Vec<u8>> = Vec::new();
                 for entry in tbl.iter()? {
@@ -2184,10 +2189,11 @@ impl ReDb {
                         id.copy_from_slice(&key[..32]);
                         !is_live(&ContractInstanceId::new(id))
                     });
-                    // Every row live is only reachable if memory is at the cap
-                    // too, in which case the admission above evicted one and
-                    // `evicted` already freed a row; fall back to the first
-                    // row so the cap holds regardless.
+                    // With `is_live` answering from the index the in-memory cap
+                    // counts, at least one row must be stale here (memory holds
+                    // at most the cap, and the new pair is not on disk yet).
+                    // The fallback only keeps the on-disk cap exact if that
+                    // ever stops holding.
                     if let Some(victim) = stale.or(own_rows.first()) {
                         tbl.remove(victim.as_slice())?;
                     }

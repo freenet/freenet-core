@@ -851,6 +851,17 @@ pub(crate) fn is_subscribed(contract: &ContractInstanceId, delegate: &DelegateKe
         .is_some_and(|delegates| delegates.contains(delegate))
 }
 
+/// Whether `(contract, delegate)` holds one of `delegate`'s units of
+/// [`MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`], i.e. is in the reverse index
+/// the cap counts. Distinct from [`is_subscribed`], which reads the forward
+/// index; the two can disagree (see `forget_one`).
+#[cfg_attr(not(feature = "redb"), allow(dead_code))]
+fn counts_toward_cap(contract: &ContractInstanceId, delegate: &DelegateKey) -> bool {
+    BY_DELEGATE
+        .get(delegate)
+        .is_some_and(|owned| owned.contains_key(contract))
+}
+
 /// Replay the persisted subscriptions into the in-memory registry at startup,
 /// and return the pairs that were restored, for the caller to re-establish the
 /// interest and network subscription a live subscribe takes
@@ -923,7 +934,9 @@ mod durable {
             evicted,
             MAX_DURABLE_DELEGATE_SUBSCRIPTIONS,
             MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE,
-            &|c| is_subscribed(c, delegate),
+            // Liveness from the REVERSE index, the one the in-memory cap
+            // counts, so "live" here means exactly "holds a unit of cap".
+            &|c| counts_toward_cap(c, delegate),
         ) {
             Ok(DurableRecord::Recorded) => {}
             Ok(DurableRecord::RecordedDisplacing(displaced)) => {

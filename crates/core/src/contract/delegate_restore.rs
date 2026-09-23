@@ -183,6 +183,10 @@ async fn reestablish(
             if i > 0 && sleep_or_shutdown(&shutdown, BETWEEN_ATTEMPTS).await {
                 return;
             }
+            // `biased;` justification (per `.claude/rules/code-style.md`):
+            // shutdown is checked first so a node stopping mid-restore does not
+            // start another subscribe. Neither arm can starve the other: each
+            // select resolves once and is not in a loop over a stream.
             let outcome = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
@@ -304,6 +308,10 @@ fn finish_attempt<E: std::fmt::Display>(
 }
 
 /// `true` if the node is shutting down.
+///
+/// `biased;` justification (per `.claude/rules/code-style.md`): shutdown wins a
+/// tie with the timer so a stopping node exits instead of starting one more
+/// attempt. Both arms are single-shot futures, so there is nothing to starve.
 async fn sleep_or_shutdown(shutdown: &CancellationToken, wait: Duration) -> bool {
     tokio::select! {
         biased;
