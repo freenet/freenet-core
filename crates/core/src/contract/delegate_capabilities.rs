@@ -171,11 +171,84 @@ impl AppIdentity {
     }
 }
 
-fn grant_key(app: &AppIdentity, code: u16) -> [u8; 35] {
-    let mut k = [0u8; 35];
-    k[..33].copy_from_slice(&app.encode());
-    k[33..].copy_from_slice(&code.to_be_bytes());
+/// Whose secrets a grant (and the runs it enables) belongs to.
+///
+/// On an ordinary node every client is the node's one user: `Node`. A hosted
+/// node (try.freenet.org) gives each user a separate secret namespace, and a
+/// grant there must be that user's, recorded per (user scope, app) and
+/// honoured by running the delegate in that user's namespace. The storage
+/// layout carries the scope today so that needs no migration; only `Node` is
+/// produced until per-user background runs exist (capabilities are disabled
+/// in hosted mode until then).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UserScope {
+    Node,
+    /// A hosted user's namespace, by the 32-byte id the node derives it from.
+    #[allow(dead_code)] // Reserved: produced once hosted background runs exist.
+    User([u8; 32]),
+}
+
+impl UserScope {
+    const TAG_NODE: u8 = 0;
+    const TAG_USER: u8 = 1;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            UserScope::Node => out.push(Self::TAG_NODE),
+            UserScope::User(id) => {
+                out.push(Self::TAG_USER);
+                out.extend_from_slice(id);
+            }
+        }
+    }
+
+    /// The scope at the start of `bytes`, and the rest.
+    fn decode(bytes: &[u8]) -> Option<(Self, &[u8])> {
+        let (&tag, rest) = bytes.split_first()?;
+        match tag {
+            Self::TAG_NODE => Some((UserScope::Node, rest)),
+            Self::TAG_USER if rest.len() >= 32 => {
+                let id: [u8; 32] = rest[..32].try_into().ok()?;
+                Some((UserScope::User(id), &rest[32..]))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Grant row key: user scope || app identity || capability code (u16 BE).
+fn grant_key(scope: UserScope, app: &AppIdentity, code: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 32 + AppIdentity::ENCODED_LEN + 2);
+    scope.encode(&mut k);
+    k.extend_from_slice(&app.encode());
+    k.extend_from_slice(&code.to_be_bytes());
     k
+}
+
+fn decode_grant_key(k: &[u8]) -> Option<(UserScope, AppIdentity, u16)> {
+    let (scope, rest) = UserScope::decode(k)?;
+    if rest.len() != AppIdentity::ENCODED_LEN + 2 {
+        return None;
+    }
+    let app = AppIdentity::decode(&rest[..AppIdentity::ENCODED_LEN])?;
+    let code = u16::from_be_bytes([
+        rest[AppIdentity::ENCODED_LEN],
+        rest[AppIdentity::ENCODED_LEN + 1],
+    ]);
+    Some((scope, app, code))
+}
+
+/// A record's app binding: user scope || app identity.
+fn encode_binding(scope: UserScope, app: &AppIdentity) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + AppIdentity::ENCODED_LEN);
+    scope.encode(&mut out);
+    out.extend_from_slice(&app.encode());
+    out
+}
+
+fn decode_binding(bytes: &[u8]) -> Option<(UserScope, AppIdentity)> {
+    let (scope, rest) = UserScope::decode(bytes)?;
+    Some((scope, AppIdentity::decode(rest)?))
 }
 
 /// The user's answer for one (app, capability).
@@ -244,7 +317,11 @@ impl DelegateRecord {
         let v1 = DelegateRecordV1 {
             manifest_json: self.manifest.to_bytes(),
             params: self.params.clone(),
-            apps: self.apps.iter().map(|a| a.encode().to_vec()).collect(),
+            apps: self
+                .apps
+                .iter()
+                .map(|a| encode_binding(UserScope::Node, a))
+                .collect(),
             installed_delivered: self.installed_delivered,
         };
         let mut out = vec![RECORD_V1];
@@ -266,7 +343,11 @@ impl DelegateRecord {
             apps: v1
                 .apps
                 .iter()
-                .filter_map(|a| AppIdentity::decode(a))
+                // Node-scope bindings only until per-user runs exist.
+                .filter_map(|a| match decode_binding(a)? {
+                    (UserScope::Node, app) => Some(app),
+                    (UserScope::User(_), _) => None,
+                })
                 .collect(),
             installed_delivered: v1.installed_delivered,
         })
@@ -841,7 +922,10 @@ impl DelegateCapabilities {
     /// The stored answer for (app, cap), if any.
     pub(crate) fn grant(&self, app: &AppIdentity, cap: Capability) -> Option<Grant> {
         let code = capability_code(cap)?;
-        match self.storage.get_grant(&grant_key(app, code)) {
+        match self
+            .storage
+            .get_grant(&grant_key(UserScope::Node, app, code))
+        {
             Ok(Some(bytes)) => Grant::decode(&bytes),
             Ok(None) => None,
             Err(e) => {
@@ -1161,10 +1245,10 @@ impl DelegateCapabilities {
                     until_ms: now_ms.saturating_add(DENIAL_COOL_OFF.as_millis() as u64),
                 }
             };
-            if let Err(e) = self
-                .storage
-                .put_grant(&grant_key(&prompt.app, code), &grant.encode())
-            {
+            if let Err(e) = self.storage.put_grant(
+                &grant_key(UserScope::Node, &prompt.app, code),
+                &grant.encode(),
+            ) {
                 tracing::warn!(error = %e, "Failed to store capability grant");
             }
         }
@@ -1204,7 +1288,9 @@ impl DelegateCapabilities {
         let Some(code) = capability_code(cap) else {
             return false;
         };
-        self.storage.remove_grant(&grant_key(app, code)).is_ok()
+        self.storage
+            .remove_grant(&grant_key(UserScope::Node, app, code))
+            .is_ok()
     }
 
     /// Every stored answer, for the dashboard.
@@ -1214,11 +1300,11 @@ impl DelegateCapabilities {
             .all_grants()?
             .into_iter()
             .filter_map(|(k, v)| {
-                if k.len() != 35 {
+                // Node-scope grants only until per-user runs exist.
+                let (UserScope::Node, app, code) = decode_grant_key(&k)? else {
                     return None;
-                }
-                let app = AppIdentity::decode(&k[..33])?;
-                let cap = capability_from_code(u16::from_be_bytes([k[33], k[34]]))?;
+                };
+                let cap = capability_from_code(code)?;
                 Some((app, cap, Grant::decode(&v)?))
             })
             .collect())
@@ -1506,6 +1592,34 @@ mod tests {
             out.push(r);
         }
         out
+    }
+
+    /// The grant store carries a user scope in every key and binding, so
+    /// per-user grants on a hosted node need no migration.
+    #[test]
+    fn scope_is_part_of_the_stored_layout() {
+        let a = app(3);
+        for scope in [UserScope::Node, UserScope::User([7; 32])] {
+            let k = grant_key(scope, &a, 1);
+            assert_eq!(decode_grant_key(&k), Some((scope, a, 1)));
+            assert_eq!(decode_binding(&encode_binding(scope, &a)), Some((scope, a)));
+        }
+        assert_ne!(
+            grant_key(UserScope::Node, &a, 1),
+            grant_key(UserScope::User([0; 32]), &a, 1),
+            "one user's grant is never another's"
+        );
+        assert_eq!(decode_grant_key(&[9, 1, 2]), None);
+        // A user-scope grant is not a node-scope grant.
+        let (c, _) = caps();
+        c.storage
+            .put_grant(
+                &grant_key(UserScope::User([7; 32]), &a, 1),
+                &Grant::Granted { at_ms: 1 }.encode(),
+            )
+            .unwrap();
+        assert_eq!(c.grant(&a, Capability::Background), None);
+        assert!(c.grants().unwrap().is_empty());
     }
 
     #[test]

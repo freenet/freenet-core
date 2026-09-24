@@ -277,7 +277,8 @@ pub(crate) const DELEGATE_CAPABILITY_RECORDS_TABLE: TableDefinition<&[u8], &[u8]
 /// The user's answers to node-enforced capability prompts, per app. Encoding
 /// is owned by `contract::delegate_capabilities`.
 ///
-/// Key: app identity (tag byte || id bytes) || capability code (u16 BE)
+/// Key: user scope (tag byte, plus a 32-byte user id for a hosted user) ||
+/// app identity (tag byte || id bytes) || capability code (u16 BE)
 pub(crate) const APP_CAPABILITY_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("app_capability_grants");
 
