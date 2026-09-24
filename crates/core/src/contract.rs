@@ -1541,8 +1541,10 @@ where
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
 
         // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
-        // opted into capabilities (declared a manifest and was registered by an
-        // app; every other delegate is untouched), a run no client asked for —
+        // opted into capabilities (a manifest, registered by an app that holds
+        // the Background grant; every other delegate, including an ungranted
+        // manifest delegate, is untouched as before this budget existed), a
+        // run no client asked for —
         // a contract notification or a lifecycle event — is admitted per
         // operation (local or network) against per-delegate and node-wide
         // per-minute allowances, plus a per-(delegate, contract) write bound
@@ -1550,6 +1552,10 @@ where
         // answered at once with a refusal the delegate can see (GET has no
         // error channel, so it reads as "not found"), and counted.
         if is_unprompted_run(inter_delegate)
+            && !(get_requests.is_empty()
+                && put_requests.is_empty()
+                && update_requests.is_empty()
+                && subscribe_requests.is_empty())
             && let Some(caps) = contract_handler.executor().delegate_capabilities()
             && caps.is_budgeted(delegate_key)
         {
@@ -3413,8 +3419,9 @@ fn lifecycle_now(
 /// budget like any other.
 ///
 /// Also re-queues `Installed` for granted delegates still owed it (an earlier
-/// delivery was dropped), so NodeStarted is never the first event a delegate
-/// sees.
+/// delivery was dropped). It is scheduled first, so it normally runs before
+/// NodeStarted; if it is deferred (delegate parked, duty spent) NodeStarted
+/// can still arrive first.
 fn seed_node_started(
     caps: &delegate_capabilities::DelegateCapabilities,
     schedule: &mut delegate_capabilities::LifecycleSchedule,
@@ -4730,13 +4737,16 @@ where
 
     match outcome {
         DelegateRunOutcome::Failed(err) if err.is_missing_delegate() => {
-            // Unregistered since (by the CLI, another connection, or a
-            // remote client): the record has nothing left to deliver to.
+            // Usually unregistered since (by the CLI, another connection, or
+            // a remote client). Counted apart from real failures, and the
+            // record is KEPT: "missing" also covers a module that failed to
+            // load from disk, and dropping a granted record on a transient
+            // read error would re-deliver Installed after the app's next
+            // registration. The record goes when its app unregisters it.
             caps.stats
                 .lifecycle_skipped_missing
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event for a delegate that is no longer registered; dropping its record");
-            caps.on_delegate_missing(&key);
+            tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event for a delegate this node could not load; skipped");
         }
         DelegateRunOutcome::Failed(err) => {
             caps.stats.lifecycle_failed.fetch_add(1, Ordering::Relaxed);

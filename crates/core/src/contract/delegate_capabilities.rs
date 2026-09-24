@@ -1317,12 +1317,6 @@ impl DelegateCapabilities {
         self.recorded.lock().apps.contains_key(key)
     }
 
-    /// The delegate this record is for is no longer registered on this node:
-    /// drop the record. A later registration is a new install.
-    pub(crate) fn on_delegate_missing(&self, key: &DelegateKey) {
-        self.remove_record(key);
-    }
-
     /// Whether a lifecycle run for `key` may start now (duty budget).
     pub(crate) fn duty_available(&self, key: &DelegateKey) -> bool {
         let now = self.time.now();

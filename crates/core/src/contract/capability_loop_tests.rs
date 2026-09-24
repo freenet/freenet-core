@@ -1035,11 +1035,12 @@ async fn a_remote_unregister_keeps_the_record() {
     assert!(!caps.is_budgeted(&key), "a local unregister drops it");
 }
 
-/// A lifecycle run for a delegate that is no longer registered here (removed
-/// by the CLI or another connection) drops its record, is counted, and does
-/// not recur on the next start.
+/// A lifecycle run for a delegate this node cannot load (removed by the CLI
+/// or another connection, or a module that failed to read) is counted apart
+/// from real failures, and the record is kept: "missing" is not proof the
+/// delegate is gone.
 #[tokio::test]
-async fn a_lifecycle_run_for_a_vanished_delegate_drops_its_record() {
+async fn a_lifecycle_run_for_a_missing_delegate_is_counted_and_kept() {
     let caps = DelegateCapabilities::in_memory();
     let lp = start(
         "cap_vanished",
@@ -1061,5 +1062,5 @@ async fn a_lifecycle_run_for_a_vanished_delegate_drops_its_record() {
     })
     .await;
     assert_eq!(caps.stats.lifecycle_failed.load(Ordering::Relaxed), 0);
-    assert!(caps.node_started_targets().is_empty(), "the record is gone");
+    assert_eq!(caps.node_started_targets(), vec![key], "the record is kept");
 }
