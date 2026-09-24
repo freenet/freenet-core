@@ -1055,14 +1055,9 @@ mod tests {
         // placeholder — the JS refresh path re-reads it from `doc.title`.
         //
         // Pass `None` explicitly rather than going through `homepage_html()`
-        // (which reads the process-global `network_status` snapshot): if
-        // another test in the same `cargo test` process (e.g. in
-        // `operations::connect` or `ring::connection_manager`) has called
-        // `network_status::init`, and more than 60 real seconds then pass
-        // before this test runs, `get_snapshot()`'s health computation
-        // (`open_connections == 0 && elapsed_secs > 60` => `Trouble`) flips
-        // the rendered title, making this test order/timing-dependent
-        // (#5732). See `homepage_html_for`'s doc comment for the mechanism.
+        // (which reads the process-global `network_status` snapshot) — see
+        // `homepage_html_for`'s doc comment for why that global made this
+        // test order/timing-dependent (#5732).
         let html = homepage_html_for(None);
         assert!(
             html.contains("<title>\u{26A1} Dashboard</title>"),
