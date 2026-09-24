@@ -66,14 +66,25 @@ pub const STREAM_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 /// streams with identical IDs to the same receiver.
 type StreamKey = (SocketAddr, StreamId);
 
-pub struct OrphanStreamRegistry {
-    /// Streams awaiting metadata (arrived before RequestStreaming/ResponseStreaming).
-    /// Maps (peer_addr, StreamId) -> (StreamHandle, timestamp when registered).
-    orphan_streams: DashMap<StreamKey, (StreamHandle, Instant)>,
+/// Whichever side of the handoff got to a key first.
+enum Slot {
+    /// The stream arrived before its metadata (RequestStreaming /
+    /// ResponseStreaming): the handle and when it was registered.
+    Orphan(StreamHandle, Instant),
+    /// The metadata arrived first: the claimant waiting for the stream.
+    Waiter(oneshot::Sender<StreamHandle>),
+}
 
-    /// Waiters for streams that haven't arrived yet (metadata arrived first).
-    /// Maps (peer_addr, StreamId) -> oneshot sender to deliver the StreamHandle.
-    stream_waiters: DashMap<StreamKey, oneshot::Sender<StreamHandle>>,
+pub struct OrphanStreamRegistry {
+    /// One slot per key holding either the early stream or the early claimant.
+    ///
+    /// Both sides live in ONE map on purpose (#5731). `register_orphan`
+    /// (transport task) and `claim_or_wait` (operations task) each
+    /// check-then-insert under the key's entry lock, so they cannot both miss
+    /// each other. With two maps — orphans and waiters — the claim could see no
+    /// orphan and park a waiter while the transport saw no waiter and parked an
+    /// orphan, stranding the stream until `STREAM_CLAIM_TIMEOUT`.
+    slots: DashMap<StreamKey, Slot>,
 
     /// Streams that have already been claimed. Used for deduplication when
     /// both the embedded metadata (in fragment #1) and the separate metadata
@@ -85,8 +96,7 @@ impl OrphanStreamRegistry {
     /// Creates a new empty registry.
     pub fn new() -> Self {
         Self {
-            orphan_streams: DashMap::new(),
-            stream_waiters: DashMap::new(),
+            slots: DashMap::new(),
             claimed_streams: DashMap::new(),
         }
     }
@@ -104,31 +114,44 @@ impl OrphanStreamRegistry {
         stream_id: StreamId,
         handle: StreamHandle,
     ) {
+        use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
-        // Check if someone is already waiting for this stream
-        if let Some((_, waiter)) = self.stream_waiters.remove(&key) {
-            // Deliver to the waiter immediately
-            if waiter.send(handle).is_err() {
-                tracing::warn!(
-                    %peer_addr,
-                    stream_id = %stream_id,
-                    "Failed to deliver orphan stream to waiter (receiver dropped)"
-                );
-            } else {
+        // Check and act under the key's entry lock, so a concurrent
+        // `claim_or_wait` has either already parked the waiter we deliver to,
+        // or will find our orphan (#5731).
+        match self.slots.entry(key) {
+            Entry::Occupied(occupied) if matches!(occupied.get(), Slot::Waiter(_)) => {
+                // `remove` consumes the entry, releasing the shard lock before
+                // the handle is sent.
+                let Slot::Waiter(waiter) = occupied.remove() else {
+                    unreachable!("the match guard checked for a waiter");
+                };
+                if waiter.send(handle).is_err() {
+                    tracing::warn!(
+                        %peer_addr,
+                        stream_id = %stream_id,
+                        "Failed to deliver orphan stream to waiter (receiver dropped)"
+                    );
+                } else {
+                    tracing::debug!(
+                        %peer_addr,
+                        stream_id = %stream_id,
+                        "Delivered stream to waiting operation"
+                    );
+                }
+            }
+            // A duplicate registration replaces the earlier orphan, as before.
+            Entry::Occupied(mut occupied) => {
+                occupied.insert(Slot::Orphan(handle, Instant::now()));
+            }
+            Entry::Vacant(vacant) => {
                 tracing::debug!(
                     %peer_addr,
                     stream_id = %stream_id,
-                    "Delivered stream to waiting operation"
+                    "Registered orphan stream (metadata not yet received)"
                 );
+                vacant.insert(Slot::Orphan(handle, Instant::now()));
             }
-        } else {
-            // Store as orphan for later claim
-            tracing::debug!(
-                %peer_addr,
-                stream_id = %stream_id,
-                "Registered orphan stream (metadata not yet received)"
-            );
-            self.orphan_streams.insert(key, (handle, Instant::now()));
         }
     }
 
@@ -155,10 +178,10 @@ impl OrphanStreamRegistry {
         stream_id: StreamId,
         timeout: Duration,
     ) -> Result<StreamHandle, OrphanStreamError> {
+        use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
         // Atomic dedup: try to insert into claimed_streams. If already present,
         // another caller already claimed this stream.
-        use dashmap::mapref::entry::Entry;
         match self.claimed_streams.entry(key) {
             Entry::Occupied(_) => {
                 tracing::debug!(
@@ -173,19 +196,35 @@ impl OrphanStreamRegistry {
             }
         }
 
-        // Check if orphan exists
-        if let Some((_, (handle, _))) = self.orphan_streams.remove(&key) {
-            tracing::debug!(
-                %peer_addr,
-                stream_id = %stream_id,
-                "Claimed orphan stream immediately"
-            );
-            return Ok(handle);
-        }
-
-        // Register waiter
-        let (tx, rx) = oneshot::channel();
-        self.stream_waiters.insert(key, tx);
+        // Take the orphan, or park a waiter, under the key's entry lock — the
+        // same lock `register_orphan` holds, so the two cannot miss each
+        // other (#5731).
+        let rx = match self.slots.entry(key) {
+            Entry::Occupied(occupied) if matches!(occupied.get(), Slot::Orphan(..)) => {
+                let Slot::Orphan(handle, _) = occupied.remove() else {
+                    unreachable!("the match guard checked for an orphan");
+                };
+                tracing::debug!(
+                    %peer_addr,
+                    stream_id = %stream_id,
+                    "Claimed orphan stream immediately"
+                );
+                return Ok(handle);
+            }
+            // A waiter already parked here can only be a stale one (the
+            // `claimed_streams` dedup above admits one live claimant per key);
+            // replace it, as the two-map version's `insert` did.
+            Entry::Occupied(mut occupied) => {
+                let (tx, rx) = oneshot::channel();
+                occupied.insert(Slot::Waiter(tx));
+                rx
+            }
+            Entry::Vacant(vacant) => {
+                let (tx, rx) = oneshot::channel();
+                vacant.insert(Slot::Waiter(tx));
+                rx
+            }
+        };
 
         tracing::debug!(
             %peer_addr,
@@ -206,7 +245,7 @@ impl OrphanStreamRegistry {
             }
             Ok(Err(_)) => {
                 // Sender was dropped (shouldn't happen in normal operation)
-                self.stream_waiters.remove(&key);
+                self.remove_waiter(&key);
                 // Remove our claim so a retry is possible
                 self.claimed_streams.remove(&key);
                 tracing::warn!(
@@ -218,7 +257,7 @@ impl OrphanStreamRegistry {
             }
             Err(_) => {
                 // Timeout expired
-                self.stream_waiters.remove(&key);
+                self.remove_waiter(&key);
                 // Remove our claim so a retry is possible
                 self.claimed_streams.remove(&key);
                 tracing::warn!(
@@ -232,6 +271,12 @@ impl OrphanStreamRegistry {
         }
     }
 
+    /// Remove the waiter parked at `key`, leaving an orphan there untouched.
+    fn remove_waiter(&self, key: &StreamKey) {
+        self.slots
+            .remove_if(key, |_, slot| matches!(slot, Slot::Waiter(_)));
+    }
+
     /// Garbage collect expired orphan streams.
     ///
     /// Should be called periodically to clean up orphan streams that were
@@ -240,21 +285,25 @@ impl OrphanStreamRegistry {
         let now = Instant::now();
         let mut expired_count = 0;
 
-        self.orphan_streams
-            .retain(|(peer_addr, stream_id), (handle, created)| {
-                if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
-                    tracing::debug!(
-                        %peer_addr,
-                        stream_id = %stream_id,
-                        age_secs = now.duration_since(*created).as_secs(),
-                        "Garbage collecting expired orphan stream"
-                    );
-                    handle.cancel();
-                    expired_count += 1;
-                    false
-                } else {
-                    true
+        self.slots
+            .retain(|(peer_addr, stream_id), slot| match slot {
+                Slot::Orphan(handle, created) => {
+                    if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
+                        tracing::debug!(
+                            %peer_addr,
+                            stream_id = %stream_id,
+                            age_secs = now.duration_since(*created).as_secs(),
+                            "Garbage collecting expired orphan stream"
+                        );
+                        handle.cancel();
+                        expired_count += 1;
+                        false
+                    } else {
+                        true
+                    }
                 }
+                // Waiters are removed by their own claim on every exit path.
+                Slot::Waiter(_) => true,
             });
 
         // Also prune claimed_streams to prevent unbounded growth.
@@ -269,22 +318,27 @@ impl OrphanStreamRegistry {
         if expired_count > 0 {
             tracing::info!(
                 expired_count,
-                remaining = self.orphan_streams.len(),
+                remaining = self.orphan_count(),
                 "Garbage collected expired orphan streams"
             );
         }
     }
 
     /// Returns the number of orphan streams currently registered.
-    #[cfg(test)]
-    pub fn orphan_count(&self) -> usize {
-        self.orphan_streams.len()
+    pub(crate) fn orphan_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| matches!(slot.value(), Slot::Orphan(..)))
+            .count()
     }
 
     /// Returns the number of waiters currently registered.
     #[cfg(test)]
     pub fn waiter_count(&self) -> usize {
-        self.stream_waiters.len()
+        self.slots
+            .iter()
+            .filter(|slot| matches!(slot.value(), Slot::Waiter(_)))
+            .count()
     }
 
     /// Drop every registered waiter without delivering a stream, the way this
@@ -292,7 +346,8 @@ impl OrphanStreamRegistry {
     /// `WaiterCancelled`.
     #[cfg(test)]
     pub fn drop_waiters(&self) {
-        self.stream_waiters.clear();
+        self.slots
+            .retain(|_, slot| !matches!(slot, Slot::Waiter(_)));
     }
 
     /// Start the background GC task for expired orphan streams.
@@ -477,9 +532,9 @@ mod tests {
         let addr = dummy_addr();
 
         // Insert with fake old timestamp by directly manipulating
-        registry.orphan_streams.insert(
+        registry.slots.insert(
             (addr, stream_id),
-            (handle, Instant::now() - EXPIRED_ORPHAN_AGE),
+            Slot::Orphan(handle, Instant::now() - EXPIRED_ORPHAN_AGE),
         );
 
         assert_eq!(registry.orphan_count(), 1);
@@ -503,6 +558,56 @@ mod tests {
         // GC should preserve fresh stream
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), 1);
+    }
+
+    /// Regression for #5731: `claim_or_wait` (operations layer, metadata
+    /// arrived) and `register_orphan` (transport layer, first fragment
+    /// arrived) run on different tasks. When they checked and inserted into
+    /// two separate maps, both could miss each other — the claim saw no
+    /// orphan and parked a waiter while the transport saw no waiter and
+    /// parked an orphan — stranding the stream until `STREAM_CLAIM_TIMEOUT`.
+    /// A streaming PUT then hung for 60 s (`test_put_with_subscribe_flag`
+    /// timed out). Race the two calls from two OS threads, many times; every
+    /// claim must get the stream, never time out.
+    #[test]
+    fn test_concurrent_claim_and_register_never_strand_the_stream() {
+        const ITERATIONS: usize = 5_000;
+        const CLAIM_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for iteration in 0..ITERATIONS {
+            let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
+            let stream_id = StreamId::next();
+            let addr = dummy_addr();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let transport = {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+                })
+            };
+            let claimed = rt.block_on(async {
+                barrier.wait();
+                registry.claim_or_wait(addr, stream_id, CLAIM_TIMEOUT).await
+            });
+            transport.join().unwrap();
+
+            assert!(
+                claimed.is_ok(),
+                "iteration {iteration}: claim raced register_orphan and lost the stream: \
+                 {claimed:?} (orphans={}, waiters={})",
+                registry.orphan_count(),
+                registry.waiter_count()
+            );
+            assert_eq!(registry.orphan_count(), 0, "iteration {iteration}");
+            assert_eq!(registry.waiter_count(), 0, "iteration {iteration}");
+        }
     }
 
     #[tokio::test]
