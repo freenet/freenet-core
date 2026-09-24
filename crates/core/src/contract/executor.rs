@@ -361,7 +361,7 @@ impl ExecutorError {
         }
     }
 
-    fn request(error: impl Into<RequestError>) -> Self {
+    pub(crate) fn request(error: impl Into<RequestError>) -> Self {
         Self {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
@@ -729,6 +729,12 @@ impl ExecutorError {
     /// Returns true if the error is due to a missing delegate (not found in store).
     /// This is expected during legacy migration probes and should be logged at
     /// warn level rather than error.
+    ///
+    /// It also decides what the CLIENT sees (#5727): the executor loop returns it
+    /// as a failure, and `client_events::missing_delegate_client_error` keeps it
+    /// as the typed `DelegateError::Missing` rather than an `OperationError`
+    /// string, which in turn lets the websocket `DelegateRateLimiter` back off
+    /// repeated requests for the same missing key.
     pub fn is_missing_delegate(&self) -> bool {
         matches!(
             &self.inner,
@@ -1143,6 +1149,16 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn delegate_capabilities(
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
+
+    /// The node's durable store, for mirroring delegate subscriptions to disk
+    /// so they survive a restart (#5493).
+    ///
+    /// `None` for mock/test executors with no durable store; their delegate
+    /// subscriptions are in-memory only, which is the behaviour before
+    /// durability existed.
+    fn delegate_subscription_store(&self) -> Option<crate::contract::storages::Storage> {
         None
     }
 }

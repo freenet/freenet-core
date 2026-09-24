@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use freenet_stdlib::prelude::*;
 use redb::{
-    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable, StorageError,
-    TableDefinition, TransactionError, WriteTransaction,
+    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, StorageError, TableDefinition, TransactionError, WriteTransaction,
 };
 
 use crate::wasm_runtime::StateStorage;
@@ -280,6 +280,75 @@ pub(crate) const DELEGATE_CAPABILITY_RECORDS_TABLE: TableDefinition<&[u8], &[u8]
 /// Key: app identity (tag byte || id bytes) || capability code (u16 BE)
 pub(crate) const APP_CAPABILITY_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("app_capability_grants");
+
+/// Durable half of the delegate contract-subscription registry
+/// (`wasm_runtime::delegate_subscriptions`), so a delegate's subscriptions
+/// survive a node restart (#5493). One row per `(contract, delegate)` pair,
+/// written and cleared ONLY through that module's writers, which keep it in step
+/// with the in-memory registry.
+///
+/// Contract-major so per-contract teardown (contract removal) is a prefix range
+/// scan rather than a full table walk.
+///
+/// Key: ContractInstanceId (32) || DelegateKey bytes (32) || delegate CodeHash (32) = 96 bytes
+/// Value: single format-version byte ([`DELEGATE_SUBSCRIPTION_ROW_V1`])
+pub(crate) const DELEGATE_SUBSCRIPTIONS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_contract_subscriptions");
+
+/// Format version stored as the value of every [`DELEGATE_SUBSCRIPTIONS_TABLE`]
+/// row. A row with any other value is treated as corrupt and dropped at load.
+pub(crate) const DELEGATE_SUBSCRIPTION_ROW_V1: u8 = 1;
+
+/// Node-wide ceiling on persisted delegate subscriptions.
+///
+/// The in-memory registry bounds each delegate at
+/// `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` (256) but has no node-wide bound,
+/// because the number of delegates is not bounded on every registration path
+/// (see that constant's doc). The durable copy must not inherit that: it is
+/// read in full at every boot, so it gets its own absolute ceiling. 4096 rows
+/// is 16 delegates at their full per-delegate cap, orders of magnitude above
+/// legitimate use (River holds single digits per user, Harvest 4-5 per seller),
+/// and 4096 * 96 bytes is under 400 KiB on disk.
+///
+/// At the ceiling the table stays FAIR rather than first-come: a new row
+/// displaces one row of the delegate holding the most, provided that delegate
+/// holds more than one row more than the newcomer's (see
+/// [`ReDb::record_delegate_subscription`]). Otherwise the new subscription still
+/// works for the life of the process and is only not persisted, which is
+/// logged. Refusing the in-memory subscription instead would turn a durability
+/// bound into a functional one.
+pub(crate) const MAX_DURABLE_DELEGATE_SUBSCRIPTIONS: u64 = 4096;
+
+/// What [`ReDb::record_delegate_subscription`] did with the new row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DurableRecord {
+    /// Written (or already present).
+    Recorded,
+    /// Written at the ceiling by displacing one row of this delegate, the one
+    /// holding the most rows. The displaced subscription still works in memory
+    /// but will not survive a restart.
+    RecordedDisplacing(DelegateKey),
+    /// Not written: at the ceiling and no delegate holds disproportionately more
+    /// than this one.
+    Refused,
+}
+
+/// What [`ReDb::load_delegate_subscriptions`] found.
+#[derive(Debug, Default)]
+pub(crate) struct DurableDelegateSubscriptions {
+    /// Well-formed rows, in key order, at most `max_rows` of them.
+    pub valid: Vec<(ContractInstanceId, DelegateKey)>,
+    /// Raw keys of rows with the wrong key length: garbage under any format,
+    /// so the caller deletes them rather than re-reading them forever.
+    pub malformed: Vec<Vec<u8>>,
+    /// Count of rows with a correct key but an unknown format byte. Skipped and
+    /// deliberately NOT deleted: a later version may have written them, and an
+    /// auto-update rollback to this binary must not destroy its data.
+    pub unknown_version: usize,
+    /// Count of well-formed rows beyond `max_rows`. Skipped, NOT deleted, for
+    /// the same reason (a later version may have raised the ceiling).
+    pub excess: usize,
+}
 
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
@@ -1079,6 +1148,19 @@ impl ReDb {
                     e
                 })?;
             }
+
+            // Durable delegate subscriptions (#5493). Created empty on first
+            // open of upgraded databases too, so an older database gains the
+            // table without disturbing any existing one.
+            txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_SUBSCRIPTIONS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_SUBSCRIPTIONS_TABLE"
+                );
+                e
+            })?;
         }
         txn.commit()?;
         Ok(db)
@@ -2151,6 +2233,348 @@ impl ReDb {
             }
             Ok(result)
         })
+    }
+
+    // ==================== Delegate Subscription Methods ====================
+    // Durable half of `wasm_runtime::delegate_subscriptions` (#5493). Called
+    // only from that module, which owns keeping it in step with memory.
+
+    fn delegate_subscription_row_key(
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> [u8; 96] {
+        let mut key = [0u8; 96];
+        key[..32].copy_from_slice(contract.as_ref());
+        key[32..].copy_from_slice(&Self::delegate_key64(delegate));
+        key
+    }
+
+    /// Inclusive bounds covering every row for `contract`.
+    fn delegate_subscription_contract_range(contract: &ContractInstanceId) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..32].copy_from_slice(contract.as_ref());
+        let mut hi = [0xffu8; 96];
+        hi[..32].copy_from_slice(contract.as_ref());
+        (lo, hi)
+    }
+
+    /// Decode a row KEY. `None` only for a wrong length; the value (format
+    /// byte) is judged separately so an unknown version can be skipped without
+    /// being deleted.
+    fn decode_delegate_subscription_key(key: &[u8]) -> Option<(ContractInstanceId, DelegateKey)> {
+        if key.len() != 96 {
+            return None;
+        }
+        let contract: [u8; 32] = key[..32].try_into().ok()?;
+        let delegate: [u8; 32] = key[32..64].try_into().ok()?;
+        let code_hash: [u8; 32] = key[64..].try_into().ok()?;
+        Some((
+            ContractInstanceId::new(contract),
+            DelegateKey::new(delegate, CodeHash::new(code_hash)),
+        ))
+    }
+
+    /// Persist `(contract, delegate)`, and drop `evicted`'s row for the same
+    /// delegate in the SAME transaction when the registry evicted one to admit
+    /// it, so the cap can never be exceeded on disk by a crash between two
+    /// writes.
+    ///
+    /// At `max_rows` the table stays fair: the delegate holding the most rows
+    /// gives one up to the newcomer if it holds more than one row more than the
+    /// newcomer's delegate does; otherwise the new row is refused. The scan
+    /// that decides this runs only at the ceiling, over at most `max_rows`
+    /// rows. The eviction, if any, is applied in every case.
+    ///
+    /// The per-delegate cap is also enforced ON DISK (`per_delegate_cap`).
+    /// Rows outlive their in-memory entry when a contract is removed for
+    /// housekeeping (the row is kept so the next boot re-subscribes), and the
+    /// in-memory cap cannot see those rows, so without this a delegate's rows
+    /// could grow past its cap one eviction at a time. When a new row would
+    /// take the delegate to the cap, one of its rows whose subscription is no
+    /// longer live in memory (`is_live` false) is dropped first. The scan runs
+    /// only when the whole table already holds at least `per_delegate_cap`
+    /// rows, so a node with few subscriptions never pays it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+        evicted: Option<&ContractInstanceId>,
+        max_rows: u64,
+        per_delegate_cap: usize,
+        is_live: &dyn Fn(&ContractInstanceId) -> bool,
+    ) -> Result<DurableRecord, redb::Error> {
+        let row = Self::delegate_subscription_row_key(contract, delegate);
+        let txn = self.begin_write()?;
+        let outcome;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut freed_own_row = false;
+            if let Some(evicted) = evicted {
+                let evicted_row = Self::delegate_subscription_row_key(evicted, delegate);
+                freed_own_row = tbl.remove(evicted_row.as_slice())?.is_some();
+            }
+            let present = tbl.get(row.as_slice())?.is_some();
+            // The scan is skipped when this call already freed one of the
+            // delegate's own rows (a cap eviction): its count is then unchanged
+            // by the insert. That keeps the scan out of the path a delegate at
+            // its cap drives on every subscribe. It cannot let the count grow;
+            // a count ALREADY over the cap (not produced by this code, e.g. an
+            // older version's rows) is trimmed by restore at the next boot.
+            if !present && !freed_own_row && tbl.len()? >= per_delegate_cap as u64 {
+                let mine = Self::delegate_key64(delegate);
+                let mut own_rows: Vec<Vec<u8>> = Vec::new();
+                for entry in tbl.iter()? {
+                    let (k, v) = entry?;
+                    let key = k.value();
+                    // Only this version's rows: another version's are never
+                    // dropped by this binary (forward compatibility).
+                    if key.len() == 96
+                        && key[32..] == mine
+                        && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                    {
+                        own_rows.push(key.to_vec());
+                    }
+                }
+                if own_rows.len() >= per_delegate_cap {
+                    let stale = own_rows.iter().find(|key| {
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(&key[..32]);
+                        !is_live(&ContractInstanceId::new(id))
+                    });
+                    // With `is_live` answering from the index the in-memory cap
+                    // counts, at least one row must be stale here (memory holds
+                    // at most the cap, and the new pair is not on disk yet).
+                    // The fallback only keeps the on-disk cap exact if that
+                    // ever stops holding.
+                    if let Some(victim) = stale.or(own_rows.first()) {
+                        tbl.remove(victim.as_slice())?;
+                    }
+                }
+            }
+            if present {
+                // Includes a row another version wrote for this pair: it is
+                // left as is (never overwritten), so after a rollback this
+                // binary does not restore that one pair. Accepted: a rollback
+                // is transient and the alternative destroys newer data.
+                outcome = DurableRecord::Recorded;
+            } else if tbl.len()? < max_rows {
+                tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
+                outcome = DurableRecord::Recorded;
+            } else {
+                // Fair share at the ceiling. Count rows per delegate and find
+                // the heaviest holder, remembering one of its rows to give up.
+                // Only this version's rows count and can be displaced: another
+                // version's are never dropped by this binary.
+                let mine = Self::delegate_key64(delegate);
+                let mut counts: std::collections::HashMap<[u8; 64], usize> =
+                    std::collections::HashMap::new();
+                for entry in tbl.iter()? {
+                    let (k, v) = entry?;
+                    let key = k.value();
+                    if key.len() != 96 || v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] {
+                        continue;
+                    }
+                    let mut holder = [0u8; 64];
+                    holder.copy_from_slice(&key[32..]);
+                    *counts.entry(holder).or_insert(0) += 1;
+                }
+                let my_count = counts.get(&mine).copied().unwrap_or(0);
+                let heaviest = counts
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                    .map(|(holder, n)| (*holder, *n));
+                // Second pass only when a displacement will happen, to find one
+                // of the heaviest holder's rows without allocating per row.
+                let victim = match heaviest {
+                    Some((holder, n)) if holder != mine && n > my_count + 1 => {
+                        let mut found = None;
+                        for entry in tbl.iter()? {
+                            let (k, v) = entry?;
+                            let key = k.value();
+                            if key.len() == 96
+                                && key[32..] == holder
+                                && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                            {
+                                found = Some(key.to_vec());
+                                break;
+                            }
+                        }
+                        found.map(|victim| (holder, victim))
+                    }
+                    _ => None,
+                };
+                match victim {
+                    Some((holder, victim)) => {
+                        tbl.remove(victim.as_slice())?;
+                        tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
+                        let mut dk = [0u8; 32];
+                        dk.copy_from_slice(&holder[..32]);
+                        let mut ch = [0u8; 32];
+                        ch.copy_from_slice(&holder[32..]);
+                        outcome = DurableRecord::RecordedDisplacing(DelegateKey::new(
+                            dk,
+                            CodeHash::new(ch),
+                        ));
+                    }
+                    None => outcome = DurableRecord::Refused,
+                }
+            }
+        }
+        Self::commit_guarded(txn)?;
+        Ok(outcome)
+    }
+
+    /// Drop exactly one persisted `(contract, delegate)` row. Reached only
+    /// from the (currently test-only) single-pair `unsubscribe` (#5600).
+    #[cfg(test)]
+    pub(crate) fn remove_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<(), redb::Error> {
+        let row = Self::delegate_subscription_row_key(contract, delegate);
+        let present = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            Ok(tbl.get(row.as_slice())?.is_some())
+        })?;
+        if !present {
+            return Ok(());
+        }
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            tbl.remove(row.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Drop every persisted row for `contract`. Returns how many were dropped.
+    ///
+    /// Checks with a READ transaction first and returns without writing when
+    /// there is nothing to drop. This runs on every contract removal, and a
+    /// node with no delegate subscriptions must not pay a write transaction
+    /// (and its fsync) per eviction for a table it never uses.
+    pub(crate) fn remove_delegate_subscriptions_for_contract(
+        &self,
+        contract: &ContractInstanceId,
+    ) -> Result<usize, redb::Error> {
+        let (lo, hi) = Self::delegate_subscription_contract_range(contract);
+        let rows: Vec<Vec<u8>> = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut rows = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _) = entry?;
+                rows.push(k.value().to_vec());
+            }
+            Ok(rows)
+        })?;
+        self.remove_delegate_subscription_rows(&rows)?;
+        Ok(rows.len())
+    }
+
+    /// Drop every persisted row for `delegate`. Returns how many were dropped.
+    ///
+    /// A full scan, deliberately: the table is bounded by
+    /// [`MAX_DURABLE_DELEGATE_SUBSCRIPTIONS`] and this runs only on
+    /// `UnregisterDelegate`, so a second, delegate-major index kept in step
+    /// with the first would cost more in consistency risk than it saves.
+    /// Read-then-write for the same inertness reason as the per-contract form.
+    pub(crate) fn remove_delegate_subscriptions_for_delegate(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<usize, redb::Error> {
+        let suffix = Self::delegate_key64(delegate);
+        let rows: Vec<Vec<u8>> = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut rows = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, _) = entry?;
+                let key = k.value();
+                if key.len() == 96 && key[32..] == suffix {
+                    rows.push(key.to_vec());
+                }
+            }
+            Ok(rows)
+        })?;
+        self.remove_delegate_subscription_rows(&rows)?;
+        Ok(rows.len())
+    }
+
+    /// Delete the given raw rows in one transaction. No-op (no write
+    /// transaction) for an empty slice.
+    pub(crate) fn remove_delegate_subscription_rows(
+        &self,
+        rows: &[Vec<u8>],
+    ) -> Result<(), redb::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            for row in rows {
+                tbl.remove(row.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Read the persisted subscriptions, at most `max_rows` valid ones.
+    ///
+    /// Never fails on a bad ROW: wrong-length rows are reported in
+    /// [`DurableDelegateSubscriptions::malformed`] for the caller to delete;
+    /// unknown-version rows and rows past `max_rows` are counted and left in
+    /// place (forward compatibility). Fails only when the table
+    /// itself cannot be read, and a caller must treat that as "unknown", not as
+    /// "empty" (deleting on a transient read error would drop every delegate's
+    /// subscriptions).
+    pub(crate) fn load_delegate_subscriptions(
+        &self,
+        max_rows: usize,
+    ) -> Result<DurableDelegateSubscriptions, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut out = DurableDelegateSubscriptions::default();
+            for entry in tbl.iter()? {
+                let (k, v) = entry?;
+                match Self::decode_delegate_subscription_key(k.value()) {
+                    None => out.malformed.push(k.value().to_vec()),
+                    Some(_) if v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] => {
+                        out.unknown_version += 1
+                    }
+                    Some(pair) if out.valid.len() < max_rows => out.valid.push(pair),
+                    Some(_) => out.excess += 1,
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Insert a raw row, bypassing every check. Test-only: lets tests plant
+    /// corrupt or over-cap tables that the real writers can never produce.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_delegate_subscription_row(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            tbl.insert(key, value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Number of persisted delegate-subscription rows. Test-only.
+    #[cfg(test)]
+    pub(crate) fn delegate_subscription_row_count(&self) -> u64 {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            Ok(tbl.len()?)
+        })
+        .expect("count delegate subscription rows")
     }
 }
 

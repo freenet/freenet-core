@@ -116,6 +116,11 @@ pub(crate) struct MockWasmRuntime {
     /// without capabilities.
     pub(crate) capabilities:
         Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    /// Delegate keys this "node" has never registered (#5727). A request to one
+    /// fails with the same `DelegateError::Missing` the real executor builds
+    /// from `RuntimeInnerError::DelegateNotFound`, before `process()` would be
+    /// entered, so it is neither recorded nor consumes a script entry.
+    pub(crate) unregistered_delegates: UnregisteredDelegates,
 }
 
 /// One scripted delegate invocation.
@@ -166,6 +171,10 @@ pub(crate) type DelegateContexts =
 
 /// Shared handle to the per-invocation observation log.
 pub(crate) type DelegateObservations = std::sync::Arc<std::sync::Mutex<Vec<DelegateObservation>>>;
+
+/// Shared handle to the set of delegate keys the mock treats as never registered.
+pub(crate) type UnregisteredDelegates =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<DelegateKey>>>;
 
 /// Name the inbound variants so an observation can identify its logical run.
 fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
@@ -510,6 +519,18 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // test changes behaviour.
         let key = req.key().clone();
 
+        if self
+            .runtime
+            .unregistered_delegates
+            .lock()
+            .unwrap()
+            .contains(&key)
+        {
+            return Err(ExecutorError::request(
+                freenet_stdlib::client_api::DelegateError::Missing(key),
+            ));
+        }
+
         // Model the real `DelegateContextCache` read-modify-write around every
         // invocation (#5544 S7): read on entry, record what was seen, write on
         // exit. Same key, same last-write-wins semantics as the runtime's.
@@ -618,6 +639,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            unregistered_delegates: UnregisteredDelegates::default(),
         };
 
         Executor::new(
@@ -653,6 +675,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            unregistered_delegates: UnregisteredDelegates::default(),
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -680,6 +703,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            unregistered_delegates: UnregisteredDelegates::default(),
         };
 
         Executor::new(

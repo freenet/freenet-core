@@ -12,6 +12,7 @@ mod capability_loop_tests;
 pub(crate) mod delegate_app_registry;
 pub(crate) mod delegate_capabilities;
 mod delegate_park;
+mod delegate_restore;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
@@ -808,7 +809,7 @@ fn contract_op_response_msg(
 /// process. In the in-process multi-node harness that means every node ever
 /// built. A hold that cannot upgrade has nothing left to release, because the
 /// `InterestManager` it would decrement went with the `OpManager`.
-fn delegate_interest_release_closure(
+pub(crate) fn delegate_interest_release_closure(
     op_manager: &std::sync::Arc<crate::node::OpManager>,
 ) -> crate::wasm_runtime::delegate_interest::InterestRelease {
     let weak = std::sync::Arc::downgrade(op_manager);
@@ -955,7 +956,14 @@ where
         // subscription's hold has to be given back — `subscribe` does that
         // itself (see `SubscribeOutcome::RegisteredEvicting`), because a caller
         // that ignores the outcome compiles fine and two of the three do.
-        crate::wasm_runtime::delegate_subscriptions::subscribe(pending.contract_id, delegate_key);
+        let durable_store = contract_handler.executor().delegate_subscription_store();
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            pending.contract_id,
+            delegate_key,
+            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                durable_store.as_ref(),
+            ),
+        );
         // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
         //
         // `run_executor_subscribe` ended in
@@ -1014,13 +1022,19 @@ where
                 // WEAK, so an outstanding hold never keeps a shut-down node's
                 // `OpManager` alive. A hold that cannot upgrade has nothing
                 // left to release.
-                crate::wasm_runtime::delegate_interest::record(
+                if !crate::wasm_runtime::delegate_interest::record(
                     pending.contract_id,
                     delegate_key.clone(),
                     key,
                     delegate_interest_release_closure(&op_manager),
                     op_manager.node_identity,
-                );
+                ) {
+                    // This node already held the pair's obligation (the
+                    // boot-time restore recorded it while this subscribe was
+                    // in flight, #5493), so the refcount this subscribe took
+                    // is unaccounted for. Give it back rather than leak it.
+                    op_manager.interest_manager.remove_local_client(&key);
+                }
             }
             None => {
                 // No `OpManager` means no `run_executor_subscribe` ran, so no
@@ -1429,17 +1443,23 @@ where
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
                 // migration probes when old delegate WASM isn't on this node.
-                // A missing-delegate probe stays a benign empty response
-                // rather than a client-visible error; only genuine execution
-                // failures propagate as Err below (#5263 — previously EVERY
-                // failure here, including real ones, silently became an
-                // empty successful DelegateResponse to the client).
+                //
+                // The LOG is downgraded, the ANSWER is not (#5727): the client
+                // gets the typed `DelegateError::Missing`, exactly what
+                // `freenet local` answers. This used to return
+                // `Completed(accumulated_messages)` — an empty successful
+                // `DelegateResponse` — so a migration walk could not tell "not
+                // registered here" from "registered and said nothing", and a
+                // rehearsal on `freenet local` did not show what network users
+                // hit (freenet/harvest#150). `Failed` carries the typed error
+                // to the client; `client_events` keeps it typed rather than
+                // flattening it to an `OperationError` string.
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
                         "Delegate not found in store (expected for migration probes)"
                     );
-                    return DelegateRunOutcome::Completed(accumulated_messages);
+                    return DelegateRunOutcome::Failed(err);
                 }
                 tracing::error!(
                     delegate_key = %delegate_key,
@@ -2183,13 +2203,18 @@ where
                                         )
                                         .await;
                                     }
-                                    crate::wasm_runtime::delegate_interest::record(
+                                    if !crate::wasm_runtime::delegate_interest::record(
                                         contract_id,
                                         delegate_key.clone(),
                                         full_key,
                                         delegate_interest_release_closure(&op_manager),
                                         op_manager.node_identity,
-                                    );
+                                    ) {
+                                        // Already held (boot-time restore won
+                                        // the race across the await above,
+                                        // #5493): return the extra refcount.
+                                        op_manager.interest_manager.remove_local_client(&full_key);
+                                    }
                                     true
                                 }
                                 // No `OpManager` means no eviction pressure worth
@@ -2203,9 +2228,14 @@ where
                             interest_registered,
                             "Delegate subscribed to a contract this node already holds"
                         );
+                        let durable_store =
+                            contract_handler.executor().delegate_subscription_store();
                         crate::wasm_runtime::delegate_subscriptions::subscribe(
                             contract_id,
                             delegate_key,
+                            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                                durable_store.as_ref(),
+                            ),
                         );
                         Ok(())
                     } else if parking.is_some()
@@ -8768,10 +8798,10 @@ mod hol_4391_tests {
     /// `DelegateResponse(Err(_))`, not a fake empty successful response.
     ///
     /// `MockWasmRuntime::execute_delegate_request` unconditionally returns a
-    /// generic `ExecutorError::other(...)` for any delegate request — not the
-    /// `is_missing_delegate()` case, which stays a benign empty response for
-    /// legacy migration probes (see `handle_delegate_with_contract_requests`)
-    /// — so no delegate needs to be registered to exercise the genuine
+    /// generic `ExecutorError::other(...)` for an unscripted delegate request
+    /// — not the `is_missing_delegate()` case, which is pinned separately by
+    /// `delegate_request_to_unregistered_delegate_surfaces_missing_5727` — so
+    /// no delegate needs to be registered to exercise the genuine
     /// execution-failure branch this test targets.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delegate_request_surfaces_execution_failure_5263() {
@@ -8819,6 +8849,103 @@ mod hol_4391_tests {
             }
             other => panic!("expected DelegateResponse, got {other}"),
         }
+    }
+
+    /// Regression for #5727: a network-mode node answering a request to a
+    /// delegate it never registered must send the typed
+    /// `DelegateError::Missing(key)`, the same answer `freenet local` gives —
+    /// not an empty successful `DelegateResponse`.
+    ///
+    /// The empty answer is what a registered delegate that emits nothing also
+    /// returns, so a migration walk could not tell "not here" from "here and
+    /// silent" (freenet/harvest#150: a rehearsal on `freenet local` saw
+    /// `Missing`, while every network node answered empty).
+    ///
+    /// The script holds a run that WOULD succeed, so if the missing arm were
+    /// bypassed the delegate would answer `Ok` rather than fail for an
+    /// unrelated reason. The assertion is on the typed variant and its key,
+    /// not merely `is_err()`, because an unscripted mock request also errors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_request_to_unregistered_delegate_surfaces_missing_5727() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, None, "del_missing_5727").await;
+
+        let delegate_key = DelegateKey::new([27u8; 32], CodeHash::new([57u8; 32]));
+        handler
+            .runtime_mut()
+            .unregistered_delegates
+            .lock()
+            .unwrap()
+            .insert(delegate_key.clone());
+        handler
+            .runtime_mut()
+            .delegate_script
+            .lock()
+            .unwrap()
+            .push_back(ScriptedRun::from(vec![]));
+
+        let event = ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &std::sync::Arc::new(user_input::AutoApprovePrompter),
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                let err = result.expect_err(
+                    "a request to a never-registered delegate must answer with an \
+                     ERROR, not an empty success that reads as a registered delegate \
+                     with nothing to say (#5727)",
+                );
+                assert!(
+                    err.is_missing_delegate(),
+                    "the error must be the typed DelegateError::Missing that local \
+                     mode sends, got: {err}"
+                );
+                match err.unwrap_request() {
+                    freenet_stdlib::client_api::RequestError::DelegateError(
+                        freenet_stdlib::client_api::DelegateError::Missing(k),
+                    ) => assert_eq!(k, delegate_key, "Missing must name the requested key"),
+                    other => panic!("expected DelegateError::Missing, got {other}"),
+                }
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+        assert!(
+            handler
+                .runtime_mut()
+                .delegate_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an unregistered delegate must not have been entered"
+        );
     }
 
     /// The executor loop's half of the same guarantee as
@@ -9206,8 +9333,14 @@ mod hol_4391_tests {
         let bad_id = ContractInstanceId::new([23u8; 32]);
         // Global registry: use ids unique to this test so it does not race the
         // rest of the suite.
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let (mut handler, _send) = build_handler(vec![]).await;
         let _ = apply_resolved_contract_op(
@@ -9246,8 +9379,14 @@ mod hol_4391_tests {
             "a FAILED subscribe must not install a hook: it would advertise a \
              delivery path that was never established"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
@@ -9409,7 +9548,10 @@ mod hol_4391_tests {
                 .into(),
             );
         }
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
@@ -9454,7 +9596,10 @@ mod hol_4391_tests {
         );
 
         handle.abort();
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one
@@ -9516,7 +9661,10 @@ mod hol_4391_tests {
                 )]
                 .into(),
             );
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
 
         let handle = GlobalExecutor::spawn(contract_handling(
@@ -9587,7 +9735,10 @@ mod hol_4391_tests {
 
         handle.abort();
         for key in [banned_key, allowed_key] {
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
     }
 
@@ -9964,7 +10115,10 @@ mod hol_4391_tests {
         // The key `add_local_client` was called with: the FULL key, carrying the
         // real code hash, because the subscribe op knew it.
         let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         // Stand in for what `run_executor_subscribe` did before returning Ok.
         assert!(
@@ -10000,7 +10154,10 @@ mod hol_4391_tests {
              subscription is dropped, even though the contract body never \
              landed and the full `ContractKey` could not be resolved (#5542)"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get

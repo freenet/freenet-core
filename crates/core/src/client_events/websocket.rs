@@ -51,8 +51,50 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 ///   error response without forwarding to the node or blocking the event loop)
 /// - On incoming responses: extracts the delegate key directly from the error
 ///   or success response to record backoff state (no correlation needed)
+///
+/// Two lanes (#5727). Registration failures (`RegisterError`) back off
+/// registrations; every other delegate error backs off the other delegate
+/// operations. Since #5727 a network-mode node answers a request to an
+/// unregistered delegate with `DelegateError::Missing`, which arms the
+/// operations lane for that key. The registration that fixes it must not be
+/// refused by that, while a registration that itself keeps failing must still
+/// be throttled.
 struct DelegateRateLimiter {
+    /// Operations lane: armed by `Missing`, `MissingSecret`, and so on.
     backoff: TrackedBackoff<[u8; 32]>,
+    /// Registration lane: armed only by `RegisterError`.
+    register_backoff: TrackedBackoff<[u8; 32]>,
+}
+
+/// Which [`DelegateRateLimiter`] lane a request is checked against, or an error
+/// is recorded into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackoffLane {
+    Registration,
+    Operations,
+}
+
+impl BackoffLane {
+    // Wildcards: `ApplicationMessages`, `UnregisterDelegate`, every other
+    // error, and any future variant stay on the operations lane, which is the
+    // pre-#5727 behaviour. Only registration is carved out.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn for_request(req: &freenet_stdlib::client_api::DelegateRequest<'_>) -> Self {
+        match req {
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } => {
+                Self::Registration
+            }
+            _ => Self::Operations,
+        }
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn for_error(err: &DelegateError) -> Self {
+        match err {
+            DelegateError::RegisterError(_) => Self::Registration,
+            _ => Self::Operations,
+        }
+    }
 }
 
 impl DelegateRateLimiter {
@@ -62,28 +104,49 @@ impl DelegateRateLimiter {
             Duration::from_secs(5),     // max: 5s cap
         );
         Self {
-            backoff: TrackedBackoff::new(config, 64),
+            backoff: TrackedBackoff::new(config.clone(), 64),
+            register_backoff: TrackedBackoff::new(config, 64),
         }
     }
 
-    /// Check if a delegate key is currently in backoff.
+    /// Check if a delegate key is currently in backoff on `lane`.
     /// Returns the remaining backoff duration, or `None` if the request can proceed.
-    fn check_backoff(&self, delegate_key: &[u8]) -> Option<Duration> {
+    fn check_backoff_in(&self, delegate_key: &[u8], lane: BackoffLane) -> Option<Duration> {
         let key = to_key_array(delegate_key)?;
-        self.backoff.remaining_backoff(&key)
-    }
-
-    /// Record a delegate error for a specific key (extracted from the error response).
-    fn record_error(&mut self, delegate_key: &[u8]) {
-        if let Some(key) = to_key_array(delegate_key) {
-            self.backoff.record_failure(key);
+        match lane {
+            BackoffLane::Registration => self.register_backoff.remaining_backoff(&key),
+            BackoffLane::Operations => self.backoff.remaining_backoff(&key),
         }
     }
 
-    /// Record a successful delegate response. Clears backoff for the key.
+    /// Record a delegate error for a specific key on `lane`.
+    fn record_error_in(&mut self, delegate_key: &[u8], lane: BackoffLane) {
+        if let Some(key) = to_key_array(delegate_key) {
+            match lane {
+                BackoffLane::Registration => self.register_backoff.record_failure(key),
+                BackoffLane::Operations => self.backoff.record_failure(key),
+            }
+        }
+    }
+
+    /// Operations-lane shorthand, kept for the existing backoff tests.
+    #[cfg(test)]
+    fn check_backoff(&self, delegate_key: &[u8]) -> Option<Duration> {
+        self.check_backoff_in(delegate_key, BackoffLane::Operations)
+    }
+
+    /// Operations-lane shorthand, kept for the existing backoff tests.
+    #[cfg(test)]
+    fn record_error(&mut self, delegate_key: &[u8]) {
+        self.record_error_in(delegate_key, BackoffLane::Operations);
+    }
+
+    /// Record a successful delegate response. Clears both lanes for the key:
+    /// a delegate that answered is registered and executable.
     fn record_success(&mut self, delegate_key: &[u8]) {
         if let Some(key) = to_key_array(delegate_key) {
             self.backoff.record_success(&key);
+            self.register_backoff.record_success(&key);
         }
     }
 }
@@ -1872,7 +1935,9 @@ async fn process_client_request(
     // would stall pings, subscriptions, and other responses).
     if let ClientRequest::DelegateOp(ref delegate_req) = req {
         let key_bytes: &[u8] = delegate_req.key().bytes();
-        if let Some(remaining) = rate_limiter.check_backoff(key_bytes) {
+        if let Some(remaining) =
+            rate_limiter.check_backoff_in(key_bytes, BackoffLane::for_request(delegate_req))
+        {
             tracing::warn!(
                 %client_id,
                 delegate_key = %delegate_req.key(),
@@ -2068,7 +2133,8 @@ async fn process_host_response(
                         err.kind()
                     {
                         if let Some(key_bytes) = delegate_error_key(delegate_err) {
-                            rate_limiter.record_error(key_bytes);
+                            rate_limiter
+                                .record_error_in(key_bytes, BackoffLane::for_error(delegate_err));
                         }
                     }
                 }
@@ -3471,6 +3537,76 @@ mod tests {
         assert!(limiter.check_backoff(&key_b).is_some());
     }
 
+    /// #5727: a `Missing` answer arms the OPERATIONS lane, so the registration
+    /// that fixes it still goes through, while a registration that keeps
+    /// failing (`RegisterError`) is throttled on its own lane.
+    #[test]
+    fn missing_does_not_block_registration_but_register_errors_do() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        let code = DelegateCode::from(vec![0u8, 1, 2, 3]);
+        let params = Parameters::from(vec![]);
+        let container =
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
+        let key = container.key().clone();
+        let register = DelegateRequest::RegisterDelegate {
+            delegate: container,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
+        };
+        let app = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        assert_eq!(
+            BackoffLane::for_request(&register),
+            BackoffLane::Registration
+        );
+        assert_eq!(BackoffLane::for_request(&app), BackoffLane::Operations);
+        assert_eq!(
+            BackoffLane::for_request(&DelegateRequest::UnregisterDelegate(key.clone())),
+            BackoffLane::Operations
+        );
+
+        let mut limiter = DelegateRateLimiter::new();
+        let missing = DelegateError::Missing(key.clone());
+        limiter.record_error_in(key.bytes(), BackoffLane::for_error(&missing));
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&app))
+                .is_some(),
+            "a repeated probe of a missing delegate stays throttled (#3305)"
+        );
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&register))
+                .is_none(),
+            "a Missing answer must not refuse the registration that fixes it"
+        );
+
+        let reg_err = DelegateError::RegisterError(key.clone());
+        limiter.record_error_in(key.bytes(), BackoffLane::for_error(&reg_err));
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&register))
+                .is_some(),
+            "a registration that keeps failing must still be throttled"
+        );
+
+        limiter.record_success(key.bytes());
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::Operations)
+                .is_none()
+        );
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::Registration)
+                .is_none(),
+            "a successful response clears the registration lane too"
+        );
+    }
+
     /// A throttled delegate request must NOT be reported as a missing
     /// delegate.
     ///
@@ -3536,7 +3672,7 @@ mod tests {
             .expect("websocket.rs should have a tests module");
 
         let idx = body
-            .find("rate_limiter.check_backoff(key_bytes)")
+            .find("rate_limiter.check_backoff_in(key_bytes")
             .expect("the delegate backoff branch should still exist");
 
         // The branch is short; take a generous window rather than trying to

@@ -932,6 +932,10 @@ impl ContractExecutor for RuntimePool {
         self.delegate_capabilities.clone()
     }
 
+    fn delegate_subscription_store(&self) -> Option<Storage> {
+        Some(self.shared_state_store.inner().clone())
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
