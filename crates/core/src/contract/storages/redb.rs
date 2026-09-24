@@ -265,6 +265,23 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
 
+/// Delegate capability records (manifest, registered parameters, bound apps,
+/// lifecycle flags), written by `contract::delegate_capabilities` when an app
+/// registers a delegate that declares a manifest. Encoding is owned by that
+/// module.
+///
+/// Key: DelegateKey bytes (32) || CodeHash (32) = 64 bytes
+pub(crate) const DELEGATE_CAPABILITY_RECORDS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_capability_records");
+
+/// The user's answers to node-enforced capability prompts, per app. Encoding
+/// is owned by `contract::delegate_capabilities`.
+///
+/// Key: user scope (tag byte, plus a 32-byte user id for a hosted user) ||
+/// app identity (tag byte || id bytes) || capability code (u16 BE)
+pub(crate) const APP_CAPABILITY_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("app_capability_grants");
+
 /// Durable half of the delegate contract-subscription registry
 /// (`wasm_runtime::delegate_subscriptions`), so a delegate's subscriptions
 /// survive a node restart (#5493). One row per `(contract, delegate)` pair,
@@ -1113,6 +1130,26 @@ impl ReDb {
                 e
             })?;
 
+            // Delegate capabilities: manifests + app grants. Created on first
+            // open of upgraded databases too.
+            for (table, name) in [
+                (
+                    DELEGATE_CAPABILITY_RECORDS_TABLE,
+                    "DELEGATE_CAPABILITY_RECORDS_TABLE",
+                ),
+                (APP_CAPABILITY_GRANTS_TABLE, "APP_CAPABILITY_GRANTS_TABLE"),
+            ] {
+                txn.open_table(table).map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        table = name,
+                        phase = "table_init_failed",
+                        "Failed to open delegate capability table"
+                    );
+                    e
+                })?;
+            }
+
             // Durable delegate subscriptions (#5493). Created empty on first
             // open of upgraded databases too, so an older database gains the
             // table without disturbing any existing one.
@@ -1869,6 +1906,121 @@ impl ReDb {
         };
         Self::commit_guarded(txn)?;
         Ok(wrote)
+    }
+
+    // ==================== Delegate Capability Methods ====================
+    // Raw byte storage for `contract::delegate_capabilities`, which owns the
+    // encoding. Two tables, both small: one row per manifest-declaring
+    // delegate, one per (app, capability) the user answered.
+
+    pub(crate) fn put_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            tbl.insert(key.as_slice(), value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    pub(crate) fn get_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            Ok(tbl.get(key.as_slice())?.map(|v| v.value().to_vec()))
+        })
+    }
+
+    pub(crate) fn remove_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            tbl.remove(key.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Every record, skipping rows whose key is not 64 bytes.
+    pub(crate) fn load_all_delegate_capability_records(
+        &self,
+    ) -> Result<Vec<(DelegateKey, Vec<u8>)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let k = key.value();
+                let (Ok(dk), Ok(ch)) = (
+                    <[u8; 32]>::try_from(&k[..k.len().min(32)]),
+                    <[u8; 32]>::try_from(&k[k.len().min(32)..]),
+                ) else {
+                    continue;
+                };
+                out.push((
+                    DelegateKey::new(dk, CodeHash::new(ch)),
+                    value.value().to_vec(),
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn put_app_capability_grant(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            tbl.insert(key, value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    pub(crate) fn get_app_capability_grant(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            Ok(tbl.get(key)?.map(|v| v.value().to_vec()))
+        })
+    }
+
+    pub(crate) fn remove_app_capability_grant(&self, key: &[u8]) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            tbl.remove(key)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn load_all_app_capability_grants(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                out.push((key.value().to_vec(), value.value().to_vec()));
+            }
+            Ok(out)
+        })
     }
 
     /// Fetch `delegate`'s FIRST-registration origin as `(has_admin_none,

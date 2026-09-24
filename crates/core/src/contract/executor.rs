@@ -1141,6 +1141,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
         None
     }
 
+    /// This node's delegate capability state (manifests, grants, lifecycle
+    /// queue, unprompted-run budget), if the executor has one. `None` for
+    /// executors that do not implement capabilities: lifecycle events are
+    /// then never delivered and unprompted runs are not budgeted, which is
+    /// exactly the behaviour before capabilities existed.
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
+
     /// The node's durable store, for mirroring delegate subscriptions to disk
     /// so they survive a restart (#5493).
     ///

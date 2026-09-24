@@ -111,6 +111,11 @@ pub(crate) struct MockWasmRuntime {
     /// an interleaving bug: a resumed run must observe the context ITS OWN
     /// pre-park run wrote, not one a foreign run left behind.
     pub(crate) delegate_observations: DelegateObservations,
+    /// Delegate capability state, for tests of lifecycle delivery and the
+    /// unprompted-run budget. `None` (the default) behaves like an executor
+    /// without capabilities.
+    pub(crate) capabilities:
+        Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
     /// Delegate keys this "node" has never registered (#5727). A request to one
     /// fails with the same `DelegateError::Missing` the real executor builds
     /// from `RuntimeInnerError::DelegateNotFound`, before `process()` would be
@@ -149,6 +154,8 @@ pub(crate) struct DelegateObservation {
     pub inbound_kinds: Vec<&'static str>,
     /// The context this invocation read on entry.
     pub observed_context: Option<Vec<u8>>,
+    /// The parameters the run was given (empty for registration requests).
+    pub params: Vec<u8>,
 }
 
 /// Shared handle to a mock delegate's scripted runs.
@@ -183,6 +190,8 @@ fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
         // Appended in stdlib 0.10.0.
         InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
         InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
+        // Appended in stdlib 0.12.0.
+        InboundDelegateMsg::Lifecycle(_) => "Lifecycle",
         _ => "Other",
     }
 }
@@ -445,6 +454,12 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.bridged_lookup_key(instance_id)
     }
 
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.runtime.capabilities.clone()
+    }
+
     fn op_manager_handle(&self) -> Option<std::sync::Arc<crate::node::OpManager>> {
         self.op_manager.clone()
     }
@@ -530,13 +545,16 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // registration variants carry none. The wildcard is required by
         // `#[non_exhaustive]` and is listed alongside the known variants so a
         // future one is not silently swallowed.
-        let inbound_kinds: Vec<&'static str> = match &req {
-            DelegateRequest::ApplicationMessages { inbound, .. } => {
-                inbound.iter().map(inbound_kind).collect()
-            }
+        let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
+            DelegateRequest::ApplicationMessages {
+                inbound, params, ..
+            } => (
+                inbound.iter().map(inbound_kind).collect(),
+                params.as_ref().to_vec(),
+            ),
             DelegateRequest::RegisterDelegate { .. }
             | DelegateRequest::UnregisterDelegate(_)
-            | _ => Vec::new(),
+            | _ => (Vec::new(), Vec::new()),
         };
 
         let script = self.runtime.delegate_script.lock().unwrap().pop_front();
@@ -549,6 +567,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
                     delegate_key: key.clone(),
                     inbound_kinds: inbound_kinds.clone(),
                     observed_context: observed_context.clone(),
+                    params: params.clone(),
                 });
             if let Some(bytes) = writes {
                 rt.delegate_contexts
@@ -619,6 +638,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 
@@ -654,6 +674,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 
@@ -681,6 +702,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 

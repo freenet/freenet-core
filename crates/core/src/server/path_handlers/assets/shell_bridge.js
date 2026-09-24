@@ -1710,6 +1710,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     return { display: 'Unknown caller', full: '' };
   }
+  // perm-label:BEGIN
+  // The card's authorship label. `author` is set by the node from the path
+  // that raised the prompt, never from delegate output; only the node's own
+  // capability prompts say "Freenet asks:". Anything else, including a
+  // missing or unexpected value, is treated as delegate-authored.
+  function permMessageLabel(p) {
+    return p && p.author === 'node' ? 'Freenet asks:' : 'Delegate says:';
+  }
+  // perm-label:END
+
   function createCard(p) {
     var card = document.createElement('div');
     card.className = 'fn-card';
@@ -1732,9 +1742,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // this request" with no way for the user to tell who authored it. The
     // text below the label is delegate-controlled; the label tells the user
     // that. See the trust-model rationale in permission_prompts.rs.
+    // See `permMessageLabel` for who may be labelled as the node.
     var msgLabel = document.createElement('div');
     msgLabel.className = 'fn-msg-label';
-    msgLabel.textContent = 'Delegate says:';
+    msgLabel.textContent = permMessageLabel(p);
     card.appendChild(msgLabel);
     // Try to render the delegate-supplied message as pretty-printed JSON
     // when it parses as JSON. Falls back to a plain paragraph for plain

@@ -384,6 +384,8 @@ fn inbound_bytes(msg: &InboundDelegateMsg<'static>) -> usize {
         // rather than assume: this arm exists precisely so nothing goes
         // uncounted. Carries no context by design.
         InboundDelegateMsg::WakeupFired { tag } => tag.len(),
+        // A fixed-size event with no context (stdlib 0.12.0).
+        InboundDelegateMsg::Lifecycle(_) => 0,
         // Required by `#[non_exhaustive]`. A new variant that carries bytes
         // MUST be added above; this arm is the only thing between it and going
         // uncounted, which is why the list is written out rather than delegated.
