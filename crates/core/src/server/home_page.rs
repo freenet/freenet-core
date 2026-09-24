@@ -118,8 +118,24 @@ pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoRespons
 }
 
 fn homepage_html() -> String {
-    let snap = network_status::get_snapshot();
+    homepage_html_for(network_status::get_snapshot())
+}
 
+/// Renders the homepage from an explicit snapshot rather than reading the
+/// process-global `network_status` state directly. Split out so tests can
+/// pass a known snapshot (including `None`) instead of relying on nothing
+/// else in the same `cargo test` process having touched the global — see
+/// #5732. `network_status::init` overwrites its `OnceLock`'s contents in
+/// place on every call (it does not leak state from one initializer to the
+/// next), but it does stamp a fresh `started_at`, and `get_snapshot()`'s
+/// health computation treats `open_connections == 0 && elapsed_secs > 60`
+/// as `Trouble`. So if some other test (e.g. in `operations::connect` or
+/// `ring::connection_manager`) calls `network_status::init` and then more
+/// than 60 real seconds pass before a test reads `homepage_html()`'s global
+/// snapshot, the rendered title silently changes — an order/timing
+/// dependency `homepage_html()`'s old single-source-of-truth read could not
+/// be isolated from.
+fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>) -> String {
     let (version, uptime) = match &snap {
         Some(s) => (s.version.as_str(), format_duration(s.elapsed_secs)),
         None => ("?", "0s".to_string()),
@@ -1037,11 +1053,16 @@ mod tests {
     fn homepage_renders_dynamic_title() {
         // The rendered page must carry the derived title, not a static
         // placeholder — the JS refresh path re-reads it from `doc.title`.
-        let html = homepage_html();
+        //
+        // Pass `None` explicitly rather than going through `homepage_html()`
+        // (which reads the process-global `network_status` snapshot) — see
+        // `homepage_html_for`'s doc comment for why that global made this
+        // test order/timing-dependent (#5732).
+        let html = homepage_html_for(None);
         assert!(
             html.contains("<title>\u{26A1} Dashboard</title>"),
-            "no snapshot exists in the unit-test process, so the homepage \
-             must render the 'trying to connect' title, got: {html}"
+            "with no snapshot, the homepage must render the 'trying to \
+             connect' title, got: {html}"
         );
     }
 
