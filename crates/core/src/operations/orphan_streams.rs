@@ -126,12 +126,18 @@ impl OrphanStreamRegistry {
                 let Slot::Waiter(waiter) = occupied.remove() else {
                     unreachable!("the match guard checked for a waiter");
                 };
-                if waiter.send(handle).is_err() {
-                    tracing::warn!(
+                if let Err(handle) = waiter.send(handle) {
+                    // The claimant went away (timed out or was dropped) between
+                    // parking and now. Keep the stream for a retried claim
+                    // instead of discarding it: go round again, which delivers
+                    // to a newer waiter or parks the stream as an orphan. Each
+                    // round removes one dead waiter, so this terminates.
+                    tracing::debug!(
                         %peer_addr,
                         stream_id = %stream_id,
-                        "Failed to deliver orphan stream to waiter (receiver dropped)"
+                        "Waiter gone before delivery; re-registering stream"
                     );
+                    self.register_orphan(peer_addr, stream_id, handle);
                 } else {
                     tracing::debug!(
                         %peer_addr,
@@ -211,9 +217,21 @@ impl OrphanStreamRegistry {
                 );
                 return Ok(handle);
             }
-            // A waiter already parked here can only be a stale one (the
-            // `claimed_streams` dedup above admits one live claimant per key);
-            // replace it, as the two-map version's `insert` did.
+            // A LIVE waiter here means another claimant got past the
+            // `claimed_streams` dedup, which `gc_expired`'s wholesale clear of
+            // that map makes possible. Never displace it: that claimant keeps
+            // the stream, and this one is the duplicate.
+            Entry::Occupied(occupied) if matches!(occupied.get(), Slot::Waiter(tx) if !tx.is_closed()) =>
+            {
+                tracing::debug!(
+                    %peer_addr,
+                    stream_id = %stream_id,
+                    "Stream already has a live waiter (dedup)"
+                );
+                return Err(OrphanStreamError::AlreadyClaimed);
+            }
+            // A dead waiter, left by a claim whose future was dropped
+            // mid-wait: replace it.
             Entry::Occupied(mut occupied) => {
                 let (tx, rx) = oneshot::channel();
                 occupied.insert(Slot::Waiter(tx));
@@ -271,10 +289,17 @@ impl OrphanStreamRegistry {
         }
     }
 
-    /// Remove the waiter parked at `key`, leaving an orphan there untouched.
+    /// Remove this claim's own waiter from `key` once its receiver is gone.
+    ///
+    /// Only a closed waiter is removed: ours is closed by the time this runs
+    /// (its receiver was dropped with the timed-out wait, or its sender was
+    /// already taken). An orphan, or another claimant's live waiter, at the
+    /// same key is left alone.
     fn remove_waiter(&self, key: &StreamKey) {
-        self.slots
-            .remove_if(key, |_, slot| matches!(slot, Slot::Waiter(_)));
+        self.slots.remove_if(
+            key,
+            |_, slot| matches!(slot, Slot::Waiter(tx) if tx.is_closed()),
+        );
     }
 
     /// Garbage collect expired orphan streams.
@@ -302,8 +327,10 @@ impl OrphanStreamRegistry {
                         true
                     }
                 }
-                // Waiters are removed by their own claim on every exit path.
-                Slot::Waiter(_) => true,
+                // A claim removes its own waiter when it times out or is
+                // cancelled, but not when its future is dropped mid-wait
+                // (task abort, shutdown). Collect those dead waiters here.
+                Slot::Waiter(tx) => !tx.is_closed(),
             });
 
         // Also prune claimed_streams to prevent unbounded growth.
@@ -608,6 +635,111 @@ mod tests {
             assert_eq!(registry.orphan_count(), 0, "iteration {iteration}");
             assert_eq!(registry.waiter_count(), 0, "iteration {iteration}");
         }
+    }
+
+    /// `gc_expired` clears `claimed_streams` wholesale once it grows past its
+    /// cap, so a duplicate claim can get past dedup while the first claimant
+    /// is still parked. It must not displace that live waiter: the duplicate
+    /// gets `AlreadyClaimed` and the original claimant still receives the
+    /// stream.
+    #[tokio::test]
+    async fn test_duplicate_claim_never_displaces_live_waiter() {
+        let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
+        let stream_id = StreamId::next();
+        let addr = dummy_addr();
+
+        let first = {
+            let registry = registry.clone();
+            GlobalExecutor::spawn(async move {
+                registry
+                    .claim_or_wait(addr, stream_id, Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(WAITER_REGISTRATION_DELAY).await;
+        assert_eq!(registry.waiter_count(), 1);
+
+        // What gc_expired's cap-triggered clear does to the live claim.
+        registry.claimed_streams.clear();
+        let duplicate = registry
+            .claim_or_wait(addr, stream_id, Duration::from_secs(5))
+            .await;
+        assert!(matches!(duplicate, Err(OrphanStreamError::AlreadyClaimed)));
+        assert_eq!(registry.waiter_count(), 1, "live waiter must survive");
+
+        registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+        assert!(first.await.unwrap().is_ok());
+        assert_eq!(registry.waiter_count(), 0);
+        assert_eq!(registry.orphan_count(), 0);
+    }
+
+    /// A stream arriving for a waiter whose claim already went away (its
+    /// receiver dropped) is kept as an orphan for a retried claim, not
+    /// discarded.
+    #[tokio::test]
+    async fn test_stream_for_dead_waiter_is_kept_for_retry() {
+        let registry = OrphanStreamRegistry::new();
+        let stream_id = StreamId::next();
+        let addr = dummy_addr();
+
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        registry.slots.insert((addr, stream_id), Slot::Waiter(tx));
+
+        registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+        assert_eq!(registry.waiter_count(), 0);
+        assert_eq!(registry.orphan_count(), 1);
+
+        let retried = registry
+            .claim_or_wait(addr, stream_id, Duration::from_secs(1))
+            .await;
+        assert!(retried.is_ok());
+    }
+
+    /// A timed-out claim cleans up only its own dead waiter; GC collects dead
+    /// waiters left by claims dropped mid-wait, and keeps live ones.
+    #[tokio::test]
+    async fn test_waiter_cleanup_removes_only_dead_waiters() {
+        let registry = OrphanStreamRegistry::new();
+        let addr = dummy_addr();
+
+        // Timeout cleanup must leave an orphan at the key alone.
+        let orphan_id = StreamId::next();
+        registry.slots.insert(
+            (addr, orphan_id),
+            Slot::Orphan(make_test_handle(orphan_id), Instant::now()),
+        );
+        registry.remove_waiter(&(addr, orphan_id));
+        assert_eq!(registry.orphan_count(), 1);
+
+        let dead_id = StreamId::next();
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        registry
+            .slots
+            .insert((addr, dead_id), Slot::Waiter(dead_tx));
+
+        let live_id = StreamId::next();
+        let (live_tx, _live_rx) = oneshot::channel();
+        registry
+            .slots
+            .insert((addr, live_id), Slot::Waiter(live_tx));
+
+        registry.remove_waiter(&(addr, live_id));
+        assert_eq!(
+            registry.waiter_count(),
+            2,
+            "a live waiter is not ours to remove"
+        );
+
+        registry.gc_expired();
+        assert_eq!(
+            registry.waiter_count(),
+            1,
+            "GC collects only the dead waiter"
+        );
+        assert!(registry.slots.contains_key(&(addr, live_id)));
+        assert_eq!(registry.orphan_count(), 1);
     }
 
     #[tokio::test]
