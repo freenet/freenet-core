@@ -146,6 +146,7 @@ fn app_messages(
 }
 
 struct Loop {
+    unregistered: super::executor::mock_wasm_runtime::UnregisteredDelegates,
     send: Arc<handler::ContractHandlerChannel<handler::SenderHalve>>,
     caps: Arc<DelegateCapabilities>,
     script: super::executor::mock_wasm_runtime::DelegateScript,
@@ -198,8 +199,10 @@ async fn start<P: UserInputPrompter + 'static>(
     let script_handle = rt.delegate_script.clone();
     script_handle.lock().unwrap().extend(script);
     let observations = rt.delegate_observations.clone();
+    let unregistered = rt.unregistered_delegates.clone();
     let handle = GlobalExecutor::spawn(contract_handling(handler, prompter));
     let lp = Loop {
+        unregistered,
         send: Arc::new(send),
         caps,
         script: script_handle,
@@ -1030,4 +1033,33 @@ async fn a_remote_unregister_keeps_the_record() {
     );
     assert!(local.is_ok(), "{local:?}");
     assert!(!caps.is_budgeted(&key), "a local unregister drops it");
+}
+
+/// A lifecycle run for a delegate that is no longer registered here (removed
+/// by the CLI or another connection) drops its record, is counted, and does
+/// not recur on the next start.
+#[tokio::test]
+async fn a_lifecycle_run_for_a_vanished_delegate_drops_its_record() {
+    let caps = DelegateCapabilities::in_memory();
+    let lp = start(
+        "cap_vanished",
+        caps.clone(),
+        vec![],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 25);
+    lp.unregistered.lock().unwrap().insert(key.clone());
+    assert!(caps.queue(LifecycleRun {
+        key: key.clone(),
+        event: LifecycleEvent::NodeStarted {
+            down_since_ms: None
+        },
+    }));
+    wait_until("the skip", || {
+        caps.stats.lifecycle_skipped_missing.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(caps.stats.lifecycle_failed.load(Ordering::Relaxed), 0);
+    assert!(caps.node_started_targets().is_empty(), "the record is gone");
 }

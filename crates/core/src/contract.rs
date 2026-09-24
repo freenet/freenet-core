@@ -3405,12 +3405,30 @@ fn lifecycle_now(
 /// NODE_STARTED_SMEAR`] after a short start-up delay.
 ///
 /// Runs when the loop starts, which is after `NetworkContractHandler::build`
-/// returned: any restore work done there (durable delegate subscriptions)
-/// has already happened.
+/// returned: the durable delegate-subscription REGISTRY is restored by then
+/// (#5728), but its network re-establishment is paced in the background and
+/// may still be running when NodeStarted arrives. A handler that
+/// re-subscribes can race it; that race is handled by the restore
+/// (`delegate_restore`), and the re-subscribe goes through the unprompted-run
+/// budget like any other.
+///
+/// Also re-queues `Installed` for granted delegates still owed it (an earlier
+/// delivery was dropped), so NodeStarted is never the first event a delegate
+/// sees.
 fn seed_node_started(
     caps: &delegate_capabilities::DelegateCapabilities,
     schedule: &mut delegate_capabilities::LifecycleSchedule,
 ) {
+    for key in caps.installed_pending_targets() {
+        schedule.push(
+            caps.now() + delegate_capabilities::NODE_STARTED_MIN_DELAY,
+            delegate_capabilities::LifecycleRun {
+                key,
+                event: LifecycleEvent::Installed,
+            },
+            0,
+        );
+    }
     let targets = caps.node_started_targets();
     if targets.is_empty() {
         return;
@@ -4711,6 +4729,15 @@ where
     caps.charge_duty(&key, caps.now().saturating_duration_since(started), true);
 
     match outcome {
+        DelegateRunOutcome::Failed(err) if err.is_missing_delegate() => {
+            // Unregistered since (by the CLI, another connection, or a
+            // remote client): the record has nothing left to deliver to.
+            caps.stats
+                .lifecycle_skipped_missing
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event for a delegate that is no longer registered; dropping its record");
+            caps.on_delegate_missing(&key);
+        }
         DelegateRunOutcome::Failed(err) => {
             caps.stats.lifecycle_failed.fetch_add(1, Ordering::Relaxed);
             tracing::info!(delegate = %key, event = ?run.event, error = %err, "Lifecycle run failed");

@@ -16,7 +16,8 @@
 //!    `LifecycleEvent::NodeStarted` after each start, only to delegates whose
 //!    manifest lists that kind AND whose app holds the grant;
 //! 3. bounds what unprompted runs (lifecycle and contract-notification runs)
-//!    may cost: loop time for lifecycle runs, and network operations for both.
+//!    may cost: loop time, and contract operations (GET/PUT/UPDATE/SUBSCRIBE,
+//!    whether answered locally or from the network) for both.
 //!
 //! # App identity
 //!
@@ -409,7 +410,7 @@ impl CapabilityPrompt {
             .map(|c| capability_description(*c))
             .collect();
         format!(
-            "The Freenet app {} wants to: {}. You will only be asked once; you can \
+            "The Freenet app {} wants to: {}. Freenet will remember your answer; you can \
              change this later from the Freenet dashboard.",
             self.app.display(),
             wants.join("; ")
@@ -438,10 +439,10 @@ impl BudgetRefusal {
     pub(crate) fn message(&self) -> &'static str {
         match self {
             BudgetRefusal::DelegateNetworkOps => {
-                "refused: this delegate's budget for unprompted network operations is spent; retry later"
+                "refused: this delegate's budget for unprompted contract operations is spent; retry later"
             }
             BudgetRefusal::NodeNetworkOps => {
-                "refused: this node's budget for unprompted delegate network operations is spent; retry later"
+                "refused: this node's budget for unprompted delegate contract operations is spent; retry later"
             }
             BudgetRefusal::ContractWrites => {
                 "refused: too many unprompted writes to this contract from this delegate; retry later"
@@ -622,15 +623,16 @@ impl Budget {
             .duty
             .entry(key.clone())
             .or_insert_with(|| DutyBucket::full(limits.duty_burst, now));
-        // Debt is floored at one burst: enough that a long run is paid back
-        // before the next lifecycle run, without letting sustained
-        // notification traffic (charged but never refused) build a debt that
-        // takes days to repay and silently starves the delegate's lifecycle
-        // runs.
-        let floor = -(limits.duty_burst.as_micros().min(i64::MAX as u128) as i64);
+        // Debt is floored at half a burst: enough that a long run is paid
+        // back before the next lifecycle run, but repayable (at the default
+        // limits, 500 s) inside the lifecycle retry window (60 x 15 s), so a
+        // burst of notification traffic (charged but never refused) cannot
+        // on its own guarantee the next lifecycle run is dropped. Pinned by
+        // `debt_is_repaid_inside_the_retry_window`.
+        let floor = -(limits.duty_burst.as_micros().min(i64::MAX as u128) as i64) / 2;
         bucket.tokens_us = bucket.tokens_us.saturating_sub(us).max(floor);
         if node_wide {
-            let floor = -(limits.node_duty_burst.as_micros().min(i64::MAX as u128) as i64);
+            let floor = -(limits.node_duty_burst.as_micros().min(i64::MAX as u128) as i64) / 2;
             self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us).max(floor);
         }
     }
@@ -685,6 +687,7 @@ pub(crate) struct CapabilityStats {
     pub lifecycle_deferred_parked: AtomicU64,
     pub lifecycle_dropped_attempts: AtomicU64,
     pub lifecycle_deduplicated: AtomicU64,
+    pub lifecycle_skipped_missing: AtomicU64,
     pub lifecycle_dropped_not_granted: AtomicU64,
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
@@ -895,13 +898,16 @@ impl DelegateCapabilities {
         params: &[u8],
         app: Option<AppIdentity>,
     ) -> Option<CapabilityPrompt> {
-        let wanted = manifest.known_capabilities();
         let wants_lifecycle = [LifecycleKind::Installed, LifecycleKind::NodeStarted]
             .iter()
             .any(|k| manifest.wants_lifecycle(*k));
-        if wanted.is_empty() && !wants_lifecycle {
+        // Background is the only capability today and only lifecycle events
+        // use it, so a manifest without lifecycle kinds has nothing to ask
+        // for; one with lifecycle kinds needs Background whatever it lists.
+        if !wants_lifecycle {
             return None;
         }
+        let wanted = Self::relevant_capabilities(&manifest);
         if params.len() > MAX_STORED_PARAMS_BYTES {
             tracing::warn!(
                 delegate = %key,
@@ -1191,8 +1197,9 @@ impl DelegateCapabilities {
         }
     }
 
-    /// Revoke a grant (dashboard). Future unprompted deliveries stop; the next
-    /// registration by that app prompts again.
+    /// Revoke a grant (dashboard). Lifecycle events stop at once (delivery
+    /// re-checks the grant); contract-notification runs are not gated by the
+    /// grant and continue. The next registration by that app prompts again.
     pub(crate) fn revoke(&self, app: &AppIdentity, cap: Capability) -> bool {
         let Some(code) = capability_code(cap) else {
             return false;
@@ -1250,6 +1257,18 @@ impl DelegateCapabilities {
 
     /// Delegates that get `NodeStarted` on this start.
     pub(crate) fn node_started_targets(&self) -> Vec<DelegateKey> {
+        self.start_targets(LifecycleKind::NodeStarted)
+    }
+
+    /// Granted delegates still owed `Installed` (its earlier delivery was
+    /// dropped: queue full, or deferred past the retry limit). Re-queued at
+    /// start so a delegate does not get NodeStarted without ever having got
+    /// Installed.
+    pub(crate) fn installed_pending_targets(&self) -> Vec<DelegateKey> {
+        self.start_targets(LifecycleKind::Installed)
+    }
+
+    fn start_targets(&self, kind: LifecycleKind) -> Vec<DelegateKey> {
         let records = match self.storage.all_records() {
             Ok(r) => r,
             Err(e) => {
@@ -1261,27 +1280,47 @@ impl DelegateCapabilities {
             .into_iter()
             .filter_map(|(key, bytes)| {
                 let rec = DelegateRecord::decode(&bytes)?;
-                (rec.manifest.wants_lifecycle(LifecycleKind::NodeStarted)
+                let owed = kind != LifecycleKind::Installed || !rec.installed_delivered;
+                (owed
+                    && rec.manifest.wants_lifecycle(kind)
                     && self.any_bound_app_granted(&rec, Capability::Background))
                 .then_some(key)
             })
             .collect()
     }
 
-    /// Whether `key`'s unprompted runs are budgeted: only delegates that opted
-    /// into the capability system by declaring a manifest (and were registered
-    /// by an app) are. Every other delegate's notification runs behave exactly
-    /// as before this module existed.
+    /// Whether `key`'s unprompted runs are budgeted: only delegates that took
+    /// up the capability system, meaning a manifest registered by an app that
+    /// holds the Background grant. Every other delegate's notification runs,
+    /// including an ungranted manifest delegate's, behave exactly as before
+    /// this module existed, so delegates nobody approved cannot spend the
+    /// node-wide allowance that approved ones rely on.
     pub(crate) fn is_budgeted(&self, key: &DelegateKey) -> bool {
-        let recorded = self.recorded.lock();
-        if recorded.apps.contains_key(key) {
-            return true;
-        }
-        if recorded.complete {
-            return false;
-        }
-        drop(recorded);
-        matches!(self.storage.get_record(key), Ok(Some(_)))
+        let apps = {
+            let recorded = self.recorded.lock();
+            match recorded.apps.get(key) {
+                Some(apps) => apps.clone(),
+                None if recorded.complete => return false,
+                None => match self.load_record(key) {
+                    Some(rec) => rec.apps,
+                    None => return false,
+                },
+            }
+        };
+        apps.iter()
+            .any(|app| self.is_granted(app, Capability::Background))
+    }
+
+    /// Whether `key` has a capability record.
+    #[cfg(test)]
+    pub(crate) fn is_recorded(&self, key: &DelegateKey) -> bool {
+        self.recorded.lock().apps.contains_key(key)
+    }
+
+    /// The delegate this record is for is no longer registered on this node:
+    /// drop the record. A later registration is a new install.
+    pub(crate) fn on_delegate_missing(&self, key: &DelegateKey) {
+        self.remove_record(key);
     }
 
     /// Whether a lifecycle run for `key` may start now (duty budget).
@@ -1298,7 +1337,7 @@ impl DelegateCapabilities {
         self.budget.lock().charge_duty(key, spent, node_wide, now);
     }
 
-    /// Admission for one network operation from an unprompted run. `write_to`
+    /// Admission for one contract operation from an unprompted run. `write_to`
     /// is the target contract for a PUT/UPDATE.
     pub(crate) fn admit_op(
         &self,
@@ -1321,7 +1360,7 @@ impl DelegateCapabilities {
                     delegate = %key,
                     ?refusal,
                     total = n + 1,
-                    "Refused a network operation from an unprompted delegate run"
+                    "Refused a contract operation from an unprompted delegate run"
                 );
             }
         }
@@ -1731,13 +1770,22 @@ mod tests {
                 .is_some()
         );
         // A manifest listing lifecycle kinds without Background (only possible
-        // by hand, the macro refuses it) never gets them.
+        // by hand, the macro refuses it) is asked for Background anyway, since
+        // delivery needs it, and gets nothing until it is granted.
         let wasm = wasm_with_manifest(&DelegateManifest::new(
             vec![LifecycleKind::NodeStarted],
             vec![],
         ));
-        assert_eq!(c.on_registered(&key(2), &wasm, &[], Some(app(9))), None);
+        let p = c
+            .on_registered(&key(2), &wasm, &[], Some(app(9)))
+            .expect("lifecycle implies Background");
+        assert_eq!(p.capabilities, vec![Capability::Background]);
         assert_eq!(c.delivery_params(&key(2), LifecycleKind::NodeStarted), None);
+        c.record_answer(&p, true);
+        assert!(
+            c.delivery_params(&key(2), LifecycleKind::NodeStarted)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1803,11 +1851,49 @@ mod tests {
         }
         assert_eq!(
             c.budget.lock().duty.get(&key(1)).unwrap().tokens_us,
-            -10_000_000
+            -5_000_000
         );
-        // 10 s of debt at 10 ms/s: back above zero after 1000 s, not days.
-        time.advance_time(Duration::from_secs(1001));
+        // 5 s of debt at 10 ms/s: back above zero after 500 s, not days.
+        time.advance_time(Duration::from_secs(501));
         assert!(c.duty_available(&key(1)));
+    }
+
+    /// Only a delegate whose app holds the grant is budgeted: ungranted
+    /// manifest delegates cannot spend the allowance granted ones rely on.
+    #[test]
+    fn only_granted_delegates_are_budgeted() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        assert!(c.is_recorded(&key(1)));
+        assert!(!c.is_budgeted(&key(1)), "recorded but not granted");
+        c.record_answer(&p, true);
+        assert!(c.is_budgeted(&key(1)));
+        assert!(c.revoke(&app(1), Capability::Background));
+        assert!(!c.is_budgeted(&key(1)));
+    }
+
+    /// A granted delegate still owed Installed is re-queued at start.
+    #[test]
+    fn installed_still_owed_is_a_start_target() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        assert!(c.installed_pending_targets().is_empty(), "not granted yet");
+        c.record_answer(&p, true);
+        assert_eq!(c.installed_pending_targets(), vec![key(1)]);
+        c.mark_installed_delivered(&key(1));
+        assert!(c.installed_pending_targets().is_empty());
+    }
+
+    /// A manifest with Background but no lifecycle kind has nothing to use it
+    /// for yet: no prompt, no record.
+    #[test]
+    fn background_without_lifecycle_asks_nothing() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&DelegateManifest::new(vec![], vec![Capability::Background]));
+        assert!(c.on_registered(&key(1), &wasm, &[], Some(app(1))).is_none());
+        assert!(!c.is_recorded(&key(1)));
     }
 
     #[test]
@@ -1834,7 +1920,7 @@ mod tests {
             c.on_registered(&key(200), &wasm, &[], Some(app(2)))
                 .is_some()
         );
-        assert!(c.is_budgeted(&key(200)));
+        assert!(c.is_recorded(&key(200)));
     }
 
     /// An app in its "Not now" cool-off creates no new records.
@@ -1845,7 +1931,7 @@ mod tests {
         let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
         c.record_answer(&p, false);
         assert!(c.on_registered(&key(2), &wasm, &[], Some(app(1))).is_none());
-        assert!(!c.is_budgeted(&key(2)));
+        assert!(!c.is_recorded(&key(2)));
     }
 
     /// Protected bindings (a relevant grant, or a prompt open right now) are
@@ -1868,7 +1954,10 @@ mod tests {
             true,
         );
         for n in 0..MAX_APPS_PER_DELEGATE as u8 {
-            let _ = c.on_registered(&key(1), &lifecycle_only, &[], Some(app(n)));
+            if let Some(p) = c.on_registered(&key(1), &lifecycle_only, &[], Some(app(n))) {
+                // Nobody answers: the prompt closes without a decision.
+                c.prompt_unanswered(&p);
+            }
         }
         let rec = c.load_record(&key(1)).unwrap();
         assert_eq!(rec.apps.len(), MAX_APPS_PER_DELEGATE);
@@ -1906,7 +1995,19 @@ mod tests {
         assert_eq!(c.load_record(&key(1)).unwrap().apps, vec![app(2)]);
         c.on_unregistered(&key(1), Some(app(2)));
         assert!(c.load_record(&key(1)).is_none());
-        assert!(!c.is_budgeted(&key(1)));
+        assert!(!c.is_recorded(&key(1)));
+    }
+
+    /// The debt floor must be repayable within the lifecycle retry window at
+    /// the default limits, or a delegate at the floor always loses its next
+    /// lifecycle run.
+    #[test]
+    fn debt_is_repaid_inside_the_retry_window() {
+        let limits = BudgetLimits::default();
+        let floor_us = limits.duty_burst.as_micros() / 2;
+        let repay_s = floor_us / limits.duty_refill_per_sec.as_micros();
+        let window_s = (LIFECYCLE_RETRY_DELAY * (LIFECYCLE_MAX_ATTEMPTS - 1)).as_secs() as u128;
+        assert!(repay_s < window_s, "repay {repay_s}s vs window {window_s}s");
     }
 
     #[test]

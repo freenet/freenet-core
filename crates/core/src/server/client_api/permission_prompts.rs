@@ -669,9 +669,10 @@ struct RevokeGrantRequest {
     capability: String,
 }
 
-/// Forget one remembered answer. A revoked Background grant stops unprompted
-/// runs at once (delivery re-checks the grant), and the app is asked again the
-/// next time it registers a delegate that wants it.
+/// Forget one remembered answer. A revoked Background grant stops lifecycle
+/// events at once (delivery re-checks the grant; contract-notification runs
+/// are not gated by it), and the app is asked again the next time it
+/// registers a delegate that wants it.
 ///
 /// State-changing, so the same gate as `/permission/{nonce}/respond`:
 /// loopback peer, and an Origin that is present and trusted (CSRF). This is
