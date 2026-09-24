@@ -6428,6 +6428,9 @@ mod tests {
             "dispatch_delegate_request",
             "handle_delegate_resume",
             "run_queued_notification",
+            // Lifecycle events (`delegate_capabilities`): called from the
+            // lifecycle block at the top of `contract_handling`'s loop.
+            "run_lifecycle",
         ];
         let mut callers: Vec<&str> = code
             .match_indices(&format!("{chokepoint}("))
