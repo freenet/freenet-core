@@ -127,11 +127,15 @@ impl OrphanStreamRegistry {
                     unreachable!("the match guard checked for a waiter");
                 };
                 if let Err(handle) = waiter.send(handle) {
-                    // The claimant went away (timed out or was dropped) between
-                    // parking and now. Keep the stream for a retried claim
-                    // instead of discarding it: go round again, which delivers
-                    // to a newer waiter or parks the stream as an orphan. Each
-                    // round removes one dead waiter, so this terminates.
+                    // The claimant closed its receiver between parking and now.
+                    // In practice that is a claim timing out at this exact
+                    // moment: it has released its `claimed_streams` entry, so a
+                    // retried claim can pick the stream up. Go round again,
+                    // which delivers to a newer waiter or parks the stream as
+                    // an orphan. (A claim future dropped mid-wait keeps its
+                    // `claimed_streams` entry, so there the orphan just ages
+                    // out via GC.) Each round removes one dead waiter, so this
+                    // terminates.
                     tracing::debug!(
                         %peer_addr,
                         stream_id = %stream_id,
@@ -251,8 +255,13 @@ impl OrphanStreamRegistry {
             "Waiting for stream to arrive"
         );
 
-        // Wait with timeout
-        match tokio::time::timeout(timeout, rx).await {
+        // Wait with timeout. `rx` is borrowed, not moved, so that on timeout
+        // we can close it and pick up a handle `register_orphan` sent in the
+        // instant after the timer fired — otherwise that handle is dropped
+        // with the receiver and the stream is lost. Closing also makes our
+        // waiter read as closed, which `remove_waiter` relies on.
+        let mut rx = rx;
+        match tokio::time::timeout(timeout, &mut rx).await {
             Ok(Ok(handle)) => {
                 tracing::debug!(
                     %peer_addr,
@@ -275,6 +284,15 @@ impl OrphanStreamRegistry {
             }
             Err(_) => {
                 // Timeout expired
+                rx.close();
+                if let Ok(handle) = rx.try_recv() {
+                    tracing::debug!(
+                        %peer_addr,
+                        stream_id = %stream_id,
+                        "Stream arrived as the claim timed out"
+                    );
+                    return Ok(handle);
+                }
                 self.remove_waiter(&key);
                 // Remove our claim so a retry is possible
                 self.claimed_streams.remove(&key);
@@ -549,6 +567,10 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(OrphanStreamError::Timeout)));
+        // The timed-out claim removed its own waiter and released its claim,
+        // so a retry is not refused as a duplicate.
+        assert_eq!(registry.waiter_count(), 0);
+        assert!(!registry.claimed_streams.contains_key(&(addr, stream_id)));
     }
 
     #[test]
@@ -656,8 +678,14 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(WAITER_REGISTRATION_DELAY).await;
-        assert_eq!(registry.waiter_count(), 1);
+        // Wait until the first claim has actually parked its waiter.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.waiter_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first claim never parked a waiter");
 
         // What gc_expired's cap-triggered clear does to the live claim.
         registry.claimed_streams.clear();
@@ -673,9 +701,9 @@ mod tests {
         assert_eq!(registry.orphan_count(), 0);
     }
 
-    /// A stream arriving for a waiter whose claim already went away (its
-    /// receiver dropped) is kept as an orphan for a retried claim, not
-    /// discarded.
+    /// A stream arriving for a waiter whose claim is timing out (receiver
+    /// closed, `claimed_streams` entry released) is kept as an orphan for a
+    /// retried claim, not discarded.
     #[tokio::test]
     async fn test_stream_for_dead_waiter_is_kept_for_retry() {
         let registry = OrphanStreamRegistry::new();
