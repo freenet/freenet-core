@@ -624,7 +624,7 @@ impl RuntimePool {
             let caps = crate::contract::delegate_capabilities::DelegateCapabilities::new(
                 capability_storage,
             );
-            op_manager.set_delegate_capabilities(caps.clone());
+            op_manager.set_delegate_capabilities(&caps);
             Some(caps)
         };
 

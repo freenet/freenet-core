@@ -232,8 +232,14 @@ pub(crate) struct OpManager {
     /// This node's delegate capability state, set once by the executor pool
     /// when it is built, so the HTTP server can answer "Apps and permissions"
     /// requests. `None` until then (and on executors without capabilities).
-    delegate_capabilities:
-        Arc<OnceLock<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>>,
+    ///
+    /// WEAK: the pool owns it. `DelegateCapabilities` holds a redb handle, and
+    /// the `OpManager` outlives the node's run loop, so a strong reference
+    /// here would keep the database file locked after shutdown and break an
+    /// in-process restart (`test_in_process_restart_releases_redb_lock`).
+    delegate_capabilities: Arc<
+        OnceLock<std::sync::Weak<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    >,
     /// Registry for handling race conditions between stream fragments and metadata messages.
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
@@ -800,9 +806,13 @@ impl OpManager {
     /// Set once by the executor pool; later calls are ignored.
     pub(crate) fn set_delegate_capabilities(
         &self,
-        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+        caps: &Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
     ) {
-        if self.delegate_capabilities.set(caps).is_err() {
+        if self
+            .delegate_capabilities
+            .set(Arc::downgrade(caps))
+            .is_err()
+        {
             tracing::debug!("delegate capabilities already set; ignoring repeat wiring");
         }
     }
@@ -810,7 +820,9 @@ impl OpManager {
     pub(crate) fn delegate_capabilities(
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
-        self.delegate_capabilities.get().cloned()
+        self.delegate_capabilities
+            .get()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.

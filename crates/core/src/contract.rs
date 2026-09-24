@@ -4582,14 +4582,21 @@ fn spawn_capability_prompt<P>(
     /// Releases the app's in-flight prompt slot however the task ends, so a
     /// panicking or dropped prompt cannot suppress every later prompt for that
     /// app until restart.
+    ///
+    /// Holds the capabilities WEAKLY: they own a redb handle, and a prompt
+    /// can wait a minute for a human, so a strong reference would keep the
+    /// database locked past a node shutdown. If the node is gone by the time
+    /// the answer arrives, there is nothing to record it in.
     struct Unanswered {
-        caps: std::sync::Arc<delegate_capabilities::DelegateCapabilities>,
+        caps: std::sync::Weak<delegate_capabilities::DelegateCapabilities>,
         prompt: Option<delegate_capabilities::CapabilityPrompt>,
     }
     impl Drop for Unanswered {
         fn drop(&mut self) {
-            if let Some(prompt) = self.prompt.take() {
-                self.caps.prompt_unanswered(&prompt);
+            if let Some(prompt) = self.prompt.take()
+                && let Some(caps) = self.caps.upgrade()
+            {
+                caps.prompt_unanswered(&prompt);
             }
         }
     }
@@ -4598,9 +4605,10 @@ fn spawn_capability_prompt<P>(
     // Short-lived (bounded by USER_INPUT_TIMEOUT), so fire-and-forget.
     drop(GlobalExecutor::spawn(async move {
         let mut guard = Unanswered {
-            caps,
+            caps: std::sync::Arc::downgrade(&caps),
             prompt: Some(prompt),
         };
+        drop(caps);
         let Some(prompt) = guard.prompt.clone() else {
             return;
         };
@@ -4612,9 +4620,11 @@ fn spawn_capability_prompt<P>(
                 CallerIdentity::WebApp(prompt.app.display()),
             )
             .await;
-        if let Some(index) = answer {
+        if let Some(index) = answer
+            && let Some(caps) = guard.caps.upgrade()
+        {
             guard.prompt = None;
-            guard.caps.record_answer(
+            caps.record_answer(
                 &prompt,
                 index == delegate_capabilities::CapabilityPrompt::ALLOW_INDEX,
             );
