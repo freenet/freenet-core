@@ -34,8 +34,14 @@
 //! verified-key variant can be added later without a storage migration.
 //!
 //! The attestation is the same one the delegate's `MessageOrigin::WebApp`
-//! already rests on, so a grant is no weaker than what an app's delegate
-//! already trusts its caller to be.
+//! and the registration-origin record already rest on, so a grant is exactly
+//! as strong as that: whoever can present an app's token can bind a delegate
+//! to that app and, if the app is granted, have it run in the background.
+//! The node mints such tokens for any contract id to loopback clients
+//! (#5264), so this is not a boundary against local processes, which can
+//! already drive any delegate by holding a connection open. Keying grants per
+//! delegate code instead would ask again on every delegate upgrade, which the
+//! consent-once rule rules out.
 //!
 //! # Platform delegates
 //!
@@ -78,8 +84,13 @@ pub(crate) const DENIAL_COOL_OFF: Duration = Duration::from_secs(7 * 24 * 3600);
 pub(crate) const MAX_STORED_PARAMS_BYTES: usize = 64 * 1024;
 
 /// Delegates with a capability record, node-wide. Bounds the table and the
-/// node-start scan. Above it, new manifests are not recorded.
+/// node-start scan. At the cap an unprotected record is evicted (see
+/// `make_room_for_record`); with none, new manifests are not recorded.
 pub(crate) const MAX_CAPABILITY_RECORDS: usize = 1024;
+
+/// Records one app may create. An app registering many throwaway delegates
+/// fills its own quota, not the node's table.
+pub(crate) const MAX_RECORDS_PER_APP: usize = 64;
 
 /// Lifecycle runs waiting for the contract loop. Producers `try_send`; a full
 /// queue drops the run with a counter (an `Installed` stays undelivered and is
@@ -611,9 +622,16 @@ impl Budget {
             .duty
             .entry(key.clone())
             .or_insert_with(|| DutyBucket::full(limits.duty_burst, now));
-        bucket.tokens_us = bucket.tokens_us.saturating_sub(us);
+        // Debt is floored at one burst: enough that a long run is paid back
+        // before the next lifecycle run, without letting sustained
+        // notification traffic (charged but never refused) build a debt that
+        // takes days to repay and silently starves the delegate's lifecycle
+        // runs.
+        let floor = -(limits.duty_burst.as_micros().min(i64::MAX as u128) as i64);
+        bucket.tokens_us = bucket.tokens_us.saturating_sub(us).max(floor);
         if node_wide {
-            self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us);
+            let floor = -(limits.node_duty_burst.as_micros().min(i64::MAX as u128) as i64);
+            self.node_duty.tokens_us = self.node_duty.tokens_us.saturating_sub(us).max(floor);
         }
     }
 
@@ -666,11 +684,28 @@ pub(crate) struct CapabilityStats {
     pub lifecycle_deferred_duty: AtomicU64,
     pub lifecycle_deferred_parked: AtomicU64,
     pub lifecycle_dropped_attempts: AtomicU64,
+    pub lifecycle_deduplicated: AtomicU64,
     pub lifecycle_dropped_not_granted: AtomicU64,
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
     pub refused_contract_writes: AtomicU64,
     pub forged_lifecycle_refused: AtomicU64,
+}
+
+/// See `DelegateCapabilities::recorded`.
+#[derive(Default)]
+struct Recorded {
+    apps: HashMap<DelegateKey, Vec<AppIdentity>>,
+    /// `false` if loading the table at start failed: then storage, not this
+    /// mirror, is asked (fail closed rather than treat every delegate as
+    /// unrecorded).
+    complete: bool,
+}
+
+impl Recorded {
+    fn records_of(&self, app: &AppIdentity) -> usize {
+        self.apps.values().filter(|apps| apps.contains(app)).count()
+    }
 }
 
 /// Per-node capability state. Held by the executor (and reachable from the
@@ -683,10 +718,11 @@ pub(crate) struct DelegateCapabilities {
     lifecycle_rx: Mutex<Option<mpsc::Receiver<LifecycleRun>>>,
     prompts_in_flight: Mutex<HashSet<AppIdentity>>,
     budget: Mutex<Budget>,
-    /// Keys with a record, mirrored in memory: it decides which delegates the
-    /// unprompted-run budget applies to (checked on every notification run)
-    /// and counts records against the cap without a table scan.
-    recorded: Mutex<HashSet<DelegateKey>>,
+    /// Keys with a record and their bound apps, mirrored in memory: it decides
+    /// which delegates the unprompted-run budget applies to (checked on every
+    /// notification run) and counts records against the caps without a table
+    /// scan. Updated only after the storage write it mirrors succeeded.
+    recorded: Mutex<Recorded>,
     pub(crate) stats: CapabilityStats,
 }
 
@@ -714,10 +750,21 @@ impl DelegateCapabilities {
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_QUEUE_CAPACITY);
         let now = time.now();
         let recorded = match storage.all_records() {
-            Ok(records) => records.into_iter().map(|(k, _)| k).collect(),
+            Ok(records) => Recorded {
+                apps: records
+                    .into_iter()
+                    .map(|(k, bytes)| {
+                        let apps = DelegateRecord::decode(&bytes)
+                            .map(|r| r.apps)
+                            .unwrap_or_default();
+                        (k, apps)
+                    })
+                    .collect(),
+                complete: true,
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to load delegate capability records");
-                HashSet::new()
+                Recorded::default()
             }
         };
         Arc::new(Self {
@@ -775,7 +822,10 @@ impl DelegateCapabilities {
     fn store_record(&self, key: &DelegateKey, rec: &DelegateRecord) -> bool {
         match self.storage.put_record(key, &rec.encode()) {
             Ok(()) => {
-                self.recorded.lock().insert(key.clone());
+                self.recorded
+                    .lock()
+                    .apps
+                    .insert(key.clone(), rec.apps.clone());
                 true
             }
             Err(e) => {
@@ -800,6 +850,16 @@ impl DelegateCapabilities {
 
     fn is_granted(&self, app: &AppIdentity, cap: Capability) -> bool {
         matches!(self.grant(app, cap), Some(Grant::Granted { .. }))
+    }
+
+    /// Whether `app` declined every capability in `wanted` and is still in the
+    /// cool-off.
+    fn declined(&self, app: &AppIdentity, wanted: &[Capability]) -> bool {
+        let now_ms = self.now_ms();
+        !wanted.is_empty()
+            && wanted.iter().all(|cap| {
+                matches!(self.grant(app, *cap), Some(Grant::Denied { until_ms, .. }) if now_ms < until_ms)
+            })
     }
 
     /// Whether any app bound to this delegate holds `cap`.
@@ -860,6 +920,19 @@ impl DelegateCapabilities {
             // no app), so it gets no record: a record is created only by an
             // app's registration.
             None if app.is_none() => return None,
+            None if app
+                .is_some_and(|a| self.recorded.lock().records_of(&a) >= MAX_RECORDS_PER_APP) =>
+            {
+                tracing::warn!(
+                    delegate = %key,
+                    max = MAX_RECORDS_PER_APP,
+                    "This app already has the maximum number of background-capable delegates; not recording another"
+                );
+                return None;
+            }
+            // Declined recently: nothing would be delivered and nobody would
+            // be asked, so there is nothing to record.
+            None if app.is_some_and(|a| self.declined(&a, &wanted)) => return None,
             None => {
                 if !self.make_room_for_record() {
                     tracing::warn!(
@@ -884,14 +957,13 @@ impl DelegateCapabilities {
             && !rec.apps.contains(&app)
         {
             if rec.apps.len() >= MAX_APPS_PER_DELEGATE {
-                // Full: drop a bound app that holds none of the capabilities
-                // this manifest asks for. Refusing instead would let anyone
-                // who can bind eight apps lock the real one out for good.
-                let wanted = rec.manifest.known_capabilities();
+                // Full: drop an unprotected bound app (no relevant grant, no
+                // prompt open). Refusing instead would let anyone who can bind
+                // eight apps lock the real one out for good.
                 if let Some(pos) = rec
                     .apps
                     .iter()
-                    .position(|a| !wanted.iter().any(|cap| self.is_granted(a, *cap)))
+                    .position(|a| !self.app_is_protected(&rec.manifest, a))
                 {
                     rec.apps.remove(pos);
                 }
@@ -904,7 +976,7 @@ impl DelegateCapabilities {
                     delegate = %key,
                     app = %app.display(),
                     max = MAX_APPS_PER_DELEGATE,
-                    "Delegate is bound to the maximum number of apps, all granted; not binding another"
+                    "Delegate is bound to the maximum number of apps, all protected; not binding another"
                 );
             }
         }
@@ -937,14 +1009,41 @@ impl DelegateCapabilities {
         prompt
     }
 
+    /// Capabilities that make an app's binding worth keeping: what the
+    /// manifest asks for, plus Background if it lists any lifecycle kind
+    /// (delivery requires Background whatever the manifest says).
+    fn relevant_capabilities(manifest: &DelegateManifest) -> Vec<Capability> {
+        let mut caps = manifest.known_capabilities();
+        let wants_lifecycle = [LifecycleKind::Installed, LifecycleKind::NodeStarted]
+            .iter()
+            .any(|k| manifest.wants_lifecycle(*k));
+        if wants_lifecycle && !caps.contains(&Capability::Background) {
+            caps.push(Capability::Background);
+        }
+        caps
+    }
+
+    /// Whether `app`'s binding to a delegate with `manifest` must not be
+    /// evicted: it holds a relevant grant, or the user is being asked right
+    /// now (evicting it then would throw the answer away).
+    fn app_is_protected(&self, manifest: &DelegateManifest, app: &AppIdentity) -> bool {
+        self.prompts_in_flight.lock().contains(app)
+            || Self::relevant_capabilities(manifest)
+                .iter()
+                .any(|cap| self.is_granted(app, *cap))
+    }
+
     /// Keep the record table under [`MAX_CAPABILITY_RECORDS`]. At the cap, drop
-    /// one record none of whose apps holds any grant (it could not be
-    /// delivered to anyway, and its app will re-create it when it registers
-    /// again), so registrations with junk manifests cannot crowd out a
-    /// delegate the user approved. `false` when every record is granted.
+    /// one record none of whose apps is protected (holds a relevant grant or
+    /// has a prompt open), so registrations with junk manifests cannot crowd
+    /// out a delegate the user approved or is approving. `false` when every
+    /// record is protected.
     fn make_room_for_record(&self) -> bool {
-        if self.recorded.lock().len() < MAX_CAPABILITY_RECORDS {
-            return true;
+        {
+            let recorded = self.recorded.lock();
+            if recorded.complete && recorded.apps.len() < MAX_CAPABILITY_RECORDS {
+                return true;
+            }
         }
         let records = match self.storage.all_records() {
             Ok(r) => r,
@@ -956,37 +1055,55 @@ impl DelegateCapabilities {
         if records.len() < MAX_CAPABILITY_RECORDS {
             return true;
         }
-        // Reached only at the cap: the caller checks the in-memory count first.
         let victim = records.into_iter().find_map(|(key, bytes)| {
-            let granted = DelegateRecord::decode(&bytes).is_some_and(|rec| {
-                rec.apps.iter().any(|app| {
-                    rec.manifest
-                        .known_capabilities()
-                        .iter()
-                        .any(|cap| self.is_granted(app, *cap))
-                })
+            let protected = DelegateRecord::decode(&bytes).is_some_and(|rec| {
+                rec.apps
+                    .iter()
+                    .any(|app| self.app_is_protected(&rec.manifest, app))
             });
-            (!granted).then_some(key)
+            (!protected).then_some(key)
         });
         match victim {
-            Some(key) => {
-                let removed = self.storage.remove_record(&key).is_ok();
-                if removed {
-                    self.recorded.lock().remove(&key);
-                }
-                removed
-            }
+            Some(key) => self.remove_record(&key),
             None => false,
         }
     }
 
-    /// Forget a delegate that was unregistered. Grants belong to apps and stay.
-    pub(crate) fn on_unregistered(&self, key: &DelegateKey) {
-        if !self.recorded.lock().remove(key) {
+    /// Delete a record and, only once that succeeded, its mirror entry.
+    fn remove_record(&self, key: &DelegateKey) -> bool {
+        match self.storage.remove_record(key) {
+            Ok(()) => {
+                self.recorded.lock().apps.remove(key);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(delegate = %key, error = %e, "Failed to remove delegate capability record");
+                false
+            }
+        }
+    }
+
+    /// A local app unregistered the delegate. Only that app's binding goes;
+    /// the record goes once no app is bound, which also clears its Installed
+    /// flag (a later registration is a reinstall). An unregister from a
+    /// connection that is not a bound app (another app, the CLI) changes
+    /// nothing here: it must not be able to reset another app's delegate.
+    /// Grants belong to apps and stay.
+    pub(crate) fn on_unregistered(&self, key: &DelegateKey, app: Option<AppIdentity>) {
+        let Some(app) = app else {
+            return;
+        };
+        let Some(mut rec) = self.load_record(key) else {
+            return;
+        };
+        if !rec.apps.contains(&app) {
             return;
         }
-        if let Err(e) = self.storage.remove_record(key) {
-            tracing::warn!(delegate = %key, error = %e, "Failed to remove delegate capability record");
+        rec.apps.retain(|a| *a != app);
+        if rec.apps.is_empty() {
+            self.remove_record(key);
+        } else {
+            self.store_record(key, &rec);
         }
     }
 
@@ -1084,13 +1201,10 @@ impl DelegateCapabilities {
     }
 
     /// Every stored answer, for the dashboard.
-    pub(crate) fn grants(&self) -> Vec<(AppIdentity, Capability, Grant)> {
-        self.storage
-            .all_grants()
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to list capability grants");
-                Vec::new()
-            })
+    pub(crate) fn grants(&self) -> anyhow::Result<Vec<(AppIdentity, Capability, Grant)>> {
+        Ok(self
+            .storage
+            .all_grants()?
             .into_iter()
             .filter_map(|(k, v)| {
                 if k.len() != 35 {
@@ -1100,7 +1214,7 @@ impl DelegateCapabilities {
                 let cap = capability_from_code(u16::from_be_bytes([k[33], k[34]]))?;
                 Some((app, cap, Grant::decode(&v)?))
             })
-            .collect()
+            .collect())
     }
 
     /// The parameters to run `key` with for an event of `kind`, or `None` if
@@ -1159,7 +1273,15 @@ impl DelegateCapabilities {
     /// by an app) are. Every other delegate's notification runs behave exactly
     /// as before this module existed.
     pub(crate) fn is_budgeted(&self, key: &DelegateKey) -> bool {
-        self.recorded.lock().contains(key)
+        let recorded = self.recorded.lock();
+        if recorded.apps.contains_key(key) {
+            return true;
+        }
+        if recorded.complete {
+            return false;
+        }
+        drop(recorded);
+        matches!(self.storage.get_record(key), Ok(Some(_)))
     }
 
     /// Whether a lifecycle run for `key` may start now (duty budget).
@@ -1236,7 +1358,7 @@ pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 1;
 pub(crate) struct LifecycleSchedule {
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(tokio::time::Instant, u64)>>,
     runs: HashMap<u64, (LifecycleRun, u32)>,
-    pending: HashSet<(DelegateKey, LifecycleKind)>,
+    pending: HashMap<(DelegateKey, LifecycleKind), u64>,
     seq: u64,
 }
 
@@ -1249,10 +1371,18 @@ impl LifecycleSchedule {
         run: LifecycleRun,
         attempts: u32,
     ) -> bool {
-        if !self.pending.insert((run.key.clone(), run.event.kind())) {
+        if let Some(seq) = self.pending.get(&(run.key.clone(), run.event.kind())) {
+            // Keep the waiting run, but a fresh request restarts its attempt
+            // count, so a run about to give up is not dropped just after a
+            // new reason to deliver it arrived.
+            if let Some((_, waiting)) = self.runs.get_mut(seq) {
+                *waiting = (*waiting).min(attempts);
+            }
             return false;
         }
         self.seq += 1;
+        self.pending
+            .insert((run.key.clone(), run.event.kind()), self.seq);
         self.heap.push(std::cmp::Reverse((due, self.seq)));
         self.runs.insert(self.seq, (run, attempts));
         true
@@ -1490,14 +1620,33 @@ mod tests {
                 CodeHash::new([1; 32]),
             )
         };
-        // Fill the table with records of a granted app, plus one ungranted.
-        let p = c.on_registered(&k(0), &wasm, &[], Some(app(0))).unwrap();
-        c.record_answer(&p, true);
-        for n in 1..(MAX_CAPABILITY_RECORDS as u32 - 1) {
-            assert!(c.on_registered(&k(n), &wasm, &[], Some(app(0))).is_none());
+        // Spread over granted apps, within each app's quota.
+        let granted_app = |n: u32| app(10 + (n / (MAX_RECORDS_PER_APP as u32 - 1)) as u8);
+        let grant = |a: AppIdentity| {
+            c.record_answer(
+                &CapabilityPrompt {
+                    app: a,
+                    delegate: key(0),
+                    capabilities: vec![Capability::Background],
+                },
+                true,
+            )
+        };
+        for n in 0..(MAX_CAPABILITY_RECORDS as u32 - 1) {
+            grant(granted_app(n));
+            assert!(
+                c.on_registered(&k(n), &wasm, &[], Some(granted_app(n)))
+                    .is_none()
+            );
         }
+        // One ungranted record fills the table.
         let ungranted = key(250);
         let _ = c.on_registered(&ungranted, &wasm, &[], Some(app(9)));
+        c.prompt_unanswered(&CapabilityPrompt {
+            app: app(9),
+            delegate: ungranted.clone(),
+            capabilities: vec![Capability::Background],
+        });
         assert_eq!(
             c.storage.all_records().unwrap().len(),
             MAX_CAPABILITY_RECORDS
@@ -1517,19 +1666,8 @@ mod tests {
         assert!(keys.contains(&newcomer));
         assert!(!keys.contains(&ungranted));
 
-        // Now every record but the newcomer's is granted; grant its app too,
-        // and a further newcomer is refused rather than evicting any of them.
-        let p = c.on_registered(&newcomer, &wasm, &[], Some(app(8)));
-        if let Some(p) = p {
-            c.record_answer(&p, true);
-        } else {
-            let prompt = CapabilityPrompt {
-                app: app(8),
-                delegate: newcomer.clone(),
-                capabilities: vec![Capability::Background],
-            };
-            c.record_answer(&prompt, true);
-        }
+        // The newcomer's app has a prompt open, so every record is now
+        // protected, and a further newcomer is refused rather than evicting.
         let late = key(252);
         assert!(c.on_registered(&late, &wasm, &[], Some(app(7))).is_none());
         let after: HashSet<DelegateKey> = c
@@ -1539,7 +1677,7 @@ mod tests {
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        assert_eq!(after, keys, "no granted record is evicted");
+        assert_eq!(after, keys, "no protected record is evicted");
         assert!(!c.is_budgeted(&late));
     }
 
@@ -1645,6 +1783,132 @@ mod tests {
         assert_eq!(tokens - start, 3);
     }
 
+    /// Notification runs are charged but never refused, so debt is floored:
+    /// a long burst of them cannot starve lifecycle runs for days.
+    #[test]
+    fn duty_debt_is_floored_at_one_burst() {
+        let time = SharedMockTimeSource::new();
+        let limits = BudgetLimits {
+            duty_refill_per_sec: Duration::from_millis(10),
+            duty_burst: Duration::from_secs(10),
+            ..BudgetLimits::default()
+        };
+        let c = DelegateCapabilities::with_time_source(
+            Arc::new(MemoryCapabilityStorage::default()),
+            Arc::new(time.clone()),
+            limits,
+        );
+        for _ in 0..1000 {
+            c.charge_duty(&key(1), Duration::from_secs(10), false);
+        }
+        assert_eq!(
+            c.budget.lock().duty.get(&key(1)).unwrap().tokens_us,
+            -10_000_000
+        );
+        // 10 s of debt at 10 ms/s: back above zero after 1000 s, not days.
+        time.advance_time(Duration::from_secs(1001));
+        assert!(c.duty_available(&key(1)));
+    }
+
+    #[test]
+    fn an_app_can_fill_only_its_own_record_quota() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let k = |n: u32| {
+            DelegateKey::new(
+                *blake3::hash(&n.to_le_bytes()).as_bytes(),
+                CodeHash::new([1; 32]),
+            )
+        };
+        for n in 0..(MAX_RECORDS_PER_APP as u32 + 5) {
+            let _ = c.on_registered(&k(n), &wasm, &[], Some(app(1)));
+            c.prompt_unanswered(&CapabilityPrompt {
+                app: app(1),
+                delegate: k(n),
+                capabilities: vec![Capability::Background],
+            });
+        }
+        assert_eq!(c.storage.all_records().unwrap().len(), MAX_RECORDS_PER_APP);
+        // Another app is unaffected.
+        assert!(
+            c.on_registered(&key(200), &wasm, &[], Some(app(2)))
+                .is_some()
+        );
+        assert!(c.is_budgeted(&key(200)));
+    }
+
+    /// An app in its "Not now" cool-off creates no new records.
+    #[test]
+    fn a_declined_app_creates_no_new_records() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let p = c.on_registered(&key(1), &wasm, &[], Some(app(1))).unwrap();
+        c.record_answer(&p, false);
+        assert!(c.on_registered(&key(2), &wasm, &[], Some(app(1))).is_none());
+        assert!(!c.is_budgeted(&key(2)));
+    }
+
+    /// Protected bindings (a relevant grant, or a prompt open right now) are
+    /// never the ones evicted; a lifecycle-only manifest counts Background as
+    /// relevant.
+    #[test]
+    fn binding_eviction_spares_granted_and_prompting_apps() {
+        let (c, _) = caps();
+        let lifecycle_only = wasm_with_manifest(&DelegateManifest::new(
+            vec![LifecycleKind::NodeStarted],
+            vec![],
+        ));
+        // app(0) is granted Background via some other delegate.
+        c.record_answer(
+            &CapabilityPrompt {
+                app: app(0),
+                delegate: key(9),
+                capabilities: vec![Capability::Background],
+            },
+            true,
+        );
+        for n in 0..MAX_APPS_PER_DELEGATE as u8 {
+            let _ = c.on_registered(&key(1), &lifecycle_only, &[], Some(app(n)));
+        }
+        let rec = c.load_record(&key(1)).unwrap();
+        assert_eq!(rec.apps.len(), MAX_APPS_PER_DELEGATE);
+        let _ = c.on_registered(&key(1), &lifecycle_only, &[], Some(app(100)));
+        let rec = c.load_record(&key(1)).unwrap();
+        assert!(
+            rec.apps.contains(&app(0)),
+            "the granted app keeps its binding"
+        );
+        assert!(rec.apps.contains(&app(100)));
+
+        // With a prompt open for every ungranted app, nothing is evicted.
+        let wasm = wasm_with_manifest(&background_manifest());
+        for n in 0..MAX_APPS_PER_DELEGATE as u8 {
+            let _ = c.on_registered(&key(2), &wasm, &[], Some(app(50 + n)));
+        }
+        let _ = c.on_registered(&key(2), &wasm, &[], Some(app(120)));
+        let rec = c.load_record(&key(2)).unwrap();
+        assert!(
+            !rec.apps.contains(&app(120)),
+            "no binding with an open prompt is evicted"
+        );
+    }
+
+    #[test]
+    fn unregister_drops_only_the_unregistering_apps_binding() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&background_manifest());
+        let _ = c.on_registered(&key(1), &wasm, &[], Some(app(1)));
+        let _ = c.on_registered(&key(1), &wasm, &[], Some(app(2)));
+        c.on_unregistered(&key(1), None);
+        c.on_unregistered(&key(1), Some(app(3)));
+        assert_eq!(c.load_record(&key(1)).unwrap().apps.len(), 2);
+        c.on_unregistered(&key(1), Some(app(1)));
+        assert_eq!(c.load_record(&key(1)).unwrap().apps, vec![app(2)]);
+        c.on_unregistered(&key(1), Some(app(2)));
+        assert!(c.load_record(&key(1)).is_none());
+        assert!(!c.is_budgeted(&key(1)));
+    }
+
     #[test]
     fn network_ops_are_bounded_per_delegate_per_node_and_per_contract() {
         let time = SharedMockTimeSource::new();
@@ -1742,6 +2006,12 @@ mod tests {
         let _ = sched.pop_due(t0);
         let _ = sched.pop_due(t0);
         assert!(sched.push(t0, run(3), 0), "free again once popped");
+
+        // A duplicate restarts the waiting run's attempt count.
+        let mut sched = LifecycleSchedule::default();
+        assert!(sched.push(t0, run(4), 59));
+        assert!(!sched.push(t0, run(4), 0));
+        assert_eq!(sched.pop_due(t0), Some((run(4), 0)));
     }
 
     #[cfg(feature = "redb")]

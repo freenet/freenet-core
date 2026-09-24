@@ -3174,8 +3174,14 @@ where
                 match rx.try_recv() {
                     Ok(run) => {
                         // A duplicate of a waiting run is dropped (see
-                        // `LifecycleSchedule::push`).
-                        lifecycle_schedule.push(now, run, 0);
+                        // `LifecycleSchedule::push`), and counted.
+                        if !lifecycle_schedule.push(now, run, 0)
+                            && let Some(caps) = &capabilities
+                        {
+                            caps.stats
+                                .lifecycle_deduplicated
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -3338,7 +3344,13 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                lifecycle_schedule.push(lifecycle_now(capabilities.as_deref()), run, 0);
+                if !lifecycle_schedule.push(lifecycle_now(capabilities.as_deref()), run, 0)
+                    && let Some(caps) = &capabilities
+                {
+                    caps.stats
+                        .lifecycle_deduplicated
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             () = async {
                 match lifecycle_deadline {
@@ -4418,7 +4430,10 @@ enum CapabilityHook {
         params: Vec<u8>,
         app: Option<delegate_capabilities::AppIdentity>,
     },
-    Unregistered(DelegateKey),
+    Unregistered {
+        key: DelegateKey,
+        app: Option<delegate_capabilities::AppIdentity>,
+    },
 }
 
 fn capability_hook(
@@ -4463,7 +4478,10 @@ fn capability_hook(
         // otherwise unregister a delegate to reset its Installed flag and its
         // app bindings (UnregisterDelegate itself is not gated, pre-existing).
         DelegateRequest::UnregisterDelegate(key) if connection_scope.is_local() => {
-            Some(CapabilityHook::Unregistered(key.clone()))
+            Some(CapabilityHook::Unregistered {
+                key: key.clone(),
+                app: origin_contract.map(|id| delegate_capabilities::AppIdentity::WebApp(*id)),
+            })
         }
         _ => None,
     }
@@ -4491,7 +4509,7 @@ fn finish_capability_hook<CH, P>(
                 spawn_capability_prompt(prompter, caps, prompt);
             }
         }
-        CapabilityHook::Unregistered(key) => caps.on_unregistered(&key),
+        CapabilityHook::Unregistered { key, app } => caps.on_unregistered(&key, app),
     }
 }
 

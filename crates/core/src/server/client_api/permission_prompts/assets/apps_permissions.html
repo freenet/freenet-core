@@ -173,6 +173,10 @@
             })
             .then(
               function (body) {
+                document.getElementById('error').hidden = true;
+                if (body && body.error) {
+                  showError(body.error);
+                }
                 var grants = (body && body.grants) || [];
                 document.getElementById('stats').textContent = JSON.stringify(
                   body && body.stats,

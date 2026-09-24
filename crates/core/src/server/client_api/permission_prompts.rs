@@ -608,10 +608,23 @@ fn grants_body(
     caps: Option<&crate::contract::delegate_capabilities::DelegateCapabilities>,
 ) -> serde_json::Value {
     match caps {
-        Some(caps) => serde_json::json!({
-            "grants": grants_json(caps),
-            "stats": serde_json::to_value(&caps.stats).unwrap_or(serde_json::Value::Null),
-        }),
+        Some(caps) => {
+            let (grants, error) = match grants_json(caps) {
+                Ok(g) => (g, serde_json::Value::Null),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to list capability grants");
+                    (
+                        serde_json::json!([]),
+                        serde_json::json!("could not read the grant store"),
+                    )
+                }
+            };
+            serde_json::json!({
+                "grants": grants,
+                "error": error,
+                "stats": serde_json::to_value(&caps.stats).unwrap_or(serde_json::Value::Null),
+            })
+        }
         None => serde_json::json!({ "grants": [], "stats": null }),
     }
 }
@@ -626,9 +639,9 @@ fn capabilities_of(
 
 fn grants_json(
     caps: &crate::contract::delegate_capabilities::DelegateCapabilities,
-) -> serde_json::Value {
+) -> anyhow::Result<serde_json::Value> {
     let rows: Vec<serde_json::Value> = caps
-        .grants()
+        .grants()?
         .into_iter()
         .map(|(app, cap, grant)| {
             let (state, at_ms, until_ms) = match grant {
@@ -645,7 +658,7 @@ fn grants_json(
             })
         })
         .collect();
-    serde_json::json!(rows)
+    Ok(serde_json::json!(rows))
 }
 
 #[derive(Deserialize)]
@@ -4820,7 +4833,7 @@ mod grant_endpoint_tests {
             capabilities: vec![Capability::Background],
         };
         caps.record_answer(&prompt, true);
-        let listed = grants_json(&caps);
+        let listed = grants_json(&caps).unwrap();
         assert_eq!(listed[0]["app"], id.to_string());
         assert_eq!(listed[0]["capability"], "background");
         assert_eq!(listed[0]["state"], "granted");

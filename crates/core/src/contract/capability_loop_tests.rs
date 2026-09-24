@@ -951,9 +951,13 @@ async fn a_run_that_never_starts_is_dropped_and_counted() {
             down_since_ms: None
         },
     }));
+    // The start-up seed already holds this run (the queued copy is a
+    // duplicate), so allow for its smear as well as every retry.
     tokio::time::sleep(
-        super::delegate_capabilities::LIFECYCLE_RETRY_DELAY
-            * (super::delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS + 2),
+        super::delegate_capabilities::NODE_STARTED_MIN_DELAY
+            + super::delegate_capabilities::NODE_STARTED_SMEAR
+            + super::delegate_capabilities::LIFECYCLE_RETRY_DELAY
+                * (super::delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS + 2),
     )
     .await;
     lp.sync().await;
@@ -970,7 +974,8 @@ async fn a_run_that_never_starts_is_dropped_and_counted() {
     assert!(lp.lifecycle_runs().is_empty());
 }
 
-/// Only a local connection's unregister drops a delegate's capability record.
+/// Only the bound app's own local unregister drops a delegate's capability
+/// record; a remote one, another app's, or one with no app does not.
 #[tokio::test]
 async fn a_remote_unregister_keeps_the_record() {
     let caps = DelegateCapabilities::in_memory();
@@ -978,30 +983,48 @@ async fn a_remote_unregister_keeps_the_record() {
     let lp = start(
         "cap_unregister",
         caps.clone(),
-        vec![ScriptedRun::default(), ScriptedRun::default()],
+        vec![ScriptedRun::default(); 4],
         CapabilityPrompter::answering(None),
     )
     .await;
-    let unregister = |scope| ContractHandlerEvent::DelegateRequest {
+    let unregister = |scope, origin| ContractHandlerEvent::DelegateRequest {
         req: DelegateRequest::UnregisterDelegate(key.clone()),
-        origin_contract: None,
+        origin_contract: origin,
         connection_scope: scope,
         user_context: None,
     };
     let remote = answer(
         lp.send
-            .send_to_handler(unregister(crate::client_events::ConnectionScope::Remote))
+            .send_to_handler(unregister(
+                crate::client_events::ConnectionScope::Remote,
+                Some(app(24)),
+            ))
             .await
             .unwrap(),
     );
     assert!(remote.is_ok(), "{remote:?}");
+    for (scope, origin) in [
+        (crate::client_events::ConnectionScope::Local, Some(app(99))),
+        (crate::client_events::ConnectionScope::Local, None),
+    ] {
+        let other = answer(
+            lp.send
+                .send_to_handler(unregister(scope, origin))
+                .await
+                .unwrap(),
+        );
+        assert!(other.is_ok(), "{other:?}");
+    }
     assert!(
         caps.is_budgeted(&key),
         "a remote unregister must not drop the record"
     );
     let local = answer(
         lp.send
-            .send_to_handler(unregister(crate::client_events::ConnectionScope::Local))
+            .send_to_handler(unregister(
+                crate::client_events::ConnectionScope::Local,
+                Some(app(24)),
+            ))
             .await
             .unwrap(),
     );
