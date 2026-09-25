@@ -43,6 +43,16 @@
         max-width: 720px;
         margin: 0 auto;
       }
+      a.back {
+        display: inline-block;
+        color: var(--accent);
+        font-size: 14px;
+        text-decoration: none;
+        margin-bottom: 16px;
+      }
+      a.back:hover {
+        text-decoration: underline;
+      }
       h1 {
         font-size: 18px;
         font-weight: 600;
@@ -106,6 +116,7 @@
   </head>
   <body>
     <div class="card">
+      <a class="back" href="/">&larr; Back to dashboard</a>
       <h1>Apps and permissions</h1>
       <p class="intro">
         Your answers to the permissions Freenet asked you for on behalf of apps.
