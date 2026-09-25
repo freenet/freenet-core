@@ -4861,4 +4861,19 @@ mod grant_endpoint_tests {
         );
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     }
+
+    // The Apps and permissions page is reached from the dashboard's "Review
+    // or revoke" link and must offer a way back to the dashboard.
+    #[tokio::test]
+    async fn test_apps_page_links_back_to_dashboard() {
+        use axum::body::to_bytes;
+        let resp = apps_page().await.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(r#"<a class="back" href="/">"#),
+            "apps page must link back to the dashboard at /"
+        );
+    }
 }
