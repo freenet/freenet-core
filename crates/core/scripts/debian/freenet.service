@@ -1,0 +1,15 @@
+[Unit]
+Description=Freenet Gateway Service
+After=network.target
+
+[Service]
+User=freenet
+WorkingDirectory=/var/lib/freenet
+Environment=FREENET_SUPERVISED=1
+ExecStart=/usr/bin/freenet network
+Restart=always
+RestartSec=10
+SuccessExitStatus=42 43
+RestartPreventExitStatus=43
+TimeoutStopSec=45
+ExecStopPost=-/bin/sh -c 'case "$EXIT_STATUS" in 0|43) ;; *) ... freenet update --quiet ;; esac'
