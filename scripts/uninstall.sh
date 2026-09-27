@@ -220,6 +220,39 @@ elif [ "$OS" = "macos" ]; then
     done
 fi
 
+# --- Step 1b: remove the freenet:// link handler (Linux) -------------------
+#
+# `freenet service install` registers a desktop entry for freenet:// links
+# (crates/core/src/bin/commands/url_handler.rs). Remove it only if it carries
+# Freenet's marker line, and remove only Freenet's own association line from
+# mimeapps.list, leaving every other entry in that file untouched.
+
+removed_handler="0"
+if [ "$OS" = "linux" ]; then
+    APPS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    DESKTOP_ENTRY="${APPS_DIR}/freenet-url-handler.desktop"
+    if [ -f "$DESKTOP_ENTRY" ] && grep -qx 'X-Freenet-Managed=true' "$DESKTOP_ENTRY"; then
+        rm -f "$DESKTOP_ENTRY"
+        info "Removed ${DESKTOP_ENTRY}"
+        removed_handler="1"
+        if has_cmd update-desktop-database; then
+            update-desktop-database -q "$APPS_DIR" >/dev/null 2>&1 || true
+        fi
+    fi
+    MIMEAPPS="${XDG_CONFIG_HOME:-${HOME}/.config}/mimeapps.list"
+    HANDLER_LINE='^x-scheme-handler/freenet=freenet-url-handler\.desktop;\{0,1\}$'
+    if [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
+        tmp_list="${MIMEAPPS}.freenet-uninstall.$$"
+        # grep -v exits 1 when it prints nothing (the file held only our
+        # line); that is still success here.
+        { grep -v "$HANDLER_LINE" "$MIMEAPPS" || true; } > "$tmp_list" \
+            && mv "$tmp_list" "$MIMEAPPS" \
+            && info "Removed the freenet:// association from ${MIMEAPPS}"
+        rm -f "$tmp_list"
+        removed_handler="1"
+    fi
+fi
+
 # --- Step 2: remove binaries from every known install location ------------
 
 removed_binaries="0"
@@ -304,7 +337,7 @@ fi
 
 # --- Summary --------------------------------------------------------------
 
-if [ -z "$removed_service" ] && [ "$removed_binaries" = "0" ]; then
+if [ -z "$removed_service" ] && [ "$removed_binaries" = "0" ] && [ "$removed_handler" = "0" ]; then
     info "Nothing to uninstall - Freenet does not appear to be installed for this user."
 else
     success "Freenet uninstalled."

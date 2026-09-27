@@ -138,6 +138,12 @@ pub enum ServiceCommand {
     },
     /// Generate and upload a diagnostic report for debugging
     Report(ReportCommand),
+    /// Register or remove the freenet:// link handler.
+    ///
+    /// `freenet service install` registers it and `freenet service uninstall`
+    /// removes it, so this is only needed for installs without the service.
+    #[command(subcommand)]
+    UrlHandler(super::url_handler::UrlHandlerCommand),
     /// Internal: process wrapper that manages the freenet node lifecycle.
     /// Handles auto-update (exit code 42), crash backoff, log capture,
     /// and on Windows shows a system tray icon.
@@ -172,6 +178,7 @@ impl ServiceCommand {
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
             }
+            ServiceCommand::UrlHandler(cmd) => cmd.run(),
             ServiceCommand::RunWrapper => run_wrapper(version),
         }
     }

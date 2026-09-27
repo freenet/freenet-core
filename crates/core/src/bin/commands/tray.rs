@@ -628,6 +628,27 @@ mod platform {
                 }
             }
 
+            // A `freenet://` link, delivered by LaunchServices because the
+            // bundle's Info.plist claims the scheme (#5726). Handle it off the
+            // main thread: it may wait for the node to come up, and AppKit
+            // must keep pumping meanwhile. The link is not logged, since
+            // apps can carry secrets in its fragment (e.g. River invites).
+            if let Event::Opened { urls } = &event {
+                for url in urls {
+                    let link = url.as_str().to_string();
+                    std::thread::spawn(move || {
+                        let outcome = super::super::open_link::handle_link(
+                            &link,
+                            super::super::open_link::APP_LAUNCH_NODE_WAIT,
+                        );
+                        tracing::info!(
+                            outcome = outcome.kind(),
+                            "Handled a freenet:// link from LaunchServices"
+                        );
+                    });
+                }
+            }
+
             // Apply status updates forwarded from the wrapper thread.
             if let Event::UserEvent(status) = event {
                 let is_terminal = state.apply_status(&status);

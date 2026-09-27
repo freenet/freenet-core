@@ -87,9 +87,17 @@ APP_DIR="$OUTPUT_DIR/Freenet.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-echo ">> Building universal binary"
-lipo -create -output "$APP_DIR/Contents/MacOS/freenet-bin" \
-    "$FREENET_ARM64_BIN" "$FREENET_X86_BIN"
+if [[ "$FREENET_ARM64_BIN" == "$FREENET_X86_BIN" ]]; then
+    # Same file for both: a single-architecture local/CI smoke-test bundle
+    # (lipo refuses two inputs of one architecture). Release builds always
+    # pass two different binaries and take the lipo path.
+    echo ">> Single-architecture bundle (FREENET_ARM64_BIN == FREENET_X86_BIN)"
+    cp "$FREENET_ARM64_BIN" "$APP_DIR/Contents/MacOS/freenet-bin"
+else
+    echo ">> Building universal binary"
+    lipo -create -output "$APP_DIR/Contents/MacOS/freenet-bin" \
+        "$FREENET_ARM64_BIN" "$FREENET_X86_BIN"
+fi
 chmod +x "$APP_DIR/Contents/MacOS/freenet-bin"
 
 if [[ -n "${FREENET_ARM64_FDEV_BIN:-}" && -n "${FREENET_X86_FDEV_BIN:-}" ]]; then
@@ -133,6 +141,14 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>org.freenet.Freenet.link</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>freenet</string></array>
+        </dict>
+    </array>
 $(if [[ -n "$ICON_ICNS" ]]; then echo "    <key>CFBundleIconFile</key><string>Freenet</string>"; fi)
 </dict>
 </plist>
