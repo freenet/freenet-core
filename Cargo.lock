@@ -1908,7 +1908,7 @@ dependencies = [
  "ed25519-dalek",
  "either",
  "freenet",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "futures 0.3.32",
  "glob",
  "hex",
@@ -2107,7 +2107,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "freenet-test-network",
  "futures 0.3.32",
  "headers",
@@ -2212,9 +2212,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-macros"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9693bea7cfcb44b5e821f3901f5e46e9101fb44b9f1e047adbd36ff7d123f52c"
+checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2231,7 +2231,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "freenet-test-network",
  "futures 0.3.32",
  "rand 0.9.4",
@@ -2251,7 +2251,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "serde_json",
 ]
 
@@ -2261,7 +2261,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "humantime",
  "humantime-serde",
  "serde",
@@ -2321,9 +2321,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "865beab617d59ebf0f6c112f3fbaa98c791a5ccfc9d9db71be3e1e5b6e62a0fc"
+checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2333,7 +2333,7 @@ dependencies = [
  "bytes 1.12.1",
  "chrono",
  "flatbuffers 24.12.23",
- "freenet-macros 0.3.0",
+ "freenet-macros 0.3.1",
  "futures 0.3.32",
  "js-sys",
  "semver",
@@ -2385,7 +2385,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "rand 0.9.4",
  "serde",
 ]
@@ -4255,7 +4255,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "futures 0.3.32",
  "hex",
  "rand 0.9.4",
@@ -6869,14 +6869,14 @@ dependencies = [
 name = "test-contract-delta-trap"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
 ]
 
 [[package]]
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "serde",
  "serde_json",
 ]
@@ -6886,21 +6886,21 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
 ]
 
 [[package]]
 name = "test-contract-requires-related"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.12.0",
+ "freenet-stdlib 0.12.1",
  "serde",
  "serde_json",
 ]

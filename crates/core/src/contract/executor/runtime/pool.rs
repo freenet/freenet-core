@@ -880,6 +880,16 @@ impl RuntimePool {
         self.log_health_if_degraded();
     }
 
+    /// Replace the pool's capability state, so a test can drive the real
+    /// handler with a clock it controls (wake-up intervals are minutes).
+    #[cfg(test)]
+    pub(crate) fn set_delegate_capabilities_for_test(
+        &mut self,
+        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        self.delegate_capabilities = Some(caps);
+    }
+
     /// Get a reference to the shared state store.
     /// Used for hosting metadata persistence operations during startup.
     pub fn state_store(&self) -> &StateStore<Storage> {
@@ -930,6 +940,15 @@ impl ContractExecutor for RuntimePool {
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
         self.delegate_capabilities.clone()
+    }
+
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        // The delegate index and code cache are shared by every executor in
+        // the pool, so any one that is not checked out can answer.
+        self.runtimes
+            .iter()
+            .flatten()
+            .find_map(|executor| executor.runtime.delegate_code(key))
     }
 
     fn delegate_subscription_store(&self) -> Option<Storage> {
@@ -1721,6 +1740,77 @@ mod tests {
         let wrapped = WrappedContract::new(Arc::new(code), params);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
         (container, key)
+    }
+
+    /// The start-up manifest refresh (`refresh_capability_manifests`) reads a
+    /// delegate's code through `RuntimePool::delegate_code`. Through the real
+    /// pool and store: a registered delegate's exact module comes back, and an
+    /// unknown key gives `None`.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn delegate_code_returns_the_stored_module() {
+        use crate::wasm_runtime::DelegateRuntimeInterface;
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+
+        let config_args = ConfigArgs {
+            id: Some("pool-delegate-code".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let mut pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(2).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        let code = crate::wasm_runtime::tests::get_test_module("test_delegate_lifecycle")
+            .expect("build the fixture delegate");
+        let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &code.clone().into(),
+            &b"params".to_vec().into(),
+        ))));
+        let key = delegate.key().clone();
+        pool.runtimes[0]
+            .as_mut()
+            .expect("pool executor present")
+            .runtime
+            .register_delegate(
+                delegate,
+                XChaCha20Poly1305::new(&[0u8; 32].into()),
+                [0u8; 24].into(),
+            )
+            .expect("register the delegate");
+
+        assert_eq!(pool.delegate_code(&key), Some(code));
+        assert_eq!(
+            pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
+            None
+        );
     }
 
     /// End-to-end proof that evicting an advertised contract through the real

@@ -996,6 +996,14 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// The raw WASM of a delegate this runtime stores, if it has it. The code
+    /// does not depend on the delegate's parameters, so none are needed.
+    pub(crate) fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        self.delegate_store
+            .fetch_delegate(key, &Parameters::from(Vec::<u8>::new()))
+            .map(|d| d.code().data().to_vec())
+    }
+
     /// Check if the runtime is in a healthy state and can execute WASM.
     pub fn is_healthy(&self) -> bool {
         self.engine.is_healthy()
