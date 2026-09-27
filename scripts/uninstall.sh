@@ -255,18 +255,24 @@ if [ "$OS" = "linux" ]; then
     # The current XDG location, and the one older xdg-utils wrote to.
     for MIMEAPPS in "${config_home}/mimeapps.list" "${APPS_DIR}/mimeapps.list"; do
         if [ "$handler_is_ours" = "1" ] && [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
-            if ! tmp_list="$(mktemp 2>/dev/null)"; then
+            # Rewrite the real file (following a dotfile-manager symlink)
+            # through a temp file in ITS directory, then rename it into place:
+            # atomic, so a failure never leaves a truncated list, and the
+            # symlink itself is untouched.
+            target="$(readlink -f "$MIMEAPPS" 2>/dev/null || echo "$MIMEAPPS")"
+            if ! tmp_list="$(mktemp "${target}.freenet-XXXXXX" 2>/dev/null)"; then
                 warn "Could not create a temp file; left the freenet:// line in ${MIMEAPPS}"
                 continue
             fi
             # grep -v exits 1 when it prints nothing (the file held only our
             # line); that is still success. Exit 2 is a read error: keep the
-            # user's file untouched rather than overwrite it with a partial
-            # copy. `cat >` rather than `mv` writes through a symlinked
-            # (dotfile-managed) list.
+            # user's file.
             grep_status=0
             grep -v "$HANDLER_LINE" "$MIMEAPPS" > "$tmp_list" || grep_status=$?
-            if [ "$grep_status" -le 1 ] && cat "$tmp_list" > "$MIMEAPPS"; then
+            # Keep the file's mode (best effort: busybox chmod has no
+            # --reference, and then the list simply becomes 0600).
+            chmod --reference="$target" "$tmp_list" 2>/dev/null || true
+            if [ "$grep_status" -le 1 ] && mv -f "$tmp_list" "$target"; then
                 info "Removed the freenet:// association from ${MIMEAPPS}"
                 removed_handler="1"
             else

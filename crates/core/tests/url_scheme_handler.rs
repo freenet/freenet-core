@@ -22,19 +22,38 @@ const FREENET_BIN: &str = env!("CARGO_BIN_EXE_freenet");
 const RIVER: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
 
 /// An isolated environment for one handler run: its own temp, home, config
-/// and cache directories, and a listener standing in for the node.
+/// and cache directories, and a stand-in node answering `GET /v1/version`
+/// like Freenet (the handler checks it is talking to Freenet).
 struct Sandbox {
     _dir: tempfile::TempDir,
     root: PathBuf,
-    listener: TcpListener,
+    port: u16,
+}
+
+/// Serve `{"version":"test"}` to every connection, for the life of the test
+/// process.
+fn spawn_fake_node() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a stand-in node");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut buf = [0u8; 2048];
+            drop(conn.read(&mut buf));
+            drop(conn.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"version\":\"test\"}",
+            ));
+        }
+    });
+    port
 }
 
 impl Sandbox {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a stand-in node");
-        let port = listener.local_addr().expect("local addr").port();
+        let port = spawn_fake_node();
         let config = format!("ws-api-port = {port}\n");
         // Debug builds read `<temp>/freenet/config.toml`; release builds read
         // the platform config dir, which HOME / XDG_CONFIG_HOME redirect on
@@ -46,12 +65,12 @@ impl Sandbox {
         Sandbox {
             _dir: dir,
             root,
-            listener,
+            port,
         }
     }
 
     fn port(&self) -> u16 {
-        self.listener.local_addr().expect("local addr").port()
+        self.port
     }
 
     fn command(&self) -> Command {
@@ -198,21 +217,16 @@ fn not_running_node_gets_the_explanatory_page() {
     if !Sandbox::port_is_controllable() {
         return;
     }
-    // Point the handler at a port nothing listens on: bind, note, release.
-    let free = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = free.local_addr().expect("addr").port();
-    drop(free);
+    // Point the handler at a port where something listens but is not Freenet
+    // (it never answers): the handler must treat the node as not running.
+    let squatter = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = squatter.local_addr().expect("addr").port();
     for dir in config_dirs(&sb.root) {
         std::fs::write(dir.join("config.toml"), format!("ws-api-port = {port}\n"))
             .expect("write config");
     }
     let out = sb.open(&format!("freenet://{RIVER}/#invite=SECRET-TOKEN"));
-    // Something else grabbing the just-released port would make this 0; the
-    // page assertion is what matters, so only check it on the expected path.
-    if out.status.code() == Some(0) {
-        eprintln!("port {port} was taken by another process; skipping");
-        return;
-    }
+    drop(squatter);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let page_path = stdout(&out);
     assert!(is_fallback_page(&page_path), "{page_path}");

@@ -747,6 +747,44 @@ mod platform {
 #[allow(unused_imports, dead_code)]
 pub use platform::run_tray_event_loop;
 
+/// macOS: handle `freenet://` links LaunchServices delivered to THIS process
+/// when it is a second copy about to exit because another wrapper holds the
+/// single-instance lock.
+///
+/// LaunchServices launches a new copy for a link when it does not (yet) see a
+/// running instance, e.g. in the moment after login or a relaunch, before the
+/// running wrapper's AppKit loop has checked in. That copy queues the link
+/// for itself; exiting without an event loop would drop it silently. So pump
+/// one briefly, open any link it receives (the node is up: the other wrapper
+/// is running it), then exit. `tao`'s run loop ends the process when done.
+#[cfg(target_os = "macos")]
+pub fn handle_links_sent_to_duplicate(window: std::time::Duration) -> ! {
+    use std::time::{Duration, Instant};
+    use tao::event::Event;
+    use tao::event_loop::{ControlFlow, EventLoop};
+
+    let deadline = Instant::now() + window;
+    let event_loop = EventLoop::new();
+    event_loop.run(move |event, _window, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(deadline);
+        if let Event::Opened { urls } = event {
+            // Handled inline: this process does nothing else, and it must not
+            // exit before the browser has been asked to open the link.
+            for url in urls.iter().take(4) {
+                let outcome =
+                    super::open_link::handle_link(url.as_str(), Duration::from_secs(5), None);
+                super::service::log_to_wrapper_log(&format!(
+                    "Handled a freenet:// link in a duplicate launch: outcome={}",
+                    outcome.kind()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            *control_flow = ControlFlow::Exit;
+        }
+    })
+}
+
 /// Open the latest log file in the platform's default viewer.
 #[allow(dead_code)]
 pub fn open_log_file() {

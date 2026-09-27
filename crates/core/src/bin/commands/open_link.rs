@@ -24,7 +24,9 @@
 //!   argument injection cannot smuggle in a flag or a second argument.
 //!
 //! Two link forms are accepted: `freenet://<id><rest>` (what the /open page
-//! emits today) and the authority-less `freenet:<id><rest>`. The second exists
+//! emits today) and the authority-less `freenet:<id><rest>` (the id must
+//! follow the colon directly; `freenet:/<id>` is refused, and `freenet:///<id>`
+//! is the authority form with an empty id, so it is refused too). The second exists
 //! because some desktops re-parse the link before handing it over and
 //! lowercase a URL's host, which in the first form is the case-sensitive
 //! contract id (Qt's `QUrl`, used by KDE's `kde-open`, does this). The
@@ -126,7 +128,19 @@ pub fn parse_freenet_link(link: &str) -> Result<ShareTarget, LinkError> {
         _ => return Err(LinkError::NotFreenetScheme),
     };
     match rest.strip_prefix("//") {
-        Some(authority_form) => parse_share_fragment(authority_form),
+        Some(authority_form) => {
+            let target = parse_share_fragment(authority_form)?;
+            // In this form the id is the URL's host, and some desktops
+            // lowercase hosts (KDE via Qt's QUrl). About a quarter of
+            // lowercased ids still decode to a valid, DIFFERENT id, so the
+            // round trip alone would open the wrong contract. A real id with
+            // no uppercase letter is vanishingly unlikely (about 1 in 10^10
+            // for 44 characters), so treat one as a lowercased link.
+            if !target.contract_id.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(LinkError::InvalidContractId);
+            }
+            Ok(target)
+        }
         None if rest.starts_with('/') => Err(LinkError::NotFreenetScheme),
         None => parse_share_fragment(rest),
     }
@@ -279,6 +293,9 @@ fn is_dot_segment(segment: &str) -> bool {
 /// constants in release builds, the temp dir in debug builds) without calling
 /// it: that function creates and removes directories, and `ConfigArgs::build()`
 /// fetches gateways over the network. A URL handler must do neither.
+///
+/// Debug builds only: a node started with `--id` keeps its config under
+/// `<temp>/freenet-<id>`, which this does not know; pass `--config-dir`.
 fn default_config_dir() -> Option<PathBuf> {
     if cfg!(debug_assertions) {
         Some(std::env::temp_dir().join("freenet"))
@@ -309,20 +326,74 @@ pub fn configured_port(config_dir: Option<&Path>) -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-/// Whether something accepts TCP connections on `127.0.0.1:<port>`, polling
-/// until `wait` has elapsed (at least one attempt is always made).
+/// Whether a Freenet node answers on `127.0.0.1:<port>`, polling until `wait`
+/// has elapsed (at least one attempt is always made).
 pub fn node_is_listening(port: u16, wait: Duration) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    poll_until(wait, Duration::from_millis(500), || {
+        freenet_answers_on(port)
+    })
+}
+
+/// Call `probe` until it returns true or `wait` has elapsed, sleeping
+/// `interval` between attempts. At least one attempt is always made.
+fn poll_until(wait: Duration, interval: Duration, mut probe: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + wait;
     loop {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
+        if probe() {
             return true;
         }
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(interval);
     }
+}
+
+/// Whether a FREENET node answers on `127.0.0.1:<port>`, not merely whether
+/// something accepts connections there. With Freenet stopped, an unrelated
+/// local service on the port would otherwise receive the link, and with it any
+/// secret in its path or query. Asks `GET /v1/version` and expects the node's
+/// JSON (`{"version":"..."}`). This keeps accidental collisions out; a local
+/// process deliberately imitating the node is outside what a probe can stop.
+fn freenet_answers_on(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = Duration::from_millis(1500);
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+    let request = format!(
+        "GET /v1/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\n\
+         Connection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    // The node's reply is ~150 bytes; cap what a stranger can make us read.
+    drop(stream.take(8192).read_to_end(&mut response));
+    looks_like_freenet_version_response(&String::from_utf8_lossy(&response))
+}
+
+/// Pure check of a raw HTTP response to `GET /v1/version`.
+fn looks_like_freenet_version_response(response: &str) -> bool {
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let status_ok = head
+        .lines()
+        .next()
+        .is_some_and(|l| l.starts_with("HTTP/1.1 200") || l.starts_with("HTTP/1.0 200"));
+    status_ok
+        && serde_json::from_str::<serde_json::Value>(body.trim())
+            .ok()
+            .and_then(|v| v.get("version")?.as_str().map(str::to_owned))
+            .is_some()
 }
 
 // ── Opening things ──────────────────────────────────────────────────────────
@@ -493,14 +564,13 @@ fn notify_desktop(page: &FallbackPage) {
 fn show_fallback_page(page: &FallbackPage) -> Result<()> {
     #[cfg(target_os = "linux")]
     notify_desktop(page);
-    let dir = dirs::cache_dir()
-        .context("no cache directory")?
-        .join("freenet");
+    let dir = fallback_page_dir().context("no cache directory")?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    sweep_stale_fallback_pages_in(&dir, FALLBACK_PAGE_LIFETIME);
     // One file per invocation, so concurrent handlers cannot overwrite each
     // other's page. Owner-only (0600 on Unix, via tempfile).
     let file = tempfile::Builder::new()
-        .prefix("open-link-")
+        .prefix(FALLBACK_PAGE_PREFIX)
         .suffix(".html")
         .tempfile_in(&dir)
         .with_context(|| format!("creating a page in {}", dir.display()))?;
@@ -508,21 +578,58 @@ fn show_fallback_page(page: &FallbackPage) -> Result<()> {
     let (_, path) = file
         .keep()
         .map_err(|e| anyhow::anyhow!("keeping the page: {e}"))?;
-    launch(&path.to_string_lossy())?;
-    // The "not running" page links to the full target, which can carry a
-    // secret in its query or fragment (e.g. a River invite). Once the browser
-    // has loaded it the file is no longer needed, so remove it rather than
-    // leave it in the cache indefinitely. Skipped in a dry run, where the
-    // caller reads it back.
-    if !dry_run() {
-        std::thread::sleep(FALLBACK_PAGE_LIFETIME);
+    if let Err(e) = launch(&path.to_string_lossy()) {
         drop(std::fs::remove_file(&path));
+        return Err(e);
     }
     Ok(())
 }
 
-/// How long a fallback page is kept for the browser to load it.
-const FALLBACK_PAGE_LIFETIME: Duration = Duration::from_secs(20);
+/// Where fallback pages are written: `<cache>/freenet/`.
+fn fallback_page_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("freenet"))
+}
+
+const FALLBACK_PAGE_PREFIX: &str = "open-link-";
+
+/// How long a fallback page is kept. The "not running" page links to the full
+/// target, which can carry a secret in its query or fragment (e.g. a River
+/// invite), so pages are not left in the cache indefinitely; but the browser
+/// must have loaded the page first, and a cold browser start can be slow.
+/// Nothing sleeps for this: stale pages are swept by the next handler run and
+/// whenever the node starts ([`sweep_stale_fallback_pages`]).
+const FALLBACK_PAGE_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// Delete fallback pages in `dir` older than `max_age`. Best effort.
+fn sweep_stale_fallback_pages_in(dir: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with(FALLBACK_PAGE_PREFIX) && name.ends_with(".html")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            drop(std::fs::remove_file(entry.path()));
+        }
+    }
+}
+
+/// Delete stale fallback pages in the default location. Called when the node
+/// starts, so a page is not kept forever when no further link is opened.
+pub fn sweep_stale_fallback_pages() {
+    if let Some(dir) = fallback_page_dir() {
+        sweep_stale_fallback_pages_in(&dir, FALLBACK_PAGE_LIFETIME);
+    }
+}
 
 #[cfg(target_os = "linux")]
 /// Write `contents` to `path` via a temp file in the same directory + rename,
@@ -753,6 +860,26 @@ mod tests {
         }
     }
 
+    /// A desktop that lowercases the host must not make the authority form open
+    /// a different contract. This id's lowercased form is itself a valid id.
+    #[test]
+    fn a_lowercased_authority_form_id_is_refused() {
+        const ID: &str = "7UHpmVF4VgCDnBYRASZpmftwCn5ezSvrYQqtYYjoXZCK";
+        const LOWER: &str = "7uhpmvf4vgcdnbyraszpmftwcn5ezsvryqqtyyjoxzck";
+        assert!(
+            parse_share_fragment(LOWER).is_ok(),
+            "precondition: LOWER is a valid id"
+        );
+        assert!(parse_freenet_link(&format!("freenet://{ID}/")).is_ok());
+        assert_eq!(
+            parse_freenet_link(&format!("freenet://{LOWER}/")),
+            Err(LinkError::InvalidContractId)
+        );
+        // The authority-less form has no host to lowercase, so it follows the
+        // shared rules exactly.
+        assert!(parse_freenet_link(&format!("freenet:{LOWER}/")).is_ok());
+    }
+
     /// The authority-less form (immune to hosts being lowercased) names the
     /// same target as the authority form, and is held to the same rules.
     #[test]
@@ -892,31 +1019,95 @@ mod tests {
     }
 
     #[test]
-    fn node_listening_probe() {
+    fn stale_fallback_pages_are_swept_and_fresh_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("open-link-abc.html");
+        let other = dir.path().join("unrelated.html");
+        std::fs::write(&page, "x").unwrap();
+        std::fs::write(&other, "x").unwrap();
+        sweep_stale_fallback_pages_in(dir.path(), Duration::from_secs(3600));
+        assert!(page.exists(), "a fresh page was swept");
+        sweep_stale_fallback_pages_in(dir.path(), Duration::ZERO);
+        assert!(!page.exists(), "a stale page was kept");
+        assert!(other.exists(), "an unrelated file was swept");
+    }
+
+    #[test]
+    fn a_listener_that_is_not_freenet_is_not_the_node() {
+        // Something listening that does not answer like Freenet.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(node_is_listening(port, Duration::ZERO));
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                drop(conn.read(&mut buf));
+                drop(conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+            }
+        });
+        assert!(!freenet_answers_on(port));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_listener_answering_like_freenet_is_the_node() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /v1/version "));
+                drop(conn.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"version\":\"0.2.139\"}",
+                ));
+            }
+        });
+        assert!(freenet_answers_on(port));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn version_response_check() {
+        let ok =
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"version\":\"0.2.139\"}";
+        assert!(looks_like_freenet_version_response(ok));
+        assert!(!looks_like_freenet_version_response(
+            "HTTP/1.1 404 Not Found\r\n\r\n{\"version\":\"x\"}"
+        ));
+        assert!(!looks_like_freenet_version_response(
+            "HTTP/1.1 200 OK\r\n\r\n<html>"
+        ));
+        assert!(!looks_like_freenet_version_response(
+            "HTTP/1.1 200 OK\r\n\r\n{\"version\":1}"
+        ));
+        assert!(!looks_like_freenet_version_response("garbage"));
     }
 
     /// The macOS in-app handler waits for a node LaunchServices just started:
-    /// a listener that appears after the first probe must still be found.
+    /// polling must keep trying until the probe succeeds.
     #[test]
-    fn node_listening_probe_waits_for_a_late_node() {
-        // Reserve a port, release it, then bind it again from a thread after
-        // a delay. (Another process taking it in between would make the
-        // probe succeed early, which this test would also accept.)
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let binder = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(700));
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port));
-            std::thread::sleep(Duration::from_secs(3));
-            drop(listener);
-        });
-        assert!(node_is_listening(port, Duration::from_secs(5)));
-        binder.join().unwrap();
+    fn polling_keeps_trying_until_the_node_answers() {
+        let mut calls = 0;
+        assert!(poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                calls == 3
+            }
+        ));
+        assert_eq!(calls, 3);
+        let mut calls = 0;
+        assert!(!poll_until(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                false
+            }
+        ));
+        assert_eq!(calls, 1, "at least, and with no wait exactly, one attempt");
     }
 }

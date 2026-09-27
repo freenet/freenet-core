@@ -148,11 +148,9 @@ if [[ -f "$HOME/Library/LaunchAgents/org.freenet.Freenet.plist" ]]; then
         sleep 1
     done
     launchctl kickstart -k "$AGENT" || fail "could not start the Launch-at-Login agent"
-    for _ in $(seq 1 60); do
-        pgrep -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" >/dev/null && break
-        sleep 1
-    done
-    sleep 5
+    # Click at once, without waiting for the new wrapper to settle: the link
+    # must be handled whether LaunchServices already sees the launchd-started
+    # instance or launches a duplicate for it (which handles it and exits).
     open "freenet://$RIVER/"
     wait_for_count 3 || fail "the launchd-started instance never handled the link"
     echo "ok - a link reaches the instance launchd started (as at login)"

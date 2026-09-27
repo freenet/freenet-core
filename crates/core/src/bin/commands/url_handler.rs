@@ -118,6 +118,7 @@ fn clear_opt_out_marker_at(marker: &std::path::Path) -> Result<()> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn opt_out_marker_in(data_local_dir: &std::path::Path) -> PathBuf {
     data_local_dir.join("freenet").join(OPT_OUT_MARKER)
 }
@@ -161,8 +162,9 @@ fn exec_path_is_representable(path: &str) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
-/// Render the desktop entry for `binary`. Returns `None` for a path that
-/// cannot be written into `Exec` safely.
+/// Render the desktop entry for `binary` (and, for a node with a non-default
+/// config, its `--config-dir`). Returns `None` for a path that cannot be
+/// written into `Exec` safely.
 ///
 /// The link is passed as `%u` after a literal `--`: the launcher substitutes
 /// `%u` as ONE argv entry with no shell, and `--` stops the link being read as
@@ -172,16 +174,22 @@ fn exec_path_is_representable(path: &str) -> bool {
 /// quote characters as part of the program name and fails; verified in a
 /// container, where the quoted form exited 4 and the unquoted one opened the
 /// link.
-pub fn render_desktop_entry(binary: &Path) -> Option<String> {
-    let path = binary.to_str()?;
-    if !exec_path_is_representable(path) {
-        return None;
+pub fn render_desktop_entry(binary: &Path, config_dir: Option<&Path>) -> Option<String> {
+    fn exec_arg(path: &Path) -> Option<String> {
+        let path = path.to_str()?;
+        if !exec_path_is_representable(path) {
+            return None;
+        }
+        Some(if path.contains(' ') {
+            format!("\"{path}\"")
+        } else {
+            path.to_string()
+        })
     }
-    let program = if path.contains(' ') {
-        format!("\"{path}\"")
-    } else {
-        path.to_string()
-    };
+    let mut program = exec_arg(binary)?;
+    if let Some(dir) = config_dir {
+        program = format!("{program} --config-dir {}", exec_arg(dir)?);
+    }
     Some(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -306,8 +314,18 @@ mod linux {
             ]
         }
 
-        pub(super) fn opt_out_marker(&self) -> PathBuf {
-            opt_out_marker_in(&self.data_home)
+        /// Where the opt-out marker is written, then every place it is
+        /// honoured: the node's data dir under `XDG_DATA_HOME`, and the
+        /// default `~/.local/share/freenet`, because a shell that sets
+        /// `XDG_DATA_HOME` and a systemd user manager that does not would
+        /// otherwise disagree about where it is.
+        pub(super) fn opt_out_markers(&self) -> Vec<PathBuf> {
+            let mut markers = vec![opt_out_marker_in(&self.data_home)];
+            let default = opt_out_marker_in(&self.home.join(".local/share"));
+            if !markers.contains(&default) {
+                markers.push(default);
+            }
+            markers
         }
 
         fn find(&self, program: &str) -> Option<PathBuf> {
@@ -329,7 +347,18 @@ mod linux {
         fn run_helper(&self, program: &str, args: &[&str]) -> Option<String> {
             let exe = self.find(program)?;
             let mut out = tempfile::tempfile().ok()?;
-            let mut child = Command::new(exe)
+            let mut cmd = Command::new(exe);
+            // The node runs with umask 077; helpers such as xdg-mime rewrite
+            // shared files like mimeapps.list and must not leave them 0600.
+            // SAFETY: umask(2) is async-signal-safe and touches no memory.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(|| {
+                    libc::umask(0o022);
+                    Ok(())
+                });
+            }
+            let mut child = cmd
                 .args(args)
                 .env("PATH", &self.path)
                 .env("HOME", &self.home)
@@ -387,6 +416,7 @@ mod linux {
     pub(super) fn register(
         env: &LinuxEnv,
         binary: &Path,
+        config_dir: Option<&Path>,
         mode: RegisterMode,
     ) -> Result<RegisterOutcome> {
         if env.find("xdg-open").is_none() {
@@ -397,7 +427,7 @@ mod linux {
                 "xdg-open is not installed (no desktop environment)",
             ));
         }
-        let Some(entry) = render_desktop_entry(binary) else {
+        let Some(entry) = render_desktop_entry(binary, config_dir) else {
             return Ok(RegisterOutcome::Skipped(
                 "the binary path cannot be written into a desktop entry",
             ));
@@ -582,22 +612,22 @@ mod linux {
         #[test]
         fn register_writes_entry_sets_default_and_is_idempotent() {
             let f = Fixture::new(ALL);
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            let out = register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert_eq!(out, RegisterOutcome::Registered);
             let entry = std::fs::read_to_string(f.env.desktop_file()).unwrap();
             assert!(entry.contains(&format!("\nExec={BIN} open -- %u\n")));
             assert_eq!(f.default().trim(), DESKTOP_FILE_NAME);
 
-            let again = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            let again = register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert_eq!(again, RegisterOutcome::AlreadyCurrent);
         }
 
         #[test]
         fn on_start_with_current_entry_runs_no_helper() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             let calls = f.xdg_mime_calls();
-            let out = register(&f.env, Path::new(BIN), RegisterMode::OnStart).unwrap();
+            let out = register(&f.env, Path::new(BIN), None, RegisterMode::OnStart).unwrap();
             assert_eq!(out, RegisterOutcome::AlreadyCurrent);
             assert_eq!(
                 f.xdg_mime_calls(),
@@ -609,10 +639,11 @@ mod linux {
         #[test]
         fn a_moved_binary_rewrites_the_entry() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             let out = register(
                 &f.env,
                 Path::new("/opt/freenet/freenet"),
+                None,
                 RegisterMode::OnStart,
             )
             .unwrap();
@@ -625,7 +656,7 @@ mod linux {
         fn a_foreign_default_is_left_alone() {
             let f = Fixture::new(ALL);
             f.set_default("other.desktop\n");
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            let out = register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert_eq!(out, RegisterOutcome::ForeignDefault("other.desktop".into()));
             assert_eq!(f.default().trim(), "other.desktop");
         }
@@ -635,14 +666,14 @@ mod linux {
             let f = Fixture::new(ALL);
             f.set_default("other.desktop\n");
             std::fs::write(f.root().join("query-fails"), "").unwrap();
-            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert_eq!(f.default().trim(), "other.desktop");
         }
 
         #[test]
         fn without_xdg_open_nothing_is_written() {
             let f = Fixture::new(&["xdg-mime"]);
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            let out = register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert!(matches!(out, RegisterOutcome::Skipped(_)));
             assert!(!f.env.desktop_file().exists());
         }
@@ -650,7 +681,7 @@ mod linux {
         #[test]
         fn unregister_removes_ours_from_every_mimeapps_list_and_keeps_the_rest() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             let line = format!("{SCHEME_MIME_TYPE}={DESKTOP_FILE_NAME}\n");
             let [current, legacy] = f.env.mimeapps_lists();
             std::fs::create_dir_all(current.parent().unwrap()).unwrap();
@@ -710,7 +741,7 @@ mod linux {
             let list = format!("{SCHEME_MIME_TYPE}={DESKTOP_FILE_NAME}\n");
             std::fs::write(&current, &list).unwrap();
 
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
+            let out = register(&f.env, Path::new(BIN), None, RegisterMode::Install).unwrap();
             assert!(matches!(out, RegisterOutcome::Skipped(_)), "{out:?}");
             assert_eq!(
                 std::fs::read_to_string(f.env.desktop_file()).unwrap(),
@@ -745,8 +776,13 @@ mod linux {
         #[test]
         fn opt_out_marker_lives_in_the_data_dir_and_round_trips() {
             let f = Fixture::new(ALL);
-            let marker = f.env.opt_out_marker();
+            let markers = f.env.opt_out_markers();
+            let marker = markers[0].clone();
             assert!(marker.starts_with(&f.env.data_home));
+            assert!(
+                markers.contains(&f.env.home.join(".local/share/freenet/.url-handler-opt-out")),
+                "the default location is always honoured"
+            );
             assert!(!opted_out_at(&marker));
             write_opt_out_marker_at(&marker).unwrap();
             assert!(opted_out_at(&marker));
@@ -791,8 +827,11 @@ mod linux {
 /// The `shell\open\command` value for `exe`: the exe path quoted, the link as
 /// `"%1"` after a literal `--`.
 #[cfg(any(target_os = "windows", test))]
-pub fn windows_open_command(exe: &str) -> String {
-    format!("\"{exe}\" open -- \"%1\"")
+pub fn windows_open_command(exe: &str, config_dir: Option<&str>) -> String {
+    match config_dir {
+        Some(dir) => format!("\"{exe}\" --config-dir \"{dir}\" open -- \"%1\""),
+        None => format!("\"{exe}\" open -- \"%1\""),
+    }
 }
 
 /// Whether `exe` can go into a registry command line. Explorer expands `%1`,
@@ -811,8 +850,9 @@ pub fn windows_command_exe(command: &str) -> Option<&str> {
 }
 
 /// Whether a registry command line launches a `freenet.exe`, i.e. is a
-/// registration Freenet may overwrite or remove. Matched by file name, not
-/// path: a reinstall to another directory must be able to replace its own
+/// registration Freenet may overwrite or remove. Unlike the Linux desktop
+/// entry (which carries a marker line), this is a file-name heuristic, not a
+/// marker. Matched by file name, not path: a reinstall to another directory must be able to replace its own
 /// stale registration. An unrelated program that happens to be called
 /// `freenet.exe` would be treated as ours.
 #[cfg(any(target_os = "windows", test))]
@@ -848,16 +888,30 @@ mod windows {
         class_key().is_some_and(|k| k.get_value::<String, _>("URL Protocol").is_ok())
     }
 
-    pub(super) fn register(exe: &std::path::Path) -> Result<RegisterOutcome> {
+    pub(super) fn register(
+        exe: &std::path::Path,
+        config_dir: Option<&std::path::Path>,
+    ) -> Result<RegisterOutcome> {
         let exe = exe
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("executable path is not valid UTF-8"))?;
-        if !windows_exe_is_representable(exe) {
+        let config_dir = match config_dir {
+            Some(d) => Some(
+                d.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("config dir is not valid UTF-8"))?,
+            ),
+            None => None,
+        };
+        // A trailing backslash would escape the closing quote.
+        let config_dir = config_dir.map(|d| d.trim_end_matches('\\'));
+        if !windows_exe_is_representable(exe)
+            || config_dir.is_some_and(|d| !windows_exe_is_representable(d))
+        {
             return Ok(RegisterOutcome::Skipped(
-                "the executable path contains a quote or percent sign",
+                "a path contains a quote or percent sign",
             ));
         }
-        let command = windows_open_command(exe);
+        let command = windows_open_command(exe, config_dir);
         match current_command() {
             Some(existing) if existing == command && has_url_protocol_value() => {
                 return Ok(RegisterOutcome::AlreadyCurrent);
@@ -945,15 +999,25 @@ mod windows {
 // ── Platform dispatch ───────────────────────────────────────────────────────
 
 /// The opt-out marker for this user, if a data directory can be found.
-fn opt_out_marker() -> Option<PathBuf> {
+/// The opt-out marker locations: written to the first, honoured at any. They
+/// sit in the node's data directory, so `uninstall --purge` removes them.
+fn opt_out_markers() -> Vec<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        linux::LinuxEnv::from_process().map(|env| env.opt_out_marker())
+        linux::LinuxEnv::from_process()
+            .map(|env| env.opt_out_markers())
+            .unwrap_or_default()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        dirs::data_local_dir().map(|d| opt_out_marker_in(&d))
+        directories::ProjectDirs::from("", "The Freenet Project Inc", "Freenet")
+            .map(|d| vec![d.data_local_dir().join(OPT_OUT_MARKER)])
+            .unwrap_or_default()
     }
+}
+
+fn opted_out() -> bool {
+    opt_out_markers().iter().any(|m| opted_out_at(m))
 }
 
 /// What the opt-out marker means for a registration in `mode`.
@@ -978,54 +1042,61 @@ fn marker_action(mode: RegisterMode, opted_out: bool) -> MarkerAction {
 
 const OPTED_OUT: &str = "turned off with `freenet service url-handler unregister`";
 
-/// Register the handler for the running binary. Idempotent.
-pub fn register(mode: RegisterMode) -> Result<RegisterOutcome> {
-    let marker = opt_out_marker();
-    match marker_action(mode, marker.as_deref().is_some_and(opted_out_at)) {
+/// Register the handler for the running binary. Idempotent. `config_dir` is
+/// passed to the handler as `--config-dir` (only for `url-handler register
+/// --config-dir`; installs and node start use the default config).
+pub fn register(
+    mode: RegisterMode,
+    config_dir: Option<&std::path::Path>,
+) -> Result<RegisterOutcome> {
+    match marker_action(mode, opted_out()) {
         MarkerAction::Clear => {
-            if let Some(m) = &marker {
-                clear_opt_out_marker_at(m)?;
+            for m in opt_out_markers() {
+                clear_opt_out_marker_at(&m)?;
             }
         }
         MarkerAction::Skip => return Ok(RegisterOutcome::Skipped(OPTED_OUT)),
         MarkerAction::Proceed => {}
     }
-    let outcome = register_platform(mode)?;
+    let outcome = register_platform(mode, config_dir);
     // `unregister` writes the marker BEFORE removing anything, so if one ran
-    // while this was registering, the marker is visible now: undo, so the
-    // user's opt-out wins the race.
-    if mode != RegisterMode::UserRequested
-        && outcome == RegisterOutcome::Registered
-        && marker.as_deref().is_some_and(opted_out_at)
-    {
+    // while this was registering, the marker is visible now. Undo whatever
+    // this wrote (whatever it returned: Linux writes the desktop entry before
+    // it can fail or find a foreign default), so the user's opt-out wins the
+    // race. `unregister` only removes Freenet's own files, so running it when
+    // nothing was written is harmless.
+    if mode != RegisterMode::UserRequested && opted_out() {
         unregister()?;
         return Ok(RegisterOutcome::Skipped(OPTED_OUT));
     }
-    Ok(outcome)
+    outcome
 }
 
-fn register_platform(mode: RegisterMode) -> Result<RegisterOutcome> {
+fn register_platform(
+    mode: RegisterMode,
+    config_dir: Option<&std::path::Path>,
+) -> Result<RegisterOutcome> {
     #[cfg(target_os = "linux")]
     {
         let env = linux::LinuxEnv::from_process()
             .ok_or_else(|| anyhow::anyhow!("could not determine the home directory"))?;
-        linux::register(&env, &std::env::current_exe()?, mode)
+        linux::register(&env, &std::env::current_exe()?, config_dir, mode)
     }
     #[cfg(target_os = "windows")]
     {
         let _ = mode;
-        windows::register(&std::env::current_exe()?)
+        windows::register(&std::env::current_exe()?, config_dir)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = mode;
+        let _ = (mode, config_dir);
         Ok(RegisterOutcome::Skipped(
             "on macOS the Freenet.app bundle registers freenet:// itself",
         ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = mode;
+        let _ = (mode, config_dir);
         Ok(RegisterOutcome::Skipped("not supported on this platform"))
     }
 }
@@ -1051,15 +1122,17 @@ pub fn unregister() -> Result<bool> {
 
 /// Record that the user opted out, so the node does not re-register on start.
 fn write_opt_out_marker() -> Result<()> {
-    let marker = opt_out_marker()
+    let markers = opt_out_markers();
+    let marker = markers
+        .first()
         .ok_or_else(|| anyhow::anyhow!("could not determine the data directory"))?;
-    write_opt_out_marker_at(&marker)
+    write_opt_out_marker_at(marker)
 }
 
 /// Register as part of an explicit install, printing one line about it.
 /// Never fails the install: the node works without the handler.
 pub fn register_for_install() {
-    match register(RegisterMode::Install) {
+    match register(RegisterMode::Install, None) {
         Ok(RegisterOutcome::Registered) => {
             println!("Registered freenet:// links to open with this Freenet install.");
         }
@@ -1122,11 +1195,12 @@ pub fn spawn_self_registration() {
         .name("freenet-url-handler".into())
         .spawn(|| {
             let result = std::panic::catch_unwind(|| {
+                super::open_link::sweep_stale_fallback_pages();
                 if !running_binary_is_managed() {
                     return None;
                 }
                 // `register` honours the opt-out marker in this mode.
-                Some(register(RegisterMode::OnStart))
+                Some(register(RegisterMode::OnStart, None))
             });
             match result {
                 Ok(None) | Ok(Some(Ok(RegisterOutcome::AlreadyCurrent))) => {}
@@ -1160,7 +1234,12 @@ pub enum UrlHandlerCommand {
     /// `freenet service install` already does this. Use it for installs
     /// without the service (Nix, cargo install, a hand-run binary), or to
     /// undo `unregister`.
-    Register,
+    Register {
+        /// The node's config directory, if not the default, so the handler
+        /// reads the right `ws-api-port`.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
     /// Remove the freenet:// link handler registration, and stop the node
     /// from registering it again when it starts.
     Unregister,
@@ -1169,8 +1248,15 @@ pub enum UrlHandlerCommand {
 impl UrlHandlerCommand {
     pub fn run(&self) -> Result<()> {
         match self {
-            UrlHandlerCommand::Register => {
-                match register(RegisterMode::UserRequested)? {
+            UrlHandlerCommand::Register { config_dir } => {
+                let config_dir = match config_dir {
+                    Some(dir) => Some(
+                        std::fs::canonicalize(dir)
+                            .map_err(|e| anyhow::anyhow!("config dir {}: {e}", dir.display()))?,
+                    ),
+                    None => None,
+                };
+                match register(RegisterMode::UserRequested, config_dir.as_deref())? {
                     RegisterOutcome::Registered => {
                         println!("Registered freenet:// links to open with this binary.")
                     }
@@ -1220,14 +1306,23 @@ mod tests {
 
     #[test]
     fn desktop_entry_passes_link_after_double_dash_and_quotes_only_spaced_paths() {
-        let entry = render_desktop_entry(Path::new("/home/u/.local/bin/freenet")).unwrap();
+        let entry = render_desktop_entry(Path::new("/home/u/.local/bin/freenet"), None).unwrap();
         assert!(entry.contains("\nExec=/home/u/.local/bin/freenet open -- %u\n"));
         assert!(entry.contains("\nMimeType=x-scheme-handler/freenet;\n"));
         assert!(entry.contains("\nNoDisplay=true\n"));
         assert!(entry.contains(DESKTOP_MARKER));
         assert!(entry.starts_with("[Desktop Entry]\n"));
-        let spaced = render_desktop_entry(Path::new("/opt/my apps/freenet")).unwrap();
+        let spaced = render_desktop_entry(Path::new("/opt/my apps/freenet"), None).unwrap();
         assert!(spaced.contains("Exec=\"/opt/my apps/freenet\" open -- %u"));
+        let with_config = render_desktop_entry(
+            Path::new("/opt/freenet"),
+            Some(Path::new("/srv/freenet cfg")),
+        )
+        .unwrap();
+        assert!(
+            with_config
+                .contains("\nExec=/opt/freenet --config-dir \"/srv/freenet cfg\" open -- %u\n")
+        );
     }
 
     #[test]
@@ -1244,8 +1339,12 @@ mod tests {
             "",
         ] {
             assert!(
-                render_desktop_entry(Path::new(bad)).is_none(),
+                render_desktop_entry(Path::new(bad), None).is_none(),
                 "accepted {bad:?}"
+            );
+            assert!(
+                render_desktop_entry(Path::new("/bin/freenet"), Some(Path::new(bad))).is_none(),
+                "accepted config dir {bad:?}"
             );
         }
     }
@@ -1294,8 +1393,12 @@ mod tests {
     #[test]
     fn windows_command_quotes_exe_and_link() {
         let exe = r"C:\Users\A B\AppData\Local\Freenet\bin\freenet.exe";
-        let cmd = windows_open_command(exe);
+        let cmd = windows_open_command(exe, None);
         assert_eq!(cmd, format!("\"{exe}\" open -- \"%1\""));
+        assert_eq!(
+            windows_open_command(exe, Some(r"C:\cfg dir")),
+            format!("\"{exe}\" --config-dir \"C:\\cfg dir\" open -- \"%1\"")
+        );
         assert_eq!(windows_command_exe(&cmd), Some(exe));
         assert!(windows_command_is_ours(&cmd));
         assert!(windows_command_is_ours(r#""C:\x\FREENET.EXE" open "%1""#));
