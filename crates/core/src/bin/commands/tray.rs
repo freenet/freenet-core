@@ -547,6 +547,7 @@ mod platform {
         use tao::event::Event;
         use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
+        let started = Instant::now();
         let event_loop = EventLoopBuilder::<WrapperStatus>::with_user_event().build();
         let proxy = event_loop.create_proxy();
 
@@ -635,10 +636,25 @@ mod platform {
             // apps can carry secrets in its fragment (e.g. River invites).
             if let Event::Opened { urls } = &event {
                 use std::sync::atomic::{AtomicUsize, Ordering};
-                // Each handler may poll for up to 30s; cap how many run at
+                // Each handler may wait for the node; cap how many run at
                 // once so a page spamming links cannot pile up threads.
                 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
                 const MAX_IN_FLIGHT: usize = 4;
+                /// Releases the slot however the handler ends, panics included.
+                struct Slot;
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                // Wait long for the node only just after launch, when
+                // LaunchServices may have started the app to deliver this
+                // link; later, a node that is down is simply down.
+                let wait = if started.elapsed() < Duration::from_secs(90) {
+                    super::super::open_link::APP_LAUNCH_NODE_WAIT
+                } else {
+                    Duration::from_secs(3)
+                };
                 for url in urls {
                     if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
                         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -647,19 +663,24 @@ mod platform {
                         );
                         continue;
                     }
+                    let slot = Slot;
                     let link = url.as_str().to_string();
-                    std::thread::spawn(move || {
-                        let outcome = super::super::open_link::handle_link(
-                            &link,
-                            super::super::open_link::APP_LAUNCH_NODE_WAIT,
-                            None,
+                    let spawned = std::thread::Builder::new()
+                        .name("freenet-link".into())
+                        .spawn(move || {
+                            let _slot = slot;
+                            let outcome = super::super::open_link::handle_link(&link, wait, None);
+                            super::super::service::log_to_wrapper_log(&format!(
+                                "Handled a freenet:// link from LaunchServices: outcome={}",
+                                outcome.kind()
+                            ));
+                        });
+                    if spawned.is_err() {
+                        // The closure (and its slot) was dropped: nothing leaks.
+                        super::super::service::log_to_wrapper_log(
+                            "Could not start a thread for a freenet:// link",
                         );
-                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                        super::super::service::log_to_wrapper_log(&format!(
-                            "Handled a freenet:// link from LaunchServices: outcome={}",
-                            outcome.kind()
-                        ));
-                    });
+                    }
                 }
             }
 

@@ -21,6 +21,21 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
+# It replaces ~/Applications/Freenet.app, kills the running Freenet wrapper,
+# rewrites the Launch-at-Login agent and sets session-wide launchctl variables:
+# fine on a throwaway CI runner, destructive on a developer's Mac.
+if [[ -z "${CI:-}" ]]; then
+    echo "macos-url-scheme-e2e.sh: refusing to run outside CI (set CI=1 on a throwaway machine)" >&2
+    exit 1
+fi
+
+cleanup() {
+    launchctl unsetenv FREENET_OPEN_DRY_RUN 2>/dev/null || true
+    launchctl unsetenv FREENET_TELEMETRY_ENABLED 2>/dev/null || true
+    pkill -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" 2>/dev/null || true
+}
+trap cleanup EXIT
+
 BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RIVER="raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv"
@@ -146,7 +161,4 @@ else
     echo "note - no Launch-at-Login agent was registered; skipped the launchd-started check"
 fi
 
-launchctl unsetenv FREENET_OPEN_DRY_RUN
-launchctl unsetenv FREENET_TELEMETRY_ENABLED
-osascript -e 'tell application id "org.freenet.Freenet" to quit' >/dev/null 2>&1 || true
 echo "All macOS freenet:// checks passed."

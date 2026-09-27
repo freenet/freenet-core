@@ -229,7 +229,11 @@ fi
 
 removed_handler="0"
 if [ "$OS" = "linux" ]; then
-    APPS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
+    # Relative XDG_* values are invalid per the spec and ignored, as the Rust
+    # side ignores them.
+    case "${XDG_DATA_HOME:-}" in /*) data_home="$XDG_DATA_HOME" ;; *) data_home="${HOME}/.local/share" ;; esac
+    case "${XDG_CONFIG_HOME:-}" in /*) config_home="$XDG_CONFIG_HOME" ;; *) config_home="${HOME}/.config" ;; esac
+    APPS_DIR="${data_home}/applications"
     DESKTOP_ENTRY="${APPS_DIR}/freenet-url-handler.desktop"
     handler_is_ours="1"
     if [ -f "$DESKTOP_ENTRY" ]; then
@@ -246,19 +250,29 @@ if [ "$OS" = "linux" ]; then
             handler_is_ours="0"
         fi
     fi
-    HANDLER_LINE='^x-scheme-handler/freenet=freenet-url-handler\.desktop;\{0,1\}$'
+    # Surrounding whitespace and a CR are tolerated, as in the Rust copy.
+    HANDLER_LINE='^[[:space:]]*x-scheme-handler/freenet=freenet-url-handler\.desktop;\{0,1\}[[:space:]]*$'
     # The current XDG location, and the one older xdg-utils wrote to.
-    for MIMEAPPS in "${XDG_CONFIG_HOME:-${HOME}/.config}/mimeapps.list" "${APPS_DIR}/mimeapps.list"; do
+    for MIMEAPPS in "${config_home}/mimeapps.list" "${APPS_DIR}/mimeapps.list"; do
         if [ "$handler_is_ours" = "1" ] && [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
-            tmp_list="$(mktemp)"
+            if ! tmp_list="$(mktemp 2>/dev/null)"; then
+                warn "Could not create a temp file; left the freenet:// line in ${MIMEAPPS}"
+                continue
+            fi
             # grep -v exits 1 when it prints nothing (the file held only our
-            # line); that is still success here. `cat >` rather than `mv`
-            # writes through a symlinked (dotfile-managed) list.
-            { grep -v "$HANDLER_LINE" "$MIMEAPPS" || true; } > "$tmp_list" \
-                && cat "$tmp_list" > "$MIMEAPPS" \
-                && info "Removed the freenet:// association from ${MIMEAPPS}"
+            # line); that is still success. Exit 2 is a read error: keep the
+            # user's file untouched rather than overwrite it with a partial
+            # copy. `cat >` rather than `mv` writes through a symlinked
+            # (dotfile-managed) list.
+            grep_status=0
+            grep -v "$HANDLER_LINE" "$MIMEAPPS" > "$tmp_list" || grep_status=$?
+            if [ "$grep_status" -le 1 ] && cat "$tmp_list" > "$MIMEAPPS"; then
+                info "Removed the freenet:// association from ${MIMEAPPS}"
+                removed_handler="1"
+            else
+                warn "Could not rewrite ${MIMEAPPS}; left it unchanged"
+            fi
             rm -f "$tmp_list"
-            removed_handler="1"
         fi
     done
 fi

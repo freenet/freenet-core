@@ -1167,14 +1167,20 @@ jobs:
           $expected = '"' + $exe + '" open -- "%1"'
           if ($cmd -ne $expected) { throw "registered '$cmd', expected '$expected'" }
           if ((Get-ItemProperty 'HKCU:\Software\Classes\freenet').'URL Protocol' -ne '') { throw 'URL Protocol value missing' }
-          $page = Join-Path $env:LOCALAPPDATA 'freenet\open-link.html'
+          $pages = Join-Path $env:LOCALAPPDATA 'freenet'
           $env:FREENET_OPEN_DRY_RUN = '1'
+          # The handler writes one open-link-*.html per link (and deletes it
+          # after 20s unless the dry-run variable reached it).
           function Invoke-Link([string]$link) {
-            Remove-Item $page -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $pages 'open-link-*.html') -ErrorAction SilentlyContinue
             Start-Process $link
-            for ($i = 0; $i -lt 60 -and -not (Test-Path $page); $i++) { Start-Sleep -Milliseconds 500 }
-            if (-not (Test-Path $page)) { throw "the handler never ran for $link" }
-            return Get-Content -Raw $page
+            $page = $null
+            for ($i = 0; $i -lt 60 -and -not $page; $i++) {
+              Start-Sleep -Milliseconds 500
+              $page = Get-ChildItem (Join-Path $pages 'open-link-*.html') -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+            if (-not $page) { throw "the handler never ran for $link" }
+            return Get-Content -Raw $page.FullName
           }
           $html = Invoke-Link "freenet://$river/?a=1#frag"
           $want = "/v1/contract/web/$river/?a=1#frag`""

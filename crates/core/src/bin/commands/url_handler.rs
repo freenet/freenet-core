@@ -82,13 +82,40 @@ pub enum RegisterOutcome {
 /// Why registration is happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterMode {
-    /// An explicit user action (`service install`, `url-handler register`):
-    /// clears the opt-out and always re-checks the default handler.
-    Explicit,
+    /// `freenet service url-handler register`: the only mode that clears the
+    /// opt-out. Always re-checks the default handler.
+    UserRequested,
+    /// `freenet service install` (also run by install.sh, the Windows setup
+    /// wizard and `service doctor`): honours the opt-out, always re-checks
+    /// the default handler.
+    Install,
     /// The node starting: honours the opt-out, and on Linux only consults
     /// `xdg-mime` when the desktop entry had to be (re)written, so a
     /// crash-looping node does not spawn helpers on every restart.
     OnStart,
+}
+
+/// Whether the opt-out marker at `marker` is present.
+fn opted_out_at(marker: &std::path::Path) -> bool {
+    marker.exists()
+}
+
+/// Write the opt-out marker at `marker`.
+fn write_opt_out_marker_at(marker: &std::path::Path) -> Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(marker, b"freenet service url-handler unregister\n")?;
+    Ok(())
+}
+
+/// Remove the opt-out marker at `marker` (absent is fine).
+fn clear_opt_out_marker_at(marker: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn opt_out_marker_in(data_local_dir: &std::path::Path) -> PathBuf {
@@ -99,14 +126,38 @@ fn opt_out_marker_in(data_local_dir: &std::path::Path) -> PathBuf {
 
 #[cfg(any(target_os = "linux", test))]
 /// Characters that cannot be represented safely in a desktop-entry `Exec` key
-/// without the spec's two-level escaping. Paths containing them are refused
-/// rather than escaped: the simplest escape that is obviously correct is none.
+/// without the spec's two-level escaping or quoting (the spec's reserved set,
+/// plus `%`). Paths containing them are refused rather than escaped: the
+/// simplest escape that is obviously correct is none. A space is allowed and
+/// handled by quoting.
 fn exec_path_is_representable(path: &str) -> bool {
     !path.is_empty()
         && path.starts_with('/')
-        && !path
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '"' | '`' | '$' | '\\' | '%' | '\''))
+        && !path.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '"' | '`'
+                        | '$'
+                        | '\\'
+                        | '%'
+                        | '\''
+                        | '>'
+                        | '<'
+                        | '~'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '*'
+                        | '?'
+                        | '#'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '\t'
+                )
+        })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -214,6 +265,7 @@ mod linux {
         pub data_home: PathBuf,
         pub config_home: PathBuf,
         pub path: OsString,
+        pub helper_timeout: Duration,
     }
 
     fn absolute_env_dir(var: &str) -> Option<PathBuf> {
@@ -232,6 +284,7 @@ mod linux {
                 config_home: absolute_env_dir("XDG_CONFIG_HOME")
                     .unwrap_or_else(|| home.join(".config")),
                 path: std::env::var_os("PATH").unwrap_or_default(),
+                helper_timeout: HELPER_TIMEOUT,
                 home,
             })
         }
@@ -269,7 +322,7 @@ mod linux {
         }
 
         /// Run a helper found on this env's `PATH`, with null stdin/stderr,
-        /// killed after [`HELPER_TIMEOUT`]. Stdout goes to an anonymous temp
+        /// killed after `helper_timeout`. Stdout goes to an anonymous temp
         /// file rather than a pipe, so a daemon the helper leaves behind
         /// holding stdout open cannot make the read block. `None` if it could
         /// not run, failed, or timed out.
@@ -287,7 +340,7 @@ mod linux {
                 .stderr(Stdio::null())
                 .spawn()
                 .ok()?;
-            let deadline = Instant::now() + HELPER_TIMEOUT;
+            let deadline = Instant::now() + self.helper_timeout;
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(status)) => break status,
@@ -317,10 +370,16 @@ mod linux {
     }
 
     /// Write `contents` to `path`, following a symlink so a dotfile-managed
-    /// `mimeapps.list` stays a symlink to the (updated) real file.
+    /// `mimeapps.list` stays a symlink to the (updated) real file, and keeping
+    /// the file's permissions (the temp file would otherwise leave it 0600).
     fn write_through_symlink(path: &Path, contents: &[u8]) -> Result<()> {
         let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        super::super::open_link::write_atomically(&target, contents)
+        let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+        super::super::open_link::write_atomically(&target, contents)?;
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&target, permissions)?;
+        }
+        Ok(())
     }
 
     /// Write or refresh the desktop entry and, when no handler is set, make it
@@ -367,6 +426,10 @@ mod linux {
             return Ok(RegisterOutcome::AlreadyCurrent);
         }
 
+        // `xdg-mime query default` reports the configured default, or, when
+        // none is configured, whatever its fallback resolution picks (any app
+        // claiming the scheme). Either way an answer other than ours is left
+        // alone: it is safer to under-claim than to take over.
         let default_changed = if env.find("xdg-mime").is_some() {
             let current = env.run_helper("xdg-mime", &["query", "default", SCHEME_MIME_TYPE]);
             match decide_default_action(current.as_deref()) {
@@ -486,6 +549,7 @@ mod linux {
                         data_home: home.join(".local/share"),
                         config_home: home.join(".config"),
                         path: bin.clone().into_os_string(),
+                        helper_timeout: HELPER_TIMEOUT,
                         home,
                     },
                     bin,
@@ -518,20 +582,20 @@ mod linux {
         #[test]
         fn register_writes_entry_sets_default_and_is_idempotent() {
             let f = Fixture::new(ALL);
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert_eq!(out, RegisterOutcome::Registered);
             let entry = std::fs::read_to_string(f.env.desktop_file()).unwrap();
             assert!(entry.contains(&format!("\nExec={BIN} open -- %u\n")));
             assert_eq!(f.default().trim(), DESKTOP_FILE_NAME);
 
-            let again = register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            let again = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert_eq!(again, RegisterOutcome::AlreadyCurrent);
         }
 
         #[test]
         fn on_start_with_current_entry_runs_no_helper() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             let calls = f.xdg_mime_calls();
             let out = register(&f.env, Path::new(BIN), RegisterMode::OnStart).unwrap();
             assert_eq!(out, RegisterOutcome::AlreadyCurrent);
@@ -545,7 +609,7 @@ mod linux {
         #[test]
         fn a_moved_binary_rewrites_the_entry() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             let out = register(
                 &f.env,
                 Path::new("/opt/freenet/freenet"),
@@ -561,7 +625,7 @@ mod linux {
         fn a_foreign_default_is_left_alone() {
             let f = Fixture::new(ALL);
             f.set_default("other.desktop\n");
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert_eq!(out, RegisterOutcome::ForeignDefault("other.desktop".into()));
             assert_eq!(f.default().trim(), "other.desktop");
         }
@@ -571,14 +635,14 @@ mod linux {
             let f = Fixture::new(ALL);
             f.set_default("other.desktop\n");
             std::fs::write(f.root().join("query-fails"), "").unwrap();
-            register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert_eq!(f.default().trim(), "other.desktop");
         }
 
         #[test]
         fn without_xdg_open_nothing_is_written() {
             let f = Fixture::new(&["xdg-mime"]);
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert!(matches!(out, RegisterOutcome::Skipped(_)));
             assert!(!f.env.desktop_file().exists());
         }
@@ -586,7 +650,7 @@ mod linux {
         #[test]
         fn unregister_removes_ours_from_every_mimeapps_list_and_keeps_the_rest() {
             let f = Fixture::new(ALL);
-            register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             let line = format!("{SCHEME_MIME_TYPE}={DESKTOP_FILE_NAME}\n");
             let [current, legacy] = f.env.mimeapps_lists();
             std::fs::create_dir_all(current.parent().unwrap()).unwrap();
@@ -646,7 +710,7 @@ mod linux {
             let list = format!("{SCHEME_MIME_TYPE}={DESKTOP_FILE_NAME}\n");
             std::fs::write(&current, &list).unwrap();
 
-            let out = register(&f.env, Path::new(BIN), RegisterMode::Explicit).unwrap();
+            let out = register(&f.env, Path::new(BIN), RegisterMode::Install).unwrap();
             assert!(matches!(out, RegisterOutcome::Skipped(_)), "{out:?}");
             assert_eq!(
                 std::fs::read_to_string(f.env.desktop_file()).unwrap(),
@@ -659,6 +723,36 @@ mod linux {
                 foreign
             );
             assert_eq!(std::fs::read_to_string(&current).unwrap(), list);
+        }
+
+        #[test]
+        fn a_hanging_helper_is_killed_at_the_timeout() {
+            let mut f = Fixture::new(&["xdg-open"]);
+            let slow = f.bin.join("slow-helper");
+            std::fs::write(&slow, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+            f.env.helper_timeout = Duration::from_millis(300);
+            let started = Instant::now();
+            assert_eq!(f.env.run_helper("slow-helper", &[]), None);
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn opt_out_marker_lives_in_the_data_dir_and_round_trips() {
+            let f = Fixture::new(ALL);
+            let marker = f.env.opt_out_marker();
+            assert!(marker.starts_with(&f.env.data_home));
+            assert!(!opted_out_at(&marker));
+            write_opt_out_marker_at(&marker).unwrap();
+            assert!(opted_out_at(&marker));
+            clear_opt_out_marker_at(&marker).unwrap();
+            assert!(!opted_out_at(&marker));
+            clear_opt_out_marker_at(&marker).unwrap();
         }
 
         #[test]
@@ -808,6 +902,44 @@ mod windows {
         };
         registered.eq_ignore_ascii_case(exe)
     }
+
+    /// Runs only under `CI` (a throwaway runner): it writes the real
+    /// `HKCU\...\Run\Freenet` value, restoring whatever was there.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn managed_install_follows_the_run_key() {
+            if std::env::var_os("CI").is_none() {
+                eprintln!("skipped: writes the real HKCU Run key; set CI=1 to run");
+                return;
+            }
+            let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
+                .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+                .unwrap();
+            let previous = run.get_value::<String, _>("Freenet").ok();
+            let exe = std::path::Path::new(r"C:\Users\T\AppData\Local\Freenet\bin\freenet.exe");
+            run.set_value(
+                "Freenet",
+                &format!("\"{}\" service run-wrapper", exe.display()),
+            )
+            .unwrap();
+            let managed = is_managed_install(exe);
+            let other =
+                is_managed_install(std::path::Path::new(r"C:\dev\target\debug\freenet.exe"));
+            let case_insensitive = is_managed_install(std::path::Path::new(
+                r"c:\users\t\appdata\local\freenet\bin\FREENET.EXE",
+            ));
+            match previous {
+                Some(v) => run.set_value("Freenet", &v).unwrap(),
+                None => drop(run.delete_value("Freenet")),
+            }
+            assert!(managed);
+            assert!(!other);
+            assert!(case_insensitive);
+        }
+    }
 }
 
 // ── Platform dispatch ───────────────────────────────────────────────────────
@@ -824,17 +956,55 @@ fn opt_out_marker() -> Option<PathBuf> {
     }
 }
 
+/// What the opt-out marker means for a registration in `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerAction {
+    /// Remove the marker, then register.
+    Clear,
+    /// The user turned the handler off: do nothing.
+    Skip,
+    /// Register.
+    Proceed,
+}
+
+/// Pure decision, so it is unit-tested.
+fn marker_action(mode: RegisterMode, opted_out: bool) -> MarkerAction {
+    match (mode, opted_out) {
+        (RegisterMode::UserRequested, _) => MarkerAction::Clear,
+        (_, true) => MarkerAction::Skip,
+        (_, false) => MarkerAction::Proceed,
+    }
+}
+
+const OPTED_OUT: &str = "turned off with `freenet service url-handler unregister`";
+
 /// Register the handler for the running binary. Idempotent.
 pub fn register(mode: RegisterMode) -> Result<RegisterOutcome> {
-    if mode == RegisterMode::Explicit {
-        if let Some(marker) = opt_out_marker() {
-            match std::fs::remove_file(&marker) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+    let marker = opt_out_marker();
+    match marker_action(mode, marker.as_deref().is_some_and(opted_out_at)) {
+        MarkerAction::Clear => {
+            if let Some(m) = &marker {
+                clear_opt_out_marker_at(m)?;
             }
         }
+        MarkerAction::Skip => return Ok(RegisterOutcome::Skipped(OPTED_OUT)),
+        MarkerAction::Proceed => {}
     }
+    let outcome = register_platform(mode)?;
+    // `unregister` writes the marker BEFORE removing anything, so if one ran
+    // while this was registering, the marker is visible now: undo, so the
+    // user's opt-out wins the race.
+    if mode != RegisterMode::UserRequested
+        && outcome == RegisterOutcome::Registered
+        && marker.as_deref().is_some_and(opted_out_at)
+    {
+        unregister()?;
+        return Ok(RegisterOutcome::Skipped(OPTED_OUT));
+    }
+    Ok(outcome)
+}
+
+fn register_platform(mode: RegisterMode) -> Result<RegisterOutcome> {
     #[cfg(target_os = "linux")]
     {
         let env = linux::LinuxEnv::from_process()
@@ -843,16 +1013,19 @@ pub fn register(mode: RegisterMode) -> Result<RegisterOutcome> {
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = mode;
         windows::register(&std::env::current_exe()?)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = mode;
         Ok(RegisterOutcome::Skipped(
             "on macOS the Freenet.app bundle registers freenet:// itself",
         ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
+        let _ = mode;
         Ok(RegisterOutcome::Skipped("not supported on this platform"))
     }
 }
@@ -880,17 +1053,13 @@ pub fn unregister() -> Result<bool> {
 fn write_opt_out_marker() -> Result<()> {
     let marker = opt_out_marker()
         .ok_or_else(|| anyhow::anyhow!("could not determine the data directory"))?;
-    if let Some(parent) = marker.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&marker, b"freenet service url-handler unregister\n")?;
-    Ok(())
+    write_opt_out_marker_at(&marker)
 }
 
 /// Register as part of an explicit install, printing one line about it.
 /// Never fails the install: the node works without the handler.
 pub fn register_for_install() {
-    match register(RegisterMode::Explicit) {
+    match register(RegisterMode::Install) {
         Ok(RegisterOutcome::Registered) => {
             println!("Registered freenet:// links to open with this Freenet install.");
         }
@@ -939,11 +1108,6 @@ fn running_binary_is_managed() -> bool {
     }
 }
 
-/// What the on-start registration should do. Pure, so it is unit-tested.
-fn should_register_on_start(managed: bool, opted_out: bool) -> bool {
-    managed && !opted_out
-}
-
 /// Register the handler in the background when the node starts, so installs
 /// that predate the handler get it from the auto-updater alone.
 ///
@@ -958,10 +1122,10 @@ pub fn spawn_self_registration() {
         .name("freenet-url-handler".into())
         .spawn(|| {
             let result = std::panic::catch_unwind(|| {
-                let opted_out = opt_out_marker().is_some_and(|m| m.exists());
-                if !should_register_on_start(running_binary_is_managed(), opted_out) {
+                if !running_binary_is_managed() {
                     return None;
                 }
+                // `register` honours the opt-out marker in this mode.
                 Some(register(RegisterMode::OnStart))
             });
             match result {
@@ -1006,7 +1170,7 @@ impl UrlHandlerCommand {
     pub fn run(&self) -> Result<()> {
         match self {
             UrlHandlerCommand::Register => {
-                match register(RegisterMode::Explicit)? {
+                match register(RegisterMode::UserRequested)? {
                     RegisterOutcome::Registered => {
                         println!("Registered freenet:// links to open with this binary.")
                     }
@@ -1022,8 +1186,19 @@ impl UrlHandlerCommand {
                 Ok(())
             }
             UrlHandlerCommand::Unregister => {
-                let removed = unregister()?;
+                if cfg!(target_os = "macos") {
+                    println!(
+                        "On macOS, Freenet.app itself receives freenet:// links (its Info.plist \
+                         declares the scheme), so there is nothing to unregister. Remove the app \
+                         to stop it handling them."
+                    );
+                    return Ok(());
+                }
+                // Marker FIRST: if removal fails halfway, the node still will
+                // not put the handler back, and a registration racing with
+                // this one sees the marker and undoes itself.
                 write_opt_out_marker()?;
+                let removed = unregister()?;
                 if removed {
                     println!("Removed the freenet:// link handler.");
                 } else {
@@ -1141,10 +1316,73 @@ mod tests {
     }
 
     #[test]
-    fn on_start_registration_needs_a_managed_install_and_no_opt_out() {
-        assert!(should_register_on_start(true, false));
-        assert!(!should_register_on_start(true, true));
-        assert!(!should_register_on_start(false, false));
-        assert!(!should_register_on_start(false, true));
+    fn only_a_user_request_overrides_the_opt_out() {
+        use MarkerAction::*;
+        assert_eq!(marker_action(RegisterMode::UserRequested, true), Clear);
+        assert_eq!(marker_action(RegisterMode::UserRequested, false), Clear);
+        // `service install` (install.sh re-runs, the setup wizard, `service
+        // doctor`) and node start must respect it.
+        assert_eq!(marker_action(RegisterMode::Install, true), Skip);
+        assert_eq!(marker_action(RegisterMode::OnStart, true), Skip);
+        assert_eq!(marker_action(RegisterMode::Install, false), Proceed);
+        assert_eq!(marker_action(RegisterMode::OnStart, false), Proceed);
+    }
+
+    /// The registration calls that make existing installs get the handler
+    /// (node start) and new installs get it and lose it (service install /
+    /// uninstall) must stay wired in. A silent drop would pass every other
+    /// test. Each call must sit at statement position inside its function,
+    /// so a commented-out call fails too.
+    #[test]
+    fn registration_stays_wired_into_start_install_and_uninstall() {
+        fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src
+                .find(&format!("\n{signature}"))
+                .unwrap_or_else(|| panic!("`{signature}` not found at column 0"));
+            let test_mod = src.find("\n#[cfg(test)]\nmod tests").unwrap_or(src.len());
+            assert!(
+                start < test_mod,
+                "`{signature}` matched inside the test module"
+            );
+            let body = &src[start + 1..];
+            // A method's closing brace is indented like its signature.
+            let indent: String = signature.chars().take_while(|c| *c == ' ').collect();
+            let end = body.find(&format!("\n{indent}}}\n")).expect("function end");
+            &body[..end]
+        }
+        fn called_at_statement(body: &str, call: &str) -> bool {
+            body.match_indices(call).any(|(i, _)| {
+                let line_start = body[..i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..i].trim().is_empty()
+            })
+        }
+        let freenet = include_str!("../freenet.rs");
+        assert!(called_at_statement(
+            fn_body(freenet, "async fn run_network("),
+            "commands::url_handler::spawn_self_registration();"
+        ));
+        let linux = include_str!("service/linux.rs");
+        assert!(called_at_statement(
+            fn_body(linux, "fn install_user_service("),
+            "super::super::url_handler::register_for_install();"
+        ));
+        assert!(called_at_statement(
+            fn_body(linux, "pub(super) fn uninstall_service("),
+            "super::super::url_handler::unregister_for_uninstall();"
+        ));
+        let windows = include_str!("service/windows.rs");
+        assert!(called_at_statement(
+            fn_body(windows, "pub(super) fn install_service("),
+            "super::super::url_handler::register_for_install();"
+        ));
+        assert!(called_at_statement(
+            fn_body(windows, "pub(super) fn uninstall_service("),
+            "super::super::url_handler::unregister_for_uninstall();"
+        ));
+        let uninstall = include_str!("uninstall.rs");
+        assert!(called_at_statement(
+            fn_body(uninstall, "    pub fn run("),
+            "super::url_handler::unregister_for_uninstall();"
+        ));
     }
 }

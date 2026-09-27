@@ -9,9 +9,11 @@
 //! as hostile:
 //!
 //! * Validation reproduces the /open page's JS exactly (freenet/web,
-//!   `hugo-site/themes/freenet/layouts/shortcodes/open-link.html`). Both sides
-//!   are pinned to the same vectors in `tests/data/share-link-vectors.json`, so a
-//!   rule change on one side fails a test until the other side matches.
+//!   `hugo-site/themes/freenet/layouts/shortcodes/open-link.html`). The rules
+//!   are pinned by `tests/data/share-link-vectors.json`: this crate's tests run
+//!   every vector, the page's JS was checked against the same file when the
+//!   handler was written, and freenet/web carries a CI check over a copy of it
+//!   (#5726 follow-up). Change a rule on both sides together with the file.
 //! * The output URL is a fixed `http://127.0.0.1:<port>/v1/contract/web/` prefix
 //!   plus the validated id and rest. Nothing in the input can choose the scheme,
 //!   host, port or contract.
@@ -281,8 +283,10 @@ fn default_config_dir() -> Option<PathBuf> {
     if cfg!(debug_assertions) {
         Some(std::env::temp_dir().join("freenet"))
     } else {
+        // `config_local_dir`, as `ConfigArgs::build` uses: on Windows that is
+        // Local AppData, not the Roaming `config_dir`.
         directories::ProjectDirs::from("", "The Freenet Project Inc", "Freenet")
-            .map(|d| d.config_dir().to_path_buf())
+            .map(|d| d.config_local_dir().to_path_buf())
     }
 }
 
@@ -373,8 +377,12 @@ fn launch(target: &str) -> Result<()> {
         if cfg!(target_os = "macos") {
             // `open` hands off and returns at once. Waiting reaps it, which
             // matters inside the long-lived menu-bar wrapper.
-            cmd.status()
+            let status = cmd
+                .status()
                 .with_context(|| format!("failed to run {opener}"))?;
+            if !status.success() {
+                bail!("{opener} exited with {status}");
+            }
         } else {
             // Not waited on: some xdg-open backends block until the browser
             // exits. This is a short-lived process, so nothing is left behind.
@@ -489,11 +497,34 @@ fn show_fallback_page(page: &FallbackPage) -> Result<()> {
         .context("no cache directory")?
         .join("freenet");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join("open-link.html");
-    write_atomically(&path, render_fallback_page(page).as_bytes())?;
-    launch(&path.to_string_lossy())
+    // One file per invocation, so concurrent handlers cannot overwrite each
+    // other's page. Owner-only (0600 on Unix, via tempfile).
+    let file = tempfile::Builder::new()
+        .prefix("open-link-")
+        .suffix(".html")
+        .tempfile_in(&dir)
+        .with_context(|| format!("creating a page in {}", dir.display()))?;
+    std::io::Write::write_all(&mut file.as_file(), render_fallback_page(page).as_bytes())?;
+    let (_, path) = file
+        .keep()
+        .map_err(|e| anyhow::anyhow!("keeping the page: {e}"))?;
+    launch(&path.to_string_lossy())?;
+    // The "not running" page links to the full target, which can carry a
+    // secret in its query or fragment (e.g. a River invite). Once the browser
+    // has loaded it the file is no longer needed, so remove it rather than
+    // leave it in the cache indefinitely. Skipped in a dry run, where the
+    // caller reads it back.
+    if !dry_run() {
+        std::thread::sleep(FALLBACK_PAGE_LIFETIME);
+        drop(std::fs::remove_file(&path));
+    }
+    Ok(())
 }
 
+/// How long a fallback page is kept for the browser to load it.
+const FALLBACK_PAGE_LIFETIME: Duration = Duration::from_secs(20);
+
+#[cfg(target_os = "linux")]
 /// Write `contents` to `path` via a temp file in the same directory + rename,
 /// so a concurrent reader never sees a partial file.
 pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
@@ -510,6 +541,8 @@ pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleOutcome {
     OpenedLocal(String),
+    /// The node answered but the browser could not be launched.
+    OpenFailed(String),
     NodeNotRunning(String),
     Invalid(LinkError),
 }
@@ -520,6 +553,7 @@ impl HandleOutcome {
     pub fn kind(&self) -> &'static str {
         match self {
             HandleOutcome::OpenedLocal(_) => "opened",
+            HandleOutcome::OpenFailed(_) => "browser-launch-failed",
             HandleOutcome::NodeNotRunning(_) => "node-not-running",
             HandleOutcome::Invalid(_) => "invalid-link",
         }
@@ -541,10 +575,13 @@ pub fn handle_link(link: &str, wait: Duration, config_dir: Option<&Path>) -> Han
     let port = configured_port(config_dir);
     let local_url = target.local_url(port);
     if node_is_listening(port, wait) {
-        if let Err(err) = launch(&local_url) {
-            tracing::warn!(error = %err, "could not open the browser");
+        match launch(&local_url) {
+            Ok(()) => HandleOutcome::OpenedLocal(local_url),
+            Err(err) => {
+                tracing::warn!(error = %err, "could not open the browser");
+                HandleOutcome::OpenFailed(local_url)
+            }
         }
-        HandleOutcome::OpenedLocal(local_url)
     } else {
         let page = FallbackPage::NotRunning {
             local_url: local_url.clone(),
@@ -608,6 +645,10 @@ impl OpenCommand {
         };
         match handle_link(link, Duration::ZERO, config_dir) {
             HandleOutcome::OpenedLocal(_) => Ok(()),
+            HandleOutcome::OpenFailed(_) => {
+                eprintln!("Freenet is running, but the web browser could not be launched.");
+                std::process::exit(1);
+            }
             HandleOutcome::NodeNotRunning(_) => {
                 // Only the port: the link itself can carry secrets in its
                 // fragment (e.g. River invites), and stderr from a
@@ -662,8 +703,7 @@ mod tests {
         note: String,
     }
 
-    /// The shared contract with freenet.org/open. The same file is run against
-    /// the page's JS in freenet/web.
+    /// The shared contract with freenet.org/open (see the module docs).
     #[test]
     fn shared_share_link_vectors() {
         let vectors: Vectors =

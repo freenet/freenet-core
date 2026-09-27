@@ -96,6 +96,14 @@ fn config_dirs(root: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// The handler's local fallback page: `<cache>/freenet/open-link-*.html`.
+fn is_fallback_page(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("open-link-") && n.ends_with(".html"))
+}
+
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
@@ -158,10 +166,7 @@ fn hostile_links_are_refused_without_opening_the_node() {
         let printed = stdout(&out);
         // The dry run prints what it would open: the local "invalid link"
         // page, never a node URL.
-        assert!(
-            printed.ends_with("open-link.html"),
-            "{link:?} opened {printed:?}"
-        );
+        assert!(is_fallback_page(&printed), "{link:?} opened {printed:?}");
         assert!(
             !printed.contains("127.0.0.1"),
             "{link:?} opened {printed:?}"
@@ -210,7 +215,7 @@ fn not_running_node_gets_the_explanatory_page() {
     }
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let page_path = stdout(&out);
-    assert!(page_path.ends_with("open-link.html"), "{page_path}");
+    assert!(is_fallback_page(&page_path), "{page_path}");
     let page = std::fs::read_to_string(&page_path).expect("read page");
     assert!(page.contains("Freenet isn't running"));
     assert!(page.contains(&format!(
