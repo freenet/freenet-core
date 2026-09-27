@@ -1597,6 +1597,17 @@ impl DelegateCapabilities {
         self.recorded.lock().apps.contains_key(key)
     }
 
+    /// Raw duty balances in microseconds, `(delegate, node)`, without
+    /// refilling. For tests that check a run was charged.
+    #[cfg(test)]
+    pub(crate) fn duty_balances_us(&self, key: &DelegateKey) -> (Option<i64>, i64) {
+        let budget = self.budget.lock();
+        (
+            budget.duty.get(key).map(|b| b.tokens_us),
+            budget.node_duty.tokens_us,
+        )
+    }
+
     /// Whether a lifecycle run for `key` may start now (duty budget).
     pub(crate) fn duty_available(&self, key: &DelegateKey) -> bool {
         let now = self.time.now();

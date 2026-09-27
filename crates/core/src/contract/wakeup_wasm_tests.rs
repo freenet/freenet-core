@@ -136,10 +136,18 @@ impl Node {
         // the clock differs.
         let clock = OffsetClock::default();
         let storage = handler.executor().state_store().inner().clone();
+        // No refill, so a balance can only move by a charge: the test can
+        // then tell exactly whether a wake-up run was charged, and to which
+        // buckets. The bursts (10 s per delegate, 30 s node-wide) are far
+        // more than a few fixture runs spend.
         let caps = DelegateCapabilities::with_time_source(
             Arc::new(storage),
             Arc::new(clock.clone()),
-            BudgetLimits::default(),
+            BudgetLimits {
+                duty_refill_per_sec: Duration::ZERO,
+                node_duty_refill_per_sec: Duration::ZERO,
+                ..BudgetLimits::default()
+            },
         );
         handler
             .executor()
@@ -282,10 +290,31 @@ async fn a_real_delegate_is_woken_with_no_client_connected() {
     node.nudge().await;
     assert_eq!(delivered(), 0, "no wake-up before it is due");
 
+    // `Installed` has run by now (it is due at once after the grant); let it
+    // finish, then take the balances it left.
+    node.nudge_until("Installed", || {
+        node.caps.stats.lifecycle_delivered.load(Ordering::Relaxed) >= 1
+    })
+    .await;
+    let (delegate_before, node_before) = node.caps.duty_balances_us(&key);
+    let delegate_before = delegate_before.expect("Installed charged the delegate");
+
     // First fire: within the start-up window (5 s + up to 60 s).
     node.clock.advance(Duration::from_secs(66));
     node.nudge_until("the first wake-up", || delivered() >= 1)
         .await;
+    // ONE budget: the wake-up run was charged to the same per-delegate and
+    // node-wide duty buckets lifecycle runs use (no refill, so any decrease
+    // is a charge).
+    let (delegate_after, node_after) = node.caps.duty_balances_us(&key);
+    assert!(
+        delegate_after.expect("still tracked") < delegate_before,
+        "a wake-up run must be charged to its delegate's duty budget"
+    );
+    assert!(
+        node_after < node_before,
+        "a wake-up run must be charged to the node-wide duty budget"
+    );
     // Second: one interval (+ <= 10% jitter) later.
     node.clock.advance(Duration::from_secs(67));
     node.nudge_until("the second wake-up", || delivered() >= 2)
