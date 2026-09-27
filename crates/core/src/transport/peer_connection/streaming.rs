@@ -217,6 +217,8 @@ impl StreamHandle {
             bytes_read: 0,
             auto_reclaim: false,
             listener: None,
+            #[cfg(test)]
+            before_rearmed_listener_poll: None,
         }
     }
 
@@ -266,6 +268,8 @@ impl StreamHandle {
             bytes_read: 0,
             auto_reclaim: true,
             listener: None,
+            #[cfg(test)]
+            before_rearmed_listener_poll: None,
         }
     }
 
@@ -475,6 +479,9 @@ pub struct StreamingInboundStream {
     /// Uses the buffer's `event_listener::Event` which is fired by every
     /// `buffer.insert()` — independent of which handle called `push_fragment`.
     listener: Option<Pin<Box<EventListener>>>,
+    /// Inject an arrival after the re-armed listener's buffer check, before its poll.
+    #[cfg(test)]
+    before_rearmed_listener_poll: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StreamingInboundStream {
@@ -616,7 +623,7 @@ impl Stream for StreamingInboundStream {
         // (set above), but we use if-let to satisfy the no-unwrap rule.
         if let Some(listener) = self.listener.as_mut() {
             match listener.as_mut().poll(cx) {
-                Poll::Ready(()) => {
+                Poll::Ready(()) => loop {
                     // Notified — clear listener and re-check buffer inline
                     // (avoids wake_by_ref spin-loop).
                     self.listener = None;
@@ -637,14 +644,21 @@ impl Stream for StreamingInboundStream {
                         self.bytes_read += data.len() as u64;
                         return Poll::Ready(Some(Ok(data)));
                     }
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_rearmed_listener_poll.take() {
+                        hook();
+                    }
                     if let Some(new_listener) = self.listener.as_mut() {
                         match new_listener.as_mut().poll(cx) {
-                            Poll::Ready(()) => self.listener = None,
-                            Poll::Pending => {}
+                            // Notification can arrive after the re-check but
+                            // before this first poll, without waking our task.
+                            // Consume it by looping to re-check, never by
+                            // returning Pending with no registered listener.
+                            Poll::Ready(()) => {}
+                            Poll::Pending => return Poll::Pending,
                         }
                     }
-                    Poll::Pending
-                }
+                },
                 Poll::Pending => Poll::Pending,
             }
         } else {
@@ -736,6 +750,147 @@ mod tests {
 
     fn make_stream_id() -> StreamId {
         StreamId::next()
+    }
+
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Drive the second-listener race without threads, timers, or an executor.
+    fn check_rearmed_listener_arrival(final_fragment: bool, auto_reclaim: bool) {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::sync::atomic::Ordering;
+
+        let fragment_count = if final_fragment { 2 } else { 3 };
+        let handle = StreamHandle::new(
+            make_stream_id(),
+            (FRAGMENT_PAYLOAD_SIZE * fragment_count) as u64,
+        );
+        let fork = handle.fork();
+        let mut stream = if auto_reclaim {
+            fork.stream_with_reclaim()
+        } else {
+            fork.stream()
+        };
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let first = Bytes::from(vec![1; FRAGMENT_PAYLOAD_SIZE]);
+        handle.push_fragment(1, first.clone()).unwrap();
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(first)))
+        );
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+
+        // Wake the old listener without supplying the missing fragment #2.
+        if final_fragment {
+            // Cancellation of a different fork shares the buffer notification,
+            // but must not cancel this consumer (nor its producer).
+            handle.fork().cancel();
+        } else {
+            handle
+                .push_fragment(3, Bytes::from(vec![3; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+        assert!(counter.0.swap(0, Ordering::SeqCst) > 0);
+
+        let expected = Bytes::from(vec![2; FRAGMENT_PAYLOAD_SIZE]);
+        let arriving = expected.clone();
+        let producer = handle.clone();
+        stream.before_rearmed_listener_poll = Some(Box::new(move || {
+            assert!(producer.push_fragment(2, arriving).unwrap());
+        }));
+
+        let result = Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(
+            stream.before_rearmed_listener_poll.is_none(),
+            "race hook did not run"
+        );
+        assert!(
+            result.is_ready() || counter.0.load(Ordering::SeqCst) > 0,
+            "fragment #2 is buffered, but poll_next returned Pending without a wake; listener present: {}",
+            stream.listener.is_some()
+        );
+        let result = if result.is_pending() {
+            Pin::new(&mut stream).poll_next(&mut cx)
+        } else {
+            result
+        };
+        assert_eq!(result, Poll::Ready(Some(Ok(expected))));
+        assert_eq!(stream.bytes_read(), (2 * FRAGMENT_PAYLOAD_SIZE) as u64);
+        if !final_fragment {
+            assert_eq!(
+                Pin::new(&mut stream).poll_next(&mut cx),
+                Poll::Ready(Some(Ok(Bytes::from(vec![3; FRAGMENT_PAYLOAD_SIZE]))))
+            );
+        }
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+    }
+
+    #[test]
+    fn test_rearmed_listener_next_fragment_arrival() {
+        for auto_reclaim in [false, true] {
+            check_rearmed_listener_arrival(false, auto_reclaim);
+        }
+    }
+
+    #[test]
+    fn test_rearmed_listener_final_fragment_arrival() {
+        for auto_reclaim in [false, true] {
+            check_rearmed_listener_arrival(true, auto_reclaim);
+        }
+    }
+
+    #[test]
+    fn test_rearmed_listener_spurious_notification_registers_waker() {
+        use std::sync::atomic::Ordering;
+
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        handle.fork().cancel();
+        assert!(counter.0.swap(0, Ordering::SeqCst) > 0);
+
+        let unrelated = handle.fork();
+        stream.before_rearmed_listener_poll = Some(Box::new(move || unrelated.cancel()));
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        assert!(stream.before_rearmed_listener_poll.is_none());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert!(stream.listener.is_some());
+
+        // After two unrelated notifications, Pending must retain a live waker.
+        let data = Bytes::from_static(b"x");
+        handle.push_fragment(1, data.clone()).unwrap();
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(data)))
+        );
+    }
+
+    #[test]
+    fn test_rearmed_listener_cancellation_is_observed() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        handle.fork().cancel();
+
+        stream.before_rearmed_listener_poll = Some(Box::new(move || handle.cancel()));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Err(StreamError::Cancelled)))
+        );
+        assert!(stream.before_rearmed_listener_poll.is_none());
     }
 
     #[test]
