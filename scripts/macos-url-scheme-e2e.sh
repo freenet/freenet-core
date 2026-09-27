@@ -38,7 +38,12 @@ OUT="$(mktemp -d)"
 VERSION=0.0.0-ci FREENET_ARM64_BIN="$BIN" FREENET_X86_BIN="$BIN" \
     FREENET_SINGLE_ARCH_BUNDLE=1 CREATE_DMG=false OUTPUT_DIR="$OUT" \
     "$REPO/scripts/package-macos.sh"
-APP="$OUT/Freenet.app"
+# LaunchServices may ignore bundles under temp directories; install where a
+# user would (per-user Applications folder, no admin needed).
+mkdir -p "$HOME/Applications"
+rm -rf "$HOME/Applications/Freenet.app"
+ditto "$OUT/Freenet.app" "$HOME/Applications/Freenet.app"
+APP="$HOME/Applications/Freenet.app"
 
 # 1. The plist claims the scheme.
 scheme="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' \
@@ -48,13 +53,25 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null || fail "Info.plist does not 
 echo "ok - Info.plist declares the freenet scheme"
 
 # 2. LaunchServices maps freenet:// to this bundle.
-"$LSREGISTER" -f "$APP"
-handler="$(osascript -l JavaScript -e '
+"$LSREGISTER" -f -R "$APP"
+resolve_handler() {
+    osascript -l JavaScript -e '
 ObjC.import("AppKit");
 var u = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL(
     $.NSURL.URLWithString("freenet://x"));
-u.isNil() ? "" : u.path.js;')"
-[[ -n "$handler" ]] || fail "LaunchServices has no handler for freenet://"
+u.isNil() ? "" : u.path.js;'
+}
+# Registration reaches lsd asynchronously; give it time.
+handler=""
+for _ in $(seq 1 30); do
+    handler="$(resolve_handler)"
+    [[ -n "$handler" ]] && break
+    sleep 1
+done
+if [[ -z "$handler" ]]; then
+    "$LSREGISTER" -dump 2>/dev/null | grep -n -B3 -A3 -i 'freenet' | head -60 >&2 || true
+    fail "LaunchServices has no handler for freenet://"
+fi
 [[ "$(cd "$handler" && pwd -P)" == "$(cd "$APP" && pwd -P)" ]] \
     || fail "freenet:// resolves to $handler, not $APP"
 echo "ok - LaunchServices resolves freenet:// to the bundle"
