@@ -124,7 +124,10 @@ for (const elapsed of [0, WINDOW_MS - 1, WINDOW_MS, WINDOW_MS + 1]) {
 }
 check(
   'no-JS fallback unchanged: the only meta refresh is the <noscript> dashboard one',
-  /<noscript><meta http-equiv="refresh" content="3;url=\/" \/><\/noscript>/.test(src),
+  /<noscript><meta http-equiv="refresh" content="3;url=\/" \/><\/noscript>/.test(
+    src,
+  ) &&
+    (src.match(/<meta\s[^>]*http-equiv=["']refresh["']/gi) || []).length === 1,
 );
 check(
   'framed, no _freload -> stamp (start a bounded window)',
