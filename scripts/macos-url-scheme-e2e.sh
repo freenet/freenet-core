@@ -46,6 +46,14 @@ fail() {
     echo "FAIL: $*" >&2
     echo "--- wrapper log ---" >&2
     cat "$LOG_DIR"/freenet-wrapper.*.log >&2 2>/dev/null || true
+    echo "--- processes ---" >&2
+    pgrep -fl 'freenet|Freenet' >&2 || true
+    echo "--- ~/Library/Logs/freenet ---" >&2
+    ls -la "$LOG_DIR" >&2 2>/dev/null || true
+    echo "--- unified log (last 10m, Freenet + LaunchServices) ---" >&2
+    log show --last 10m --style compact \
+        --predicate 'process CONTAINS[c] "freenet" OR (subsystem == "com.apple.launchservices" AND eventMessage CONTAINS[c] "freenet")' \
+        2>/dev/null | tail -80 >&2 || true
     exit 1
 }
 

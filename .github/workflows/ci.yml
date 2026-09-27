@@ -1167,7 +1167,7 @@ jobs:
           $expected = '"' + $exe + '" open -- "%1"'
           if ($cmd -ne $expected) { throw "registered '$cmd', expected '$expected'" }
           if ((Get-ItemProperty 'HKCU:\Software\Classes\freenet').'URL Protocol' -ne '') { throw 'URL Protocol value missing' }
-          $pages = Join-Path $env:LOCALAPPDATA 'freenet-open-link'
+          $pages = Join-Path $env:LOCALAPPDATA 'The Freenet Project Inc\Freenet\cache\open-link'
           $env:FREENET_OPEN_DRY_RUN = '1'
           # The handler writes one open-link-*.html per link (stale ones are
           # swept later, so it is still there to read).

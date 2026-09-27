@@ -66,6 +66,10 @@ pub const DRY_RUN_ENV_VAR: &str = "FREENET_OPEN_DRY_RUN";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const APP_LAUNCH_NODE_WAIT: Duration = Duration::from_secs(30);
 
+/// How long the OS-launched CLI handler polls for the node before showing the
+/// "not running" page.
+const CLI_NODE_WAIT: Duration = Duration::from_secs(3);
+
 /// Exit code for a link that failed validation.
 pub const EXIT_CODE_INVALID_LINK: i32 = 2;
 
@@ -583,12 +587,14 @@ fn write_and_open_fallback_page(
     Ok(())
 }
 
-/// Where fallback pages are written: `<cache>/freenet-open-link/`. Its own
-/// directory: on case-insensitive filesystems `<cache>/freenet` is the same
-/// folder as macOS's `~/Library/Caches/Freenet` (wrapper lock, updater
-/// staging) and Windows' `%LOCALAPPDATA%\Freenet` (the install root).
+/// Where fallback pages are written: `open-link/` in the node's own
+/// ProjectDirs cache directory, which `uninstall --purge` removes. (Not
+/// `<cache>/freenet`: on case-insensitive filesystems that is the same folder
+/// as macOS's `~/Library/Caches/Freenet`, with the wrapper lock and updater
+/// staging, and Windows' `%LOCALAPPDATA%\Freenet`, the install root.)
 fn fallback_page_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("freenet-open-link"))
+    directories::ProjectDirs::from("", "The Freenet Project Inc", "Freenet")
+        .map(|d| d.cache_dir().join("open-link"))
 }
 
 const FALLBACK_PAGE_PREFIX: &str = "open-link-";
@@ -747,7 +753,10 @@ impl OpenCommand {
                 std::process::exit(EXIT_CODE_INVALID_LINK);
             }
         };
-        match handle_link(link, Duration::ZERO, config_dir) {
+        // A short grace period: a link clicked just after login can arrive
+        // while the service is still binding its port. (The macOS in-app
+        // handler waits longer, as it may have launched the app itself.)
+        match handle_link(link, CLI_NODE_WAIT, config_dir) {
             HandleOutcome::OpenedLocal(_) => Ok(()),
             HandleOutcome::OpenFailed(_) => {
                 eprintln!("Freenet is running, but the web browser could not be launched.");

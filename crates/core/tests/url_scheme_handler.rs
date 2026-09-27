@@ -115,7 +115,7 @@ fn config_dirs(root: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// The handler's local fallback page: `<cache>/freenet/open-link-*.html`.
+/// The handler's local fallback page: `<project cache>/open-link/open-link-*.html`.
 fn is_fallback_page(path: &str) -> bool {
     Path::new(path)
         .file_name()

@@ -66,6 +66,7 @@ pub const WINDOWS_CLASS_KEY: &str = r"Software\Classes\freenet";
 const OPT_OUT_MARKER: &str = ".url-handler-opt-out";
 
 /// What a registration attempt did.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterOutcome {
     /// The handler was written or updated.
@@ -80,6 +81,7 @@ pub enum RegisterOutcome {
 }
 
 /// Why registration is happening.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterMode {
     /// `freenet service url-handler register`: the only mode that clears the
@@ -989,11 +991,14 @@ mod windows {
         }
         let command = windows_open_command(exe, config_dir);
         let ours = is_ours();
+        if class_key().is_some() && !ours {
+            // A key we did not write (another application's, even one with
+            // no `open` command): leave it.
+            return Ok(RegisterOutcome::ForeignDefault(
+                current_command().unwrap_or_else(|| WINDOWS_CLASS_KEY.to_string()),
+            ));
+        }
         match current_command() {
-            Some(existing) if !ours => {
-                // Another application's registration: leave it.
-                return Ok(RegisterOutcome::ForeignDefault(existing));
-            }
             Some(existing) if existing == command && has_url_protocol_value() => {
                 return Ok(RegisterOutcome::AlreadyCurrent);
             }
@@ -1010,13 +1015,16 @@ mod windows {
         }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (class, _) = hkcu.create_subkey(WINDOWS_CLASS_KEY)?;
+        // Marker FIRST: if a later write fails, the half-written key is still
+        // recognised as ours, so the next start repairs it and unregister can
+        // remove it.
+        class.set_value(WINDOWS_MARKER_VALUE, &"1")?;
         class.set_value("", &"URL:Freenet Protocol")?;
         class.set_value("URL Protocol", &"")?;
         let (icon, _) = class.create_subkey("DefaultIcon")?;
         icon.set_value("", &format!("\"{exe}\",0"))?;
         let (cmd, _) = class.create_subkey(r"shell\open\command")?;
         cmd.set_value("", &command)?;
-        class.set_value(WINDOWS_MARKER_VALUE, &"1")?;
         Ok(RegisterOutcome::Registered)
     }
 
@@ -1232,6 +1240,7 @@ fn write_opt_out_marker() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 /// Register as part of an explicit install, printing one line about it.
 /// Never fails the install: the node works without the handler.
 pub fn register_for_install() {
