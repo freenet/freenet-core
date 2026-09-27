@@ -1228,7 +1228,7 @@ struct ParkingCtx<'a> {
     /// Whether this run's loop time is charged to the NODE duty bucket too:
     /// lifecycle and wake-up runs, not notification or client runs. Carried
     /// into the continuation so a resumed leg is charged like the first one
-    /// (see `charge_resumed_leg`).
+    /// (see `handle_delegate_resume`).
     node_wide_duty: bool,
 }
 

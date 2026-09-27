@@ -1225,6 +1225,10 @@ async fn a_sub_floor_interval_fires_no_faster_than_the_floor() {
 /// grant re-arms it.
 #[tokio::test(start_paused = true)]
 async fn revoking_stops_wakeups_and_a_new_grant_rearms_them() {
+    // Fixed jitter draws: the counts below assume the first fire lands inside
+    // 66 s and the next ones at least 60 s apart, true for any draw but the
+    // exact-count assertions are easier to trust with a fixed one.
+    let _seed = crate::config::GlobalRng::seed_guard(0x5eed_0001);
     let caps = paused_caps(BudgetLimits::default());
     let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 42);
     let lp = start(
@@ -1267,9 +1271,9 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
     use super::delegate_capabilities::WAKEUP_MAX_DEFERRALS;
     let caps = paused_caps(BudgetLimits {
         duty_burst: Duration::from_millis(10),
-        // The debt below is floored at half a burst (5 ms); at 10 us/s it is
-        // repaid after 500 s.
-        duty_refill_per_sec: Duration::from_micros(10),
+        // The debt below is floored at half a burst (5 ms); at 5 us/s it is
+        // repaid after 1000 s.
+        duty_refill_per_sec: Duration::from_micros(5),
         ..BudgetLimits::default()
     });
     let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 43);
@@ -1283,13 +1287,14 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
     )
     .await;
     // Several intervals: every fire deferred, then skipped; none run. At
-    // least 3 skips, so the exact per-fire deferral count below cannot be
-    // matched by a different retry count on any random draw.
-    tokio::time::sleep(Duration::from_secs(66 + 5 * 72)).await;
+    // least 4 skips (one per <= 111 s: <= 66 s to the fire, 45 s of retries),
+    // so the exact per-fire deferral count below cannot be matched by a
+    // retry count one lower or one higher on any random draw.
+    tokio::time::sleep(Duration::from_secs(66 + 5 * 112)).await;
     lp.sync().await;
     assert!(lp.wakeup_runs().is_empty(), "never runs over budget");
     let skipped = caps.stats.wakeups_skipped.load(Ordering::Relaxed);
-    assert!(skipped >= 3, "each starved fire is skipped, got {skipped}");
+    assert!(skipped >= 4, "each starved fire is skipped, got {skipped}");
     // Each skipped fire was deferred on its first attempt and on each of its
     // WAKEUP_MAX_DEFERRALS retries (one more fire may be part-way through).
     let deferred = caps.stats.wakeups_deferred.load(Ordering::Relaxed);
@@ -1298,7 +1303,7 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
         deferred >= skipped * per_fire && deferred < (skipped + 1) * per_fire,
         "deferred {deferred}, skipped {skipped}"
     );
-    // The debt is repaid (500 s), and the SAME schedule fires again: it was
+    // The debt is repaid (1000 s), and the SAME schedule fires again: it was
     // never dropped.
     tokio::time::sleep(Duration::from_secs(600)).await;
     lp.sync().await;
@@ -1653,9 +1658,124 @@ async fn a_storage_error_at_fire_time_skips_the_fire_but_keeps_the_schedule() {
     storage.fail_records.store(false, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(70)).await;
     lp.sync().await;
-    assert_eq!(
-        lp.wakeup_runs(),
-        vec![(key, b"p".to_vec())],
+    // How many fires fell in the window depends on the jitter draws; what
+    // matters is that there is at least one and each is this delegate's.
+    let runs = lp.wakeup_runs();
+    assert!(
+        !runs.is_empty(),
         "the schedule survived the unreadable fire"
     );
+    assert!(runs.iter().all(|r| *r == (key.clone(), b"p".to_vec())));
+}
+
+fn user_input_run() -> ScriptedRun {
+    let message = NotificationMessage::try_from(&serde_json::json!({"message": "ok?"}))
+        .expect("notification message");
+    ScriptedRun::from(vec![OutboundDelegateMsg::RequestUserInput(
+        UserInputRequest {
+            request_id: 1,
+            message,
+            responses: vec![ClientResponse::new(b"yes".to_vec())],
+        },
+    )])
+}
+
+fn zero_refill_caps() -> Arc<DelegateCapabilities> {
+    DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits {
+            duty_refill_per_sec: Duration::ZERO,
+            node_duty_refill_per_sec: Duration::ZERO,
+            ..BudgetLimits::default()
+        },
+    )
+}
+
+/// The other side of #5748's fix: a CLIENT-driven run is never budgeted, so
+/// neither of its legs is charged, even for a delegate that is budgeted for
+/// its background runs.
+#[tokio::test]
+async fn a_parked_client_run_is_not_charged_on_resume() {
+    let caps = zero_refill_caps();
+    let lp = start(
+        "resume_client_uncharged",
+        caps.clone(),
+        vec![user_input_run(), ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 51);
+    let before = caps.duty_balances_us(&key);
+    let resp = answer(
+        lp.send
+            .send_to_handler(app_messages(
+                &key,
+                vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(b"go".to_vec()),
+                )],
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(resp.is_ok(), "{resp:?}");
+    assert_eq!(
+        lp.observations.lock().unwrap().len(),
+        2,
+        "the client run parked and resumed"
+    );
+    assert_eq!(
+        caps.duty_balances_us(&key),
+        before,
+        "a client run is never charged"
+    );
+}
+
+/// A contract-NOTIFICATION run that parks is charged for its resumed leg to
+/// its delegate only, as its first leg is (#5730): never to the node bucket,
+/// so busy notification traffic cannot starve lifecycle and wake-up runs.
+#[tokio::test]
+async fn a_parked_notification_run_is_charged_to_its_delegate_only() {
+    let caps = zero_refill_caps();
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 52);
+    let (_send, rcv, _) = handler::contract_handler_channel();
+    let mut handler = MockWasmContractHandler::new_test(rcv, None, "resume_notification").await;
+    let rt = handler.runtime_mut();
+    rt.capabilities = Some(caps.clone());
+    rt.delegate_script
+        .lock()
+        .unwrap()
+        .extend([user_input_run(), ScriptedRun::default()]);
+    let observations = rt.delegate_observations.clone();
+    let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut park = super::delegate_park::DelegateParkCtx::new(resume_tx);
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+
+    super::handle_delegate_notification(
+        &mut handler,
+        super::executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x64; 32]),
+            new_state: Arc::new(WrappedState::new(vec![1])),
+        },
+        &prompter,
+        Some(&mut park),
+    )
+    .await;
+    assert!(park.is_parked(&key), "the notification run parked");
+    let (delegate_parked, node_parked) = caps.duty_balances_us(&key);
+    let delegate_parked = delegate_parked.expect("first leg charged to the delegate");
+
+    let resume = tokio::time::timeout(Duration::from_secs(10), resume_rx.recv())
+        .await
+        .expect("the prompt is answered")
+        .expect("resume");
+    super::handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+    assert_eq!(observations.lock().unwrap().len(), 2, "resumed");
+    let (delegate_after, node_after) = caps.duty_balances_us(&key);
+    assert!(
+        delegate_after.expect("tracked") < delegate_parked,
+        "the resumed leg is charged to the delegate"
+    );
+    assert_eq!(node_after, node_parked, "and never to the node bucket");
 }
