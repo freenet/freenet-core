@@ -121,6 +121,9 @@ pub(crate) struct MockWasmRuntime {
     /// from `RuntimeInnerError::DelegateNotFound`, before `process()` would be
     /// entered, so it is neither recorded nor consumes a script entry.
     pub(crate) unregistered_delegates: UnregisteredDelegates,
+    /// Delegate code this "node" stores, for the start-up manifest refresh
+    /// (`ContractExecutor::delegate_code`). Empty by default: no code.
+    pub(crate) delegate_codes: HashMap<DelegateKey, Vec<u8>>,
 }
 
 /// One scripted delegate invocation.
@@ -460,6 +463,10 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.runtime.capabilities.clone()
     }
 
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        self.runtime.delegate_codes.get(key).cloned()
+    }
+
     fn op_manager_handle(&self) -> Option<std::sync::Arc<crate::node::OpManager>> {
         self.op_manager.clone()
     }
@@ -639,6 +646,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            delegate_codes: HashMap::new(),
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 
@@ -675,6 +683,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            delegate_codes: HashMap::new(),
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 
@@ -703,6 +712,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
             capabilities: None,
+            delegate_codes: HashMap::new(),
             unregistered_delegates: UnregisteredDelegates::default(),
         };
 

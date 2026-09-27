@@ -203,10 +203,22 @@ async fn start<P: UserInputPrompter + 'static>(
     script: Vec<ScriptedRun>,
     prompter: P,
 ) -> Loop {
+    start_with_codes(name, caps, script, prompter, Vec::new()).await
+}
+
+/// [`start`], with delegate code the "node" already stores.
+async fn start_with_codes<P: UserInputPrompter + 'static>(
+    name: &str,
+    caps: Arc<DelegateCapabilities>,
+    script: Vec<ScriptedRun>,
+    prompter: P,
+    codes: Vec<(DelegateKey, Vec<u8>)>,
+) -> Loop {
     let (send, rcv, _) = handler::contract_handler_channel();
     let mut handler = MockWasmContractHandler::new_test(rcv, None, name).await;
     let rt = handler.runtime_mut();
     rt.capabilities = Some(caps.clone());
+    rt.delegate_codes.extend(codes);
     let script_handle = rt.delegate_script.clone();
     script_handle.lock().unwrap().extend(script);
     let observations = rt.delegate_observations.clone();
@@ -1292,4 +1304,91 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
         !lp.wakeup_runs().is_empty(),
         "the schedule outlived the starved fires"
     );
+}
+
+/// Restart: wake-ups are not persisted, they are re-armed at node start from
+/// the stored records. The "restarted node" is a second capability instance
+/// over the same storage with an EMPTY queue, so only the start-up seed can
+/// arm anything.
+#[tokio::test(start_paused = true)]
+async fn wakeups_are_rearmed_at_node_start() {
+    let storage = Arc::new(MemoryCapabilityStorage::default());
+    let before = DelegateCapabilities::with_time_source(
+        storage.clone(),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits::default(),
+    );
+    let key = granted_with_wakeups(&before, &[("hb", 300)], b"p", 44);
+    drop(before);
+
+    let after = DelegateCapabilities::with_time_source(
+        storage,
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits::default(),
+    );
+    let lp = start(
+        "wake_restart",
+        after.clone(),
+        vec![ScriptedRun::default(); 8],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs(), vec![(key, b"p".to_vec())]);
+}
+
+/// A delegate registered and granted on v0.2.138, whose record holds its
+/// manifest re-serialized WITHOUT `wakeups`, gets its wake-ups on the first
+/// start of this release: the start-up refresh re-reads the manifest from the
+/// delegate's stored code. No re-registration involved.
+#[tokio::test(start_paused = true)]
+async fn a_record_written_without_wakeups_is_refreshed_from_the_code_at_start() {
+    let storage = Arc::new(MemoryCapabilityStorage::default());
+    let declared = DelegateManifest::new(
+        vec![LifecycleKind::NodeStarted],
+        vec![Capability::Background],
+    )
+    .with_wakeup("hb", 300);
+    let full_code = manifest_module(&declared);
+    let key = container(&declared, b"p").key().clone();
+    // What v0.2.138 stored: the manifest minus the field it did not know.
+    let as_stored = DelegateManifest::from_bytes(
+        br#"{"manifest_version":1,"lifecycle":["node_started"],"capabilities":["background"]}"#,
+    )
+    .unwrap();
+    {
+        let old = DelegateCapabilities::with_time_source(
+            storage.clone(),
+            Arc::new(InstantTimeSrc::new()),
+            BudgetLimits::default(),
+        );
+        let p = old
+            .on_registered(
+                &key,
+                &manifest_module(&as_stored),
+                b"p",
+                Some(AppIdentity::WebApp(app(45))),
+            )
+            .unwrap();
+        old.record_answer(&p, true);
+        assert!(old.wakeup_start_targets().is_empty());
+    }
+
+    let caps = DelegateCapabilities::with_time_source(
+        storage,
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits::default(),
+    );
+    let lp = start_with_codes(
+        "wake_refresh",
+        caps.clone(),
+        vec![ScriptedRun::default(); 8],
+        CapabilityPrompter::answering(None),
+        vec![(key.clone(), full_code)],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs(), vec![(key, b"p".to_vec())]);
 }
