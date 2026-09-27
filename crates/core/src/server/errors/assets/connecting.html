@@ -99,7 +99,7 @@
         }
         if (recoveryStart === null) {
           // Stamp app links and framed pages so retries are wall-clock bounded.
-          var isApp = (pathname || '').indexOf('/v1/contract/web/') === 0;
+          var isApp = /^\/v\d+\/contract\/web\//.test(pathname || ''); // every ApiVersion prefix (server.rs)
           return atTop && !isApp
             ? { action: 'dashboard' }
             : { action: 'stamp' };

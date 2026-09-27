@@ -71,10 +71,17 @@ check(
   'top-level app, no _freload -> stamp (preserve shared app link)',
   connectingRecoveryDecision('', true, NOW, APP_PATH).action === 'stamp',
 );
+check(
+  'top-level v2 app, no _freload -> stamp (every ApiVersion prefix is an app path)',
+  connectingRecoveryDecision('', true, NOW, '/v2/contract/web/shared-key/')
+    .action === 'stamp',
+);
 for (const path of [
   '/status',
   '/v1/contract/web',
   '/v1/contract/website/key/',
+  '/v2/contract/website/key/',
+  '/vx/contract/web/key/',
 ]) {
   check(
     `top-level non-app ${path}, no _freload -> dashboard`,
