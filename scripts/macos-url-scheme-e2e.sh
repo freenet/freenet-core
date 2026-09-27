@@ -52,8 +52,8 @@ fail() {
     ls -la "$LOG_DIR" >&2 2>/dev/null || true
     echo "--- unified log (last 10m, Freenet + LaunchServices) ---" >&2
     log show --last 10m --style compact \
-        --predicate 'process CONTAINS[c] "freenet" OR (subsystem == "com.apple.launchservices" AND eventMessage CONTAINS[c] "freenet")' \
-        2>/dev/null | tail -80 >&2 || true
+        --predicate 'process CONTAINS[c] "freenet" OR eventMessage CONTAINS[c] "org.freenet" OR eventMessage CONTAINS[c] "Freenet.app"' \
+        2>/dev/null | grep -v 'com.apple.network' | tail -120 >&2 || true
     exit 1
 }
 
@@ -98,6 +98,33 @@ fi
 [[ "$(cd "$handler" && pwd -P)" == "$(cd "$APP" && pwd -P)" ]] \
     || fail "freenet:// resolves to $handler, not $APP"
 echo "ok - LaunchServices resolves freenet:// to the bundle"
+
+# 2b. Can the app start at all here? Launch it directly (no link) first, so a
+# failure below can be told apart: "the app cannot start in this environment"
+# vs "the link was not delivered".
+RUN_WRAPPER="Freenet.app/Contents/MacOS/freenet-bin service run-wrapper"
+open -a "$APP" || fail "open -a could not launch the app"
+started=false
+for _ in $(seq 1 30); do
+    if pgrep -f "$RUN_WRAPPER" >/dev/null; then started=true; break; fi
+    sleep 1
+done
+if ! $started; then
+    echo "--- the app did not start via open -a; running its executable directly ---" >&2
+    ( "$APP/Contents/MacOS/Freenet" > "$OUT/direct.log" 2>&1 & echo $! > "$OUT/direct.pid" )
+    sleep 15
+    head -c 4000 "$OUT/direct.log" >&2 || true
+    kill "$(cat "$OUT/direct.pid")" 2>/dev/null || true
+    codesign -dv --verbose=2 "$APP/Contents/MacOS/freenet-bin" >&2 2>&1 || true
+    spctl -a -vv "$APP" >&2 2>&1 || true
+    fail "Freenet.app does not start in this environment"
+fi
+echo "ok - Freenet.app starts via LaunchServices"
+pkill -f "$RUN_WRAPPER" || true
+for _ in $(seq 1 30); do
+    pgrep -f "$RUN_WRAPPER" >/dev/null || break
+    sleep 1
+done
 
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
 # stops the handler opening a browser; it is set for apps LaunchServices

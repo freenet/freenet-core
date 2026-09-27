@@ -1616,12 +1616,13 @@ mod tests {
                 body[line_start..i].trim().is_empty()
             })
         }
-        let freenet = include_str!("../freenet.rs");
+        // Windows checkouts may have CRLF line endings.
+        let freenet = &include_str!("../freenet.rs").replace("\r\n", "\n");
         assert!(called_at_statement(
             fn_body(freenet, "async fn run_network("),
             "commands::url_handler::spawn_self_registration();"
         ));
-        let linux = include_str!("service/linux.rs");
+        let linux = &include_str!("service/linux.rs").replace("\r\n", "\n");
         assert!(called_at_statement(
             fn_body(linux, "fn install_user_service("),
             "super::super::url_handler::register_for_install();"
@@ -1630,7 +1631,7 @@ mod tests {
             fn_body(linux, "pub(super) fn uninstall_service("),
             "super::super::url_handler::unregister_for_uninstall();"
         ));
-        let windows = include_str!("service/windows.rs");
+        let windows = &include_str!("service/windows.rs").replace("\r\n", "\n");
         assert!(called_at_statement(
             fn_body(windows, "pub(super) fn install_service("),
             "super::super::url_handler::register_for_install();"
@@ -1639,7 +1640,7 @@ mod tests {
             fn_body(windows, "pub(super) fn uninstall_service("),
             "super::super::url_handler::unregister_for_uninstall();"
         ));
-        let uninstall = include_str!("uninstall.rs");
+        let uninstall = &include_str!("uninstall.rs").replace("\r\n", "\n");
         assert!(called_at_statement(
             fn_body(uninstall, "    pub fn run("),
             "super::url_handler::unregister_for_uninstall();"
