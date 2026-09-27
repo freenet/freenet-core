@@ -1481,7 +1481,11 @@ fn a_full_wakeup_schedule_sweeps_stale_entries_before_refusing() {
     }
     assert_eq!(schedule.wakeup_count(), MAX_SCHEDULED_WAKEUPS);
     super::schedule_queued_run(Some(&caps), &mut schedule, now, wake(live.clone()));
-    assert_eq!(schedule.wakeup_count(), 1, "stale entries swept, the live one armed");
+    assert_eq!(
+        schedule.wakeup_count(),
+        1,
+        "stale entries swept, the live one armed"
+    );
     assert_eq!(caps.stats.wakeups_schedule_full.load(Ordering::Relaxed), 0);
 
     // Nothing to sweep (no capability state to consult, so nothing is known

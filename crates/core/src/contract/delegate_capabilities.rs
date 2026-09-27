@@ -1509,6 +1509,7 @@ impl DelegateCapabilities {
     /// declares the tag, or no bound app holds the Background grant. Checked
     /// at every fire, so a revocation or a manifest change takes effect at
     /// the next one.
+    #[cfg(test)]
     pub(crate) fn wakeup_delivery(
         &self,
         key: &DelegateKey,
@@ -1520,7 +1521,7 @@ impl DelegateCapabilities {
         }
     }
 
-    /// [`Self::wakeup_delivery`], telling "not eligible" (the schedule ends)
+    /// Whether wake-up `tag` of `key` may fire, telling "not eligible" (the schedule ends)
     /// apart from "could not read whether it is" (a storage error: skip this
     /// fire and keep the schedule, or one transient failure would silently
     /// stop a delegate's wake-ups until the node restarts).
@@ -1875,7 +1876,7 @@ impl LifecycleSchedule {
             .iter()
             .filter_map(|(seq, (run, _))| match &run.event {
                 RunEvent::Wakeup { tag, .. } if !keep(&run.key, tag) => Some(*seq),
-                _ => None,
+                RunEvent::Wakeup { .. } | RunEvent::Lifecycle(_) => None,
             })
             .collect();
         if drop.is_empty() {
@@ -2848,12 +2849,15 @@ mod tests {
         assert_eq!(sched.wakeup_count(), 1);
         assert_eq!(sched.len(), 2);
         let later = t0 + Duration::from_secs(5);
-        let mut popped = vec![sched.pop_due(later), sched.pop_due(later)];
+        let mut popped = [sched.pop_due(later), sched.pop_due(later)];
         popped.sort_by_key(|p| p.as_ref().map(|(r, _)| r.key.to_string()));
         assert!(popped.contains(&Some((installed, 0))));
         assert!(popped.contains(&Some((wake(2, b"a"), 0))));
         assert_eq!(sched.pop_due(later), None);
-        assert!(sched.push(t0, wake(1, b"a"), 0), "a dropped entry frees its slot");
+        assert!(
+            sched.push(t0, wake(1, b"a"), 0),
+            "a dropped entry frees its slot"
+        );
     }
 
     /// Storage that fails reads on demand, to tell "gone" from "unreadable".
@@ -2907,7 +2911,10 @@ mod tests {
         let wasm = wasm_with_manifest(&wakeup_manifest(vec![], &[("hb", 300)]));
         let p = c.on_registered(&key(1), &wasm, b"p", Some(app(1))).unwrap();
         c.record_answer(&p, true);
-        assert!(matches!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Deliver { .. }));
+        assert!(matches!(
+            c.wakeup_check(&key(1), b"hb"),
+            WakeupCheck::Deliver { .. }
+        ));
         storage.fail.store(true, Ordering::Relaxed);
         assert_eq!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Unknown);
         storage.fail.store(false, Ordering::Relaxed);
