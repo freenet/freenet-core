@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 mod commands;
 use commands::{
-    secrets_cmd::SecretsCliConfig, service::ServiceCommand, uninstall::UninstallCommand,
-    update::UpdateCommand,
+    open_link::OpenCommand, secrets_cmd::SecretsCliConfig, service::ServiceCommand,
+    uninstall::UninstallCommand, update::UpdateCommand,
 };
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
@@ -61,6 +61,14 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
+    /// Open a freenet:// link in your browser, via your local Freenet peer.
+    ///
+    /// This is what the operating system runs when you click a freenet:// link
+    /// (for example "Open in Freenet" on freenet.org/open). It opens
+    /// http://127.0.0.1:<port>/v1/contract/web/<contract-id>/... using the port
+    /// from your Freenet config, or a page explaining that Freenet isn't
+    /// running.
+    Open(OpenCommand),
     /// Manage the node KEK (key encryption key) backend.
     ///
     /// The KEK is the master key that every per-delegate data encryption key
@@ -236,6 +244,14 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     let clients = serve_client_api(config.ws_api.clone())
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
+
+    // Register the freenet:// link handler for a managed install whose
+    // registration is missing or stale (#5726). This is how installs that
+    // predate the handler get it: the auto-updater replaces the binary but
+    // never re-runs the installer. Detached and best-effort; it cannot fail,
+    // block or delay the node.
+    commands::url_handler::spawn_self_registration();
+
     tracing::info!("Initializing node configuration");
 
     // Capture before `config` is moved into NodeConfig; threaded to the
@@ -1452,6 +1468,9 @@ fn freenet_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // The link-handler commands need no node directories: skip building
+        // ConfigPaths, which creates them (and has no default in debug builds).
+        Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),
         Some(Command::Service(cmd)) => {
             // Build only ConfigPaths (directory layout), not the full Config
             // which triggers a remote gateway fetch that fails on fresh
@@ -1479,6 +1498,9 @@ fn freenet_main() -> anyhow::Result<()> {
             cmd.run(build_info::VERSION)
         }
         Some(Command::Uninstall(cmd)) => cmd.run(),
+        // Launched by the OS with an untrusted link from any website: no
+        // config build (it fetches gateways), no node, no setup wizard.
+        Some(Command::Open(cmd)) => cmd.run(cli.config.config_paths.config_dir.as_deref()),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
             // multi-thread / blocking-pool tuning needed for IO-light

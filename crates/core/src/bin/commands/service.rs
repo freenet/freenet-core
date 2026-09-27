@@ -138,6 +138,12 @@ pub enum ServiceCommand {
     },
     /// Generate and upload a diagnostic report for debugging
     Report(ReportCommand),
+    /// Register or remove the freenet:// link handler.
+    ///
+    /// `freenet service install` registers it and `freenet service uninstall`
+    /// removes it, so this is only needed for installs without the service.
+    #[command(subcommand)]
+    UrlHandler(super::url_handler::UrlHandlerCommand),
     /// Internal: process wrapper that manages the freenet node lifecycle.
     /// Handles auto-update (exit code 42), crash backoff, log capture,
     /// and on Windows shows a system tray icon.
@@ -172,6 +178,7 @@ impl ServiceCommand {
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
             }
+            ServiceCommand::UrlHandler(cmd) => cmd.run(),
             ServiceCommand::RunWrapper => run_wrapper(version),
         }
     }
@@ -208,6 +215,15 @@ pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 /// assert their consistency on Linux CI.
 #[allow(dead_code)]
 const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
+
+/// Append a line to the wrapper's own log (the wrapper process has no
+/// tracing subscriber, so `tracing` output from it goes nowhere).
+#[cfg(target_os = "macos")]
+pub(crate) fn log_to_wrapper_log(message: &str) {
+    if let Some(dir) = freenet::tracing::tracer::get_log_dir() {
+        wrapper::log_wrapper_event(&dir, message);
+    }
+}
 
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]

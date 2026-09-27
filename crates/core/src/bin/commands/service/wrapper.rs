@@ -546,6 +546,11 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
                     std::process::id()
                 ),
             );
+            // LaunchServices may have launched this copy to deliver a
+            // freenet:// link; open it rather than drop it (#5726).
+            #[cfg(target_os = "macos")]
+            super::super::tray::handle_links_sent_to_duplicate(std::time::Duration::from_secs(3));
+            #[cfg(not(target_os = "macos"))]
             return Ok(());
         }
         AcquireWrapperLockOutcome::UnavailableSoProceed => {
