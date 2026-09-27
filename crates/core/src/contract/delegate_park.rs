@@ -600,6 +600,9 @@ pub(super) struct Continuation {
     /// in a row must not strand its client.
     pub responder: Option<StashedResponder>,
     pub delivery: Delivery,
+    /// Charge this run's resumed legs to the node duty bucket too (lifecycle
+    /// and wake-up runs); see `ParkingCtx::node_wide_duty`.
+    pub node_wide_duty: bool,
 }
 
 /// One parked delegate.
@@ -1617,6 +1620,7 @@ mod tests {
             inbound_so_far: Vec::new(),
             responder: None,
             delivery: Delivery::Client,
+            node_wide_duty: false,
             iterations: 0,
         }
     }

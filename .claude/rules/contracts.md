@@ -72,7 +72,7 @@ delegates without a manifest are untouched.
 
 Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
 declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at
-every fire (wakeup_delivery). Declared in the manifest ON PURPOSE: a host import
+every fire (wakeup_check; a storage error skips that fire, never ends the schedule). Declared in the manifest ON PURPOSE: a host import
 fails instantiation on nodes without it, and a new OutboundDelegateMsg variant
 fails decoding of the whole outbound batch on older nodes; an unknown manifest
 field is ignored. DO NOT add a run-time request (import or outbound variant)
@@ -80,7 +80,19 @@ without solving that. Bounds: effective_wakeups (60 s floor, 4 per delegate),
 one pending fire per (delegate, tag), and the SAME duty budget as lifecycle
 runs (one budget, not two). Not persisted: re-armed at node start after
 refresh_capability_manifests re-reads manifests from stored code (older nodes
-stored them without `wakeups`).
+stored them without `wakeups`). A parked unprompted run is charged for its
+resumed legs too (handle_delegate_resume, #5748).
+
+Consent: wake-ups ride the existing Background grant (decided with the work's
+brief: "gate on the #5730 Background grant"); an app granted under the older
+card text gets periodic runs without a new prompt. Revoking stops them at the
+next fire.
+
+Old delegate versions: a re-keyed delegate's OLD key keeps its record, and so
+its wake-ups, while any app stays bound to it. Only an unregister by a bound
+app from a local connection removes a binding (the record goes with the last
+one); a CLI or remote unregister does not. An app that re-keys should
+unregister the old key from its own tab once its migration is done.
 ```
 
 ### WASM Call Modes

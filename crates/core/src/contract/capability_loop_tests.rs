@@ -1282,12 +1282,14 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
         CapabilityPrompter::answering(None),
     )
     .await;
-    // Three intervals: every fire deferred, then skipped; none run.
-    tokio::time::sleep(Duration::from_secs(66 + 3 * 66)).await;
+    // Several intervals: every fire deferred, then skipped; none run. At
+    // least 3 skips, so the exact per-fire deferral count below cannot be
+    // matched by a different retry count on any random draw.
+    tokio::time::sleep(Duration::from_secs(66 + 5 * 72)).await;
     lp.sync().await;
     assert!(lp.wakeup_runs().is_empty(), "never runs over budget");
     let skipped = caps.stats.wakeups_skipped.load(Ordering::Relaxed);
-    assert!(skipped >= 2, "each starved fire is skipped, got {skipped}");
+    assert!(skipped >= 3, "each starved fire is skipped, got {skipped}");
     // Each skipped fire was deferred on its first attempt and on each of its
     // WAKEUP_MAX_DEFERRALS retries (one more fire may be part-way through).
     let deferred = caps.stats.wakeups_deferred.load(Ordering::Relaxed);
@@ -1498,10 +1500,162 @@ fn a_full_wakeup_schedule_sweeps_stale_entries_before_refusing() {
         );
         unsweepable.push(now, wake(k), 0);
     }
-    super::schedule_queued_run(None, &mut unsweepable, now, wake(live));
+    super::schedule_queued_run(None, &mut unsweepable, now, wake(live.clone()));
     assert_eq!(
         unsweepable.wakeup_count(),
         MAX_SCHEDULED_WAKEUPS,
         "not grown past the cap"
+    );
+}
+
+/// #5748: a background run that PARKS (any off-loop contract fetch or network
+/// op does, not only a prompt) is charged for its resumed leg too, to the same
+/// buckets as its first leg. Real clock with no refill, so the balances move
+/// only by charges; the delegate is held parked (a gated prompt) so the test
+/// can read the balance between the two legs.
+#[tokio::test]
+async fn the_resumed_leg_of_a_parked_background_run_is_charged() {
+    struct GatedPrompt(Arc<tokio::sync::Semaphore>);
+    impl UserInputPrompter for GatedPrompt {
+        async fn prompt(
+            &self,
+            request: &UserInputRequest<'static>,
+            _delegate_key: &str,
+            _caller: CallerIdentity,
+        ) -> Option<(usize, ClientResponse<'static>)> {
+            self.0.acquire().await.expect("gate").forget();
+            request
+                .responses
+                .first()
+                .map(|r| (0, r.clone().into_owned()))
+        }
+    }
+    let caps = DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits {
+            duty_refill_per_sec: Duration::ZERO,
+            node_duty_refill_per_sec: Duration::ZERO,
+            ..BudgetLimits::default()
+        },
+    );
+    let message = NotificationMessage::try_from(&serde_json::json!({"message": "ok?"}))
+        .expect("notification message");
+    let prompt = ScriptedRun::from(vec![OutboundDelegateMsg::RequestUserInput(
+        UserInputRequest {
+            request_id: 1,
+            message,
+            responses: vec![ClientResponse::new(b"yes".to_vec())],
+        },
+    )]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let lp = start(
+        "resume_charged",
+        caps.clone(),
+        vec![prompt, ScriptedRun::default()],
+        GatedPrompt(gate.clone()),
+    )
+    .await;
+    // Granted AFTER the loop started, so the start-up seed holds nothing for it
+    // and the run below is due at once (not a duplicate of a smeared seed).
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 48);
+    assert!(
+        caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
+    wait_until("the run to park", || {
+        caps.stats.lifecycle_delivered.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    let (delegate_parked, node_parked) = caps.duty_balances_us(&key);
+    let delegate_parked = delegate_parked.expect("first leg charged");
+
+    gate.add_permits(1);
+    wait_until("the resumed leg", || {
+        lp.observations.lock().unwrap().len() == 2
+    })
+    .await;
+    // The resumed leg's charge lands just after it returns.
+    wait_until("the resumed leg's charge", || {
+        caps.duty_balances_us(&key).0.expect("tracked") < delegate_parked
+    })
+    .await;
+    assert!(
+        caps.duty_balances_us(&key).1 < node_parked,
+        "a lifecycle/wake-up run's resumed leg is charged node-wide too"
+    );
+}
+
+/// A routine re-arm of an ALREADY scheduled wake-up does not trip the cap:
+/// no sweep, no "schedule full", just counted as already armed.
+#[test]
+fn rearming_a_scheduled_wakeup_at_the_cap_is_not_a_refusal() {
+    use super::delegate_capabilities::{LifecycleSchedule, MAX_SCHEDULED_WAKEUPS, RunEvent};
+    let caps = DelegateCapabilities::in_memory();
+    let live = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 49);
+    let now = tokio::time::Instant::now();
+    let wake = |key: DelegateKey| LifecycleRun {
+        key,
+        event: RunEvent::Wakeup {
+            tag: b"hb".to_vec(),
+            every: Duration::from_secs(60),
+        },
+    };
+    let mut schedule = LifecycleSchedule::default();
+    assert!(schedule.push(now, wake(live.clone()), 0));
+    for n in 1..MAX_SCHEDULED_WAKEUPS as u32 {
+        let stale = DelegateKey::new(
+            *blake3::hash(&n.to_le_bytes()).as_bytes(),
+            CodeHash::new([7; 32]),
+        );
+        schedule.push(now, wake(stale), 0);
+    }
+    super::schedule_queued_run(Some(&caps), &mut schedule, now, wake(live));
+    assert_eq!(
+        schedule.wakeup_count(),
+        MAX_SCHEDULED_WAKEUPS,
+        "no sweep for a duplicate"
+    );
+    assert_eq!(caps.stats.wakeups_already_armed.load(Ordering::Relaxed), 1);
+    assert_eq!(caps.stats.wakeups_schedule_full.load(Ordering::Relaxed), 0);
+}
+
+/// A storage error while checking a fire skips THAT fire and keeps the
+/// schedule: once the store reads again, the delegate is woken again.
+#[tokio::test(start_paused = true)]
+async fn a_storage_error_at_fire_time_skips_the_fire_but_keeps_the_schedule() {
+    let storage = Arc::new(super::delegate_capabilities::FlakyCapabilityStorage::default());
+    let caps = DelegateCapabilities::with_time_source(
+        storage.clone(),
+        Arc::new(InstantTimeSrc::new()),
+        BudgetLimits::default(),
+    );
+    let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 50);
+    let lp = start(
+        "wake_storage_error",
+        caps.clone(),
+        vec![ScriptedRun::default(); 8],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    storage.fail_records.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    assert!(lp.wakeup_runs().is_empty());
+    assert_eq!(caps.stats.wakeups_storage_error.load(Ordering::Relaxed), 1);
+    assert_eq!(caps.stats.wakeups_stopped.load(Ordering::Relaxed), 0);
+
+    storage.fail_records.store(false, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    lp.sync().await;
+    assert_eq!(
+        lp.wakeup_runs(),
+        vec![(key, b"p".to_vec())],
+        "the schedule survived the unreadable fire"
     );
 }

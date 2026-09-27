@@ -1225,6 +1225,11 @@ struct ParkingCtx<'a> {
     /// new continuation, and if it completes the caller reads what is left here
     /// and answers the client. A fresh run passes `&mut None`.
     carried_responder: &'a mut Option<StashedResponder>,
+    /// Whether this run's loop time is charged to the NODE duty bucket too:
+    /// lifecycle and wake-up runs, not notification or client runs. Carried
+    /// into the continuation so a resumed leg is charged like the first one
+    /// (see `charge_resumed_leg`).
+    node_wide_duty: bool,
 }
 
 /// State carried into a delegate run that is continuing an earlier one.
@@ -2603,6 +2608,7 @@ where
                     // is itself a resume that is parking again.
                     responder: ctx.carried_responder.take(),
                     delivery: ctx.delivery,
+                    node_wide_duty: ctx.node_wide_duty,
                 };
                 // Charge what the OFF-LOOP TASK will retain, not just what the
                 // continuation points at: the prompts and the deferred upserts
@@ -3425,6 +3431,18 @@ fn schedule_queued_run(
             now + delegate_capabilities::first_wakeup_delay(*every)
         }
     };
+    // Already scheduled (every registration re-arms a wake-up): skip the cap
+    // check, and above all its sweep, for the routine case. A duplicate
+    // lifecycle run still goes to `push`, which restarts the waiting run's
+    // attempt count.
+    if is_wakeup && schedule.contains(&run.key, &run.event.kind()) {
+        if let Some(caps) = caps {
+            caps.stats
+                .wakeups_already_armed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
     if is_wakeup && schedule.wakeup_count() >= delegate_capabilities::MAX_SCHEDULED_WAKEUPS {
         // Entries of delegates unregistered since they were armed linger
         // until due; sweep them before refusing anything. Kept: everything
@@ -4378,6 +4396,7 @@ async fn handle_delegate_notification<CH, P>(
             // No client behind a notification-driven run; residual messages fan
             // out to registered apps instead.
             delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: false,
             carried_responder: &mut no_responder,
         }),
         RunSeed::default(),
@@ -4925,6 +4944,7 @@ where
         Some(ParkingCtx {
             park,
             delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: true,
             carried_responder: &mut no_responder,
         }),
         RunSeed::default(),
@@ -5176,6 +5196,7 @@ async fn dispatch_delegate_request<CH, P>(
         Some(ParkingCtx {
             park: &mut *park,
             delivery: delegate_park::Delivery::Client,
+            node_wide_duty: false,
             carried_responder: &mut carried_responder,
         }),
         RunSeed::default(),
@@ -5341,7 +5362,18 @@ where
         inbound_so_far,
         responder,
         delivery,
+        node_wide_duty,
     } = continuation;
+    // The resumed leg is loop time like the first one: charge it to the same
+    // duty buckets (#5748). Without this a background run that parks (every
+    // off-loop contract fetch or network op does, not only prompts) spends
+    // its resumed leg free, every time, and the "1% of loop time" bound does
+    // not hold for exactly the delegates the budget exists for.
+    let leg_clock = is_unprompted_run(inter_delegate)
+        .then(|| contract_handler.executor().delegate_capabilities())
+        .flatten()
+        .filter(|caps| caps.is_budgeted(&delegate_key))
+        .map(|caps| (caps.now(), caps));
 
     let mut all_inbound = inbound_so_far;
     // Re-run any deferred upserts ON the loop (WASM stays serial; only the
@@ -5423,6 +5455,7 @@ where
                 park: &mut *park,
                 delivery,
                 carried_responder: &mut carried_responder,
+                node_wide_duty,
             }),
             // SEED, not append-afterwards (#5544 B3). What the delegate emitted
             // before the earlier park has to be inside the run, so that if this
@@ -5437,6 +5470,13 @@ where
         )
         .await
     };
+    if let Some((started, caps)) = leg_clock {
+        caps.charge_duty(
+            &delegate_key,
+            caps.now().saturating_duration_since(started),
+            node_wide_duty,
+        );
+    }
 
     match outcome {
         DelegateRunOutcome::Parked => {
@@ -5583,6 +5623,7 @@ async fn run_queued_notification<CH, P>(
         park.map(|park| ParkingCtx {
             park,
             delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: false,
             carried_responder: &mut no_responder,
         }),
         RunSeed::default(),
@@ -11012,6 +11053,7 @@ mod hol_4391_tests {
             inbound_so_far: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
+            node_wide_duty: false,
         }
     }
 

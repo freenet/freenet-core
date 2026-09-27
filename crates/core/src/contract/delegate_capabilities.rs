@@ -478,6 +478,50 @@ impl CapabilityStorage for MemoryCapabilityStorage {
     }
 }
 
+/// [`MemoryCapabilityStorage`] whose record and grant READS can be made to
+/// fail, to tell "gone" from "unreadable" in tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FlakyCapabilityStorage {
+    inner: MemoryCapabilityStorage,
+    pub fail_records: std::sync::atomic::AtomicBool,
+    pub fail_grants: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl CapabilityStorage for FlakyCapabilityStorage {
+    fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_record(key, value)
+    }
+    fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.fail_records.load(Ordering::Relaxed) {
+            anyhow::bail!("injected record read failure");
+        }
+        self.inner.get_record(key)
+    }
+    fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()> {
+        self.inner.remove_record(key)
+    }
+    fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>> {
+        self.inner.all_records()
+    }
+    fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_grant(key, value)
+    }
+    fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.fail_grants.load(Ordering::Relaxed) {
+            anyhow::bail!("injected grant read failure");
+        }
+        self.inner.get_grant(key)
+    }
+    fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()> {
+        self.inner.remove_grant(key)
+    }
+    fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.all_grants()
+    }
+}
+
 /// Read a delegate's manifest from its raw WASM module. `None` for no
 /// manifest, and for an unreadable one (logged): a delegate whose manifest
 /// cannot be read is treated as having asked for nothing.
@@ -1000,7 +1044,13 @@ impl DelegateCapabilities {
     /// "this delegate is gone". An unreadable (undecodable) record is `Ok(None)`.
     fn load_record_checked(&self, key: &DelegateKey) -> Result<Option<DelegateRecord>, ()> {
         match self.storage.get_record(key) {
-            Ok(Some(bytes)) => Ok(DelegateRecord::decode(&bytes)),
+            Ok(Some(bytes)) => {
+                let rec = DelegateRecord::decode(&bytes);
+                if rec.is_none() {
+                    tracing::warn!(delegate = %key, "Unreadable delegate capability record; ignoring it");
+                }
+                Ok(rec)
+            }
             Ok(None) => Ok(None),
             Err(e) => {
                 tracing::warn!(delegate = %key, error = %e, "Failed to read delegate capability record");
@@ -1859,6 +1909,11 @@ impl LifecycleSchedule {
         let (run, attempts) = self.runs.remove(&seq)?;
         self.pending.remove(&(run.key.clone(), run.event.kind()));
         Some((run, attempts))
+    }
+
+    /// Whether a run of this kind for this delegate is already waiting.
+    pub(crate) fn contains(&self, key: &DelegateKey, kind: &RunKind) -> bool {
+        self.pending.contains_key(&(key.clone(), kind.clone()))
     }
 
     /// Wake-up entries currently scheduled.
@@ -2795,7 +2850,7 @@ mod tests {
     /// ONE budget across delegates and kinds: a lifecycle run of one delegate
     /// that spends the node bucket holds back another delegate's wake-up.
     #[test]
-    fn the_node_duty_bucket_is_shared_across_delegates_and_run_kinds() {
+    fn the_node_duty_bucket_is_shared_across_delegates() {
         let (c, _) = caps();
         assert!(c.duty_available(&key(2)));
         c.charge_duty(&key(1), Duration::from_secs(40), true);
@@ -2860,49 +2915,9 @@ mod tests {
         );
     }
 
-    /// Storage that fails reads on demand, to tell "gone" from "unreadable".
-    #[derive(Default)]
-    struct FlakyStorage {
-        inner: MemoryCapabilityStorage,
-        fail: std::sync::atomic::AtomicBool,
-    }
-
-    impl CapabilityStorage for FlakyStorage {
-        fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
-            self.inner.put_record(key, value)
-        }
-        fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>> {
-            if self.fail.load(Ordering::Relaxed) {
-                anyhow::bail!("injected read failure");
-            }
-            self.inner.get_record(key)
-        }
-        fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()> {
-            self.inner.remove_record(key)
-        }
-        fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>> {
-            self.inner.all_records()
-        }
-        fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-            self.inner.put_grant(key, value)
-        }
-        fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-            if self.fail.load(Ordering::Relaxed) {
-                anyhow::bail!("injected read failure");
-            }
-            self.inner.get_grant(key)
-        }
-        fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()> {
-            self.inner.remove_grant(key)
-        }
-        fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-            self.inner.all_grants()
-        }
-    }
-
     #[test]
     fn an_unreadable_store_is_unknown_not_ineligible() {
-        let storage = Arc::new(FlakyStorage::default());
+        let storage = Arc::new(FlakyCapabilityStorage::default());
         let c = DelegateCapabilities::with_time_source(
             storage.clone(),
             Arc::new(crate::util::time_source::SharedMockTimeSource::new()),
@@ -2915,9 +2930,15 @@ mod tests {
             c.wakeup_check(&key(1), b"hb"),
             WakeupCheck::Deliver { .. }
         ));
-        storage.fail.store(true, Ordering::Relaxed);
+        // The record unreadable.
+        storage.fail_records.store(true, Ordering::Relaxed);
         assert_eq!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Unknown);
-        storage.fail.store(false, Ordering::Relaxed);
+        storage.fail_records.store(false, Ordering::Relaxed);
+        // The record readable, the GRANT unreadable: still unknown, not "not
+        // granted" (which would end the schedule).
+        storage.fail_grants.store(true, Ordering::Relaxed);
+        assert_eq!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Unknown);
+        storage.fail_grants.store(false, Ordering::Relaxed);
         assert_eq!(c.wakeup_check(&key(1), b"nope"), WakeupCheck::Ineligible);
         assert_eq!(c.wakeup_check(&key(9), b"hb"), WakeupCheck::Ineligible);
     }
