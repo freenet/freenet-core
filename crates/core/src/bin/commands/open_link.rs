@@ -464,27 +464,14 @@ fn launch(target: &str) -> Result<()> {
     }
 }
 
-/// Escape text for an HTML attribute or element body.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// What the local fallback page reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FallbackPage {
-    /// The link was valid but no node answered on the port.
-    NotRunning { local_url: String, port: u16 },
+    /// The link was valid but no Freenet node answered on the port. Carries no
+    /// part of the link: it can hold a secret (e.g. a River invite), and this
+    /// page is a file on disk. The user goes back and clicks the link again,
+    /// which re-runs the handler, probe included.
+    NotRunning { port: u16 },
     /// The link failed validation. Carries no attacker-controlled text.
     InvalidLink,
 }
@@ -501,17 +488,18 @@ fn start_instructions() -> &'static str {
     }
 }
 
-/// Render the fallback page. Pure, so it is unit-tested.
+/// Render the fallback page. Pure, so it is unit-tested. It interpolates
+/// nothing from the link (only the port number), so there is nothing to
+/// escape.
 pub fn render_fallback_page(page: &FallbackPage) -> String {
     let (title, body) = match page {
-        FallbackPage::NotRunning { local_url, port } => (
+        FallbackPage::NotRunning { port } => (
             "Freenet isn't running",
             format!(
                 "<p>This link opens a Freenet site on your own computer, but no Freenet \
                  peer answered on port {port}.</p>\n<p>{}</p>\n\
-                 <p><a class=\"button\" href=\"{}\">Try again</a></p>",
+                 <p>Then go back and click the link again.</p>",
                 start_instructions(),
-                html_escape(local_url),
             ),
         ),
         FallbackPage::InvalidLink => (
@@ -565,20 +553,30 @@ fn show_fallback_page(page: &FallbackPage) -> Result<()> {
     #[cfg(target_os = "linux")]
     notify_desktop(page);
     let dir = fallback_page_dir().context("no cache directory")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    sweep_stale_fallback_pages_in(&dir, FALLBACK_PAGE_LIFETIME);
+    write_and_open_fallback_page(page, &dir, launch)
+}
+
+/// Write the page into `dir` and hand it to `open`; a page whose launch
+/// fails is removed at once. Split out so the failure path is testable.
+fn write_and_open_fallback_page(
+    page: &FallbackPage,
+    dir: &Path,
+    open: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    sweep_stale_fallback_pages_in(dir, FALLBACK_PAGE_LIFETIME);
     // One file per invocation, so concurrent handlers cannot overwrite each
     // other's page. Owner-only (0600 on Unix, via tempfile).
     let file = tempfile::Builder::new()
         .prefix(FALLBACK_PAGE_PREFIX)
         .suffix(".html")
-        .tempfile_in(&dir)
+        .tempfile_in(dir)
         .with_context(|| format!("creating a page in {}", dir.display()))?;
     std::io::Write::write_all(&mut file.as_file(), render_fallback_page(page).as_bytes())?;
     let (_, path) = file
         .keep()
         .map_err(|e| anyhow::anyhow!("keeping the page: {e}"))?;
-    if let Err(e) = launch(&path.to_string_lossy()) {
+    if let Err(e) = open(&path.to_string_lossy()) {
         drop(std::fs::remove_file(&path));
         return Err(e);
     }
@@ -592,12 +590,11 @@ fn fallback_page_dir() -> Option<PathBuf> {
 
 const FALLBACK_PAGE_PREFIX: &str = "open-link-";
 
-/// How long a fallback page is kept. The "not running" page links to the full
-/// target, which can carry a secret in its query or fragment (e.g. a River
-/// invite), so pages are not left in the cache indefinitely; but the browser
-/// must have loaded the page first, and a cold browser start can be slow.
-/// Nothing sleeps for this: stale pages are swept by the next handler run and
-/// whenever the node starts ([`sweep_stale_fallback_pages`]).
+/// How long a fallback page is kept. The pages carry no part of the link, so
+/// this is only tidiness: the browser must have loaded the page first, and a
+/// cold browser start can be slow. Nothing sleeps for this: stale pages are
+/// swept by the next fallback page and whenever the node starts
+/// ([`sweep_stale_fallback_pages`]).
 const FALLBACK_PAGE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// Delete fallback pages in `dir` older than `max_age`. Best effort.
@@ -690,10 +687,7 @@ pub fn handle_link(link: &str, wait: Duration, config_dir: Option<&Path>) -> Han
             }
         }
     } else {
-        let page = FallbackPage::NotRunning {
-            local_url: local_url.clone(),
-            port,
-        };
+        let page = FallbackPage::NotRunning { port };
         if let Err(err) = show_fallback_page(&page) {
             tracing::warn!(error = %err, "could not show the not-running page");
         }
@@ -1005,17 +999,43 @@ mod tests {
 
     #[test]
     fn fallback_pages_escape_and_carry_no_link_text() {
-        let page = render_fallback_page(&FallbackPage::NotRunning {
-            local_url: "http://127.0.0.1:7509/v1/contract/web/x/?a=1&b=\"<'".into(),
-            port: 7509,
-        });
-        assert!(page.contains(
-            "href=\"http://127.0.0.1:7509/v1/contract/web/x/?a=1&amp;b=&quot;&lt;&#39;\""
-        ));
-        assert!(!page.contains("b=\"<'"));
+        let page = render_fallback_page(&FallbackPage::NotRunning { port: 7509 });
+        assert!(page.contains("Freenet isn't running"));
+        assert!(page.contains("port 7509"));
+        assert!(
+            !page.contains("href=\"http://127.0.0.1"),
+            "the page must not carry the link"
+        );
         let invalid = render_fallback_page(&FallbackPage::InvalidLink);
         assert!(invalid.contains("isn't valid"));
         assert!(!invalid.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_page_whose_launch_fails_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let result =
+            write_and_open_fallback_page(&FallbackPage::NotRunning { port: 1 }, dir.path(), |p| {
+                assert!(Path::new(p).exists(), "the page exists while being opened");
+                bail!("no browser")
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "page left behind"
+        );
+
+        let mut opened = String::new();
+        write_and_open_fallback_page(&FallbackPage::InvalidLink, dir.path(), |p| {
+            opened = p.to_string();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            Path::new(&opened).exists(),
+            "a page that opened is kept for the browser"
+        );
     }
 
     #[test]

@@ -232,9 +232,11 @@ fn not_running_node_gets_the_explanatory_page() {
     assert!(is_fallback_page(&page_path), "{page_path}");
     let page = std::fs::read_to_string(&page_path).expect("read page");
     assert!(page.contains("Freenet isn't running"));
-    assert!(page.contains(&format!(
-        "href=\"http://127.0.0.1:{port}/v1/contract/web/{RIVER}/#invite=SECRET-TOKEN\""
-    )));
+    // The page is a file on disk: it must not carry the link, whose query or
+    // fragment can be a secret (the user goes back and clicks the link again).
+    assert!(!page.contains("SECRET-TOKEN"), "{page}");
+    assert!(!page.contains(RIVER), "{page}");
+    assert!(page.contains(&format!("port {port}")), "{page}");
     // Stderr from a browser-launched handler usually lands in the journal:
     // it must not carry the link, whose fragment can be a secret.
     let stderr = String::from_utf8_lossy(&out.stderr);

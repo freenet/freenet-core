@@ -102,7 +102,15 @@ launchctl setenv FREENET_TELEMETRY_ENABLED false
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR"/freenet-wrapper.*.log
 
+# Links handled by the running wrapper ("from LaunchServices") or by a
+# duplicate launch that lost the single-instance lock ("in a duplicate
+# launch"); both open the link.
 handled_count() {
+    cat "$LOG_DIR"/freenet-wrapper.*.log 2>/dev/null \
+        | grep -c 'Handled a freenet:// link' || true
+}
+
+running_instance_count() {
     cat "$LOG_DIR"/freenet-wrapper.*.log 2>/dev/null \
         | grep -c 'Handled a freenet:// link from LaunchServices' || true
 }
@@ -129,10 +137,11 @@ echo "ok - a link launches Freenet.app and is handled"
 # parses the link into a url::Url before the handler sees it, which already
 # resolves dot segments, so that case is covered by the unit tests instead.)
 open "freenet://11111111111111111111111111111111/"
-# A second instance launched for this link would lose the single-instance
-# lock and exit without handling it, so reaching count 2 proves the RUNNING
-# instance received it.
 wait_for_count 2 || fail "the running app never handled the second link"
+# The app was already running and settled, so LaunchServices must have given
+# the link to it, not to a duplicate launch.
+[[ "$(running_instance_count)" -ge 2 ]] \
+    || fail "the second link went to a duplicate launch, not the running app"
 grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
     || fail "an invalid link was not refused"
 echo "ok - a second link reaches the running instance, and a hostile one is refused"

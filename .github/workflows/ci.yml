@@ -1169,8 +1169,8 @@ jobs:
           if ((Get-ItemProperty 'HKCU:\Software\Classes\freenet').'URL Protocol' -ne '') { throw 'URL Protocol value missing' }
           $pages = Join-Path $env:LOCALAPPDATA 'freenet'
           $env:FREENET_OPEN_DRY_RUN = '1'
-          # The handler writes one open-link-*.html per link (and deletes it
-          # after 20s unless the dry-run variable reached it).
+          # The handler writes one open-link-*.html per link (stale ones are
+          # swept later, so it is still there to read).
           function Invoke-Link([string]$link) {
             Remove-Item (Join-Path $pages 'open-link-*.html') -ErrorAction SilentlyContinue
             Start-Process $link

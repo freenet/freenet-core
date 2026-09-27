@@ -762,17 +762,28 @@ pub fn handle_links_sent_to_duplicate(window: std::time::Duration) -> ! {
     use std::time::{Duration, Instant};
     use tao::event::Event;
     use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 
     let deadline = Instant::now() + window;
-    let event_loop = EventLoop::new();
+    let mut event_loop = EventLoop::new();
+    // A background helper, not an app the user switched to: no Dock icon, no
+    // stealing focus (tao defaults to a regular, activating app).
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    event_loop.set_activate_ignoring_other_apps(false);
     event_loop.run(move |event, _window, control_flow| {
         *control_flow = ControlFlow::WaitUntil(deadline);
         if let Event::Opened { urls } = event {
             // Handled inline: this process does nothing else, and it must not
             // exit before the browser has been asked to open the link.
             for url in urls.iter().take(4) {
-                let outcome =
-                    super::open_link::handle_link(url.as_str(), Duration::from_secs(5), None);
+                // The running wrapper may have only just started its node
+                // (this is the login/relaunch window), so wait as long as a
+                // fresh launch would.
+                let outcome = super::open_link::handle_link(
+                    url.as_str(),
+                    super::open_link::APP_LAUNCH_NODE_WAIT,
+                    None,
+                );
                 super::service::log_to_wrapper_log(&format!(
                     "Handled a freenet:// link in a duplicate launch: outcome={}",
                     outcome.kind()
