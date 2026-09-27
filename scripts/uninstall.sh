@@ -231,26 +231,36 @@ removed_handler="0"
 if [ "$OS" = "linux" ]; then
     APPS_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/applications"
     DESKTOP_ENTRY="${APPS_DIR}/freenet-url-handler.desktop"
-    if [ -f "$DESKTOP_ENTRY" ] && grep -qx 'X-Freenet-Managed=true' "$DESKTOP_ENTRY"; then
-        rm -f "$DESKTOP_ENTRY"
-        info "Removed ${DESKTOP_ENTRY}"
-        removed_handler="1"
-        if has_cmd update-desktop-database; then
-            update-desktop-database -q "$APPS_DIR" >/dev/null 2>&1 || true
+    handler_is_ours="1"
+    if [ -f "$DESKTOP_ENTRY" ]; then
+        if grep -qx 'X-Freenet-Managed=true' "$DESKTOP_ENTRY"; then
+            rm -f "$DESKTOP_ENTRY"
+            info "Removed ${DESKTOP_ENTRY}"
+            removed_handler="1"
+            if has_cmd update-desktop-database; then
+                update-desktop-database -q "$APPS_DIR" >/dev/null 2>&1 || true
+            fi
+        else
+            # Someone else's file at our path: it, and the association
+            # naming it, are not ours to remove.
+            handler_is_ours="0"
         fi
     fi
-    MIMEAPPS="${XDG_CONFIG_HOME:-${HOME}/.config}/mimeapps.list"
     HANDLER_LINE='^x-scheme-handler/freenet=freenet-url-handler\.desktop;\{0,1\}$'
-    if [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
-        tmp_list="${MIMEAPPS}.freenet-uninstall.$$"
-        # grep -v exits 1 when it prints nothing (the file held only our
-        # line); that is still success here.
-        { grep -v "$HANDLER_LINE" "$MIMEAPPS" || true; } > "$tmp_list" \
-            && mv "$tmp_list" "$MIMEAPPS" \
-            && info "Removed the freenet:// association from ${MIMEAPPS}"
-        rm -f "$tmp_list"
-        removed_handler="1"
-    fi
+    # The current XDG location, and the one older xdg-utils wrote to.
+    for MIMEAPPS in "${XDG_CONFIG_HOME:-${HOME}/.config}/mimeapps.list" "${APPS_DIR}/mimeapps.list"; do
+        if [ "$handler_is_ours" = "1" ] && [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
+            tmp_list="$(mktemp)"
+            # grep -v exits 1 when it prints nothing (the file held only our
+            # line); that is still success here. `cat >` rather than `mv`
+            # writes through a symlinked (dotfile-managed) list.
+            { grep -v "$HANDLER_LINE" "$MIMEAPPS" || true; } > "$tmp_list" \
+                && cat "$tmp_list" > "$MIMEAPPS" \
+                && info "Removed the freenet:// association from ${MIMEAPPS}"
+            rm -f "$tmp_list"
+            removed_handler="1"
+        fi
+    done
 fi
 
 # --- Step 2: remove binaries from every known install location ------------

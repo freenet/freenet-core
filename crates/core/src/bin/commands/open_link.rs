@@ -21,10 +21,24 @@
 //!   (`open -- %u` / `open -- "%1"`), and exactly one positional is accepted, so
 //!   argument injection cannot smuggle in a flag or a second argument.
 //!
-//! The handler never starts a stopped node: that would interact with the
-//! service supervisors (systemd's start limit, a wrapper mid-update). When the
-//! node is not reachable it opens a local page that says so instead of failing
-//! silently.
+//! Two link forms are accepted: `freenet://<id><rest>` (what the /open page
+//! emits today) and the authority-less `freenet:<id><rest>`. The second exists
+//! because some desktops re-parse the link before handing it over and
+//! lowercase a URL's host, which in the first form is the case-sensitive
+//! contract id (Qt's `QUrl`, used by KDE's `kde-open`, does this). The
+//! authority-less form has no host to lowercase.
+//!
+//! The handler itself never starts a stopped node: that would interact with
+//! the service supervisors (systemd's start limit, a wrapper mid-update). When
+//! the node is not reachable it opens a local page that says so instead of
+//! failing silently. On macOS, LaunchServices launches `Freenet.app` to
+//! deliver a link if it is not running, exactly as a double-click would; the
+//! in-app handler then waits for the node it just started.
+//!
+//! The port comes from `ws-api-port` in the node's config (`--config-dir` /
+//! `CONFIG_DIR` if given, else the default config directory). The URL is
+//! always `127.0.0.1`, so a node bound only to a specific non-loopback address
+//! reads as "not running".
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -99,13 +113,20 @@ impl std::fmt::Display for LinkError {
     }
 }
 
-/// Parse a full `freenet://...` link. The scheme is matched case-insensitively
-/// (RFC 3986); only the authority form the /open page emits is accepted.
+/// Parse a full link: `freenet://<id><rest>` or `freenet:<id><rest>`. The
+/// scheme is matched case-insensitively (RFC 3986). In the authority-less
+/// form the id must follow the colon directly, so `freenet:/x` and
+/// `freenet:///x` are refused rather than guessed at.
 pub fn parse_freenet_link(link: &str) -> Result<ShareTarget, LinkError> {
-    let prefix = "freenet://";
-    match link.get(..prefix.len()) {
-        Some(p) if p.eq_ignore_ascii_case(prefix) => parse_share_fragment(&link[prefix.len()..]),
-        _ => Err(LinkError::NotFreenetScheme),
+    let scheme = "freenet:";
+    let rest = match link.get(..scheme.len()) {
+        Some(p) if p.eq_ignore_ascii_case(scheme) => &link[scheme.len()..],
+        _ => return Err(LinkError::NotFreenetScheme),
+    };
+    match rest.strip_prefix("//") {
+        Some(authority_form) => parse_share_fragment(authority_form),
+        None if rest.starts_with('/') => Err(LinkError::NotFreenetScheme),
+        None => parse_share_fragment(rest),
     }
 }
 
@@ -273,9 +294,12 @@ fn port_from_config_toml(content: &str) -> Option<u16> {
 }
 
 /// The port the local node serves its HTTP API on: `ws-api-port` from the
-/// user's config, else [`DEFAULT_PORT`].
-pub fn configured_port() -> u16 {
-    default_config_dir()
+/// config in `config_dir` (or the default config directory), else
+/// [`DEFAULT_PORT`].
+pub fn configured_port(config_dir: Option<&Path>) -> u16 {
+    config_dir
+        .map(Path::to_path_buf)
+        .or_else(default_config_dir)
         .and_then(|dir| std::fs::read_to_string(dir.join("config.toml")).ok())
         .and_then(|content| port_from_config_toml(&content))
         .unwrap_or(DEFAULT_PORT)
@@ -341,14 +365,22 @@ fn launch(target: &str) -> Result<()> {
         } else {
             "xdg-open"
         };
-        // Not waited on: some openers block until the browser exits.
-        std::process::Command::new(opener)
-            .arg(target)
+        let mut cmd = std::process::Command::new(opener);
+        cmd.arg(target)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to run {opener}"))?;
+            .stderr(std::process::Stdio::null());
+        if cfg!(target_os = "macos") {
+            // `open` hands off and returns at once. Waiting reaps it, which
+            // matters inside the long-lived menu-bar wrapper.
+            cmd.status()
+                .with_context(|| format!("failed to run {opener}"))?;
+        } else {
+            // Not waited on: some xdg-open backends block until the browser
+            // exits. This is a short-lived process, so nothing is left behind.
+            cmd.spawn()
+                .with_context(|| format!("failed to run {opener}"))?;
+        }
         Ok(())
     }
 }
@@ -424,8 +456,35 @@ pub fn render_fallback_page(page: &FallbackPage) -> String {
     )
 }
 
+/// A one-line desktop notification for the fallback cases on Linux. Sandboxed
+/// browsers (Ubuntu's snap Firefox and Chromium) cannot read files under a
+/// hidden directory such as `~/.cache`, so the page alone may not be seen.
+/// Best effort, static text only (never the link).
+#[cfg(target_os = "linux")]
+fn notify_desktop(page: &FallbackPage) {
+    if dry_run() {
+        return;
+    }
+    let body = match page {
+        FallbackPage::NotRunning { .. } => {
+            "Freenet isn't running. Start it with `freenet service start`, then open the link again."
+        }
+        FallbackPage::InvalidLink => "That freenet:// link isn't valid, so it was not opened.",
+    };
+    drop(
+        std::process::Command::new("notify-send")
+            .args(["--app-name=Freenet", "Freenet", body])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn(),
+    );
+}
+
 /// Write the fallback page to the user's cache dir and open it.
 fn show_fallback_page(page: &FallbackPage) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    notify_desktop(page);
     let dir = dirs::cache_dir()
         .context("no cache directory")?
         .join("freenet");
@@ -469,7 +528,7 @@ impl HandleOutcome {
 
 /// Handle one link end to end: validate, find the node, open the browser (or
 /// the fallback page). `wait` is how long to poll for the node to come up.
-pub fn handle_link(link: &str, wait: Duration) -> HandleOutcome {
+pub fn handle_link(link: &str, wait: Duration, config_dir: Option<&Path>) -> HandleOutcome {
     let target = match parse_freenet_link(link) {
         Ok(t) => t,
         Err(e) => {
@@ -479,7 +538,7 @@ pub fn handle_link(link: &str, wait: Duration) -> HandleOutcome {
             return HandleOutcome::Invalid(e);
         }
     };
-    let port = configured_port();
+    let port = configured_port(config_dir);
     let local_url = target.local_url(port);
     if node_is_listening(port, wait) {
         if let Err(err) = launch(&local_url) {
@@ -531,7 +590,9 @@ fn single_link(links: &[OsString]) -> Result<&str> {
 }
 
 impl OpenCommand {
-    pub fn run(&self) -> Result<()> {
+    /// `config_dir` is `--config-dir` / `CONFIG_DIR` from the top-level
+    /// arguments, if given, so a node with a non-default config is found.
+    pub fn run(&self, config_dir: Option<&Path>) -> Result<()> {
         #[cfg(target_os = "windows")]
         detach_from_private_console();
 
@@ -545,12 +606,16 @@ impl OpenCommand {
                 std::process::exit(EXIT_CODE_INVALID_LINK);
             }
         };
-        match handle_link(link, Duration::ZERO) {
+        match handle_link(link, Duration::ZERO, config_dir) {
             HandleOutcome::OpenedLocal(_) => Ok(()),
-            HandleOutcome::NodeNotRunning(url) => {
+            HandleOutcome::NodeNotRunning(_) => {
+                // Only the port: the link itself can carry secrets in its
+                // fragment (e.g. River invites), and stderr from a
+                // browser-launched handler usually ends up in the journal.
                 eprintln!(
-                    "Freenet is not running (nothing answered on {url}). Start it with \
-                     `freenet service start`, then open the link again."
+                    "Freenet is not running (nothing answered on 127.0.0.1:{}). Start it \
+                     with `freenet service start`, then open the link again.",
+                    configured_port(config_dir)
                 );
                 std::process::exit(1);
             }
@@ -633,8 +698,10 @@ mod tests {
         for bad in [
             format!("http://{RIVER}/"),
             format!("https://{RIVER}/"),
-            format!("freenet:{RIVER}/"),
             format!("freenet:/{RIVER}/"),
+            format!("freenet:///{RIVER}/"),
+            format!("freenet:{RIVER}//evil/"),
+            format!("freenet:{}/", RIVER.to_lowercase()),
             format!("web+freenet://{RIVER}/"),
             "javascript:alert(1)".to_string(),
             "file:///etc/passwd".to_string(),
@@ -643,6 +710,26 @@ mod tests {
             " freenet://x".to_string(),
         ] {
             assert!(parse_freenet_link(&bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// The authority-less form (immune to hosts being lowercased) names the
+    /// same target as the authority form, and is held to the same rules.
+    #[test]
+    fn authority_less_form_matches_authority_form() {
+        for rest in ["", "/", "/a?b=c#d", "?q", "#store=X", "/%20"] {
+            assert_eq!(
+                parse_freenet_link(&format!("freenet:{RIVER}{rest}")),
+                parse_freenet_link(&format!("freenet://{RIVER}{rest}")),
+                "{rest}"
+            );
+            assert!(parse_freenet_link(&format!("FREENET:{RIVER}{rest}")).is_ok());
+        }
+        for bad in ["/%2e%2e/x", "/../x", "/a b", "/\" --x \"y"] {
+            assert!(
+                parse_freenet_link(&format!("freenet:{RIVER}{bad}")).is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -741,6 +828,12 @@ mod tests {
         assert_eq!(port_from_config_toml("ws-api-port = 70000\n"), None);
         assert_eq!(port_from_config_toml("ws-api-port = \"7509\"\n"), None);
         assert_eq!(port_from_config_toml("not toml ["), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "ws-api-port = 7777\n").unwrap();
+        assert_eq!(configured_port(Some(dir.path())), 7777);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(configured_port(Some(empty.path())), DEFAULT_PORT);
     }
 
     #[test]
@@ -763,5 +856,27 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(node_is_listening(port, Duration::ZERO));
+    }
+
+    /// The macOS in-app handler waits for a node LaunchServices just started:
+    /// a listener that appears after the first probe must still be found.
+    #[test]
+    fn node_listening_probe_waits_for_a_late_node() {
+        // Reserve a port, release it, then bind it again from a thread after
+        // a delay. (Another process taking it in between would make the
+        // probe succeed early, which this test would also accept.)
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let binder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port));
+            std::thread::sleep(Duration::from_secs(3));
+            drop(listener);
+        });
+        assert!(node_is_listening(port, Duration::from_secs(5)));
+        binder.join().unwrap();
     }
 }

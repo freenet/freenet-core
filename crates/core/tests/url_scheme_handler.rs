@@ -92,7 +92,7 @@ fn config_dirs(root: &Path) -> Vec<PathBuf> {
     vec![
         root.join("tmp/freenet"),
         root.join("home/.config/freenet"),
-        root.join("home/Library/Application Support/org.The-Freenet-Project-Inc.Freenet"),
+        root.join("home/Library/Application Support/The-Freenet-Project-Inc.Freenet"),
     ]
 }
 
@@ -116,14 +116,20 @@ fn valid_links_open_exactly_the_loopback_url() {
         "/a/b.html?q=1#frag/../x",
         "/^&calc|x",
     ] {
-        let link = format!("freenet://{RIVER}{rest}");
-        let out = sb.open(&link);
-        assert_eq!(out.status.code(), Some(0), "{link}: {out:?}");
-        assert_eq!(
-            stdout(&out),
-            format!("http://127.0.0.1:{port}/v1/contract/web/{RIVER}{rest}"),
-            "{link}"
-        );
+        // Both forms: the authority form the /open page emits today, and the
+        // authority-less form, whose id no desktop can lowercase as a host.
+        for link in [
+            format!("freenet://{RIVER}{rest}"),
+            format!("freenet:{RIVER}{rest}"),
+        ] {
+            let out = sb.open(&link);
+            assert_eq!(out.status.code(), Some(0), "{link}: {out:?}");
+            assert_eq!(
+                stdout(&out),
+                format!("http://127.0.0.1:{port}/v1/contract/web/{RIVER}{rest}"),
+                "{link}"
+            );
+        }
     }
 }
 
@@ -134,6 +140,9 @@ fn hostile_links_are_refused_without_opening_the_node() {
         format!("freenet://{RIVER}/%2e%2e/%2e%2e/"),
         format!("freenet://{RIVER}/../other/"),
         format!("freenet://{RIVER}//evil.example/"),
+        format!("freenet:{RIVER}/%2e%2e/"),
+        format!("freenet:/{RIVER}/"),
+        format!("freenet:///{RIVER}/"),
         format!("freenet://{RIVER}/\" --config-dir \"/tmp/x"),
         format!("freenet://{RIVER}/a b"),
         format!("http://{RIVER}/"),
@@ -192,7 +201,7 @@ fn not_running_node_gets_the_explanatory_page() {
         std::fs::write(dir.join("config.toml"), format!("ws-api-port = {port}\n"))
             .expect("write config");
     }
-    let out = sb.open(&format!("freenet://{RIVER}/"));
+    let out = sb.open(&format!("freenet://{RIVER}/#invite=SECRET-TOKEN"));
     // Something else grabbing the just-released port would make this 0; the
     // page assertion is what matters, so only check it on the expected path.
     if out.status.code() == Some(0) {
@@ -205,18 +214,31 @@ fn not_running_node_gets_the_explanatory_page() {
     let page = std::fs::read_to_string(&page_path).expect("read page");
     assert!(page.contains("Freenet isn't running"));
     assert!(page.contains(&format!(
-        "href=\"http://127.0.0.1:{port}/v1/contract/web/{RIVER}/\""
+        "href=\"http://127.0.0.1:{port}/v1/contract/web/{RIVER}/#invite=SECRET-TOKEN\""
     )));
+    // Stderr from a browser-launched handler usually lands in the journal:
+    // it must not carry the link, whose fragment can be a secret.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("SECRET-TOKEN"), "{stderr}");
+    assert!(!stderr.contains(RIVER), "{stderr}");
 }
 
 /// The Windows argument-injection surface, exercised for real: register, read
 /// the command line back from the registry, substitute each link for `%1`
 /// exactly as Explorer does, and launch it raw.
+///
+/// It writes the real `HKCU\Software\Classes\freenet` of whoever runs it, so
+/// it only runs where `CI` is set (a disposable runner), never on a
+/// developer's machine with Freenet installed.
 #[cfg(windows)]
 #[test]
 fn windows_registered_command_line_resists_argument_injection() {
     use std::os::windows::process::CommandExt;
 
+    if std::env::var_os("CI").is_none() {
+        eprintln!("skipped: modifies the real HKCU registration; set CI=1 to run");
+        return;
+    }
     let sb = Sandbox::new();
     let register = sb
         .command()

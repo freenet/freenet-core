@@ -1009,7 +1009,9 @@ jobs:
   macos_unit:
     name: macOS Service Unit
     runs-on: macos-latest
-    timeout-minutes: 30
+    # 45, not 30: the freenet:// LaunchServices e2e rebuilds the freenet crate
+    # (auto-update off) and waits for the app to launch and handle links.
+    timeout-minutes: 45
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
@@ -1071,9 +1073,17 @@ jobs:
       # And through LaunchServices: build an unsigned Freenet.app with the real
       # package-macos.sh, register it, click links with `open`, and check the
       # menu-bar wrapper handled them, including the instance launchd starts at
-      # login.
+      # login. The app starts a real node, so this rebuilds the binary with
+      # FREENET_GIT_IS_DIRTY=1 (auto-update off; only the freenet crate
+      # recompiles): otherwise a release newer than this branch would make
+      # the node exit 42 and the DMG-swap updater replace the test bundle
+      # mid-run. Last step on purpose, since it changes target/debug/freenet.
       - name: freenet:// end to end through LaunchServices
-        run: scripts/macos-url-scheme-e2e.sh target/debug/freenet
+        env:
+          FREENET_GIT_IS_DIRTY: "1"
+        run: |
+          cargo build --locked -p freenet --bin freenet
+          scripts/macos-url-scheme-e2e.sh target/debug/freenet
 
   # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
   # single-instance guard, process classification, etc). `windows_check` above

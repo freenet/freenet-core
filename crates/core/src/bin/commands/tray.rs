@@ -634,13 +634,27 @@ mod platform {
             // must keep pumping meanwhile. The link is not logged, since
             // apps can carry secrets in its fragment (e.g. River invites).
             if let Event::Opened { urls } = &event {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                // Each handler may poll for up to 30s; cap how many run at
+                // once so a page spamming links cannot pile up threads.
+                static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+                const MAX_IN_FLIGHT: usize = 4;
                 for url in urls {
+                    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        super::super::service::log_to_wrapper_log(
+                            "Dropped a freenet:// link: too many links already being handled",
+                        );
+                        continue;
+                    }
                     let link = url.as_str().to_string();
                     std::thread::spawn(move || {
                         let outcome = super::super::open_link::handle_link(
                             &link,
                             super::super::open_link::APP_LAUNCH_NODE_WAIT,
+                            None,
                         );
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                         super::super::service::log_to_wrapper_log(&format!(
                             "Handled a freenet:// link from LaunchServices: outcome={}",
                             outcome.kind()

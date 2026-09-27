@@ -1497,7 +1497,7 @@ fn freenet_main() -> anyhow::Result<()> {
         Some(Command::Uninstall(cmd)) => cmd.run(),
         // Launched by the OS with an untrusted link from any website: no
         // config build (it fetches gateways), no node, no setup wizard.
-        Some(Command::Open(cmd)) => cmd.run(),
+        Some(Command::Open(cmd)) => cmd.run(cli.config.config_paths.config_dir.as_deref()),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
             // multi-thread / blocking-pool tuning needed for IO-light

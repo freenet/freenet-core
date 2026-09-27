@@ -36,7 +36,8 @@ fail() {
 
 OUT="$(mktemp -d)"
 VERSION=0.0.0-ci FREENET_ARM64_BIN="$BIN" FREENET_X86_BIN="$BIN" \
-    CREATE_DMG=false OUTPUT_DIR="$OUT" "$REPO/scripts/package-macos.sh"
+    FREENET_SINGLE_ARCH_BUNDLE=1 CREATE_DMG=false OUTPUT_DIR="$OUT" \
+    "$REPO/scripts/package-macos.sh"
 APP="$OUT/Freenet.app"
 
 # 1. The plist claims the scheme.
@@ -62,6 +63,10 @@ echo "ok - LaunchServices resolves freenet:// to the bundle"
 # stops the handler opening a browser; it is set for apps LaunchServices
 # starts in this session.
 launchctl setenv FREENET_OPEN_DRY_RUN 1
+# The app starts a real node. Keep it out of the production telemetry. (Its
+# auto-update is off because CI builds this binary with FREENET_GIT_IS_DIRTY=1,
+# so a newer release cannot swap the bundle out mid-test.)
+launchctl setenv FREENET_TELEMETRY_ENABLED false
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR"/freenet-wrapper.*.log
 
@@ -88,13 +93,16 @@ grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
     && fail "a valid link was treated as invalid"
 echo "ok - a link launches Freenet.app and is handled"
 
-open "freenet://$RIVER/%2e%2e/other/"
+# An all-'1' id is invalid on every platform. (Not a %2e%2e traversal: tao
+# parses the link into a url::Url before the handler sees it, which already
+# resolves dot segments, so that case is covered by the unit tests instead.)
+open "freenet://11111111111111111111111111111111/"
 # A second instance launched for this link would lose the single-instance
 # lock and exit without handling it, so reaching count 2 proves the RUNNING
 # instance received it.
 wait_for_count 2 || fail "the running app never handled the second link"
 grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
-    || fail "a traversal link was not refused"
+    || fail "an invalid link was not refused"
 echo "ok - a second link reaches the running instance, and a hostile one is refused"
 
 # 4. The instance started at login is launchd's, not LaunchServices'. Links
@@ -122,5 +130,6 @@ else
 fi
 
 launchctl unsetenv FREENET_OPEN_DRY_RUN
+launchctl unsetenv FREENET_TELEMETRY_ENABLED
 osascript -e 'tell application id "org.freenet.Freenet" to quit' >/dev/null 2>&1 || true
 echo "All macOS freenet:// checks passed."

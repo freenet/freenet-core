@@ -28,6 +28,9 @@
 #     ICON_ICNS           Path to a .icns file (default: generic app icon)
 #     CREATE_DMG          "true" to produce a .dmg; "false" to stop at .app
 #                         (default: true)
+#     FREENET_SINGLE_ARCH_BUNDLE  "1" to bundle FREENET_ARM64_BIN alone, for an
+#                         unsigned local/CI smoke-test .app (refused when
+#                         signing is enabled)
 #
 # Produces:
 #   $OUTPUT_DIR/Freenet.app        (signed + notarized if credentials set)
@@ -87,11 +90,15 @@ APP_DIR="$OUTPUT_DIR/Freenet.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-if [[ "$FREENET_ARM64_BIN" == "$FREENET_X86_BIN" ]]; then
-    # Same file for both: a single-architecture local/CI smoke-test bundle
-    # (lipo refuses two inputs of one architecture). Release builds always
-    # pass two different binaries and take the lipo path.
-    echo ">> Single-architecture bundle (FREENET_ARM64_BIN == FREENET_X86_BIN)"
+if [[ "${FREENET_SINGLE_ARCH_BUNDLE:-}" == "1" ]]; then
+    # A single-architecture local/CI smoke-test bundle from FREENET_ARM64_BIN
+    # alone (lipo refuses two inputs of one architecture). Opt-in only, and
+    # refused when signing, so a release can never ship one by accident.
+    if [[ "$SIGNING_ENABLED" == "true" ]]; then
+        echo "package-macos.sh: FREENET_SINGLE_ARCH_BUNDLE=1 is for unsigned test bundles only" >&2
+        exit 1
+    fi
+    echo ">> Single-architecture test bundle (FREENET_SINGLE_ARCH_BUNDLE=1)"
     cp "$FREENET_ARM64_BIN" "$APP_DIR/Contents/MacOS/freenet-bin"
 else
     echo ">> Building universal binary"
