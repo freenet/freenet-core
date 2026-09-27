@@ -3417,18 +3417,42 @@ fn schedule_queued_run(
     now: tokio::time::Instant,
     run: delegate_capabilities::LifecycleRun,
 ) {
+    use std::sync::atomic::Ordering;
+    let is_wakeup = matches!(run.event, delegate_capabilities::RunEvent::Wakeup { .. });
     let due = match &run.event {
         delegate_capabilities::RunEvent::Lifecycle(_) => now,
         delegate_capabilities::RunEvent::Wakeup { every, .. } => {
             now + delegate_capabilities::first_wakeup_delay(*every)
         }
     };
+    if is_wakeup && schedule.wakeup_count() >= delegate_capabilities::MAX_SCHEDULED_WAKEUPS {
+        // Entries of delegates unregistered since they were armed linger
+        // until due; sweep them before refusing anything. Kept: everything
+        // still eligible, and anything whose eligibility cannot be read now.
+        if let Some(caps) = caps {
+            schedule.retain_wakeups(|key, tag| {
+                caps.wakeup_check(key, tag) != delegate_capabilities::WakeupCheck::Ineligible
+            });
+        }
+        if schedule.wakeup_count() >= delegate_capabilities::MAX_SCHEDULED_WAKEUPS {
+            if let Some(caps) = caps {
+                caps.stats
+                    .wakeups_schedule_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(delegate = %run.key, "Wake-up schedule full; not arming this wake-up");
+            return;
+        }
+    }
     if !schedule.push(due, run, 0)
         && let Some(caps) = caps
     {
-        caps.stats
-            .lifecycle_deduplicated
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = if is_wakeup {
+            &caps.stats.wakeups_already_armed
+        } else {
+            &caps.stats.lifecycle_deduplicated
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -4773,21 +4797,38 @@ where
             };
             (params, InboundDelegateMsg::Lifecycle(event.clone()), None)
         }
-        RunEvent::Wakeup { tag, .. } => {
-            let Some((params, every)) = caps.wakeup_delivery(&key, tag) else {
+        RunEvent::Wakeup {
+            tag,
+            every: armed_every,
+        } => match caps.wakeup_check(&key, tag) {
+            delegate_capabilities::WakeupCheck::Deliver { params, every } => (
+                params,
+                InboundDelegateMsg::WakeupFired { tag: tag.clone() },
+                Some(every),
+            ),
+            delegate_capabilities::WakeupCheck::Ineligible => {
                 // Revoked, no longer declared, or the record is gone: the
                 // chain ends here. A grant, a registration or the next node
                 // start re-arms it if the delegate becomes eligible again.
                 caps.stats.wakeups_stopped.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(delegate = %key, event = ?run.event, "Wake-up not delivered: not granted or no longer declared; schedule ended");
+                tracing::info!(delegate = %key, event = ?run.event, "Wake-up schedule ended: not granted, no longer declared, or the delegate's record is gone");
                 return LifecycleOutcome::Skipped;
-            };
-            (
-                params,
-                InboundDelegateMsg::WakeupFired { tag: tag.clone() },
-                Some(every),
-            )
-        }
+            }
+            delegate_capabilities::WakeupCheck::Unknown => {
+                // A storage error, not an answer: skip this fire and keep the
+                // schedule, or one transient failure would stop the
+                // delegate's wake-ups until the node restarts.
+                caps.stats
+                    .wakeups_storage_error
+                    .fetch_add(1, Ordering::Relaxed);
+                schedule.push(
+                    caps.now() + delegate_capabilities::next_wakeup_delay(*armed_every),
+                    run.clone(),
+                    0,
+                );
+                return LifecycleOutcome::Deferred;
+            }
+        },
     };
     // The next fire of a wake-up, `delay` from now.
     let rearm = |schedule: &mut delegate_capabilities::LifecycleSchedule,
@@ -4813,7 +4854,7 @@ where
     if parked || !caps.duty_available(&key) {
         if let Some(every) = every {
             caps.stats.wakeups_deferred.fetch_add(1, Ordering::Relaxed);
-            if attempts + 1 >= delegate_capabilities::WAKEUP_MAX_DEFERRALS {
+            if attempts >= delegate_capabilities::WAKEUP_MAX_DEFERRALS {
                 // Skip this one fire; the schedule goes on.
                 caps.stats.wakeups_skipped.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(

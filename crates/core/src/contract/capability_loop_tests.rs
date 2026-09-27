@@ -1288,10 +1288,10 @@ async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
     assert!(lp.wakeup_runs().is_empty(), "never runs over budget");
     let skipped = caps.stats.wakeups_skipped.load(Ordering::Relaxed);
     assert!(skipped >= 2, "each starved fire is skipped, got {skipped}");
-    // Each skipped fire was deferred exactly WAKEUP_MAX_DEFERRALS times first
-    // (one more fire may be part-way through its deferrals).
+    // Each skipped fire was deferred on its first attempt and on each of its
+    // WAKEUP_MAX_DEFERRALS retries (one more fire may be part-way through).
     let deferred = caps.stats.wakeups_deferred.load(Ordering::Relaxed);
-    let per_fire = u64::from(WAKEUP_MAX_DEFERRALS);
+    let per_fire = u64::from(WAKEUP_MAX_DEFERRALS) + 1;
     assert!(
         deferred >= skipped * per_fire && deferred < (skipped + 1) * per_fire,
         "deferred {deferred}, skipped {skipped}"
@@ -1391,4 +1391,113 @@ async fn a_record_written_without_wakeups_is_refreshed_from_the_code_at_start() 
     tokio::time::sleep(Duration::from_secs(66)).await;
     lp.sync().await;
     assert_eq!(lp.wakeup_runs(), vec![(key, b"p".to_vec())]);
+}
+
+/// What Harvest's design rests on, both halves: a wake-up run CAN write a
+/// contract (its UPDATE goes through the unprompted-op admission, and a
+/// refusal is answered), and CANNOT reach another delegate (the inter-delegate
+/// hop is suppressed, as for every unprompted run).
+#[tokio::test(start_paused = true)]
+async fn a_wakeup_run_can_update_a_contract_but_not_message_a_delegate() {
+    let caps = paused_caps(BudgetLimits {
+        ops_per_delegate_per_min: 1,
+        ..BudgetLimits::default()
+    });
+    let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 46);
+    let other = DelegateKey::new([0x44; 32], CodeHash::new([0x44; 32]));
+    let target = ContractInstanceId::new([0x72; 32]);
+    let update = || {
+        OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest::new(
+            target,
+            UpdateData::State(State::from(vec![7])),
+        ))
+    };
+    let wake_run = ScriptedRun::from(vec![
+        update(),
+        update(),
+        OutboundDelegateMsg::SendDelegateMessage(DelegateMessage::new(
+            other.clone(),
+            key.clone(),
+            b"sign this".to_vec(),
+        )),
+    ]);
+    let lp = start(
+        "wake_ops",
+        caps.clone(),
+        vec![wake_run, ScriptedRun::default(), ScriptedRun::default()],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    wait_until("the wake-up's follow-up run", || {
+        lp.observations.lock().unwrap().len() >= 2
+    })
+    .await;
+    lp.sync().await;
+    let obs = lp.observations.lock().unwrap().clone();
+    assert_eq!(obs[0].inbound_kinds, vec!["WakeupFired"]);
+    assert!(
+        obs[1..]
+            .iter()
+            .any(|o| o.delegate_key == key && o.inbound_kinds.contains(&"UpdateContractResponse")),
+        "both UPDATEs are answered to the delegate: {obs:?}"
+    );
+    assert_eq!(
+        caps.stats.refused_delegate_ops.load(Ordering::Relaxed),
+        1,
+        "the second UPDATE is past the per-minute allowance: refused, not dropped"
+    );
+    assert!(
+        obs.iter().all(|o| o.delegate_key != other),
+        "a wake-up run must not reach another delegate: {obs:?}"
+    );
+}
+
+/// The wake-up schedule is bounded: at `MAX_SCHEDULED_WAKEUPS` the entries
+/// of delegates that are no longer eligible are swept before an arm is
+/// refused, so churned registrations cannot grow it without bound, and a real
+/// delegate still gets armed.
+#[test]
+fn a_full_wakeup_schedule_sweeps_stale_entries_before_refusing() {
+    use super::delegate_capabilities::{LifecycleSchedule, MAX_SCHEDULED_WAKEUPS, RunEvent};
+    let caps = DelegateCapabilities::in_memory();
+    let live = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 47);
+    let mut schedule = LifecycleSchedule::default();
+    let now = tokio::time::Instant::now();
+    let wake = |key: DelegateKey| LifecycleRun {
+        key,
+        event: RunEvent::Wakeup {
+            tag: b"hb".to_vec(),
+            every: Duration::from_secs(60),
+        },
+    };
+    for n in 0..MAX_SCHEDULED_WAKEUPS as u32 {
+        let stale = DelegateKey::new(
+            *blake3::hash(&n.to_le_bytes()).as_bytes(),
+            CodeHash::new([9; 32]),
+        );
+        assert!(schedule.push(now, wake(stale), 0));
+    }
+    assert_eq!(schedule.wakeup_count(), MAX_SCHEDULED_WAKEUPS);
+    super::schedule_queued_run(Some(&caps), &mut schedule, now, wake(live.clone()));
+    assert_eq!(schedule.wakeup_count(), 1, "stale entries swept, the live one armed");
+    assert_eq!(caps.stats.wakeups_schedule_full.load(Ordering::Relaxed), 0);
+
+    // Nothing to sweep (no capability state to consult, so nothing is known
+    // stale): the arm is refused and the schedule does not grow past the cap.
+    let mut unsweepable = LifecycleSchedule::default();
+    for n in 0..MAX_SCHEDULED_WAKEUPS as u32 {
+        let k = DelegateKey::new(
+            *blake3::hash(&(n + 1_000_000).to_le_bytes()).as_bytes(),
+            CodeHash::new([8; 32]),
+        );
+        unsweepable.push(now, wake(k), 0);
+    }
+    super::schedule_queued_run(None, &mut unsweepable, now, wake(live));
+    assert_eq!(
+        unsweepable.wakeup_count(),
+        MAX_SCHEDULED_WAKEUPS,
+        "not grown past the cap"
+    );
 }

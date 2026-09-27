@@ -122,11 +122,13 @@ pub(crate) const MAX_CAPABILITY_RECORDS: usize = 1024;
 /// fills its own quota, not the node's table.
 pub(crate) const MAX_RECORDS_PER_APP: usize = 64;
 
-/// Lifecycle runs waiting for the contract loop. Producers `try_send`; a full
-/// queue drops the run with a counter (an `Installed` stays undelivered and is
-/// retried at the next registration or grant, a `NodeStarted` is lost for this
-/// start).
-pub(crate) const LIFECYCLE_QUEUE_CAPACITY: usize = 256;
+/// Lifecycle runs and wake-up arms waiting for the contract loop. Producers
+/// `try_send`; a full queue drops the run with a counter (an `Installed` stays
+/// undelivered and is retried at the next registration or grant, a
+/// `NodeStarted` is lost for this start, a wake-up arm is re-made at the next
+/// registration, grant or start). Sized so one grant can arm a whole app:
+/// `MAX_RECORDS_PER_APP` x (Installed + `MAX_WAKEUPS`) = 320.
+pub(crate) const LIFECYCLE_QUEUE_CAPACITY: usize = 512;
 
 /// Stable wire code of each capability in the grant table.
 fn capability_code(cap: Capability) -> Option<u16> {
@@ -527,6 +529,18 @@ impl RunEvent {
     }
 }
 
+/// Whether a wake-up may fire now; see [`DelegateCapabilities::wakeup_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WakeupCheck {
+    /// Fire, with these registered parameters, at this CURRENT interval.
+    Deliver { params: Vec<u8>, every: Duration },
+    /// Not eligible (no record, tag no longer declared, no grant): the
+    /// schedule ends.
+    Ineligible,
+    /// Eligibility could not be read (storage error): skip this fire only.
+    Unknown,
+}
+
 /// An unprompted run (lifecycle event or wake-up) queued for the contract
 /// loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -759,9 +773,10 @@ impl Budget {
         bucket.tokens_us > 0 && self.node_duty.tokens_us > 0
     }
 
-    /// `node_wide`: also charge the node bucket. Only lifecycle runs do; a
-    /// notification run charges its delegate alone, so busy notification
-    /// traffic cannot starve every delegate's lifecycle runs.
+    /// `node_wide`: also charge the node bucket. Lifecycle and wake-up runs
+    /// do; a notification run charges its delegate alone, so busy
+    /// notification traffic cannot starve every delegate's lifecycle and
+    /// wake-up runs.
     fn charge_duty(
         &mut self,
         key: &DelegateKey,
@@ -853,6 +868,17 @@ pub(crate) struct CapabilityStats {
     /// Wake-up chains ended because the delegate is no longer eligible
     /// (grant revoked, tag no longer declared, record gone).
     pub wakeups_stopped: AtomicU64,
+    /// Wake-up fires skipped because eligibility could not be READ (storage
+    /// error); the schedule continues rather than ending on a transient
+    /// failure.
+    pub wakeups_storage_error: AtomicU64,
+    /// Wake-up arms that found the same (delegate, tag) already scheduled:
+    /// the normal outcome of every re-registration, counted apart from
+    /// `lifecycle_deduplicated` so neither hides the other.
+    pub wakeups_already_armed: AtomicU64,
+    /// Wake-up arms refused because the schedule held
+    /// `MAX_SCHEDULED_WAKEUPS` live entries even after sweeping stale ones.
+    pub wakeups_schedule_full: AtomicU64,
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
     pub refused_contract_writes: AtomicU64,
@@ -967,6 +993,48 @@ impl DelegateCapabilities {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// [`Self::load_record`], but a storage ERROR is `Err` rather than folded
+    /// into `None`, for callers that must not read a transient failure as
+    /// "this delegate is gone". An unreadable (undecodable) record is `Ok(None)`.
+    fn load_record_checked(&self, key: &DelegateKey) -> Result<Option<DelegateRecord>, ()> {
+        match self.storage.get_record(key) {
+            Ok(Some(bytes)) => Ok(DelegateRecord::decode(&bytes)),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                tracing::warn!(delegate = %key, error = %e, "Failed to read delegate capability record");
+                Err(())
+            }
+        }
+    }
+
+    /// Whether any app bound to `rec` holds `cap`, with a storage error as
+    /// `Err` (see [`Self::load_record_checked`]).
+    fn any_bound_app_granted_checked(
+        &self,
+        rec: &DelegateRecord,
+        cap: Capability,
+    ) -> Result<bool, ()> {
+        let Some(code) = capability_code(cap) else {
+            return Ok(false);
+        };
+        for app in &rec.apps {
+            match self
+                .storage
+                .get_grant(&grant_key(UserScope::Node, app, code))
+            {
+                Ok(Some(bytes)) if matches!(Grant::decode(&bytes), Some(Grant::Granted { .. })) => {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read capability grant");
+                    return Err(());
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn load_record(&self, key: &DelegateKey) -> Option<DelegateRecord> {
@@ -1446,16 +1514,38 @@ impl DelegateCapabilities {
         key: &DelegateKey,
         tag: &[u8],
     ) -> Option<(Vec<u8>, Duration)> {
-        let rec = self.load_record(key)?;
-        let every = rec
+        match self.wakeup_check(key, tag) {
+            WakeupCheck::Deliver { params, every } => Some((params, every)),
+            WakeupCheck::Ineligible | WakeupCheck::Unknown => None,
+        }
+    }
+
+    /// [`Self::wakeup_delivery`], telling "not eligible" (the schedule ends)
+    /// apart from "could not read whether it is" (a storage error: skip this
+    /// fire and keep the schedule, or one transient failure would silently
+    /// stop a delegate's wake-ups until the node restarts).
+    pub(crate) fn wakeup_check(&self, key: &DelegateKey, tag: &[u8]) -> WakeupCheck {
+        let rec = match self.load_record_checked(key) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return WakeupCheck::Ineligible,
+            Err(()) => return WakeupCheck::Unknown,
+        };
+        let Some(every) = rec
             .manifest
             .effective_wakeups()
             .into_iter()
-            .find_map(|(t, every)| (t == tag).then_some(every))?;
-        if !self.any_bound_app_granted(&rec, Capability::Background) {
-            return None;
+            .find_map(|(t, every)| (t == tag).then_some(every))
+        else {
+            return WakeupCheck::Ineligible;
+        };
+        match self.any_bound_app_granted_checked(&rec, Capability::Background) {
+            Ok(true) => WakeupCheck::Deliver {
+                params: rec.params,
+                every,
+            },
+            Ok(false) => WakeupCheck::Ineligible,
+            Err(()) => WakeupCheck::Unknown,
         }
-        Some((rec.params, every))
     }
 
     /// Wake-ups to arm at node start: every declared wake-up of every record
@@ -1608,7 +1698,8 @@ impl DelegateCapabilities {
         )
     }
 
-    /// Whether a lifecycle run for `key` may start now (duty budget).
+    /// Whether a lifecycle or wake-up run for `key` may start now (duty
+    /// budget).
     pub(crate) fn duty_available(&self, key: &DelegateKey) -> bool {
         let now = self.time.now();
         self.budget.lock().duty_available(key, now)
@@ -1616,7 +1707,8 @@ impl DelegateCapabilities {
 
     /// Charge time spent on the loop in an unprompted run (wall time between
     /// entering and leaving the run on the loop, including work it awaited
-    /// there). `node_wide` for lifecycle runs only; see `Budget::charge_duty`.
+    /// there). `node_wide` for lifecycle and wake-up runs, not notification
+    /// runs; see `Budget::charge_duty`.
     pub(crate) fn charge_duty(&self, key: &DelegateKey, spent: Duration, node_wide: bool) {
         let now = self.time.now();
         self.budget.lock().charge_duty(key, spent, node_wide, now);
@@ -1670,16 +1762,28 @@ pub(crate) const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_secs(15);
 pub(crate) const LIFECYCLE_MAX_ATTEMPTS: u32 = 60;
 
 /// Retries (at [`LIFECYCLE_RETRY_DELAY`]) of a wake-up fire that could not
-/// start before that one fire is skipped and the next period's is scheduled.
-/// 3 x 15 s stays under the 60 s minimum interval, so a deferred fire never
-/// overlaps the next one. A wake-up is never dropped for good this way: the
-/// chain continues.
+/// start, after its first attempt, before that one fire is skipped and the
+/// next period's is scheduled: 3 retries span 45 s, under the 60 s minimum
+/// interval, so a deferred fire never overlaps the next one. (A skipped fire
+/// is therefore deferred `WAKEUP_MAX_DEFERRALS + 1` times.) A wake-up is never
+/// dropped for good this way: the schedule continues.
 pub(crate) const WAKEUP_MAX_DEFERRALS: u32 = 3;
+
+/// Live wake-up entries the schedule holds at most: one per declared tag of
+/// every record the table can hold. Entries whose delegate has since been
+/// unregistered linger until they fall due (up to an interval, 7 days at
+/// most), so an app churning registrations could otherwise grow the schedule
+/// without bound; at this cap stale entries are swept, and an arm that still
+/// does not fit is refused and counted.
+pub(crate) const MAX_SCHEDULED_WAKEUPS: usize =
+    MAX_CAPABILITY_RECORDS * freenet_stdlib::prelude::MAX_WAKEUPS;
 
 /// Delay before the first fire of a freshly armed wake-up: after the node's
 /// own start-up work (same floor as NodeStarted), smeared over up to one
 /// interval (at most [`NODE_STARTED_SMEAR`]) so a node with many background
-/// delegates does not wake them all at once.
+/// delegates does not wake them all at once. At a node start this is the same
+/// window NodeStarted is smeared over, so either may arrive first: a delegate
+/// must not assume NodeStarted precedes its first wake-up.
 pub(crate) fn first_wakeup_delay(every: Duration) -> Duration {
     let smear_ms = every.min(NODE_STARTED_SMEAR).as_millis() as u64;
     NODE_STARTED_MIN_DELAY
@@ -1701,8 +1805,10 @@ pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 1;
 /// Lifecycle and wake-up runs waiting on the loop, ordered by due time. Owned
 /// by the contract loop.
 /// A run for a `(delegate, kind)` already waiting is not added again, so the
-/// schedule holds at most one run per delegate per kind: bounded by the record
-/// cap times (2 lifecycle kinds + `MAX_WAKEUPS` wake-up tags).
+/// schedule holds at most one run per delegate per kind. Lifecycle runs are
+/// bounded by twice the record cap; wake-up entries by
+/// [`MAX_SCHEDULED_WAKEUPS`], enforced by the loop (`schedule_queued_run`),
+/// because entries of since-removed records outlive their records until due.
 #[derive(Default)]
 pub(crate) struct LifecycleSchedule {
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(tokio::time::Instant, u64)>>,
@@ -1721,10 +1827,15 @@ impl LifecycleSchedule {
         attempts: u32,
     ) -> bool {
         if let Some(seq) = self.pending.get(&(run.key.clone(), run.event.kind())) {
-            // Keep the waiting run, but a fresh request restarts its attempt
-            // count, so a run about to give up is not dropped just after a
-            // new reason to deliver it arrived.
-            if let Some((_, waiting)) = self.runs.get_mut(seq) {
+            // Keep the waiting run, but a fresh request restarts a LIFECYCLE
+            // run's attempt count, so a run about to give up is not dropped
+            // just after a new reason to deliver it arrived. Not a wake-up's:
+            // its re-arm is routine (every registration), and resetting would
+            // let an app that keeps registering hold a starved fire in retry
+            // indefinitely instead of skipping it.
+            if matches!(run.event, RunEvent::Lifecycle(_))
+                && let Some((_, waiting)) = self.runs.get_mut(seq)
+            {
                 *waiting = (*waiting).min(attempts);
             }
             return false;
@@ -1747,6 +1858,37 @@ impl LifecycleSchedule {
         let (run, attempts) = self.runs.remove(&seq)?;
         self.pending.remove(&(run.key.clone(), run.event.kind()));
         Some((run, attempts))
+    }
+
+    /// Wake-up entries currently scheduled.
+    pub(crate) fn wakeup_count(&self) -> usize {
+        self.pending
+            .keys()
+            .filter(|(_, kind)| matches!(kind, RunKind::Wakeup(_)))
+            .count()
+    }
+
+    /// Drop every scheduled wake-up for which `keep(delegate, tag)` is false.
+    pub(crate) fn retain_wakeups(&mut self, mut keep: impl FnMut(&DelegateKey, &[u8]) -> bool) {
+        let drop: Vec<u64> = self
+            .runs
+            .iter()
+            .filter_map(|(seq, (run, _))| match &run.event {
+                RunEvent::Wakeup { tag, .. } if !keep(&run.key, tag) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        if drop.is_empty() {
+            return;
+        }
+        for seq in &drop {
+            if let Some((run, _)) = self.runs.remove(seq) {
+                self.pending.remove(&(run.key.clone(), run.event.kind()));
+            }
+        }
+        let runs = &self.runs;
+        self.heap
+            .retain(|std::cmp::Reverse((_, seq))| runs.contains_key(seq));
     }
 
     pub(crate) fn next_deadline(&self) -> Option<tokio::time::Instant> {
@@ -2647,6 +2789,130 @@ mod tests {
             "a lifecycle run is a different kind"
         );
         assert_eq!(sched.len(), 4);
+    }
+
+    /// ONE budget across delegates and kinds: a lifecycle run of one delegate
+    /// that spends the node bucket holds back another delegate's wake-up.
+    #[test]
+    fn the_node_duty_bucket_is_shared_across_delegates_and_run_kinds() {
+        let (c, _) = caps();
+        assert!(c.duty_available(&key(2)));
+        c.charge_duty(&key(1), Duration::from_secs(40), true);
+        assert!(
+            !c.duty_available(&key(2)),
+            "another delegate waits once the node bucket is spent"
+        );
+        // A notification run (node_wide = false) spends only its own bucket.
+        let (c, _) = caps();
+        c.charge_duty(&key(1), Duration::from_secs(40), false);
+        assert!(c.duty_available(&key(2)));
+        assert!(!c.duty_available(&key(1)));
+    }
+
+    #[test]
+    fn a_wakeup_rearm_does_not_reset_a_starved_fires_attempts() {
+        let mut sched = LifecycleSchedule::default();
+        let t0 = tokio::time::Instant::now();
+        let wake = LifecycleRun {
+            key: key(1),
+            event: RunEvent::Wakeup {
+                tag: b"a".to_vec(),
+                every: Duration::from_secs(60),
+            },
+        };
+        assert!(sched.push(t0, wake.clone(), 2));
+        assert!(!sched.push(t0, wake.clone(), 0));
+        assert_eq!(sched.pop_due(t0), Some((wake, 2)));
+    }
+
+    #[test]
+    fn retain_wakeups_drops_only_the_rejected_wakeups() {
+        let mut sched = LifecycleSchedule::default();
+        let t0 = tokio::time::Instant::now();
+        let wake = |n, tag: &[u8]| LifecycleRun {
+            key: key(n),
+            event: RunEvent::Wakeup {
+                tag: tag.to_vec(),
+                every: Duration::from_secs(60),
+            },
+        };
+        let installed = LifecycleRun {
+            key: key(1),
+            event: LifecycleEvent::Installed.into(),
+        };
+        sched.push(t0, wake(1, b"a"), 0);
+        sched.push(t0 + Duration::from_secs(1), wake(2, b"a"), 0);
+        sched.push(t0, installed.clone(), 0);
+        assert_eq!(sched.wakeup_count(), 2);
+        sched.retain_wakeups(|k, _| *k == key(2));
+        assert_eq!(sched.wakeup_count(), 1);
+        assert_eq!(sched.len(), 2);
+        let later = t0 + Duration::from_secs(5);
+        let mut popped = vec![sched.pop_due(later), sched.pop_due(later)];
+        popped.sort_by_key(|p| p.as_ref().map(|(r, _)| r.key.to_string()));
+        assert!(popped.contains(&Some((installed, 0))));
+        assert!(popped.contains(&Some((wake(2, b"a"), 0))));
+        assert_eq!(sched.pop_due(later), None);
+        assert!(sched.push(t0, wake(1, b"a"), 0), "a dropped entry frees its slot");
+    }
+
+    /// Storage that fails reads on demand, to tell "gone" from "unreadable".
+    #[derive(Default)]
+    struct FlakyStorage {
+        inner: MemoryCapabilityStorage,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl CapabilityStorage for FlakyStorage {
+        fn put_record(&self, key: &DelegateKey, value: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_record(key, value)
+        }
+        fn get_record(&self, key: &DelegateKey) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.fail.load(Ordering::Relaxed) {
+                anyhow::bail!("injected read failure");
+            }
+            self.inner.get_record(key)
+        }
+        fn remove_record(&self, key: &DelegateKey) -> anyhow::Result<()> {
+            self.inner.remove_record(key)
+        }
+        fn all_records(&self) -> anyhow::Result<Vec<(DelegateKey, Vec<u8>)>> {
+            self.inner.all_records()
+        }
+        fn put_grant(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_grant(key, value)
+        }
+        fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.fail.load(Ordering::Relaxed) {
+                anyhow::bail!("injected read failure");
+            }
+            self.inner.get_grant(key)
+        }
+        fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.inner.remove_grant(key)
+        }
+        fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            self.inner.all_grants()
+        }
+    }
+
+    #[test]
+    fn an_unreadable_store_is_unknown_not_ineligible() {
+        let storage = Arc::new(FlakyStorage::default());
+        let c = DelegateCapabilities::with_time_source(
+            storage.clone(),
+            Arc::new(crate::util::time_source::SharedMockTimeSource::new()),
+            BudgetLimits::default(),
+        );
+        let wasm = wasm_with_manifest(&wakeup_manifest(vec![], &[("hb", 300)]));
+        let p = c.on_registered(&key(1), &wasm, b"p", Some(app(1))).unwrap();
+        c.record_answer(&p, true);
+        assert!(matches!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Deliver { .. }));
+        storage.fail.store(true, Ordering::Relaxed);
+        assert_eq!(c.wakeup_check(&key(1), b"hb"), WakeupCheck::Unknown);
+        storage.fail.store(false, Ordering::Relaxed);
+        assert_eq!(c.wakeup_check(&key(1), b"nope"), WakeupCheck::Ineligible);
+        assert_eq!(c.wakeup_check(&key(9), b"hb"), WakeupCheck::Ineligible);
     }
 
     #[test]
