@@ -43,6 +43,18 @@ test("shared app link stamps recovery and retries the same URL", async ({
   await expect(page).toHaveURL(stamped);
 });
 
+test("a v2 shared app link also stamps recovery instead of leaving", async ({
+  page,
+}) => {
+  await page.clock.install({ time: now - 60_000 });
+  await page.clock.pauseAt(now);
+  await page.goto(`${origin}/v2/contract/web/shared-key/`);
+  await page.clock.runFor(3_000);
+  await expect(page).toHaveURL(
+    `${origin}/v2/contract/web/shared-key/?_freload=${now + 3_000}-0`,
+  );
+});
+
 test("expired top-level app recovery falls back to the dashboard", async ({
   page,
 }) => {
