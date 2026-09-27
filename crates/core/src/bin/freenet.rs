@@ -1468,6 +1468,9 @@ fn freenet_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // The link-handler commands need no node directories: skip building
+        // ConfigPaths, which creates them (and has no default in debug builds).
+        Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),
         Some(Command::Service(cmd)) => {
             // Build only ConfigPaths (directory layout), not the full Config
             // which triggers a remote gateway fetch that fails on fresh
