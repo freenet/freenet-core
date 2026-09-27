@@ -129,9 +129,19 @@ wait_for_count() {
 
 open "freenet://$RIVER/?x=1#y"
 wait_for_count 1 || fail "the launched app never handled the link"
-grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
-    && fail "a valid link was treated as invalid"
-echo "ok - a link launches Freenet.app and is handled"
+# `opened` (not merely "not invalid"): the handler found the node the app
+# started and it answered the /v1/version probe like Freenet.
+grep -q 'outcome=opened' "$LOG_DIR"/freenet-wrapper.*.log \
+    || fail "the link was not opened against the running node"
+echo "ok - a link launches Freenet.app and is opened against its node"
+
+# First launch registers the Launch-at-Login agent, whose RunAtLoad starts a
+# second wrapper that exits after losing the lock. Let it go, so the next
+# link has only the settled app to go to.
+for _ in $(seq 1 30); do
+    [[ "$(pgrep -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" | wc -l | tr -d ' ')" -le 1 ]] && break
+    sleep 1
+done
 
 # An all-'1' id is invalid on every platform. (Not a %2e%2e traversal: tao
 # parses the link into a url::Url before the handler sees it, which already

@@ -583,9 +583,12 @@ fn write_and_open_fallback_page(
     Ok(())
 }
 
-/// Where fallback pages are written: `<cache>/freenet/`.
+/// Where fallback pages are written: `<cache>/freenet-open-link/`. Its own
+/// directory: on case-insensitive filesystems `<cache>/freenet` is the same
+/// folder as macOS's `~/Library/Caches/Freenet` (wrapper lock, updater
+/// staging) and Windows' `%LOCALAPPDATA%\Freenet` (the install root).
 fn fallback_page_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("freenet"))
+    dirs::cache_dir().map(|d| d.join("freenet-open-link"))
 }
 
 const FALLBACK_PAGE_PREFIX: &str = "open-link-";

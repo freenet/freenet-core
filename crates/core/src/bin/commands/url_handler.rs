@@ -529,7 +529,7 @@ mod linux {
         match std::fs::read_to_string(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 // Unreadable: cannot establish ownership, so touch nothing.
-                return Ok(false);
+                anyhow::bail!("could not read {} ({e}); left it unchanged", path.display());
             }
             Ok(content) if is_ours(&content) => {
                 std::fs::remove_file(&path)?;
@@ -929,20 +929,11 @@ pub fn windows_command_exe(command: &str) -> Option<&str> {
     rest.split_once('"').map(|(exe, _)| exe)
 }
 
-/// Whether a registry command line launches a `freenet.exe`, i.e. is a
-/// registration Freenet may overwrite or remove. Unlike the Linux desktop
-/// entry (which carries a marker line), this is a file-name heuristic, not a
-/// marker. Matched by file name, not path: a reinstall to another directory must be able to replace its own
-/// stale registration. An unrelated program that happens to be called
-/// `freenet.exe` would be treated as ours.
-#[cfg(any(target_os = "windows", test))]
-pub fn windows_command_is_ours(command: &str) -> bool {
-    windows_command_exe(command).is_some_and(|exe| {
-        exe.rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case("freenet.exe"))
-    })
-}
+/// Registry value (under [`WINDOWS_CLASS_KEY`]) marking a registration
+/// Freenet wrote, the Windows counterpart of the desktop entry's marker line.
+/// Only a key carrying it is ever overwritten or removed.
+#[cfg(target_os = "windows")]
+pub const WINDOWS_MARKER_VALUE: &str = "FreenetManaged";
 
 #[cfg(target_os = "windows")]
 mod windows {
@@ -966,6 +957,11 @@ mod windows {
 
     fn has_url_protocol_value() -> bool {
         class_key().is_some_and(|k| k.get_value::<String, _>("URL Protocol").is_ok())
+    }
+
+    /// Whether the registration was written by Freenet (carries the marker).
+    fn is_ours() -> bool {
+        class_key().is_some_and(|k| k.get_value::<String, _>(WINDOWS_MARKER_VALUE).is_ok())
     }
 
     pub(super) fn register(
@@ -992,7 +988,12 @@ mod windows {
             ));
         }
         let command = windows_open_command(exe, config_dir);
+        let ours = is_ours();
         match current_command() {
+            Some(existing) if !ours => {
+                // Another application's registration: leave it.
+                return Ok(RegisterOutcome::ForeignDefault(existing));
+            }
             Some(existing) if existing == command && has_url_protocol_value() => {
                 return Ok(RegisterOutcome::AlreadyCurrent);
             }
@@ -1005,9 +1006,6 @@ mod windows {
             {
                 return Ok(RegisterOutcome::AlreadyCurrent);
             }
-            Some(existing) if !windows_command_is_ours(&existing) => {
-                return Ok(RegisterOutcome::ForeignDefault(existing));
-            }
             _ => {}
         }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -1018,17 +1016,16 @@ mod windows {
         icon.set_value("", &format!("\"{exe}\",0"))?;
         let (cmd, _) = class.create_subkey(r"shell\open\command")?;
         cmd.set_value("", &command)?;
+        class.set_value(WINDOWS_MARKER_VALUE, &"1")?;
         Ok(RegisterOutcome::Registered)
     }
 
     pub(super) fn unregister() -> Result<bool> {
-        match current_command() {
-            Some(existing) if windows_command_is_ours(&existing) => {
-                RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(WINDOWS_CLASS_KEY)?;
-                Ok(true)
-            }
-            _ => Ok(false),
+        if !is_ours() {
+            return Ok(false);
         }
+        RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(WINDOWS_CLASS_KEY)?;
+        Ok(true)
     }
 
     /// Whether `exe` is what the Run key launches (`"<exe>" service run-wrapper`).
@@ -1510,11 +1507,8 @@ mod tests {
             format!("\"{exe}\" --config-dir \"C:\\\\\" open -- \"%1\"")
         );
         assert_eq!(windows_command_exe(&cmd), Some(exe));
-        assert!(windows_command_is_ours(&cmd));
-        assert!(windows_command_is_ours(r#""C:\x\FREENET.EXE" open "%1""#));
-        assert!(!windows_command_is_ours(r#""C:\x\other.exe" "%1""#));
-        assert!(!windows_command_is_ours(r#"C:\x\freenet.exe open "%1""#));
-        assert!(!windows_command_is_ours(""));
+        assert_eq!(windows_command_exe(r#"C:\x\freenet.exe open "%1""#), None);
+        assert_eq!(windows_command_exe(""), None);
     }
 
     #[test]

@@ -1154,7 +1154,7 @@ jobs:
       # And through real protocol activation: Start-Process hands the link to
       # Windows, which looks up HKCU\Software\Classes\freenet and runs the
       # handler. No node runs here, so the handler writes its "not running"
-      # page, which proves it ran and shows exactly what it would open.
+      # page, which proves it ran. The page must not carry the link.
       - name: freenet:// end to end through Windows protocol activation
         shell: pwsh
         run: |
@@ -1167,7 +1167,7 @@ jobs:
           $expected = '"' + $exe + '" open -- "%1"'
           if ($cmd -ne $expected) { throw "registered '$cmd', expected '$expected'" }
           if ((Get-ItemProperty 'HKCU:\Software\Classes\freenet').'URL Protocol' -ne '') { throw 'URL Protocol value missing' }
-          $pages = Join-Path $env:LOCALAPPDATA 'freenet'
+          $pages = Join-Path $env:LOCALAPPDATA 'freenet-open-link'
           $env:FREENET_OPEN_DRY_RUN = '1'
           # The handler writes one open-link-*.html per link (stale ones are
           # swept later, so it is still there to read).
@@ -1182,9 +1182,9 @@ jobs:
             if (-not $page) { throw "the handler never ran for $link" }
             return Get-Content -Raw $page.FullName
           }
-          $html = Invoke-Link "freenet://$river/?a=1#frag"
-          $want = "/v1/contract/web/$river/?a=1#frag`""
-          if (-not $html.Contains('href="http://127.0.0.1:') -or -not $html.Contains($want)) { throw "unexpected page: $html" }
+          $html = Invoke-Link "freenet://$river/?a=1#secret=TOKEN"
+          if (-not $html.Contains("Freenet isn't running") -or -not $html.Contains('port 7509')) { throw "unexpected page: $html" }
+          if ($html.Contains($river) -or $html.Contains('TOKEN')) { throw "the page carries the link: $html" }
           Write-Host 'ok - a valid link reached the handler through protocol activation'
           $html = Invoke-Link "freenet://$river/%2e%2e/other/"
           if (-not $html.Contains("isn't valid") -or $html.Contains('127.0.0.1')) { throw "traversal link not refused: $html" }
