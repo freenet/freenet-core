@@ -688,7 +688,10 @@ impl RoutingPredictor {
         p
     }
 
-    /// Record a routing outcome. Uses wall-clock time for the time feature.
+    /// Record a routing outcome observed at `wall_clock_hours` (hours since the
+    /// Unix epoch). The caller supplies the reading so it comes from the same
+    /// injected clock as the queries (see `Router`'s `EstimatorClock`), rather
+    /// than from `SystemTime` here, which no test can hold still (#5754).
     pub fn record(
         &mut self,
         peer: &PeerKeyLocation,
@@ -696,9 +699,30 @@ impl RoutingPredictor {
         distance: f64,
         outcome: RoutingOutcome,
         residuals: StageResiduals,
+        wall_clock_hours: f64,
     ) {
-        let time = wall_clock_hours() - self.reference_time_hours;
+        let time = self.time_at(wall_clock_hours);
         self.record_at_time(peer, contract_location, distance, outcome, residuals, time);
+    }
+
+    /// The time feature of the most recent failure-stage observation. Test-only,
+    /// so a test can see which clock training read.
+    #[cfg(test)]
+    pub(crate) fn latest_failure_observation_time(&self) -> Option<f64> {
+        self.failure_stage
+            .bandwidth_samples
+            .back()
+            .map(|observation| observation.time)
+    }
+
+    /// Anchor the time feature at `wall_clock_hours`, for a router whose clock
+    /// is replaced at construction (`Router::with_time_source`). Without it, a
+    /// mock clock's wall time would sit decades from the `SystemTime` reference
+    /// taken in [`Self::new`], and the time feature would stop being the small
+    /// value metric learning expects. Observations already stored keep their
+    /// times; only later readings move.
+    pub(crate) fn set_reference_time(&mut self, wall_clock_hours: f64) {
+        self.reference_time_hours = wall_clock_hours;
     }
 
     /// Record at a specific relative time (for batch loading with original timestamps
