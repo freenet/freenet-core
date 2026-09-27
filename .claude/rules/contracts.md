@@ -69,6 +69,18 @@ connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
 "Freenet asks:") and raised off the contract loop. Unprompted runs
 (InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
 delegates without a manifest are untouched.
+
+Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
+declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at
+every fire (wakeup_delivery). Declared in the manifest ON PURPOSE: a host import
+fails instantiation on nodes without it, and a new OutboundDelegateMsg variant
+fails decoding of the whole outbound batch on older nodes; an unknown manifest
+field is ignored. DO NOT add a run-time request (import or outbound variant)
+without solving that. Bounds: effective_wakeups (60 s floor, 4 per delegate),
+one pending fire per (delegate, tag), and the SAME duty budget as lifecycle
+runs (one budget, not two). Not persisted: re-armed at node start after
+refresh_capability_manifests re-reads manifests from stored code (older nodes
+stored them without `wakeups`).
 ```
 
 ### WASM Call Modes

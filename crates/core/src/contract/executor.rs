@@ -1152,6 +1152,13 @@ pub(crate) trait ContractExecutor: Send + 'static {
         None
     }
 
+    /// The raw WASM of a delegate this node stores, if it has it. Used at
+    /// start-up to re-read manifests (`refresh_capability_manifests`); `None`
+    /// for executors without a delegate store.
+    fn delegate_code(&self, _key: &DelegateKey) -> Option<Vec<u8>> {
+        None
+    }
+
     /// The node's durable store, for mirroring delegate subscriptions to disk
     /// so they survive a restart (#5493).
     ///

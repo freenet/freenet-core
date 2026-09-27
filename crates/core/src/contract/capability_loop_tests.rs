@@ -172,6 +172,17 @@ impl Loop {
             .collect()
     }
 
+    /// Wake-up runs, in order, as (delegate, tag, params).
+    fn wakeup_runs(&self) -> Vec<(DelegateKey, Vec<u8>)> {
+        self.observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.inbound_kinds == vec!["WakeupFired"])
+            .map(|o| (o.delegate_key.clone(), o.params.clone()))
+            .collect()
+    }
+
     /// Round-trip an event through the loop, so everything queued before it
     /// has had at least one loop iteration.
     async fn sync(&self) {
@@ -354,7 +365,7 @@ async fn allow_at_registration_delivers_installed_once_with_registered_params() 
     for _ in 0..2 {
         assert!(caps.queue(LifecycleRun {
             key: key.clone(),
-            event: LifecycleEvent::Installed,
+            event: LifecycleEvent::Installed.into(),
         }));
     }
     lp.sync().await;
@@ -538,12 +549,15 @@ async fn node_started_reaches_only_granted_delegates() {
     // A run that reaches the queue for an ungranted delegate (a grant revoked
     // after it was queued) is re-checked at delivery and not run.
     for key in [denied.key(), unattested.key()] {
-        assert!(caps.queue(LifecycleRun {
-            key: key.clone(),
-            event: LifecycleEvent::NodeStarted {
-                down_since_ms: None
-            },
-        }));
+        assert!(
+            caps.queue(LifecycleRun {
+                key: key.clone(),
+                event: LifecycleEvent::NodeStarted {
+                    down_since_ms: None
+                }
+                .into(),
+            })
+        );
     }
     lp.sync().await;
     lp.sync().await;
@@ -620,12 +634,15 @@ async fn unprompted_network_ops_are_refused_past_the_budget() {
     assert_eq!(caps.stats.refused_delegate_ops.load(Ordering::Relaxed), 0);
 
     // Unprompted: the second GET is refused.
-    assert!(lp.caps.queue(LifecycleRun {
-        key: key.clone(),
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        lp.caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     wait_until("the lifecycle run and its follow-up", || {
         lp.observations.lock().unwrap().len() == 4
     })
@@ -668,12 +685,15 @@ async fn a_spent_duty_budget_defers_lifecycle_runs() {
         .unwrap();
     caps.record_answer(&p, true);
     caps.charge_duty(&key, Duration::from_secs(10), true);
-    assert!(caps.queue(LifecycleRun {
-        key,
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        caps.queue(LifecycleRun {
+            key,
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     wait_until("the deferral", || {
         caps.stats.lifecycle_deferred_duty.load(Ordering::Relaxed) == 1
     })
@@ -838,12 +858,15 @@ async fn every_operation_kind_is_answered_when_refused() {
     )
     .await;
     let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 21);
-    assert!(caps.queue(LifecycleRun {
-        key,
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        caps.queue(LifecycleRun {
+            key,
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     wait_until("the follow-up run", || {
         lp.observations.lock().unwrap().len() == 2
     })
@@ -912,12 +935,15 @@ async fn a_parked_delegate_defers_its_lifecycle_run() {
         lp.observations.lock().unwrap().len() == 1
     })
     .await;
-    assert!(caps.queue(LifecycleRun {
-        key,
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        caps.queue(LifecycleRun {
+            key,
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     wait_until("the deferral", || {
         caps.stats.lifecycle_deferred_parked.load(Ordering::Relaxed) == 1
     })
@@ -948,12 +974,15 @@ async fn a_run_that_never_starts_is_dropped_and_counted() {
         CapabilityPrompter::answering(None),
     )
     .await;
-    assert!(caps.queue(LifecycleRun {
-        key,
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        caps.queue(LifecycleRun {
+            key,
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     // The start-up seed already holds this run (the queued copy is a
     // duplicate), so allow for its smear as well as every retry.
     tokio::time::sleep(
@@ -1051,16 +1080,216 @@ async fn a_lifecycle_run_for_a_missing_delegate_is_counted_and_kept() {
     .await;
     let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 25);
     lp.unregistered.lock().unwrap().insert(key.clone());
-    assert!(caps.queue(LifecycleRun {
-        key: key.clone(),
-        event: LifecycleEvent::NodeStarted {
-            down_since_ms: None
-        },
-    }));
+    assert!(
+        caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
     wait_until("the skip", || {
         caps.stats.lifecycle_skipped_missing.load(Ordering::Relaxed) == 1
     })
     .await;
     assert_eq!(caps.stats.lifecycle_failed.load(Ordering::Relaxed), 0);
     assert_eq!(caps.node_started_targets(), vec![key], "the record is kept");
+}
+
+/// A granted delegate whose manifest declares wake-ups (and no lifecycle
+/// kinds, so every run the test sees is a wake-up).
+fn granted_with_wakeups(
+    caps: &DelegateCapabilities,
+    wakeups: &[(&str, u64)],
+    params: &[u8],
+    app_n: u8,
+) -> DelegateKey {
+    let mut manifest = DelegateManifest::new(vec![], vec![Capability::Background]);
+    for (tag, secs) in wakeups {
+        manifest = manifest.with_wakeup(*tag, *secs);
+    }
+    let delegate = container(&manifest, params);
+    let key = delegate.key().clone();
+    let p = caps
+        .on_registered(
+            &key,
+            &manifest_module(&manifest),
+            params,
+            Some(AppIdentity::WebApp(app(app_n))),
+        )
+        .expect("first registration asks");
+    caps.record_answer(&p, true);
+    key
+}
+
+fn paused_caps(limits: BudgetLimits) -> Arc<DelegateCapabilities> {
+    DelegateCapabilities::with_time_source(
+        Arc::new(MemoryCapabilityStorage::default()),
+        Arc::new(InstantTimeSrc::new()),
+        limits,
+    )
+}
+
+/// The feature: with NO client connected, a granted delegate's declared
+/// wake-up fires, first within the start-up window and then once per
+/// interval (plus at most 10% jitter), each time with its REGISTERED
+/// parameters, and the delegate is re-entered with `WakeupFired`.
+#[tokio::test(start_paused = true)]
+async fn a_wakeup_fires_on_schedule_with_no_client() {
+    use super::delegate_capabilities::{NODE_STARTED_MIN_DELAY, NODE_STARTED_SMEAR};
+    let caps = paused_caps(BudgetLimits::default());
+    // Armed at "node start": the grant exists before the loop starts, so the
+    // start-up seed arms it (the queued arm from the grant is a duplicate).
+    let key = granted_with_wakeups(&caps, &[("hb", 60)], b"reg", 40);
+    let lp = start(
+        "wake_schedule",
+        caps.clone(),
+        vec![ScriptedRun::default(); 64],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+
+    // Not before the start-up floor.
+    tokio::time::sleep(NODE_STARTED_MIN_DELAY - Duration::from_millis(100)).await;
+    lp.sync().await;
+    assert!(
+        lp.wakeup_runs().is_empty(),
+        "no fire before the start-up floor"
+    );
+
+    // First fire inside [floor, floor + min(interval, smear)).
+    tokio::time::sleep(
+        Duration::from_secs(60).min(NODE_STARTED_SMEAR) + Duration::from_millis(200),
+    )
+    .await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs(), vec![(key.clone(), b"reg".to_vec())]);
+
+    // Then one per 60..66 s: over 660 s, 10 or 11 more.
+    tokio::time::sleep(Duration::from_secs(660)).await;
+    lp.sync().await;
+    let runs = lp.wakeup_runs();
+    assert!(
+        (11..=12).contains(&runs.len()),
+        "expected 11-12 fires by now, got {}",
+        runs.len()
+    );
+    assert!(runs.iter().all(|r| *r == (key.clone(), b"reg".to_vec())));
+    assert_eq!(
+        caps.stats.wakeups_delivered.load(Ordering::Relaxed),
+        runs.len() as u64
+    );
+    // Never more often than the interval: the storm bound.
+    assert!(runs.len() as u64 <= 1 + 660 / 60);
+}
+
+/// A delegate asking for less than the floor gets the floor: a storm is not
+/// possible whatever the manifest says.
+#[tokio::test(start_paused = true)]
+async fn a_sub_floor_interval_fires_no_faster_than_the_floor() {
+    let caps = paused_caps(BudgetLimits::default());
+    // A hand-written manifest can say 1 s; the macro would refuse it.
+    let _key = granted_with_wakeups(&caps, &[("spin", 1)], b"", 41);
+    let lp = start(
+        "wake_floor",
+        caps.clone(),
+        vec![ScriptedRun::default(); 64],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(65 + 600)).await;
+    lp.sync().await;
+    let n = lp.wakeup_runs().len() as u64;
+    let floor = freenet_stdlib::prelude::MIN_WAKEUP_INTERVAL_SECS;
+    assert!(n >= 1, "it still fires");
+    assert!(
+        n <= 1 + 600 / floor,
+        "{n} fires in 665 s: faster than the {floor} s floor"
+    );
+}
+
+/// Revocation takes effect at the next fire and ends the schedule; a new
+/// grant re-arms it.
+#[tokio::test(start_paused = true)]
+async fn revoking_stops_wakeups_and_a_new_grant_rearms_them() {
+    let caps = paused_caps(BudgetLimits::default());
+    let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 42);
+    let lp = start(
+        "wake_revoke",
+        caps.clone(),
+        vec![ScriptedRun::default(); 64],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs().len(), 1);
+
+    assert!(caps.revoke(&AppIdentity::WebApp(app(42)), Capability::Background));
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs().len(), 1, "no fire after revocation");
+    assert_eq!(caps.stats.wakeups_stopped.load(Ordering::Relaxed), 1);
+
+    // Granted again (the user re-allows at the app's next registration).
+    caps.record_answer(
+        &super::delegate_capabilities::CapabilityPrompt {
+            app: AppIdentity::WebApp(app(42)),
+            delegate: key.clone(),
+            capabilities: vec![Capability::Background],
+        },
+        true,
+    );
+    tokio::time::sleep(Duration::from_secs(66)).await;
+    lp.sync().await;
+    assert_eq!(lp.wakeup_runs().len(), 2, "re-armed by the grant");
+}
+
+/// A delegate whose duty budget is spent does not fire: each fire is
+/// deferred, then skipped after `WAKEUP_MAX_DEFERRALS`, and the SCHEDULE
+/// GOES ON (it is not dropped the way a lifecycle run is), so it fires again
+/// once the budget allows.
+#[tokio::test(start_paused = true)]
+async fn a_budget_starved_wakeup_is_skipped_but_the_schedule_continues() {
+    use super::delegate_capabilities::WAKEUP_MAX_DEFERRALS;
+    let caps = paused_caps(BudgetLimits {
+        duty_burst: Duration::from_millis(10),
+        // The debt below is floored at half a burst (5 ms); at 10 us/s it is
+        // repaid after 500 s.
+        duty_refill_per_sec: Duration::from_micros(10),
+        ..BudgetLimits::default()
+    });
+    let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 43);
+    // Deep in debt (floored at half a burst = 5 ms, so charge far more).
+    caps.charge_duty(&key, Duration::from_secs(5), true);
+    let lp = start(
+        "wake_starved",
+        caps.clone(),
+        vec![ScriptedRun::default(); 64],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    // Three intervals: every fire deferred, then skipped; none run.
+    tokio::time::sleep(Duration::from_secs(66 + 3 * 66)).await;
+    lp.sync().await;
+    assert!(lp.wakeup_runs().is_empty(), "never runs over budget");
+    let skipped = caps.stats.wakeups_skipped.load(Ordering::Relaxed);
+    assert!(skipped >= 2, "each starved fire is skipped, got {skipped}");
+    // Each skipped fire was deferred exactly WAKEUP_MAX_DEFERRALS times first
+    // (one more fire may be part-way through its deferrals).
+    let deferred = caps.stats.wakeups_deferred.load(Ordering::Relaxed);
+    let per_fire = u64::from(WAKEUP_MAX_DEFERRALS);
+    assert!(
+        deferred >= skipped * per_fire && deferred < (skipped + 1) * per_fire,
+        "deferred {deferred}, skipped {skipped}"
+    );
+    // The debt is repaid (500 s), and the SAME schedule fires again: it was
+    // never dropped.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    lp.sync().await;
+    assert!(
+        !lp.wakeup_runs().is_empty(),
+        "the schedule outlived the starved fires"
+    );
 }

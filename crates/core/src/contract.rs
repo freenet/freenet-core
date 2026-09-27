@@ -15,6 +15,8 @@ mod delegate_park;
 mod delegate_restore;
 mod executor;
 mod fair_queue;
+#[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
+mod wakeup_wasm_tests;
 pub(crate) use fair_queue::Priority;
 /// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
 /// than widening `fair_queue` itself, which is otherwise private to this
@@ -2985,6 +2987,7 @@ where
         .and_then(|caps| caps.take_lifecycle_rx());
     let mut lifecycle_schedule = delegate_capabilities::LifecycleSchedule::default();
     if let Some(caps) = &capabilities {
+        refresh_capability_manifests(contract_handler.executor(), caps);
         seed_node_started(caps, &mut lifecycle_schedule);
     }
 
@@ -3209,15 +3212,12 @@ where
             for _ in 0..delegate_capabilities::LIFECYCLE_QUEUE_CAPACITY {
                 match rx.try_recv() {
                     Ok(run) => {
-                        // A duplicate of a waiting run is dropped (see
-                        // `LifecycleSchedule::push`), and counted.
-                        if !lifecycle_schedule.push(now, run, 0)
-                            && let Some(caps) = &capabilities
-                        {
-                            caps.stats
-                                .lifecycle_deduplicated
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        schedule_queued_run(
+                            capabilities.as_deref(),
+                            &mut lifecycle_schedule,
+                            now,
+                            run,
+                        );
                     }
                     Err(_) => break,
                 }
@@ -3380,13 +3380,12 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                if !lifecycle_schedule.push(lifecycle_now(capabilities.as_deref()), run, 0)
-                    && let Some(caps) = &capabilities
-                {
-                    caps.stats
-                        .lifecycle_deduplicated
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                schedule_queued_run(
+                    capabilities.as_deref(),
+                    &mut lifecycle_schedule,
+                    lifecycle_now(capabilities.as_deref()),
+                    run,
+                );
             }
             () = async {
                 match lifecycle_deadline {
@@ -3406,9 +3405,72 @@ fn lifecycle_now(
     caps.map_or_else(tokio::time::Instant::now, |c| c.now())
 }
 
+/// Put a run that arrived on the capability queue into the schedule: a
+/// lifecycle event is due now, a freshly armed wake-up after
+/// [`delegate_capabilities::first_wakeup_delay`]. A duplicate of a waiting run
+/// is dropped (see `LifecycleSchedule::push`), and counted; for a wake-up that
+/// is the normal case (every registration re-arms, and the chain already
+/// running is kept as it is).
+fn schedule_queued_run(
+    caps: Option<&delegate_capabilities::DelegateCapabilities>,
+    schedule: &mut delegate_capabilities::LifecycleSchedule,
+    now: tokio::time::Instant,
+    run: delegate_capabilities::LifecycleRun,
+) {
+    let due = match &run.event {
+        delegate_capabilities::RunEvent::Lifecycle(_) => now,
+        delegate_capabilities::RunEvent::Wakeup { every, .. } => {
+            now + delegate_capabilities::first_wakeup_delay(*every)
+        }
+    };
+    if !schedule.push(due, run, 0)
+        && let Some(caps) = caps
+    {
+        caps.stats
+            .lifecycle_deduplicated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Re-read the manifest of every granted delegate from its stored code, so a
+/// record written by an older node (which dropped manifest fields it did not
+/// know, such as `wakeups`) reflects what the delegate actually declares. Runs
+/// once, before [`seed_node_started`], so wake-ups declared by a delegate
+/// registered under an older release are armed on the first start of this
+/// one without its app having to register it again.
+///
+/// Bounded by the granted records (at most `MAX_CAPABILITY_RECORDS`), and
+/// only reads code this node already stores. A delegate whose code cannot be
+/// loaded keeps its record unchanged.
+fn refresh_capability_manifests<E: ContractExecutor>(
+    executor: &E,
+    caps: &delegate_capabilities::DelegateCapabilities,
+) {
+    let mut refreshed = 0usize;
+    for key in caps.granted_record_keys() {
+        let Some(code) = executor.delegate_code(&key) else {
+            continue;
+        };
+        if let Some(manifest) = delegate_capabilities::read_manifest(&key, &code)
+            && caps.refresh_manifest(&key, manifest)
+        {
+            refreshed += 1;
+        }
+    }
+    if refreshed > 0 {
+        tracing::info!(
+            delegates = refreshed,
+            "Refreshed background delegates' manifests from their stored code"
+        );
+    }
+}
+
 /// Schedule `NodeStarted` for every delegate that asked for it and whose app
 /// holds the Background grant, spread over [`delegate_capabilities::
-/// NODE_STARTED_SMEAR`] after a short start-up delay.
+/// NODE_STARTED_SMEAR`] after a short start-up delay. Also arms every declared
+/// wake-up of those delegates (first fire per
+/// [`delegate_capabilities::first_wakeup_delay`]): wake-ups are re-armed at
+/// each start rather than persisted.
 ///
 /// Runs when the loop starts, which is after `NetworkContractHandler::build`
 /// returned: the durable delegate-subscription REGISTRY is restored by then
@@ -3431,7 +3493,24 @@ fn seed_node_started(
             caps.now() + delegate_capabilities::NODE_STARTED_MIN_DELAY,
             delegate_capabilities::LifecycleRun {
                 key,
-                event: LifecycleEvent::Installed,
+                event: LifecycleEvent::Installed.into(),
+            },
+            0,
+        );
+    }
+    let wakeups = caps.wakeup_start_targets();
+    if !wakeups.is_empty() {
+        tracing::info!(
+            wakeups = wakeups.len(),
+            "Arming background delegates' wake-ups"
+        );
+    }
+    for (key, tag, every) in wakeups {
+        schedule.push(
+            caps.now() + delegate_capabilities::first_wakeup_delay(every),
+            delegate_capabilities::LifecycleRun {
+                key,
+                event: delegate_capabilities::RunEvent::Wakeup { tag, every },
             },
             0,
         );
@@ -3459,7 +3538,8 @@ fn seed_node_started(
                 // missed anything".
                 event: LifecycleEvent::NodeStarted {
                     down_since_ms: None,
-                },
+                }
+                .into(),
             },
             0,
         );
@@ -4647,16 +4727,22 @@ enum LifecycleOutcome {
     Dropped,
 }
 
-/// Deliver one lifecycle event, on the loop.
+/// Deliver one lifecycle event or wake-up, on the loop.
 ///
 /// Runs like a notification run: no origin, no client, `Local` scope with the
 /// inter-delegate hop SUPPRESSED (the node, not a caller, chose to run it, so
 /// there is no caller scope to forward), residual `ApplicationMessage`s fanned
 /// out to registered apps. Unlike a notification run it gets the delegate's
-/// REGISTERED parameters, and it is admitted by the duty budget.
+/// REGISTERED parameters, and it is admitted by the duty budget: the same one
+/// for both kinds.
 ///
 /// The grant and the manifest are checked again here rather than trusted from
 /// the time the run was queued, so a revocation in between takes effect.
+///
+/// A wake-up re-schedules its next fire whatever happens to this one (run,
+/// failed, delegate missing, or skipped after [`delegate_capabilities::
+/// WAKEUP_MAX_DEFERRALS`] deferrals), so a periodic schedule is never lost to
+/// one bad fire; it ends only when the delegate is no longer eligible.
 async fn run_lifecycle<CH, P>(
     contract_handler: &mut CH,
     park: &mut delegate_park::DelegateParkCtx,
@@ -4669,23 +4755,83 @@ where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
 {
+    use delegate_capabilities::RunEvent;
     use std::sync::atomic::Ordering;
     let Some(caps) = contract_handler.executor().delegate_capabilities() else {
         return LifecycleOutcome::Skipped;
     };
     let key = run.key.clone();
-    let Some(params) = caps.delivery_params(&key, run.event.kind()) else {
-        caps.stats
-            .lifecycle_dropped_not_granted
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event not delivered: not granted or not requested");
-        return LifecycleOutcome::Skipped;
+    // `every` is `Some` for a wake-up: its CURRENT interval, from the record.
+    let (params, inbound, every) = match &run.event {
+        RunEvent::Lifecycle(event) => {
+            let Some(params) = caps.delivery_params(&key, event.kind()) else {
+                caps.stats
+                    .lifecycle_dropped_not_granted
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event not delivered: not granted or not requested");
+                return LifecycleOutcome::Skipped;
+            };
+            (params, InboundDelegateMsg::Lifecycle(event.clone()), None)
+        }
+        RunEvent::Wakeup { tag, .. } => {
+            let Some((params, every)) = caps.wakeup_delivery(&key, tag) else {
+                // Revoked, no longer declared, or the record is gone: the
+                // chain ends here. A grant, a registration or the next node
+                // start re-arms it if the delegate becomes eligible again.
+                caps.stats.wakeups_stopped.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(delegate = %key, event = ?run.event, "Wake-up not delivered: not granted or no longer declared; schedule ended");
+                return LifecycleOutcome::Skipped;
+            };
+            (
+                params,
+                InboundDelegateMsg::WakeupFired { tag: tag.clone() },
+                Some(every),
+            )
+        }
+    };
+    // The next fire of a wake-up, `delay` from now.
+    let rearm = |schedule: &mut delegate_capabilities::LifecycleSchedule,
+                 every: std::time::Duration| {
+        if let RunEvent::Wakeup { tag, .. } = &run.event {
+            schedule.push(
+                caps.now() + delegate_capabilities::next_wakeup_delay(every),
+                delegate_capabilities::LifecycleRun {
+                    key: key.clone(),
+                    event: RunEvent::Wakeup {
+                        tag: tag.clone(),
+                        every,
+                    },
+                },
+                0,
+            );
+        }
     };
 
     // Per-delegate exclusion (#5544): never re-enter a parked delegate. And
     // the duty budget: a delegate that has spent its loop time waits.
     let parked = park.is_parked(&key);
     if parked || !caps.duty_available(&key) {
+        if let Some(every) = every {
+            caps.stats.wakeups_deferred.fetch_add(1, Ordering::Relaxed);
+            if attempts + 1 >= delegate_capabilities::WAKEUP_MAX_DEFERRALS {
+                // Skip this one fire; the schedule goes on.
+                caps.stats.wakeups_skipped.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    delegate = %key,
+                    event = ?run.event,
+                    parked,
+                    "Skipping a wake-up that could not start; the next one is scheduled"
+                );
+                rearm(schedule, every);
+                return LifecycleOutcome::Deferred;
+            }
+            schedule.push(
+                caps.now() + delegate_capabilities::LIFECYCLE_RETRY_DELAY,
+                run.clone(),
+                attempts + 1,
+            );
+            return LifecycleOutcome::Deferred;
+        }
         let counter = if parked {
             &caps.stats.lifecycle_deferred_parked
         } else {
@@ -4706,13 +4852,13 @@ where
         }
         schedule.push(
             caps.now() + delegate_capabilities::LIFECYCLE_RETRY_DELAY,
-            run,
+            run.clone(),
             attempts + 1,
         );
         return LifecycleOutcome::Deferred;
     }
 
-    if run.event == LifecycleEvent::Installed {
+    if run.event == RunEvent::Lifecycle(LifecycleEvent::Installed) {
         // Marked before the run: a delegate that brings the node down in its
         // Installed handler must not get it again on every start.
         caps.mark_installed_delivered(&key);
@@ -4721,7 +4867,7 @@ where
     let req = DelegateRequest::ApplicationMessages {
         key: key.clone(),
         params: Parameters::from(params),
-        inbound: vec![InboundDelegateMsg::Lifecycle(run.event.clone())],
+        inbound: vec![inbound],
     };
     let started = caps.now();
     let mut no_responder = None;
@@ -4744,7 +4890,18 @@ where
     )
     .await;
     caps.charge_duty(&key, caps.now().saturating_duration_since(started), true);
+    if let Some(every) = every {
+        rearm(schedule, every);
+    }
 
+    let (delivered, failed) = if every.is_some() {
+        (&caps.stats.wakeups_delivered, &caps.stats.wakeups_failed)
+    } else {
+        (
+            &caps.stats.lifecycle_delivered,
+            &caps.stats.lifecycle_failed,
+        )
+    };
     match outcome {
         DelegateRunOutcome::Failed(err) if err.is_missing_delegate() => {
             // Usually unregistered since (by the CLI, another connection, or
@@ -4759,19 +4916,23 @@ where
             tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event for a delegate this node could not load; skipped");
         }
         DelegateRunOutcome::Failed(err) => {
-            caps.stats.lifecycle_failed.fetch_add(1, Ordering::Relaxed);
-            tracing::info!(delegate = %key, event = ?run.event, error = %err, "Lifecycle run failed");
+            let n = failed.fetch_add(1, Ordering::Relaxed);
+            // A wake-up that fails fails every period: log the first and
+            // every 100th, so it is visible without flooding the log.
+            if every.is_none() || n % 100 == 0 {
+                tracing::info!(delegate = %key, event = ?run.event, error = %err, total = n + 1, "Lifecycle run failed");
+            }
         }
         DelegateRunOutcome::Parked => {
-            caps.stats
-                .lifecycle_delivered
-                .fetch_add(1, Ordering::Relaxed);
+            delivered.fetch_add(1, Ordering::Relaxed);
         }
         DelegateRunOutcome::Completed(outbound) => {
-            caps.stats
-                .lifecycle_delivered
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
+            delivered.fetch_add(1, Ordering::Relaxed);
+            if every.is_some() {
+                tracing::debug!(delegate = %key, event = ?run.event, "Delivered wake-up to delegate");
+            } else {
+                tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
+            }
             route_notification_outbound(&key, outbound);
         }
     }

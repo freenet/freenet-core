@@ -882,6 +882,16 @@ impl RuntimePool {
 
     /// Get a reference to the shared state store.
     /// Used for hosting metadata persistence operations during startup.
+    /// Replace the pool's capability state, so a test can drive the real
+    /// handler with a clock it controls (wake-up intervals are minutes).
+    #[cfg(test)]
+    pub(crate) fn set_delegate_capabilities_for_test(
+        &mut self,
+        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        self.delegate_capabilities = Some(caps);
+    }
+
     pub fn state_store(&self) -> &StateStore<Storage> {
         &self.shared_state_store
     }
@@ -930,6 +940,15 @@ impl ContractExecutor for RuntimePool {
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
         self.delegate_capabilities.clone()
+    }
+
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        // The delegate index and code cache are shared by every executor in
+        // the pool, so any one that is not checked out can answer.
+        self.runtimes
+            .iter()
+            .flatten()
+            .find_map(|executor| executor.runtime.delegate_code(key))
     }
 
     fn delegate_subscription_store(&self) -> Option<Storage> {

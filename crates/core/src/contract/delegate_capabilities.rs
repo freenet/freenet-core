@@ -15,9 +15,38 @@
 //! 2. delivers `LifecycleEvent::Installed` once per delegate per node, and
 //!    `LifecycleEvent::NodeStarted` after each start, only to delegates whose
 //!    manifest lists that kind AND whose app holds the grant;
-//! 3. bounds what unprompted runs (lifecycle and contract-notification runs)
-//!    may cost: loop time, and contract operations (GET/PUT/UPDATE/SUBSCRIBE,
-//!    whether answered locally or from the network) for both.
+//! 3. delivers `InboundDelegateMsg::WakeupFired { tag }` on each periodic
+//!    schedule the manifest declares (`wakeups = [tag = seconds]`, #3972),
+//!    under the same two conditions (see "Wake-ups" below);
+//! 4. bounds what unprompted runs (lifecycle, wake-up and contract-notification
+//!    runs) may cost: loop time, and contract operations (GET/PUT/UPDATE/
+//!    SUBSCRIBE, whether answered locally or from the network) for all of them.
+//!
+//! # Wake-ups
+//!
+//! A wake-up is declared in the manifest rather than requested at run time so
+//! that one delegate build works on nodes with and without the feature: a node
+//! that predates it skips the unknown JSON field and still honours the rest of
+//! the manifest, where a new host import would fail instantiation and a new
+//! outbound message variant would fail decoding of the whole outbound batch.
+//!
+//! - Bounds come from `DelegateManifest::effective_wakeups` (interval clamped
+//!   to 60 s..7 d, 1..=64-byte tags, at most 4 per delegate) plus one pending
+//!   fire per (delegate, tag) in [`LifecycleSchedule`], so a delegate cannot
+//!   wake itself into a storm or pile fires up.
+//! - Metering is the SAME duty budget lifecycle runs use (per delegate and
+//!   node-wide, see [`Budget`]): one budget for every unprompted run the node
+//!   starts on its own, as #5730 required when wake-ups were re-implemented.
+//!   Their contract operations go through the same unprompted-op admission.
+//! - Gating: the manifest must still list the tag and a bound app must still
+//!   hold the Background grant, re-checked at EVERY fire; a parked delegate or
+//!   a spent duty budget defers the fire (bounded), never runs it.
+//! - Restart: nothing about a pending fire is persisted. Wake-ups are re-armed
+//!   at node start from the persisted records (whose manifests are refreshed
+//!   from the stored delegate code first, see `refresh_manifest`), and after a
+//!   registration or a grant. A chain whose fire finds the delegate no longer
+//!   eligible (revoked, unlisted, record gone) ends there; the re-arm points
+//!   above restart it.
 //!
 //! # App identity
 //!
@@ -121,7 +150,8 @@ pub(crate) fn capability_description(cap: Capability) -> &'static str {
     #[allow(clippy::wildcard_enum_match_arm)]
     match cap {
         Capability::Background => {
-            "run when it is installed and each time Freenet starts, even with its tab closed"
+            "run when it is installed, each time Freenet starts, and on a regular schedule \
+             if it asks for one, even with its tab closed"
         }
         _ => "use a capability this node does not know",
     }
@@ -463,11 +493,46 @@ pub(crate) fn read_manifest(key: &DelegateKey, code: &[u8]) -> Option<DelegateMa
     }
 }
 
-/// A lifecycle event queued for delivery on the contract loop.
+/// What an unprompted run the node schedules on its own delivers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunEvent {
+    /// `InboundDelegateMsg::Lifecycle`.
+    Lifecycle(LifecycleEvent),
+    /// `InboundDelegateMsg::WakeupFired { tag }`, one fire of a periodic
+    /// schedule the manifest declares. `every` is the interval in force when
+    /// the fire was armed; the fire itself re-reads it from the record.
+    Wakeup { tag: Vec<u8>, every: Duration },
+}
+
+impl From<LifecycleEvent> for RunEvent {
+    fn from(event: LifecycleEvent) -> Self {
+        RunEvent::Lifecycle(event)
+    }
+}
+
+/// Identity of a scheduled run for deduplication: at most one waiting run per
+/// (delegate, kind).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RunKind {
+    Lifecycle(LifecycleKind),
+    Wakeup(Vec<u8>),
+}
+
+impl RunEvent {
+    pub(crate) fn kind(&self) -> RunKind {
+        match self {
+            RunEvent::Lifecycle(e) => RunKind::Lifecycle(e.kind()),
+            RunEvent::Wakeup { tag, .. } => RunKind::Wakeup(tag.clone()),
+        }
+    }
+}
+
+/// An unprompted run (lifecycle event or wake-up) queued for the contract
+/// loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LifecycleRun {
     pub key: DelegateKey,
-    pub event: LifecycleEvent,
+    pub event: RunEvent,
 }
 
 /// A node-authored prompt the caller must raise (from a spawned task, never
@@ -534,13 +599,19 @@ impl BudgetRefusal {
 
 /// Limits for unprompted runs. Generous on purpose: a grant is consent, not an
 /// exemption, but existing notification-driven apps must not regress.
+///
+/// ONE budget for every run the node starts on its own: lifecycle runs and
+/// wake-ups are both admitted by, and charged to, the same per-delegate and
+/// node duty buckets (#5730 required this when #5614's wake-ups returned; the
+/// draft had a second budget of its own).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BudgetLimits {
-    /// Loop time a delegate may spend in lifecycle runs: refill per second.
+    /// Loop time a delegate may spend in lifecycle and wake-up runs: refill
+    /// per second.
     pub duty_refill_per_sec: Duration,
     /// ...and bucket size.
     pub duty_burst: Duration,
-    /// Node-wide loop time for lifecycle runs: refill per second.
+    /// Node-wide loop time for lifecycle and wake-up runs: refill per second.
     pub node_duty_refill_per_sec: Duration,
     /// ...and bucket size.
     pub node_duty_burst: Duration,
@@ -770,6 +841,18 @@ pub(crate) struct CapabilityStats {
     pub lifecycle_deduplicated: AtomicU64,
     pub lifecycle_skipped_missing: AtomicU64,
     pub lifecycle_dropped_not_granted: AtomicU64,
+    /// Wake-up runs handed to the delegate.
+    pub wakeups_delivered: AtomicU64,
+    /// Wake-up runs that failed (the delegate errored or trapped).
+    pub wakeups_failed: AtomicU64,
+    /// Wake-up fires deferred (delegate parked, or its duty budget spent).
+    pub wakeups_deferred: AtomicU64,
+    /// Wake-up fires given up after `WAKEUP_MAX_DEFERRALS`; the schedule
+    /// continues with the next period.
+    pub wakeups_skipped: AtomicU64,
+    /// Wake-up chains ended because the delegate is no longer eligible
+    /// (grant revoked, tag no longer declared, record gone).
+    pub wakeups_stopped: AtomicU64,
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
     pub refused_contract_writes: AtomicU64,
@@ -982,13 +1065,10 @@ impl DelegateCapabilities {
         params: &[u8],
         app: Option<AppIdentity>,
     ) -> Option<CapabilityPrompt> {
-        let wants_lifecycle = [LifecycleKind::Installed, LifecycleKind::NodeStarted]
-            .iter()
-            .any(|k| manifest.wants_lifecycle(*k));
-        // Background is the only capability today and only lifecycle events
-        // use it, so a manifest without lifecycle kinds has nothing to ask
-        // for; one with lifecycle kinds needs Background whatever it lists.
-        if !wants_lifecycle {
+        // Background is the only capability today, and only lifecycle events
+        // and wake-ups use it, so a manifest with neither has nothing to ask
+        // for; one with either needs Background whatever it lists.
+        if !Self::wants_background_runs(&manifest) {
             return None;
         }
         let wanted = Self::relevant_capabilities(&manifest);
@@ -1096,18 +1176,25 @@ impl DelegateCapabilities {
         });
 
         self.maybe_queue_installed(key, &rec);
+        self.maybe_arm_wakeups(key, &rec);
         prompt
     }
 
+    /// Whether the manifest asks for anything that runs with no app open: a
+    /// lifecycle kind or a wake-up.
+    fn wants_background_runs(manifest: &DelegateManifest) -> bool {
+        [LifecycleKind::Installed, LifecycleKind::NodeStarted]
+            .iter()
+            .any(|k| manifest.wants_lifecycle(*k))
+            || manifest.wants_wakeups()
+    }
+
     /// Capabilities that make an app's binding worth keeping: what the
-    /// manifest asks for, plus Background if it lists any lifecycle kind
-    /// (delivery requires Background whatever the manifest says).
+    /// manifest asks for, plus Background if it lists any lifecycle kind or
+    /// wake-up (delivery requires Background whatever the manifest says).
     fn relevant_capabilities(manifest: &DelegateManifest) -> Vec<Capability> {
         let mut caps = manifest.known_capabilities();
-        let wants_lifecycle = [LifecycleKind::Installed, LifecycleKind::NodeStarted]
-            .iter()
-            .any(|k| manifest.wants_lifecycle(*k));
-        if wants_lifecycle && !caps.contains(&Capability::Background) {
+        if Self::wants_background_runs(manifest) && !caps.contains(&Capability::Background) {
             caps.push(Capability::Background);
         }
         caps
@@ -1206,8 +1293,25 @@ impl DelegateCapabilities {
         }
         self.queue(LifecycleRun {
             key: key.clone(),
-            event: LifecycleEvent::Installed,
+            event: LifecycleEvent::Installed.into(),
         });
+    }
+
+    /// Arm every wake-up the delegate's manifest declares, if a bound app
+    /// holds the grant. An already-armed chain is kept as it is (the schedule
+    /// holds one pending fire per tag), so calling this on every registration
+    /// neither duplicates fires nor postpones them.
+    fn maybe_arm_wakeups(&self, key: &DelegateKey, rec: &DelegateRecord) {
+        let wakeups = rec.manifest.effective_wakeups();
+        if wakeups.is_empty() || !self.any_bound_app_granted(rec, Capability::Background) {
+            return;
+        }
+        for (tag, every) in wakeups {
+            self.queue(LifecycleRun {
+                key: key.clone(),
+                event: RunEvent::Wakeup { tag, every },
+            });
+        }
     }
 
     /// Non-blocking enqueue; a full queue is counted and logged.
@@ -1277,12 +1381,13 @@ impl DelegateCapabilities {
                 && rec.apps.contains(app)
             {
                 self.maybe_queue_installed(&key, &rec);
+                self.maybe_arm_wakeups(&key, &rec);
             }
         }
     }
 
-    /// Revoke a grant (dashboard). Lifecycle events stop at once (delivery
-    /// re-checks the grant); contract-notification runs are not gated by the
+    /// Revoke a grant (dashboard). Lifecycle events and wake-ups stop at once
+    /// (delivery re-checks the grant); contract-notification runs are not gated by the
     /// grant and continue. The next registration by that app prompts again.
     pub(crate) fn revoke(&self, app: &AppIdentity, cap: Capability) -> bool {
         let Some(code) = capability_code(cap) else {
@@ -1329,6 +1434,95 @@ impl DelegateCapabilities {
             return None;
         }
         Some(rec.params)
+    }
+
+    /// The parameters and CURRENT interval to run a wake-up `tag` of `key`
+    /// with, or `None` if it must not fire: no record, the manifest no longer
+    /// declares the tag, or no bound app holds the Background grant. Checked
+    /// at every fire, so a revocation or a manifest change takes effect at
+    /// the next one.
+    pub(crate) fn wakeup_delivery(
+        &self,
+        key: &DelegateKey,
+        tag: &[u8],
+    ) -> Option<(Vec<u8>, Duration)> {
+        let rec = self.load_record(key)?;
+        let every = rec
+            .manifest
+            .effective_wakeups()
+            .into_iter()
+            .find_map(|(t, every)| (t == tag).then_some(every))?;
+        if !self.any_bound_app_granted(&rec, Capability::Background) {
+            return None;
+        }
+        Some((rec.params, every))
+    }
+
+    /// Wake-ups to arm at node start: every declared wake-up of every record
+    /// whose app holds the grant, as `(delegate, tag, interval)`.
+    pub(crate) fn wakeup_start_targets(&self) -> Vec<(DelegateKey, Vec<u8>, Duration)> {
+        let records = match self.storage.all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list delegate capability records at start");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for (key, bytes) in records {
+            let Some(rec) = DelegateRecord::decode(&bytes) else {
+                continue;
+            };
+            let wakeups = rec.manifest.effective_wakeups();
+            if wakeups.is_empty() || !self.any_bound_app_granted(&rec, Capability::Background) {
+                continue;
+            }
+            out.extend(
+                wakeups
+                    .into_iter()
+                    .map(|(tag, every)| (key.clone(), tag, every)),
+            );
+        }
+        out
+    }
+
+    /// Delegates with a record that a bound app's Background grant makes
+    /// eligible for unprompted runs.
+    pub(crate) fn granted_record_keys(&self) -> Vec<DelegateKey> {
+        let records = match self.storage.all_records() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list delegate capability records");
+                return Vec::new();
+            }
+        };
+        records
+            .into_iter()
+            .filter_map(|(key, bytes)| {
+                let rec = DelegateRecord::decode(&bytes)?;
+                self.any_bound_app_granted(&rec, Capability::Background)
+                    .then_some(key)
+            })
+            .collect()
+    }
+
+    /// Replace a record's manifest with one freshly read from the delegate's
+    /// stored code, if they differ. `true` if it changed.
+    ///
+    /// Needed because a record stores the manifest as re-serialized by the
+    /// node that wrote it: a node that predates a manifest field (v0.2.138
+    /// predates `wakeups`) drops it on the way to disk. Without this, a
+    /// delegate registered on the old release would get no wake-ups after
+    /// the node updates until its app happened to register it again.
+    pub(crate) fn refresh_manifest(&self, key: &DelegateKey, manifest: DelegateManifest) -> bool {
+        let Some(mut rec) = self.load_record(key) else {
+            return false;
+        };
+        if rec.manifest == manifest {
+            return false;
+        }
+        rec.manifest = manifest;
+        self.store_record(key, &rec)
     }
 
     /// Record that `Installed` was handed to the delegate. Set BEFORE the run,
@@ -1464,20 +1658,45 @@ pub(crate) const LIFECYCLE_RETRY_DELAY: Duration = Duration::from_secs(15);
 /// Attempts before a deferred lifecycle run is dropped (about 15 minutes).
 pub(crate) const LIFECYCLE_MAX_ATTEMPTS: u32 = 60;
 
+/// Retries (at [`LIFECYCLE_RETRY_DELAY`]) of a wake-up fire that could not
+/// start before that one fire is skipped and the next period's is scheduled.
+/// 3 x 15 s stays under the 60 s minimum interval, so a deferred fire never
+/// overlaps the next one. A wake-up is never dropped for good this way: the
+/// chain continues.
+pub(crate) const WAKEUP_MAX_DEFERRALS: u32 = 3;
+
+/// Delay before the first fire of a freshly armed wake-up: after the node's
+/// own start-up work (same floor as NodeStarted), smeared over up to one
+/// interval (at most [`NODE_STARTED_SMEAR`]) so a node with many background
+/// delegates does not wake them all at once.
+pub(crate) fn first_wakeup_delay(every: Duration) -> Duration {
+    let smear_ms = every.min(NODE_STARTED_SMEAR).as_millis() as u64;
+    NODE_STARTED_MIN_DELAY
+        + Duration::from_millis(crate::config::GlobalRng::random_u64() % smear_ms.max(1))
+}
+
+/// Delay from one fire to the next: the interval plus up to 10% jitter, so
+/// delegates armed together drift apart instead of firing in lockstep. Never
+/// shorter than the interval, so the declared floor holds.
+pub(crate) fn next_wakeup_delay(every: Duration) -> Duration {
+    let jitter_ms = (every.as_millis() / 10) as u64;
+    every + Duration::from_millis(crate::config::GlobalRng::random_u64() % jitter_ms.max(1))
+}
+
 /// Lifecycle runs started per loop iteration, so a burst cannot starve client
 /// work (each is a full delegate run).
 pub(crate) const MAX_LIFECYCLE_RUNS_PER_ITERATION: usize = 1;
 
-/// Lifecycle runs waiting on the loop, ordered by due time. Owned by the
-/// contract loop.
+/// Lifecycle and wake-up runs waiting on the loop, ordered by due time. Owned
+/// by the contract loop.
 /// A run for a `(delegate, kind)` already waiting is not added again, so the
-/// schedule holds at most one run per delegate per kind: bounded by twice the
-/// record cap.
+/// schedule holds at most one run per delegate per kind: bounded by the record
+/// cap times (2 lifecycle kinds + `MAX_WAKEUPS` wake-up tags).
 #[derive(Default)]
 pub(crate) struct LifecycleSchedule {
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(tokio::time::Instant, u64)>>,
     runs: HashMap<u64, (LifecycleRun, u32)>,
-    pending: HashMap<(DelegateKey, LifecycleKind), u64>,
+    pending: HashMap<(DelegateKey, RunKind), u64>,
     seq: u64,
 }
 
@@ -1679,7 +1898,7 @@ mod tests {
             runs,
             vec![LifecycleRun {
                 key: key(1),
-                event: LifecycleEvent::Installed
+                event: LifecycleEvent::Installed.into()
             }]
         );
         assert_eq!(
@@ -2164,12 +2383,12 @@ mod tests {
         for n in 0..LIFECYCLE_QUEUE_CAPACITY {
             assert!(c.queue(LifecycleRun {
                 key: key((n % 250) as u8),
-                event: LifecycleEvent::Installed,
+                event: LifecycleEvent::Installed.into(),
             }));
         }
         assert!(!c.queue(LifecycleRun {
             key: key(1),
-            event: LifecycleEvent::Installed,
+            event: LifecycleEvent::Installed.into(),
         }));
         assert_eq!(c.stats.lifecycle_queue_full.load(Ordering::Relaxed), 1);
     }
@@ -2180,7 +2399,7 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let run = |n| LifecycleRun {
             key: key(n),
-            event: LifecycleEvent::Installed,
+            event: LifecycleEvent::Installed.into(),
         };
         sched.push(t0 + Duration::from_secs(10), run(1), 0);
         sched.push(t0 + Duration::from_secs(5), run(2), 3);
@@ -2201,16 +2420,19 @@ mod tests {
         // One waiting run per (delegate, kind).
         assert!(sched.push(t0, run(3), 0));
         assert!(!sched.push(t0, run(3), 0));
-        assert!(sched.push(
-            t0,
-            LifecycleRun {
-                key: key(3),
-                event: LifecycleEvent::NodeStarted {
-                    down_since_ms: None
+        assert!(
+            sched.push(
+                t0,
+                LifecycleRun {
+                    key: key(3),
+                    event: LifecycleEvent::NodeStarted {
+                        down_since_ms: None
+                    }
+                    .into(),
                 },
-            },
-            0
-        ));
+                0
+            )
+        );
         assert_eq!(sched.len(), 2);
         let _ = sched.pop_due(t0);
         let _ = sched.pop_due(t0);
@@ -2221,6 +2443,215 @@ mod tests {
         assert!(sched.push(t0, run(4), 59));
         assert!(!sched.push(t0, run(4), 0));
         assert_eq!(sched.pop_due(t0), Some((run(4), 0)));
+    }
+
+    fn wakeup_manifest(lifecycle: Vec<LifecycleKind>, wakeups: &[(&str, u64)]) -> DelegateManifest {
+        let mut m = DelegateManifest::new(lifecycle, vec![Capability::Background]);
+        for (tag, secs) in wakeups {
+            m = m.with_wakeup(*tag, *secs);
+        }
+        m
+    }
+
+    fn wakeup_runs(rx: &mut mpsc::Receiver<LifecycleRun>) -> Vec<(DelegateKey, Vec<u8>, Duration)> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                RunEvent::Wakeup { tag, every } => Some((r.key, tag, every)),
+                RunEvent::Lifecycle(_) => None,
+            })
+            .collect()
+    }
+
+    /// A manifest that declares only wake-ups (no lifecycle kind) still needs
+    /// and asks for Background, and nothing is armed until it is granted.
+    #[test]
+    fn a_wakeup_only_manifest_asks_for_background_and_arms_on_grant() {
+        let (c, _) = caps();
+        let mut rx = c.take_lifecycle_rx().unwrap();
+        let wasm = wasm_with_manifest(&wakeup_manifest(vec![], &[("hb", 300)]));
+        let prompt = c
+            .on_registered(&key(1), &wasm, b"p", Some(app(1)))
+            .expect("wake-ups alone need Background");
+        assert_eq!(prompt.capabilities, vec![Capability::Background]);
+        assert!(drain(&mut rx).is_empty(), "nothing armed before the grant");
+        c.record_answer(&prompt, true);
+        assert_eq!(
+            wakeup_runs(&mut rx),
+            vec![(key(1), b"hb".to_vec(), Duration::from_secs(300))]
+        );
+    }
+
+    /// A granted delegate's registration arms every declared wake-up (the
+    /// schedule, not this call, is what keeps a re-arm from duplicating), with
+    /// the node's clamped reading of the interval.
+    #[test]
+    fn registration_arms_every_declared_wakeup_once_granted() {
+        let (c, _) = caps();
+        let mut rx = c.take_lifecycle_rx().unwrap();
+        let wasm = wasm_with_manifest(&wakeup_manifest(
+            vec![LifecycleKind::NodeStarted],
+            &[("hb", 300), ("fast", 5)],
+        ));
+        let p = c.on_registered(&key(1), &wasm, b"p", Some(app(1))).unwrap();
+        c.record_answer(&p, true);
+        let runs = wakeup_runs(&mut rx);
+        assert_eq!(
+            runs,
+            vec![
+                (key(1), b"hb".to_vec(), Duration::from_secs(300)),
+                (
+                    key(1),
+                    b"fast".to_vec(),
+                    Duration::from_secs(freenet_stdlib::prelude::MIN_WAKEUP_INTERVAL_SECS)
+                ),
+            ]
+        );
+        // Re-registration re-arms (the loop's schedule drops the duplicates).
+        assert_eq!(c.on_registered(&key(1), &wasm, b"p", Some(app(1))), None);
+        assert_eq!(wakeup_runs(&mut rx).len(), 2);
+        // An ungranted app's registration arms nothing.
+        let _ = c.on_registered(&key(2), &wasm, b"q", Some(app(2)));
+        assert!(wakeup_runs(&mut rx).is_empty());
+    }
+
+    /// Fire-time gating: the tag must still be declared, a bound app must
+    /// still hold the grant, and the record must still exist. The interval is
+    /// the CURRENT one.
+    #[test]
+    fn wakeup_delivery_is_gated_at_fire_time() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&wakeup_manifest(vec![], &[("hb", 300)]));
+        let p = c.on_registered(&key(1), &wasm, b"p", Some(app(1))).unwrap();
+        assert_eq!(c.wakeup_delivery(&key(1), b"hb"), None, "not granted yet");
+        c.record_answer(&p, true);
+        assert_eq!(
+            c.wakeup_delivery(&key(1), b"hb"),
+            Some((b"p".to_vec(), Duration::from_secs(300)))
+        );
+        assert_eq!(c.wakeup_delivery(&key(1), b"other"), None, "undeclared tag");
+        assert_eq!(c.wakeup_delivery(&key(9), b"hb"), None, "no record");
+
+        // The same key registered with a new interval: the fire uses it.
+        let wasm2 = wasm_with_manifest(&wakeup_manifest(vec![], &[("hb", 900)]));
+        assert_eq!(c.on_registered(&key(1), &wasm2, b"p", Some(app(1))), None);
+        assert_eq!(
+            c.wakeup_delivery(&key(1), b"hb"),
+            Some((b"p".to_vec(), Duration::from_secs(900)))
+        );
+
+        assert!(c.revoke(&app(1), Capability::Background));
+        assert_eq!(c.wakeup_delivery(&key(1), b"hb"), None, "revoked");
+        c.record_answer(&p, true);
+        assert!(c.wakeup_delivery(&key(1), b"hb").is_some(), "granted again");
+        c.on_unregistered(&key(1), Some(app(1)));
+        assert_eq!(c.wakeup_delivery(&key(1), b"hb"), None, "record gone");
+    }
+
+    #[test]
+    fn wakeup_start_targets_are_the_granted_records_wakeups() {
+        let (c, _) = caps();
+        let wasm = wasm_with_manifest(&wakeup_manifest(
+            vec![LifecycleKind::NodeStarted],
+            &[("a", 60), ("b", 120)],
+        ));
+        let p = c.on_registered(&key(1), &wasm, b"", Some(app(1))).unwrap();
+        c.record_answer(&p, true);
+        let p = c.on_registered(&key(2), &wasm, b"", Some(app(2))).unwrap();
+        c.record_answer(&p, false);
+        // Granted, but declares no wake-ups.
+        let plain = wasm_with_manifest(&background_manifest());
+        let p = c.on_registered(&key(3), &plain, b"", Some(app(3))).unwrap();
+        c.record_answer(&p, true);
+        let mut got = c.wakeup_start_targets();
+        got.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            got,
+            vec![
+                (key(1), b"a".to_vec(), Duration::from_secs(60)),
+                (key(1), b"b".to_vec(), Duration::from_secs(120)),
+            ]
+        );
+        let mut granted = c.granted_record_keys();
+        granted.sort_by_key(|k| k.to_string());
+        let mut expected = vec![key(1), key(3)];
+        expected.sort_by_key(|k| k.to_string());
+        assert_eq!(granted, expected);
+    }
+
+    /// A record written by v0.2.138 holds the manifest re-serialized without
+    /// `wakeups`. Re-reading it from the code restores them.
+    #[test]
+    fn refresh_manifest_restores_wakeups_a_node_without_them_dropped() {
+        let (c, _) = caps();
+        let declared = wakeup_manifest(vec![LifecycleKind::NodeStarted], &[("hb", 300)]);
+        // What the old node stored: the same manifest minus the field it did
+        // not know.
+        let as_stored = DelegateManifest::from_bytes(
+            br#"{"manifest_version":1,"lifecycle":["node_started"],"capabilities":["background"]}"#,
+        )
+        .unwrap();
+        let p = c
+            .on_registered(&key(1), &wasm_with_manifest(&as_stored), b"", Some(app(1)))
+            .unwrap();
+        c.record_answer(&p, true);
+        assert!(c.wakeup_start_targets().is_empty());
+
+        assert!(c.refresh_manifest(&key(1), declared.clone()));
+        assert_eq!(
+            c.wakeup_start_targets(),
+            vec![(key(1), b"hb".to_vec(), Duration::from_secs(300))]
+        );
+        assert!(!c.refresh_manifest(&key(1), declared.clone()), "unchanged");
+        assert!(
+            !c.refresh_manifest(&key(9), declared),
+            "no record, nothing to refresh"
+        );
+    }
+
+    #[test]
+    fn the_schedule_holds_one_fire_per_delegate_and_tag() {
+        let mut sched = LifecycleSchedule::default();
+        let t0 = tokio::time::Instant::now();
+        let wake = |n, tag: &[u8]| LifecycleRun {
+            key: key(n),
+            event: RunEvent::Wakeup {
+                tag: tag.to_vec(),
+                every: Duration::from_secs(60),
+            },
+        };
+        assert!(sched.push(t0, wake(1, b"a"), 0));
+        assert!(!sched.push(t0, wake(1, b"a"), 0), "same tag: duplicate");
+        assert!(sched.push(t0, wake(1, b"b"), 0), "other tag");
+        assert!(sched.push(t0, wake(2, b"a"), 0), "other delegate");
+        assert!(
+            sched.push(
+                t0,
+                LifecycleRun {
+                    key: key(1),
+                    event: LifecycleEvent::Installed.into(),
+                },
+                0
+            ),
+            "a lifecycle run is a different kind"
+        );
+        assert_eq!(sched.len(), 4);
+    }
+
+    #[test]
+    fn wakeup_delays_stay_inside_their_bounds() {
+        let _seed = crate::config::GlobalRng::seed_guard(7);
+        for every in [60u64, 300, 7 * 24 * 3600] {
+            let every = Duration::from_secs(every);
+            for _ in 0..200 {
+                let first = first_wakeup_delay(every);
+                assert!(first >= NODE_STARTED_MIN_DELAY);
+                assert!(first < NODE_STARTED_MIN_DELAY + every.min(NODE_STARTED_SMEAR));
+                let next = next_wakeup_delay(every);
+                assert!(next >= every, "never sooner than the interval");
+                assert!(next < every + every / 10 + Duration::from_millis(1));
+            }
+        }
     }
 
     #[cfg(feature = "redb")]
