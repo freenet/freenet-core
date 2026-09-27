@@ -30,8 +30,9 @@ if [[ -z "${CI:-}" ]]; then
 fi
 
 cleanup() {
-    launchctl unsetenv FREENET_OPEN_DRY_RUN 2>/dev/null || true
-    launchctl unsetenv FREENET_TELEMETRY_ENABLED 2>/dev/null || true
+    for var in FREENET_OPEN_DRY_RUN FREENET_TELEMETRY_ENABLED DATA_DIR CONFIG_DIR; do
+        launchctl unsetenv "$var" 2>/dev/null || true
+    done
     pkill -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -99,6 +100,21 @@ fi
     || fail "freenet:// resolves to $handler, not $APP"
 echo "ok - LaunchServices resolves freenet:// to the bundle"
 
+# Session environment for apps LaunchServices and launchd start from now on.
+# FREENET_OPEN_DRY_RUN: the handler prints instead of opening a browser.
+# DATA_DIR / CONFIG_DIR: this is a DEBUG build, and debug builds only know a
+# temp-dir default for these, which the service path refuses (a release
+# build uses the platform directories); explicit directories sidestep that.
+# FREENET_TELEMETRY_ENABLED: the app starts a real node; keep it out of the
+# production telemetry. (Its auto-update is off because CI builds this binary
+# with FREENET_GIT_IS_DIRTY=1, so a newer release cannot swap the bundle out
+# mid-test.)
+mkdir -p "$OUT/data" "$OUT/config"
+launchctl setenv FREENET_OPEN_DRY_RUN 1
+launchctl setenv FREENET_TELEMETRY_ENABLED false
+launchctl setenv DATA_DIR "$OUT/data"
+launchctl setenv CONFIG_DIR "$OUT/config"
+
 # 2b. Can the app start at all here? Launch it directly (no link) first, so a
 # failure below can be told apart: "the app cannot start in this environment"
 # vs "the link was not delivered".
@@ -111,7 +127,8 @@ for _ in $(seq 1 30); do
 done
 if ! $started; then
     echo "--- the app did not start via open -a; running its executable directly ---" >&2
-    ( "$APP/Contents/MacOS/Freenet" > "$OUT/direct.log" 2>&1 & echo $! > "$OUT/direct.pid" )
+    ( DATA_DIR="$OUT/data" CONFIG_DIR="$OUT/config" "$APP/Contents/MacOS/Freenet" \
+        > "$OUT/direct.log" 2>&1 & echo $! > "$OUT/direct.pid" )
     sleep 15
     head -c 4000 "$OUT/direct.log" >&2 || true
     kill "$(cat "$OUT/direct.pid")" 2>/dev/null || true
@@ -129,11 +146,7 @@ done
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
 # stops the handler opening a browser; it is set for apps LaunchServices
 # starts in this session.
-launchctl setenv FREENET_OPEN_DRY_RUN 1
-# The app starts a real node. Keep it out of the production telemetry. (Its
-# auto-update is off because CI builds this binary with FREENET_GIT_IS_DIRTY=1,
-# so a newer release cannot swap the bundle out mid-test.)
-launchctl setenv FREENET_TELEMETRY_ENABLED false
+# (The session environment was set up before step 2b.)
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR"/freenet-wrapper.*.log
 

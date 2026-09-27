@@ -301,6 +301,12 @@ fn is_dot_segment(segment: &str) -> bool {
 /// Debug builds only: a node started with `--id` keeps its config under
 /// `<temp>/freenet-<id>`, which this does not know; pass `--config-dir`.
 fn default_config_dir() -> Option<PathBuf> {
+    // `CONFIG_DIR` is the node's own override (ConfigPathsArgs), honoured
+    // here too so the in-app macOS handler, which has no command line,
+    // agrees with a node started with it.
+    if let Some(dir) = std::env::var_os("CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     if cfg!(debug_assertions) {
         Some(std::env::temp_dir().join("freenet"))
     } else {

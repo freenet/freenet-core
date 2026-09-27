@@ -90,7 +90,8 @@ impl Sandbox {
             .env("HOME", self.root.join("home"))
             .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
             .env("XDG_CACHE_HOME", self.root.join("home/.cache"))
-            .env_remove("WS_API_PORT");
+            .env_remove("WS_API_PORT")
+            .env_remove("CONFIG_DIR");
     }
 
     fn open(&self, link: &str) -> Output {
