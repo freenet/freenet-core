@@ -216,6 +216,15 @@ pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 #[allow(dead_code)]
 const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
 
+/// Append a line to the wrapper's own log (the wrapper process has no
+/// tracing subscriber, so `tracing` output from it goes nowhere).
+#[cfg(target_os = "macos")]
+pub(crate) fn log_to_wrapper_log(message: &str) {
+    if let Some(dir) = freenet::tracing::tracer::get_log_dir() {
+        wrapper::log_wrapper_event(&dir, message);
+    }
+}
+
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn open_url_in_browser(url: &str) {

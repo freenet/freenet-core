@@ -641,10 +641,10 @@ mod platform {
                             &link,
                             super::super::open_link::APP_LAUNCH_NODE_WAIT,
                         );
-                        tracing::info!(
-                            outcome = outcome.kind(),
-                            "Handled a freenet:// link from LaunchServices"
-                        );
+                        super::super::service::log_to_wrapper_log(&format!(
+                            "Handled a freenet:// link from LaunchServices: outcome={}",
+                            outcome.kind()
+                        ));
                     });
                 }
             }
