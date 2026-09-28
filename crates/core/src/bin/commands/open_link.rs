@@ -23,14 +23,15 @@
 //!   (`open -- %u` / `open -- "%1"`), and exactly one positional is accepted, so
 //!   argument injection cannot smuggle in a flag or a second argument.
 //!
-//! Two link forms are accepted: `freenet://<id><rest>` (what the /open page
-//! emits today) and the authority-less `freenet:<id><rest>` (the id must
-//! follow the colon directly; `freenet:/<id>` is refused, and `freenet:///<id>`
-//! is the authority form with an empty id, so it is refused too). The second exists
-//! because some desktops re-parse the link before handing it over and
-//! lowercase a URL's host, which in the first form is the case-sensitive
-//! contract id (Qt's `QUrl`, used by KDE's `kde-open`, does this). The
-//! authority-less form has no host to lowercase.
+//! Two link forms are accepted: the authority-less `freenet:<id><rest>`, which
+//! freenet.org/open emits (freenet/web#186), and `freenet://<id><rest>`, which
+//! it emitted before and links already shared may use. In the first, the id must follow
+//! the colon directly; `freenet:/<id>` is refused, and `freenet:///<id>` is
+//! the authority form with an empty id, so it is refused too. The
+//! authority-less form exists because some desktops re-parse the link before
+//! handing it over and lowercase a URL's host, which in the `//` form is the
+//! case-sensitive contract id (Qt's `QUrl`, used by KDE's `kde-open`, does
+//! this). The authority-less form has no host to lowercase.
 //!
 //! The handler itself never starts a stopped node: that would interact with
 //! the service supervisors (systemd's start limit, a wrapper mid-update). When
