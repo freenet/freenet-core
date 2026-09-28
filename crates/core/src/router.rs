@@ -1422,7 +1422,14 @@ impl Clone for Router {
             per_op_failure: self.per_op_failure.clone(),
             per_op_response_time: self.per_op_response_time.clone(),
             per_op_transfer_rate: self.per_op_transfer_rate.clone(),
-            renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
+            // Anchored on the clock carried over below, as `with_time_source`
+            // does, so a clone of a mock-clocked router keeps one time scale.
+            renegade_predictor: {
+                let mut predictor =
+                    routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS);
+                predictor.set_reference_time(self.estimator_clock.wall_clock_hours());
+                predictor
+            },
             // Reset with the predictor: these score the predictor's output, so
             // carrying them across a clone that discards it would attribute one
             // model's accuracy to another.
@@ -1503,7 +1510,8 @@ impl Default for EstimatorClock {
 /// same instant.
 #[derive(Debug, Clone, Copy)]
 struct PredictionClock {
-    /// Host wall clock in hours since the epoch, for the legacy Renegade path.
+    /// The injected source's wall clock in hours since the epoch, for the
+    /// legacy Renegade path.
     wall_clock_hours: f64,
     /// The hierarchical estimator's hours, from [`EstimatorClock`].
     estimator_hours: f64,
@@ -2206,6 +2214,13 @@ impl Router {
         mut self,
         source: crate::util::time_source::DynTimeSource,
     ) -> Self {
+        // Re-anchoring a trained predictor would put later observations on a
+        // different base from the ones already stored.
+        debug_assert_eq!(
+            self.renegade_predictor.len(),
+            0,
+            "with_time_source must be called before any event is recorded"
+        );
         self.estimator_clock = EstimatorClock::new(source);
         self.renegade_predictor
             .set_reference_time(self.estimator_clock.wall_clock_hours());
@@ -4199,7 +4214,11 @@ mod tests {
         // The warm-up below goes through `add_event` with no recorder, so the
         // estimator must be switched on to learn from it.
         let _hierarchical = force_hierarchical_routing(true);
-        let mut router = Router::new(&[]);
+        // A frozen clock, so the forecast taken below and the one `add_event`
+        // records read the same instant, for the legacy (Renegade) path too.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
         // A key of its own: `PeerKeyLocation::random()` reuses one key per
         // thread, which would make the peer-hash assertion below vacuous.
         let peer = PeerKeyLocation::new(
@@ -4385,18 +4404,10 @@ mod tests {
             let expected = value
                 .unwrap_or_else(|| panic!("{field} has an acted-on value"))
                 .ln();
-            // Exact for the hierarchical forecasts. The legacy ones pass through
-            // Renegade, whose time feature reads the host clock inside
-            // `add_event`, so they can move in the fifth digit between the two
-            // readings; `legacy_timing_forecast_follows_the_residual_correction_flag`
-            // pins them exactly on a shared clock.
-            let tolerance = if field.ends_with("_legacy") {
-                1e-4
-            } else {
-                1e-12
-            };
+            // Exact up to the record's float round trip, for the legacy
+            // forecasts too: both readings are on the same frozen clock.
             assert!(
-                (recorded(field) - expected).abs() < tolerance,
+                (recorded(field) - expected).abs() < 1e-12,
                 "{field}: recorded {} but routing would act on ln = {expected}",
                 recorded(field)
             );
@@ -6828,6 +6839,19 @@ mod tests {
             .renegade_predictor
             .time_at(router.prediction_clock().wall_clock_hours);
         assert_eq!(queried.to_bits(), recorded.to_bits());
+    }
+
+    /// A clone keeps the injected clock, so its fresh Renegade predictor must be
+    /// anchored on that clock too, not on `SystemTime`, or its time feature is
+    /// decades off the moment the clone reads the mock.
+    #[test]
+    fn clone_anchors_renegade_on_the_carried_clock() {
+        let router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let clone = router.clone();
+        let now = clone.prediction_clock().wall_clock_hours;
+        assert_eq!(clone.renegade_predictor.time_at(now), 0.0);
     }
 
     /// Cold stages and candidates neither model can predict are recorded as

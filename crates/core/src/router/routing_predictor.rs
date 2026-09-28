@@ -76,8 +76,9 @@ struct RoutingObservation {
     contract_location: f64,
     /// Distance from peer to contract [0, 0.5].
     distance: f64,
-    /// Time of observation in hours (relative to predictor start, not epoch).
-    /// This keeps values small for metric learning.
+    /// Time of observation in hours, relative to the predictor's reference time
+    /// (set at construction, or re-anchored by `Router::with_time_source`), not
+    /// the epoch. This keeps values small for metric learning.
     time: f64,
 }
 
@@ -1145,10 +1146,10 @@ pub(crate) fn queries_on_this_thread() -> u64 {
     QUERIES.with(|count| count.get())
 }
 
-/// Wall-clock time in hours since epoch. Used for the time feature.
-/// Note: For full deterministic simulation testing, this should be replaced
-/// with TimeSource. Currently, the _at_time() methods allow controlled time
-/// in tests, and batch loading passes original timestamps.
+/// Wall-clock time in hours since epoch. Only seeds the default reference time
+/// in [`RoutingPredictor::new`]; the time feature itself is read from the
+/// router's injected `TimeSource` (`Router`'s `EstimatorClock`), which
+/// re-anchors the reference in `Router::with_time_source`.
 pub(crate) fn wall_clock_hours() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
