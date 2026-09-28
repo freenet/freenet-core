@@ -2208,8 +2208,11 @@ impl Router {
     /// the ring's `InstantTimeSrc`, which follows tokio's clock (so it advances
     /// under a paused runtime); tests pass a mock they advance by hand.
     ///
-    /// The legacy Renegade path's wall clock comes from the same source, and its
-    /// time feature is re-anchored to it, so call at construction.
+    /// The legacy Renegade path reads its wall clock from the same source's
+    /// `system_time_now()`, and its time feature is re-anchored to it, so call
+    /// at construction. For `InstantTimeSrc` that is `SystemTime::now()`, which
+    /// does NOT follow a paused tokio runtime: under paused time the
+    /// hierarchical hours advance and Renegade's time feature does not.
     pub(crate) fn with_time_source(
         mut self,
         source: crate::util::time_source::DynTimeSource,

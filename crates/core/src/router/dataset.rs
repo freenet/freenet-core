@@ -323,8 +323,9 @@ const MARKER_RESERVE: u64 = 512;
 /// exists to replay derives its own time feature from the router's wall clock,
 /// which in production is the ring's `InstantTimeSrc` and so the host wall
 /// clock, so a replay needs records on that same clock. If the router's clock
-/// is ever made overridable outside tests, this must follow it. Route events and peer snapshots MUST share this function, or they
-/// stop joining the moment either side's clock is changed.
+/// is ever made overridable outside tests, this must follow it. Route events
+/// and peer snapshots MUST share this function, or they stop joining the
+/// moment either side's clock is changed.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
