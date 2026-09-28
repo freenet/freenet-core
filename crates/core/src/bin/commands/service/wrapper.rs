@@ -20,7 +20,7 @@ use super::open_url_in_browser;
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
-    WRAPPER_MAX_PORT_CONFLICT_KILLS,
+    WRAPPER_MAX_PORT_CONFLICT_KILLS, WRAPPER_MIN_HEALTHY_RUNTIME_SECS,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::{
@@ -221,6 +221,29 @@ pub(super) enum WrapperAction {
     KillAndRetry,
     /// Wait (with jitter) then relaunch.
     BackoffAndRelaunch { secs: u64 },
+}
+
+/// When the child that just exited ran long enough to have been healthy, clear
+/// the failure count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES` (as the macOS
+/// launchd script does) and the backoff. Without it the count only reset on a
+/// successful update, so a node that runs for days and fails one update a day
+/// (a #3934 lockout retry, or an AV-locked binary) walked to the limit and the
+/// wrapper gave up for good.
+///
+/// The identical-failure streak is deliberately LEFT ALONE: the same failure
+/// after every healthy run (a version that dies after ten minutes, the same
+/// install failing day after day) is exactly the "stuck" condition that
+/// streak exists to report, and hiding it would hide a node stuck on an old
+/// version.
+///
+/// `runtime_secs` must be the child's own runtime, measured when it exited,
+/// not including the post-exit update: a quick crash followed by a slow failed
+/// update is not a healthy run.
+pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
+    if runtime_secs >= WRAPPER_MIN_HEALTHY_RUNTIME_SECS {
+        state.consecutive_failures = 0;
+        state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+    }
 }
 
 /// Pure function: given current state and exit info, determine the next action
@@ -926,6 +949,12 @@ fn run_wrapper_loop(
             cmd.stderr(std::process::Stdio::null());
         }
 
+        // Wall-clock time is right here: this measures how long a real child
+        // process ran, in bin-side supervisor code no simulation reaches.
+        let child_started = {
+            use std::time::Instant;
+            Instant::now()
+        };
         // Use spawn + polling so we can handle tray actions while child runs
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1045,6 +1074,13 @@ fn run_wrapper_loop(
             // Sleep briefly before polling again
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
+
+        // The child's own runtime, taken as it exits and before any update
+        // runs, so the updater's time is never counted as a healthy run.
+        // Applied here, before the tray Restart/Stop sentinels `continue`, so
+        // a healthy run ended from the tray also starts a fresh count.
+        let child_runtime_secs = child_started.elapsed().as_secs();
+        note_child_runtime(&mut state, child_runtime_secs);
 
         // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == SENTINEL_RESTART {

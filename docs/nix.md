@@ -101,9 +101,10 @@ One honest residual: the wrapper cannot see the node's auto-update failure
 lockout, and re-seeding would not clear it if it could. The lockout is a counter
 file in the node's own state directory, not a property of the binary. It does not
 gate the wrapper's own `freenet update` (which clears the counter on a successful
-install), so it only stops the node's in-process update re-poll — which means a
-locked-out peer that never crashes also never updates. Closing that would mean
-making update decisions in shell, which this wrapper deliberately does not do.
+install), so it only stops the node's in-process update re-poll. The node lets
+that lockout expire a day after the last failure, so a locked-out peer that
+never crashes still gets one attempt a day; the wrapper needs no update logic of
+its own for that.
 
 The supervisor itself (`nix/freenet-node.sh`) is a faithful port of the systemd
 unit the node generates for itself (`generate_user_service_file`,
