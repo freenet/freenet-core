@@ -76,8 +76,9 @@ struct RoutingObservation {
     contract_location: f64,
     /// Distance from peer to contract [0, 0.5].
     distance: f64,
-    /// Time of observation in hours (relative to predictor start, not epoch).
-    /// This keeps values small for metric learning.
+    /// Time of observation in hours, relative to the predictor's reference time
+    /// (set at construction, or re-anchored by `Router::with_time_source`), not
+    /// the epoch. This keeps values small for metric learning.
     time: f64,
 }
 
@@ -688,7 +689,10 @@ impl RoutingPredictor {
         p
     }
 
-    /// Record a routing outcome. Uses wall-clock time for the time feature.
+    /// Record a routing outcome observed at `wall_clock_hours` (hours since the
+    /// Unix epoch). The caller supplies the reading so it comes from the same
+    /// injected clock as the queries (see `Router`'s `EstimatorClock`), rather
+    /// than from `SystemTime` here, which no test can hold still (#5754).
     pub fn record(
         &mut self,
         peer: &PeerKeyLocation,
@@ -696,9 +700,30 @@ impl RoutingPredictor {
         distance: f64,
         outcome: RoutingOutcome,
         residuals: StageResiduals,
+        wall_clock_hours: f64,
     ) {
-        let time = wall_clock_hours() - self.reference_time_hours;
+        let time = self.time_at(wall_clock_hours);
         self.record_at_time(peer, contract_location, distance, outcome, residuals, time);
+    }
+
+    /// The time feature of the most recent failure-stage observation. Test-only,
+    /// so a test can see which clock training read.
+    #[cfg(test)]
+    pub(crate) fn latest_failure_observation_time(&self) -> Option<f64> {
+        self.failure_stage
+            .bandwidth_samples
+            .back()
+            .map(|observation| observation.time)
+    }
+
+    /// Anchor the time feature at `wall_clock_hours`, for a router whose clock
+    /// is replaced at construction (`Router::with_time_source`). Without it, a
+    /// mock clock's wall time would sit decades from the `SystemTime` reference
+    /// taken in [`Self::new`], and the time feature would stop being the small
+    /// value metric learning expects. Observations already stored keep their
+    /// times; only later readings move.
+    pub(crate) fn set_reference_time(&mut self, wall_clock_hours: f64) {
+        self.reference_time_hours = wall_clock_hours;
     }
 
     /// Record at a specific relative time (for batch loading with original timestamps
@@ -1121,10 +1146,10 @@ pub(crate) fn queries_on_this_thread() -> u64 {
     QUERIES.with(|count| count.get())
 }
 
-/// Wall-clock time in hours since epoch. Used for the time feature.
-/// Note: For full deterministic simulation testing, this should be replaced
-/// with TimeSource. Currently, the _at_time() methods allow controlled time
-/// in tests, and batch loading passes original timestamps.
+/// Wall-clock time in hours since epoch. Only seeds the default reference time
+/// in [`RoutingPredictor::new`]; the time feature itself is read from the
+/// router's injected `TimeSource` (`Router`'s `EstimatorClock`), which
+/// re-anchors the reference in `Router::with_time_source`.
 pub(crate) fn wall_clock_hours() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
