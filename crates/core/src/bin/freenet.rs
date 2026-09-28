@@ -557,11 +557,12 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
+        let startup_check_ran = startup_attempt.is_ok();
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_attempt.is_ok() && startup_jitter_secs > 0 {
+        if startup_check_ran && startup_jitter_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
         }
-        let latest = match &startup_attempt {
+        let latest = match startup_attempt {
             Ok(attempt) => {
                 tracing::info!(
                     current = build_info::VERSION,
@@ -616,7 +617,7 @@ async fn run_network_node_with_signals(
         //
         // Only when the check actually ran: a skip above is its own terminal
         // line, and this one must keep meaning "the check finished".
-        if startup_attempt.is_ok() {
+        if startup_check_ran {
             tracing::info!(
                 current = build_info::VERSION,
                 "Startup update check complete: staying on the current version"
@@ -836,24 +837,30 @@ async fn run_network_node_with_signals(
                     }
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
                         let open_connections = get_open_connection_count();
-                        // Claimed like every other self-initiated exit 42, so a
-                        // locked-out node (#3934) cannot loop through here.
-                        if open_connections == 0 && claim_update_attempt().is_ok() {
-                            tracing::warn!(
-                                "Max backoff + 0 connections — \
-                                 trusting gateway version signal, exiting for auto-update"
+                        if open_connections == 0 {
+                            // Claimed like every other self-initiated exit 42,
+                            // so a locked-out node (#3934) cannot loop through
+                            // here. On refusal the mismatch is KEPT, so the node
+                            // tries again once its cooldown has passed, instead
+                            // of forgetting it is isolated on an old version.
+                            if claim_update_attempt().is_ok() {
+                                tracing::warn!(
+                                    "Max backoff + 0 connections — \
+                                     trusting gateway version signal, exiting for auto-update"
+                                );
+                                clear_version_mismatch();
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send("unknown (gateway mismatch)".to_string());
+                                return;
+                            }
+                        } else {
+                            tracing::info!(
+                                open_connections,
+                                "Max backoff reached but node has connections — \
+                                 clearing version mismatch flag"
                             );
                             clear_version_mismatch();
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = update_tx.send("unknown (gateway mismatch)".to_string());
-                            return;
                         }
-                        tracing::info!(
-                            open_connections,
-                            "Max backoff reached but node has connections — \
-                             clearing version mismatch flag"
-                        );
-                        clear_version_mismatch();
                     }
                     UpdateCheckResult::Skipped => {}
                     UpdateCheckResult::RateLimited => {
@@ -932,7 +939,7 @@ async fn run_network_node_with_signals(
                         "Periodic re-poll: checking GitHub directly for a newer release"
                     );
                     if let Some(new_version) =
-                        startup_update_check(&attempt, build_info::VERSION).await
+                        startup_update_check(attempt, build_info::VERSION).await
                     {
                         // #4073 (rebase onto #4591/#4593): mirror the boot-time
                         // startup check — never exit-42 to a version that is
@@ -968,7 +975,7 @@ async fn run_network_node_with_signals(
                     // retry raises the failure count, which announces it again.
                     // Mirrors `LOCKOUT_WARNED_AT` in `check_if_update_available`.
                     static LOCKOUT_REPORTED_AT: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
+                        std::sync::atomic::AtomicU32::new(u32::MAX);
                     let failures = commands::auto_update::get_update_failure_count();
                     if LOCKOUT_REPORTED_AT.swap(failures, std::sync::atomic::Ordering::Relaxed)
                         != failures
@@ -3208,7 +3215,7 @@ mod tests {
         let complete = "\"Startupupdatecheckcomplete:stayingonthecurrentversion\"";
         assert_eq!(prod.matches(complete).count(), 1);
         assert!(
-            braced_block(&prod, "ifstartup_attempt.is_ok(){").contains(complete),
+            braced_block(&prod, "ifstartup_check_ran{").contains(complete),
             "the startup completion line must only log when the lockout claim allowed the check"
         );
     }
@@ -3225,7 +3232,7 @@ mod tests {
                 concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),
             ),
             (
-                "ifopen_connections==0&&claim_update_attempt().is_ok(){",
+                "ifclaim_update_attempt().is_ok(){",
                 concat!(
                     "update_tx",
                     ".send(\"unknown(gatewaymismatch)\".to_string())"

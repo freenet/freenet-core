@@ -3034,6 +3034,45 @@ echo "RC=$?"
     }
 
     #[test]
+    fn a_long_healthy_run_also_resets_backoff_and_the_stuck_streak() {
+        let mut state = WrapperState::new();
+        for _ in 0..4 {
+            next_wrapper_action(&mut state, 42, false, Some(false));
+        }
+        assert!(state.backoff_secs > WRAPPER_INITIAL_BACKOFF_SECS);
+        assert!(state.identical_failure_streak > 0);
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+        assert_eq!(state.identical_failure_streak, 0);
+    }
+
+    /// The healthy-run reset only works if the loop measures the child's own
+    /// runtime as it exits (before the post-exit update, which can take
+    /// minutes) and applies it before the state machine counts the failure.
+    /// Swapping either order brings back the give-up it exists to prevent.
+    #[test]
+    fn wrapper_loop_measures_child_runtime_before_updating_and_applies_it_first() {
+        let wrapper = include_str!("service/wrapper.rs");
+        let pos = |needle: &str| {
+            wrapper
+                .find(needle)
+                .unwrap_or_else(|| panic!("run_wrapper_loop must contain `{needle}`"))
+        };
+        let measured = pos("let child_runtime_secs = child_started.elapsed().as_secs();");
+        let update = pos("spawn_update_command(&exe_path, Some(exit_code))");
+        let noted = pos("note_child_runtime(&mut state, child_runtime_secs);");
+        let decided = pos("next_wrapper_action(&mut state, exit_code, is_port_conflict");
+        assert!(
+            measured < update,
+            "measure the child's runtime before the post-exit update runs"
+        );
+        assert!(
+            noted < decided,
+            "apply the healthy-run reset before next_wrapper_action counts the failure"
+        );
+    }
+
+    #[test]
     fn a_short_run_keeps_the_failure_streak() {
         // A tight crash loop must still reach the give-up limit.
         let mut state = WrapperState::new();

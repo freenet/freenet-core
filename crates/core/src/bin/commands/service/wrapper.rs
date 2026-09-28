@@ -223,19 +223,27 @@ pub(super) enum WrapperAction {
     BackoffAndRelaunch { secs: u64 },
 }
 
-/// Pure function: given current state and exit info, determine the next action
-/// and update the state. Testable without spawning processes.
-/// Clear the failure streak when the child that just exited ran long enough to
-/// have been healthy, as the macOS launchd script does. Without it the streak
-/// only reset on a successful update, so a node that runs for days and fails
-/// one update a day (a #3934 lockout retry, or an AV-locked binary) walked to
-/// `WRAPPER_MAX_CONSECUTIVE_FAILURES` and the wrapper gave up for good.
+/// Start fresh when the child that just exited ran long enough to have been
+/// healthy (as the macOS launchd script does for its failure count): clear the
+/// failure count, the backoff and the identical-failure streak. Without it the
+/// count only reset on a successful update, so a node that runs for days and
+/// fails one update a day (a #3934 lockout retry, or an AV-locked binary)
+/// walked to `WRAPPER_MAX_CONSECUTIVE_FAILURES` and the wrapper gave up for
+/// good, and its streak eventually raised a false "stuck" notification.
+///
+/// `runtime_secs` must be the child's own runtime, measured when it exited,
+/// not including the post-exit update: a quick crash followed by a slow failed
+/// update is not a healthy run.
 pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
     if runtime_secs >= WRAPPER_MIN_HEALTHY_RUNTIME_SECS {
         state.consecutive_failures = 0;
+        state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+        state.reset_failure_streak();
     }
 }
 
+/// Pure function: given current state and exit info, determine the next action
+/// and update the state. Testable without spawning processes.
 pub(super) fn next_wrapper_action(
     state: &mut WrapperState,
     exit_code: i32,
@@ -939,7 +947,10 @@ fn run_wrapper_loop(
 
         // Wall-clock time is right here: this measures how long a real child
         // process ran, in bin-side supervisor code no simulation reaches.
-        let child_started = std::time::Instant::now();
+        let child_started = {
+            use std::time::Instant;
+            Instant::now()
+        };
         // Use spawn + polling so we can handle tray actions while child runs
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1061,6 +1072,10 @@ fn run_wrapper_loop(
         };
 
         // Restart sentinel from tray Restart action — skip exit code handling
+        // The child's own runtime, taken as it exits and before any update
+        // runs, so the updater's time is never counted as a healthy run.
+        let child_runtime_secs = child_started.elapsed().as_secs();
+
         if exit_code == SENTINEL_RESTART {
             continue;
         }
@@ -1263,7 +1278,7 @@ fn run_wrapper_loop(
         };
 
         // Use the tested state machine to determine next action
-        note_child_runtime(&mut state, child_started.elapsed().as_secs());
+        note_child_runtime(&mut state, child_runtime_secs);
         let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
 
         // #4382 (cross-process): an exit-43 stale-orphan relaunch — the DOMINANT

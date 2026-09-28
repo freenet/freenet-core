@@ -1735,8 +1735,9 @@ fn lockout_expired(events: &[SystemTime], now: SystemTime) -> bool {
 
 /// Proof that [`claim_update_attempt`] allowed a self-initiated update check.
 /// Only this module can make one, and the GitHub release checks the node runs
-/// on its own ([`startup_update_check`]) take it as a parameter, so a check
-/// that skips the claim, or ignores its answer, does not compile.
+/// on its own ([`startup_update_check`]) take it BY VALUE, so a check that
+/// skips the claim, ignores its answer, or reuses an earlier one does not
+/// compile.
 #[derive(Debug)]
 pub struct UpdateAttempt(());
 
@@ -1823,14 +1824,6 @@ pub(crate) fn claim_update_attempt_at(
     Ok(UpdateAttempt(()))
 }
 
-#[cfg(test)]
-impl UpdateAttempt {
-    /// Tests exercise the check logic without a state directory.
-    pub(crate) fn for_test() -> Self {
-        Self(())
-    }
-}
-
 /// Returns true if the update check backoff has reached the maximum (1 hour).
 /// At that point, we've checked GitHub multiple times with no update found,
 /// so the version mismatch flag should be cleared to stop log spam.
@@ -1857,7 +1850,7 @@ pub fn has_reached_max_backoff() -> bool {
 /// Returns `Some(latest_version_string)` only when GitHub confirms a strictly
 /// newer release than `current_version`. Never returns a downgrade.
 pub async fn startup_update_check(
-    _attempt: &UpdateAttempt,
+    _attempt: UpdateAttempt,
     current_version: &str,
 ) -> Option<String> {
     startup_update_check_with_fetcher(current_version, get_latest_version).await
