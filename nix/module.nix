@@ -90,9 +90,10 @@ in
         User = "freenet";
         Group = "freenet";
         # The wrapper seeds the self-updating binary into $STATE_DIRECTORY/bin.
-        # Load-bearing: the node refuses an explicit --config-dir that does not
-        # exist (a typo must not silently create a fresh identity), so systemd
-        # creates all three. $STATE_DIRECTORY becomes a colon-separated list;
+        # "freenet/config" is load-bearing: the node refuses an explicit
+        # --config-dir that does not exist (a typo must not silently create a
+        # fresh identity). data and logs are listed for symmetry; the node would
+        # create those itself. $STATE_DIRECTORY becomes a colon-separated list;
         # the wrapper and the node both take its first entry, /var/lib/freenet.
         StateDirectory = [
           "freenet"
