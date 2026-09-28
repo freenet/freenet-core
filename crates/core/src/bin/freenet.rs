@@ -334,7 +334,8 @@ async fn run_network_node_with_signals(
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
         UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
-        jittered_repoll_interval, reset_backoff, startup_update_check, version_mismatch_generation,
+        jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
+        version_mismatch_generation,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -822,7 +823,13 @@ async fn run_network_node_with_signals(
                     }
                 }
 
-                tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                // A locked-out node does not check GitHub here, so saying it
+                // does every 60s tick would be both noise and false.
+                if should_attempt_update() {
+                    tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                } else {
+                    tracing::debug!("Version mismatch detected; auto-update locked out");
+                }
 
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -840,9 +847,11 @@ async fn run_network_node_with_signals(
                         if open_connections == 0 {
                             // Claimed like every other self-initiated exit 42,
                             // so a locked-out node (#3934) cannot loop through
-                            // here. On refusal the mismatch is KEPT, so the node
-                            // tries again once its cooldown has passed, instead
-                            // of forgetting it is isolated on an old version.
+                            // here. On refusal the mismatch is KEPT rather than
+                            // cleared: the node still knows it is isolated on an
+                            // old version, so its next allowed retry (usually the
+                            // peer-signal check above, once the cooldown passes)
+                            // happens promptly instead of waiting for a re-poll.
                             if claim_update_attempt().is_ok() {
                                 tracing::warn!(
                                     "Max backoff + 0 connections — \
@@ -3249,5 +3258,21 @@ mod tests {
                 "`{send}` must be inside the block gated by claim_update_attempt() (#3934)"
             );
         }
+        // ...and a REFUSED claim at max backoff with no connections keeps the
+        // version mismatch: the only clear inside that block is the claimed one.
+        let max_backoff_arm = braced_block(
+            &prod,
+            "UpdateCheckResult::Skippedifhas_reached_max_backoff()=>{",
+        );
+        let isolated = braced_block(max_backoff_arm, "ifopen_connections==0{");
+        assert_eq!(
+            isolated.matches("clear_version_mismatch()").count(),
+            1,
+            "with 0 connections, clear the mismatch only when the claim is granted"
+        );
+        assert!(
+            braced_block(isolated, "ifclaim_update_attempt().is_ok(){")
+                .contains("clear_version_mismatch()")
+        );
     }
 }

@@ -223,13 +223,18 @@ pub(super) enum WrapperAction {
     BackoffAndRelaunch { secs: u64 },
 }
 
-/// Start fresh when the child that just exited ran long enough to have been
-/// healthy (as the macOS launchd script does for its failure count): clear the
-/// failure count, the backoff and the identical-failure streak. Without it the
-/// count only reset on a successful update, so a node that runs for days and
-/// fails one update a day (a #3934 lockout retry, or an AV-locked binary)
-/// walked to `WRAPPER_MAX_CONSECUTIVE_FAILURES` and the wrapper gave up for
-/// good, and its streak eventually raised a false "stuck" notification.
+/// When the child that just exited ran long enough to have been healthy, clear
+/// the failure count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES` (as the macOS
+/// launchd script does) and the backoff. Without it the count only reset on a
+/// successful update, so a node that runs for days and fails one update a day
+/// (a #3934 lockout retry, or an AV-locked binary) walked to the limit and the
+/// wrapper gave up for good.
+///
+/// The identical-failure streak is deliberately LEFT ALONE: the same failure
+/// after every healthy run (a version that dies after ten minutes, the same
+/// install failing day after day) is exactly the "stuck" condition that
+/// streak exists to report, and hiding it would hide a node stuck on an old
+/// version.
 ///
 /// `runtime_secs` must be the child's own runtime, measured when it exited,
 /// not including the post-exit update: a quick crash followed by a slow failed
@@ -238,7 +243,6 @@ pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
     if runtime_secs >= WRAPPER_MIN_HEALTHY_RUNTIME_SECS {
         state.consecutive_failures = 0;
         state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-        state.reset_failure_streak();
     }
 }
 
@@ -1071,11 +1075,11 @@ fn run_wrapper_loop(
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
 
-        // Restart sentinel from tray Restart action — skip exit code handling
         // The child's own runtime, taken as it exits and before any update
         // runs, so the updater's time is never counted as a healthy run.
         let child_runtime_secs = child_started.elapsed().as_secs();
 
+        // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == SENTINEL_RESTART {
             continue;
         }

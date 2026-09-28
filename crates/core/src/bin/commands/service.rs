@@ -205,8 +205,9 @@ const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 /// Maximum consecutive failures before the wrapper gives up.
 const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
 /// A child that ran at least this long before exiting was healthy, so its exit
-/// starts a fresh streak toward `WRAPPER_MAX_CONSECUTIVE_FAILURES`. Same value
-/// and rule as the macOS launchd script's `MIN_HEALTHY_RUNTIME`.
+/// starts a fresh count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES`. Same value as
+/// the macOS launchd script's `MIN_HEALTHY_RUNTIME`, which resets its count the
+/// same way.
 const WRAPPER_MIN_HEALTHY_RUNTIME_SECS: u64 = 300;
 
 /// Dashboard URL served by the local freenet node.
@@ -3034,16 +3035,19 @@ echo "RC=$?"
     }
 
     #[test]
-    fn a_long_healthy_run_also_resets_backoff_and_the_stuck_streak() {
+    fn a_long_healthy_run_resets_backoff_but_keeps_the_stuck_streak() {
+        // The same failure after every healthy run is still "stuck" (a node
+        // that cannot leave an old version), so the streak must survive.
         let mut state = WrapperState::new();
         for _ in 0..4 {
             next_wrapper_action(&mut state, 42, false, Some(false));
         }
+        let streak = state.identical_failure_streak;
         assert!(state.backoff_secs > WRAPPER_INITIAL_BACKOFF_SECS);
-        assert!(state.identical_failure_streak > 0);
+        assert!(streak > 0);
         note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS);
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
-        assert_eq!(state.identical_failure_streak, 0);
+        assert_eq!(state.identical_failure_streak, streak);
     }
 
     /// The healthy-run reset only works if the loop measures the child's own
@@ -3052,7 +3056,30 @@ echo "RC=$?"
     /// Swapping either order brings back the give-up it exists to prevent.
     #[test]
     fn wrapper_loop_measures_child_runtime_before_updating_and_applies_it_first() {
-        let wrapper = include_str!("service/wrapper.rs");
+        // Scoped to run_wrapper_loop's own body (brace-matched), so moving
+        // these statements into another function fails instead of passing on
+        // their file-wide order.
+        let src = include_str!("service/wrapper.rs");
+        let sig = src
+            .find("fn run_wrapper_loop(")
+            .expect("run_wrapper_loop not found");
+        let open = sig + src[sig..].find('{').expect("run_wrapper_loop has no body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let wrapper = &src[open..close.expect("run_wrapper_loop braces never balance")];
         let pos = |needle: &str| {
             wrapper
                 .find(needle)
