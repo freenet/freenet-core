@@ -1077,7 +1077,10 @@ fn run_wrapper_loop(
 
         // The child's own runtime, taken as it exits and before any update
         // runs, so the updater's time is never counted as a healthy run.
+        // Applied here, before the tray Restart/Stop sentinels `continue`, so
+        // a healthy run ended from the tray also starts a fresh count.
         let child_runtime_secs = child_started.elapsed().as_secs();
+        note_child_runtime(&mut state, child_runtime_secs);
 
         // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == SENTINEL_RESTART {
@@ -1282,7 +1285,6 @@ fn run_wrapper_loop(
         };
 
         // Use the tested state machine to determine next action
-        note_child_runtime(&mut state, child_runtime_secs);
         let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
 
         // #4382 (cross-process): an exit-43 stale-orphan relaunch — the DOMINANT

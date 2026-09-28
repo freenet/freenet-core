@@ -3060,6 +3060,11 @@ echo "RC=$?"
         // these statements into another function fails instead of passing on
         // their file-wide order.
         let src = include_str!("service/wrapper.rs");
+        assert_eq!(
+            src.matches("fn run_wrapper_loop(").count(),
+            1,
+            "the slice below takes the first match, so a second one would hide code"
+        );
         let sig = src
             .find("fn run_wrapper_loop(")
             .expect("run_wrapper_loop not found");
@@ -3086,12 +3091,17 @@ echo "RC=$?"
                 .unwrap_or_else(|| panic!("run_wrapper_loop must contain `{needle}`"))
         };
         let measured = pos("let child_runtime_secs = child_started.elapsed().as_secs();");
-        let update = pos("spawn_update_command(&exe_path, Some(exit_code))");
         let noted = pos("note_child_runtime(&mut state, child_runtime_secs);");
+        let sentinel = pos("if exit_code == SENTINEL_RESTART {");
+        let update = pos("spawn_update_command(&exe_path, Some(exit_code))");
         let decided = pos("next_wrapper_action(&mut state, exit_code, is_port_conflict");
         assert!(
             measured < update,
             "measure the child's runtime before the post-exit update runs"
+        );
+        assert!(
+            noted < sentinel,
+            "apply the healthy-run reset before the tray Restart/Stop sentinels continue"
         );
         assert!(
             noted < decided,
