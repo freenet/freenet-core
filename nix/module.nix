@@ -18,6 +18,7 @@ self:
 {
   config,
   lib,
+  options,
   pkgs,
   utils,
   ...
@@ -25,6 +26,16 @@ self:
 let
   cfg = config.services.freenet-node;
   stateDir = "/var/lib/freenet";
+  # Whether the Java Freenet (now Hyphanet) is enabled on this host AND runs as
+  # the `freenet` user in /var/lib/freenet: always under its old name
+  # `services.freenet`, and as `services.hyphanet` until stateVersion 26.11,
+  # when nixpkgs moved it to its own `hyphanet` user and directory.
+  javaFreenetSharesOurUser =
+    if options.services ? hyphanet then
+      config.services.hyphanet.enable
+      && lib.versionOlder config.system.stateVersion "26.11"
+    else
+      config.services.freenet.enable or false;
 in
 {
   options.services.freenet-node = {
@@ -53,13 +64,12 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # nixpkgs' Hyphanet module (the Java Freenet) also runs as a `freenet`
-    # user in /var/lib/freenet on hosts with stateVersion < 26.11, so the two
-    # would share a user, a state directory and its logs/ without any error.
+    # Otherwise the two would share a user, a state directory and its logs/
+    # without any error.
     assertions = [
       {
-        assertion = !(config.services.hyphanet.enable or false);
-        message = "services.freenet-node and services.hyphanet cannot both be enabled: they share the `freenet` user and /var/lib/freenet.";
+        assertion = !javaFreenetSharesOurUser;
+        message = "services.freenet-node cannot run alongside the Java Freenet (services.hyphanet / services.freenet) on this host: both use the `freenet` user and /var/lib/freenet. On stateVersion 26.11 or later Hyphanet uses its own user and directory.";
       }
     ];
 

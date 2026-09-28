@@ -126,8 +126,9 @@ jobs:
           fi
           echo "SOURCE_DATE_EPOCH is unset in the devShell"
 
-      # Boots a NixOS VM with `services.freenet-node.enable = true` and checks the
-      # seed, the process and the state directory (nix/module-test.nix).
+      # Boots NixOS VMs running `services.freenet-node` (nix/module-test.nix):
+      # the plain default, extraArgs escaping, and an isolated gateway that
+      # stays up for the process, restart and state-directory checks.
       # Reuses the freenet build above. Last, so a VM failure cannot hide the
       # devShell checks before it. Fails rather than skips without KVM:
       # a skipped VM test would read as a passing one.

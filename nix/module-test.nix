@@ -17,6 +17,26 @@
 pkgs.testers.runNixOSTest {
   name = "freenet-nixos-module";
 
+  # The plain default: nothing but `enable`. Offline, an ordinary peer exits
+  # at once and is restarted in backoff, so only what the module owns is
+  # asserted here: the seed and a running unit.
+  nodes.plain = {
+    imports = [ self.nixosModules.default ];
+    services.freenet-node.enable = true;
+  };
+
+  # extraArgs must reach the command line literally. `%` is a systemd
+  # specifier and `$` a variable reference, so shell escaping lets systemd
+  # expand both. The node rejects this argument, but the wrapper (the unit's
+  # main process) keeps running with it on its command line.
+  nodes.escaping = {
+    imports = [ self.nixosModules.default ];
+    services.freenet-node = {
+      enable = true;
+      extraArgs = [ "--escaping-probe=100%H-$HOME" ];
+    };
+  };
+
   nodes.machine = {
     imports = [ self.nixosModules.default ];
     services.freenet-node = {
@@ -35,6 +55,20 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    start_all()
+
+    plain.wait_for_unit("freenet-node.service")
+    plain.wait_until_succeeds("test -f /var/lib/freenet/bin/freenet", timeout=120)
+
+    escaping.wait_for_unit("freenet-node.service")
+    # PID and command line read in one command: the unit can restart between
+    # two separate reads.
+    escaping.wait_until_succeeds(
+        "tr '\\0' '\\n' < /proc/$(systemctl show -p MainPID --value freenet-node)/cmdline"
+        " | grep -qxF -- '--escaping-probe=100%H-$HOME'",
+        timeout=60,
+    )
+
     machine.wait_for_unit("freenet-node.service")
 
     # Seeded into the writable state directory as a regular file, not a
