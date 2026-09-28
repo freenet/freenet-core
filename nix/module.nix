@@ -19,6 +19,7 @@ self:
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 let
@@ -52,6 +53,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # nixpkgs' Hyphanet module (the Java Freenet) also runs as a `freenet`
+    # user in /var/lib/freenet on hosts with stateVersion < 26.11, so the two
+    # would share a user, a state directory and its logs/ without any error.
+    assertions = [
+      {
+        assertion = !(config.services.hyphanet.enable or false);
+        message = "services.freenet-node and services.hyphanet cannot both be enabled: they share the `freenet` user and /var/lib/freenet.";
+      }
+    ];
+
     users.users.freenet = {
       isSystemUser = true;
       group = "freenet";
@@ -75,7 +86,9 @@ in
       # systemd start limit on top of it can park the unit in `failed` forever.
       startLimitIntervalSec = 0;
       serviceConfig = {
-        ExecStart = lib.escapeShellArgs (
+        # systemd's own quoting, which also escapes `%` specifiers and `$`
+        # in extraArgs; shell escaping leaves both for systemd to expand.
+        ExecStart = utils.escapeSystemdExecArgs (
           [
             (lib.getExe' cfg.package "freenet-node")
             "--config-dir"
