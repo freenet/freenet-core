@@ -952,13 +952,18 @@ async fn run_network_node_with_signals(
                         // best-effort and fails the same way the read did), so
                         // "run freenet update" alone would be advice that does not
                         // work. `--force` bypasses the gate for a one-off recovery.
+                        // Print the directory actually in use: it is not always
+                        // under HOME (see `auto_update::state_dir`).
+                        let state = commands::auto_update::state_dir().map_or_else(
+                            || "the Freenet state directory".to_string(),
+                            |d| d.display().to_string(),
+                        );
                         eprintln!(
                             "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
                          installs, #3934, or an unreadable failure counter). It will not detect \
                          or apply any further release until this is cleared: run `freenet \
-                         update` manually, or delete `update_failures` in the Freenet state \
-                         directory (~/.local/state/freenet on Linux). `freenet update --force` \
-                         bypasses the gate for a single run."
+                         update` manually, or delete `update_failures` in {state}. `freenet \
+                         update --force` bypasses the gate for a single run."
                         );
                         tracing::warn!(
                             "Periodic re-poll: skipped — auto-update locked out after repeated \
@@ -2981,7 +2986,8 @@ mod tests {
              the wrapper installs it with no probation marker, so rollback could never \
              fire"
         );
-        // The pin lives under the node's HOME, and `dirs::home_dir()` falls back
+        // The pin lives under the node's HOME whenever that is usable (falling
+        // back to $STATE_DIRECTORY only when it is not), and `dirs::home_dir()` falls back
         // to `getpwuid_r` when $HOME is unset or empty -- so the node writes a
         // pin in an environment where a `[ -n "$HOME" ]` guard sees nothing.
         // systemd exports $HOME only for a unit with `User=`, which the

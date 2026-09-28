@@ -232,6 +232,21 @@ user's home should be too, because that is where the node keeps its auto-update
 rollback state when it can. The two may be different directories — the wrapper
 looks for the known-bad pin in both.
 
+To run `freenet update` by hand, run it as the service user with the unit's
+environment, so it reads the same state the node does. With `home` set as above
+that is simply:
+
+```bash
+sudo -u freenet /var/lib/freenet/bin/freenet update
+```
+
+On a host where the service user has no usable home, the node keeps its state
+in `$STATE_DIRECTORY`, which only systemd sets. Pass it explicitly
+(`sudo -u freenet STATE_DIRECTORY=/var/lib/freenet /var/lib/freenet/bin/freenet update`),
+or a manual run will neither see the node's known-bad pin nor clear its failure
+counter. The lockout message printed by the node names the directory it is
+using.
+
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and
 `freenet-node` already absorbs those codes — it exits 0 for both.
