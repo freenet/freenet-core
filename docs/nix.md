@@ -245,7 +245,8 @@ in `$STATE_DIRECTORY`, which only systemd sets. Pass it explicitly
 (`sudo -u freenet STATE_DIRECTORY=/var/lib/freenet /var/lib/freenet/bin/freenet update`),
 or a manual run will neither see the node's known-bad pin nor clear its failure
 counter. The lockout message printed by the node names the directory it is
-using.
+using. A manual update replaces the binary but not the running process, so
+restart the service afterwards (`sudo systemctl restart freenet-node`).
 
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and

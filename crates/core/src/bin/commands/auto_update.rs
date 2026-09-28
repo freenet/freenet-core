@@ -1003,8 +1003,17 @@ async fn get_latest_version() -> Result<String> {
 /// remount) split its failure counter, probation marker and pins across two
 /// places. The node and the supervisor-invoked `freenet update` run in the
 /// same unit, as the same user, with the same environment, so they resolve the
-/// same directory too. A `freenet update` run by hand OUTSIDE that unit has no
+/// same directory as long as HOME's usability does not change between their
+/// starts. A `freenet update` run by hand OUTSIDE that unit has no
 /// `$STATE_DIRECTORY`; docs/nix.md says how to run one inside it.
+///
+/// Resolving is not read-only: it creates the chosen directory.
+///
+/// A home state directory that already holds state and then becomes
+/// unwritable is abandoned for `$STATE_DIRECTORY` without copying that state
+/// (a known-bad pin, an in-flight probation marker). Staying on it would fail
+/// every write, which is rollback off for good; switching loses that stale
+/// state once and has working rollback from the next update on.
 pub(crate) fn state_dir() -> Option<PathBuf> {
     static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     RESOLVED
@@ -2281,6 +2290,7 @@ mod tests {
     /// NixOS `/var/empty` shape. A child process, because both variables are
     /// process-global and `state_dir()` caches its first answer.
     #[test]
+    #[cfg(unix)] // `dirs::home_dir()` ignores $HOME on Windows
     fn real_state_dir_and_rollback_use_state_directory_when_home_is_unusable() {
         const CHILD_ENV: &str = "FREENET_STATE_DIR_FALLBACK_CHILD";
         const CHILD_TEST: &str = "commands::auto_update::tests::\
