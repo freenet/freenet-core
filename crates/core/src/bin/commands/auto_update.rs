@@ -120,6 +120,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Maximum consecutive update failures before disabling auto-update.
 const MAX_UPDATE_FAILURES: u32 = 3;
 
+/// How long a [`MAX_UPDATE_FAILURES`] lockout holds before the node is allowed
+/// one more attempt. Each failed attempt re-records the failure, which restamps
+/// the counter file and closes the gate for another full cooldown, so a peer
+/// whose installs always fail costs one restart a day rather than a loop. A
+/// permanent lockout instead stranded any peer that runs stably and never
+/// restarts: only the boot-time check bypasses it, so such a peer never updated
+/// again.
+const UPDATE_LOCKOUT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
 /// Non-API "latest release" URL (#5102).
 ///
 /// This is deliberately **not** `api.github.com`. GitHub's REST API allows only
@@ -392,13 +401,13 @@ static LOCKOUT_WARNED: AtomicBool = AtomicBool::new(false);
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
     if !should_attempt_update() {
-        // Loud, operator-visible (issue #4580): a persistent lockout means this
-        // peer has stopped trying to auto-update entirely and will silently stay
-        // behind. A common cause is a non-writable binary path (e.g. a
-        // hand-installed binary the service account can't replace), which is a
-        // *permanent* lockout until an operator intervenes. Warn LOUDLY the first
-        // time we observe it this process, then drop to debug! so the permanent
-        // state does not spam the log every minute.
+        // Loud, operator-visible (issue #4580): a lockout means this peer has
+        // stopped trying to auto-update until the cooldown passes, and a common
+        // cause is a non-writable binary path (e.g. a hand-installed binary the
+        // service account can't replace), which will keep failing until an
+        // operator intervenes. Warn LOUDLY the first time we observe it this
+        // process, then drop to debug! so the state does not spam the log every
+        // minute.
         let failures = get_update_failure_count();
         if !LOCKOUT_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
@@ -406,10 +415,9 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 max = MAX_UPDATE_FAILURES,
                 state_dir = ?state_dir(),
                 "Auto-update is LOCKED OUT after {MAX_UPDATE_FAILURES} consecutive failed update \
-                 attempts and will NOT retry. This peer will stay on the current version until an \
-                 operator intervenes. Run `freenet update` manually to update and reset the \
-                 lockout; if updates keep failing, the binary path is likely not writable by this \
-                 account.",
+                 attempts. It will try again once a day after the last failure. Run `freenet \
+                 update` manually to update now and reset the lockout; if updates keep failing, \
+                 the binary path is likely not writable by this account.",
             );
         } else {
             tracing::debug!(
@@ -1634,7 +1642,45 @@ pub fn should_attempt_update() -> bool {
 /// Testable variant of [`should_attempt_update`] that reads from an explicit
 /// directory. Used by the regression tests for the #3934 lockout invariant.
 pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
-    get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES
+    should_attempt_update_at_time(dir, SystemTime::now())
+}
+
+/// [`should_attempt_update_at`] with an explicit clock, so the cooldown can be
+/// tested without waiting a day.
+///
+/// Below [`MAX_UPDATE_FAILURES`] the answer is yes. At or above it the gate
+/// reopens once [`UPDATE_LOCKOUT_COOLDOWN`] has passed since the counter was
+/// last written — i.e. since the last recorded failure.
+///
+/// Only a counter this process can both read and rewrite can expire. An
+/// unreadable one reads as fully failed (see [`get_update_failure_count_at`])
+/// and stays shut. So does one that cannot be rewritten, because a failed
+/// attempt could not restamp it, the gate would stay open, and every re-poll
+/// would turn into another restart: the exact loop #3934 closed. Opening the
+/// file for append is the probe; it does not change the file's mtime.
+///
+/// A counter stamped in the FUTURE (the clock stepped backwards) counts as
+/// expired. Staying shut until the clock catches up could take arbitrarily
+/// long, while one early attempt restamps the file with the current time.
+fn should_attempt_update_at_time(dir: &std::path::Path, now: SystemTime) -> bool {
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return true;
+    }
+    let path = dir.join("update_failures");
+    let rewritable = fs::read_to_string(&path).is_ok()
+        && fs::OpenOptions::new().append(true).open(&path).is_ok();
+    let last_failure = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    lockout_expired(rewritable, last_failure, now)
+}
+
+/// The pure decision behind [`should_attempt_update_at_time`]'s lockout arm.
+fn lockout_expired(rewritable: bool, last_failure: Option<SystemTime>, now: SystemTime) -> bool {
+    match (rewritable, last_failure) {
+        (true, Some(stamp)) => now
+            .duration_since(stamp)
+            .map_or(true, |age| age >= UPDATE_LOCKOUT_COOLDOWN),
+        _ => false,
+    }
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -2345,6 +2391,90 @@ mod tests {
             "the child must actually have run {CHILD_TEST}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(systemd.join("update_failures").is_file());
+    }
+
+    /// Lock `dir` out and return the counter file's own mtime, the instant the
+    /// cooldown is measured from.
+    fn lock_out(dir: &std::path::Path) -> SystemTime {
+        for _ in 0..MAX_UPDATE_FAILURES {
+            record_update_failure_at(dir);
+        }
+        std::fs::metadata(dir.join("update_failures"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    #[test]
+    fn update_lockout_holds_for_the_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        let just_short = stamp + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1);
+        assert!(!should_attempt_update_at_time(tmp.path(), just_short));
+    }
+
+    #[test]
+    fn update_lockout_expires_after_the_cooldown() {
+        // The stranded-peer bug: a node that runs stably never restarts, so the
+        // ungated boot-time check never runs, and a permanent lockout meant it
+        // never updated again.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_failure_after_the_lockout_expires_closes_it_for_another_cooldown() {
+        // The half-open attempt must not become a loop: its failure restamps
+        // the counter and the gate shuts again for a full cooldown.
+        let tmp = tempfile::tempdir().unwrap();
+        lock_out(tmp.path());
+        record_update_failure_at(tmp.path());
+        assert_eq!(
+            get_update_failure_count_at(tmp.path()),
+            MAX_UPDATE_FAILURES + 1
+        );
+        let restamped = std::fs::metadata(tmp.path().join("update_failures"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!should_attempt_update_at_time(
+            tmp.path(),
+            restamped + Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_update_counter_never_expires() {
+        // A directory in place of the counter reads as fully failed and can
+        // never be rewritten, so reopening the gate would loop.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("update_failures")).unwrap();
+        let far_future = SystemTime::now() + UPDATE_LOCKOUT_COOLDOWN * 30;
+        assert!(!should_attempt_update_at_time(tmp.path(), far_future));
+    }
+
+    #[test]
+    fn lockout_expiry_decision_edges() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let later = t0 + UPDATE_LOCKOUT_COOLDOWN;
+        // A counter that cannot be rewritten never expires.
+        assert!(!lockout_expired(false, Some(t0), later));
+        // Nor does one whose timestamp cannot be read.
+        assert!(!lockout_expired(true, None, later));
+        // Exactly at the boundary it expires; one second short it does not.
+        assert!(lockout_expired(true, Some(t0), later));
+        assert!(!lockout_expired(
+            true,
+            Some(t0),
+            later - Duration::from_secs(1)
+        ));
+        // Stamped in the future (clock stepped back): expired, see the doc.
+        assert!(lockout_expired(true, Some(later), t0));
     }
 
     #[test]

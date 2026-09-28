@@ -183,9 +183,10 @@ START_LIMIT_INTERVAL_SECS="${FREENET_NODE_START_LIMIT_INTERVAL_SECS:-120}"
 # path at all: `commands::update::run` never consults `should_attempt_update()`,
 # so the ExecStopPost `freenet update` below runs regardless and clears the
 # counter on a successful install. What the lockout genuinely stops is the
-# node's in-process exit-42 re-poll, so a locked-out peer that never crashes
-# also never updates. That residual is real, and this script cannot close it
-# without making update decisions, which is the one thing it must not do.
+# node's in-process exit-42 re-poll, and the node lets it expire a day after
+# the last failure (`UPDATE_LOCKOUT_COOLDOWN`), so a locked-out peer that never
+# crashes still gets one attempt a day. This script makes no decision about it,
+# which is the one thing it must not do.
 # ---------------------------------------------------------------------------
 
 # `dirs::home_dir()` -- which is what `auto_update::state_dir()` is built from --

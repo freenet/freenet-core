@@ -889,7 +889,9 @@ async fn run_network_node_with_signals(
                 // exact loop the lockout exists to stop. (The boot-time startup
                 // check bypasses the lockout, but only once per restart; a
                 // *recurring* bypass is the regression.) A successful manual
-                // `freenet update` clears the counter and re-enables this path.
+                // `freenet update` clears the counter and re-enables this path,
+                // and the lockout itself expires after UPDATE_LOCKOUT_COOLDOWN
+                // (one attempt a day), so a stable node is not stranded forever.
                 if should_attempt_update() {
                     tracing::debug!(
                         current = build_info::VERSION,
@@ -927,8 +929,9 @@ async fn run_network_node_with_signals(
                     }
                 } else {
                     // Once per process, not once per 6h tick: the lockout
-                    // persists until an operator acts, so this is a state to
-                    // announce on each boot rather than a recurring alarm.
+                    // lasts a day at a time and usually needs an operator, so
+                    // this is a state to announce on each boot rather than a
+                    // recurring alarm.
                     // Mirrors the existing `LOCKOUT_WARNED` pattern in
                     // `check_if_update_available`.
                     static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
@@ -943,8 +946,8 @@ async fn run_network_node_with_signals(
                         // node would never update again.
                         //
                         // Once per process, mirroring that existing `LOCKOUT_WARNED`
-                        // pattern: the condition is permanent until an operator
-                        // acts, so repeating it every 6h forever is noise, and one
+                        // pattern: the condition usually persists until an
+                        // operator acts, so repeating it every 6h is noise, and one
                         // line per restart is enough to find it.
                         // Names the file as well as the command: the lockout can
                         // also be reached with the counter UNREADABLE, and in that
@@ -960,8 +963,8 @@ async fn run_network_node_with_signals(
                         );
                         eprintln!(
                             "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
-                         installs, #3934, or an unreadable failure counter). It will not detect \
-                         or apply any further release until this is cleared: run `freenet \
+                         installs, #3934, or an unreadable failure counter). After failed installs it \
+                         retries once a day; an unreadable counter never clears itself. Run `freenet \
                          update` manually, or delete `update_failures` in {state}. `freenet \
                          update --force` bypasses the gate for a single run."
                         );
