@@ -340,10 +340,13 @@ self_update_blocker() {
 # snapshot and no probation marker. So consult it before replacing a peer that
 # is still serving the network.
 #
-# Two directories, because the node resolves this one from its home directory
-# (`auto_update::state_dir()`) and NOT from $STATE_DIRECTORY: under this script's
-# XDG fallback the two are the same path, and under a systemd unit with
-# `StateDirectory=` they are not. Either pinning this version is a refusal.
+# Two directories, because the node (`auto_update::state_dir()`) keeps its
+# state under its home directory whenever that is usable, and only falls back
+# to $STATE_DIRECTORY when it is not (a system user whose home is /var/empty).
+# Under this script's XDG fallback the two are the same path; under a systemd
+# unit with `StateDirectory=` the pin can be in either, and a binary that
+# predates the fallback only ever writes the home one. Either pinning this
+# version is a refusal.
 version_is_pinned_bad() {
     local want="$1" dir pinned
     local dirs=("$state_dir")

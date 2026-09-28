@@ -508,7 +508,8 @@ fn remove_probation_at(dir: &Path) -> std::io::Result<()> {
 /// The operator-facing line for a marker-clearing outcome, or `None` when
 /// nothing happened. Split out from [`commit_probation`] so every branch is
 /// unit-testable: `commit_probation` itself reads the process-global `$HOME`
-/// through [`state_dir`] and so cannot be driven from a test.
+/// (or `$STATE_DIRECTORY`) through [`state_dir`], cached for the process, and
+/// so cannot be driven from an in-process test.
 ///
 /// Every outcome gets its OWN wording. The four are reached from four different
 /// arms of [`commit_probation_at`] and differ in both facts an operator acts on
