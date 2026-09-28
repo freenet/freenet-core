@@ -3030,8 +3030,8 @@ mod tests {
         assert!(
             has_statement(&nix_src, NODE_STATE_DIR),
             "the Nix supervisor must know about HOME/{NODE_STATE_DIR}: that is where \
-             `auto_update::state_dir()` puts the known-bad pin, NOT $STATE_DIRECTORY, \
-             which the documented systemd unit points somewhere else entirely"
+             `auto_update::state_dir()` puts the known-bad pin whenever HOME is usable, \
+             falling back to $STATE_DIRECTORY only when it is not"
         );
         // ...and the flake must actually build that script, or the assertions
         // above guard a file nothing runs.

@@ -980,8 +980,55 @@ async fn get_latest_version() -> Result<String> {
 /// persists its probation / known-bad markers in the SAME directory as the
 /// auto-update failure counter and backoff state, ensuring both the node and
 /// the supervisor-invoked `freenet update` agree on a single state location.
+///
+/// Normally `$HOME/.local/state/freenet`. When that cannot be created — a
+/// system service user whose home is `/var/empty` (the NixOS default for a
+/// user declared without `home`) or does not exist — it falls back to the
+/// first entry of systemd's `$STATE_DIRECTORY`. Without the fallback every
+/// write here fails, so the crash-probation marker, the known-good rollback
+/// snapshot and the known-bad pin are never persisted and #4073 crash-loop
+/// rollback is silently OFF on that peer.
+///
+/// Home stays first on purpose: an install whose home is writable keeps its
+/// existing state exactly where it was, so nothing has to migrate, and the
+/// fallback only ever applies where no state could have been saved before.
+/// The node and `freenet update` run under the same unit, user and
+/// environment, so both resolve the same directory. `nix/freenet-node.sh`
+/// already consults `$STATE_DIRECTORY` for the known-bad pin.
 pub(crate) fn state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local/state/freenet"))
+    resolve_state_dir(
+        dirs::home_dir(),
+        std::env::var_os("STATE_DIRECTORY").as_deref(),
+    )
+}
+
+/// Testable core of [`state_dir`]: `home` is the user's home directory and
+/// `systemd_state` the raw value of `$STATE_DIRECTORY`, which systemd passes
+/// as a colon-separated list when a unit names several.
+///
+/// Probes by creating the directory, since "can the node write here" is the
+/// question that matters and an existence check cannot answer it. If neither
+/// candidate can be created the home path is returned anyway, preserving the
+/// historical result (and its failure) rather than inventing a third location.
+fn resolve_state_dir(
+    home: Option<PathBuf>,
+    systemd_state: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let home_state = home.map(|h| h.join(".local/state/freenet"));
+    if let Some(dir) = &home_state {
+        if fs::create_dir_all(dir).is_ok() {
+            return home_state;
+        }
+    }
+    let systemd_dir = systemd_state
+        .and_then(|v| std::env::split_paths(v).next())
+        .filter(|first| !first.as_os_str().is_empty());
+    if let Some(dir) = systemd_dir {
+        if fs::create_dir_all(&dir).is_ok() {
+            return Some(dir);
+        }
+    }
+    home_state
 }
 
 /// Get the last time we checked for updates.
@@ -2053,6 +2100,81 @@ mod tests {
         // Clearing an already-clear counter is idempotent.
         clear_update_failures_at(dir);
         assert_eq!(get_update_failure_count_at(dir), 0);
+    }
+
+    /// A "home" that cannot hold `.local/state/freenet`. A regular file in
+    /// place of the directory makes `create_dir_all` fail with ENOTDIR even
+    /// when the tests run as root, which a read-only directory would not.
+    fn unusable_home(tmp: &std::path::Path) -> PathBuf {
+        let home = tmp.join("not-a-directory");
+        std::fs::write(&home, b"").unwrap();
+        home
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_state_directory_when_home_is_unusable() {
+        // The NixOS shape: a system user declared without `home` gets
+        // `/var/empty`, so nothing under HOME can be created. Before the
+        // fallback, state_dir() returned that unusable path, every
+        // probation/known-good/known-bad write failed, and crash-loop
+        // rollback was silently off.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home), Some(systemd.as_os_str()));
+        assert_eq!(resolved.as_deref(), Some(systemd.as_path()));
+        assert!(systemd.is_dir(), "the fallback directory must be created");
+    }
+
+    #[test]
+    fn state_dir_prefers_a_usable_home_even_when_state_directory_is_set() {
+        // An existing install keeps its state where it always was, so a
+        // unit that happens to set StateDirectory= does not strand its
+        // probation marker or known-bad pin by moving directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home.clone()), Some(systemd.as_os_str()));
+        assert_eq!(resolved, Some(home.join(".local/state/freenet")));
+        assert!(!systemd.exists(), "the fallback must not be touched");
+    }
+
+    #[test]
+    fn state_dir_uses_the_first_entry_of_a_state_directory_list() {
+        // systemd passes several StateDirectory= entries colon-separated.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let list = std::env::join_paths([&first, &second]).unwrap();
+        let resolved = resolve_state_dir(Some(home), Some(list.as_os_str()));
+        assert_eq!(resolved, Some(first));
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn state_dir_keeps_the_home_path_when_there_is_nothing_to_fall_back_to() {
+        // No STATE_DIRECTORY, or an empty one: the historical result stands
+        // rather than a guessed third location.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let expected = Some(home.join(".local/state/freenet"));
+        assert_eq!(resolve_state_dir(Some(home.clone()), None), expected);
+        assert_eq!(
+            resolve_state_dir(Some(home), Some(std::ffi::OsStr::new(""))),
+            expected
+        );
+    }
+
+    #[test]
+    fn state_dir_uses_state_directory_when_there_is_no_home_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd = tmp.path().join("var-lib-freenet");
+        assert_eq!(
+            resolve_state_dir(None, Some(systemd.as_os_str())),
+            Some(systemd)
+        );
+        assert_eq!(resolve_state_dir(None, None), None);
     }
 
     #[test]

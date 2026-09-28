@@ -207,15 +207,14 @@ systemd.services.freenet-node = {
   startLimitIntervalSec = 0;
 };
 
-# Load-bearing, and the part that is easy to leave out. `StateDirectory` is NOT
-# the only writable directory this needs: the node's auto-update state —
-# the crash-probation marker, the known-good rollback snapshot and the
-# known-bad version pin — lives under the service user's HOME
-# (`auto_update::state_dir()` is `dirs::home_dir()/.local/state/freenet`), NOT
-# under $STATE_DIRECTORY. A NixOS user declared without `home` gets
-# `/var/empty`, which is not writable, so `prepare_known_good_for_install` and
-# `begin_probation` both fail and the peer runs with #4073 crash-loop rollback
-# silently OFF — a release that boot-crashes then has nothing to roll it back.
+# Keep `home`. The node's auto-update state — the crash-probation marker, the
+# known-good rollback snapshot and the known-bad version pin — lives under the
+# service user's HOME (`auto_update::state_dir()`), falling back to
+# $STATE_DIRECTORY only when HOME is unusable. Binaries older than that
+# fallback have no such escape: a NixOS user declared without `home` gets
+# `/var/empty`, every write fails, and the peer runs with #4073 crash-loop
+# rollback silently OFF until it updates past them. Seeding from an older tag
+# runs exactly such a binary first, so the line is still worth having.
 users.users.freenet = {
   isSystemUser = true;
   group = "freenet";
@@ -227,11 +226,11 @@ users.groups.freenet = { };
 
 The directories are named explicitly because the node otherwise derives them
 from the service user's home, which a system user may not usefully have. A
-read-only `/nix/store` is fine; **two** things must be writable, and they are
-different directories: the state directory (`$STATE_DIRECTORY`, where the
-wrapper seeds the binary) and the service user's home (where the node keeps its
-auto-update rollback state). This wrapper already has to know they differ — it
-looks for the known-bad pin in both — so an operator does too.
+read-only `/nix/store` is fine. The state directory (`$STATE_DIRECTORY`) must
+be writable, because the wrapper seeds the binary there, and the service
+user's home should be too, because that is where the node keeps its auto-update
+rollback state when it can. The two may be different directories — the wrapper
+looks for the known-bad pin in both.
 
 Do **not** add `SuccessExitStatus=42 43` or `RestartPreventExitStatus=43` here:
 those belong to a unit supervising `freenet network` directly, and
