@@ -187,7 +187,12 @@ systemd.services.freenet-node = {
     User = "freenet";
     Group = "freenet";
     # /var/lib/freenet. The wrapper seeds the binary under $STATE_DIRECTORY/bin.
-    StateDirectory = "freenet";
+    # Load-bearing: all four entries. The node refuses an explicit
+    # --config-dir that does not exist (a typo must not silently create a fresh
+    # identity), so with only "freenet" listed the peer exits 1 on "Configuration
+    # directory not found" and crash-loops. $STATE_DIRECTORY becomes a
+    # colon-separated list; the wrapper takes its first entry, /var/lib/freenet.
+    StateDirectory = [ "freenet" "freenet/config" "freenet/data" "freenet/logs" ];
     # Load-bearing, not a default: the wrapper exits 0 for a stood-down peer
     # as well as for a clean shutdown — notably on exit 43, "another instance
     # already holds the port", where the holder may be a stale orphan (see the
