@@ -332,10 +332,9 @@ async fn run_network_node_with_signals(
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
-        UpdateNeededError, check_if_update_available, clear_version_mismatch,
+        UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
-        jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
-        version_mismatch_generation,
+        jittered_repoll_interval, reset_backoff, startup_update_check, version_mismatch_generation,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -543,16 +542,38 @@ async fn run_network_node_with_signals(
         //
         // Fail-open: any GitHub / parse error returns None and the node
         // continues booting normally into the peer-signal loop below.
+        //
+        // A locked-out node (#3934) runs this check only when it can claim its
+        // once-per-cooldown retry. Ungated, every restart after a failed retry
+        // would ask again and exit 42 again, a burst of failed installs a day
+        // bounded only by the GitHub poll budget, which on Windows counts
+        // toward the wrapper's give-up limit. Claimed before logging, so a skip
+        // never reads as a check that ran.
+        let startup_check_allowed = commands::auto_update::claim_update_attempt();
+        if !startup_check_allowed {
+            tracing::warn!(
+                "Startup update check skipped: auto-update is locked out after repeated failed \
+                 installs (#3934) and has already spent its retry for today. Run `freenet \
+                 update` to update now."
+            );
+        }
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_jitter_secs > 0 {
+        if startup_check_allowed && startup_jitter_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
         }
-        tracing::info!(
-            current = build_info::VERSION,
-            jitter_secs = startup_jitter_secs,
-            "Startup update check against GitHub"
-        );
-        if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+        if startup_check_allowed {
+            tracing::info!(
+                current = build_info::VERSION,
+                jitter_secs = startup_jitter_secs,
+                "Startup update check against GitHub"
+            );
+        }
+        let latest = if startup_check_allowed {
+            startup_update_check(build_info::VERSION).await
+        } else {
+            None
+        };
+        if let Some(new_version) = latest {
             // #4073: don't auto-update to a version that is locally BLOCKED — a
             // crash-loop known-bad pin OR a version that has repeatedly failed to
             // install (checksum / signature / download / extract). The installer
@@ -886,13 +907,13 @@ async fn run_network_node_with_signals(
                 // re-poll MUST honor the same lockout — otherwise a locked-out
                 // long-running node would exit-42 every interval and make the
                 // supervisor rerun the same failing update, reintroducing the
-                // exact loop the lockout exists to stop. (The boot-time startup
-                // check bypasses the lockout, but only once per restart; a
-                // *recurring* bypass is the regression.) A successful manual
-                // `freenet update` clears the counter and re-enables this path,
-                // and the lockout itself expires after UPDATE_LOCKOUT_COOLDOWN
-                // (one attempt a day), so a stable node is not stranded forever.
-                if should_attempt_update() {
+                // exact loop the lockout exists to stop. The boot-time startup
+                // check honours it too, through the same claim. A successful
+                // manual `freenet update` clears the counter and re-enables this
+                // path, and a locked-out node gets one retry per
+                // UPDATE_LOCKOUT_COOLDOWN, claimed here before it asks GitHub,
+                // so a stable node is not stranded forever.
+                if claim_update_attempt() {
                     tracing::debug!(
                         current = build_info::VERSION,
                         "Periodic re-poll: checking GitHub directly for a newer release"
@@ -928,15 +949,15 @@ async fn run_network_node_with_signals(
                         }
                     }
                 } else {
-                    // Once per process, not once per 6h tick: the lockout
-                    // lasts a day at a time and usually needs an operator, so
-                    // this is a state to announce on each boot rather than a
-                    // recurring alarm.
-                    // Mirrors the existing `LOCKOUT_WARNED` pattern in
-                    // `check_if_update_available`.
-                    static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // Once per lockout episode, not once per 6h tick: a failed
+                    // retry raises the failure count, which announces it again.
+                    // Mirrors `LOCKOUT_WARNED_AT` in `check_if_update_available`.
+                    static LOCKOUT_REPORTED_AT: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let failures = commands::auto_update::get_update_failure_count();
+                    if LOCKOUT_REPORTED_AT.swap(failures, std::sync::atomic::Ordering::Relaxed)
+                        != failures
+                    {
                         // The second state where the update machinery is silently
                         // OFF (#5244). This was `debug!`, which release builds
                         // compile out entirely (`release_max_level_info`), and the
@@ -945,10 +966,9 @@ async fn run_network_node_with_signals(
                         // node whose peers all share its version, nothing said this
                         // node would never update again.
                         //
-                        // Once per process, mirroring that existing `LOCKOUT_WARNED`
-                        // pattern: the condition usually persists until an
-                        // operator acts, so repeating it every 6h is noise, and one
-                        // line per restart is enough to find it.
+                        // Once per episode, mirroring `LOCKOUT_WARNED_AT`: the
+                        // condition usually persists until an operator acts, so
+                        // repeating it every 6h is noise.
                         // Names the file as well as the command: the lockout can
                         // also be reached with the counter UNREADABLE, and in that
                         // state `freenet update` cannot clear it (the removal is
@@ -964,7 +984,7 @@ async fn run_network_node_with_signals(
                         eprintln!(
                             "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
                          installs, #3934, or an unreadable failure counter). After failed installs it \
-                         retries once a day; an unreadable counter never clears itself. Run `freenet \
+                         retries at most once a day; an unreadable counter stays locked until it can be read. Run `freenet \
                          update` manually, or delete `update_failures` in {state}. `freenet \
                          update --force` bypasses the gate for a single run."
                         );
@@ -3151,33 +3171,42 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on
-    /// `should_attempt_update()` so it honors the persistent auto-update failure
-    /// lockout (#3934). Without the gate, a locked-out long-running node (e.g. a
-    /// non-writable binary path that makes every install fail) would exit-42 once
-    /// per re-poll interval and make the supervisor rerun the same failing
-    /// update, reintroducing the loop the lockout exists to stop. The boot-time
-    /// startup check bypasses the lockout, but only once per restart; the
-    /// recurring re-poll must not.
+    /// Both GitHub release checks the node makes on its own, at boot and on the
+    /// periodic re-poll, must each be preceded by their own
+    /// `claim_update_attempt()`, so a node locked out by repeated failed
+    /// installs (#3934) asks at most once per cooldown. The boot check used to
+    /// be ungated, which turned every restart after a failed retry into another
+    /// failed install: a daily burst, and on Windows a walk toward the
+    /// wrapper's give-up limit. Comments are stripped, so commenting a claim out
+    /// fails this.
     #[test]
-    fn periodic_repoll_respects_update_lockout() {
+    fn every_self_initiated_release_check_claims_the_lockout_retry_first() {
         let src = strip_line_comments(include_str!("freenet.rs"));
-        // `should_attempt_update()` (with parens) appears only at the re-poll
-        // gate; the bare name without parens is the `use` import. The re-poll's
-        // GitHub call is the LAST `startup_update_check(...)` in the file (the
-        // first is the boot-time startup check).
-        let gate = src.find("should_attempt_update()").expect(
-            "periodic re-poll must gate on should_attempt_update() to honor the \
-             #3934 auto-update failure lockout",
+        let prod = production_region(&src);
+        let checks: Vec<usize> = prod
+            .match_indices("startup_update_check(build_info::VERSION).await")
+            .map(|(i, _)| i)
+            .collect();
+        let claims: Vec<usize> = prod
+            .match_indices("claim_update_attempt()")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            checks.len(),
+            2,
+            "expected exactly the boot-time and periodic re-poll GitHub checks; if one \
+             was added, gate it on claim_update_attempt() and update this pin"
         );
-        let repoll_check = src
-            .rfind("startup_update_check(build_info::VERSION).await")
-            .expect("periodic re-poll startup_update_check call not found");
+        assert_eq!(
+            claims.len(),
+            2,
+            "each self-initiated GitHub check must claim the lockout retry first"
+        );
         assert!(
-            gate < repoll_check,
-            "the should_attempt_update() lockout gate must precede the periodic \
-             re-poll's startup_update_check call, so a locked-out node does not \
-             exit-42 in a loop (#4073 / #3934)"
+            claims[0] < checks[0] && checks[0] < claims[1] && claims[1] < checks[1],
+            "each GitHub check must be preceded by its OWN claim_update_attempt() \
+             (claim, check, claim, check), so a locked-out node does not exit 42 on \
+             every restart or re-poll (#3934)"
         );
     }
 }

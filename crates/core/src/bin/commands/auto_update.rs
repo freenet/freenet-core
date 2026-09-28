@@ -17,7 +17,7 @@ use anyhow::Result;
 use semver::Version;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use freenet::transport::{
@@ -117,17 +117,21 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(60);
 /// Maximum backoff interval for update checks (1 hour).
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
-/// Maximum consecutive update failures before disabling auto-update.
+/// Consecutive update failures after which auto-update is locked out: paused
+/// to at most one retry per [`UPDATE_LOCKOUT_COOLDOWN`].
 const MAX_UPDATE_FAILURES: u32 = 3;
 
-/// How long a [`MAX_UPDATE_FAILURES`] lockout holds before the node is allowed
-/// one more attempt. Each failed attempt re-records the failure, which restamps
-/// the counter file and closes the gate for another full cooldown, so a peer
-/// whose installs always fail costs one restart a day rather than a loop. A
-/// permanent lockout instead stranded any peer that runs stably and never
-/// restarts: only the boot-time check bypasses it, so such a peer never updated
-/// again.
+/// The minimum spacing of a locked-out node's retries. A permanent lockout
+/// stranded any peer that runs stably and never restarts, since it then never
+/// asked again; a lockout that reopens lets such a peer recover once whatever
+/// broke its installs is fixed. See [`claim_update_attempt`] for what keeps a
+/// peer whose installs ALWAYS fail at one attempt per cooldown.
 const UPDATE_LOCKOUT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
+/// When a locked-out node last spent its retry, as Unix seconds. Written by the
+/// NODE, before it asks GitHub, so the spacing does not depend on the updater
+/// managing to record its failure. Older binaries ignore it.
+const LOCKOUT_RETRY_FILE: &str = "update_lockout_retry";
 
 /// Non-API "latest release" URL (#5102).
 ///
@@ -393,10 +397,11 @@ pub enum UpdateCheckResult {
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
-/// Set the first time this process logs the auto-update lockout at warn! level,
-/// so the permanent locked-out state is surfaced loudly once rather than on
-/// every 60s update-loop tick (it can be hit from multiple triggers per tick).
-static LOCKOUT_WARNED: AtomicBool = AtomicBool::new(false);
+/// The failure count this process last warned about (0 = none). The lockout is
+/// surfaced loudly once per EPISODE rather than on every 60s update-loop tick:
+/// a failed retry after the cooldown raises the count, which warns again, so a
+/// long-running peer whose retries keep failing is not silent after the first.
+static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(0);
 
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
@@ -405,17 +410,16 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
         // stopped trying to auto-update until the cooldown passes, and a common
         // cause is a non-writable binary path (e.g. a hand-installed binary the
         // service account can't replace), which will keep failing until an
-        // operator intervenes. Warn LOUDLY the first time we observe it this
-        // process, then drop to debug! so the state does not spam the log every
-        // minute.
+        // operator intervenes. Warn LOUDLY once per lockout episode, then drop
+        // to debug! so the state does not spam the log every minute.
         let failures = get_update_failure_count();
-        if !LOCKOUT_WARNED.swap(true, Ordering::Relaxed) {
+        if LOCKOUT_WARNED_AT.swap(failures, Ordering::Relaxed) != failures {
             tracing::warn!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
                 state_dir = ?state_dir(),
                 "Auto-update is LOCKED OUT after {MAX_UPDATE_FAILURES} consecutive failed update \
-                 attempts. It will try again once a day after the last failure. Run `freenet \
+                 attempts. It retries at most once a day. Run `freenet \
                  update` manually to update now and reset the lockout; if updates keep failing, \
                  the binary path is likely not writable by this account.",
             );
@@ -423,7 +427,7 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             tracing::debug!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
-                "Skipping update check - auto-update locked out (already warned this process)"
+                "Skipping update check - auto-update locked out (already warned this episode)"
             );
         }
         return UpdateCheckResult::Skipped;
@@ -436,6 +440,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             backoff_secs = current_backoff.as_secs(),
             "Skipping update check - backoff not elapsed"
         );
+        return UpdateCheckResult::Skipped;
+    }
+
+    // A locked-out node whose cooldown has passed records that it is spending
+    // its retry BEFORE asking GitHub, after the backoff gate so a backoff skip
+    // does not use it up. No-op for a node that is not locked out.
+    if !claim_update_attempt() {
         return UpdateCheckResult::Skipped;
     }
 
@@ -1143,7 +1154,7 @@ fn should_check_for_update(backoff: Duration) -> bool {
 }
 
 /// Get the number of consecutive update failures.
-fn get_update_failure_count() -> u32 {
+pub(crate) fn get_update_failure_count() -> u32 {
     state_dir()
         .map(|d| get_update_failure_count_at(&d))
         .unwrap_or(0)
@@ -1270,6 +1281,7 @@ pub fn clear_update_failures() {
 /// explicit directory.
 pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
     let _rm = fs::remove_file(dir.join("update_failures"));
+    let _rm = fs::remove_file(dir.join(LOCKOUT_RETRY_FILE));
 }
 
 // ── Persistent GitHub-poll rate limit (token buckets) ──────────────────────
@@ -1646,41 +1658,114 @@ pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
 }
 
 /// [`should_attempt_update_at`] with an explicit clock, so the cooldown can be
-/// tested without waiting a day.
+/// tested without waiting a day. READ-ONLY: it never writes, so callers may use
+/// it for decisions and logging freely. Spending a retry is
+/// [`claim_update_attempt`]'s job.
 ///
 /// Below [`MAX_UPDATE_FAILURES`] the answer is yes. At or above it the gate
-/// reopens once [`UPDATE_LOCKOUT_COOLDOWN`] has passed since the counter was
-/// last written — i.e. since the last recorded failure.
-///
-/// Only a counter this process can both read and rewrite can expire. An
-/// unreadable one reads as fully failed (see [`get_update_failure_count_at`])
-/// and stays shut. So does one that cannot be rewritten, because a failed
-/// attempt could not restamp it, the gate would stay open, and every re-poll
-/// would turn into another restart: the exact loop #3934 closed. Opening the
-/// file for append is the probe; it does not change the file's mtime.
-///
-/// A counter stamped in the FUTURE (the clock stepped backwards) counts as
-/// expired. Staying shut until the clock catches up could take arbitrarily
-/// long, while one early attempt restamps the file with the current time.
+/// reopens once [`UPDATE_LOCKOUT_COOLDOWN`] has passed since the later of the
+/// last recorded failure (the counter's mtime) and the last retry this node
+/// claimed. An unreadable counter reads as fully failed (see
+/// [`get_update_failure_count_at`]) and its timestamps cannot be trusted, so it
+/// stays shut.
 fn should_attempt_update_at_time(dir: &std::path::Path, now: SystemTime) -> bool {
     if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
         return true;
     }
-    let path = dir.join("update_failures");
-    let rewritable = fs::read_to_string(&path).is_ok()
-        && fs::OpenOptions::new().append(true).open(&path).is_ok();
-    let last_failure = fs::metadata(&path).and_then(|m| m.modified()).ok();
-    lockout_expired(rewritable, last_failure, now)
+    lockout_expired(&lockout_events(dir), now)
+}
+
+/// When the lockout was last touched: the counter's mtime (the last recorded
+/// failure) and the last claimed retry, whichever exist.
+fn lockout_events(dir: &std::path::Path) -> Vec<SystemTime> {
+    let counter = dir.join("update_failures");
+    let mut events = Vec::new();
+    if fs::read_to_string(&counter).is_ok() {
+        if let Ok(mtime) = fs::metadata(&counter).and_then(|m| m.modified()) {
+            events.push(mtime);
+        }
+    }
+    if let Some(secs) = fs::read_to_string(dir.join(LOCKOUT_RETRY_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        events.push(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    }
+    events
 }
 
 /// The pure decision behind [`should_attempt_update_at_time`]'s lockout arm.
-fn lockout_expired(rewritable: bool, last_failure: Option<SystemTime>, now: SystemTime) -> bool {
-    match (rewritable, last_failure) {
-        (true, Some(stamp)) => now
-            .duration_since(stamp)
-            .map_or(true, |age| age >= UPDATE_LOCKOUT_COOLDOWN),
-        _ => false,
+///
+/// * No usable timestamp at all: stay shut. Without one there is no way to
+///   space retries, which is how the #3934 loop comes back.
+/// * A timestamp slightly in the FUTURE (coarse mtime granularity, a network
+///   filesystem whose clock runs ahead, a clock stepped back): not expired. The
+///   cooldown then runs from that stamp, at worst a little longer than a day.
+/// * A timestamp more than a whole cooldown ahead is not a clock that is a bit
+///   off, it is a bogus one, and waiting it out could take years. It is
+///   ignored; if every timestamp is bogus the lockout counts as expired, and
+///   the retry claimed next writes a sane one.
+fn lockout_expired(events: &[SystemTime], now: SystemTime) -> bool {
+    if events.is_empty() {
+        return false;
     }
+    let plausible = events
+        .iter()
+        .filter(|stamp| match stamp.duration_since(now) {
+            Ok(ahead) => ahead <= UPDATE_LOCKOUT_COOLDOWN,
+            Err(_) => true,
+        })
+        .max();
+    match plausible {
+        None => true,
+        Some(latest) => now
+            .duration_since(*latest)
+            .is_ok_and(|age| age >= UPDATE_LOCKOUT_COOLDOWN),
+    }
+}
+
+/// Call immediately before spending an update check. Returns whether to go
+/// ahead.
+///
+/// A node that is not locked out always may, and nothing is written. A
+/// locked-out node may only once its cooldown has passed, and only after it
+/// has durably recorded that it is spending its retry now: if that write
+/// fails, the answer is no. This is what bounds a peer whose installs ALWAYS
+/// fail to one attempt per [`UPDATE_LOCKOUT_COOLDOWN`] without relying on the
+/// updater. Whether or not the failed install gets recorded, and whether the
+/// retry is spent by the startup check, the periodic re-poll or a peer signal,
+/// every later gate sees a fresh claim and stays shut, so the restart that
+/// follows a failed attempt does not start another.
+pub fn claim_update_attempt() -> bool {
+    state_dir()
+        .map(|d| claim_update_attempt_at(&d, SystemTime::now()))
+        .unwrap_or(false)
+}
+
+pub(crate) fn claim_update_attempt_at(dir: &std::path::Path, now: SystemTime) -> bool {
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return true;
+    }
+    if !should_attempt_update_at_time(dir, now) {
+        return false;
+    }
+    let Ok(since_epoch) = now.duration_since(SystemTime::UNIX_EPOCH) else {
+        return false;
+    };
+    let claimed = fs::write(
+        dir.join(LOCKOUT_RETRY_FILE),
+        since_epoch.as_secs().to_string(),
+    )
+    .is_ok();
+    if claimed {
+        tracing::warn!(
+            failures = get_update_failure_count_at(dir),
+            "Auto-update lockout cooldown has passed: spending this node's retry now. \
+             If it fails, the next one is in {} hours.",
+            UPDATE_LOCKOUT_COOLDOWN.as_secs() / 3600
+        );
+    }
+    claimed
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -2412,13 +2497,14 @@ mod tests {
         assert!(!should_attempt_update_at_time(tmp.path(), stamp));
         let just_short = stamp + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1);
         assert!(!should_attempt_update_at_time(tmp.path(), just_short));
+        assert!(!claim_update_attempt_at(tmp.path(), just_short));
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
     }
 
     #[test]
     fn update_lockout_expires_after_the_cooldown() {
-        // The stranded-peer bug: a node that runs stably never restarts, so the
-        // ungated boot-time check never runs, and a permanent lockout meant it
-        // never updated again.
+        // The stranded-peer bug: a node that runs stably never restarts, and a
+        // permanent lockout meant it never asked again.
         let tmp = tempfile::tempdir().unwrap();
         let stamp = lock_out(tmp.path());
         assert!(should_attempt_update_at_time(
@@ -2428,53 +2514,96 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_after_the_lockout_expires_closes_it_for_another_cooldown() {
-        // The half-open attempt must not become a loop: its failure restamps
-        // the counter and the gate shuts again for a full cooldown.
+    fn a_claimed_retry_closes_the_lockout_for_a_cooldown_even_if_the_failure_is_never_recorded() {
+        // The restart burst: after the retry is spent, the node restarts and
+        // its startup check must NOT ask again, even when the updater's
+        // failure did not get recorded (network error, rate limit, or no
+        // failure recording on that path at all). The claim alone closes it.
         let tmp = tempfile::tempdir().unwrap();
-        lock_out(tmp.path());
-        record_update_failure_at(tmp.path());
-        assert_eq!(
-            get_update_failure_count_at(tmp.path()),
-            MAX_UPDATE_FAILURES + 1
-        );
-        let restamped = std::fs::metadata(tmp.path().join("update_failures"))
-            .unwrap()
-            .modified()
-            .unwrap();
+        let stamp = lock_out(tmp.path());
+        let expiry = stamp + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(claim_update_attempt_at(tmp.path(), expiry));
+        assert!(!claim_update_attempt_at(tmp.path(), expiry));
         assert!(!should_attempt_update_at_time(
             tmp.path(),
-            restamped + Duration::from_secs(3600)
+            expiry + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1)
+        ));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            expiry + UPDATE_LOCKOUT_COOLDOWN
         ));
     }
 
     #[test]
+    fn a_retry_that_cannot_be_recorded_is_not_spent() {
+        // If the claim cannot be written, the node must not ask: that is what
+        // keeps retries spaced without any probe of the counter's writability.
+        // A directory in place of the stamp file fails the write even as root.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::create_dir(tmp.path().join(LOCKOUT_RETRY_FILE)).unwrap();
+        assert!(!claim_update_attempt_at(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn claiming_writes_nothing_for_a_node_that_is_not_locked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_update_failure_at(tmp.path());
+        assert!(claim_update_attempt_at(tmp.path(), SystemTime::now()));
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn a_successful_update_clears_the_claimed_retry_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(claim_update_attempt_at(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+        clear_update_failures_at(tmp.path());
+        assert!(!tmp.path().join("update_failures").exists());
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
     fn an_unreadable_update_counter_never_expires() {
-        // A directory in place of the counter reads as fully failed and can
-        // never be rewritten, so reopening the gate would loop.
+        // A directory in place of the counter reads as fully failed, and its
+        // timestamps are not evidence of anything.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("update_failures")).unwrap();
         let far_future = SystemTime::now() + UPDATE_LOCKOUT_COOLDOWN * 30;
         assert!(!should_attempt_update_at_time(tmp.path(), far_future));
+        assert!(!claim_update_attempt_at(tmp.path(), far_future));
     }
 
     #[test]
     fn lockout_expiry_decision_edges() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let later = t0 + UPDATE_LOCKOUT_COOLDOWN;
-        // A counter that cannot be rewritten never expires.
-        assert!(!lockout_expired(false, Some(t0), later));
-        // Nor does one whose timestamp cannot be read.
-        assert!(!lockout_expired(true, None, later));
+        // No usable timestamp: stay shut.
+        assert!(!lockout_expired(&[], later));
         // Exactly at the boundary it expires; one second short it does not.
-        assert!(lockout_expired(true, Some(t0), later));
+        assert!(lockout_expired(&[t0], later));
+        assert!(!lockout_expired(&[t0], later - Duration::from_secs(1)));
+        // The LATER of the failure and the claimed retry counts.
         assert!(!lockout_expired(
-            true,
-            Some(t0),
-            later - Duration::from_secs(1)
+            &[t0, t0 + Duration::from_secs(3600)],
+            later
         ));
-        // Stamped in the future (clock stepped back): expired, see the doc.
-        assert!(lockout_expired(true, Some(later), t0));
+        // Slightly in the future (coarse mtime, a clock running ahead): NOT
+        // expired. Treating it as expired reopened the gate at once.
+        assert!(!lockout_expired(&[t0 + Duration::from_secs(2)], t0));
+        assert!(!lockout_expired(&[later], t0));
+        // More than a whole cooldown ahead is a bogus clock: ignored, and if
+        // nothing plausible remains the lockout counts as expired...
+        let bogus = later + Duration::from_secs(1);
+        assert!(lockout_expired(&[bogus], t0));
+        // ...but a plausible timestamp alongside it still governs.
+        assert!(!lockout_expired(&[bogus, t0], t0 + Duration::from_secs(60)));
     }
 
     #[test]
@@ -2708,8 +2837,8 @@ mod tests {
     fn test_locked_out_update_check_is_loud() {
         // Source-scrape pin for #4580: when the failure lockout disables
         // auto-update, the skip MUST be operator-visible (warn!), not a silent
-        // debug! line. A regression to debug! would re-hide the permanent
-        // lockout (e.g. non-writable binary path) the issue calls out.
+        // debug! line. A regression to debug! would re-hide the lockout (e.g.
+        // a non-writable binary path) the issue calls out.
         let src = include_str!("auto_update.rs");
         let (_, after_fn_start) = src
             .split_once("pub async fn check_if_update_available(")

@@ -272,7 +272,8 @@ assert_contains "$LOG" "poststop=42" \
 
 # The two assertions the suite was missing entirely. Run either of these from
 # $FREENET_NIX_SEED_BINARY and the peer can never update again (EROFS on
-# /nix/store, then the MAX_UPDATE_FAILURES lockout), silently and forever.
+# /nix/store, then the MAX_UPDATE_FAILURES lockout, whose daily retry fails the
+# same way), silently.
 assert_eq "$(self_of network)" "$STATE/bin/freenet" \
   "the NODE runs from the writable state dir, never from the read-only /nix/store seed"
 assert_eq "$(self_of update)" "$STATE/bin/freenet" \
