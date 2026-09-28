@@ -88,6 +88,21 @@ jobs:
       - name: Build the supervised node wrapper
         run: nix build .#freenet-node -L
 
+      # Boots a NixOS VM with `services.freenet-node.enable = true` and checks the
+      # seed, the process and the state directory (nix/module-test.nix).
+      # Reuses the freenet build above. Fails rather than skips without KVM:
+      # a skipped VM test would read as a passing one.
+      - name: NixOS module VM test
+        run: |
+          # Hosted runners often ship /dev/kvm root-only; nix only enables
+          # its `kvm` system feature when the build user can open it.
+          if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
+          if [ ! -w /dev/kvm ]; then
+              echo "::error::/dev/kvm is not available on this runner, so the NixOS VM test cannot run"
+              exit 1
+          fi
+          nix build .#checks.x86_64-linux.nixos-module -L
+
       # The devShell breaks independently of the package. `cargo metadata` runs
       # cargo against the real workspace; a bare `cargo --version` would not.
       - name: Check the devShell opens and cargo works inside it

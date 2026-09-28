@@ -85,6 +85,12 @@
 
         freenet-node = final.callPackage ./nix/node.nix { };
       };
+
+      # `services.freenet-node`: the supervised, self-updating peer as a NixOS
+      # service. Defaults to this flake's own `freenet-node` package, not the
+      # overlay's, so the node is built with the pinned toolchain. See
+      # docs/nix.md, "Running it under systemd on NixOS".
+      nixosModules.default = import ./nix/module.nix self;
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -119,6 +125,12 @@
           # Retained so `nix run github:freenet/freenet-core#freenet-autoupdate`
           # keeps working for anyone who wired it up before the rename.
           freenet-autoupdate = freenet-node;
+        };
+
+        # Boots a NixOS VM running `services.freenet-node` (nix/module-test.nix).
+        # Linux only: a NixOS VM test needs a Linux host with KVM.
+        checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-module = import ./nix/module-test.nix { inherit self pkgs; };
         };
 
         devShells.default = pkgs.mkShell {
