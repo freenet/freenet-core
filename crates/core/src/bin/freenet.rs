@@ -3193,7 +3193,9 @@ mod tests {
     /// `UpdateAttempt`. The two fallbacks below exit 42 without asking GitHub,
     /// so they are pinned here instead: each send must sit inside the block
     /// whose condition spends the claim, and must occur exactly once, so an
-    /// ungated copy elsewhere fails too.
+    /// ungated copy elsewhere fails too. The needles are split with `concat!`
+    /// so this file does not grow extra trigger-send sites for
+    /// scripts/auto-update-canary_test.sh's trigger-site count to trip on.
     /// "Startup update check complete" means the check RAN and finished; the
     /// release canary (#5222) greps for it on exactly that premise. A startup
     /// check skipped by the lockout claim logs its own line instead, so the
@@ -3220,11 +3222,14 @@ mod tests {
             (
                 "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&claim_update_attempt()\
                  .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
-                "update_tx.send(\"unknown(hardtimeout)\".to_string())",
+                concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),
             ),
             (
                 "ifopen_connections==0&&claim_update_attempt().is_ok(){",
-                "update_tx.send(\"unknown(gatewaymismatch)\".to_string())",
+                concat!(
+                    "update_tx",
+                    ".send(\"unknown(gatewaymismatch)\".to_string())"
+                ),
             ),
         ] {
             assert_eq!(
