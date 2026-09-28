@@ -167,8 +167,48 @@ this landed silently gets you a worse updater, not an older copy of this one.
 After the first update the tag stops mattering: the state-dir binary is a real
 release, and the node tracks releases from then on.
 
+## The NixOS module
+
+The flake exports `nixosModules.default`, which runs the unit below for you
+(first shipped in the release after v0.2.139):
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.freenet.url = "github:freenet/freenet-core/vX.Y.Z";
+
+  outputs = { nixpkgs, freenet, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        freenet.nixosModules.default
+        { services.freenet-node.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+| Option | Default | |
+|---|---|---|
+| `services.freenet-node.enable` | `false` | Run the supervised, self-updating peer as `freenet-node.service`. |
+| `services.freenet-node.package` | the flake's `freenet-node` | Must provide `bin/freenet-node`. The bare `freenet` package has no supervisor. |
+| `services.freenet-node.extraArgs` | `[ ]` | Passed through to `freenet network`. |
+
+It is `services.freenet-node`, not `services.freenet`: nixpkgs already uses
+`services.freenet` as an alias for `services.hyphanet`, the unrelated Java
+Freenet now called Hyphanet.
+
+State lives in `/var/lib/freenet` (mode 0700, since the config directory holds
+the node's keys), which is also the `freenet` user's home. The default package
+is the flake's own, built with the pinned toolchain, not `pkgs.freenet-node`
+from the overlay. `nix build .#checks.x86_64-linux.nixos-module` boots a VM
+running the module (`nix/module-test.nix`).
+
 ## Running it under systemd on NixOS
 
+This is what the module does, for anyone writing their own unit.
 `freenet-node` is the process to supervise. It already handles the node's exit
 codes internally, so the surrounding unit should be plain:
 
