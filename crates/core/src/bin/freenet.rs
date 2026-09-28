@@ -548,30 +548,29 @@ async fn run_network_node_with_signals(
         // would ask again and exit 42 again, a burst of failed installs a day
         // bounded only by the GitHub poll budget, which on Windows counts
         // toward the wrapper's give-up limit. Claimed before logging, so a skip
-        // never reads as a check that ran.
-        let startup_check_allowed = commands::auto_update::claim_update_attempt();
-        if !startup_check_allowed {
+        // never reads as a check that ran. `startup_update_check` takes the
+        // claim's token, so the check cannot run without it.
+        let startup_attempt = commands::auto_update::claim_update_attempt();
+        if let Err(reason) = &startup_attempt {
             tracing::warn!(
-                "Startup update check skipped: auto-update is locked out after repeated failed \
-                 installs (#3934) and has already spent its retry for today. Run `freenet \
-                 update` to update now."
+                reason = %reason,
+                "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_check_allowed && startup_jitter_secs > 0 {
+        if startup_attempt.is_ok() && startup_jitter_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
         }
-        if startup_check_allowed {
-            tracing::info!(
-                current = build_info::VERSION,
-                jitter_secs = startup_jitter_secs,
-                "Startup update check against GitHub"
-            );
-        }
-        let latest = if startup_check_allowed {
-            startup_update_check(build_info::VERSION).await
-        } else {
-            None
+        let latest = match &startup_attempt {
+            Ok(attempt) => {
+                tracing::info!(
+                    current = build_info::VERSION,
+                    jitter_secs = startup_jitter_secs,
+                    "Startup update check against GitHub"
+                );
+                startup_update_check(attempt, build_info::VERSION).await
+            }
+            Err(_) => None,
         };
         if let Some(new_version) = latest {
             // #4073: don't auto-update to a version that is locally BLOCKED — a
@@ -614,10 +613,15 @@ async fn run_network_node_with_signals(
         // Do not reword it into a claim about the version, and do not change the
         // leading phrase: scripts/auto-update-canary.sh greps for it, and
         // scripts/auto-update-canary_test.sh pins it against this file.
-        tracing::info!(
-            current = build_info::VERSION,
-            "Startup update check complete: staying on the current version"
-        );
+        //
+        // Only when the check actually ran: a skip above is its own terminal
+        // line, and this one must keep meaning "the check finished".
+        if startup_attempt.is_ok() {
+            tracing::info!(
+                current = build_info::VERSION,
+                "Startup update check complete: staying on the current version"
+            );
+        }
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
@@ -798,7 +802,14 @@ async fn run_network_node_with_signals(
 
                 // Hard timeout: force exit if isolated with mismatch for too long.
                 if let Some(since) = isolated_mismatch_since {
-                    if since.elapsed() > HARD_EXIT_TIMEOUT {
+                    // A locked-out node (#3934) that cannot claim its retry
+                    // must not exit 42 here either; it restarts the 6h window
+                    // instead, so this is not re-evaluated every tick.
+                    if since.elapsed() > HARD_EXIT_TIMEOUT
+                        && claim_update_attempt()
+                            .inspect_err(|_| isolated_mismatch_since = Some(Instant::now()))
+                            .is_ok()
+                    {
                         tracing::error!(
                             isolated_secs = since.elapsed().as_secs(),
                             "Isolated with version mismatch >6h — forcing exit for auto-update"
@@ -825,7 +836,9 @@ async fn run_network_node_with_signals(
                     }
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
                         let open_connections = get_open_connection_count();
-                        if open_connections == 0 {
+                        // Claimed like every other self-initiated exit 42, so a
+                        // locked-out node (#3934) cannot loop through here.
+                        if open_connections == 0 && claim_update_attempt().is_ok() {
                             tracing::warn!(
                                 "Max backoff + 0 connections — \
                                  trusting gateway version signal, exiting for auto-update"
@@ -913,12 +926,14 @@ async fn run_network_node_with_signals(
                 // path, and a locked-out node gets one retry per
                 // UPDATE_LOCKOUT_COOLDOWN, claimed here before it asks GitHub,
                 // so a stable node is not stranded forever.
-                if claim_update_attempt() {
+                if let Ok(attempt) = claim_update_attempt() {
                     tracing::debug!(
                         current = build_info::VERSION,
                         "Periodic re-poll: checking GitHub directly for a newer release"
                     );
-                    if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+                    if let Some(new_version) =
+                        startup_update_check(&attempt, build_info::VERSION).await
+                    {
                         // #4073 (rebase onto #4591/#4593): mirror the boot-time
                         // startup check — never exit-42 to a version that is
                         // locally BLOCKED (crash-loop known-bad pin OR repeatedly
@@ -3171,42 +3186,56 @@ mod tests {
         );
     }
 
-    /// Both GitHub release checks the node makes on its own, at boot and on the
-    /// periodic re-poll, must each be preceded by their own
-    /// `claim_update_attempt()`, so a node locked out by repeated failed
-    /// installs (#3934) asks at most once per cooldown. The boot check used to
-    /// be ungated, which turned every restart after a failed retry into another
-    /// failed install: a daily burst, and on Windows a walk toward the
-    /// wrapper's give-up limit. Comments are stripped, so commenting a claim out
-    /// fails this.
+    /// Every self-initiated exit 42 must spend the lockout claim first, so a
+    /// node locked out by repeated failed installs (#3934) retries at most once
+    /// per cooldown. The two GitHub checks (boot and periodic re-poll) are
+    /// gated by the type system: `startup_update_check` takes the claim's
+    /// `UpdateAttempt`. The two fallbacks below exit 42 without asking GitHub,
+    /// so they are pinned here instead: each send must sit inside the block
+    /// whose condition spends the claim, and must occur exactly once, so an
+    /// ungated copy elsewhere fails too.
+    /// "Startup update check complete" means the check RAN and finished; the
+    /// release canary (#5222) greps for it on exactly that premise. A startup
+    /// check skipped by the lockout claim logs its own line instead, so the
+    /// completion line must sit inside the block gated on the claim.
     #[test]
-    fn every_self_initiated_release_check_claims_the_lockout_retry_first() {
-        let src = strip_line_comments(include_str!("freenet.rs"));
-        let prod = production_region(&src);
-        let checks: Vec<usize> = prod
-            .match_indices("startup_update_check(build_info::VERSION).await")
-            .map(|(i, _)| i)
-            .collect();
-        let claims: Vec<usize> = prod
-            .match_indices("claim_update_attempt()")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            checks.len(),
-            2,
-            "expected exactly the boot-time and periodic re-poll GitHub checks; if one \
-             was added, gate it on claim_update_attempt() and update this pin"
-        );
-        assert_eq!(
-            claims.len(),
-            2,
-            "each self-initiated GitHub check must claim the lockout retry first"
-        );
+    fn startup_completion_line_is_not_logged_for_a_skipped_check() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        let complete = "\"Startupupdatecheckcomplete:stayingonthecurrentversion\"";
+        assert_eq!(prod.matches(complete).count(), 1);
         assert!(
-            claims[0] < checks[0] && checks[0] < claims[1] && claims[1] < checks[1],
-            "each GitHub check must be preceded by its OWN claim_update_attempt() \
-             (claim, check, claim, check), so a locked-out node does not exit 42 on \
-             every restart or re-poll (#3934)"
+            braced_block(&prod, "ifstartup_attempt.is_ok(){").contains(complete),
+            "the startup completion line must only log when the lockout claim allowed the check"
         );
+    }
+
+    #[test]
+    fn fallback_update_exits_are_gated_on_the_lockout_claim() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        for (opener, send) in [
+            (
+                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&claim_update_attempt()\
+                 .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
+                "update_tx.send(\"unknown(hardtimeout)\".to_string())",
+            ),
+            (
+                "ifopen_connections==0&&claim_update_attempt().is_ok(){",
+                "update_tx.send(\"unknown(gatewaymismatch)\".to_string())",
+            ),
+        ] {
+            assert_eq!(
+                prod.matches(send).count(),
+                1,
+                "expected exactly one `{send}`; a second one would bypass the claim"
+            );
+            assert!(
+                braced_block(&prod, opener).contains(send),
+                "`{send}` must be inside the block gated by claim_update_attempt() (#3934)"
+            );
+        }
     }
 }

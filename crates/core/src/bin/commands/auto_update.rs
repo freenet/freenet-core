@@ -397,11 +397,13 @@ pub enum UpdateCheckResult {
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
-/// The failure count this process last warned about (0 = none). The lockout is
+/// The failure count this process last warned about (`u32::MAX` = none yet, so
+/// even a count of 0, which is what a node with no state dir reports, warns
+/// once). The lockout is
 /// surfaced loudly once per EPISODE rather than on every 60s update-loop tick:
 /// a failed retry after the cooldown raises the count, which warns again, so a
 /// long-running peer whose retries keep failing is not silent after the first.
-static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(0);
+static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
@@ -446,9 +448,9 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
     // A locked-out node whose cooldown has passed records that it is spending
     // its retry BEFORE asking GitHub, after the backoff gate so a backoff skip
     // does not use it up. No-op for a node that is not locked out.
-    if !claim_update_attempt() {
+    let Ok(_attempt) = claim_update_attempt() else {
         return UpdateCheckResult::Skipped;
-    }
+    };
 
     // NOTE: the last-check timestamp is recorded only when a GitHub poll is
     // actually attempted (see the arms below), NOT here. A token-denied
@@ -1667,7 +1669,9 @@ pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
 /// last recorded failure (the counter's mtime) and the last retry this node
 /// claimed. An unreadable counter reads as fully failed (see
 /// [`get_update_failure_count_at`]) and its timestamps cannot be trusted, so it
-/// stays shut.
+/// stays shut. A readable but unparseable one (a torn write) also reads as
+/// fully failed, but its mtime is a real timestamp, so it does expire; that is
+/// deliberate and bounded, because the next failure rewrites it as 1.
 fn should_attempt_update_at_time(dir: &std::path::Path, now: SystemTime) -> bool {
     if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
         return true;
@@ -1689,7 +1693,12 @@ fn lockout_events(dir: &std::path::Path) -> Vec<SystemTime> {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
     {
-        events.push(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        // `checked_add`: a corrupt or hand-edited value too large for
+        // SystemTime must be ignored, not panic the update-check task on
+        // every tick.
+        if let Some(stamp) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+            events.push(stamp);
+        }
     }
     events
 }
@@ -1724,48 +1733,102 @@ fn lockout_expired(events: &[SystemTime], now: SystemTime) -> bool {
     }
 }
 
-/// Call immediately before spending an update check. Returns whether to go
-/// ahead.
+/// Proof that [`claim_update_attempt`] allowed a self-initiated update check.
+/// Only this module can make one, and the GitHub release checks the node runs
+/// on its own ([`startup_update_check`]) take it as a parameter, so a check
+/// that skips the claim, or ignores its answer, does not compile.
+#[derive(Debug)]
+pub struct UpdateAttempt(());
+
+/// Why [`claim_update_attempt`] refused. Distinct because the remedies differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefused {
+    /// No state directory could be resolved, so nothing can space retries.
+    NoStateDir,
+    /// The failure counter exists but cannot be read.
+    CounterUnreadable,
+    /// Locked out (#3934) and this cooldown's retry is already spent.
+    CoolingDown,
+    /// Locked out, cooldown passed, but the retry could not be recorded.
+    NotRecordable,
+}
+
+impl std::fmt::Display for ClaimRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoStateDir => "no Freenet state directory could be resolved",
+            Self::CounterUnreadable => "the update-failure counter cannot be read",
+            Self::CoolingDown => {
+                "auto-update is locked out after repeated failed installs (#3934) and \
+                 retries at most once a day"
+            }
+            Self::NotRecordable => {
+                "auto-update is locked out and its once-a-day retry could not be recorded \
+                 in the state directory"
+            }
+        })
+    }
+}
+
+/// Call immediately before spending an update check; go ahead only on `Ok`.
 ///
 /// A node that is not locked out always may, and nothing is written. A
 /// locked-out node may only once its cooldown has passed, and only after it
 /// has durably recorded that it is spending its retry now: if that write
 /// fails, the answer is no. This is what bounds a peer whose installs ALWAYS
 /// fail to one attempt per [`UPDATE_LOCKOUT_COOLDOWN`] without relying on the
-/// updater. Whether or not the failed install gets recorded, and whether the
-/// retry is spent by the startup check, the periodic re-poll or a peer signal,
-/// every later gate sees a fresh claim and stays shut, so the restart that
-/// follows a failed attempt does not start another.
-pub fn claim_update_attempt() -> bool {
-    state_dir()
-        .map(|d| claim_update_attempt_at(&d, SystemTime::now()))
-        .unwrap_or(false)
+/// updater. Whether or not the failed install gets recorded, and whichever
+/// path spends the retry, every later claim sees it and refuses, so the
+/// restart that follows a failed attempt does not start another.
+pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
+    match state_dir() {
+        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        None => Err(ClaimRefused::NoStateDir),
+    }
 }
 
-pub(crate) fn claim_update_attempt_at(dir: &std::path::Path, now: SystemTime) -> bool {
+pub(crate) fn claim_update_attempt_at(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    match fs::read_to_string(dir.join("update_failures")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(ClaimRefused::CounterUnreadable);
+        }
+        _ => {}
+    }
     if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
-        return true;
+        return Ok(UpdateAttempt(()));
     }
     if !should_attempt_update_at_time(dir, now) {
-        return false;
+        return Err(ClaimRefused::CoolingDown);
     }
     let Ok(since_epoch) = now.duration_since(SystemTime::UNIX_EPOCH) else {
-        return false;
+        return Err(ClaimRefused::NotRecordable);
     };
-    let claimed = fs::write(
+    if fs::write(
         dir.join(LOCKOUT_RETRY_FILE),
         since_epoch.as_secs().to_string(),
     )
-    .is_ok();
-    if claimed {
-        tracing::warn!(
-            failures = get_update_failure_count_at(dir),
-            "Auto-update lockout cooldown has passed: spending this node's retry now. \
-             If it fails, the next one is in {} hours.",
-            UPDATE_LOCKOUT_COOLDOWN.as_secs() / 3600
-        );
+    .is_err()
+    {
+        return Err(ClaimRefused::NotRecordable);
     }
-    claimed
+    tracing::warn!(
+        failures = get_update_failure_count_at(dir),
+        "Auto-update lockout cooldown has passed: spending this node's retry now. \
+         If it fails, the next one is in {} hours.",
+        UPDATE_LOCKOUT_COOLDOWN.as_secs() / 3600
+    );
+    Ok(UpdateAttempt(()))
+}
+
+#[cfg(test)]
+impl UpdateAttempt {
+    /// Tests exercise the check logic without a state directory.
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -1793,7 +1856,10 @@ pub fn has_reached_max_backoff() -> bool {
 ///
 /// Returns `Some(latest_version_string)` only when GitHub confirms a strictly
 /// newer release than `current_version`. Never returns a downgrade.
-pub async fn startup_update_check(current_version: &str) -> Option<String> {
+pub async fn startup_update_check(
+    _attempt: &UpdateAttempt,
+    current_version: &str,
+) -> Option<String> {
     startup_update_check_with_fetcher(current_version, get_latest_version).await
 }
 
@@ -2497,7 +2563,10 @@ mod tests {
         assert!(!should_attempt_update_at_time(tmp.path(), stamp));
         let just_short = stamp + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1);
         assert!(!should_attempt_update_at_time(tmp.path(), just_short));
-        assert!(!claim_update_attempt_at(tmp.path(), just_short));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), just_short).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
         assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
     }
 
@@ -2522,8 +2591,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let stamp = lock_out(tmp.path());
         let expiry = stamp + UPDATE_LOCKOUT_COOLDOWN;
-        assert!(claim_update_attempt_at(tmp.path(), expiry));
-        assert!(!claim_update_attempt_at(tmp.path(), expiry));
+        assert!(claim_update_attempt_at(tmp.path(), expiry).is_ok());
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), expiry).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
         assert!(!should_attempt_update_at_time(
             tmp.path(),
             expiry + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1)
@@ -2542,17 +2614,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let stamp = lock_out(tmp.path());
         std::fs::create_dir(tmp.path().join(LOCKOUT_RETRY_FILE)).unwrap();
-        assert!(!claim_update_attempt_at(
-            tmp.path(),
-            stamp + UPDATE_LOCKOUT_COOLDOWN
-        ));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).unwrap_err(),
+            ClaimRefused::NotRecordable
+        );
     }
 
     #[test]
     fn claiming_writes_nothing_for_a_node_that_is_not_locked_out() {
         let tmp = tempfile::tempdir().unwrap();
         record_update_failure_at(tmp.path());
-        assert!(claim_update_attempt_at(tmp.path(), SystemTime::now()));
+        assert!(claim_update_attempt_at(tmp.path(), SystemTime::now()).is_ok());
         assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
     }
 
@@ -2560,10 +2632,7 @@ mod tests {
     fn a_successful_update_clears_the_claimed_retry_too() {
         let tmp = tempfile::tempdir().unwrap();
         let stamp = lock_out(tmp.path());
-        assert!(claim_update_attempt_at(
-            tmp.path(),
-            stamp + UPDATE_LOCKOUT_COOLDOWN
-        ));
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
         clear_update_failures_at(tmp.path());
         assert!(!tmp.path().join("update_failures").exists());
         assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
@@ -2577,7 +2646,54 @@ mod tests {
         std::fs::create_dir(tmp.path().join("update_failures")).unwrap();
         let far_future = SystemTime::now() + UPDATE_LOCKOUT_COOLDOWN * 30;
         assert!(!should_attempt_update_at_time(tmp.path(), far_future));
-        assert!(!claim_update_attempt_at(tmp.path(), far_future));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), far_future).unwrap_err(),
+            ClaimRefused::CounterUnreadable
+        );
+    }
+
+    /// The peer-signal path spends the lockout claim before it asks GitHub, as a
+    /// `let ... else` that returns on refusal (so the result cannot be ignored),
+    /// at statement position (so commenting it out fails), inside
+    /// `check_if_update_available`, and before the fetch. Without it an expired
+    /// node reaching GitHub through a peer signal writes no claim, and a
+    /// transient failure there lets the startup check on restart retry again
+    /// the same day.
+    #[test]
+    fn peer_signal_check_spends_the_lockout_claim_before_asking_github() {
+        let src = include_str!("auto_update.rs");
+        let body = fn_body(src, "pub async fn check_if_update_available(");
+        let claim = "let Ok(_attempt) = claim_update_attempt() else {";
+        let fetch = "match get_latest_version().await {";
+        let at_statement = |needle: &str| {
+            body.match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    body[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("`{needle}` is not at statement position"))
+        };
+        assert!(
+            at_statement(claim) < at_statement(fetch),
+            "check_if_update_available must spend the lockout claim before asking GitHub (#3934)"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_retry_stamp_is_ignored_not_a_panic() {
+        // A corrupt or hand-edited stamp too large for SystemTime used to
+        // panic in `UNIX_EPOCH + secs` on every update-check tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::write(tmp.path().join(LOCKOUT_RETRY_FILE), u64::MAX.to_string()).unwrap();
+        // Ignored, so the counter's own mtime governs.
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
     }
 
     #[test]

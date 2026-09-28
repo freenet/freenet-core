@@ -204,6 +204,10 @@ const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
 const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 /// Maximum consecutive failures before the wrapper gives up.
 const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
+/// A child that ran at least this long before exiting was healthy, so its exit
+/// starts a fresh streak toward `WRAPPER_MAX_CONSECUTIVE_FAILURES`. Same value
+/// and rule as the macOS launchd script's `MIN_HEALTHY_RUNTIME`.
+const WRAPPER_MIN_HEALTHY_RUNTIME_SECS: u64 = 300;
 
 /// Dashboard URL served by the local freenet node.
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
@@ -3014,6 +3018,28 @@ echo "RC=$?"
         let action = next_wrapper_action(&mut state, 42, false, Some(false));
         assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
         assert_eq!(state.backoff_secs, 40);
+    }
+
+    #[test]
+    fn a_long_healthy_run_clears_the_failure_streak() {
+        // A node that runs for a day and then fails one update (a #3934
+        // lockout retry) must not creep toward the give-up limit: before this,
+        // 50 such days stopped the node for good.
+        let mut state = WrapperState::new();
+        state.consecutive_failures = WRAPPER_MAX_CONSECUTIVE_FAILURES - 1;
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS);
+        assert_eq!(state.consecutive_failures, 0);
+        next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn a_short_run_keeps_the_failure_streak() {
+        // A tight crash loop must still reach the give-up limit.
+        let mut state = WrapperState::new();
+        state.consecutive_failures = 7;
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS - 1);
+        assert_eq!(state.consecutive_failures, 7);
     }
 
     #[test]

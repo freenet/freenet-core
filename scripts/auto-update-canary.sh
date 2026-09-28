@@ -819,7 +819,7 @@ assert_gate_a_decision() {
   # `update` and `unknown` arms, plus Gate B (which names it separately). In the
   # `decline` arm it is close to unreachable, because the node only reaches the
   # #4073 branch at all from inside
-  # `if let Some(new_version) = startup_update_check(...)` -- so entering it on
+  # the `Some` arm of `startup_update_check(...)` -- so entering it on
   # the normal path already requires an inverted comparator, and with a fresh
   # HOME the pin/gate would then not match either, so the TRIGGER fires and the
   # decline arm below catches it first. Two independent defects, not one. It is
