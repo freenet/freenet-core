@@ -2714,6 +2714,45 @@ else
     fi
 fi
 
+# --- 6b. Gate B's job timeout still holds the canary's worst case ----------
+# #5715 added a wait for GitHub to serve the release before the node boots, on
+# top of the node attempts, and raised `timeout-minutes` to hold both. The two
+# live in different files and change for different reasons, so nothing kept
+# them in step. A job killed by its timeout carries no classification and
+# reports only "cancelled" -- a red release with no diagnosis.
+#
+# The worst case is computed from the canary's OWN defaults (sourced in a clean
+# environment, so an exported CANARY_* in the caller cannot skew it), plus the
+# fixed allowances below, which are the curl bounds hard-coded in the script:
+#   300  previous-release download (curl --max-time 300)
+#    95  one latest-release probe overrunning the wait budget
+#        (curl --max-time 30, --retry 2, plus retry delays)
+#    30  the runner reachability probe (curl --max-time 30)
+#   300  `freenet update` downloading and installing the new release
+#    60  checkout, previous-release lookup, runner overhead
+# shellcheck disable=SC2016  # the inner script expands in the child, on purpose
+canary_defaults="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+    source "$1" >/dev/null 2>&1 || exit 1
+    echo "$CANARY_LATEST_WAIT_SECS $CANARY_ATTEMPTS $CANARY_TIMEOUT_SECS $CANARY_RETRY_SLEEP"
+' _ "$SCRIPT_DIR/auto-update-canary.sh")"
+gate_b_timeout_min="$(printf '%s\n' "$selfupdate_block" \
+    | sed -n 's/^    timeout-minutes:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -1)"
+read -r _wait _attempts _timeout _sleep <<<"$canary_defaults"
+if [[ -z "$gate_b_timeout_min" || -z "${_sleep:-}" ]]; then
+    fail "could not read Gate B's timeout-minutes or the canary's default budgets" \
+        "timeout-minutes='${gate_b_timeout_min}' defaults='${canary_defaults}'" \
+        "Without both, the check below cannot say whether the job can finish."
+else
+    _worst=$(( 300 + _wait + 95 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
+    if [[ $(( gate_b_timeout_min * 60 )) -ge "$_worst" ]]; then
+        pass "Gate B's timeout-minutes ($gate_b_timeout_min) holds the canary's worst case (${_worst}s)"
+    else
+        fail "Gate B's timeout-minutes ($gate_b_timeout_min = $(( gate_b_timeout_min * 60 ))s) is below the canary's worst case (${_worst}s)" \
+            "wait=${_wait}s attempts=${_attempts} x ${_timeout}s retry-sleep=${_sleep}s, plus fixed allowances." \
+            "Raise timeout-minutes, or shrink the budgets in auto-update-canary.sh."
+    fi
+fi
+
 # --- 7. Gate B's job still exists -------------------------------------------
 # The notify job's clauses are only meaningful if the job they name is real.
 if grep -qE '^  auto-update-selfupdate-canary:[[:space:]]*$' "$WF"; then

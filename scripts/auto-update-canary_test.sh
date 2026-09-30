@@ -1007,8 +1007,13 @@ GATE_B_LATEST=0.2.121 gate_b_case "GitHub never serves the release -> loud, node
     "GitHub never reported v0.2.122 as latest within 1s" "0:SEEN_OK" "0:SEEN_OK"
 GATE_B_LATEST=0.2.121 gate_b_case "...and it names what GitHub DID serve" 1 0 yes \
     "last named '0.2.121'" "0:SEEN_OK" "0:SEEN_OK"
-GATE_B_LATEST=FAIL gate_b_case "runner gets no answer from GitHub at all -> 75, node never booted" 75 0 no \
-    "got no answer from https://github.com/freenet/freenet-core/releases/latest" "0:SEEN_OK" "0:SEEN_OK"
+GATE_B_LATEST=FAIL gate_b_case "no tag from GitHub and the runner cannot connect -> 75, node never booted" 75 0 no \
+    "this runner could not connect to https://github.com/freenet/freenet-core/releases/latest" "0:SEEN_OK" "0:SEEN_OK"
+# The same non-answer with the runner ONLINE is not environmental: a 403, a 429
+# or a new redirect shape all look like "no tag" to resolve_expected_latest, and
+# the node reads the same 302. Quiet here is the direction that hides things.
+GATE_B_LATEST=FAIL gate_b_case "no tag from GitHub but the runner CAN connect -> loud, node never booted" 1 0 yes \
+    "yet THIS RUNNER can connect to it" "0:SEEN_OK" "0:SEEN_OK"
 # Property 2. GitHub serves 0.2.122 (the default stub), the node still reads
 # 0.2.121 and stays put: a CDN flap after the wait, or a genuinely broken
 # updater. Either way it is a real failure and is never retried -- two specs,
@@ -1033,8 +1038,13 @@ wait_case() {
     errfile="$(mktemp "$TMPROOT/wait.XXXXXX")"
     got_rc="$(
         CANARY_LATEST_CONFIRMATIONS=3
-        CANARY_LATEST_POLL_SECS=1
+        CANARY_LATEST_POLL_SECS="${WAIT_CASE_POLL:-1}"
         CANARY_LATEST_WAIT_SECS="${WAIT_CASE_BUDGET:-30}"
+        if [[ "${WAIT_CASE_REACHABLE:-no}" == yes ]]; then
+            runner_can_reach_github() { return 0; }
+        else
+            runner_can_reach_github() { return 1; }
+        fi
         # Cases that expect success never reach the budget, so their 1s polls
         # are skipped. Cases that set a budget must spend it on the real clock
         # (`SECONDS`), so they keep the real `sleep` -- a no-op there would spin
@@ -1057,7 +1067,14 @@ wait_case() {
     )"
     got_probes="$(wc -l < "$counter")"
     err="$(cat "$errfile")"
-    if [[ "$got_rc" != "$want_rc" || ( -n "$want_probes" && "$got_probes" != "$want_probes" ) ]]; then
+    # <want-probes> is exact, empty for "any", or ">=N" for a floor.
+    local probes_ok=1
+    case "$want_probes" in
+        '')    ;;
+        '>='*) [[ "$got_probes" -ge "${want_probes#>=}" ]] || probes_ok=0 ;;
+        *)     [[ "$got_probes" == "$want_probes" ]] || probes_ok=0 ;;
+    esac
+    if [[ "$got_rc" != "$want_rc" || "$probes_ok" -eq 0 ]]; then
         echo "FAIL - latest wait: $desc" >&2
         echo "         got rc $got_rc after $got_probes probe(s); wanted rc $want_rc after ${want_probes:-any} probe(s)" >&2
         FAILURES=$((FAILURES + 1))
@@ -1085,10 +1102,21 @@ wait_case "a probe with no answer resets the streak too" 0 5 "" \
 # A 1s budget with 1s polls: two probes, then the deadline.
 WAIT_CASE_BUDGET=1 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
     "GitHub never reported v0.2.122 as latest within 1s" 0.2.121
-WAIT_CASE_BUDGET=1 wait_case "a NEWER tag is not the expected one either -> 1" 1 "" \
-    "last named '0.2.123'" 0.2.123
-WAIT_CASE_BUDGET=1 wait_case "no answer on any probe -> 75, environmental" 75 "" \
-    "UNVERIFIED (ENVIRONMENTAL): this runner got no answer" FAIL
+# Lag only ever serves an OLDER tag, so a newer one is final: fail on the first
+# probe instead of spending the whole budget on an answer that cannot change.
+wait_case "a NEWER tag fails at once -> 1, after one probe" 1 1 \
+    "GitHub reports a NEWER release than the one this run was asked to verify: https://github.com/freenet/freenet-core/releases/latest names '0.2.123'" 0.2.123
+WAIT_CASE_BUDGET=1 wait_case "no tag on any probe, runner cannot connect -> 75, environmental" 75 "" \
+    "UNVERIFIED (ENVIRONMENTAL): this runner could not connect" FAIL
+WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runner CAN connect -> 1, loud" 1 "" \
+    "yet THIS RUNNER can connect to it" FAIL
+# The CADENCE. Every case above either stubs `sleep` or sets poll == budget, so
+# swapping the poll interval for the budget in the loop's `sleep` left them all
+# green -- and in production that is one probe per 300s budget, which fails
+# every release whose publication lag is longer than zero. Poll 1s against a 3s
+# budget is 4 probes; a 3s cadence would be 2.
+WAIT_CASE_BUDGET=3 WAIT_CASE_POLL=1 wait_case "polls at the poll interval, not the budget" 1 ">=3" \
+    "GitHub never reported v0.2.122 as latest" 0.2.121
 
 # --- Gate A END TO END, driven per attempt ----------------------------------
 # The Gate A counterpart of the block above, sharing its stub. Two properties

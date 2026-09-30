@@ -1034,10 +1034,14 @@ jobs:
   auto-update-selfupdate-canary:
     name: Auto-update self-update canary (previous release -> this one)
     runs-on: ubuntu-latest
-    # 20 -> 25 for the latest-release wait (#5715, up to ~5 min plus probe
-    # time). The node attempts alone can take ~9 min at worst (2 x
-    # CANARY_TIMEOUT_SECS + outcome wait + retry sleep) on top of the download.
-    timeout-minutes: 25
+    # 20 -> 30 for the latest-release wait (#5715). Worst case is the previous
+    # release's download, the wait (budget plus one probe's overrun), every
+    # node attempt at CANARY_TIMEOUT_SECS with the retry sleeps, and the
+    # install. `release_canary_wiring_test.sh` computes that from the canary's
+    # own defaults and fails if this no longer holds it. A job killed by the
+    # timeout carries no classification and takes the loud path, which is safe
+    # but says nothing useful.
+    timeout-minutes: 30
     needs: attach-to-release
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -1162,13 +1166,14 @@ jobs:
           # Names EVERY environmental cause rather than assuming the network
           # one. Exit 75 covers three: the previous release's binary could not
           # reach GitHub (and neither could the runner), every attempt lost a
-          # port race on this host, or the runner got no answer at all while
-          # waiting for GitHub to report this release as latest (#5715). An earlier version of this message asserted
+          # port race on this host, or the runner could not connect to GitHub
+          # while waiting for it to report this release as latest (#5715). An
+          # earlier version of this message asserted
           # the first, so a self-hosted runner with something holding the ports
           # sent the operator after DNS. The job log's `UNVERIFIED
           # (ENVIRONMENTAL)` line says which; this says what to do, which is the
           # same either way.
-          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: the previous release's binary could not reach GitHub (and neither could the runner), every attempt hit a port collision on the runner, or the runner could not reach GitHub at all to confirm this release was being served as latest. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: the previous release's binary could not reach GitHub (and neither could the runner), every attempt hit a port collision on the runner, or the runner could not connect to GitHub at all to confirm this release was being served as latest. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
@@ -1196,7 +1201,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). Exception: if the canary's log says GitHub never reported this release as latest, the canary node never ran and `freenet update` would not help either (it reads the same endpoint); fix which release GitHub marks latest. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

@@ -980,7 +980,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Five distinct outcomes end in a red job; only one of them means
+enough to tell.** Several distinct outcomes end in a red job; only one of them means
 a node on the previous release genuinely cannot reach this one. **Read the
 `::error::` line in the job log before doing anything** — it names which.
 
@@ -993,6 +993,10 @@ rather than on the shape of the alarm.
 | `UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host` | 75 | ⚠️ quiet | Something else on the runner held the ports; the node never started. | Re-run the job. |
 | `UNVERIFIED: … reported it could not reach GitHub … but THIS RUNNER reached the same endpoint immediately afterwards` | 1 | 🚨 loud | The published binary consistently could not do what the runner just did. Most likely its persisted poll-budget cooldown (#5102), possibly a published fetch-side regression. **Not a stranded fleet.** | Read the node output. Re-run; if it recurs across releases it is not the runner. |
 | `UNVERIFIED: at least one attempt started the update check and never logged an outcome` | 1 | 🚨 loud | A hung updater, or the check was cut short. Genuinely unknown. | Re-run. Persisting, treat as a real fault. |
+| `GitHub never reported vX as latest within Ns: … last named '<older tag>'` | 1 | 🚨 loud | Before booting the node, Gate B waits (up to `CANARY_LATEST_WAIT_SECS`, 300s) for `releases/latest` to name this release (#5715). It never did. The node was **not started**, so this says nothing about the updater, but until GitHub serves this release as latest no node can see it. | Check the release is published, not a prerelease, and marked latest. `freenet update` by hand will not help: it reads the same endpoint. |
+| `GitHub reports a NEWER release than the one this run was asked to verify` | 1 | 🚨 loud | A newer release is already latest, usually because an old tag's workflow was re-run. Node not started. | Expected on a re-run of an old tag. Otherwise check which release is marked latest. |
+| `GitHub never reported vX as latest: … answered on none of N probe(s) … with a release redirect, yet THIS RUNNER can connect to it` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
+| `UNVERIFIED (ENVIRONMENTAL): this runner could not connect to … releases/latest` | 75 | ⚠️ quiet | The runner could not connect to GitHub for the whole wait. Node not started, nothing learned. | Re-run the job. |
 | Anything naming a specific detection or install failure | 1 | 🚨 loud | The real thing. See case 3. | See case 3. |
 
 **The trap this table exists to remove.** An earlier version of this section said
