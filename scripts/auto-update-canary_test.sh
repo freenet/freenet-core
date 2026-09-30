@@ -1077,17 +1077,17 @@ wait_case() {
             if [[ "$n" -le "$#" ]]; then r="${!n}"; else r="${!#}"; fi
             [[ "$r" == yes ]]
         }
-        # FAKE TIME. `sleep` advances bash's `SECONDS` (assigning it rebases
-        # the counter) instead of sleeping, so the loop's deadline arithmetic
-        # runs for real and instantly. A real `sleep` against a 1s budget made
-        # the probe count -- and with it which branch the wait ended in --
-        # depend on where in a wall-clock second the case started: measured at
-        # about 1% per case under load. A real second can still tick during a
-        # case, which costs at most one probe, so every case below that ends by
-        # the budget gets enough of it (10 polls) for one probe fewer not to
-        # change its outcome. It also still sees WHICH variable is slept on:
-        # sleeping the budget instead of the poll interval gives 2 probes, not 11.
-        sleep() { SECONDS=$(( SECONDS + $1 )); }
+        # FAKE CLOCK. The wait reads time only through `canary_now`, so a
+        # counter that only the stubbed `sleep` advances makes every case
+        # exactly deterministic: probes land at t = 0, poll, 2*poll, ... up to
+        # and including the first at or past the budget. An earlier version
+        # advanced bash's `SECONDS` instead, and real second ticks leaked
+        # through it under load (10 of 120 parallel runs, round-4 review). It
+        # still sees WHICH variable is slept on: sleeping the budget instead of
+        # the poll interval gives 2 probes, not 11.
+        FAKE_NOW=0
+        canary_now() { printf '%s' "$FAKE_NOW"; }
+        sleep() { FAKE_NOW=$(( FAKE_NOW + $1 )); }
         resolve_expected_latest() {
             local n a
             n=$(( $(wc -l < "$counter") + 1 ))
@@ -1146,8 +1146,8 @@ WAIT_CASE_BUDGET=10 wait_case "stale, then connect-class failures -> 75" 75 "" \
 # The wait ENDED ON AN ANSWER: never quiet, whatever came before. The round-2
 # version read "served, streak incomplete" as "the probes after it failed" and
 # returned 75 with no failed probe and no connect check at all (round-3 review).
-WAIT_CASE_BUDGET=10 wait_case "budget runs out mid-streak with no failures -> loud, never 75" 1 "" \
-    "answer(s) from https://github.com/freenet/freenet-core/releases/latest named it, but earlier ones did not" \
+WAIT_CASE_BUDGET=10 wait_case "budget runs out mid-streak with no failures -> loud, never 75" 1 11 \
+    "the wait ended 2 answer(s) into a streak naming it at https://github.com/freenet/freenet-core/releases/latest. Of 11 probe(s), 9 named a different tag and 0 got no tag at all" \
     0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.122
 # Flapping for the whole budget, both parities: which tag came last must not
 # decide whether the gate is quiet.
@@ -1155,6 +1155,21 @@ WAIT_CASE_BUDGET=10 wait_case "flapping throughout, ending either way (a) -> lou
     0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121
 WAIT_CASE_BUDGET=10 wait_case "flapping throughout, ending either way (b) -> loud, never 75" 1 "" "" \
     0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122
+# The streak message must not blame "earlier answers" when every answer named
+# the release and a failed probe broke the streak.
+WAIT_CASE_BUDGET=4 wait_case "streak broken by a failed probe, not by another tag -> loud, counts say so" 1 5 \
+    "Of 5 probe(s), 0 named a different tag and 1 got no tag at all" \
+    0.2.122 0.2.122 FAIL 0.2.122 0.2.122
+# An OLDER tag long past any measured lag, then the network goes: the stale
+# answer is the finding, and must not be washed out into the quiet path.
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "stale far beyond lag, then an outage -> loud, not 75" 1 "" \
+    "was still naming '0.2.121' 150s into the wait" \
+    $(for _ in $(seq 1 151); do printf '0.2.121 '; done) FAIL
+# The per-run reset of the connect result: a connect success in an EARLIER
+# failure run must not keep a later run loud.
+WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE="yes no" wait_case "connect result resets with each answer" 75 "" \
+    "then this runner lost its connection to it" FAIL 0.2.122 FAIL
 # An outage GitHub then answered through says nothing about how the wait ended.
 WAIT_CASE_BUDGET=10 wait_case "an early outage followed by stale answers -> loud, not 75" 1 "" \
     "GitHub never reported v0.2.122 as latest within " FAIL FAIL 0.2.121
@@ -1180,8 +1195,8 @@ WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE="no yes no" wait_case "connected on one 
 # swapping the poll interval for the budget in the loop's `sleep` left them all
 # green -- and in production that is one probe per 300s budget, which fails
 # every release whose publication lag is longer than zero. Poll 1s against a 10s
-# budget is 11 probes (10 if a real second ticks); a 10s cadence would be 2.
-WAIT_CASE_BUDGET=10 WAIT_CASE_POLL=1 wait_case "polls at the poll interval, not the budget" 1 ">=9" \
+# budget is exactly 11 probes on the fake clock; a 10s cadence would be 2.
+WAIT_CASE_BUDGET=10 WAIT_CASE_POLL=1 wait_case "polls at the poll interval, not the budget" 1 11 \
     "GitHub never reported v0.2.122 as latest" 0.2.121
 
 # --- Gate A END TO END, driven per attempt ----------------------------------

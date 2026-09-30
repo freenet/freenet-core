@@ -980,10 +980,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Several distinct outcomes end in a red job; only the ones that
-name a specific detection or install failure, or say GitHub never served this
-release as latest, mean a node on the previous release genuinely cannot reach
-this one. **Read the
+enough to tell.** Several distinct outcomes end in a red job. Only the ones that
+name a specific detection or install failure mean a node on the previous release
+genuinely cannot reach this one; the rows that say GitHub never served this
+release as latest mean no node can see it YET, and their Response column says
+whether that is a re-run or a real problem. **Read the
 `::error::` line in the job log before doing anything** — it names which.
 
 The wording below is generated from the code, so match on the quoted phrases
@@ -998,7 +999,8 @@ rather than on the shape of the alarm.
 | `GitHub never reported vX as latest within Ns: … last named '<older tag>'` | 1 | 🚨 loud | Before booting the node, Gate B waits (up to `CANARY_LATEST_WAIT_SECS`, 300s) for `releases/latest` to name this release (#5715). It never did. The node was **not started**, so this says nothing about the updater, but until GitHub serves this release as latest no node can see it. | Check the release is published, not a prerelease, and marked latest. `freenet update` by hand will not help: it reads the same endpoint. |
 | `GitHub reports a NEWER release than the one this run was asked to verify` | 1 | 🚨 loud | A newer release is already latest, usually because an old tag's workflow was re-run. Node not started. | Expected on a re-run of an old tag. Otherwise check which release is marked latest. |
 | `GitHub never reported vX as latest: … answered none of N probe(s) … with a release redirect, yet THIS RUNNER could connect to it during the wait` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
-| `GitHub never reported vX as latest on 3 consecutive probes … the last N answer(s) … named it, but earlier ones did not` | 1 | 🚨 loud | GitHub named the release only at the very end of the budget, or its CDN flapped between tags throughout. Node not started. | Re-run. If it recurs, GitHub is not serving the release consistently. |
+| `GitHub never reported vX as latest on 3 consecutive probes … the wait ended N answer(s) into a streak naming it … Of P probe(s), A named a different tag and B got no tag at all` | 1 | 🚨 loud | The budget ran out mid-streak. The counts say why: GitHub began serving it only at the end (A high, at the start), its CDN flapped between tags (A spread through), or probes failed intermittently (B). Node not started. | Re-run. If it recurs, GitHub is not serving the release consistently. |
+| `GitHub never reported vX as latest: … was still naming '<older tag>' Ns into the wait, longer than any publication lag measured` | 1 | 🚨 loud | GitHub served the old release for longer than lag explains, then the probes failed. The stale answer is the finding. Node not started. | As for the "last named '<older tag>'" row above. |
 | `GitHub never reported vX as latest: … last named '<tag>', then answered none of the last N probe(s) with a release redirect … while THIS RUNNER could still connect` | 1 | 🚨 loud | GitHub answered, then the endpoint stopped answering with a redirect while the runner could still connect: the endpoint went bad. Node not started. | Check the endpoint by hand as above. |
 | `UNVERIFIED (ENVIRONMENTAL): … last named '<tag>', then this runner lost its connection to it` | 75 | ⚠️ quiet | GitHub answered, then the runner's network went for the rest of the wait. Node not started, nothing learned. | Re-run the job. |
 | `UNVERIFIED (ENVIRONMENTAL): no probe of … releases/latest produced a release tag … and after every one of them this runner also failed to connect to it` | 75 | ⚠️ quiet | The runner could not connect to GitHub after any probe of the wait. Node not started, nothing learned. | Re-run the job. |

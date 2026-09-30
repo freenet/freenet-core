@@ -1280,8 +1280,10 @@ resolve_expected_latest() {
 #        302, so a changed redirect shape is what a stranded fleet looks like
 #        from here. Only a connect-class failure buys the quiet path -- the same
 #        rule `gate_b_unverified_class` applies to the node's own fetch failures.
-#   75 The wait ended on failed probes and the connect check failed after EVERY
-#      one of that trailing run. Checked per probe, not once at the end, so a
+#   75 The wait ended on failed probes, the connect check failed after EVERY
+#      one of that trailing run, and the last answer (if any) was either the
+#      release itself or an older tag early enough to still be publication lag
+#      (LATEST_PLAUSIBLE_LAG_SECS). Checked per probe, not once at the end, so a
 #      run of 429s ending in one connect blip stays loud; and only on the
 #      TRAILING run, so a wait that ended on an answer (budget out mid-streak,
 #      flapping) can never be quiet. Nothing about the updater can be learned
@@ -1289,28 +1291,43 @@ resolve_expected_latest() {
 #
 # The messages say "GitHub never reported ...", never "the node failed to
 # update": the node has not been started when these fire.
+# The wait's clock, in whole seconds. A function so the tests can substitute a
+# fake one: bash's `SECONDS` ticks on real second boundaries however the loop's
+# `sleep` is stubbed, and under load those ticks changed which branch a test
+# ended in (10 of 120 parallel suite runs, round-4 review).
+canary_now() { printf '%s' "$SECONDS"; }
+
+# How long a stale answer can still be publication lag: 2x the worst measured
+# (52s, v0.2.136). An OLDER tag still being served after this is itself a
+# finding, and a network drop afterwards must not wash it out into the quiet
+# path.
+LATEST_PLAUSIBLE_LAG_SECS=120
+
 wait_for_release_to_be_latest() {
   local expected="$1" seen last_seen="" streak=0 probes=0 answered=0
+  local other_tags=0 last_answer_at=0
   # The TRAILING run of failed probes -- those after the last probe that
   # produced a tag -- and whether any connect check during that run succeeded.
   # Both reset on every answer. The failure classification reads only these:
   # an earlier outage that GitHub then answered through says nothing about why
   # the wait ended, and a wait that ended on an answer had no failure to classify.
   local trail_fail=0 trail_connected=0
-  local start="$SECONDS"
-  local deadline=$(( SECONDS + CANARY_LATEST_WAIT_SECS ))
+  local start now
+  start="$(canary_now)"
+  local deadline=$(( start + CANARY_LATEST_WAIT_SECS ))
   log "waiting for GitHub to report v$expected as latest at $RELEASES_LATEST_URL (up to ${CANARY_LATEST_WAIT_SECS}s, $CANARY_LATEST_CONFIRMATIONS consecutive answers)"
   while :; do
     probes=$((probes + 1))
     if seen="$(resolve_expected_latest)"; then
       answered=$((answered + 1))
       last_seen="$seen"
+      last_answer_at=$(( $(canary_now) - start ))
       trail_fail=0
       trail_connected=0
       if [ "$seen" = "$expected" ]; then
         streak=$((streak + 1))
         if [ "$streak" -ge "$CANARY_LATEST_CONFIRMATIONS" ]; then
-          log "GitHub reports v$expected as latest ($streak consecutive answers, $(( SECONDS - start ))s after the first probe)"
+          log "GitHub reports v$expected as latest ($streak consecutive answers, $(( $(canary_now) - start ))s after the first probe)"
           return 0
         fi
       elif is_dotted_version "$seen" && is_dotted_version "$expected" \
@@ -1319,6 +1336,7 @@ wait_for_release_to_be_latest() {
         return 1
       else
         streak=0
+        other_tags=$((other_tags + 1))
       fi
     else
       # A failed probe breaks the streak: "fresh, then no answer, then fresh"
@@ -1332,14 +1350,15 @@ wait_for_release_to_be_latest() {
         trail_connected=1
       fi
     fi
-    [ "$SECONDS" -lt "$deadline" ] || break
+    now="$(canary_now)"
+    [ "$now" -lt "$deadline" ] || break
     sleep "$CANARY_LATEST_POLL_SECS"
   done
 
   # The measured time, not the budget: one probe can take ~90s on its own
   # (curl --max-time 30, two retries), so the loop can overrun the budget and
   # the message must not understate how long GitHub was given.
-  local waited=$(( SECONDS - start ))
+  local waited=$(( $(canary_now) - start ))
 
   # The wait ENDED ON FAILURES. Classify them by the connect checks.
   if [ "$trail_fail" -gt 0 ]; then
@@ -1350,6 +1369,13 @@ wait_for_release_to_be_latest() {
       fi
       fail "UNVERIFIED (ENVIRONMENTAL): no probe of $RELEASES_LATEST_URL produced a release tag in ${waited}s ($probes probe(s)), and after every one of them this runner also failed to connect to it, so it could not confirm that GitHub reports v$expected as latest, and the canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
       return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+    fi
+    # Still an OLDER tag long after publication lag could explain it: that
+    # answer is the finding, and the network going afterwards does not make it
+    # environmental. Loud, with the same reading as the older-tag case below.
+    if [ "$last_seen" != "$expected" ] && [ "$last_answer_at" -gt "$LATEST_PLAUSIBLE_LAG_SECS" ]; then
+      fail "GitHub never reported v$expected as latest: $RELEASES_LATEST_URL was still naming '$last_seen' ${last_answer_at}s into the wait, longer than any publication lag measured (52s), before the last $trail_fail probe(s) failed. The canary node was NOT started, so this is not a verdict on the updater, but until GitHub reports v$expected as latest NO node can auto-update to it. Check that the release is published, is not a prerelease, and is marked latest."
+      return 1
     fi
     if [ "$trail_connected" -eq 1 ]; then
       fail "GitHub never reported v$expected as latest: $RELEASES_LATEST_URL last named '$last_seen', then answered none of the last $trail_fail probe(s) with a release redirect (${waited}s in all), while THIS RUNNER could still connect to it. Most likely the endpoint started returning an error or a non-redirect. The canary node was NOT started, so this is not a verdict on the updater -- but the node reads the same 302, so if this persists NO node can detect any release. Check the endpoint by hand: curl -sI $RELEASES_LATEST_URL"
@@ -1365,7 +1391,7 @@ wait_for_release_to_be_latest() {
     # Named it, but the budget ran out before the streak completed: it arrived
     # in the last few polls, or edges were flapping between tags for the whole
     # wait. Either way three consecutive answers never happened.
-    fail "GitHub never reported v$expected as latest on $CANARY_LATEST_CONFIRMATIONS consecutive probes within ${waited}s: the last $streak answer(s) from $RELEASES_LATEST_URL named it, but earlier ones did not ($answered answer(s) from $probes probe(s)). GitHub either began serving it only at the end of the budget, or its CDN was flapping between tags throughout. The canary node was NOT started, so this is not a verdict on the updater. Re-run the job; if it recurs, GitHub is not serving this release consistently and nodes will see it only intermittently."
+    fail "GitHub never reported v$expected as latest on $CANARY_LATEST_CONFIRMATIONS consecutive probes within ${waited}s: the wait ended $streak answer(s) into a streak naming it at $RELEASES_LATEST_URL. Of $probes probe(s), $other_tags named a different tag and $(( probes - answered )) got no tag at all. GitHub began serving it only at the end of the budget, its CDN was flapping between tags, or probes were failing intermittently -- the counts say which. The canary node was NOT started, so this is not a verdict on the updater. Re-run the job; if it recurs, GitHub is not serving this release consistently."
     return 1
   fi
   fail "GitHub never reported v$expected as latest within ${waited}s: $RELEASES_LATEST_URL last named '${last_seen}' ($answered answer(s) from $probes probe(s)). The canary node was NOT started, so this is not a verdict on the updater -- but it is not a propagation blip either: publication lag has measured under a minute. Until GitHub reports v$expected as latest, NO node can auto-update to it. Check that the release is published, is not a prerelease, and is marked latest."

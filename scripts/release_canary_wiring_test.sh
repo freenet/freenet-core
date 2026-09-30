@@ -2731,7 +2731,8 @@ fi
 #   checked between probes, so slow probes inside the budget are paid for by
 #   the budget itself; only the LAST iteration can run past it. That is the
 #   poll sleep (read from the defaults) plus:
-#    95  one probe (curl --max-time 30, --retry 2, --retry-max-time 90)
+#   120  one probe: a retry may START just inside --retry-max-time 90 and then
+#        run its full --max-time 30
 #    30  the connect check that follows a failed probe (curl --max-time 30)
 #    30  the runner reachability probe after the node attempts (same bound)
 #   300  `freenet update` downloading and installing the new release. Estimate:
@@ -2750,7 +2751,7 @@ if [[ -z "$gate_b_timeout_min" || -z "${_sleep:-}" ]]; then
         "timeout-minutes='${gate_b_timeout_min}' defaults='${canary_defaults}'" \
         "Without both, the check below cannot say whether the job can finish."
 else
-    _worst=$(( 300 + _wait + _poll + 95 + 30 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
+    _worst=$(( 300 + _wait + _poll + 120 + 30 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
     if [[ $(( gate_b_timeout_min * 60 )) -ge "$_worst" ]]; then
         pass "Gate B's timeout-minutes ($gate_b_timeout_min) holds the canary's worst case (${_worst}s)"
     else
