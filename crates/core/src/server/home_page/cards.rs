@@ -1417,9 +1417,13 @@ enum CeilingKind {
     ///   for ~2.5 minutes, so a node with contracts still arriving sits a few
     ///   over, trims to exactly N of N, and goes over again.
     ///
-    /// Being over is the eviction sweep's trigger, not a fault, and the sweep
-    /// can always make progress (a subscribed contract is shed as a last
-    /// resort). The strip says what is happening in words instead.
+    /// Being over is the eviction sweep's trigger, not a fault, and a
+    /// subscribed contract is shed as a last resort, so the sweep is not
+    /// blocked by everything being in use. (One corner does stay over for a
+    /// while: a just-inserted contract larger than the whole budget is
+    /// protected from the insert-time sweep and goes at the next periodic one.
+    /// That is logged as a warning; it is not a reason to colour this axis for
+    /// every busy node.) The strip says what is happening in words instead.
     Cache,
     /// An admission limit (disk). Reaching it refuses new writes, so
     /// approaching it is a real warning.
@@ -1506,7 +1510,10 @@ impl LimitAxis {
     /// The sentence shown under the bar, if the axis is in a state a reader
     /// would otherwise have to interpret for themselves.
     fn note(&self) -> Option<&'static str> {
-        if self.is_over() {
+        // An admission limit already refuses growth AT its limit, not only
+        // past it, so exactly-full gets the same sentence as over.
+        let refusing = self.kind == CeilingKind::Admission && self.utilisation >= 1.0;
+        if self.is_over() || refusing {
             return Some(self.over_note);
         }
         let shown = self.shown_pct();
@@ -1658,7 +1665,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                  also tighten the contract-state limit, but only when the disk \
                  budget is the smaller of the two, since that limit is \
                  min(RAM budget, disk budget).",
-                over_note: "Over the limit, so new writes are being refused.",
+                over_note: "At its limit, so new writes are being refused.",
             });
         }
     }

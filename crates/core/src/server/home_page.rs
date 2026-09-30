@@ -3403,6 +3403,28 @@ mod tests {
                 && strips.contains("new writes are being refused"),
             "a disk over its limit must say so — got:\n{strips}"
         );
+
+        // Exactly full is already refusing writes. "Refused once this is full"
+        // would describe the present as the future.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 1,
+            contract_slot_budget: 100,
+            disk_total_bytes: Some(1000),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("(100%)")
+                && strips.contains("new writes are being refused")
+                && !strips.contains("once this is full"),
+            "a disk exactly at its limit is refusing writes now — got:\n{strips}"
+        );
     }
 
     /// The lowest-utilisation axis must NOT be the one reported.
