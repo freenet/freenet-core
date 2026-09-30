@@ -1034,14 +1034,14 @@ jobs:
   auto-update-selfupdate-canary:
     name: Auto-update self-update canary (previous release -> this one)
     runs-on: ubuntu-latest
-    # 20 -> 30 for the latest-release wait (#5715). Worst case is the previous
+    # 20 -> 35 for the latest-release wait (#5715). Worst case is the previous
     # release's download, the wait (budget plus one probe's overrun), every
     # node attempt at CANARY_TIMEOUT_SECS with the retry sleeps, and the
     # install. `release_canary_wiring_test.sh` computes that from the canary's
     # own defaults and fails if this no longer holds it. A job killed by the
     # timeout carries no classification and takes the loud path, which is safe
     # but says nothing useful.
-    timeout-minutes: 30
+    timeout-minutes: 35
     needs: attach-to-release
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

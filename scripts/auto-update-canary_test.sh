@@ -1085,7 +1085,9 @@ wait_case() {
         # through it under load (10 of 120 parallel runs, round-4 review). It
         # still sees WHICH variable is slept on: sleeping the budget instead of
         # the poll interval gives 2 probes, not 11.
-        FAKE_NOW=0
+        # Starts at 1000, not 0: a deadline or elapsed-time computation that
+        # forgets to subtract `start` passes on a clock that starts at zero.
+        FAKE_NOW=1000
         canary_now() { printf '%s' "$FAKE_NOW"; }
         sleep() { FAKE_NOW=$(( FAKE_NOW + $1 )); }
         resolve_expected_latest() {
@@ -1164,8 +1166,34 @@ WAIT_CASE_BUDGET=4 wait_case "streak broken by a failed probe, not by another ta
 # answer is the finding, and must not be washed out into the quiet path.
 # shellcheck disable=SC2046  # deliberate: one argument per scripted answer
 WAIT_CASE_BUDGET=200 wait_case "stale far beyond lag, then an outage -> loud, not 75" 1 "" \
-    "was still naming '0.2.121' 150s into the wait" \
+    "was still naming a different tag 150s into the wait" \
     $(for _ in $(seq 1 151); do printf '0.2.121 '; done) FAIL
+# ...but stale only EARLY, within lag, then an outage, stays environmental. With
+# the production-sized budget, so a rule keyed on total elapsed time instead of
+# on WHEN the older tag was seen would go loud here.
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "stale only within lag, then an outage -> 75" 75 "" \
+    "then this runner lost its connection to it" \
+    $(for _ in $(seq 1 31); do printf '0.2.121 '; done) FAIL
+# The boundary: an older tag last seen AT the cutoff is still lag; one second
+# later it is not.
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "older tag last seen at exactly the lag cutoff -> 75" 75 "" "" \
+    $(for _ in $(seq 1 121); do printf '0.2.121 '; done) FAIL
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "older tag last seen one second past the cutoff -> loud" 1 "" \
+    "was still naming a different tag 121s into the wait" \
+    $(for _ in $(seq 1 122); do printf '0.2.121 '; done) FAIL
+# Flapping past the cutoff, then an outage, both parities: which tag came last
+# must not decide whether the gate is quiet (round-5 review).
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "flapping past lag then an outage, ending on the old tag -> loud" 1 "" \
+    "was still naming a different tag" \
+    $(for _ in $(seq 1 76); do printf '0.2.121 0.2.122 '; done) 0.2.121 FAIL
+# shellcheck disable=SC2046  # deliberate: one argument per scripted answer
+WAIT_CASE_BUDGET=200 wait_case "flapping past lag then an outage, ending on the release -> loud" 1 "" \
+    "its last answer was '0.2.122'" \
+    $(for _ in $(seq 1 76); do printf '0.2.121 0.2.122 '; done) FAIL
 # The per-run reset of the connect result: a connect success in an EARLIER
 # failure run must not keep a later run loud.
 WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE="yes no" wait_case "connect result resets with each answer" 75 "" \
