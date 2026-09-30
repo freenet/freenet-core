@@ -3141,11 +3141,12 @@ mod tests {
     /// A full cache is the steady state, not an alarm.
     ///
     /// Reported from a live peer: "Closest limit: contract slots — 508 of 508
-    /// (100%)" over a solid red bar. Nothing was wrong. The sweep trims back
-    /// TO the budget and stops, so a busy node rests at exactly N of N for as
-    /// long as it stays busy; the strip coloured purely on utilisation and so
-    /// was red on every peer doing the most useful work. Same for contract
-    /// state, which nova's own peer showed at "1023.9 MB of 1.0 GB (100%)".
+    /// (100%)" over a solid red bar. Nothing was wrong. A cache is supposed to
+    /// be full: the sweep trims back to the budget and stops, so a busy node
+    /// sits at or around N of N for as long as it stays busy. The strip
+    /// coloured purely on utilisation and so was red on every peer doing the
+    /// most useful work. Same for contract state, which nova's own peer showed
+    /// at "1023.9 MB of 1.0 GB (100%)".
     #[test]
     fn hosting_card_full_cache_axis_is_not_an_alarm() {
         use crate::node::network_status::HostingSnapshot;
@@ -3167,20 +3168,6 @@ mod tests {
                     budget_bytes: 1_000_000,
                     used_bytes: 999_900,
                     contract_count: 5,
-                    contract_slot_budget: 508,
-                    contracts: vec![mk_hosted_entry("A", true)],
-                    ..Default::default()
-                },
-            ),
-            (
-                // 509 of 508 prints as "(100%)". Thresholds are taken on the
-                // printed figure, so this must match the exactly-full case
-                // rather than colouring a line that reads 100%.
-                "one slot over, still printed as 100%",
-                HostingSnapshot {
-                    budget_bytes: 1000,
-                    used_bytes: 100,
-                    contract_count: 509,
                     contract_slot_budget: 508,
                     contracts: vec![mk_hosted_entry("A", true)],
                     ..Default::default()
@@ -3230,16 +3217,80 @@ mod tests {
         );
     }
 
-    /// OVER a cache ceiling is worth noticing, but it is the sweep's trigger
-    /// and resolves itself, so it is amber with an explanation — never red.
+    /// "Full is normal" is only said of a bar that prints as full. At 76% the
+    /// bar visibly has room and the sentence would be false.
     #[test]
-    fn hosting_card_over_budget_cache_axis_is_amber_not_red() {
+    fn hosting_card_does_not_call_a_part_full_cache_full() {
         use crate::node::network_status::HostingSnapshot;
+        for count in [76, 99] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                contract_slot_budget: 100,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(&format!("({count}%)")) && !strips.contains("hz-binding-note"),
+                "a cache at {count}% is neither full nor over and needs no note — got:\n{strips}"
+            );
+        }
+    }
+
+    /// OVER a cache ceiling is not an alarm either. It is the eviction sweep's
+    /// trigger, and on the slot axis a busy node spends much of its time a few
+    /// contracts over: the sweep only fires after ~2.5 minutes over, trims to
+    /// exactly N, and the next arrival puts it over again. At the 128-slot
+    /// floor a single extra contract prints as 101%, so colouring "over" would
+    /// keep the smallest peers amber in normal operation. It is described in
+    /// words, never coloured.
+    #[test]
+    fn hosting_card_over_budget_cache_axis_is_explained_not_coloured() {
+        use crate::node::network_status::HostingSnapshot;
+        for (count, budget, printed) in [
+            // One over at the slot floor.
+            (129, 128, "129 of 128 (101%)"),
+            // One over on a bigger node: prints as 100%, but the detail text
+            // says 509 of 508, so the note must say "over" and not "full".
+            (509, 508, "509 of 508 (100%)"),
+            // Well over.
+            (120, 100, "120 of 100 (120%)"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                contract_slot_budget: budget,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(printed),
+                "fixture must render as {printed} — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--warn") && !strips.contains("var(--danger"),
+                "{printed}: an over-budget cache axis must not be coloured — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("A little over is normal") && !strips.contains("Full is normal"),
+                "{printed}: over must be described as over, not as full — got:\n{strips}"
+            );
+        }
+
+        // The state-byte axis has its own wording: crossing it evicts at once.
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
-            budget_bytes: 1000,
-            used_bytes: 100,
-            contract_count: 120,
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
             contract_slot_budget: 100,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
@@ -3247,16 +3298,10 @@ mod tests {
         let html = build_hosting_card(&Some(snap));
         let strips = binding_strips(&html);
         assert!(
-            strips.contains("120 of 100 (120%)"),
-            "fixture must render over budget — got:\n{strips}"
-        );
-        assert!(
-            strips.contains("var(--warn") && !strips.contains("var(--danger"),
-            "an over-budget cache axis is amber, not red — got:\n{strips}"
-        );
-        assert!(
-            strips.contains("Over the limit") && !strips.contains("Full is normal"),
-            "over budget must be described as over, not as normal — got:\n{strips}"
+            strips.contains("how eviction is triggered")
+                && !strips.contains("var(--warn")
+                && !strips.contains("var(--danger"),
+            "an over-budget state axis is explained, not coloured — got:\n{strips}"
         );
     }
 
@@ -3335,6 +3380,28 @@ mod tests {
             strips.matches(r#"class="hz-binding""#).count(),
             2,
             "exactly the closest axis plus the one in a warning state — got:\n{strips}"
+        );
+
+        // A disk that is itself over its limit, behind a cache that is further
+        // over, must not be introduced as merely "near" its limit.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 130,
+            contract_slot_budget: 100,
+            disk_total_bytes: Some(1200),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract slots</strong>")
+                && strips.contains("Also over its limit: <strong>disk</strong>")
+                && strips.contains("new writes are being refused"),
+            "a disk over its limit must say so — got:\n{strips}"
         );
     }
 
@@ -3452,8 +3519,12 @@ mod tests {
         let mut snap = base_snapshot();
         snap.open_connections = 1;
         snap.gateway_only_persisting = false;
-        snap.health = HealthLevel::Healthy;
+        snap.health = HealthLevel::Connecting;
         let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("health-connecting"),
+            "a node still joining is shown as connecting — got:\n{html}"
+        );
         assert!(
             !html.contains("Firewall likely blocking"),
             "gateway-only within the joining grace is not a firewall diagnosis — got:\n{html}"
@@ -3515,25 +3586,50 @@ mod tests {
         }
     }
 
-    /// The favicon and tab title share the NAT verdict, so they share its
-    /// sample floor.
+    /// The favicon's dark red is the NAT-specific "blocked" verdict, so it
+    /// shares the verdict's sample floor.
+    ///
+    /// What this does NOT change, deliberately: a NAT failure recorded while
+    /// the node has no connections also lands in `failures`, and with zero
+    /// connections any failure still drives the plain-red favicon and the
+    /// warning title. That is the existing "cannot connect and here is why"
+    /// path, not a verdict on the port, so the fixture includes the failure
+    /// entry production would have alongside the NAT count.
     #[test]
-    fn favicon_and_title_give_no_nat_verdict_on_one_attempt() {
-        let mut snap = base_snapshot();
-        snap.nat_stats.attempts = 1;
-        snap.nat_stats.successes = 0;
-        let uri = build_favicon_data_uri(&Some(snap));
+    fn favicon_gives_no_nat_verdict_on_one_attempt() {
+        let one_failed_attempt = || {
+            let mut snap = base_snapshot();
+            snap.nat_stats.attempts = 1;
+            snap.nat_stats.successes = 0;
+            snap.failures.push(FailureSnapshot {
+                address: "1.2.3.4:1234".parse::<SocketAddr>().unwrap(),
+                reason_html: "NAT traversal failed".to_string(),
+            });
+            snap
+        };
+        let uri = build_favicon_data_uri(&Some(one_failed_attempt()));
         assert!(
             !uri.contains("%238b0000"),
-            "one failed NAT attempt must not turn the favicon dark red — got: {uri}"
+            "one failed NAT attempt must not be the dark-red 'blocked' verdict — got: {uri}"
         );
-        let mut snap = base_snapshot();
-        snap.nat_stats.attempts = 1;
-        snap.nat_stats.successes = 0;
+        assert!(
+            uri.contains("%23f44336"),
+            "with no connections, the recorded failure still shows as a failure — got: {uri}"
+        );
         assert_eq!(
-            build_dashboard_title(&Some(snap)),
-            "\u{26A1} Dashboard",
-            "one failed NAT attempt is still 'connecting', not a warning"
+            build_dashboard_title(&Some(one_failed_attempt())),
+            "\u{26A0} Dashboard",
+            "with no connections, a recorded failure still warns in the title"
+        );
+
+        // Once connected, neither a single failed attempt nor its failure
+        // entry colours anything.
+        let mut snap = one_failed_attempt();
+        snap.open_connections = 2;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(
+            uri.contains("%230abab5"),
+            "connected wins over a single failed NAT attempt — got: {uri}"
         );
     }
 

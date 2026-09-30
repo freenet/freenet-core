@@ -330,6 +330,17 @@ pub struct NetworkStatus {
     pub gateway_addresses: HashSet<SocketAddr>,
     /// Active peer connections.
     pub connected_peers: Vec<ConnectedPeer>,
+    /// When the node most recently BECAME gateway-only: connected, and every
+    /// connection is a gateway. `None` whenever it has a peer-to-peer
+    /// connection or no connection at all.
+    ///
+    /// Maintained by [`NetworkStatus::refresh_gateway_only_since`], which
+    /// every mutation of `connected_peers` must call. Kept as its own
+    /// timestamp because no property of the current connections can stand in
+    /// for it: the age of the oldest connection is too old when a long-lived
+    /// gateway link outlives the last peer, and too young when a gateway link
+    /// is re-established.
+    pub gateway_only_since: Option<Instant>,
     /// Freenet version string.
     pub version: String,
     /// This node's ring location.
@@ -938,6 +949,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         started_at: Instant::now(),
         gateway_addresses: gateway_addrs,
         connected_peers: Vec::new(),
+        gateway_only_since: None,
         version,
         own_location: None,
         external_address: None,
@@ -1006,6 +1018,20 @@ pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
     }
 }
 
+impl NetworkStatus {
+    /// Bring [`Self::gateway_only_since`] in line with `connected_peers`.
+    /// Call after every change to that list.
+    fn refresh_gateway_only_since(&mut self, now: Instant) {
+        let gateway_only =
+            !self.connected_peers.is_empty() && self.connected_peers.iter().all(|p| p.is_gateway);
+        if !gateway_only {
+            self.gateway_only_since = None;
+        } else if self.gateway_only_since.is_none() {
+            self.gateway_only_since = Some(now);
+        }
+    }
+}
+
 /// Record a successful peer connection.
 pub fn record_peer_connected(
     addr: SocketAddr,
@@ -1024,6 +1050,7 @@ pub fn record_peer_connected(
                 connected_since: Instant::now(),
                 peer_key_location,
             });
+            s.refresh_gateway_only_since(Instant::now());
             s.gateway_failures.clear();
         }
     }
@@ -1034,6 +1061,7 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
     // Free the per-peer metrics slot so the bounded table doesn't accumulate
@@ -1999,7 +2027,8 @@ pub enum HealthLevel {
     /// Connected but degraded: still gateway-only after the joining grace
     /// period, or every NAT attempt failing over a meaningful sample.
     Degraded,
-    /// Still trying to establish connections.
+    /// Still joining: no connections yet, or connected only to gateways and
+    /// still within [`GATEWAY_ONLY_GRACE_SECS`].
     Connecting,
     /// No connections after extended time, or version mismatch.
     Trouble,
@@ -2226,9 +2255,13 @@ pub const NAT_MIN_ATTEMPTS_FOR_VERDICT: u32 = 5;
 /// Every node is gateway-only from its first connection until its first
 /// peer-to-peer one, and with no grace the dashboard greeted every fresh start
 /// with an amber banner and "Firewall likely blocking incoming connections".
-/// Measured from the oldest current connection rather than from process
-/// start, so a node that lost everything and reconnected (a laptop waking up)
-/// gets the same grace as one that just started.
+/// The same applies to a node that loses its last peer: it gets this long to
+/// find another before being told its firewall is at fault.
+///
+/// Two minutes is a judgement, not a measurement. It is long enough that a
+/// node joining normally is not warned, and short enough that a genuinely
+/// unreachable node is told within one look at the page. Measuring the real
+/// time-to-first-peer distribution is tracked in #5770.
 pub const GATEWAY_ONLY_GRACE_SECS: u64 = 120;
 
 impl NatStatsSnapshot {
@@ -2240,17 +2273,25 @@ impl NatStatsSnapshot {
     }
 }
 
-/// Whether a gateway-only node has been that way long enough to warn about.
-/// `oldest_connection_secs` is the age of the longest-lived current connection.
-fn gateway_only_is_persisting(gateway_only: bool, oldest_connection_secs: Option<u64>) -> bool {
-    gateway_only && oldest_connection_secs.is_some_and(|secs| secs >= GATEWAY_ONLY_GRACE_SECS)
+/// Whether a node that became gateway-only at `since` has been that way long
+/// enough, as of `now`, to warn about.
+fn gateway_only_is_persisting(since: Option<Instant>, now: Instant) -> bool {
+    since.is_some_and(|since| {
+        now.saturating_duration_since(since).as_secs() >= GATEWAY_ONLY_GRACE_SECS
+    })
 }
 
 /// Get a snapshot of the current network status for the dashboard.
 pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
+    snapshot_at(Instant::now())
+}
+
+/// [`get_snapshot`] as of `now`. Split out so a test can ask what the
+/// dashboard shows some time from now without sleeping or constructing an
+/// `Instant` in the past (which can underflow on a freshly booted machine).
+fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     let status = NETWORK_STATUS.get()?;
     let s = status.read().ok()?;
-    let now = Instant::now();
 
     let failures = s
         .gateway_failures
@@ -2273,6 +2314,16 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                         "<strong>NAT traversal failed</strong>: Could not connect to this \
                          peer. This is normal — not all NAT traversal attempts succeed."
                             .to_string()
+                    } else if !s.connected_peers.is_empty() {
+                        // Connected, but only to gateways. "Can't reach
+                        // gateway" would be false here, and one failed attempt
+                        // is not yet evidence of a blocked port.
+                        format!(
+                            "<strong>NAT traversal failed</strong>: Could not connect to \
+                             this peer. If no peer connections succeed, check that UDP \
+                             port <code>{}</code> is open in your firewall.",
+                            s.listening_port
+                        )
                     } else {
                         format!(
                             "<strong>NAT traversal failed</strong>: Can't reach gateway. \
@@ -2307,7 +2358,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                 address: p.address,
                 is_gateway: p.is_gateway,
                 location: p.location,
-                connected_secs: now.duration_since(p.connected_since).as_secs(),
+                connected_secs: now.saturating_duration_since(p.connected_since).as_secs(),
                 peer_key_location: p.peer_key_location.clone(),
                 bytes_sent: sent,
                 bytes_received: recv,
@@ -2318,7 +2369,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
     let gateway_only_persisting =
-        gateway_only_is_persisting(gateway_only, peers.iter().map(|p| p.connected_secs).max());
+        gateway_only && gateway_only_is_persisting(s.gateway_only_since, now);
 
     // Read subscribed contracts from the registered provider, which in
     // production points at the canonical lease map in `HostingManager`.
@@ -2357,7 +2408,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         })
         .unwrap_or_default();
 
-    let elapsed_secs = s.started_at.elapsed().as_secs();
+    let elapsed_secs = now.saturating_duration_since(s.started_at).as_secs();
     let has_version_mismatch = s
         .gateway_failures
         .iter()
@@ -2375,6 +2426,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         HealthLevel::Connecting
     } else if gateway_only_persisting || nat_stats.looks_blocked() {
         HealthLevel::Degraded
+    } else if gateway_only {
+        // Connected to a gateway and nothing else yet, within the grace: the
+        // node is still joining. Not a problem, but not "connected to N
+        // peers" either, since it has no peer-to-peer connection.
+        HealthLevel::Connecting
     } else {
         HealthLevel::Healthy
     };
@@ -2866,15 +2922,15 @@ mod tests {
                 address: gw_addr,
                 is_gateway: true,
                 location: Some(0.5),
-                // Older than the joining grace, so the state counts as
-                // persisting rather than as a node still connecting.
-                connected_since: Instant::now()
-                    .checked_sub(Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5))
-                    .expect("the monotonic clock is past the grace period"),
+                connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.gateway_only_since = None;
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
+        // Read past the joining grace, where gateway-only counts as persisting.
+        let later = Instant::now() + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
+        let snap = snapshot_at(later).unwrap();
         assert!(snap.gateway_only_persisting);
 
         // Not gateway-only: add a non-gateway peer
@@ -2887,22 +2943,27 @@ mod tests {
                 connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
+        let snap = snapshot_at(later).unwrap();
         assert!(!snap.gateway_only_persisting);
 
         // Back to gateway-only: remove non-gateway peer
         {
             let mut s = status.write().unwrap();
             s.connected_peers.retain(|p| p.address != peer_addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
+        // Gateway-only again, but only just: the grace restarts.
+        assert!(!get_snapshot().unwrap().gateway_only_persisting);
+        let snap = snapshot_at(later).unwrap();
         assert!(snap.gateway_only_persisting);
 
         // Cleanup
         {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
 
@@ -3019,53 +3080,82 @@ mod tests {
     /// reachability problem.
     #[test]
     fn gateway_only_is_degraded_only_after_the_joining_grace() {
-        assert!(!gateway_only_is_persisting(false, Some(10_000)));
-        assert!(!gateway_only_is_persisting(true, None));
-        assert!(!gateway_only_is_persisting(true, Some(0)));
-        assert!(!gateway_only_is_persisting(
-            true,
-            Some(GATEWAY_ONLY_GRACE_SECS - 1)
-        ));
-        assert!(gateway_only_is_persisting(
-            true,
-            Some(GATEWAY_ONLY_GRACE_SECS)
-        ));
-
         let _lock = TEST_MUTEX.lock().unwrap();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 12345);
         init(31346, HashSet::new(), "0.1.148".to_string());
-        let status = NETWORK_STATUS.get().unwrap();
-        let connect_gateway = |connected_since: Instant| {
-            let mut s = status.write().unwrap();
+        {
+            let mut s = NETWORK_STATUS.get().unwrap().write().unwrap();
             s.gateway_addresses.insert(gw_addr);
             s.connected_peers.clear();
+            s.gateway_only_since = None;
             s.gateway_failures.clear();
             s.nat_stats = NatStats::default();
-            s.connected_peers.push(ConnectedPeer {
-                address: gw_addr,
-                is_gateway: true,
-                location: Some(0.5),
-                connected_since,
-                peer_key_location: None,
-            });
-        };
+        }
+        let just_short = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS - 1);
+        let past_grace = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
 
         // Freshly connected to a gateway: joining, not a problem.
-        connect_gateway(Instant::now());
+        let before_join = Instant::now();
+        record_peer_connected(gw_addr, None, None);
+        let joined = Instant::now();
         let snap = get_snapshot().unwrap();
         assert!(!snap.gateway_only_persisting);
-        assert_eq!(snap.health, HealthLevel::Healthy);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        let snap = snapshot_at(before_join + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
 
-        // Still gateway-only well past the grace period: now it is a problem.
-        let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5))
-            .expect("the monotonic clock is further than the grace period from its origin");
-        connect_gateway(long_ago);
-        let snap = get_snapshot().unwrap();
+        // Still gateway-only past the grace period: now it is a problem.
+        let snap = snapshot_at(joined + past_grace).unwrap();
         assert!(snap.gateway_only_persisting);
         assert_eq!(snap.health, HealthLevel::Degraded);
 
-        status.write().unwrap().connected_peers.clear();
+        // Re-establishing the gateway connection must NOT restart the grace.
+        // The anchor is when the node became gateway-only, not the age of any
+        // one connection, or a firewalled node whose gateway link reconnects
+        // every minute would never be warned.
+        // Asked at exactly the grace after `joined`, which is only satisfied
+        // if the anchor is still at or before `joined`: an anchor moved to the
+        // reconnect would be a moment short.
+        record_peer_connected(gw_addr, None, None);
+        assert!(
+            snapshot_at(joined + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS))
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        // A peer-to-peer connection clears it...
+        record_peer_connected(peer_addr, None, None);
+        let snap = snapshot_at(joined + past_grace).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Healthy);
+
+        // ...and losing that peer starts a NEW grace, even though the gateway
+        // connection is by now long-lived. A node gets time to find another
+        // peer before it is told its firewall is at fault.
+        let before_loss = Instant::now();
+        record_peer_disconnected(peer_addr);
+        let lost_peer = Instant::now();
+        let snap = snapshot_at(before_loss + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        assert!(
+            snapshot_at(lost_peer + past_grace)
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        record_peer_disconnected(gw_addr);
+        assert!(
+            NETWORK_STATUS
+                .get()
+                .unwrap()
+                .read()
+                .unwrap()
+                .gateway_only_since
+                .is_none(),
+            "no connections is not gateway-only"
+        );
     }
 
     /// Single NAT traversal attempts fail routinely, so a node is not
@@ -3212,6 +3302,12 @@ mod tests {
         assert!(html.contains("NAT traversal failed"));
         assert!(html.contains("firewall"));
         assert!(!html.contains("This is normal"));
+        // But it must not claim the gateway is unreachable: this node is
+        // connected to one.
+        assert!(
+            !html.contains("Can't reach gateway"),
+            "a node connected to a gateway must not be told it can't reach one — got: {html}"
+        );
 
         // Cleanup
         record_peer_disconnected(gw_addr);

@@ -605,11 +605,12 @@ code {
 .op-ok::before {
   content: '\2713 ';
 }
-/* Not red. The count beside the cross is mostly requests the NETWORK could
- * not route (a GET that dead-ends is recorded here), it is non-zero on every
- * healthy node, and it used to render a red "0" on a node with no failures at
- * all. The status card above declines to colour the same counter for the same
- * reason (#5370); the cross already says which number this is. */
+/* Not red, for any operation type. This is a lifetime count with no rate
+ * behind it, so colour cannot distinguish one failure a week ago from every
+ * request failing now, and it rendered a red "0" on a node with no failures
+ * at all. For GET it is mostly requests the NETWORK could not route, which
+ * the status card above declines to colour for the same reason (#5370). The
+ * cross already says which number this is; the numbers say how it is going. */
 .op-fail {
   color: var(--text-secondary);
   font-weight: 600;
@@ -1529,9 +1530,8 @@ table.sortable thead th.sort-desc::after {
  * because three flat rows of identical tiles gave no clue which mattered. The
  * fill is coloured only when the state is worth attention, and what counts
  * depends on the axis: a cache ceiling (contract state, contract slots) is
- * meant to sit at 100% and stays neutral until it is OVER; the disk limit
- * warns as it fills, because filling it refuses writes. See `CeilingKind` in
- * cards.rs. */
+ * meant to run full and is never coloured; the disk limit warns as it fills,
+ * because filling it refuses writes. See `CeilingKind` in cards.rs. */
 .hz-binding {
   margin: 0 0.9rem 0.7rem;
 }
@@ -1544,9 +1544,11 @@ table.sortable thead th.sort-desc::after {
   color: var(--text-primary, #e6edf3);
   font-weight: 600;
 }
+/* `--text-secondary`, not `--text-muted`: this sentence carries the meaning
+ * the bar's colour used to, so it has to be comfortably readable. */
 .hz-binding-note {
   font-size: 0.78rem;
-  color: var(--text-muted, #8b949e);
+  color: var(--text-secondary, #8b949e);
   margin-top: 0.3rem;
 }
 .hz-bar {
@@ -1583,7 +1585,7 @@ table.sortable thead th.sort-desc::after {
  * lost". */
 .hz-next {
   background: rgba(139, 148, 158, 0.16);
-  color: var(--text-muted, #8b949e);
+  color: var(--text-secondary, #8b949e);
 }
 
 /* Denominator in the empty-state verdict ("3/30"). Smaller than the

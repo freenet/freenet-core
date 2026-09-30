@@ -1402,23 +1402,31 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
 ///
 /// The "Closest limit" strip used to colour every axis from utilisation alone
 /// (amber from 75%, red from 90%). That is right for a limit you are supposed
-/// to stay under and wrong for a cache, which is supposed to be full: the
-/// eviction sweep trims back TO the budget and stops (`evict_over_budget`
-/// breaks as soon as both axes are at or under it), so a busy node rests at
-/// "508 of 508 (100%)" indefinitely. The strip was therefore permanently red
-/// on exactly the peers doing the most useful work, and red reads as "broken".
+/// to stay under and wrong for a cache, which is supposed to be full. So the
+/// strip was permanently red on exactly the peers doing the most useful work,
+/// and red reads as "broken".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CeilingKind {
-    /// A cache ceiling (contract state bytes, contract slots). Full is the
-    /// steady state; only being OVER it is noteworthy, and that resolves by
-    /// evicting the least-demanded contracts.
+    /// A cache ceiling (contract state bytes, contract slots). Never coloured,
+    /// at any utilisation, because both "full" and "a little over" are how a
+    /// busy node normally runs:
+    ///
+    /// - contract state is trimmed back under its budget on every insert, so
+    ///   it rests just below 100%;
+    /// - contract slots are trimmed only after the ceiling has been exceeded
+    ///   for ~2.5 minutes, so a node with contracts still arriving sits a few
+    ///   over, trims to exactly N of N, and goes over again.
+    ///
+    /// Being over is the eviction sweep's trigger, not a fault, and the sweep
+    /// can always make progress (a subscribed contract is shed as a last
+    /// resort). The strip says what is happening in words instead.
     Cache,
     /// An admission limit (disk). Reaching it refuses new writes, so
     /// approaching it is a real warning.
     Admission,
 }
 
-/// How the strip's bar is coloured. Ordered by severity.
+/// How the strip's bar is coloured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LimitTone {
     Neutral,
@@ -1436,14 +1444,11 @@ impl LimitTone {
     }
 }
 
-/// Displayed percentage from which an [`CeilingKind::Admission`] axis turns
-/// amber, and from which a [`CeilingKind::Cache`] axis gets its "full is
-/// normal" note.
+/// Displayed percentage from which a [`CeilingKind::Admission`] axis turns amber.
 const LIMIT_WARN_PCT: f64 = 75.0;
-/// Displayed percentage from which an [`CeilingKind::Admission`] axis turns red.
+/// Displayed percentage from which a [`CeilingKind::Admission`] axis turns red.
 const LIMIT_DANGER_PCT: f64 = 90.0;
-/// A ceiling is exactly met at this displayed percentage; above it the axis is
-/// over its limit.
+/// A ceiling is met at this displayed percentage.
 const LIMIT_FULL_PCT: f64 = 100.0;
 
 /// One of the hosting card's independent ceilings, as ranked and rendered by
@@ -1462,35 +1467,31 @@ struct LimitAxis {
 }
 
 impl LimitAxis {
-    /// The percentage as PRINTED. Every threshold below is taken on this, not
-    /// on the raw ratio: colouring from the raw value while printing a rounded
+    /// The percentage as PRINTED. Colour thresholds are taken on this, not on
+    /// the raw ratio: colouring from the raw value while printing a rounded
     /// one makes the two disagree at a boundary (89.6% prints as "90%" but
     /// would colour as 89), and an operator cannot tell a red 90% from an
     /// amber 90%.
     ///
-    /// Not clamped. Over budget is a real, reachable state: exceeding the
-    /// contract-state budget is the eviction trigger itself, and the slot axis
-    /// sits over its ceiling for the whole ~2.5 min sustained window before
-    /// anything is shed. Clamping rendered that as "150 of 100 (100%)", which
-    /// contradicts itself and hides how far over the node is.
+    /// Not clamped. Over budget is a real, reachable state, and clamping
+    /// rendered it as "150 of 100 (100%)", which contradicts itself and hides
+    /// how far over the node is.
     fn shown_pct(&self) -> f64 {
         (self.utilisation * 100.0).round()
     }
 
+    /// Strictly over the limit, judged on the raw ratio so it always agrees
+    /// with the detail text: "509 of 508" is over even though it prints as
+    /// "(100%)".
+    fn is_over(&self) -> bool {
+        self.utilisation > 1.0
+    }
+
     fn tone(&self) -> LimitTone {
-        let shown = self.shown_pct();
         match self.kind {
-            // A cache is meant to run full, so nothing up to and including
-            // 100% is coloured. Over the limit is amber rather than red: it is
-            // the sweep's trigger, not a fault, and it resolves itself.
-            CeilingKind::Cache => {
-                if shown > LIMIT_FULL_PCT {
-                    LimitTone::Warn
-                } else {
-                    LimitTone::Neutral
-                }
-            }
+            CeilingKind::Cache => LimitTone::Neutral,
             CeilingKind::Admission => {
+                let shown = self.shown_pct();
                 if shown >= LIMIT_DANGER_PCT {
                     LimitTone::Danger
                 } else if shown >= LIMIT_WARN_PCT {
@@ -1505,14 +1506,16 @@ impl LimitAxis {
     /// The sentence shown under the bar, if the axis is in a state a reader
     /// would otherwise have to interpret for themselves.
     fn note(&self) -> Option<&'static str> {
-        let shown = self.shown_pct();
-        if shown > LIMIT_FULL_PCT {
+        if self.is_over() {
             return Some(self.over_note);
         }
+        let shown = self.shown_pct();
         match self.kind {
             // Say it in words as well as by the absence of colour: a full bar
             // under the heading "Closest limit" still looks like a problem.
-            CeilingKind::Cache if shown >= LIMIT_WARN_PCT => Some(
+            // Only when it actually prints as full, so the sentence is never
+            // attached to a bar that visibly has room.
+            CeilingKind::Cache if shown >= LIMIT_FULL_PCT => Some(
                 "Full is normal here: the node keeps as many contracts as fit and \
                  evicts the least-demanded to make room.",
             ),
@@ -1638,7 +1641,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                 format_bytes(h.budget_bytes)
             ),
             tooltip: "Crossing this triggers an eviction sweep.",
-            over_note: "Over the limit, so the node is evicting its least-demanded contracts.",
+            over_note: "Over the limit, which is how eviction is triggered: the node is \
+             shedding its least-demanded contracts to get back under.",
         });
     }
     if let (Some(used), Some(disk_budget)) = (h.disk_total_bytes, h.disk_budget_bytes) {
@@ -1666,8 +1670,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             detail: format!("{} of {}", h.contract_count, h.contract_slot_budget),
             tooltip: "Crossing this triggers a sweep only if it stays over for a few minutes, \
              so a brief spike here resolves on its own.",
-            over_note: "Over the limit. If it stays over for a few minutes the node evicts \
-             its least-demanded contracts.",
+            over_note: "A little over is normal while new contracts arrive. If it stays \
+             over for a few minutes the node evicts its least-demanded contracts.",
         });
     }
     // Cost pressure (#4861) is deliberately absent: it is a sustained-rate
@@ -1675,9 +1679,9 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // has no comparable denominator to rank against these three.
     //
     // The closest axis is always shown. Any OTHER axis that is in a warning
-    // state is shown as well: now that a full cache renders neutral, a full
-    // slot ceiling would otherwise outrank — and hide — a disk at 95%, which
-    // is the one axis here where nearly-full is a real problem.
+    // state is shown as well: a cache axis renders neutral however full it is,
+    // so a full slot ceiling would otherwise outrank — and hide — a disk at
+    // 95%, which is the one axis here where nearly-full is a real problem.
     axes.sort_by(|a, b| b.utilisation.total_cmp(&a.utilisation));
     let binding: String = axes
         .iter()
@@ -1686,6 +1690,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         .map(|(i, axis)| {
             let lead = if i == 0 {
                 "Closest limit"
+            } else if axis.is_over() {
+                "Also over its limit"
             } else {
                 "Also near its limit"
             };
