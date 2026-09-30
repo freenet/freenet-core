@@ -1276,6 +1276,10 @@ resolve_expected_latest() {
 #        302, so a changed redirect shape is what a stranded fleet looks like
 #        from here. Only a connect-class failure buys the quiet path -- the same
 #        rule `gate_b_unverified_class` applies to the node's own fetch failures.
+#      - GitHub named the release, then stopped producing a tag before the
+#        streak completed, while the runner could connect: same reading.
+#   75 GitHub named the release and then the runner lost its connection before
+#      the streak completed (connect check failed after every failed probe).
 #   75 No probe produced a tag AND the connect check failed after EVERY failed
 #      probe, so the runner could not connect for the whole wait. Checked per
 #      probe, not once at the end: a wait of 429s ending in one connect blip
@@ -1332,6 +1336,18 @@ wait_for_release_to_be_latest() {
       return 1
     fi
     fail "UNVERIFIED (ENVIRONMENTAL): no probe of $RELEASES_LATEST_URL produced a release tag in ${waited}s ($probes probe(s)), and after every one of them this runner also failed to connect to it, so it could not confirm that GitHub reports v$expected as latest, and the canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
+    return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+  fi
+  # GitHub DID name the release, but the streak never completed. A stale answer
+  # after it would have made `last_seen` stale, so the probes after the last
+  # sighting FAILED -- and that is what to classify, exactly as above. Reporting
+  # "never reported vX" here would contradict the tag it just printed.
+  if [ "$last_seen" = "$expected" ]; then
+    if [ "$connected" -eq 1 ]; then
+      fail "GitHub began reporting v$expected as latest, but $RELEASES_LATEST_URL then stopped answering with a release redirect before $CANARY_LATEST_CONFIRMATIONS consecutive answers ($answered answer(s) from $probes probe(s) in ${waited}s), while THIS RUNNER could still connect to it. Most likely the endpoint started returning an error or a non-redirect. The canary node was NOT started, so this is not a verdict on the updater. Check the endpoint by hand: curl -sI $RELEASES_LATEST_URL"
+      return 1
+    fi
+    fail "UNVERIFIED (ENVIRONMENTAL): GitHub began reporting v$expected as latest, but this runner then lost its connection to $RELEASES_LATEST_URL before $CANARY_LATEST_CONFIRMATIONS consecutive answers ($answered answer(s) from $probes probe(s) in ${waited}s), and failed to connect after every failed probe. The canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
     return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
   fi
   fail "GitHub never reported v$expected as latest within ${waited}s: $RELEASES_LATEST_URL last named '${last_seen}' ($answered answer(s) from $probes probe(s)). The canary node was NOT started, so this is not a verdict on the updater -- but it is not a propagation blip either: publication lag has measured under a minute. Until GitHub reports v$expected as latest, NO node can auto-update to it. Check that the release is published, is not a prerelease, and is marked latest."

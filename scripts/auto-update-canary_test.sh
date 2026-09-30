@@ -1107,6 +1107,13 @@ wait_case "a flap back to the old tag resets the streak" 0 5 "" \
     0.2.122 0.2.121 0.2.122
 wait_case "a probe with no answer resets the streak too" 0 5 "" \
     0.2.122 FAIL 0.2.122
+# Partial confirmation, then failures: GitHub DID name the release, so the
+# message must not say it never did. Classified by the connect checks like the
+# no-answer case (codex round 2).
+WAIT_CASE_BUDGET=1 wait_case "served once, then connect-class failures -> 75" 75 "" \
+    "GitHub began reporting v0.2.122 as latest, but this runner then lost its connection" 0.2.122 FAIL
+WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "served once, then non-redirect answers -> 1, loud" 1 "" \
+    "GitHub began reporting v0.2.122 as latest, but https://github.com/freenet/freenet-core/releases/latest then stopped answering" 0.2.122 FAIL
 # A 1s budget with 1s polls: two probes, then the deadline.
 WAIT_CASE_BUDGET=1 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
     "GitHub never reported v0.2.122 as latest within " 0.2.121
