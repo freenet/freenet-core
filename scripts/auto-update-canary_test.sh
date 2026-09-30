@@ -1077,13 +1077,17 @@ wait_case() {
             if [[ "$n" -le "$#" ]]; then r="${!n}"; else r="${!#}"; fi
             [[ "$r" == yes ]]
         }
-        # Cases that expect success never reach the budget, so their 1s polls
-        # are skipped. Cases that set a budget must spend it on the real clock
-        # (`SECONDS`), so they keep the real `sleep` -- a no-op there would spin
-        # the loop thousands of times inside that one second.
-        if [[ -z "${WAIT_CASE_BUDGET:-}" ]]; then
-            sleep() { :; }
-        fi
+        # FAKE TIME. `sleep` advances bash's `SECONDS` (assigning it rebases
+        # the counter) instead of sleeping, so the loop's deadline arithmetic
+        # runs for real and instantly. A real `sleep` against a 1s budget made
+        # the probe count -- and with it which branch the wait ended in --
+        # depend on where in a wall-clock second the case started: measured at
+        # about 1% per case under load. A real second can still tick during a
+        # case, which costs at most one probe, so every case below that ends by
+        # the budget gets enough of it (10 polls) for one probe fewer not to
+        # change its outcome. It also still sees WHICH variable is slept on:
+        # sleeping the budget instead of the poll interval gives 2 probes, not 11.
+        sleep() { SECONDS=$(( SECONDS + $1 )); }
         resolve_expected_latest() {
             local n a
             n=$(( $(wc -l < "$counter") + 1 ))
@@ -1131,23 +1135,38 @@ wait_case "a flap back to the old tag resets the streak" 0 5 "" \
     0.2.122 0.2.121 0.2.122
 wait_case "a probe with no answer resets the streak too" 0 5 "" \
     0.2.122 FAIL 0.2.122
-# Partial confirmation, then failures: GitHub DID name the release, so the
-# message must not say it never did. Classified by the connect checks like the
-# no-answer case (codex round 2).
-WAIT_CASE_BUDGET=1 wait_case "served once, then connect-class failures -> 75" 75 "" \
-    "GitHub began reporting v0.2.122 as latest, but this runner then lost its connection" 0.2.122 FAIL
-WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "served once, then non-redirect answers -> 1, loud" 1 "" \
-    "GitHub began reporting v0.2.122 as latest, but https://github.com/freenet/freenet-core/releases/latest then stopped answering" 0.2.122 FAIL
-# A 1s budget with 1s polls: two probes, then the deadline.
-WAIT_CASE_BUDGET=1 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
+# The wait ENDED ON FAILURES after GitHub had answered: classified by the
+# connect checks of that trailing run, exactly like the no-answer case.
+WAIT_CASE_BUDGET=10 wait_case "served once, then connect-class failures -> 75" 75 "" \
+    "releases/latest last named '0.2.122', then this runner lost its connection to it" 0.2.122 FAIL
+WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE=yes wait_case "served once, then non-redirect answers -> 1, loud" 1 "" \
+    "releases/latest last named '0.2.122', then answered none of the last" 0.2.122 FAIL
+WAIT_CASE_BUDGET=10 wait_case "stale, then connect-class failures -> 75" 75 "" \
+    "releases/latest last named '0.2.121', then this runner lost its connection to it" 0.2.121 FAIL
+# The wait ENDED ON AN ANSWER: never quiet, whatever came before. The round-2
+# version read "served, streak incomplete" as "the probes after it failed" and
+# returned 75 with no failed probe and no connect check at all (round-3 review).
+WAIT_CASE_BUDGET=10 wait_case "budget runs out mid-streak with no failures -> loud, never 75" 1 "" \
+    "answer(s) from https://github.com/freenet/freenet-core/releases/latest named it, but earlier ones did not" \
+    0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.121 0.2.122
+# Flapping for the whole budget, both parities: which tag came last must not
+# decide whether the gate is quiet.
+WAIT_CASE_BUDGET=10 wait_case "flapping throughout, ending either way (a) -> loud, never 75" 1 "" "" \
+    0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121
+WAIT_CASE_BUDGET=10 wait_case "flapping throughout, ending either way (b) -> loud, never 75" 1 "" "" \
+    0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122 0.2.121 0.2.122
+# An outage GitHub then answered through says nothing about how the wait ended.
+WAIT_CASE_BUDGET=10 wait_case "an early outage followed by stale answers -> loud, not 75" 1 "" \
+    "GitHub never reported v0.2.122 as latest within " FAIL FAIL 0.2.121
+WAIT_CASE_BUDGET=10 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
     "GitHub never reported v0.2.122 as latest within " 0.2.121
 # Lag only ever serves an OLDER tag, so a newer one is final: fail on the first
 # probe instead of spending the whole budget on an answer that cannot change.
 wait_case "a NEWER tag fails at once -> 1, after one probe" 1 1 \
     "GitHub reports a NEWER release than the one this run was asked to verify: https://github.com/freenet/freenet-core/releases/latest names '0.2.123'" 0.2.123
-WAIT_CASE_BUDGET=1 wait_case "no tag on any probe, runner cannot connect -> 75, environmental" 75 "" \
+WAIT_CASE_BUDGET=10 wait_case "no tag on any probe, runner cannot connect -> 75, environmental" 75 "" \
     "UNVERIFIED (ENVIRONMENTAL): no probe of" FAIL
-WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runner CAN connect -> 1, loud" 1 "" \
+WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runner CAN connect -> 1, loud" 1 "" \
     "yet THIS RUNNER could connect to it during the wait" FAIL
 # The connect check is per failed probe, not one call at the end. The runner
 # fails to connect after the first probe, connects after the second (so the
@@ -1155,14 +1174,14 @@ WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runne
 # would see only a single "no" and go quiet; per probe, the "yes" keeps it loud.
 # (An earlier version scripted "yes no", which a once-at-the-end mutation also
 # passed: its single call consumed the "yes".)
-WAIT_CASE_BUDGET=2 WAIT_CASE_REACHABLE="no yes no" wait_case "connected on one probe mid-wait -> still loud" 1 "" \
+WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE="no yes no" wait_case "connected on one probe mid-wait -> still loud" 1 "" \
     "yet THIS RUNNER could connect to it during the wait" FAIL
 # The CADENCE. Every case above either stubs `sleep` or sets poll == budget, so
 # swapping the poll interval for the budget in the loop's `sleep` left them all
 # green -- and in production that is one probe per 300s budget, which fails
-# every release whose publication lag is longer than zero. Poll 1s against a 3s
-# budget is 4 probes; a 3s cadence would be 2.
-WAIT_CASE_BUDGET=3 WAIT_CASE_POLL=1 wait_case "polls at the poll interval, not the budget" 1 ">=3" \
+# every release whose publication lag is longer than zero. Poll 1s against a 10s
+# budget is 11 probes (10 if a real second ticks); a 10s cadence would be 2.
+WAIT_CASE_BUDGET=10 WAIT_CASE_POLL=1 wait_case "polls at the poll interval, not the budget" 1 ">=9" \
     "GitHub never reported v0.2.122 as latest" 0.2.121
 
 # --- Gate A END TO END, driven per attempt ----------------------------------
