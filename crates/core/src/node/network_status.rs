@@ -347,7 +347,10 @@ pub struct NetworkStatus {
     /// firewalled node whose one gateway link flaps stay "still joining"
     /// forever. It is restarted only if the node then stays disconnected for
     /// longer than the grace itself (see [`Self::gateway_only_outage_since`]),
-    /// so a laptop waking from a long sleep is treated as joining afresh.
+    /// so a node that has been offline for a long stretch is treated as
+    /// joining afresh. (Time spent suspended does not count: `Instant` is a
+    /// monotonic clock that stops during sleep, so what is measured is the
+    /// disconnected time while awake.)
     pub gateway_only_since: Option<Instant>,
     /// When the node dropped to zero connections while
     /// [`Self::gateway_only_since`] was set. `None` while connected.
@@ -3185,7 +3188,8 @@ mod tests {
     /// A real reconnect is a disconnect followed by a connect. It must not
     /// restart the grace, or a firewalled node whose one gateway link flaps
     /// would be "still joining" forever; but an outage longer than the grace
-    /// is a fresh start, so a laptop waking from sleep is not warned at once.
+    /// is a fresh start, so a node back from a long time offline is not warned
+    /// at once.
     #[test]
     fn gateway_only_grace_survives_a_reconnect_but_not_a_long_outage() {
         let _lock = TEST_MUTEX.lock().unwrap();
@@ -3248,7 +3252,59 @@ mod tests {
         );
         assert!(persisting(back + secs(GATEWAY_ONLY_GRACE_SECS)));
 
-        set_gateway_connected(false, back + secs(500));
+        // The outage boundary: exactly the grace counts as long, one second
+        // less does not.
+        let reset_to_gateway_only_at = |at: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            drop(s);
+            set_gateway_connected(true, at);
+        };
+        let t1 = back + secs(1_000);
+        reset_to_gateway_only_at(t1);
+        set_gateway_connected(false, t1 + secs(10));
+        set_gateway_connected(true, t1 + secs(10 + GATEWAY_ONLY_GRACE_SECS - 1));
+        assert!(
+            persisting(t1 + secs(GATEWAY_ONLY_GRACE_SECS)),
+            "an outage one second short of the grace is a reconnect, not a fresh start"
+        );
+        let t2 = t1 + secs(1_000);
+        reset_to_gateway_only_at(t2);
+        set_gateway_connected(false, t2 + secs(10));
+        let back2 = t2 + secs(10 + GATEWAY_ONLY_GRACE_SECS);
+        set_gateway_connected(true, back2);
+        assert!(
+            !persisting(back2 + secs(GATEWAY_ONLY_GRACE_SECS - 1)),
+            "an outage of exactly the grace is a fresh start"
+        );
+
+        // Gateway-only, then a peer, then nothing, then gateway-only again: the
+        // peer ended the old spell, so the new one starts at the reconnect.
+        let t3 = t2 + secs(1_000);
+        reset_to_gateway_only_at(t3);
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.push(ConnectedPeer {
+                address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 1),
+                is_gateway: false,
+                location: None,
+                connected_since: t3 + secs(20),
+                peer_key_location: None,
+            });
+            s.refresh_gateway_only_since(t3 + secs(20));
+            assert!(s.gateway_only_since.is_none());
+        }
+        set_gateway_connected(false, t3 + secs(30));
+        assert!(
+            status.read().unwrap().gateway_only_outage_since.is_none(),
+            "an outage with no gateway-only spell running has nothing to time"
+        );
+        set_gateway_connected(true, t3 + secs(40));
+        assert!(!persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS - 1)));
+        assert!(persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS)));
+
+        set_gateway_connected(false, t3 + secs(500));
         let mut s = status.write().unwrap();
         s.gateway_only_since = None;
         s.gateway_only_outage_since = None;
