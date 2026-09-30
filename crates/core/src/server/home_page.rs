@@ -258,6 +258,7 @@ mod tests {
             op_stats: OpStatsSnapshot::default(),
             nat_stats: NatStatsSnapshot::default(),
             gateway_only: false,
+            gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
@@ -599,6 +600,7 @@ mod tests {
         let mut snap = base_snapshot();
         snap.health = HealthLevel::Degraded;
         snap.gateway_only = true;
+        snap.gateway_only_persisting = true;
         snap.open_connections = 1;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-degraded"), "degraded banner missing");
@@ -2641,10 +2643,13 @@ mod tests {
             "the state tooltip must name the operator override and the disk-budget \
              floor, not just the RAM-scaled default — got:\n{html}"
         );
-        // Non-zero recently-read evictions are the miscalibration alarm: colored.
+        // A non-zero "evicted w/ demand" count is NOT coloured. It is a
+        // lifetime counter that any node running at its ceiling accumulates,
+        // so colouring it on `> 0` kept the tile red on a healthy peer. (This
+        // fixture has a non-zero count; the assertion used to demand red.)
         assert!(
-            html.contains("var(--danger"),
-            "recently-read eviction count should be highlighted — got:\n{html}"
+            !html.contains("var(--danger") && !html.contains("var(--warn"),
+            "a lifetime eviction count must not be styled as an alarm — got:\n{html}"
         );
         // The next-to-evict badge attaches to the first eligible row.
         let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
@@ -3433,6 +3438,159 @@ mod tests {
             !html.contains("contract slots</strong>"),
             "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
+    }
+
+    // ─── Normal states must not be styled as alarms ────────────────────
+    //
+    // Each of these pins a state that every healthy node passes through, or
+    // rests in, and that the dashboard used to present in warning colours.
+    // SCOPE: they assert emitted markup and stylesheet text. They do not load
+    // a browser, so they cannot see a colour applied by some other rule.
+
+    /// A node that has just joined is connected only to a gateway. That is
+    /// the first step of joining, not a firewall fault.
+    #[test]
+    fn status_card_does_not_diagnose_a_firewall_while_still_joining() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only = true;
+        snap.gateway_only_persisting = false;
+        snap.health = HealthLevel::Healthy;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            !html.contains("Firewall likely blocking"),
+            "gateway-only within the joining grace is not a firewall diagnosis — got:\n{html}"
+        );
+        assert!(
+            !html.contains("health-degraded") && !html.contains("Only connected to gateways"),
+            "no degraded banner while still joining — got:\n{html}"
+        );
+
+        // Once it has persisted, the warning is real and must still appear.
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only = true;
+        snap.gateway_only_persisting = true;
+        snap.health = HealthLevel::Degraded;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Firewall likely blocking")
+                && html.contains("Only connected to gateways"),
+            "a persisting gateway-only state must still warn — got:\n{html}"
+        );
+    }
+
+    /// One failed hole-punch is not a blocked port. Single attempts fail
+    /// routinely; the verdict needs a sample.
+    #[test]
+    fn nat_line_gives_no_verdict_on_a_handful_of_attempts() {
+        use crate::node::network_status::NAT_MIN_ATTEMPTS_FOR_VERDICT;
+        let card = |attempts: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.health = HealthLevel::Healthy;
+            snap.nat_stats.attempts = attempts;
+            snap.nat_stats.successes = 0;
+            snap.nat_stats.recent_attempts = attempts;
+            snap.nat_stats.recent_successes = 0;
+            build_status_card(&Some(snap))
+        };
+
+        for attempts in [1, NAT_MIN_ATTEMPTS_FOR_VERDICT - 1] {
+            let html = card(attempts);
+            assert!(
+                html.contains(&format!("0/{attempts} successful")),
+                "the counts are facts and must still be shown — got:\n{html}"
+            );
+            for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+                assert!(
+                    !html.contains(alarm),
+                    "{attempts} failed attempt(s) must not render {alarm:?} — got:\n{html}"
+                );
+            }
+        }
+
+        let html = card(NAT_MIN_ATTEMPTS_FOR_VERDICT);
+        for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+            assert!(
+                html.contains(alarm),
+                "every attempt failing over a real sample must still render {alarm:?} — got:\n{html}"
+            );
+        }
+    }
+
+    /// The favicon and tab title share the NAT verdict, so they share its
+    /// sample floor.
+    #[test]
+    fn favicon_and_title_give_no_nat_verdict_on_one_attempt() {
+        let mut snap = base_snapshot();
+        snap.nat_stats.attempts = 1;
+        snap.nat_stats.successes = 0;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(
+            !uri.contains("%238b0000"),
+            "one failed NAT attempt must not turn the favicon dark red — got: {uri}"
+        );
+        let mut snap = base_snapshot();
+        snap.nat_stats.attempts = 1;
+        snap.nat_stats.successes = 0;
+        assert_eq!(
+            build_dashboard_title(&Some(snap)),
+            "\u{26A1} Dashboard",
+            "one failed NAT attempt is still 'connecting', not a warning"
+        );
+    }
+
+    /// The declarations of one top-level rule in the dashboard stylesheet.
+    /// Anchored at the start of a line so a selector that merely CONTAINS
+    /// `selector` (`[data-theme='light'] .op-fail`) is not mistaken for it, and
+    /// a missing rule fails loudly rather than matching something else.
+    fn css_rule(selector: &str) -> &'static str {
+        let css = include_str!("home_page/assets/style.css");
+        let open = format!("\n{selector} {{");
+        let start = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("style.css has no top-level `{selector}` rule"))
+            + open.len();
+        let len = css[start..].find('}').expect("rule is closed");
+        &css[start..start + len]
+    }
+
+    /// Colours the dashboard uses to mean "something is wrong".
+    const ALARM_COLOURS: [&str; 7] = [
+        "#f87171", "#dc2626", "#ff6b6b", "#b3261e", "#ff8a3d", "--danger", "--warn",
+    ];
+
+    /// The operations card's failure count is mostly requests the network
+    /// could not route, is non-zero on every healthy node, and rendered a red
+    /// "0" on a node with none. The cross identifies it; red mis-describes it.
+    #[test]
+    fn operation_failure_count_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".op-fail");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.op-fail` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
+        let css = include_str!("home_page/assets/style.css");
+        assert!(
+            !css.contains("[data-theme='light'] .op-fail"),
+            "no per-theme override may put the alarm colour back on `.op-fail`"
+        );
+    }
+
+    /// "Next to evict" marks a position in an ordering and is present on any
+    /// node hosting anything, including one far under budget.
+    #[test]
+    fn next_to_evict_badge_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".hz-next");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.hz-next` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
     }
 
     // ─── Long-table filter controls ────────────────────────────────

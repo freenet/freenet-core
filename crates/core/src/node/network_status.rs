@@ -1776,7 +1776,16 @@ pub struct NetworkStatusSnapshot {
     pub op_stats: OpStatsSnapshot,
     pub nat_stats: NatStatsSnapshot,
     /// True if all connections are to gateways (no peer-to-peer connections).
+    ///
+    /// A plain fact, and true of every node for a while after it joins: a
+    /// node's first connection is always a gateway. Whether that is worth a
+    /// warning is [`Self::gateway_only_persisting`].
     pub gateway_only: bool,
+    /// [`Self::gateway_only`] has held for longer than
+    /// [`GATEWAY_ONLY_GRACE_SECS`], so it is no longer just a node that has
+    /// not finished joining. This, not the raw flag, is what the dashboard
+    /// warns on.
+    pub gateway_only_persisting: bool,
     /// Cumulative bytes uploaded (lifetime, never reset).
     pub bytes_uploaded: u64,
     /// Cumulative bytes downloaded (lifetime, never reset).
@@ -1990,7 +1999,8 @@ pub struct NetworkNorms {
 pub enum HealthLevel {
     /// Node has peer-to-peer connections and things are working.
     Healthy,
-    /// Connected but degraded (gateway-only, or all NAT attempts failing).
+    /// Connected but degraded: still gateway-only after the joining grace
+    /// period, or every NAT attempt failing over a meaningful sample.
     Degraded,
     /// Still trying to establish connections.
     Connecting,
@@ -2204,6 +2214,41 @@ pub struct NatStatsSnapshot {
     pub recent_successes: u32,
 }
 
+/// NAT traversal attempts needed before "every one failed" is read as a
+/// blocked port.
+///
+/// Individual hole-punch attempts fail routinely on a healthy node (the
+/// failure list on the same page labels them "normal"), so a node whose first
+/// attempt or two happened to fail used to be told, in red, "0/1 successful —
+/// Port may be blocked". Below this the counts are shown without a verdict.
+pub const NAT_MIN_ATTEMPTS_FOR_VERDICT: u32 = 5;
+
+/// How long a node may be connected only to gateways before the dashboard
+/// treats it as a reachability problem rather than a node still joining.
+///
+/// Every node is gateway-only from its first connection until its first
+/// peer-to-peer one, and with no grace the dashboard greeted every fresh start
+/// with an amber banner and "Firewall likely blocking incoming connections".
+/// Measured from the oldest current connection rather than from process
+/// start, so a node that lost everything and reconnected (a laptop waking up)
+/// gets the same grace as one that just started.
+pub const GATEWAY_ONLY_GRACE_SECS: u64 = 120;
+
+impl NatStatsSnapshot {
+    /// Every NAT traversal attempt has failed, over enough attempts for that
+    /// to mean something. The one place this judgement is made: the health
+    /// level, the status card, the favicon and the tab title all read it.
+    pub fn looks_blocked(&self) -> bool {
+        self.attempts >= NAT_MIN_ATTEMPTS_FOR_VERDICT && self.successes == 0
+    }
+}
+
+/// Whether a gateway-only node has been that way long enough to warn about.
+/// `oldest_connection_secs` is the age of the longest-lived current connection.
+fn gateway_only_is_persisting(gateway_only: bool, oldest_connection_secs: Option<u64>) -> bool {
+    gateway_only && oldest_connection_secs.is_some_and(|secs| secs >= GATEWAY_ONLY_GRACE_SECS)
+}
+
 /// Get a snapshot of the current network status for the dashboard.
 pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let status = NETWORK_STATUS.get()?;
@@ -2275,6 +2320,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
 
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
+    let gateway_only_persisting =
+        gateway_only_is_persisting(gateway_only, peers.iter().map(|p| p.connected_secs).max());
 
     // Read subscribed contracts from the registered provider, which in
     // production points at the canonical lease map in `HostingManager`.
@@ -2318,13 +2365,18 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         .gateway_failures
         .iter()
         .any(|f| matches!(f.reason, FailureReason::VersionMismatch { .. }));
-    let nat_all_failing = s.nat_stats.attempts > 0 && s.nat_stats.successes == 0;
+    let nat_stats = NatStatsSnapshot {
+        attempts: s.nat_stats.attempts,
+        successes: s.nat_stats.successes,
+        recent_attempts: s.nat_stats.recent_attempts(),
+        recent_successes: s.nat_stats.recent_successes(),
+    };
 
     let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
-    } else if gateway_only || nat_all_failing {
+    } else if gateway_only_persisting || nat_stats.looks_blocked() {
         HealthLevel::Degraded
     } else {
         HealthLevel::Healthy
@@ -2359,13 +2411,9 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             subscribes: s.op_stats.subscribes,
             updates_received: s.op_stats.updates_received,
         },
-        nat_stats: NatStatsSnapshot {
-            attempts: s.nat_stats.attempts,
-            successes: s.nat_stats.successes,
-            recent_attempts: s.nat_stats.recent_attempts(),
-            recent_successes: s.nat_stats.recent_successes(),
-        },
+        nat_stats,
         gateway_only,
+        gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
         health,
@@ -2964,6 +3012,111 @@ mod tests {
         assert!(snap.contracts.is_empty());
 
         clear_subscription_provider();
+    }
+
+    /// A node that has just connected to its first gateway is joining, not
+    /// degraded. Only once that state has outlasted the grace period is it a
+    /// reachability problem.
+    #[test]
+    fn gateway_only_is_degraded_only_after_the_joining_grace() {
+        assert!(!gateway_only_is_persisting(false, Some(10_000)));
+        assert!(!gateway_only_is_persisting(true, None));
+        assert!(!gateway_only_is_persisting(true, Some(0)));
+        assert!(!gateway_only_is_persisting(
+            true,
+            Some(GATEWAY_ONLY_GRACE_SECS - 1)
+        ));
+        assert!(gateway_only_is_persisting(
+            true,
+            Some(GATEWAY_ONLY_GRACE_SECS)
+        ));
+
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        init(31346, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        let connect_gateway = |connected_since: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+            s.connected_peers.push(ConnectedPeer {
+                address: gw_addr,
+                is_gateway: true,
+                location: Some(0.5),
+                connected_since,
+                peer_key_location: None,
+            });
+        };
+
+        // Freshly connected to a gateway: the fact is reported, the alarm is not.
+        connect_gateway(Instant::now());
+        let snap = get_snapshot().unwrap();
+        assert!(snap.gateway_only);
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Healthy);
+
+        // Still gateway-only well past the grace period: now it is a problem.
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5))
+            .expect("the monotonic clock is further than the grace period from its origin");
+        connect_gateway(long_ago);
+        let snap = get_snapshot().unwrap();
+        assert!(snap.gateway_only);
+        assert!(snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Degraded);
+
+        status.write().unwrap().connected_peers.clear();
+    }
+
+    /// Single NAT traversal attempts fail routinely, so a node is not
+    /// "degraded" until every attempt has failed over a real sample.
+    #[test]
+    fn nat_failures_degrade_health_only_over_a_real_sample() {
+        let blocked = |attempts, successes| {
+            NatStatsSnapshot {
+                attempts,
+                successes,
+                ..Default::default()
+            }
+            .looks_blocked()
+        };
+        assert!(!blocked(0, 0));
+        assert!(!blocked(1, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT - 1, 0));
+        assert!(blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT * 10, 1));
+
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 12345);
+        init(31347, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+            s.connected_peers.push(ConnectedPeer {
+                address: peer_addr,
+                is_gateway: false,
+                location: Some(0.3),
+                connected_since: Instant::now(),
+                peer_key_location: None,
+            });
+        }
+
+        record_nat_attempt(false);
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Healthy);
+
+        for _ in 1..NAT_MIN_ATTEMPTS_FOR_VERDICT {
+            record_nat_attempt(false);
+        }
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Degraded);
+
+        let mut s = status.write().unwrap();
+        s.connected_peers.clear();
+        s.nat_stats = NatStats::default();
     }
 
     #[test]

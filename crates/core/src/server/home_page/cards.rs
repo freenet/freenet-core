@@ -140,7 +140,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             )
         }
         network_status::HealthLevel::Degraded => {
-            let detail = if snap.gateway_only {
+            let detail = if snap.gateway_only_persisting {
                 "Only connected to gateways — no peer-to-peer connections yet"
             } else {
                 "Connected but NAT traversal is failing"
@@ -362,8 +362,11 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         ""
     };
 
-    // Gateway-only warning (only when not connected to any peers)
-    let gateway_warning = if snap.gateway_only {
+    // Gateway-only warning (only when not connected to any peers). Gated on
+    // the state having PERSISTED: every node is gateway-only for a while after
+    // it joins, and diagnosing a firewall fault on a node that simply has not
+    // finished connecting is a false alarm shown to every new user.
+    let gateway_warning = if snap.gateway_only_persisting {
         format!(
             r#"<div class="warning">
                 <strong>Firewall likely blocking incoming connections</strong> on UDP port <code>{port}</code>.
@@ -380,9 +383,11 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
 
     // NAT stats with rolling trend
     let nat_html = if snap.nat_stats.attempts > 0 {
-        let all_failed = snap.nat_stats.successes == 0;
+        // `looks_blocked`, not "no successes yet": single attempts fail
+        // routinely, so one or two failures are not a verdict on the port.
+        let all_failed = snap.nat_stats.looks_blocked();
         let class = if all_failed { " nat-fail" } else { "" };
-        let extra = if all_failed && !snap.gateway_only {
+        let extra = if all_failed && !snap.gateway_only_persisting {
             format!(
                 r#"<p class="nat-advice">All NAT traversal attempts have failed. Try forwarding UDP port <code>{}</code> on your router.</p>"#,
                 snap.listening_port
@@ -395,7 +400,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         let (recent, verdict) = if snap.nat_stats.recent_attempts > 0 {
             let rs = snap.nat_stats.recent_successes;
             let ra = snap.nat_stats.recent_attempts;
-            let verdict = if rs == 0 && snap.nat_stats.successes == 0 {
+            let verdict = if rs == 0 && all_failed {
                 r#" <span class="nat-verdict nat-verdict-bad">Port may be blocked</span>"#
                     .to_string()
             } else {
@@ -1688,17 +1693,15 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         })
         .collect();
 
-    // Recently-read evictions are the miscalibration alarm (#4338): evicting a
-    // repeatedly-requested contract means the demand estimate is mis-ordering
-    // the working set. Color it when non-zero so an operator notices.
-    let recently_read_value = if h.evictions_of_recently_read_total > 0 {
-        format!(
-            r#"<span style="color: var(--danger, #c0392b);">{}</span>"#,
-            h.evictions_of_recently_read_total
-        )
-    } else {
-        "0".to_string()
-    };
+    // Deliberately NOT coloured. This used to go red whenever it was non-zero,
+    // as "the miscalibration alarm (#4338)". But it is a lifetime counter that
+    // increments for any evicted contract read twice or more over its whole
+    // residency, however long ago — so on a node running at its ceiling it is
+    // non-zero after a while and stays that way, which made the tile
+    // permanently red on a healthy peer. The signal `HostingCacheStats`
+    // documents is a rising RATE against budget evictions, and a bare count
+    // cannot show a rate; the tile beside it gives the denominator.
+    let recently_read_value = h.evictions_of_recently_read_total.to_string();
 
     // Per-contract table, bounded. Rows arrive from the cache already sorted
     // ascending by `(recency_seq, key)` — so `recency_seq` is the column that
@@ -1881,7 +1884,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
+                    <div class="g-norm" title="Evictions of a contract that had been read at least twice while this node held it. A lifetime count since the node started, so it grows on any node running at its ceiling. It is only a concern if it is a large and rising share of budget evictions."><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
                 </div>
             </div>
             <div class="g-verdict-row">

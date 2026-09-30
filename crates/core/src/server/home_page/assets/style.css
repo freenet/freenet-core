@@ -605,8 +605,13 @@ code {
 .op-ok::before {
   content: '\2713 ';
 }
+/* Not red. The count beside the cross is mostly requests the NETWORK could
+ * not route (a GET that dead-ends is recorded here), it is non-zero on every
+ * healthy node, and it used to render a red "0" on a node with no failures at
+ * all. The status card above declines to colour the same counter for the same
+ * reason (#5370); the cross already says which number this is. */
 .op-fail {
-  color: #f87171;
+  color: var(--text-secondary);
   font-weight: 600;
   margin-left: 0.5rem;
 }
@@ -615,9 +620,6 @@ code {
 }
 [data-theme='light'] .op-ok {
   color: #059669;
-}
-[data-theme='light'] .op-fail {
-  color: #dc2626;
 }
 .op-count {
   color: var(--text-primary);
@@ -1575,9 +1577,13 @@ table.sortable thead th.sort-desc::after {
   font-weight: 500;
   vertical-align: middle;
 }
+/* Neutral on purpose. The badge marks a position in the eviction ORDER and is
+ * present on every node that hosts anything, including one far under budget
+ * where nothing is being evicted; in warning orange it read as "about to be
+ * lost". */
 .hz-next {
-  background: rgba(255, 138, 61, 0.2);
-  color: #ff8a3d;
+  background: rgba(139, 148, 158, 0.16);
+  color: var(--text-muted, #8b949e);
 }
 
 /* Denominator in the empty-state verdict ("3/30"). Smaller than the
