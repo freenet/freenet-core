@@ -1118,10 +1118,13 @@ WAIT_CASE_BUDGET=1 wait_case "no tag on any probe, runner cannot connect -> 75, 
     "UNVERIFIED (ENVIRONMENTAL): no probe of" FAIL
 WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runner CAN connect -> 1, loud" 1 "" \
     "yet THIS RUNNER could connect to it during the wait" FAIL
-# The connect check is per failed probe, not one call at the end. A wait of
-# 429s (runner connects fine) that ends in one connect blip must stay loud: a
-# single end-of-wait check would read the blip and go quiet.
-WAIT_CASE_BUDGET=2 WAIT_CASE_REACHABLE="yes no" wait_case "connected mid-wait, blip at the end -> still loud" 1 "" \
+# The connect check is per failed probe, not one call at the end. The runner
+# fails to connect after the first probe, connects after the second (so the
+# failures are HTTP-level, e.g. 429s), then blips again. One end-of-wait check
+# would see only a single "no" and go quiet; per probe, the "yes" keeps it loud.
+# (An earlier version scripted "yes no", which a once-at-the-end mutation also
+# passed: its single call consumed the "yes".)
+WAIT_CASE_BUDGET=2 WAIT_CASE_REACHABLE="no yes no" wait_case "connected on one probe mid-wait -> still loud" 1 "" \
     "yet THIS RUNNER could connect to it during the wait" FAIL
 # The CADENCE. Every case above either stubs `sleep` or sets poll == budget, so
 # swapping the poll interval for the budget in the loop's `sleep` left them all
