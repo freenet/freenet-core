@@ -605,8 +605,14 @@ code {
 .op-ok::before {
   content: '\2713 ';
 }
+/* Not red, for any operation type. This is a lifetime count with no rate
+ * behind it, so colour cannot distinguish one failure a week ago from every
+ * request failing now, and it rendered a red "0" on a node with no failures
+ * at all. For GET it is mostly requests the NETWORK could not route, which
+ * the status card above declines to colour for the same reason (#5370). The
+ * cross already says which number this is; the numbers say how it is going. */
 .op-fail {
-  color: #f87171;
+  color: var(--text-secondary);
   font-weight: 600;
   margin-left: 0.5rem;
 }
@@ -615,9 +621,6 @@ code {
 }
 [data-theme='light'] .op-ok {
   color: #059669;
-}
-[data-theme='light'] .op-fail {
-  color: #dc2626;
 }
 .op-count {
   color: var(--text-primary);
@@ -1525,7 +1528,10 @@ table.sortable thead th.sort-desc::after {
 /* "Closest limit" strip on the Demand-driven eviction card: the card shows
  * several independent ceilings and this names the one nearest to binding,
  * because three flat rows of identical tiles gave no clue which mattered. The
- * fill is coloured only above 75% so the strip is ignorable until it isn't. */
+ * fill is coloured only when the state is worth attention, and what counts
+ * depends on the axis: a cache ceiling (contract state, contract slots) is
+ * meant to run full and is never coloured; the disk limit warns as it fills,
+ * because filling it refuses writes. See `CeilingKind` in cards.rs. */
 .hz-binding {
   margin: 0 0.9rem 0.7rem;
 }
@@ -1537,6 +1543,13 @@ table.sortable thead th.sort-desc::after {
 .hz-binding-head strong {
   color: var(--text-primary, #e6edf3);
   font-weight: 600;
+}
+/* `--text-secondary`, not `--text-muted`: this sentence carries the meaning
+ * the bar's colour used to, so it has to be comfortably readable. */
+.hz-binding-note {
+  font-size: 0.78rem;
+  color: var(--text-secondary, #8b949e);
+  margin-top: 0.3rem;
 }
 .hz-bar {
   display: block;
@@ -1566,9 +1579,13 @@ table.sortable thead th.sort-desc::after {
   font-weight: 500;
   vertical-align: middle;
 }
+/* Neutral on purpose. The badge marks a position in the eviction ORDER and is
+ * present on every node that hosts anything, including one far under budget
+ * where nothing is being evicted; in warning orange it read as "about to be
+ * lost". */
 .hz-next {
-  background: rgba(255, 138, 61, 0.2);
-  color: #ff8a3d;
+  background: rgba(139, 148, 158, 0.16);
+  color: var(--text-secondary, #8b949e);
 }
 
 /* Denominator in the empty-state verdict ("3/30"). Smaller than the
