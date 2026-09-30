@@ -1392,6 +1392,151 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     )
 }
 
+/// What reaching a ceiling on the hosting card MEANS, which decides whether a
+/// full bar is worth an operator's attention.
+///
+/// The "Closest limit" strip used to colour every axis from utilisation alone
+/// (amber from 75%, red from 90%). That is right for a limit you are supposed
+/// to stay under and wrong for a cache, which is supposed to be full: the
+/// eviction sweep trims back TO the budget and stops (`evict_over_budget`
+/// breaks as soon as both axes are at or under it), so a busy node rests at
+/// "508 of 508 (100%)" indefinitely. The strip was therefore permanently red
+/// on exactly the peers doing the most useful work, and red reads as "broken".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeilingKind {
+    /// A cache ceiling (contract state bytes, contract slots). Full is the
+    /// steady state; only being OVER it is noteworthy, and that resolves by
+    /// evicting the least-demanded contracts.
+    Cache,
+    /// An admission limit (disk). Reaching it refuses new writes, so
+    /// approaching it is a real warning.
+    Admission,
+}
+
+/// How the strip's bar is coloured. Ordered by severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LimitTone {
+    Neutral,
+    Warn,
+    Danger,
+}
+
+impl LimitTone {
+    fn css_colour(self) -> &'static str {
+        match self {
+            LimitTone::Neutral => "var(--text-muted, #888)",
+            LimitTone::Warn => "var(--warn, #b8860b)",
+            LimitTone::Danger => "var(--danger, #c0392b)",
+        }
+    }
+}
+
+/// Displayed percentage from which an [`CeilingKind::Admission`] axis turns
+/// amber, and from which a [`CeilingKind::Cache`] axis gets its "full is
+/// normal" note.
+const LIMIT_WARN_PCT: f64 = 75.0;
+/// Displayed percentage from which an [`CeilingKind::Admission`] axis turns red.
+const LIMIT_DANGER_PCT: f64 = 90.0;
+/// A ceiling is exactly met at this displayed percentage; above it the axis is
+/// over its limit.
+const LIMIT_FULL_PCT: f64 = 100.0;
+
+/// One of the hosting card's independent ceilings, as ranked and rendered by
+/// the "Closest limit" strip.
+struct LimitAxis {
+    name: &'static str,
+    kind: CeilingKind,
+    /// `used / budget`, unclamped.
+    utilisation: f64,
+    /// The axis in its own units, e.g. "508 of 508".
+    detail: String,
+    /// Hover text: what crossing this ceiling does.
+    tooltip: &'static str,
+    /// Visible text shown when the axis is over its limit.
+    over_note: &'static str,
+}
+
+impl LimitAxis {
+    /// The percentage as PRINTED. Every threshold below is taken on this, not
+    /// on the raw ratio: colouring from the raw value while printing a rounded
+    /// one makes the two disagree at a boundary (89.6% prints as "90%" but
+    /// would colour as 89), and an operator cannot tell a red 90% from an
+    /// amber 90%.
+    ///
+    /// Not clamped. Over budget is a real, reachable state: exceeding the
+    /// contract-state budget is the eviction trigger itself, and the slot axis
+    /// sits over its ceiling for the whole ~2.5 min sustained window before
+    /// anything is shed. Clamping rendered that as "150 of 100 (100%)", which
+    /// contradicts itself and hides how far over the node is.
+    fn shown_pct(&self) -> f64 {
+        (self.utilisation * 100.0).round()
+    }
+
+    fn tone(&self) -> LimitTone {
+        let shown = self.shown_pct();
+        match self.kind {
+            // A cache is meant to run full, so nothing up to and including
+            // 100% is coloured. Over the limit is amber rather than red: it is
+            // the sweep's trigger, not a fault, and it resolves itself.
+            CeilingKind::Cache => {
+                if shown > LIMIT_FULL_PCT {
+                    LimitTone::Warn
+                } else {
+                    LimitTone::Neutral
+                }
+            }
+            CeilingKind::Admission => {
+                if shown >= LIMIT_DANGER_PCT {
+                    LimitTone::Danger
+                } else if shown >= LIMIT_WARN_PCT {
+                    LimitTone::Warn
+                } else {
+                    LimitTone::Neutral
+                }
+            }
+        }
+    }
+
+    /// The sentence shown under the bar, if the axis is in a state a reader
+    /// would otherwise have to interpret for themselves.
+    fn note(&self) -> Option<&'static str> {
+        let shown = self.shown_pct();
+        if shown > LIMIT_FULL_PCT {
+            return Some(self.over_note);
+        }
+        match self.kind {
+            // Say it in words as well as by the absence of colour: a full bar
+            // under the heading "Closest limit" still looks like a problem.
+            CeilingKind::Cache if shown >= LIMIT_WARN_PCT => Some(
+                "Full is normal here: the node keeps as many contracts as fit and \
+                 evicts the least-demanded to make room.",
+            ),
+            CeilingKind::Admission if shown >= LIMIT_DANGER_PCT => {
+                Some("New writes are refused once this is full.")
+            }
+            CeilingKind::Cache | CeilingKind::Admission => None,
+        }
+    }
+
+    fn render_strip(&self, lead: &str) -> String {
+        let shown = self.shown_pct();
+        // Only the bar WIDTH is capped: a fill cannot overflow its track.
+        let bar_pct = (self.utilisation * 100.0).min(LIMIT_FULL_PCT);
+        let note = self
+            .note()
+            .map(|n| format!(r#"<div class="hz-binding-note">{}</div>"#, html_escape(n)))
+            .unwrap_or_default();
+        format!(
+            r#"<div class="hz-binding" title="{tooltip}"><div class="hz-binding-head">{lead}: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {bar_pct:.1}%; background: {tone};"></span></div>{note}</div>"#,
+            lead = html_escape(lead),
+            name = html_escape(self.name),
+            detail = html_escape(&self.detail),
+            tooltip = html_escape(self.tooltip),
+            tone = self.tone().css_colour(),
+        )
+    }
+}
+
 /// Build the demand-driven eviction card (#4642). Surfaces the
 /// capability-relative budgets and the per-contract rows that the
 /// subscriber-primary eviction sweep orders. Every value comes from
@@ -1476,88 +1621,72 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     //     node it is not (measured: 1.0 GB RAM budget against 32.0 GB disk),
     //     so saying "filling disk tightens the state limit" would be wrong in
     //     the ordinary case and wrong precisely when writes start failing.
-    let mut axes: Vec<(&str, f64, String, &str)> = Vec::new();
+    let mut axes: Vec<LimitAxis> = Vec::new();
     if let Some(u) = axis_utilisation(h.used_bytes, h.budget_bytes) {
-        axes.push((
-            "contract state",
-            u,
-            format!(
+        axes.push(LimitAxis {
+            name: "contract state",
+            kind: CeilingKind::Cache,
+            utilisation: u,
+            detail: format!(
                 "{} of {}",
                 format_bytes(h.used_bytes),
                 format_bytes(h.budget_bytes)
             ),
-            "Crossing this triggers an eviction sweep.",
-        ));
+            tooltip: "Crossing this triggers an eviction sweep.",
+            over_note: "Over the limit, so the node is evicting its least-demanded contracts.",
+        });
     }
     if let (Some(used), Some(disk_budget)) = (h.disk_total_bytes, h.disk_budget_bytes) {
         if let Some(u) = axis_utilisation(used, disk_budget) {
-            axes.push((
-                "disk",
-                u,
-                format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
-                "Filling this rejects new writes — the disk admission gates refuse \
+            axes.push(LimitAxis {
+                name: "disk",
+                kind: CeilingKind::Admission,
+                utilisation: u,
+                detail: format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
+                tooltip: "Filling this rejects new writes — the disk admission gates refuse \
                  state and WASM growth once the projected total would exceed the \
                  budget. It does not by itself trigger an eviction sweep. It can \
                  also tighten the contract-state limit, but only when the disk \
                  budget is the smaller of the two, since that limit is \
                  min(RAM budget, disk budget).",
-            ));
+                over_note: "Over the limit, so new writes are being refused.",
+            });
         }
     }
     if let Some(u) = axis_utilisation(h.contract_count, h.contract_slot_budget) {
-        axes.push((
-            "contract slots",
-            u,
-            format!("{} of {}", h.contract_count, h.contract_slot_budget),
-            "Crossing this triggers a sweep only if it stays over for a few minutes, \
+        axes.push(LimitAxis {
+            name: "contract slots",
+            kind: CeilingKind::Cache,
+            utilisation: u,
+            detail: format!("{} of {}", h.contract_count, h.contract_slot_budget),
+            tooltip: "Crossing this triggers a sweep only if it stays over for a few minutes, \
              so a brief spike here resolves on its own.",
-        ));
+            over_note: "Over the limit. If it stays over for a few minutes the node evicts \
+             its least-demanded contracts.",
+        });
     }
     // Cost pressure (#4861) is deliberately absent: it is a sustained-rate
     // condition on a single offending contract, not a utilisation ratio, so it
     // has no comparable denominator to rank against these three.
-    let binding = axes
+    //
+    // The closest axis is always shown. Any OTHER axis that is in a warning
+    // state is shown as well: now that a full cache renders neutral, a full
+    // slot ceiling would otherwise outrank — and hide — a disk at 95%, which
+    // is the one axis here where nearly-full is a real problem.
+    axes.sort_by(|a, b| b.utilisation.total_cmp(&a.utilisation));
+    let binding: String = axes
         .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(name, util, detail, note)| {
-            // Over budget is a REAL, reachable state, not an error: exceeding
-            // the contract-state budget is the eviction trigger itself, and
-            // the slot axis sits over its ceiling for the whole ~2.5 min
-            // sustained window before anything is shed. Clamping the
-            // percentage rendered that as "150 of 100 (100%)" — a line that
-            // contradicts itself and hides the breach magnitude at exactly the
-            // moment an operator needs it. So the percentage is unclamped and
-            // only the BAR WIDTH is capped, since a bar cannot overflow its
-            // track.
-            let pct = util * 100.0;
-            let bar_pct = pct.min(100.0);
-            // Threshold on the DISPLAYED figure, not the raw one. Colouring
-            // from `pct` while printing `{pct:.0}` makes the two disagree at
-            // the boundary: 89.6% prints as "90%" but renders amber, and 74.6%
-            // prints as "75%" but renders grey. An operator seeing a red 90%
-            // beside an amber 90% has no way to tell them apart, so round
-            // first and threshold on what they can actually read.
-            let shown_pct = pct.round();
-            // Colour only near the ceiling: an operator should be able to
-            // ignore this strip until it means something.
-            let tone = if shown_pct >= 90.0 {
-                "var(--danger, #c0392b)"
-            } else if shown_pct >= 75.0 {
-                "var(--warn, #b8860b)"
+        .enumerate()
+        .filter(|(i, axis)| *i == 0 || axis.tone() != LimitTone::Neutral)
+        .map(|(i, axis)| {
+            let lead = if i == 0 {
+                "Closest limit"
             } else {
-                "var(--text-muted, #888)"
+                "Also near its limit"
             };
-            format!(
-                r#"<div class="hz-binding" title="{note}"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {bar_pct:.1}%; background: {tone};"></span></div></div>"#,
-                name = html_escape(name),
-                detail = html_escape(detail),
-                note = html_escape(note),
-                shown = shown_pct,
-                bar_pct = bar_pct,
-                tone = tone,
-            )
+            axis.render_strip(lead)
         })
-        .unwrap_or_default();
+        .collect();
 
     // Recently-read evictions are the miscalibration alarm (#4338): evicting a
     // repeatedly-requested contract means the demand estimate is mis-ordering

@@ -1525,7 +1525,11 @@ table.sortable thead th.sort-desc::after {
 /* "Closest limit" strip on the Demand-driven eviction card: the card shows
  * several independent ceilings and this names the one nearest to binding,
  * because three flat rows of identical tiles gave no clue which mattered. The
- * fill is coloured only above 75% so the strip is ignorable until it isn't. */
+ * fill is coloured only when the state is worth attention, and what counts
+ * depends on the axis: a cache ceiling (contract state, contract slots) is
+ * meant to sit at 100% and stays neutral until it is OVER; the disk limit
+ * warns as it fills, because filling it refuses writes. See `CeilingKind` in
+ * cards.rs. */
 .hz-binding {
   margin: 0 0.9rem 0.7rem;
 }
@@ -1537,6 +1541,11 @@ table.sortable thead th.sort-desc::after {
 .hz-binding-head strong {
   color: var(--text-primary, #e6edf3);
   font-weight: 600;
+}
+.hz-binding-note {
+  font-size: 0.78rem;
+  color: var(--text-muted, #8b949e);
+  margin-top: 0.3rem;
 }
 .hz-bar {
   display: block;

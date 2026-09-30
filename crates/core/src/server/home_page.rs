@@ -3112,11 +3112,226 @@ mod tests {
             html.contains("99 of 100"),
             "the binding axis detail must show its own units — got:\n{html}"
         );
-        // At 99% it must be flagged, not left in the same muted grey as an
-        // axis with room to spare.
+        // Naming it is the whole signal. It is NOT coloured: a slot ceiling
+        // is a cache ceiling and 99% is where a busy node is supposed to sit
+        // (this test used to assert red here, which is the false alarm
+        // `hosting_card_full_cache_axis_is_not_an_alarm` now pins against).
+        let strips = binding_strips(&html);
         assert!(
-            html.contains("var(--danger"),
-            "a near-full binding axis must be coloured — got:\n{html}"
+            !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+            "a nearly-full cache axis is normal and must not be coloured — got:\n{strips}"
+        );
+    }
+
+    /// The "Closest limit" strips only, so a colour assertion cannot be
+    /// satisfied (or tripped) by some other tile on the card.
+    fn binding_strips(html: &str) -> &str {
+        let start = html
+            .find(r#"<div class="hz-binding""#)
+            .expect("the card must render a closest-limit strip");
+        let len = html[start..]
+            .find(r#"<div class="g-verdict-row">"#)
+            .expect("the tiles follow the strip");
+        &html[start..start + len]
+    }
+
+    /// A full cache is the steady state, not an alarm.
+    ///
+    /// Reported from a live peer: "Closest limit: contract slots — 508 of 508
+    /// (100%)" over a solid red bar. Nothing was wrong. The sweep trims back
+    /// TO the budget and stops, so a busy node rests at exactly N of N for as
+    /// long as it stays busy; the strip coloured purely on utilisation and so
+    /// was red on every peer doing the most useful work. Same for contract
+    /// state, which nova's own peer showed at "1023.9 MB of 1.0 GB (100%)".
+    #[test]
+    fn hosting_card_full_cache_axis_is_not_an_alarm() {
+        use crate::node::network_status::HostingSnapshot;
+        for (label, hosting) in [
+            (
+                "slots exactly full",
+                HostingSnapshot {
+                    budget_bytes: 1000,
+                    used_bytes: 100,
+                    contract_count: 508,
+                    contract_slot_budget: 508,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+            (
+                "state a hair under full",
+                HostingSnapshot {
+                    budget_bytes: 1_000_000,
+                    used_bytes: 999_900,
+                    contract_count: 5,
+                    contract_slot_budget: 508,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+            (
+                // 509 of 508 prints as "(100%)". Thresholds are taken on the
+                // printed figure, so this must match the exactly-full case
+                // rather than colouring a line that reads 100%.
+                "one slot over, still printed as 100%",
+                HostingSnapshot {
+                    budget_bytes: 1000,
+                    used_bytes: 100,
+                    contract_count: 509,
+                    contract_slot_budget: 508,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = hosting;
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("(100%)"),
+                "{label}: fixture must render at 100% — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+                "{label}: a full cache axis must render neutral — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("var(--text-muted"),
+                "{label}: the bar must still be drawn, in the neutral tone — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("Full is normal here"),
+                "{label}: a full bar must say in words that full is normal — got:\n{strips}"
+            );
+        }
+    }
+
+    /// Below the point where a reader would wonder, the strip says nothing extra.
+    #[test]
+    fn hosting_card_cache_axis_with_room_carries_no_note() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 500,
+            contract_count: 5,
+            contract_slot_budget: 100,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("hz-binding-note"),
+            "a half-full cache needs no explanation — got:\n{html}"
+        );
+    }
+
+    /// OVER a cache ceiling is worth noticing, but it is the sweep's trigger
+    /// and resolves itself, so it is amber with an explanation — never red.
+    #[test]
+    fn hosting_card_over_budget_cache_axis_is_amber_not_red() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 120,
+            contract_slot_budget: 100,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("120 of 100 (120%)"),
+            "fixture must render over budget — got:\n{strips}"
+        );
+        assert!(
+            strips.contains("var(--warn") && !strips.contains("var(--danger"),
+            "an over-budget cache axis is amber, not red — got:\n{strips}"
+        );
+        assert!(
+            strips.contains("Over the limit") && !strips.contains("Full is normal"),
+            "over budget must be described as over, not as normal — got:\n{strips}"
+        );
+    }
+
+    /// Disk is not a cache: filling it refuses writes, so it keeps the
+    /// utilisation thresholds the cache axes lost.
+    #[test]
+    fn hosting_card_disk_axis_still_warns_as_it_fills() {
+        use crate::node::network_status::HostingSnapshot;
+        for (used, shown, colour, other) in [
+            (740, "(74%)", "var(--text-muted", "var(--warn"),
+            (750, "(75%)", "var(--warn", "var(--danger"),
+            (899, "(90%)", "var(--danger", "var(--warn"),
+            (1100, "(110%)", "var(--danger", "var(--warn"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 10,
+                contract_count: 1,
+                contract_slot_budget: 100,
+                disk_total_bytes: Some(used),
+                disk_budget_bytes: Some(1000),
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("<strong>disk</strong>") && strips.contains(shown),
+                "disk at {used}/1000 must be the closest limit at {shown} — got:\n{strips}"
+            );
+            assert!(
+                strips.contains(colour) && !strips.contains(other),
+                "disk at {shown} must be {colour} — got:\n{strips}"
+            );
+        }
+    }
+
+    /// A full cache must not hide a disk that is genuinely running out.
+    ///
+    /// The strip names the single highest-utilisation axis. Before full cache
+    /// axes went neutral that was harmless, since whichever axis won was red
+    /// anyway. Now a slot ceiling at its normal 100% would outrank a disk at
+    /// 95% and the one real warning on the card would disappear behind a grey
+    /// bar, so any other axis in a warning state gets its own strip.
+    #[test]
+    fn hosting_card_full_cache_does_not_hide_a_disk_warning() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 508,
+            contract_slot_budget: 508,
+            disk_total_bytes: Some(950),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract slots</strong>"),
+            "the highest-utilisation axis is still the closest — got:\n{strips}"
+        );
+        assert!(
+            strips.contains("Also near its limit: <strong>disk</strong>")
+                && strips.contains("var(--danger"),
+            "a disk at 95% must get its own red strip — got:\n{strips}"
+        );
+        assert!(
+            !strips.contains("<strong>contract state</strong>"),
+            "an axis with room to spare gets no strip — got:\n{strips}"
+        );
+        assert_eq!(
+            strips.matches(r#"class="hz-binding""#).count(),
+            2,
+            "exactly the closest axis plus the one in a warning state — got:\n{strips}"
         );
     }
 
