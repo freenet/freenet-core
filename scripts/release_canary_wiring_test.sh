@@ -2714,43 +2714,59 @@ else
     fi
 fi
 
-# --- 6b. Gate B's job timeout still holds the canary's worst case ----------
+# --- 6f. Gate B's job timeout still holds the canary's worst case ----------
 # #5715 added a wait for GitHub to serve the release before the node boots, on
 # top of the node attempts, and raised `timeout-minutes` to hold both. The two
 # live in different files and change for different reasons, so nothing kept
 # them in step. A job killed by its timeout carries no classification and
 # reports only "cancelled" -- a red release with no diagnosis.
 #
-# The worst case is computed from the canary's OWN defaults (sourced in a clean
-# environment, so an exported CANARY_* in the caller cannot skew it), plus the
-# fixed allowances below, which are the curl bounds hard-coded in the script:
+# The budgets come from the canary's OWN defaults, sourced in a clean
+# environment so an exported CANARY_* in the caller cannot skew them. The
+# remaining terms are allowances. Only the first three are hard curl bounds in
+# auto-update-canary.sh; the last two are ESTIMATES, so this is a sanity bound
+# with margin, not a proof that the job can never time out:
 #   300  previous-release download (curl --max-time 300)
-#    95  one latest-release probe overrunning the wait budget
-#        (curl --max-time 30, --retry 2, plus retry delays)
+#    95  one latest-release probe overrunning the wait budget (curl
+#        --max-time 30, --retry 2, --retry-max-time 90), plus the poll sleep
+#        before it, read from the defaults
 #    30  the runner reachability probe (curl --max-time 30)
-#   300  `freenet update` downloading and installing the new release
-#    60  checkout, previous-release lookup, runner overhead
+#   300  `freenet update` downloading and installing the new release. Estimate:
+#        update.rs bounds a STALLED transfer (30s idle), not a slow one.
+#    60  checkout, previous-release lookup, runner overhead. Estimate.
 # shellcheck disable=SC2016  # the inner script expands in the child, on purpose
 canary_defaults="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
     source "$1" >/dev/null 2>&1 || exit 1
-    echo "$CANARY_LATEST_WAIT_SECS $CANARY_ATTEMPTS $CANARY_TIMEOUT_SECS $CANARY_RETRY_SLEEP"
+    echo "$CANARY_LATEST_WAIT_SECS $CANARY_LATEST_POLL_SECS $CANARY_ATTEMPTS $CANARY_TIMEOUT_SECS $CANARY_RETRY_SLEEP"
 ' _ "$SCRIPT_DIR/auto-update-canary.sh")"
 gate_b_timeout_min="$(printf '%s\n' "$selfupdate_block" \
     | sed -n 's/^    timeout-minutes:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -1)"
-read -r _wait _attempts _timeout _sleep <<<"$canary_defaults"
+read -r _wait _poll _attempts _timeout _sleep <<<"$canary_defaults"
 if [[ -z "$gate_b_timeout_min" || -z "${_sleep:-}" ]]; then
     fail "could not read Gate B's timeout-minutes or the canary's default budgets" \
         "timeout-minutes='${gate_b_timeout_min}' defaults='${canary_defaults}'" \
         "Without both, the check below cannot say whether the job can finish."
 else
-    _worst=$(( 300 + _wait + 95 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
+    _worst=$(( 300 + _wait + _poll + 95 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
     if [[ $(( gate_b_timeout_min * 60 )) -ge "$_worst" ]]; then
         pass "Gate B's timeout-minutes ($gate_b_timeout_min) holds the canary's worst case (${_worst}s)"
     else
         fail "Gate B's timeout-minutes ($gate_b_timeout_min = $(( gate_b_timeout_min * 60 ))s) is below the canary's worst case (${_worst}s)" \
-            "wait=${_wait}s attempts=${_attempts} x ${_timeout}s retry-sleep=${_sleep}s, plus fixed allowances." \
+            "wait=${_wait}s poll=${_poll}s attempts=${_attempts} x ${_timeout}s retry-sleep=${_sleep}s, plus fixed allowances." \
             "Raise timeout-minutes, or shrink the budgets in auto-update-canary.sh."
     fi
+fi
+# The check above reads the SCRIPT's defaults. A CANARY_* override set in the
+# workflow would bypass it silently, so refuse one outright: change the default
+# in auto-update-canary.sh instead, where this check can see it.
+# A here-string, not `printf | grep -q`: under pipefail that form reads a
+# present match as absent (SIGPIPE; see bug-prevention-patterns.md).
+if grep -qE '^[[:space:]]+CANARY_[A-Z_]+:' <<<"$selfupdate_block"; then
+    fail "Gate B's job sets a CANARY_* variable in cross-compile.yml" \
+        "The timeout check above computes the worst case from auto-update-canary.sh's" \
+        "defaults and cannot see a workflow override. Change the default in the script."
+else
+    pass "Gate B's job does not override the canary's budgets in the workflow"
 fi
 
 # --- 7. Gate B's job still exists -------------------------------------------

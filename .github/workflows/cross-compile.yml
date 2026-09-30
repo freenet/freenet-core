@@ -1079,7 +1079,9 @@ jobs:
 
       # Exit 75 (EX_TEMPFAIL, EXIT_UNVERIFIED_ENVIRONMENTAL in the canary) means
       # the run was environmental -- the previous release's binary could not
-      # reach GitHub from this runner, or the ports were held -- so nothing was
+      # reach GitHub from this runner, the ports were held, or the runner could
+      # not connect to GitHub while waiting for it to serve this release as
+      # latest (#5715) -- so nothing was
       # learned about the updater in either direction. The step still FAILS on
       # it: unverified is not verified, and a green job here would be the
       # vacuous pass the canary exists to remove. What the classification buys
@@ -1201,7 +1203,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). Exception: if the canary's log says GitHub never reported this release as latest, the canary node never ran and `freenet update` would not help either (it reads the same endpoint); fix which release GitHub marks latest. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). Exception: if the canary's log says GitHub never reported this release as latest, or reports a NEWER release, the canary node never ran and `freenet update` would not help either (it reads the same endpoint); fix which release GitHub marks latest. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

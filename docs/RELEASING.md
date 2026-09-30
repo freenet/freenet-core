@@ -995,9 +995,18 @@ rather than on the shape of the alarm.
 | `UNVERIFIED: at least one attempt started the update check and never logged an outcome` | 1 | 🚨 loud | A hung updater, or the check was cut short. Genuinely unknown. | Re-run. Persisting, treat as a real fault. |
 | `GitHub never reported vX as latest within Ns: … last named '<older tag>'` | 1 | 🚨 loud | Before booting the node, Gate B waits (up to `CANARY_LATEST_WAIT_SECS`, 300s) for `releases/latest` to name this release (#5715). It never did. The node was **not started**, so this says nothing about the updater, but until GitHub serves this release as latest no node can see it. | Check the release is published, not a prerelease, and marked latest. `freenet update` by hand will not help: it reads the same endpoint. |
 | `GitHub reports a NEWER release than the one this run was asked to verify` | 1 | 🚨 loud | A newer release is already latest, usually because an old tag's workflow was re-run. Node not started. | Expected on a re-run of an old tag. Otherwise check which release is marked latest. |
-| `GitHub never reported vX as latest: … answered on none of N probe(s) … with a release redirect, yet THIS RUNNER can connect to it` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
-| `UNVERIFIED (ENVIRONMENTAL): this runner could not connect to … releases/latest` | 75 | ⚠️ quiet | The runner could not connect to GitHub for the whole wait. Node not started, nothing learned. | Re-run the job. |
+| `GitHub never reported vX as latest: … answered none of N probe(s) … with a release redirect, yet THIS RUNNER could connect to it during the wait` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
+| `UNVERIFIED (ENVIRONMENTAL): no probe of … releases/latest produced a release tag … and after every one of them this runner also failed to connect to it` | 75 | ⚠️ quiet | The runner could not connect to GitHub after any probe of the wait. Node not started, nothing learned. | Re-run the job. |
 | Anything naming a specific detection or install failure | 1 | 🚨 loud | The real thing. See case 3. | See case 3. |
+
+**The residual from #5715.** The latest-release wait requires three consecutive
+answers naming the release before the node boots, which removed the v0.2.136 and
+v0.2.140 false failures. It cannot rule out the node's own request landing on a
+stale CDN edge seconds later. That shows up as `compared against the WRONG
+release` or `did NOT decide to update`, with the node's logged `latest=` equal to
+the PREVIOUS version. Gate B does not retry it (a retry would let an intermittent
+real fault pass). If the job log shows the wait succeeded and the node still read
+the previous tag, re-run once. If it recurs, treat it as real.
 
 **The trap this table exists to remove.** An earlier version of this section said
 a fetch failure always gives exit 75 and the quiet ⚠️, and told the reader that
@@ -1015,7 +1024,9 @@ on an otherwise healthy runner — produces **exit 1 and the loud 🚨**, and th
 text sent the reader straight past it into "a real detection failure" and on to
 cutting a fix release for a poll-budget cooldown.
 
-**1. Environmental (exit 75, quiet ⚠️).** Two causes, both above. The previous
+**1. Environmental (exit 75, quiet ⚠️).** Three causes, all in the table above
+(the third, the runner failing to connect during the latest-release wait, never
+starts the node, so the rest of this paragraph is about the first two). The previous
 release's binary retries its startup fetch zero times, so a single bad moment on
 the network is enough to produce the first. Gate B retries (`CANARY_ATTEMPTS`, 2
 by default) and only reports this if every attempt lands the same way AND this

@@ -1004,16 +1004,16 @@ SEEN_STALE='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check agai
 2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.121"'
 
 GATE_B_LATEST=0.2.121 gate_b_case "GitHub never serves the release -> loud, node never booted" 1 0 yes \
-    "GitHub never reported v0.2.122 as latest within 1s" "0:SEEN_OK" "0:SEEN_OK"
+    "GitHub never reported v0.2.122 as latest within " "0:SEEN_OK" "0:SEEN_OK"
 GATE_B_LATEST=0.2.121 gate_b_case "...and it names what GitHub DID serve" 1 0 yes \
     "last named '0.2.121'" "0:SEEN_OK" "0:SEEN_OK"
 GATE_B_LATEST=FAIL gate_b_case "no tag from GitHub and the runner cannot connect -> 75, node never booted" 75 0 no \
-    "this runner could not connect to https://github.com/freenet/freenet-core/releases/latest" "0:SEEN_OK" "0:SEEN_OK"
+    "after every one of them this runner also failed to connect to it" "0:SEEN_OK" "0:SEEN_OK"
 # The same non-answer with the runner ONLINE is not environmental: a 403, a 429
 # or a new redirect shape all look like "no tag" to resolve_expected_latest, and
 # the node reads the same 302. Quiet here is the direction that hides things.
 GATE_B_LATEST=FAIL gate_b_case "no tag from GitHub but the runner CAN connect -> loud, node never booted" 1 0 yes \
-    "yet THIS RUNNER can connect to it" "0:SEEN_OK" "0:SEEN_OK"
+    "yet THIS RUNNER could connect to it during the wait" "0:SEEN_OK" "0:SEEN_OK"
 # Property 2. GitHub serves 0.2.122 (the default stub), the node still reads
 # 0.2.121 and stays put: a CDN flap after the wait, or a genuinely broken
 # updater. Either way it is a real failure and is never retried -- two specs,
@@ -1032,7 +1032,7 @@ wait_case() {
     # the end, the last answer repeats.
     local desc="$1" want_rc="$2" want_probes="$3" want_msg="$4"
     shift 4
-    local counter answers errfile got_rc got_probes err
+    local counter answers errfile got_rc got_probes err reach_counter
     counter="$(mktemp "$TMPROOT/probes.XXXXXX")"
     answers="$*"
     errfile="$(mktemp "$TMPROOT/wait.XXXXXX")"
@@ -1040,11 +1040,19 @@ wait_case() {
         CANARY_LATEST_CONFIRMATIONS=3
         CANARY_LATEST_POLL_SECS="${WAIT_CASE_POLL:-1}"
         CANARY_LATEST_WAIT_SECS="${WAIT_CASE_BUDGET:-30}"
-        if [[ "${WAIT_CASE_REACHABLE:-no}" == yes ]]; then
-            runner_can_reach_github() { return 0; }
-        else
-            runner_can_reach_github() { return 1; }
-        fi
+        # WAIT_CASE_REACHABLE is one answer per connect check, in order, the
+        # last repeating -- the same scripting as <answer...> below, and for the
+        # same reason it advances through a file.
+        reach_counter="$(mktemp "$TMPROOT/reach.XXXXXX")"
+        runner_can_reach_github() {
+            local n r
+            n=$(( $(wc -l < "$reach_counter") + 1 ))
+            echo x >> "$reach_counter"
+            # shellcheck disable=SC2086  # deliberate word split of the list
+            set -- ${WAIT_CASE_REACHABLE:-no}
+            if [[ "$n" -le "$#" ]]; then r="${!n}"; else r="${!#}"; fi
+            [[ "$r" == yes ]]
+        }
         # Cases that expect success never reach the budget, so their 1s polls
         # are skipped. Cases that set a budget must spend it on the real clock
         # (`SECONDS`), so they keep the real `sleep` -- a no-op there would spin
@@ -1101,15 +1109,20 @@ wait_case "a probe with no answer resets the streak too" 0 5 "" \
     0.2.122 FAIL 0.2.122
 # A 1s budget with 1s polls: two probes, then the deadline.
 WAIT_CASE_BUDGET=1 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
-    "GitHub never reported v0.2.122 as latest within 1s" 0.2.121
+    "GitHub never reported v0.2.122 as latest within " 0.2.121
 # Lag only ever serves an OLDER tag, so a newer one is final: fail on the first
 # probe instead of spending the whole budget on an answer that cannot change.
 wait_case "a NEWER tag fails at once -> 1, after one probe" 1 1 \
     "GitHub reports a NEWER release than the one this run was asked to verify: https://github.com/freenet/freenet-core/releases/latest names '0.2.123'" 0.2.123
 WAIT_CASE_BUDGET=1 wait_case "no tag on any probe, runner cannot connect -> 75, environmental" 75 "" \
-    "UNVERIFIED (ENVIRONMENTAL): this runner could not connect" FAIL
+    "UNVERIFIED (ENVIRONMENTAL): no probe of" FAIL
 WAIT_CASE_BUDGET=1 WAIT_CASE_REACHABLE=yes wait_case "no tag on any probe, runner CAN connect -> 1, loud" 1 "" \
-    "yet THIS RUNNER can connect to it" FAIL
+    "yet THIS RUNNER could connect to it during the wait" FAIL
+# The connect check is per failed probe, not one call at the end. A wait of
+# 429s (runner connects fine) that ends in one connect blip must stay loud: a
+# single end-of-wait check would read the blip and go quiet.
+WAIT_CASE_BUDGET=2 WAIT_CASE_REACHABLE="yes no" wait_case "connected mid-wait, blip at the end -> still loud" 1 "" \
+    "yet THIS RUNNER could connect to it during the wait" FAIL
 # The CADENCE. Every case above either stubs `sleep` or sets poll == budget, so
 # swapping the poll interval for the budget in the loop's `sleep` left them all
 # green -- and in production that is one probe per 300s budget, which fails
