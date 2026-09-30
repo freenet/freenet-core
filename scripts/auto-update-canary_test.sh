@@ -1023,6 +1023,30 @@ GATE_B_LATEST=FAIL gate_b_case "no tag from GitHub but the runner CAN connect ->
 gate_b_case "GitHub serves the release but the node stays on a stale tag -> still loud, not retried" 1 1 yes \
     "did NOT decide to update to v0.2.122" "0:SEEN_STALE" "0:SEEN_STALE"
 
+# The wait's DEFAULTS, read in a clean environment. Every case above overrides
+# them, so a default edited to 30s or 1 confirmation left the suite green -- and
+# either one quietly brings #5715 back. Pinned as relations to the measured lag
+# (52s on v0.2.136, the worst seen) rather than as copies of the numbers, so a
+# deliberate retune within reason does not need this file touched.
+# shellcheck disable=SC2016,SC2031  # the inner script expands in the child, on purpose
+read -r _lw _lc <<<"$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+    source "$1" >/dev/null 2>&1 || exit 1
+    echo "$CANARY_LATEST_WAIT_SECS $CANARY_LATEST_CONFIRMATIONS"' _ "$CANARY_SH")"
+if [[ -z "${_lc:-}" ]]; then
+    echo "FAIL - could not read the latest-release wait defaults from $(basename "$CANARY_SH")" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$_lw" -lt 120 ]]; then
+    echo "FAIL - CANARY_LATEST_WAIT_SECS defaults to ${_lw}s, under 2x the worst measured publication lag (52s)." >&2
+    echo "       A budget that short fails healthy releases the way #5715 did." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$_lc" -lt 2 ]]; then
+    echo "FAIL - CANARY_LATEST_CONFIRMATIONS defaults to $_lc. One answer is one CDN edge; the node's" >&2
+    echo "       request can land on another. Keep it at 2 or more." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - latest wait defaults: ${_lw}s budget, $_lc consecutive confirmations"
+fi
+
 # The wait loop itself. `resolve_expected_latest` runs inside `$(...)`, so the
 # scripted sequence advances through a counter FILE -- a shell variable would
 # reset in every subshell and the stub would answer the first entry forever.

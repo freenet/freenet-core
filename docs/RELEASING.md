@@ -980,8 +980,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Several distinct outcomes end in a red job; only one of them means
-a node on the previous release genuinely cannot reach this one. **Read the
+enough to tell.** Several distinct outcomes end in a red job; only the ones that
+name a specific detection or install failure, or say GitHub never served this
+release as latest, mean a node on the previous release genuinely cannot reach
+this one. **Read the
 `::error::` line in the job log before doing anything** — it names which.
 
 The wording below is generated from the code, so match on the quoted phrases
