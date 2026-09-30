@@ -269,8 +269,10 @@ EXIT_CODE_ALREADY_RUNNING=43
 # reusing it here would make "the canary exited 43" mean either "another process
 # held the port" or "the node started fine and GitHub was unreachable" --
 # indistinguishable at the one moment someone is reading it under time pressure,
-# on a release. The port collision is one of the two things that produce a 75;
-# it is not what 75 means.
+# on a release. The port collision is one of the three things that produce a
+# 75 (with the node's corroborated fetch failure, and the runner failing to
+# connect while waiting for GitHub to serve the release, #5715); it is not what
+# 75 means.
 #
 # The job still goes RED on a 75. Unverified is not verified, and reporting green
 # on a run that proved nothing is the vacuous pass this whole file exists to
@@ -366,6 +368,27 @@ CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 # canary stops the node mid-request and reads the resulting silence as health
 # (#5236).
 CANARY_OUTCOME_WAIT_SECS="$(sanitise_positive_int "${CANARY_OUTCOME_WAIT_SECS:-20}" 20)"
+
+# Gate B only: how long to wait for GitHub to report the just-published release
+# as latest before booting the previous release's node (#5715), how often to
+# ask, and how many CONSECUTIVE answers naming it are required.
+#
+# `releases/latest` is eventually consistent after an un-draft. Gate B starts
+# seconds after publication, and twice the node's one startup check read the
+# PREVIOUS tag: 52s after publication on v0.2.136, 39s on v0.2.140. The gate
+# then failed a healthy release with "compared against the WRONG release".
+#
+# Consecutive, not first-sight, because the answer comes from a CDN: one fresh
+# edge answering does not mean the next request (the node's) lands on a fresh
+# one. Three answers 5s apart cost ~10s on the happy path.
+#
+# 300s is ~6x the worst lag seen so far. Gate B's `timeout-minutes` in
+# cross-compile.yml has to hold this on top of the node attempts;
+# `release_canary_wiring_test.sh` computes that from these defaults and goes
+# red if the job no longer fits.
+CANARY_LATEST_WAIT_SECS="$(sanitise_positive_int "${CANARY_LATEST_WAIT_SECS:-300}" 300)"
+CANARY_LATEST_POLL_SECS="$(sanitise_positive_int "${CANARY_LATEST_POLL_SECS:-5}" 5)"
+CANARY_LATEST_CONFIRMATIONS="$(sanitise_positive_int "${CANARY_LATEST_CONFIRMATIONS:-3}" 3)"
 
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
@@ -1205,7 +1228,14 @@ resolve_expected_latest() {
   # NODE's verdict and not of one curl. `--retry-all-errors` because the
   # interesting failures (connection reset, DNS blip) are not HTTP statuses,
   # which is all bare `--retry` covers.
-  url="$(curl -fsS --max-time 30 --retry 2 --retry-all-errors \
+  #
+  # `--retry-max-time 90` bounds the retries in wall time. curl honours a 429's
+  # `Retry-After`, so without it one probe could sleep past the job's timeout
+  # -- and Gate B's latest-release wait calls this every few seconds (#5715).
+  # Gate A shares this call: a 429 asking for more than ~90s now fails its
+  # lookup (loud, release stays a draft) instead of waiting it out. Bounded and
+  # visible, where the unbounded wait could hit Gate A's step timeout instead.
+  url="$(curl -fsS --max-time 30 --retry 2 --retry-all-errors --retry-max-time 90 \
     -o /dev/null -w '%{redirect_url}' \
     "$RELEASES_LATEST_URL" 2>/dev/null)" || return 1
   case "$url" in
@@ -1214,6 +1244,164 @@ resolve_expected_latest() {
   esac
   [ -n "$tag" ] || return 1
   normalise_release_tag "$tag"
+}
+
+# The wait's clock, in whole seconds. A function so the tests can substitute a
+# fake one: bash's `SECONDS` ticks on real second boundaries however the loop's
+# `sleep` is stubbed, and under load those ticks changed which branch a test
+# ended in (10 of 120 parallel suite runs, round-4 review).
+canary_now() { printf '%s' "$SECONDS"; }
+
+# How long a stale answer can still be publication lag: 2x the worst measured
+# (52s, v0.2.136). An OLDER tag served after this -- at ANY point, not only as
+# the last answer -- is itself a finding, and a network drop afterwards must
+# not wash it out into the quiet path. The clock starts at the WAIT, not at
+# publication, which errs toward quiet: on a re-run hours after publishing, an
+# older tag in the first two minutes followed by an outage still reads as
+# possible lag.
+LATEST_PLAUSIBLE_LAG_SECS=120
+
+# wait_for_release_to_be_latest <expected-version>
+#
+# Gate B only (#5715). Polls the endpoint the node's updater uses
+# (RELEASES_LATEST_URL, via `resolve_expected_latest`, so the same URL and the
+# same tag normalisation) until it names <expected-version> on
+# CANARY_LATEST_CONFIRMATIONS consecutive probes, or CANARY_LATEST_WAIT_SECS
+# runs out.
+#
+# THIS IS A PRECONDITION, NOT A VERDICT. It decides only WHEN the node is
+# booted. Everything that judges the updater -- the two-sided log assertion,
+# the positive-equality check, the decision to update, exit 42, the install,
+# the final version -- runs afterwards exactly as before, against the same
+# expected version. A node that genuinely fails to update still fails the gate.
+# What this removes is the node being asked about a release GitHub was not yet
+# serving, which proves nothing about the updater.
+#
+# Returns:
+#   0  GitHub reports <expected-version> as latest.
+#   1  Loud, deliberately:
+#      - GitHub named a NEWER tag. Returned at once: lag only ever serves an
+#        older tag, so waiting cannot change the answer. The release has been
+#        superseded and this run cannot test the transition it was asked about.
+#      - The wait ended on an ANSWER without completing the streak: an older
+#        tag for the whole budget (a lag of minutes is not the CDN we have
+#        measured, and a release that is not "latest" is invisible to the fleet
+#        too), or the release itself arriving too late or flapping.
+#      - The wait ended on FAILED probes after GitHub had named a different tag
+#        later than LATEST_PLAUSIBLE_LAG_SECS into the wait: that stale answer
+#        is the finding, whatever the network did afterwards.
+#      - The wait ended on FAILED probes, and after at least one of them THIS
+#        RUNNER could connect (`runner_can_reach_github`).
+#        `resolve_expected_latest` collapses a 403, a 429, a 200 with no
+#        redirect and a redirect of a new shape into the same `return 1` as a
+#        dead network. Those are not environmental: the node reads the same
+#        302, so a changed redirect shape is what a stranded fleet looks like
+#        from here. Only a connect-class failure buys the quiet path -- the same
+#        rule `gate_b_unverified_class` applies to the node's own fetch failures.
+#   75 The wait ended on failed probes, the connect check failed after EVERY
+#      one of that trailing run, and no answer naming a different tag came
+#      later than publication lag can explain (LATEST_PLAUSIBLE_LAG_SECS). Checked per probe, not once at the end, so a
+#      run of 429s ending in one connect blip stays loud; and only on the
+#      TRAILING run, so a wait that ended on an answer (budget out mid-streak,
+#      flapping) can never be quiet. Nothing about the updater can be learned
+#      -- EXIT_UNVERIFIED_ENVIRONMENTAL, and the job is still red.
+#
+# The messages say "GitHub never reported ...", never "the node failed to
+# update": the node has not been started when these fire.
+wait_for_release_to_be_latest() {
+  local expected="$1" seen last_seen="" streak=0 probes=0 answered=0
+  local other_tags=0 last_other_at=-1
+  # The TRAILING run of failed probes -- those after the last probe that
+  # produced a tag -- and whether any connect check during that run succeeded.
+  # Both reset on every answer. The failure classification reads only these:
+  # an earlier outage that GitHub then answered through says nothing about why
+  # the wait ended, and a wait that ended on an answer had no failure to classify.
+  local trail_fail=0 trail_connected=0
+  local start now
+  start="$(canary_now)"
+  local deadline=$(( start + CANARY_LATEST_WAIT_SECS ))
+  log "waiting for GitHub to report v$expected as latest at $RELEASES_LATEST_URL (up to ${CANARY_LATEST_WAIT_SECS}s, $CANARY_LATEST_CONFIRMATIONS consecutive answers)"
+  while :; do
+    probes=$((probes + 1))
+    if seen="$(resolve_expected_latest)"; then
+      answered=$((answered + 1))
+      last_seen="$seen"
+      trail_fail=0
+      trail_connected=0
+      if [ "$seen" = "$expected" ]; then
+        streak=$((streak + 1))
+        if [ "$streak" -ge "$CANARY_LATEST_CONFIRMATIONS" ]; then
+          log "GitHub reports v$expected as latest ($streak consecutive answers, $(( $(canary_now) - start ))s after the first probe)"
+          return 0
+        fi
+      elif is_dotted_version "$seen" && is_dotted_version "$expected" \
+           && version_at_least "$seen" "$expected"; then
+        fail "GitHub reports a NEWER release than the one this run was asked to verify: $RELEASES_LATEST_URL names '$seen', not v$expected. Propagation lag only ever serves an OLDER tag, so waiting cannot change this, and the canary node was NOT started. A node on the previous release would now go straight to v$seen, so this run cannot test the transition to v$expected. If this is a re-run of an old tag's workflow, that is the expected outcome; otherwise check which release is marked latest."
+        return 1
+      else
+        streak=0
+        other_tags=$((other_tags + 1))
+        last_other_at=$(( $(canary_now) - start ))
+      fi
+    else
+      # A failed probe breaks the streak: "fresh, then no answer, then fresh"
+      # is not three answers naming the release.
+      streak=0
+      trail_fail=$((trail_fail + 1))
+      # Only FAILED probes are classified, so a healthy wait costs no extra
+      # requests. One success per trailing run is enough to rule out the quiet
+      # path, so stop asking once one connects.
+      if [ "$trail_connected" -eq 0 ] && runner_can_reach_github; then
+        trail_connected=1
+      fi
+    fi
+    now="$(canary_now)"
+    [ "$now" -lt "$deadline" ] || break
+    sleep "$CANARY_LATEST_POLL_SECS"
+  done
+
+  # The measured time, not the budget: one probe can take ~120s on its own
+  # (a retry can start just inside --retry-max-time 90, then run --max-time 30), so the loop can overrun the budget and
+  # the message must not understate how long GitHub was given.
+  local waited=$(( $(canary_now) - start ))
+
+  # The wait ENDED ON FAILURES. Classify them by the connect checks.
+  if [ "$trail_fail" -gt 0 ]; then
+    if [ "$answered" -eq 0 ]; then
+      if [ "$trail_connected" -eq 1 ]; then
+        fail "GitHub never reported v$expected as latest: $RELEASES_LATEST_URL answered none of $probes probe(s) in ${waited}s with a release redirect, yet THIS RUNNER could connect to it during the wait. So the network was not simply down: most likely the endpoint the node reads is answering with something that is not a '/releases/tag/<tag>' redirect (an HTTP error, a rate limit, a page instead of a 302, or a new redirect shape), though an intermittent network can also produce this. The canary node was NOT started, so this is not a verdict on the updater -- but the node reads the same 302, so if this persists NO node can detect any release. Check the endpoint by hand: curl -sI $RELEASES_LATEST_URL"
+        return 1
+      fi
+      fail "UNVERIFIED (ENVIRONMENTAL): no probe of $RELEASES_LATEST_URL produced a release tag in ${waited}s ($probes probe(s)), and after every one of them this runner also failed to connect to it, so it could not confirm that GitHub reports v$expected as latest, and the canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
+      return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+    fi
+    # An OLDER tag served long after publication lag could explain it -- at any
+    # point, not only as the last answer, or whether the gate goes quiet would
+    # depend on which tag a flapping CDN happened to serve last. That answer is
+    # the finding; the network going afterwards does not make it environmental.
+    if [ "$last_other_at" -gt "$LATEST_PLAUSIBLE_LAG_SECS" ]; then
+      fail "GitHub never reported v$expected as latest: $RELEASES_LATEST_URL was still naming a different tag ${last_other_at}s into the wait (the cutoff for publication lag is ${LATEST_PLAUSIBLE_LAG_SECS}s, 2x the worst measured), before the last $trail_fail probe(s) failed; its last answer was '$last_seen'. The canary node was NOT started, so this is not a verdict on the updater, but until GitHub reports v$expected as latest NO node can auto-update to it. Check that the release is published, is not a prerelease, and is marked latest."
+      return 1
+    fi
+    if [ "$trail_connected" -eq 1 ]; then
+      fail "GitHub never reported v$expected as latest: $RELEASES_LATEST_URL last named '$last_seen', then answered none of the last $trail_fail probe(s) with a release redirect (${waited}s in all), while THIS RUNNER could still connect to it. Most likely the endpoint started returning an error or a non-redirect. The canary node was NOT started, so this is not a verdict on the updater -- but the node reads the same 302, so if this persists NO node can detect any release. Check the endpoint by hand: curl -sI $RELEASES_LATEST_URL"
+      return 1
+    fi
+    fail "UNVERIFIED (ENVIRONMENTAL): $RELEASES_LATEST_URL last named '$last_seen', then this runner lost its connection to it: none of the last $trail_fail probe(s) produced a tag and the connect check failed after each (${waited}s in all). So it could not confirm that GitHub reports v$expected as latest, and the canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
+    return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+  fi
+
+  # The wait ended ON AN ANSWER, so there is no failure to classify: every path
+  # below is loud and none is environmental.
+  if [ "$last_seen" = "$expected" ]; then
+    # Named it, but the budget ran out before the streak completed: it arrived
+    # in the last few polls, or edges were flapping between tags for the whole
+    # wait. Either way three consecutive answers never happened.
+    fail "GitHub never reported v$expected as latest on $CANARY_LATEST_CONFIRMATIONS consecutive probes within ${waited}s: the wait ended $streak answer(s) into a streak naming it at $RELEASES_LATEST_URL. Of $probes probe(s), $other_tags named a different tag and $(( probes - answered )) got no tag at all. GitHub began serving it only at the end of the budget, its CDN was flapping between tags, or probes were failing intermittently -- the counts say which. The canary node was NOT started, so this is not a verdict on the updater. Re-run the job; if it recurs, GitHub is not serving this release consistently."
+    return 1
+  fi
+  fail "GitHub never reported v$expected as latest within ${waited}s: $RELEASES_LATEST_URL last named '${last_seen}' ($answered answer(s) from $probes probe(s)). The canary node was NOT started, so this is not a verdict on the updater -- but it is not a propagation blip either: publication lag has measured under a minute. Until GitHub reports v$expected as latest, NO node can auto-update to it. Check that the release is published, is not a prerelease, and is marked latest."
+  return 1
 }
 
 # True when THIS RUNNER can reach the release endpoint the node uses.
@@ -1577,11 +1765,25 @@ cmd_selfupdate() {
   starting="$("$work/bin/freenet" --version | head -1)"
   log "starting from: $starting"
 
+  # Do not ask the node about a release GitHub is not serving yet (#5715). Last
+  # thing before the boot, after the download, so the gap between "GitHub says
+  # latest" and the node's own check is as small as it can be. A non-zero return
+  # is propagated as-is: 1 is loud, 75 is EXIT_UNVERIFIED_ENVIRONMENTAL. The
+  # expected version stays the caller's argument; this only waits for GitHub to
+  # agree with it, it does not replace it with whatever GitHub says.
+  local wait_rc=0
+  wait_for_release_to_be_latest "$expected_version" || wait_rc=$?
+  if [ "$wait_rc" -ne 0 ]; then
+    return "$wait_rc"
+  fi
+
   # Arm the positive-equality check, as Gate A does. Gate B runs AFTER
-  # publication, so `releases/latest` IS this release: the previous release's
-  # binary must observe `expected_version`, and there is no need to re-resolve
-  # it from GitHub -- the caller already knows which release it just published,
-  # and asking again would only introduce a second source allowed to disagree.
+  # publication, and the wait above has just confirmed `releases/latest` names
+  # this release, so the previous release's binary must observe
+  # `expected_version`. The value comes from the caller's argument, not from
+  # GitHub: the wait only waited for GitHub to AGREE with it. Taking GitHub's
+  # answer as the expected value instead would introduce a second source allowed
+  # to disagree with the release the caller just published.
   #
   # Without this the deliberately-loud "CANARY_EXPECTED_LATEST is unset" NOTE
   # fired on EVERY healthy Gate B run (the command runs in its own process, so
