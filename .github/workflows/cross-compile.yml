@@ -1024,11 +1024,20 @@ jobs:
   # own. The release is already public at that point, so the job is red and
   # notifies rather than blocking; the response is to ship a fix and/or roll
   # the fleet by hand, exactly as v0.2.120/v0.2.121 required.
+  #
+  # `releases/latest` lags an un-draft by tens of seconds (v0.2.136: 52s,
+  # v0.2.140: 39s), so the canary first waits, up to CANARY_LATEST_WAIT_SECS,
+  # for GitHub to report this tag as latest before it boots the old node
+  # (#5715). Without that the node was asked about a release GitHub was not
+  # serving yet and the gate went red on healthy releases.
   # -----------------------------------------------------------------------
   auto-update-selfupdate-canary:
     name: Auto-update self-update canary (previous release -> this one)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 -> 25 for the latest-release wait (#5715, up to ~5 min plus probe
+    # time). The node attempts alone can take ~9 min at worst (2 x
+    # CANARY_TIMEOUT_SECS + outcome wait + retry sleep) on top of the download.
+    timeout-minutes: 25
     needs: attach-to-release
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -1150,15 +1159,16 @@ jobs:
           needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
         uses: ./.github/actions/river-dev-notify
         with:
-          # Names BOTH environmental causes rather than assuming the network
-          # one. Exit 75 covers two: the previous release's binary could not
-          # reach GitHub (and neither could the runner), or every attempt lost a
-          # port race on this host. An earlier version of this message asserted
+          # Names EVERY environmental cause rather than assuming the network
+          # one. Exit 75 covers three: the previous release's binary could not
+          # reach GitHub (and neither could the runner), every attempt lost a
+          # port race on this host, or the runner got no answer at all while
+          # waiting for GitHub to report this release as latest (#5715). An earlier version of this message asserted
           # the first, so a self-hosted runner with something holding the ports
           # sent the operator after DNS. The job log's `UNVERIFIED
           # (ENVIRONMENTAL)` line says which; this says what to do, which is the
           # same either way.
-          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: either the previous release's binary could not reach GitHub (and neither could the runner) or every attempt hit a port collision on the runner. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: the previous release's binary could not reach GitHub (and neither could the runner), every attempt hit a port collision on the runner, or the runner could not reach GitHub at all to confirm this release was being served as latest. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

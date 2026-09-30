@@ -856,6 +856,19 @@ gate_b_case() {
         curl() { :; }
         tar()  { :; }
         run_node_until_check() { run_node_until_check_stub "$@"; }
+        # The #5715 latest-release wait. `curl` is a no-op above, so without
+        # this stub the real `resolve_expected_latest` never answers and every
+        # case would end in the wait instead of reaching the node. One
+        # confirmation, and a 1s budget, so a case that makes GitHub stale or
+        # silent (GATE_B_LATEST) fails fast; the wait's own loop has its own
+        # cases further down.
+        CANARY_LATEST_CONFIRMATIONS=1
+        CANARY_LATEST_WAIT_SECS=1
+        CANARY_LATEST_POLL_SECS=1
+        resolve_expected_latest() {
+            [[ "${GATE_B_LATEST:-0.2.122}" != FAIL ]] || return 1
+            printf '%s' "${GATE_B_LATEST:-0.2.122}"
+        }
         if [[ "$reachable" == yes ]]; then
             runner_can_reach_github() { return 0; }
         else
@@ -969,6 +982,113 @@ gate_b_case "the previous release simply stayed put -> loud, named as such" 1 1 
     "did NOT decide to update to v0.2.122" "0:SEEN_OK" "0:SEEN_OK"
 gate_b_case "the previous release refused via the #4073 local gate -> named as THAT" 1 1 yes \
     "REFUSED it as locally blocked (#4073" "0:SEEN_REFUSED_4073" "0:SEEN_REFUSED_4073"
+
+# --- Gate B waits for GitHub to serve the release before asking the node ----
+# #5715. Gate B used to boot the previous release's node seconds after the
+# un-draft, while `releases/latest` still named the PREVIOUS tag (52s lag on
+# v0.2.136, 39s on v0.2.140). The node read the stale tag, stayed put, and a
+# healthy release failed "compared against the WRONG release".
+#
+# Two properties, both behavioural:
+#   1. The wait is a PRECONDITION: if GitHub never serves the release, the node
+#      is never booted (0 attempts) and the message says GitHub, not the node.
+#   2. It is NOT a verdict: once GitHub serves the release, a node that still
+#      fails -- stale read, stayed put, #5221 -- fails exactly as before, and is
+#      not retried into a pass.
+
+# The exact v0.2.140 log shape: the previous release saw its OWN version as
+# latest and stayed put.
+# shellcheck disable=SC2034
+SEEN_STALE='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.121
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.121"'
+
+GATE_B_LATEST=0.2.121 gate_b_case "GitHub never serves the release -> loud, node never booted" 1 0 yes \
+    "GitHub never reported v0.2.122 as latest within 1s" "0:SEEN_OK" "0:SEEN_OK"
+GATE_B_LATEST=0.2.121 gate_b_case "...and it names what GitHub DID serve" 1 0 yes \
+    "last named '0.2.121'" "0:SEEN_OK" "0:SEEN_OK"
+GATE_B_LATEST=FAIL gate_b_case "runner gets no answer from GitHub at all -> 75, node never booted" 75 0 no \
+    "got no answer from https://github.com/freenet/freenet-core/releases/latest" "0:SEEN_OK" "0:SEEN_OK"
+# Property 2. GitHub serves 0.2.122 (the default stub), the node still reads
+# 0.2.121 and stays put: a CDN flap after the wait, or a genuinely broken
+# updater. Either way it is a real failure and is never retried -- two specs,
+# one consumed. (v0.2.121 predates the observed-latest marker, so what catches
+# it here is the decision check; the equality check is exercised on the
+# `assert_detection_healthy` fixtures above.)
+gate_b_case "GitHub serves the release but the node stays on a stale tag -> still loud, not retried" 1 1 yes \
+    "did NOT decide to update to v0.2.122" "0:SEEN_STALE" "0:SEEN_STALE"
+
+# The wait loop itself. `resolve_expected_latest` runs inside `$(...)`, so the
+# scripted sequence advances through a counter FILE -- a shell variable would
+# reset in every subshell and the stub would answer the first entry forever.
+wait_case() {
+    # wait_case <desc> <want-rc> <want-probes> <want-msg> <answer...>
+    # Each <answer> is a version, or FAIL for a probe that gets no answer. Past
+    # the end, the last answer repeats.
+    local desc="$1" want_rc="$2" want_probes="$3" want_msg="$4"
+    shift 4
+    local counter answers errfile got_rc got_probes err
+    counter="$(mktemp "$TMPROOT/probes.XXXXXX")"
+    answers="$*"
+    errfile="$(mktemp "$TMPROOT/wait.XXXXXX")"
+    got_rc="$(
+        CANARY_LATEST_CONFIRMATIONS=3
+        CANARY_LATEST_POLL_SECS=1
+        CANARY_LATEST_WAIT_SECS="${WAIT_CASE_BUDGET:-30}"
+        # Cases that expect success never reach the budget, so their 1s polls
+        # are skipped. Cases that set a budget must spend it on the real clock
+        # (`SECONDS`), so they keep the real `sleep` -- a no-op there would spin
+        # the loop thousands of times inside that one second.
+        if [[ -z "${WAIT_CASE_BUDGET:-}" ]]; then
+            sleep() { :; }
+        fi
+        resolve_expected_latest() {
+            local n a
+            n=$(( $(wc -l < "$counter") + 1 ))
+            echo x >> "$counter"
+            # shellcheck disable=SC2086  # deliberate word split of the list
+            set -- $answers
+            if [[ "$n" -le "$#" ]]; then a="${!n}"; else a="${!#}"; fi
+            [[ "$a" != FAIL ]] || return 1
+            printf '%s' "$a"
+        }
+        wait_for_release_to_be_latest 0.2.122 2>"$errfile" >/dev/null
+        echo "$?"
+    )"
+    got_probes="$(wc -l < "$counter")"
+    err="$(cat "$errfile")"
+    if [[ "$got_rc" != "$want_rc" || ( -n "$want_probes" && "$got_probes" != "$want_probes" ) ]]; then
+        echo "FAIL - latest wait: $desc" >&2
+        echo "         got rc $got_rc after $got_probes probe(s); wanted rc $want_rc after ${want_probes:-any} probe(s)" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ -n "$want_msg" && "$err" != *"$want_msg"* ]]; then
+        echo "FAIL - latest wait: $desc (rc correct, wrong text)" >&2
+        echo "         wanted: $want_msg" >&2
+        echo "         got: ${err:-<nothing on stderr>}" >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - latest wait: $desc"
+    fi
+}
+
+wait_case "served from the first probe: done after the confirmations" 0 3 "" \
+    0.2.122
+wait_case "stale for two probes, then served (the #5715 shape)" 0 5 "" \
+    0.2.121 0.2.121 0.2.122
+# A CDN flap: one fresh edge, then a stale one. The first sighting must not be
+# taken as propagation, or the node's own request can still land on the stale
+# edge.
+wait_case "a flap back to the old tag resets the streak" 0 5 "" \
+    0.2.122 0.2.121 0.2.122
+wait_case "a probe with no answer resets the streak too" 0 5 "" \
+    0.2.122 FAIL 0.2.122
+# A 1s budget with 1s polls: two probes, then the deadline.
+WAIT_CASE_BUDGET=1 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
+    "GitHub never reported v0.2.122 as latest within 1s" 0.2.121
+WAIT_CASE_BUDGET=1 wait_case "a NEWER tag is not the expected one either -> 1" 1 "" \
+    "last named '0.2.123'" 0.2.123
+WAIT_CASE_BUDGET=1 wait_case "no answer on any probe -> 75, environmental" 75 "" \
+    "UNVERIFIED (ENVIRONMENTAL): this runner got no answer" FAIL
 
 # --- Gate A END TO END, driven per attempt ----------------------------------
 # The Gate A counterpart of the block above, sharing its stub. Two properties

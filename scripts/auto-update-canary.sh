@@ -367,6 +367,26 @@ CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 # (#5236).
 CANARY_OUTCOME_WAIT_SECS="$(sanitise_positive_int "${CANARY_OUTCOME_WAIT_SECS:-20}" 20)"
 
+# Gate B only: how long to wait for GitHub to report the just-published release
+# as latest before booting the previous release's node (#5715), how often to
+# ask, and how many CONSECUTIVE answers naming it are required.
+#
+# `releases/latest` is eventually consistent after an un-draft. Gate B starts
+# seconds after publication, and twice the node's one startup check read the
+# PREVIOUS tag: 52s after publication on v0.2.136, 39s on v0.2.140. The gate
+# then failed a healthy release with "compared against the WRONG release".
+#
+# Consecutive, not first-sight, because the answer comes from a CDN: one fresh
+# edge answering does not mean the next request (the node's) lands on a fresh
+# one. Three answers 5s apart cost ~10s on the happy path.
+#
+# 300s is ~6x the worst lag seen so far. The job's `timeout-minutes` in
+# cross-compile.yml was raised to hold this on top of the node attempts; change
+# the two together.
+CANARY_LATEST_WAIT_SECS="$(sanitise_positive_int "${CANARY_LATEST_WAIT_SECS:-300}" 300)"
+CANARY_LATEST_POLL_SECS="$(sanitise_positive_int "${CANARY_LATEST_POLL_SECS:-5}" 5)"
+CANARY_LATEST_CONFIRMATIONS="$(sanitise_positive_int "${CANARY_LATEST_CONFIRMATIONS:-3}" 3)"
+
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
 # An UNVERIFIED result, not a detected fault. Deliberately not `::error::`:
@@ -1216,6 +1236,71 @@ resolve_expected_latest() {
   normalise_release_tag "$tag"
 }
 
+# wait_for_release_to_be_latest <expected-version>
+#
+# Gate B only (#5715). Polls the endpoint the node's updater uses
+# (RELEASES_LATEST_URL, via `resolve_expected_latest`, so the same URL and the
+# same tag normalisation) until it names <expected-version> on
+# CANARY_LATEST_CONFIRMATIONS consecutive probes, or CANARY_LATEST_WAIT_SECS
+# runs out.
+#
+# THIS IS A PRECONDITION, NOT A VERDICT. It decides only WHEN the node is
+# booted. Everything that judges the updater -- the two-sided log assertion,
+# the positive-equality check, the decision to update, exit 42, the install,
+# the final version -- runs afterwards exactly as before, against the same
+# expected version. A node that genuinely fails to update still fails the gate.
+# What this removes is the node being asked about a release GitHub was not yet
+# serving, which proves nothing about the updater.
+#
+# Returns:
+#   0  GitHub reports <expected-version> as latest.
+#   1  GitHub ANSWERED but never named <expected-version> in the budget. Loud,
+#      deliberately: a lag of minutes is not the CDN we have measured, and if
+#      the release is really not "latest" (marked prerelease, `make_latest`
+#      off, a newer release already out) the fleet cannot see it either, which
+#      is precisely what the loud message says.
+#   75 GitHub never answered at all (every probe failed). The runner itself
+#      cannot reach the endpoint, so nothing about the updater can be learned
+#      -- EXIT_UNVERIFIED_ENVIRONMENTAL, and the job is still red.
+#
+# The messages say "GitHub never reported ...", never "the node failed to
+# update": the node has not been started when these fire.
+wait_for_release_to_be_latest() {
+  local expected="$1" seen last_seen="" streak=0 probes=0 answered=0
+  local start="$SECONDS"
+  local deadline=$(( SECONDS + CANARY_LATEST_WAIT_SECS ))
+  log "waiting for GitHub to report v$expected as latest at $RELEASES_LATEST_URL (up to ${CANARY_LATEST_WAIT_SECS}s, $CANARY_LATEST_CONFIRMATIONS consecutive answers)"
+  while :; do
+    probes=$((probes + 1))
+    if seen="$(resolve_expected_latest)"; then
+      answered=$((answered + 1))
+      last_seen="$seen"
+      if [ "$seen" = "$expected" ]; then
+        streak=$((streak + 1))
+        if [ "$streak" -ge "$CANARY_LATEST_CONFIRMATIONS" ]; then
+          log "GitHub reports v$expected as latest ($streak consecutive answers, $(( SECONDS - start ))s after the first probe)"
+          return 0
+        fi
+      else
+        streak=0
+      fi
+    else
+      # A failed probe breaks the streak: "fresh, then no answer, then fresh"
+      # is not three answers naming the release.
+      streak=0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep "$CANARY_LATEST_POLL_SECS"
+  done
+
+  if [ "$answered" -eq 0 ]; then
+    fail "UNVERIFIED (ENVIRONMENTAL): this runner got no answer from $RELEASES_LATEST_URL on any of $probes probe(s) in ${CANARY_LATEST_WAIT_SECS}s, so it could not confirm that GitHub reports v$expected as latest, and the canary node was NOT started. v$expected has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. Re-run the job."
+    return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+  fi
+  fail "GitHub never reported v$expected as latest within ${CANARY_LATEST_WAIT_SECS}s: $RELEASES_LATEST_URL last named '${last_seen}' ($answered answer(s) from $probes probe(s)). The canary node was NOT started, so this is not a verdict on the updater -- but it is not a propagation blip either: publication lag has measured under a minute. Until GitHub reports v$expected as latest, NO node can auto-update to it. Check that the release is published, is not a prerelease, is marked latest, and that no newer release has superseded it."
+  return 1
+}
+
 # True when THIS RUNNER can reach the release endpoint the node uses.
 #
 # A named function rather than the call inlined, so the decision below can be
@@ -1576,6 +1661,18 @@ cmd_selfupdate() {
   local starting
   starting="$("$work/bin/freenet" --version | head -1)"
   log "starting from: $starting"
+
+  # Do not ask the node about a release GitHub is not serving yet (#5715). Last
+  # thing before the boot, after the download, so the gap between "GitHub says
+  # latest" and the node's own check is as small as it can be. A non-zero return
+  # is propagated as-is: 1 is loud, 75 is EXIT_UNVERIFIED_ENVIRONMENTAL. The
+  # expected version stays the caller's argument; this only waits for GitHub to
+  # agree with it, it does not replace it with whatever GitHub says.
+  local wait_rc=0
+  wait_for_release_to_be_latest "$expected_version" || wait_rc=$?
+  if [ "$wait_rc" -ne 0 ]; then
+    return "$wait_rc"
+  fi
 
   # Arm the positive-equality check, as Gate A does. Gate B runs AFTER
   # publication, so `releases/latest` IS this release: the previous release's
