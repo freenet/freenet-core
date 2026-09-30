@@ -1201,8 +1201,10 @@ WAIT_CASE_BUDGET=10 WAIT_CASE_REACHABLE="yes no" wait_case "connect result reset
 # An outage GitHub then answered through says nothing about how the wait ended.
 WAIT_CASE_BUDGET=10 wait_case "an early outage followed by stale answers -> loud, not 75" 1 "" \
     "GitHub never reported v0.2.122 as latest within " FAIL FAIL 0.2.121
-WAIT_CASE_BUDGET=10 wait_case "never served within the budget -> 1, names the stale tag" 1 "" \
-    "GitHub never reported v0.2.122 as latest within " 0.2.121
+# Exactly 10s on the fake clock, which also pins the `- start` in the elapsed
+# time the message reports.
+WAIT_CASE_BUDGET=10 wait_case "never served within the budget -> 1, names the stale tag" 1 11 \
+    "GitHub never reported v0.2.122 as latest within 10s" 0.2.121
 # Lag only ever serves an OLDER tag, so a newer one is final: fail on the first
 # probe instead of spending the whole budget on an answer that cannot change.
 wait_case "a NEWER tag fails at once -> 1, after one probe" 1 1 \
