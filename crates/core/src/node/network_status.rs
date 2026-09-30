@@ -1775,16 +1775,13 @@ pub struct NetworkStatusSnapshot {
     pub contracts: Vec<ContractSnapshot>,
     pub op_stats: OpStatsSnapshot,
     pub nat_stats: NatStatsSnapshot,
-    /// True if all connections are to gateways (no peer-to-peer connections).
+    /// True if every connection is to a gateway (no peer-to-peer connections)
+    /// AND that has held for longer than [`GATEWAY_ONLY_GRACE_SECS`].
     ///
-    /// A plain fact, and true of every node for a while after it joins: a
-    /// node's first connection is always a gateway. Whether that is worth a
-    /// warning is [`Self::gateway_only_persisting`].
-    pub gateway_only: bool,
-    /// [`Self::gateway_only`] has held for longer than
-    /// [`GATEWAY_ONLY_GRACE_SECS`], so it is no longer just a node that has
-    /// not finished joining. This, not the raw flag, is what the dashboard
-    /// warns on.
+    /// The raw "all my peers are gateways" fact is deliberately not exposed:
+    /// it is true of every node for a while after it joins, since a node's
+    /// first connection is always a gateway, and rendering it as a warning
+    /// told every new user their firewall was at fault.
     pub gateway_only_persisting: bool,
     /// Cumulative bytes uploaded (lifetime, never reset).
     pub bytes_uploaded: u64,
@@ -2412,7 +2409,6 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             updates_received: s.op_stats.updates_received,
         },
         nat_stats,
-        gateway_only,
         gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
@@ -2870,12 +2866,16 @@ mod tests {
                 address: gw_addr,
                 is_gateway: true,
                 location: Some(0.5),
-                connected_since: Instant::now(),
+                // Older than the joining grace, so the state counts as
+                // persisting rather than as a node still connecting.
+                connected_since: Instant::now()
+                    .checked_sub(Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5))
+                    .expect("the monotonic clock is past the grace period"),
                 peer_key_location: None,
             });
         }
         let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        assert!(snap.gateway_only_persisting);
 
         // Not gateway-only: add a non-gateway peer
         {
@@ -2889,7 +2889,7 @@ mod tests {
             });
         }
         let snap = get_snapshot().unwrap();
-        assert!(!snap.gateway_only);
+        assert!(!snap.gateway_only_persisting);
 
         // Back to gateway-only: remove non-gateway peer
         {
@@ -2897,7 +2897,7 @@ mod tests {
             s.connected_peers.retain(|p| p.address != peer_addr);
         }
         let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        assert!(snap.gateway_only_persisting);
 
         // Cleanup
         {
@@ -3050,10 +3050,9 @@ mod tests {
             });
         };
 
-        // Freshly connected to a gateway: the fact is reported, the alarm is not.
+        // Freshly connected to a gateway: joining, not a problem.
         connect_gateway(Instant::now());
         let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
         assert!(!snap.gateway_only_persisting);
         assert_eq!(snap.health, HealthLevel::Healthy);
 
@@ -3063,7 +3062,6 @@ mod tests {
             .expect("the monotonic clock is further than the grace period from its origin");
         connect_gateway(long_ago);
         let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
         assert!(snap.gateway_only_persisting);
         assert_eq!(snap.health, HealthLevel::Degraded);
 

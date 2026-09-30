@@ -257,7 +257,6 @@ mod tests {
             contracts: Vec::new(),
             op_stats: OpStatsSnapshot::default(),
             nat_stats: NatStatsSnapshot::default(),
-            gateway_only: false,
             gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
@@ -599,7 +598,6 @@ mod tests {
         // Degraded
         let mut snap = base_snapshot();
         snap.health = HealthLevel::Degraded;
-        snap.gateway_only = true;
         snap.gateway_only_persisting = true;
         snap.open_connections = 1;
         let html = build_status_card(&Some(snap));
@@ -3453,7 +3451,6 @@ mod tests {
     fn status_card_does_not_diagnose_a_firewall_while_still_joining() {
         let mut snap = base_snapshot();
         snap.open_connections = 1;
-        snap.gateway_only = true;
         snap.gateway_only_persisting = false;
         snap.health = HealthLevel::Healthy;
         let html = build_status_card(&Some(snap));
@@ -3469,7 +3466,6 @@ mod tests {
         // Once it has persisted, the warning is real and must still appear.
         let mut snap = base_snapshot();
         snap.open_connections = 1;
-        snap.gateway_only = true;
         snap.gateway_only_persisting = true;
         snap.health = HealthLevel::Degraded;
         let html = build_status_card(&Some(snap));
