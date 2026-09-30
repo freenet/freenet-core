@@ -1287,6 +1287,9 @@ LATEST_PLAUSIBLE_LAG_SECS=120
 #        tag for the whole budget (a lag of minutes is not the CDN we have
 #        measured, and a release that is not "latest" is invisible to the fleet
 #        too), or the release itself arriving too late or flapping.
+#      - The wait ended on FAILED probes after GitHub had named a different tag
+#        later than LATEST_PLAUSIBLE_LAG_SECS into the wait: that stale answer
+#        is the finding, whatever the network did afterwards.
 #      - The wait ended on FAILED probes, and after at least one of them THIS
 #        RUNNER could connect (`runner_can_reach_github`).
 #        `resolve_expected_latest` collapses a 403, a 429, a 200 with no
