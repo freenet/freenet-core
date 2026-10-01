@@ -109,6 +109,18 @@ Each in-flight packet is released EXACTLY ONCE across these paths, because
 drop_stream / Abandon / ACK each REMOVE the packet from pending_receipts; a
 packet absent from pending_receipts yields no ack-info and cannot abandon.
 
+  - Since #5276 the receiver RE-ACKNOWLEDGES a retransmitted packet
+    (ReceivedPacketTracker's already-received arm re-queues the receipt), so
+    a receipt for an already-released packet is a routine, DELIBERATE wire
+    event, not an anomaly. Exactly-once therefore depends on
+    report_received_receipts emitting an ack-info tuple ONLY while the id is
+    still in pending_receipts, and removing it on the first hit. Do NOT make
+    an unknown receipt id an error, a warning, or a bookkeeping event, and do
+    NOT hoist per-id work above that membership guard — the packet_loss_
+    proportion decay is already above it and is documented there as inert for
+    that reason. Pinned by
+    peer_connection.rs::reacknowledged_retransmit_drains_flightsize_exactly_once.
+
   - on_timeout() applies the cwnd loss response only; it MUST NOT change
     flight size (the timed-out packet is immediately re-sent and stays in
     flight). Do NOT reintroduce a decrement-on-RTO + re-add-on-resend pair —
