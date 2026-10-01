@@ -513,17 +513,23 @@ pub(crate) enum SummaryPopulationSource {
     DigestAgreement,
     InboundBroadcast,
     ResyncResponse,
+    /// Derived, not received: the originator's #5147 covered list named this
+    /// peer, so it applied the same update we just did and its summary equals
+    /// our own post-merge summary. Costs no message. See
+    /// `operations::update::seed_covered_peer_summaries`.
+    CoveredListInference,
     Unknown,
 }
 
 impl SummaryPopulationSource {
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const COUNT: usize = 7;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Delivery,
         Self::InterestSummary,
         Self::DigestAgreement,
         Self::InboundBroadcast,
         Self::ResyncResponse,
+        Self::CoveredListInference,
         Self::Unknown,
     ];
 
@@ -538,6 +544,7 @@ impl SummaryPopulationSource {
             Self::DigestAgreement => "digest_agreement",
             Self::InboundBroadcast => "inbound_broadcast",
             Self::ResyncResponse => "resync_response",
+            Self::CoveredListInference => "covered_list_inference",
             Self::Unknown => "unknown",
         }
     }
