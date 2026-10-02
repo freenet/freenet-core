@@ -3013,9 +3013,6 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 self.unregister_local_hosting(&key);
                 outcome.hosting_unregistered += 1;
             }
-            if self.has_local_interest(&key) {
-                continue;
-            }
             let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
                 Some(entry) => entry.keys().cloned().collect(),
                 None => {
@@ -3025,7 +3022,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             };
             let mut dropped = 0;
             for peer in peers {
-                // Re-check per record: demand or a re-host may land mid-loop.
+                // Checked per record, so local interest (a client, delegate or
+                // downstream subscriber) or a re-host that lands mid-loop stops
+                // the drop.
                 if self.has_local_interest(&key) || is_hosted(&key) || in_use(&key) {
                     break;
                 }
