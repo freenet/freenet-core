@@ -43,7 +43,7 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
-use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 #[rustfmt::skip]
@@ -2037,9 +2037,13 @@ async fn cache_contract_locally(
 
     let mut removed_contracts = Vec::new();
     for (evicted_key, expected_generation) in &access_result.evicted {
-        if op_manager
-            .interest_manager
-            .unregister_local_hosting(evicted_key)
+        // Skip if re-hosted since the eviction decision (#5780): the
+        // reconcile pass would repair it, but not before it fell out of
+        // anti-entropy.
+        if !op_manager.ring.is_hosting_contract(evicted_key)
+            && op_manager
+                .interest_manager
+                .unregister_local_hosting(evicted_key)
         {
             removed_contracts.push(*evicted_key);
         }
@@ -2053,11 +2057,14 @@ async fn cache_contract_locally(
     // HOST-FORMATION site (GET cache path). About to (conditionally) announce
     // hosting; does the controller agree? Focused on `Announce`. Actual =
     // `{Announce}` iff production announces a NOT-yet-advertised host this event
-    // (`is_new && put_persisted` AND not already advertised — the announce is
+    // (`forms_host` AND not already advertised — the announce is
     // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
     // reflects the pre-announce state. DRIVES NOTHING.
+    let forms_host = access_result.is_new
+        && (state_matches || put_persisted)
+        && op_manager.ring.is_hosting_contract(&key);
     {
-        let will_announce = access_result.is_new && put_persisted;
+        let will_announce = forms_host;
         op_manager.record_reconcile_shadow_event(
             crate::node::network_status::ReconcileShadowSite::HostFormation,
             &key,
@@ -2072,44 +2079,16 @@ async fn cache_contract_locally(
         );
     }
 
-    // (4) Newly-hosted announcement gates on BOTH first-time access
-    // AND the fact that we actually persisted new state. Without
-    // persistence there's nothing to announce hosting for.
-    if access_result.is_new && put_persisted {
-        crate::operations::announce_contract_hosted(op_manager, &key).await;
-        // Directed-subscribe placement (#4404): best-effort nudge the node to
-        // consider migrating this freshly-hosted contract toward a closer
-        // neighbor. Dropped silently if the event channel is full — the next
-        // hosting/peer event re-triggers consideration.
-        if let Err(err) =
-            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
-        {
-            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (GET)");
-        }
-        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-        let added = if became_interested { vec![key] } else { vec![] };
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
-        }
-    } else {
-        // #5780: a fresh host whose state was already on disk (`state_matches`,
-        // e.g. re-hosted after an eviction that kept the state) is hosted just
-        // as much as one we persisted now. Register it so it joins
-        // anti-entropy (hosting-invariants invariant 1); before this it sat in
-        // the hosting cache with no local interest until a restart rehydrated
-        // it. The announce above stays gated on persisting new state.
-        let mut added = Vec::new();
-        if access_result.is_new
-            && state_matches
-            && op_manager.interest_manager.register_local_hosting(&key)
-        {
-            added.push(key);
-        }
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
-        }
+    // (4) A fresh host whose state is held locally, either persisted now or
+    // already on disk (`state_matches`, e.g. re-hosted after an eviction that
+    // kept the state), runs the full host-formation sequence: announce,
+    // register, interest change (#5780). Skipped if this access evicted the
+    // newcomer itself (Overflow), so a contract being reclaimed is never
+    // re-announced.
+    if forms_host {
+        crate::operations::complete_host_formation(op_manager, key, removed_contracts).await;
+    } else if !removed_contracts.is_empty() {
+        crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
 
     // D-CACHE-RET: current state is held locally iff it already matched or we
@@ -6058,35 +6037,87 @@ mod tests {
         );
     }
 
+    /// Code-only, whitespace-free text of `src`: comment lines dropped and all
+    /// whitespace removed, so a pin matches the code whatever rustfmt does to
+    /// its layout and is never satisfied by a commented-out line.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
     /// #5780: a GET that re-hosts a contract whose state was already on disk
-    /// (`state_matches`, so nothing new is persisted) must still register local
-    /// hosting, or the contract sits in the hosting cache outside anti-entropy.
-    /// Code lines only, so a commented-out registration fails this pin.
+    /// (`state_matches`) must form a host exactly like one that persisted new
+    /// state, through the shared helper, and only if the newcomer is still
+    /// hosted (an Overflow eviction can evict it in the same access).
     #[test]
-    fn cache_contract_locally_registers_a_rehost_whose_state_matched() {
-        let src = production_source();
-        let body = extract_fn_body(src, "async fn cache_contract_locally(");
-        let code: Vec<&str> = body
-            .lines()
-            .map(str::trim_start)
-            .filter(|line| !line.starts_with("//"))
-            .collect();
-        let gate = code
-            .iter()
-            .position(|line| line.starts_with("&& state_matches"))
-            .expect("a registration gated on state_matches");
-        assert!(
-            code[gate.saturating_sub(2)..gate]
-                .iter()
-                .any(|l| l.contains("access_result.is_new")),
-            "the state_matches registration must be for a fresh host (access_result.is_new)"
+    fn cache_contract_locally_forms_a_host_whenever_state_is_held() {
+        let body = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        let gate = concat!(
+            "letforms_host=access_result.is_new&&(state_matches||put_persisted)",
+            "&&op_manager.ring.is_hosting_contract(&key);"
         );
         assert!(
-            code[gate..(gate + 3).min(code.len())]
-                .iter()
-                .any(|l| l.contains("interest_manager.register_local_hosting(&key)")),
-            "the state_matches branch must call register_local_hosting"
+            body.contains(gate),
+            "forms_host must require is_new, held state and still hosted"
         );
+        let call = concat!(
+            "ifforms_host{crate::operations::",
+            "complete_host_formation("
+        );
+        assert!(
+            body.contains(call),
+            "a forming host must run the shared host-formation helper"
+        );
+    }
+
+    /// #5780: the shared host-formation helper runs the whole sequence, so no
+    /// caller can register without advertising (or the reverse).
+    #[test]
+    fn complete_host_formation_runs_announce_register_and_interest_change() {
+        const OPS: &str = include_str!("../../operations.rs");
+        let body = code_only(extract_fn_body(
+            OPS,
+            "pub(crate) async fn complete_host_formation(",
+        ));
+        for leg in [
+            concat!("announce_contract_hosted(", "op_manager,&key).await;"),
+            concat!("interest_manager.", "register_local_hosting(&key)"),
+            concat!(
+                "broadcast_change_interests(",
+                "op_manager,added,removed).await;"
+            ),
+        ] {
+            assert!(
+                body.contains(leg),
+                "complete_host_formation must contain `{leg}`"
+            );
+        }
+    }
+
+    /// #5780: the GET and PUT eviction loops must not unregister a contract
+    /// that has been re-hosted since the eviction decision.
+    #[test]
+    fn eviction_loops_skip_unregister_for_a_rehosted_contract() {
+        let get = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        assert!(get.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(evicted_key)"
+        )));
+        const PUT: &str = include_str!("../put/op_ctx_task.rs");
+        let put = code_only(&PUT[..PUT.find("#[cfg(test)]").expect("test section")]);
+        assert!(put.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(&evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(&evicted_key)"
+        )));
     }
 
     /// Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED.

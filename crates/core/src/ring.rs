@@ -3592,21 +3592,34 @@ impl Ring {
             }
 
             // Interest-record reconciliation (#5780): drop neighbour records for
-            // contracts this node neither hosts nor uses (two passes in a row),
-            // and register hosted contracts that are missing their local-hosting
-            // registration. Neighbours learn of both through the next interest
-            // heartbeat, which is a full replace.
+            // contracts this node has neither hosted nor used for
+            // `RECONCILE_MIN_UNUSED_AGE`, and repair hosted contracts that lack
+            // their local-hosting registration. A repair runs only after an
+            // authoritative state probe (the synchronous check assumes present
+            // on SQLite) and a fresh hosted check, and goes through the same
+            // host-formation sequence as a GET, so the copy is both advertised
+            // and in anti-entropy. Dropped records reach neighbours through the
+            // next interest heartbeat, which is a full replace.
             if let Some(op_manager) = &op_manager {
                 let hosted = ring.hosting_contract_keys();
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     &hosted,
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
-                    |key| ring.contract_state_present(key),
                 );
-                if outcome != crate::ring::interest::ReconcileOutcome::default() {
+                let mut repaired = 0usize;
+                for key in &outcome.missing_registration {
+                    if ring.contract_state_present_async(key).await && ring.is_hosting_contract(key)
+                    {
+                        crate::operations::complete_host_formation(op_manager, *key, Vec::new())
+                            .await;
+                        repaired += 1;
+                    }
+                }
+                if repaired > 0 || outcome.hosting_unregistered > 0 || outcome.contracts_dropped > 0
+                {
                     tracing::info!(
-                        hosting_registered = outcome.hosting_registered,
+                        hosting_repaired = repaired,
                         hosting_unregistered = outcome.hosting_unregistered,
                         contracts_dropped = outcome.contracts_dropped,
                         records_dropped = outcome.records_dropped,
@@ -7833,15 +7846,40 @@ mod k_closest_source_tests {
             src,
             "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
         );
-        let called = body.lines().any(|line| {
-            let code = line.trim_start();
-            !code.starts_with("//") && code.contains("interest_manager.reconcile_with_hosting(")
-        });
-        assert!(
-            called,
-            "sweep_get_subscription_cache must call interest_manager.reconcile_with_hosting \
-             on a code line (#5780)"
-        );
+        // Code only, whitespace removed: layout-proof, and a commented-out
+        // line cannot satisfy it.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for needle in [
+            // the call, with the hosting facts in the right order
+            concat!(
+                "interest_manager.reconcile_with_hosting(&hosted,",
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
+            ),
+            // repairs only after an authoritative probe and a fresh hosted check
+            concat!(
+                "ifring.contract_state_present_async(key).await",
+                "&&ring.is_hosting_contract(key)"
+            ),
+            concat!(
+                "crate::operations::",
+                "complete_host_formation(op_manager,*key,"
+            ),
+            // the post-eviction unregister skips a re-hosted contract
+            concat!(
+                "if!ring.is_hosting_contract(&key)&&op_manager",
+                ".interest_manager.unregister_local_hosting(&key)"
+            ),
+        ] {
+            assert!(
+                code.contains(needle),
+                "sweep_get_subscription_cache must contain `{needle}` (#5780)"
+            );
+        }
     }
 
     /// PR #4734 Fix 1: the periodic hosting sweep must retract the local hosting

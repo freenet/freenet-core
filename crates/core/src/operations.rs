@@ -274,6 +274,41 @@ pub(crate) fn reject_if_contract_banned_on(
     Ok(())
 }
 
+/// Side effects of a contract becoming hosted with its state held locally
+/// (#5780): advertise it to neighbours (so it receives live UPDATE fan-out),
+/// nudge placement, register local hosting (so it joins anti-entropy,
+/// hosting-invariants invariant 1), and send one interest change carrying it
+/// together with any `removed` contracts from the same event.
+///
+/// One helper so every path that forms a host runs the whole sequence: the GET
+/// cache path and the hosting sweep's reconciliation both call it. A path that
+/// registered without announcing left a re-hosted copy unadvertised after its
+/// eviction had retracted the advertisement.
+pub(crate) async fn complete_host_formation(
+    op_manager: &OpManager,
+    key: ContractKey,
+    removed: Vec<ContractKey>,
+) {
+    announce_contract_hosted(op_manager, &key).await;
+    // Directed-subscribe placement (#4404): best-effort nudge the node to
+    // consider migrating this freshly-hosted contract toward a closer
+    // neighbor. Dropped silently if the event channel is full; the next
+    // hosting/peer event re-triggers consideration.
+    if let Err(err) = op_manager
+        .try_notify_node_event(crate::message::NodeEvent::ConsiderContractMigration { key })
+    {
+        tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped");
+    }
+    let added = if op_manager.interest_manager.register_local_hosting(&key) {
+        vec![key]
+    } else {
+        Vec::new()
+    };
+    if !added.is_empty() || !removed.is_empty() {
+        broadcast_change_interests(op_manager, added, removed).await;
+    }
+}
+
 /// Announces to neighbors that we're hosting a contract.
 /// This broadcasts to all connected peers so they know to forward UPDATEs to us.
 pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &ContractKey) {

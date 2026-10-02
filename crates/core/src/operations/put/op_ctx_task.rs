@@ -2851,9 +2851,13 @@ async fn relay_put_store_locally(
 
         let mut removed_contracts = Vec::new();
         for (evicted_key, expected_generation) in evicted {
-            if op_manager
-                .interest_manager
-                .unregister_local_hosting(&evicted_key)
+            // Skip if re-hosted since the eviction decision (#5780): the
+            // reconcile pass would repair it, but not before it fell out of
+            // anti-entropy.
+            if !op_manager.ring.is_hosting_contract(&evicted_key)
+                && op_manager
+                    .interest_manager
+                    .unregister_local_hosting(&evicted_key)
             {
                 removed_contracts.push(evicted_key);
             }

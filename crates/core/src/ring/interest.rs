@@ -84,6 +84,19 @@ pub const INTEREST_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minu
 /// broadcast-target sources are symmetrically bounded (#3798 Gap 2).
 pub(crate) const MAX_INTERESTED_PEERS_PER_CONTRACT: usize = 512;
 
+/// How long a contract must stay neither hosted nor in use before
+/// [`InterestManager::reconcile_with_hosting`] drops its neighbour records
+/// (#5780). Two hosting-sweep intervals (60s each): long enough for an
+/// in-flight registration, a GET/PUT re-host or a spawned unsubscribe to land,
+/// and measured as elapsed time so stalled-then-burst sweep ticks cannot
+/// collapse it.
+pub(crate) const RECONCILE_MIN_UNUSED_AGE: Duration = Duration::from_secs(120);
+
+/// Most tracked contracts one reconcile pass examines (#5780). Peers can
+/// influence how many contracts have records, so a pass works through them in
+/// a rotating window rather than snapshotting all of them every minute.
+pub(crate) const MAX_RECONCILE_KEYS_PER_PASS: usize = 4096;
+
 /// Grace period before removing a disconnected peer's interests.
 ///
 /// When a peer disconnects, we defer interest removal for this duration instead of
@@ -1156,12 +1169,16 @@ pub(crate) fn summary_indicates_stale_peer(
     delta_indicates_change.unwrap_or(true)
 }
 
-/// What one [`InterestManager::reconcile_with_hosting`] pass changed (#5780).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What one [`InterestManager::reconcile_with_hosting`] pass found and changed
+/// (#5780).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ReconcileOutcome {
-    /// Hosted contracts that were missing their local-hosting registration.
-    pub hosting_registered: usize,
-    /// Contracts flagged as locally hosted that the hosting cache no longer holds.
+    /// Hosted contracts without a local-hosting registration. Not registered
+    /// here: the caller probes their stored state (authoritatively, on every
+    /// backend) and runs the full host-formation sequence for those that have
+    /// it, so a stateless phantom is never registered or advertised.
+    pub missing_registration: Vec<ContractKey>,
+    /// Local-hosting flags cleared for contracts the hosting cache no longer holds.
     pub hosting_unregistered: usize,
     /// Contracts whose neighbour records were all dropped.
     pub contracts_dropped: usize,
@@ -1313,11 +1330,15 @@ pub struct InterestManager<T: TimeSource> {
     /// in-flight duplicate, and sequential missing-summary sends.
     missing_summary_history: Mutex<LruCache<(ContractKey, PeerKey), MissingPairHistory>>,
 
-    /// Contracts that were neither hosted nor in use at the previous
-    /// [`Self::reconcile_with_hosting`] pass (#5780). A contract is cleaned up
-    /// only if it is still in that state on the next pass, so an in-flight
-    /// registration, a re-host or a just-spawned unsubscribe is never raced.
-    reconcile_candidates: Mutex<HashSet<ContractKey>>,
+    /// When [`Self::reconcile_with_hosting`] first saw each contract neither
+    /// hosted nor in use (#5780). A contract is cleaned up only once it has
+    /// stayed that way for [`RECONCILE_MIN_UNUSED_AGE`], measured on the time
+    /// source, so a burst of sweep ticks cannot shorten the wait. Entries are
+    /// removed when the contract is seen hosted or in use, when it is cleaned
+    /// up, or when it is no longer tracked.
+    reconcile_candidates: Mutex<HashMap<ContractKey, Instant>>,
+    /// Where the next reconcile pass starts its bounded scan (#5780).
+    reconcile_cursor: std::sync::atomic::AtomicUsize,
     /// Per-key entries are updated through DashMap's shard-local `entry()`
     /// API, so same-key increment/decrement stays atomic. The total-size
     /// bound checked in `begin_active_attempt` is a soft diagnostic cap (not
@@ -1388,7 +1409,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
                     .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
             )),
-            reconcile_candidates: Mutex::new(HashSet::new()),
+            reconcile_candidates: Mutex::new(HashMap::new()),
+            reconcile_cursor: std::sync::atomic::AtomicUsize::new(0),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
                     .expect("MISSING_SUMMARY_HISTORY_SIZE must be > 0"),
@@ -2590,11 +2612,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             if lost_interest {
                 drop(entry);
                 // Remove only if still uninterested: a concurrent add_* between
-                // dropping the guard and here must not be deleted (#5780).
-                self.local_interests
-                    .remove_if(contract, |_, v| !v.is_interested());
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2624,11 +2651,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             if lost_interest {
                 drop(entry);
                 // Remove only if still uninterested: a concurrent add_* between
-                // dropping the guard and here must not be deleted (#5780).
-                self.local_interests
-                    .remove_if(contract, |_, v| !v.is_interested());
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2655,11 +2687,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             if lost_interest {
                 drop(entry);
                 // Remove only if still uninterested: a concurrent add_* between
-                // dropping the guard and here must not be deleted (#5780).
-                self.local_interests
-                    .remove_if(contract, |_, v| !v.is_interested());
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2749,7 +2786,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(entry) = self.local_interests.get(contract) {
             if !entry.is_interested() {
                 drop(entry);
-                self.local_interests.remove(contract);
+                // Conditional: a concurrent add_* after the guard drop must not
+                // be deleted (#5780).
+                self.local_interests
+                    .remove_if(contract, |_, v| !v.is_interested());
             }
         }
     }
@@ -2892,63 +2932,84 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// hosting facts as closures.
     ///
     /// Each pass:
-    /// - a contract in `hosted_keys` whose state is present but which is not
-    ///   registered as locally hosted is registered, so it joins anti-entropy
-    ///   (hosting-invariants invariant 1);
-    /// - a contract that is neither hosted nor in use on two consecutive passes
-    ///   loses its stale local-hosting flag and then, if nothing else keeps a
-    ///   local interest in it (a local client or delegate, a downstream
-    ///   subscriber), every neighbour record. That also unindexes it, so the
-    ///   heartbeat stops advertising it.
+    /// - reports hosted contracts that lack a local-hosting registration
+    ///   ([`ReconcileOutcome::missing_registration`]) for the caller to verify
+    ///   and register;
+    /// - for a bounded window of tracked contracts, records when each was first
+    ///   seen neither hosted nor in use. Once that has lasted
+    ///   [`RECONCILE_MIN_UNUSED_AGE`], it clears a stale local-hosting flag and,
+    ///   if nothing else keeps a local interest in the contract (a local client
+    ///   or delegate, a downstream subscriber), drops every neighbour record,
+    ///   which also unindexes it so the heartbeat stops advertising it.
     ///
     /// Why level-triggered: neighbour records used to outlive eviction because
     /// the contract stayed in `contract_hash_index` while any record existed,
     /// so our heartbeat kept advertising it and neighbours kept refreshing the
     /// records. Several paths create records without a hosting check, so a
-    /// cleanup run only at the moment interest ends can be undone by a
-    /// registration already in flight. Checking the state every pass, and
-    /// acting only on a state seen twice, covers every such path.
+    /// cleanup run only when interest ends can be undone by a registration
+    /// already in flight. Re-checking the state every pass, waiting out
+    /// [`RECONCILE_MIN_UNUSED_AGE`], and re-checking hosted, in-use and local
+    /// interest immediately before each action covers those paths. The checks
+    /// are not atomic with concurrent registrations; a registration that lands
+    /// after a record is dropped is restored by the next heartbeat or renewal.
     pub(crate) fn reconcile_with_hosting(
         &self,
         hosted_keys: &[ContractKey],
         is_hosted: impl Fn(&ContractKey) -> bool,
         in_use: impl Fn(&ContractKey) -> bool,
-        state_present: impl Fn(&ContractKey) -> bool,
     ) -> ReconcileOutcome {
         let mut outcome = ReconcileOutcome::default();
+        let now = self.time_source.now();
 
         for key in hosted_keys {
             let flagged = self
                 .local_interests
                 .get(key)
                 .is_some_and(|entry| entry.hosting);
-            if !flagged && state_present(key) {
-                self.register_local_hosting(key);
-                outcome.hosting_registered += 1;
+            if !flagged && is_hosted(key) {
+                outcome.missing_registration.push(*key);
             }
         }
 
-        // Every contract this manager tracks in any form.
-        let mut tracked: HashSet<ContractKey> =
-            self.interested_peers.iter().map(|e| *e.key()).collect();
-        tracked.extend(self.local_interests.iter().map(|e| *e.key()));
+        // Bounded rotating window over every contract this manager tracks.
+        let total = self.interested_peers.len() + self.local_interests.len();
+        let start = if total == 0 {
+            0
+        } else {
+            self.reconcile_cursor
+                .fetch_add(MAX_RECONCILE_KEYS_PER_PASS, Ordering::Relaxed)
+                % total
+        };
+        let mut window: Vec<ContractKey> = self
+            .interested_peers
+            .iter()
+            .map(|e| *e.key())
+            .chain(self.local_interests.iter().map(|e| *e.key()))
+            .skip(start)
+            .take(MAX_RECONCILE_KEYS_PER_PASS)
+            .collect();
+        window.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        window.dedup();
 
-        let previous = std::mem::take(&mut *self.reconcile_candidates.lock());
-        let mut candidates = HashSet::new();
-        for key in tracked {
+        let mut candidates = self.reconcile_candidates.lock();
+        // Forget contracts that are no longer tracked at all.
+        candidates.retain(|key, _| {
+            self.interested_peers.contains_key(key) || self.local_interests.contains_key(key)
+        });
+        for key in window {
             if is_hosted(&key) || in_use(&key) {
+                candidates.remove(&key);
                 continue;
             }
-            if !previous.contains(&key) {
-                candidates.insert(key);
+            let first_seen = *candidates.entry(key).or_insert(now);
+            if now.saturating_duration_since(first_seen) < RECONCILE_MIN_UNUSED_AGE {
                 continue;
             }
-            // Second consecutive pass neither hosted nor in use.
             let flagged = self
                 .local_interests
                 .get(&key)
                 .is_some_and(|entry| entry.hosting);
-            if flagged {
+            if flagged && !is_hosted(&key) {
                 self.unregister_local_hosting(&key);
                 outcome.hosting_unregistered += 1;
             }
@@ -2957,12 +3018,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }
             let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
                 Some(entry) => entry.keys().cloned().collect(),
-                None => continue,
+                None => {
+                    candidates.remove(&key);
+                    continue;
+                }
             };
             let mut dropped = 0;
             for peer in peers {
-                // Re-check per record: a registration may land mid-loop.
-                if self.has_local_interest(&key) || is_hosted(&key) {
+                // Re-check per record: demand or a re-host may land mid-loop.
+                if self.has_local_interest(&key) || is_hosted(&key) || in_use(&key) {
                     break;
                 }
                 if self.remove_peer_interest_for(&key, &peer, InterestRemovalCause::Eviction) {
@@ -2973,8 +3037,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 outcome.contracts_dropped += 1;
                 outcome.records_dropped += dropped;
             }
+            if !self.interested_peers.contains_key(&key) {
+                candidates.remove(&key);
+            }
         }
-        *self.reconcile_candidates.lock() = candidates;
         outcome
     }
 
@@ -4253,13 +4319,42 @@ mod tests {
         );
     }
 
+    /// #5780: all three local-interest loss paths remove the entry only if it
+    /// is still uninterested, and report whether they removed it, so a
+    /// concurrent add is neither deleted nor followed by a false retraction.
+    #[test]
+    fn local_interest_loss_paths_remove_conditionally_and_report_it() {
+        const FULL: &str = include_str!("interest.rs");
+        let prod = &FULL[..FULL.find("\nmod tests {").expect("test module")];
+        let code: String = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = concat!(
+            "letremoved=self.local_interests.remove_if(contract,",
+            "|_,v|!v.is_interested()).is_some();"
+        );
+        assert_eq!(code.matches(needle).count(), 3, "all three loss paths");
+        assert_eq!(
+            code.matches(concat!("returnremoved;", "}lost_interest"))
+                .count(),
+            3
+        );
+        assert!(
+            !code.contains(concat!("self.local_interests.remove(", "contract);")),
+            "no unconditional removal of a local-interest entry"
+        );
+    }
+
     /// #5780 regression: a contract this node no longer hosts or uses keeps
     /// neighbour records indefinitely, because the records keep it indexed and
-    /// advertised. Reconciliation drops them on the second consecutive pass
-    /// that sees the contract unhosted and unused, and unindexes it.
+    /// advertised. Reconciliation drops them once the contract has stayed
+    /// unhosted and unused for `RECONCILE_MIN_UNUSED_AGE`, and unindexes it.
     #[test]
-    fn reconcile_drops_records_of_an_unhosted_unused_contract_after_two_passes() {
-        let (manager, _time) = make_manager();
+    fn reconcile_drops_records_of_an_unhosted_unused_contract_after_the_wait() {
+        let (manager, time) = make_manager();
         let contract = make_contract_key(1);
         let a = make_peer_key(1);
         let b = make_peer_key(2);
@@ -4278,13 +4373,23 @@ mod tests {
         );
 
         let no = |_: &ContractKey| false;
-        let first = manager.reconcile_with_hosting(&[], no, no, no);
-        assert_eq!(first, ReconcileOutcome::default(), "one pass must not act");
+        let first = manager.reconcile_with_hosting(&[], no, no);
+        assert_eq!(
+            first,
+            ReconcileOutcome::default(),
+            "first sighting must not act"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_with_hosting(&[], no, no),
+            ReconcileOutcome::default()
+        );
         assert!(manager.get_peer_interest(&contract, &a).is_some());
 
-        let second = manager.reconcile_with_hosting(&[], no, no, no);
-        assert_eq!(second.contracts_dropped, 1);
-        assert_eq!(second.records_dropped, 2);
+        time.advance_time(Duration::from_secs(1));
+        let done = manager.reconcile_with_hosting(&[], no, no);
+        assert_eq!(done.contracts_dropped, 1);
+        assert_eq!(done.records_dropped, 2);
         assert!(manager.get_peer_interest(&contract, &a).is_none());
         assert!(manager.get_peer_interest(&contract, &b).is_none());
         assert!(!manager.get_contracts_for_peer(&a).contains(&contract));
@@ -4296,28 +4401,55 @@ mod tests {
         );
     }
 
-    /// A contract re-hosted between the two passes is not dropped: the second
-    /// pass sees it hosted and clears it as a candidate.
+    /// Review finding (#5782): the hosting sweep's interval fires missed ticks
+    /// back to back after a stall, so the wait must be elapsed time, not a
+    /// count of passes. Many passes with no time passing drop nothing.
     #[test]
-    fn reconcile_keeps_records_of_a_contract_rehosted_between_passes() {
+    fn reconcile_burst_of_passes_without_elapsed_time_drops_nothing() {
         let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream = make_peer_key(1);
+        manager.register_peer_interest(&contract, upstream.clone(), None, true);
+        let no = |_: &ContractKey| false;
+        for _ in 0..10 {
+            assert_eq!(
+                manager.reconcile_with_hosting(&[], no, no),
+                ReconcileOutcome::default()
+            );
+        }
+        assert!(manager.get_peer_interest(&contract, &upstream).is_some());
+    }
+
+    /// Seeing the contract hosted (or in use) resets the wait: a contract that
+    /// goes unhosted again must wait the full age again.
+    #[test]
+    fn reconcile_rehost_resets_the_wait() {
+        let (manager, time) = make_manager();
         let contract = make_contract_key(1);
         let a = make_peer_key(1);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(&[], no, no, no);
+        manager.reconcile_with_hosting(&[], no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2);
         let hosted = |k: &ContractKey| *k == contract;
-        manager.reconcile_with_hosting(&[contract], hosted, no, |_| true);
-        manager.reconcile_with_hosting(&[contract], hosted, no, |_| true);
-        assert!(manager.get_peer_interest(&contract, &a).is_some());
+        manager.reconcile_with_hosting(&[], hosted, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2 + Duration::from_secs(1));
+        manager.reconcile_with_hosting(&[], no, no);
+        assert!(
+            manager.get_peer_interest(&contract, &a).is_some(),
+            "unhosted again for less than the full age: kept"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.reconcile_with_hosting(&[], no, no);
+        assert!(manager.get_peer_interest(&contract, &a).is_none());
     }
 
     /// Records of a contract that is in use (local client or downstream
     /// subscriber) or held by other local interest (a delegate) are kept
-    /// however many passes run.
+    /// however long it stays unhosted.
     #[test]
     fn reconcile_keeps_records_while_in_use_or_locally_interested() {
-        let (manager, _time) = make_manager();
+        let (manager, time) = make_manager();
         let in_use_key = make_contract_key(1);
         let delegate_key = make_contract_key(2);
         let a = make_peer_key(1);
@@ -4327,7 +4459,8 @@ mod tests {
         let in_use = |k: &ContractKey| *k == in_use_key;
         let no = |_: &ContractKey| false;
         for _ in 0..3 {
-            manager.reconcile_with_hosting(&[], no, in_use, no);
+            manager.reconcile_with_hosting(&[], no, in_use);
+            time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         }
         let upstream = manager.get_peer_interest(&in_use_key, &a).expect("kept");
         assert!(
@@ -4337,46 +4470,75 @@ mod tests {
         assert!(manager.get_peer_interest(&delegate_key, &a).is_some());
     }
 
-    /// A hosted contract with state present but no local-hosting registration
-    /// (e.g. re-hosted while a sweep's unregister landed) is registered, so it
-    /// joins anti-entropy; one without state is left alone.
+    /// The upstream record of a contract that is neither hosted nor in use is
+    /// dropped after the wait too: `send_unsubscribe_upstream` runs as soon as
+    /// the last subscriber goes, so two minutes later the record has no use.
     #[test]
-    fn reconcile_registers_hosted_contracts_missing_their_registration() {
+    fn reconcile_drops_a_stale_upstream_record_after_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream = make_peer_key(1);
+        manager.register_peer_interest(&contract, upstream.clone(), None, true);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no);
+        assert_eq!(outcome.records_dropped, 1);
+        assert!(manager.get_peer_interest(&contract, &upstream).is_none());
+    }
+
+    /// Hosted contracts without a local-hosting registration are REPORTED, not
+    /// registered: the caller verifies stored state before registering, so a
+    /// stateless phantom is never registered here.
+    #[test]
+    fn reconcile_reports_hosted_contracts_missing_their_registration() {
         let (manager, _time) = make_manager();
-        let with_state = make_contract_key(1);
-        let without_state = make_contract_key(2);
+        let registered = make_contract_key(1);
+        let missing = make_contract_key(2);
+        manager.register_local_hosting(&registered);
         let hosted = |_: &ContractKey| true;
         let no = |_: &ContractKey| false;
-        let outcome =
-            manager.reconcile_with_hosting(&[with_state, without_state], hosted, no, |k| {
-                *k == with_state
-            });
-        assert_eq!(outcome.hosting_registered, 1);
-        assert!(manager.has_local_interest(&with_state));
-        assert!(!manager.has_local_interest(&without_state));
+        let outcome = manager.reconcile_with_hosting(&[registered, missing], hosted, no);
+        assert_eq!(outcome.missing_registration, vec![missing]);
         assert!(
-            manager
-                .get_all_interest_hashes()
-                .contains(&contract_hash(&with_state))
+            !manager.has_local_interest(&missing),
+            "reconcile itself registers nothing"
         );
     }
 
     /// A contract flagged as locally hosted that the hosting cache no longer
-    /// holds loses the flag on the second pass, and then its records.
+    /// holds loses the flag after the wait, and then its records.
     #[test]
     fn reconcile_unregisters_a_stale_hosting_flag_then_drops_records() {
-        let (manager, _time) = make_manager();
+        let (manager, time) = make_manager();
         let contract = make_contract_key(1);
         let a = make_peer_key(1);
         manager.register_local_hosting(&contract);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(&[], no, no, no);
-        let outcome = manager.reconcile_with_hosting(&[], no, no, no);
+        manager.reconcile_with_hosting(&[], no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no);
         assert_eq!(outcome.hosting_unregistered, 1);
         assert_eq!(outcome.records_dropped, 1);
         assert!(!manager.has_local_interest(&contract));
         assert!(manager.get_peer_interest(&contract, &a).is_none());
+    }
+
+    /// The candidate map forgets contracts that are no longer tracked, so it
+    /// cannot outgrow the tracked set.
+    #[test]
+    fn reconcile_candidates_forget_untracked_contracts() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no);
+        assert_eq!(manager.reconcile_candidates.lock().len(), 1);
+        assert!(manager.remove_peer_interest(&contract, &a));
+        manager.reconcile_with_hosting(&[], no, no);
+        assert!(manager.reconcile_candidates.lock().is_empty());
     }
 
     /// [`summary_digest`] must be a FIXED function of the bytes — identical on
