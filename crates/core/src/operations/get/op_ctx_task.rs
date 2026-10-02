@@ -6058,6 +6058,35 @@ mod tests {
         );
     }
 
+    /// #5780: a GET that re-hosts a contract whose state was already on disk
+    /// (`state_matches`, so nothing new is persisted) must still register local
+    /// hosting, or the contract sits in the hosting cache outside anti-entropy.
+    /// Code lines only, so a commented-out registration fails this pin.
+    #[test]
+    fn cache_contract_locally_registers_a_rehost_whose_state_matched() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        let code: Vec<&str> = body
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+        let gate = code
+            .iter()
+            .position(|line| line.starts_with("&& state_matches"))
+            .expect("a registration gated on state_matches");
+        assert!(
+            code[gate.saturating_sub(2)..gate].iter().any(|l| l.contains("access_result.is_new")),
+            "the state_matches registration must be for a fresh host (access_result.is_new)"
+        );
+        assert!(
+            code[gate..(gate + 3).min(code.len())]
+                .iter()
+                .any(|l| l.contains("interest_manager.register_local_hosting(&key)")),
+            "the state_matches branch must call register_local_hosting"
+        );
+    }
+
     /// Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED.
     /// A successful GET with `subscribe=false` must NOT install a durable
     /// subscription — that is the "GET-auto-subscribe" anti-pattern
