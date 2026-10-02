@@ -3562,7 +3562,12 @@ impl Ring {
                     "Cleaned up expired hosting subscription from local state"
                 );
                 if let Some(op_manager) = &op_manager {
-                    if op_manager.interest_manager.unregister_local_hosting(&key) {
+                    // A GET/PUT may have re-hosted it since the eviction decision
+                    // (#5780); unregistering then would leave a hosted contract
+                    // outside anti-entropy until the reconcile pass below.
+                    if !ring.is_hosting_contract(&key)
+                        && op_manager.interest_manager.unregister_local_hosting(&key)
+                    {
                         removed_contracts.push(key);
                     }
                     crate::operations::reclaim_evicted_contract(
@@ -3584,6 +3589,30 @@ impl Ring {
                     removed_contracts,
                 )
                 .await;
+            }
+
+            // Interest-record reconciliation (#5780): drop neighbour records for
+            // contracts this node neither hosts nor uses (two passes in a row),
+            // and register hosted contracts that are missing their local-hosting
+            // registration. Neighbours learn of both through the next interest
+            // heartbeat, which is a full replace.
+            if let Some(op_manager) = &op_manager {
+                let hosted = ring.hosting_contract_keys();
+                let outcome = op_manager.interest_manager.reconcile_with_hosting(
+                    &hosted,
+                    |key| ring.is_hosting_contract(key),
+                    |key| ring.contract_in_use(key),
+                    |key| ring.contract_state_present(key),
+                );
+                if outcome != crate::ring::interest::ReconcileOutcome::default() {
+                    tracing::info!(
+                        hosting_registered = outcome.hosting_registered,
+                        hosting_unregistered = outcome.hosting_unregistered,
+                        contracts_dropped = outcome.contracts_dropped,
+                        records_dropped = outcome.records_dropped,
+                        "interest records reconciled with the hosted set"
+                    );
+                }
             }
 
             // Retry pending reclamations queued by the two skip points
@@ -7790,6 +7819,28 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// #5780: the periodic hosting sweep must run the interest-record
+    /// reconciliation, or evicted contracts keep their neighbours' records and
+    /// stay advertised. Requires the call on a code line (not a comment), so a
+    /// commented-out call fails this pin.
+    #[test]
+    fn sweep_reconciles_interest_records_with_the_hosted_set() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        let called = body.lines().any(|line| {
+            let code = line.trim_start();
+            !code.starts_with("//") && code.contains("interest_manager.reconcile_with_hosting(")
+        });
+        assert!(
+            called,
+            "sweep_get_subscription_cache must call interest_manager.reconcile_with_hosting \
+             on a code line (#5780)"
         );
     }
 

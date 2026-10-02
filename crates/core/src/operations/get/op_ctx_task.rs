@@ -2092,8 +2092,24 @@ async fn cache_contract_locally(
             crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
                 .await;
         }
-    } else if !removed_contracts.is_empty() {
-        crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
+    } else {
+        // #5780: a fresh host whose state was already on disk (`state_matches`,
+        // e.g. re-hosted after an eviction that kept the state) is hosted just
+        // as much as one we persisted now. Register it so it joins
+        // anti-entropy (hosting-invariants invariant 1); before this it sat in
+        // the hosting cache with no local interest until a restart rehydrated
+        // it. The announce above stays gated on persisting new state.
+        let mut added = Vec::new();
+        if access_result.is_new
+            && state_matches
+            && op_manager.interest_manager.register_local_hosting(&key)
+        {
+            added.push(key);
+        }
+        if !added.is_empty() || !removed_contracts.is_empty() {
+            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
+                .await;
+        }
     }
 
     // D-CACHE-RET: current state is held locally iff it already matched or we
