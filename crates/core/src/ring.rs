@@ -3784,6 +3784,7 @@ impl Ring {
             // join/peer_ready progress signal (snapshot presence alone only
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
+            snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -4987,6 +4988,27 @@ impl Ring {
     pub fn active_demand_count(&self) -> Option<usize> {
         self.upgrade_op_manager()
             .map(|op_manager| op_manager.interest_manager.active_demand_count())
+    }
+
+    /// Number of contracts this node keeps neighbour records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Such records keep the contract indexed and advertised in the interest
+    /// heartbeat, so neighbours keep refreshing them; reconciliation removes
+    /// them. `None` if the `OpManager` is not attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn orphan_interest_contract_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .contracts_with_peer_records()
+                .into_iter()
+                .filter(|key| {
+                    !self.is_hosting_contract(key)
+                        && !self.contract_in_use(key)
+                        && !op_manager.interest_manager.has_local_interest(key)
+                })
+                .count()
+        })
     }
 
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.
@@ -6996,6 +7018,7 @@ impl Ring {
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
+        snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 

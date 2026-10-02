@@ -18816,3 +18816,114 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
         control.replicas,
     );
 }
+
+/// #5780 regression: a node kept neighbour interest records for contracts it
+/// had evicted. The records kept each contract indexed, so the node's interest
+/// heartbeat kept advertising it and neighbours kept refreshing the records;
+/// nothing ever removed them, and their summaries held memory indefinitely.
+///
+/// A hub GETs many contracts one at a time under a hosting budget that holds
+/// only a few, pausing between GETs so interest records form for each contract
+/// while it is hosted, and the later GETs evict the earlier ones. The run then
+/// continues on virtual time well past `RECONCILE_MIN_UNUSED_AGE` plus several
+/// hosting sweeps and an interest heartbeat. (The injectable hosting clock is
+/// not used: it is frozen between explicit advances, so a contract first seen
+/// after the last advance would never age.) Every node must end with no records for a
+/// contract it neither hosts nor uses nor has local interest in.
+#[test]
+fn test_evicted_contracts_keep_no_interest_records() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "evicted-interest-records";
+    const SEED: u64 = 0x5780_0001_CAFE;
+    const CONTRACTS: u8 = 10;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let hub = NodeLabel::node(NETWORK, 1);
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| SimOperation::create_test_contract(80 + i))
+        .collect();
+
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 3, 7, 3, 10, 2, SEED).await;
+        // Holds a few 64-byte test states, so the hub's later GETs evict its
+        // earlier ones.
+        sim.with_hosting_budget(256);
+        // Hold each contract across interest exchanges before the next GET.
+        sim.with_controlled_op_interval(Duration::from_secs(45));
+        sim
+    });
+
+    let mut ops = Vec::new();
+    for (i, c) in contracts.iter().enumerate() {
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: c.clone(),
+                state: SimOperation::create_test_state(80 + i as u8),
+                subscribe: false,
+            },
+        ));
+    }
+    for c in &contracts {
+        ops.push(ScheduledOperation::new(
+            hub.clone(),
+            SimOperation::Get {
+                contract_id: *c.key().id(),
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+    let result = sim.run_controlled_simulation(
+        SEED,
+        ops,
+        Duration::from_secs(3600),
+        // Quiet period before measuring. A contract can legitimately stay in
+        // use for up to one 8-minute subscription lease after the last access,
+        // and a neighbour may refresh a record until our next interest
+        // heartbeat (5 min) tells it we are no longer interested; the record
+        // is then dropped after the 120s wait plus up to one 60s sweep.
+        Duration::from_secs(1500),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let hub_hosting = result.node_hosting_count(&hub);
+    // Scenario sanity: eviction actually happened at the hub, so the assertion
+    // below is about evicted contracts and not a run where nothing was evicted.
+    assert!(
+        hub_hosting < CONTRACTS as usize,
+        "hub hosts {hub_hosting} of {CONTRACTS} contracts; the budget did not force eviction"
+    );
+
+    // Each node's latest topology snapshot (taken every virtual second while
+    // its `OpManager` was attached) carries its orphan-record count; the live
+    // `OpManager` is gone by the time the run returns.
+    let mut measured = 0;
+    for snap in &result.topology_snapshots {
+        let Some(orphans) = snap.orphan_interest_contracts else {
+            continue;
+        };
+        measured += 1;
+        eprintln!(
+            "[#5780] peer={} hosting={} orphan_interest_contracts={orphans} at={}s",
+            snap.peer_addr,
+            snap.contracts.len(),
+            snap.timestamp_nanos / 1_000_000_000
+        );
+        assert_eq!(
+            orphans, 0,
+            "peer {} keeps interest records for {orphans} contract(s) it neither hosts nor \
+             uses; they stay advertised and their summaries are never freed (#5780)",
+            snap.peer_addr
+        );
+    }
+    assert!(measured >= 2, "only {measured} node(s) were measurable");
+}

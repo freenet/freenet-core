@@ -97,6 +97,11 @@ pub struct TopologySnapshot {
     /// one handshake and can originate operations. See
     /// `SimNetwork::wait_for_join_convergence_before_ops`.
     pub connection_count: usize,
+    /// Contracts this peer keeps neighbour interest records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Stamped by the registration sites; `None` when the `OpManager` was not
+    /// attached at snapshot time. See `Ring::orphan_interest_contract_count`.
+    pub orphan_interest_contracts: Option<usize>,
 }
 
 impl TopologySnapshot {
@@ -109,6 +114,7 @@ impl TopologySnapshot {
             active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
             connection_count: 0,
+            orphan_interest_contracts: None,
         }
     }
 

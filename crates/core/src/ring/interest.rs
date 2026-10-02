@@ -2980,14 +2980,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .fetch_add(MAX_RECONCILE_KEYS_PER_PASS, Ordering::Relaxed)
                 % total
         };
-        let mut window: Vec<ContractKey> = self
-            .interested_peers
-            .iter()
-            .map(|e| *e.key())
-            .chain(self.local_interests.iter().map(|e| *e.key()))
+        let tracked_keys = || {
+            self.interested_peers
+                .iter()
+                .map(|e| *e.key())
+                .chain(self.local_interests.iter().map(|e| *e.key()))
+        };
+        let mut window: Vec<ContractKey> = tracked_keys()
             .skip(start)
             .take(MAX_RECONCILE_KEYS_PER_PASS)
             .collect();
+        // Wrap to the front, so a pass sees every tracked contract whenever
+        // they fit in one window, whatever the start offset.
+        let room = MAX_RECONCILE_KEYS_PER_PASS.saturating_sub(window.len());
+        window.extend(tracked_keys().take(start.min(room)));
         window.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
         window.dedup();
 
@@ -3074,6 +3080,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // Sort for deterministic ordering (critical for simulation tests)
         hashes.sort_unstable();
         hashes
+    }
+
+    /// Contracts that have at least one neighbour record, sorted (#5780 sim
+    /// assertions).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn contracts_with_peer_records(&self) -> Vec<ContractKey> {
+        let mut keys: Vec<ContractKey> = self.interested_peers.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        keys
     }
 
     /// Get contracts we're interested in that match the given hashes.
@@ -4417,6 +4432,32 @@ mod tests {
             );
         }
         assert!(manager.get_peer_interest(&contract, &upstream).is_some());
+    }
+
+    /// Review finding: with fewer tracked contracts than the per-pass cap, the
+    /// window must wrap to the front. Without the wrap, a pass that starts at
+    /// offset k never examines the first k contracts, so they are cleaned up
+    /// only on passes that start at 0.
+    #[test]
+    fn reconcile_window_examines_every_contract_when_they_fit() {
+        let (manager, time) = make_manager();
+        let a = make_peer_key(1);
+        let contracts: Vec<_> = (1..=5).map(make_contract_key).collect();
+        for c in &contracts {
+            manager.register_peer_interest(c, a.clone(), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        // Move the cursor off zero so the next passes do not start at offset 0.
+        manager
+            .reconcile_cursor
+            .store(MAX_RECONCILE_KEYS_PER_PASS, Ordering::Relaxed);
+        manager.reconcile_with_hosting(&[], no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no);
+        assert_eq!(outcome.contracts_dropped, contracts.len());
+        for c in &contracts {
+            assert!(manager.get_peer_interest(c, &a).is_none());
+        }
     }
 
     /// Seeing the contract hosted (or in use) resets the wait: a contract that
