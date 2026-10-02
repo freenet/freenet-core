@@ -6076,7 +6076,9 @@ mod tests {
             .position(|line| line.starts_with("&& state_matches"))
             .expect("a registration gated on state_matches");
         assert!(
-            code[gate.saturating_sub(2)..gate].iter().any(|l| l.contains("access_result.is_new")),
+            code[gate.saturating_sub(2)..gate]
+                .iter()
+                .any(|l| l.contains("access_result.is_new")),
             "the state_matches registration must be for a fresh host (access_result.is_new)"
         );
         assert!(
