@@ -816,6 +816,12 @@ unchecked writer.
   errors) answers "present" when it cannot tell; a repair keyed on it
   registers and advertises stateless phantoms (#4610 shape). #5782 removed
   such a repair rather than gate it; the residual is #5784.
+- **A node's own subscription lease is not demand.** It exists to receive
+  updates for a hosted copy, so it follows hosting and never justifies it.
+  Demand is a local client or a downstream subscriber (`contract_in_use`).
+  When the copy is gone, release the lease (unsubscribe upstream) rather than
+  count it as use; the advertisement retraction refuses while a lease is live,
+  so the lease has to go first.
 
 The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration

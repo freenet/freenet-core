@@ -3598,31 +3598,57 @@ impl Ring {
             // stale local-hosting flag cleared here has its co-host
             // advertisement retracted, as an eviction would; neighbours are told
             // the interest ended only if it did (a delegate or local client can
-            // keep it).
+            // keep it). This node's own subscription lease toward the contract
+            // is not demand: it only exists to receive updates for a hosted
+            // copy, so once the copy is gone it is released (unsubscribe
+            // upstream), and only then can the advertisement be retracted,
+            // since the retraction keeps an advertisement while a lease is live.
             if let Some(op_manager) = &op_manager {
-                // In use includes an upstream subscription lease, the same
-                // gate the advertisement retraction applies, so a flag is
-                // never cleared while its advertisement must stay.
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     |key| ring.is_hosting_contract(key),
-                    |key| ring.contract_in_use(key) || ring.is_subscribed(key),
+                    |key| ring.contract_in_use(key),
+                    |key| ring.is_subscribed(key),
                 );
                 for key in &outcome.hosting_flags_cleared {
-                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
+                    if !outcome.leases_to_release.contains(key) {
+                        crate::operations::retract_advertisement_for_evicted_contract(
+                            op_manager, key,
+                        );
+                    }
                 }
-                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
+                for &key in &outcome.leases_to_release {
+                    let op_mgr = op_manager.clone();
+                    GlobalExecutor::spawn(async move {
+                        op_mgr.send_unsubscribe_upstream(&key).await;
+                        crate::operations::retract_advertisement_for_evicted_contract(
+                            &op_mgr, &key,
+                        );
+                    });
+                }
+                if !outcome.hosting_flags_cleared.is_empty()
+                    || !outcome.leases_to_release.is_empty()
+                    || outcome.contracts_dropped > 0
+                {
                     tracing::info!(
                         hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
+                        leases_released = outcome.leases_to_release.len(),
                         contracts_dropped = outcome.contracts_dropped,
                         records_dropped = outcome.records_dropped,
                         "interest records reconciled with the hosted set"
                     );
                 }
-                if !outcome.interest_lost.is_empty() {
+                // Skip any contract that regained local interest since the pass,
+                // so this removal cannot follow a concurrent re-host's addition.
+                let interest_lost: Vec<ContractKey> = outcome
+                    .interest_lost
+                    .into_iter()
+                    .filter(|key| !op_manager.interest_manager.has_local_interest(key))
+                    .collect();
+                if !interest_lost.is_empty() {
                     crate::operations::broadcast_change_interests(
                         op_manager,
                         Vec::new(),
-                        outcome.interest_lost,
+                        interest_lost,
                     )
                     .await;
                 }
@@ -7887,21 +7913,29 @@ mod k_closest_source_tests {
             // the call, with the hosting facts in the right order
             concat!(
                 "interest_manager.reconcile_with_hosting(",
-                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key)||ring.is_subscribed(key),)"
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
+                "|key|ring.is_subscribed(key),)"
             ),
-            // every cleared stale flag is retracted like an eviction
+            // every cleared stale flag is retracted like an eviction, except
+            // where a lease must be released first
             concat!(
-                "forkeyin&outcome.hosting_flags_cleared{crate::operations::",
-                "retract_advertisement_for_evicted_contract(op_manager,key);}"
+                "forkeyin&outcome.hosting_flags_cleared{if!outcome.leases_to_release.contains(key)",
+                "{crate::operations::retract_advertisement_for_evicted_contract(op_manager,key,);}}"
             ),
-            // neighbours are told only when interest actually ended
+            // our own lease is released (unsubscribe upstream), then retracted
             concat!(
-                "if!outcome.interest_lost.is_empty(){",
-                "crate::operations::broadcast_change_interests("
+                "op_mgr.send_unsubscribe_upstream(&key).await;",
+                "crate::operations::retract_advertisement_for_evicted_contract(&op_mgr,&key,);"
+            ),
+            // neighbours are told only when interest actually ended, and still
+            // has not come back
+            concat!(
+                ".filter(|key|!op_manager.interest_manager.has_local_interest(key))",
+                ".collect();if!interest_lost.is_empty(){"
             ),
             concat!(
                 "crate::operations::broadcast_change_interests(op_manager,",
-                "Vec::new(),outcome.interest_lost,)"
+                "Vec::new(),interest_lost,)"
             ),
             // the post-eviction unregister skips a re-hosted contract
             concat!(
@@ -7919,7 +7953,7 @@ mod k_closest_source_tests {
             .find("forkeyin&outcome.hosting_flags_cleared{")
             .expect("retraction loop");
         let broadcast = code
-            .find("Vec::new(),outcome.interest_lost,)")
+            .find("Vec::new(),interest_lost,)")
             .expect("interest broadcast");
         assert!(
             retract < broadcast,

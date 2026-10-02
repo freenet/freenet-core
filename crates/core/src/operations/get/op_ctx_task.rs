@@ -2065,26 +2065,29 @@ async fn cache_contract_locally(
     // A re-host from state already on disk forms a host only if the contract
     // code is on disk too: a partial reclamation can delete the code and leave
     // the state, and `state_matches` reads the state alone (#5782). Checked
-    // only on this branch, since it loads the WASM.
-    let rehost_has_code = if access_result.is_new && state_matches && !put_persisted {
-        matches!(
-            op_manager
-                .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                    instance_id: *key.id(),
-                    return_contract_code: true,
-                })
-                .await,
-            Ok(ContractHandlerEvent::GetResponse {
-                response: Ok(StoreResponse {
-                    contract: Some(_),
+    // only on this branch, and only while still hosted, since it loads the
+    // WASM. It reads the code on disk and ignores code carried by the GET:
+    // restoring missing code from the GET is #5784.
+    let rehost_has_code =
+        if access_result.is_new && state_matches && op_manager.ring.is_hosting_contract(&key) {
+            matches!(
+                op_manager
+                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                        instance_id: *key.id(),
+                        return_contract_code: true,
+                    })
+                    .await,
+                Ok(ContractHandlerEvent::GetResponse {
+                    response: Ok(StoreResponse {
+                        contract: Some(_),
+                        ..
+                    }),
                     ..
-                }),
-                ..
-            })
-        )
-    } else {
-        false
-    };
+                })
+            )
+        } else {
+            false
+        };
     let forms_host = access_result.is_new
         && (put_persisted || rehost_has_code)
         && op_manager.ring.is_hosting_contract(&key);
@@ -6088,13 +6091,21 @@ mod tests {
             "letforms_host=access_result.is_new&&(put_persisted||rehost_has_code)",
             "&&op_manager.ring.is_hosting_contract(&key);"
         );
-        // A state-only re-host must also find the code on disk.
+        // A state-only re-host must also find the code on disk: the query
+        // asks for the code and only a returned contract counts.
+        let check = body
+            .split_once("letrehost_has_code=")
+            .expect("rehost_has_code")
+            .1
+            .split_once("letforms_host=")
+            .expect("forms_host after rehost_has_code")
+            .0;
         assert!(
-            body.contains(concat!(
-                "letrehost_has_code=ifaccess_result.is_new&&state_matches&&!put_persisted{",
-                "matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
+            check.starts_with(concat!(
+                "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
+                "{matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
                 "instance_id:*key.id(),return_contract_code:true,})"
-            )) && body.contains("contract:Some(_),"),
+            )) && check.contains("contract:Some(_),"),
             "a state-only re-host must check the contract code is present"
         );
         assert!(
