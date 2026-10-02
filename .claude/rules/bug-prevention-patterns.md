@@ -774,3 +774,69 @@ grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegat
 # reachable from the driver.
 grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/
 ```
+
+
+## A mirror of hosting state cleaned up only when the mirror changes
+
+**State that mirrors another structure's membership must be reconciled against
+that structure on a timer, not only cleaned up at the moment the mirror
+changes.** `InterestManager` mirrors the hosting cache (`LocalInterest.hosting`,
+and the neighbour records in `interested_peers` that ride on it), and
+several paths write the mirror without consulting the source: the `Interests`
+heartbeat handler, `upsert_peer_summary_from`, a subscribe finaliser. A cleanup
+run at the instant local interest ends can be undone by a registration already
+in flight, and nothing ever runs it again.
+
+#5780: eviction cleared `LocalInterest.hosting` but left `interested_peers`.
+The records kept the contract in `contract_hash_index`, so the heartbeat kept
+advertising it, so neighbours kept refreshing the records. Evicting a contract
+freed almost none of its memory. #5779's first fix dropped the records at the
+moment interest ended (edge-triggered) and review found it raced every
+unchecked writer.
+
+### Fix shape (#5782)
+
+- **Level-triggered reconciliation** on the existing hosting sweep
+  (`InterestManager::reconcile_with_hosting`), acting only on a state that has
+  held for `RECONCILE_MIN_UNUSED_AGE`.
+- **Measure the wait in elapsed time, never in passes.** The sweep's
+  `tokio::time::interval` uses `MissedTickBehavior::Burst`, so after a stall
+  two passes can run milliseconds apart.
+- **Restart the wait on every change to the mirror**, not only when a pass
+  observes the source: a re-host and re-eviction between two passes is
+  invisible to the passes.
+- **Re-check the source immediately before each destructive step**, and say in
+  the doc comment that the checks are not atomic and what restores state when
+  a registration lands just after a drop.
+- **When a pass works through a bounded window, resume from a KEY, not an
+  offset.** An offset into unordered map iteration loses coverage under churn.
+- **Do not add a repair that writes the mirror from a probe that can be
+  inconclusive.** `contract_state_present` (and the async variant on SQLite
+  errors) answers "present" when it cannot tell; a repair keyed on it
+  registers and advertises stateless phantoms (#4610 shape). #5782 removed
+  such a repair rather than gate it; the residual is #5784.
+
+The two paths that form a CACHE host (the GET cache path and the PUT relay
+store) go through `operations::complete_host_formation` (announce, migration
+nudge, register local hosting, interest change), behind an
+`is_hosting_contract` check, so neither registers without advertising nor
+advertises a contract it no longer holds. This is the "manually-inlined side
+effects" row applied to hosting. The subscribe finalisers in `subscribe.rs`
+announce on their own: they register demand (`add_local_client`, a downstream
+subscriber) rather than cache hosting, so they are not cache host formation.
+
+### Audit
+
+```bash
+# Writers of the mirror that do not consult the hosting cache:
+grep -n "interested_peers.entry\|register_local_hosting\|unregister_local_hosting" crates/core/src/ring/interest.rs crates/core/src/operations/
+# Announce call sites. Outside `complete_host_formation` itself, expect only the
+# two subscribe finalisers in subscribe.rs (demand, not cache hosting) plus
+# needle strings in pin tests; a new cache-hosting path must use the helper.
+grep -rn "announce_contract_hosted(" crates/core/src/operations* | grep -v "fn announce_contract_hosted"
+```
+
+Simulation guard: `test_evicted_contracts_keep_no_interest_records` asserts
+that no peer keeps records for a contract it neither hosts nor uses, and that
+reconciliation actually dropped some, so a run in which no records formed
+cannot pass.
