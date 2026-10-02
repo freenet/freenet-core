@@ -3041,9 +3041,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .get(&key)
                 .is_some_and(|entry| entry.hosting);
             if flagged && !is_hosted(&key) {
-                outcome.hosting_flags_cleared.push(key);
-                if self.unregister_local_hosting(&key) {
-                    outcome.interest_lost.push(key);
+                let lost = self.unregister_local_hosting(&key);
+                if is_hosted(&key) {
+                    // Re-hosted between the check and the clear: put the flag
+                    // back and report nothing (#5782).
+                    self.register_local_hosting(&key);
+                } else {
+                    outcome.hosting_flags_cleared.push(key);
+                    if lost {
+                        outcome.interest_lost.push(key);
+                    }
                 }
             }
             let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
@@ -4749,6 +4756,37 @@ mod tests {
                 .local_interests
                 .get(&contract)
                 .expect("kept")
+                .hosting
+        );
+    }
+
+    /// Codex finding (#5782 round 4): a re-host that lands between the
+    /// "still unhosted" check and the flag clear must not leave a hosted
+    /// contract without its flag. The flag is put back and nothing is
+    /// reported for retraction or broadcast.
+    #[test]
+    fn reconcile_restores_a_flag_cleared_under_a_concurrent_rehost() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Calls: the window check, the check before the clear, the check
+        // after it. Hosted only by the third.
+        let calls = std::cell::Cell::new(0);
+        let rehosted_during_clear = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let outcome = manager.reconcile_with_hosting(rehosted_during_clear, no);
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(outcome.interest_lost.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("restored")
                 .hosting
         );
     }

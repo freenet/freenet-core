@@ -2654,8 +2654,9 @@ where
 /// Store a relayed PUT's contract locally: `put_contract` + `host_contract`
 /// (unconditional, so EVERY genuine PUT refreshes hosting recency —
 /// invariant 3 / #4903 review Fix 1) + (on first host, gated on the atomic
-/// `host_contract` `is_new` result) `announce_contract_hosted` + interest
-/// register/unregister + broadcast interest changes.
+/// `host_contract` `is_new` result) eviction teardown, then host formation
+/// through `operations::complete_host_formation` (announce, interest register,
+/// interest changes) while the contract is still hosted (#5780).
 ///
 /// Shared between the non-streaming relay driver (`drive_relay_put`)
 /// and the streaming relay driver (`drive_relay_put_streaming`) so both
@@ -2812,8 +2813,9 @@ async fn relay_put_store_locally(
     // result (`is_new`), NOT a pre-await `is_hosting_contract` snapshot
     // (#4903 review round-3 Fix 1): a sweep can evict this contract during the
     // `put_contract().await` above, in which case `host_contract` re-adds it
-    // (`is_new = true`) and we MUST run announce / interest-register /
-    // evicted-teardown here. A stale pre-await "was already hosting" snapshot
+    // (`is_new = true`) and we MUST run evicted-teardown and host formation
+    // here (host formation itself is skipped if the contract has been evicted
+    // again by then). A stale pre-await "was already hosting" snapshot
     // would skip them AND drop `access_result.evicted` (leaking the contracts
     // this re-add shed to make room). On the already-hosted refresh path
     // `is_new` is false and `evicted` is empty (`record_access_with_demand`

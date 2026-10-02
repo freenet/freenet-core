@@ -1887,9 +1887,8 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 /// 4. **Newly-hosted announcement** — runs through
 ///    `operations::complete_host_formation` when this access newly hosts
 ///    the contract with its state held locally, whether persisted now or
-///    already on disk, and it is still hosted (`forms_host`:
-///    `is_new && (state_matches || put_persisted)` and still in the
-///    hosting cache, #5780). NOT gated on
+///    already on disk with its code, and it is still hosted (`forms_host`,
+///    #5780). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
 ///
@@ -2063,8 +2062,31 @@ async fn cache_contract_locally(
     // (`forms_host` AND not already advertised — the announce is
     // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
     // reflects the pre-announce state. DRIVES NOTHING.
+    // A re-host from state already on disk forms a host only if the contract
+    // code is on disk too: a partial reclamation can delete the code and leave
+    // the state, and `state_matches` reads the state alone (#5782). Checked
+    // only on this branch, since it loads the WASM.
+    let rehost_has_code = if access_result.is_new && state_matches && !put_persisted {
+        matches!(
+            op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: true,
+                })
+                .await,
+            Ok(ContractHandlerEvent::GetResponse {
+                response: Ok(StoreResponse {
+                    contract: Some(_),
+                    ..
+                }),
+                ..
+            })
+        )
+    } else {
+        false
+    };
     let forms_host = access_result.is_new
-        && (state_matches || put_persisted)
+        && (put_persisted || rehost_has_code)
         && op_manager.ring.is_hosting_contract(&key);
     {
         let will_announce = forms_host;
@@ -6063,8 +6085,17 @@ mod tests {
             "async fn cache_contract_locally(",
         ));
         let gate = concat!(
-            "letforms_host=access_result.is_new&&(state_matches||put_persisted)",
+            "letforms_host=access_result.is_new&&(put_persisted||rehost_has_code)",
             "&&op_manager.ring.is_hosting_contract(&key);"
+        );
+        // A state-only re-host must also find the code on disk.
+        assert!(
+            body.contains(concat!(
+                "letrehost_has_code=ifaccess_result.is_new&&state_matches&&!put_persisted{",
+                "matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
+                "instance_id:*key.id(),return_contract_code:true,})"
+            )) && body.contains("contract:Some(_),"),
+            "a state-only re-host must check the contract code is present"
         );
         assert!(
             body.contains(gate),
@@ -6089,6 +6120,26 @@ mod tests {
             OPS,
             "pub(crate) async fn complete_host_formation(",
         ));
+        // Order: announce, then the re-check (which returns early), then the
+        // migration nudge and the registration.
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("complete_host_formation must contain `{needle}`"))
+        };
+        let announce = pos(concat!(
+            "announce_contract_hosted(",
+            "op_manager,&key).await;"
+        ));
+        let recheck = pos(concat!(
+            "if!op_manager.ring.is_hosting_contract(&key){",
+            "retract_"
+        ));
+        let bail = pos(concat!(
+            "broadcast_change_interests(op_manager,Vec::new(),removed)",
+            ".await;}return;}"
+        ));
+        let register = pos(concat!("interest_manager.", "register_local_hosting(&key)"));
+        assert!(announce < recheck && recheck < bail && bail < register);
         for leg in [
             concat!("announce_contract_hosted(", "op_manager,&key).await;"),
             // re-checked after the announce await; an eviction there is retracted

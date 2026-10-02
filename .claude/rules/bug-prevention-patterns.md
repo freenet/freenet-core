@@ -821,10 +821,16 @@ The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration
 nudge, register local hosting, interest change). The caller checks
 `is_hosting_contract` before it, and the helper checks again after the
-announce await and retracts if the contract was evicted meanwhile. Neither
-check is atomic with eviction: a flag set just before an eviction is cleared
-and its advertisement retracted by reconciliation, so the window is bounded by
-`RECONCILE_MIN_UNUSED_AGE`, not closed. This is the "manually-inlined side
+announce await and registers nothing if the contract was evicted meanwhile.
+Its retraction there is usually a no-op (the eviction already removed the
+advertisement entry), and every hosting retraction is best-effort: a dropped
+one is healed when a co-host re-requests our hosted set on the interest
+heartbeat. Neither check is atomic with eviction: a flag set just before an
+eviction is cleared and its advertisement retracted by reconciliation, within
+`RECONCILE_MIN_UNUSED_AGE` plus one sweep interval, since registering restarts
+the wait. The window is bounded, not closed. A re-host from state already on
+disk also requires the contract code on disk, because a partial reclamation
+can delete the code and leave the state. This is the "manually-inlined side
 effects" row applied to hosting. The subscribe finalisers in `subscribe.rs`
 announce on their own: they register demand (`add_local_client`, a downstream
 subscriber) rather than cache hosting, so they are not cache host formation.

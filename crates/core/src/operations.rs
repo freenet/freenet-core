@@ -288,10 +288,15 @@ pub(crate) fn reject_if_contract_banned_on(
 /// contract it no longer held.
 ///
 /// Callers check `is_hosting_contract` first, and the helper checks again after
-/// the announce, which can wait up to 30s: an eviction in that window has its
-/// advertisement retracted here and nothing is registered. Neither check is
-/// atomic with eviction; a flag set just before an eviction is cleared and
-/// retracted by the hosting sweep's reconciliation (`RECONCILE_MIN_UNUSED_AGE`).
+/// the announce, which can wait up to 30s: if the contract was evicted in that
+/// window nothing is registered, so no local-hosting flag or `added` interest
+/// outlives the eviction. The retraction issued then is often a no-op, since
+/// the eviction already removed the advertisement entry; like every hosting
+/// retraction it is best-effort, and a dropped one is healed when a co-host
+/// re-requests our hosted set on the interest heartbeat (~5 min). Neither check
+/// is atomic with eviction: a flag set just before an eviction is cleared and
+/// retracted by the hosting sweep's reconciliation, within
+/// `RECONCILE_MIN_UNUSED_AGE` plus one sweep interval.
 pub(crate) async fn complete_host_formation(
     op_manager: &OpManager,
     key: ContractKey,

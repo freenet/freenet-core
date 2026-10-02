@@ -3600,9 +3600,12 @@ impl Ring {
             // the interest ended only if it did (a delegate or local client can
             // keep it).
             if let Some(op_manager) = &op_manager {
+                // In use includes an upstream subscription lease, the same
+                // gate the advertisement retraction applies, so a flag is
+                // never cleared while its advertisement must stay.
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     |key| ring.is_hosting_contract(key),
-                    |key| ring.contract_in_use(key),
+                    |key| ring.contract_in_use(key) || ring.is_subscribed(key),
                 );
                 for key in &outcome.hosting_flags_cleared {
                     crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
@@ -7884,7 +7887,7 @@ mod k_closest_source_tests {
             // the call, with the hosting facts in the right order
             concat!(
                 "interest_manager.reconcile_with_hosting(",
-                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key)||ring.is_subscribed(key),)"
             ),
             // every cleared stale flag is retracted like an eviction
             concat!(
@@ -7892,6 +7895,10 @@ mod k_closest_source_tests {
                 "retract_advertisement_for_evicted_contract(op_manager,key);}"
             ),
             // neighbours are told only when interest actually ended
+            concat!(
+                "if!outcome.interest_lost.is_empty(){",
+                "crate::operations::broadcast_change_interests("
+            ),
             concat!(
                 "crate::operations::broadcast_change_interests(op_manager,",
                 "Vec::new(),outcome.interest_lost,)"
