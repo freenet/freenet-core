@@ -2877,11 +2877,6 @@ async fn relay_put_store_locally(
         }
     }
 
-    debug_assert!(
-        op_manager.ring.is_hosting_contract(&key),
-        "PUT relay: contract {key} must be in hosting list after put_contract + host_contract"
-    );
-
     Ok(merged_value)
 }
 
@@ -6846,9 +6841,14 @@ mod tests {
             helper_src.contains("host_contract("),
             "helper MUST call ring.host_contract for first-time hosting"
         );
+        // #5780: the announce lives in `complete_host_formation`. Match the
+        // call at statement position, so a doc comment naming it cannot
+        // satisfy the pin.
         assert!(
-            helper_src.contains("announce_contract_hosted"),
-            "helper MUST call announce_contract_hosted for first-time hosting"
+            helper_src.lines().any(|line| line
+                .trim_start()
+                .starts_with("crate::operations::complete_host_formation(")),
+            "helper MUST form the host through complete_host_formation (announce + register)"
         );
         // PR #4734 Fix 1: the eviction handler must sync the InterestManager for
         // any subscribed contract the subscriber-primary eviction shed + tore

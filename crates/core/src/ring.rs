@@ -3564,7 +3564,7 @@ impl Ring {
                 if let Some(op_manager) = &op_manager {
                     // A GET/PUT may have re-hosted it since the eviction decision
                     // (#5780); unregistering then would leave a hosted contract
-                    // outside anti-entropy until the reconcile pass below.
+                    // outside anti-entropy (until a restart; see #5784).
                     if !ring.is_hosting_contract(&key)
                         && op_manager.interest_manager.unregister_local_hosting(&key)
                     {
@@ -3595,29 +3595,31 @@ impl Ring {
             // contracts this node has neither hosted nor used for
             // `RECONCILE_MIN_UNUSED_AGE`. Dropped records reach neighbours
             // through the next interest heartbeat, which is a full replace. A
-            // stale local-hosting flag cleared here is retracted the way an
-            // eviction retracts one: the co-host advertisement and the interest.
+            // stale local-hosting flag cleared here has its co-host
+            // advertisement retracted, as an eviction would; neighbours are told
+            // the interest ended only if it did (a delegate or local client can
+            // keep it).
             if let Some(op_manager) = &op_manager {
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
                 );
-                for key in &outcome.hosting_unregistered {
+                for key in &outcome.hosting_flags_cleared {
                     crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
                 }
-                if !outcome.hosting_unregistered.is_empty() || outcome.contracts_dropped > 0 {
+                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
                     tracing::info!(
-                        hosting_unregistered = outcome.hosting_unregistered.len(),
+                        hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
                         contracts_dropped = outcome.contracts_dropped,
                         records_dropped = outcome.records_dropped,
                         "interest records reconciled with the hosted set"
                     );
                 }
-                if !outcome.hosting_unregistered.is_empty() {
+                if !outcome.interest_lost.is_empty() {
                     crate::operations::broadcast_change_interests(
                         op_manager,
                         Vec::new(),
-                        outcome.hosting_unregistered,
+                        outcome.interest_lost,
                     )
                     .await;
                 }
@@ -7884,14 +7886,15 @@ mod k_closest_source_tests {
                 "interest_manager.reconcile_with_hosting(",
                 "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
             ),
-            // a cleared stale flag is retracted like an eviction
+            // every cleared stale flag is retracted like an eviction
             concat!(
-                "forkeyin&outcome.hosting_unregistered{crate::operations::",
+                "forkeyin&outcome.hosting_flags_cleared{crate::operations::",
                 "retract_advertisement_for_evicted_contract(op_manager,key);}"
             ),
+            // neighbours are told only when interest actually ended
             concat!(
                 "crate::operations::broadcast_change_interests(op_manager,",
-                "Vec::new(),outcome.hosting_unregistered,)"
+                "Vec::new(),outcome.interest_lost,)"
             ),
             // the post-eviction unregister skips a re-hosted contract
             concat!(
@@ -7904,6 +7907,17 @@ mod k_closest_source_tests {
                 "sweep_get_subscription_cache must contain `{needle}` (#5780)"
             );
         }
+        // The retraction runs before the interest broadcast for the same pass.
+        let retract = code
+            .find("forkeyin&outcome.hosting_flags_cleared{")
+            .expect("retraction loop");
+        let broadcast = code
+            .find("Vec::new(),outcome.interest_lost,)")
+            .expect("interest broadcast");
+        assert!(
+            retract < broadcast,
+            "retract before broadcasting lost interest"
+        );
     }
 
     /// PR #4734 Fix 1: the periodic hosting sweep must retract the local hosting

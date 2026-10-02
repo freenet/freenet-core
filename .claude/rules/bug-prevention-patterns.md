@@ -800,8 +800,9 @@ unchecked writer.
   (`InterestManager::reconcile_with_hosting`), acting only on a state that has
   held for `RECONCILE_MIN_UNUSED_AGE`.
 - **Measure the wait in elapsed time, never in passes.** The sweep's
-  `tokio::time::interval` uses `MissedTickBehavior::Burst`, so after a stall
-  two passes can run milliseconds apart.
+  `tokio::time::interval` uses `MissedTickBehavior::Burst` (the tokio default;
+  the sweep does not set it), so after a stall two passes can run milliseconds
+  apart.
 - **Restart the wait on every change to the mirror**, not only when a pass
   observes the source: a re-host and re-eviction between two passes is
   invisible to the passes.
@@ -818,9 +819,12 @@ unchecked writer.
 
 The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration
-nudge, register local hosting, interest change), behind an
-`is_hosting_contract` check, so neither registers without advertising nor
-advertises a contract it no longer holds. This is the "manually-inlined side
+nudge, register local hosting, interest change). The caller checks
+`is_hosting_contract` before it, and the helper checks again after the
+announce await and retracts if the contract was evicted meanwhile. Neither
+check is atomic with eviction: a flag set just before an eviction is cleared
+and its advertisement retracted by reconciliation, so the window is bounded by
+`RECONCILE_MIN_UNUSED_AGE`, not closed. This is the "manually-inlined side
 effects" row applied to hosting. The subscribe finalisers in `subscribe.rs`
 announce on their own: they register demand (`add_local_client`, a downstream
 subscriber) rather than cache hosting, so they are not cache host formation.
@@ -828,12 +832,19 @@ subscriber) rather than cache hosting, so they are not cache host formation.
 ### Audit
 
 ```bash
-# Writers of the mirror that do not consult the hosting cache:
-grep -n "interested_peers.entry\|register_local_hosting\|unregister_local_hosting" crates/core/src/ring/interest.rs crates/core/src/operations/
+# Production callers of the local-hosting mirror. Comment lines dropped; the
+# test modules of interest.rs, node.rs and operations/, and the simulation
+# harness node/testing_impl/in_memory.rs, also match, so read the file
+# position of each hit. Expected: the GET/PUT eviction loops and the sweep
+# (guarded unregister), complete_host_formation, reconcile_with_hosting, and
+# startup rehydration in node/op_state_manager.rs, which registers from
+# `contract_state_present` and so inherits the inconclusive-probe caveat above.
+grep -rn "register_local_hosting(\|unregister_local_hosting(" crates/core/src --include=*.rs | grep -v ':\s*//'
 # Announce call sites. Outside `complete_host_formation` itself, expect only the
-# two subscribe finalisers in subscribe.rs (demand, not cache hosting) plus
-# needle strings in pin tests; a new cache-hosting path must use the helper.
-grep -rn "announce_contract_hosted(" crates/core/src/operations* | grep -v "fn announce_contract_hosted"
+# two subscribe finalisers in subscribe.rs (demand, not cache hosting); the
+# remaining hits are needle strings in pin tests and doc comments. A new
+# cache-hosting path must use the helper.
+grep -rn "announce_contract_hosted(" crates/core/src/operations* | grep -v "fn announce_contract_hosted\|:\s*//"
 ```
 
 Simulation guard: `test_evicted_contracts_keep_no_interest_records` asserts

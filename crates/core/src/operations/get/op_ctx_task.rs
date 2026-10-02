@@ -6091,6 +6091,11 @@ mod tests {
         ));
         for leg in [
             concat!("announce_contract_hosted(", "op_manager,&key).await;"),
+            // re-checked after the announce await; an eviction there is retracted
+            concat!(
+                "if!op_manager.ring.is_hosting_contract(&key){",
+                "retract_advertisement_for_evicted_contract(op_manager,&key);"
+            ),
             concat!("interest_manager.", "register_local_hosting(&key)"),
             concat!(
                 "broadcast_change_interests(",
@@ -6131,15 +6136,18 @@ mod tests {
             production_source(),
             "async fn cache_contract_locally(",
         ));
+        // The guard, and the retraction push gated on its result.
         assert!(get.contains(concat!(
             "if!op_manager.ring.is_hosting_contract(evicted_key)&&op_manager",
-            ".interest_manager.unregister_local_hosting(evicted_key)"
+            ".interest_manager.unregister_local_hosting(evicted_key){",
+            "removed_contracts.push(*evicted_key);"
         )));
         const PUT: &str = include_str!("../put/op_ctx_task.rs");
         let put = code_only(extract_fn_body(PUT, "async fn relay_put_store_locally("));
         assert!(put.contains(concat!(
             "if!op_manager.ring.is_hosting_contract(&evicted_key)&&op_manager",
-            ".interest_manager.unregister_local_hosting(&evicted_key)"
+            ".interest_manager.unregister_local_hosting(&evicted_key){",
+            "removed_contracts.push(evicted_key);"
         )));
     }
 

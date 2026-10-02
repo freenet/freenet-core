@@ -285,13 +285,26 @@ pub(crate) fn reject_if_contract_banned_on(
 /// without announcing left a re-hosted copy unadvertised after its eviction had
 /// retracted the advertisement; one that announced without checking the
 /// contract was still hosted left an advertisement and a hosting flag for a
-/// contract it no longer held. Callers check `is_hosting_contract` first.
+/// contract it no longer held.
+///
+/// Callers check `is_hosting_contract` first, and the helper checks again after
+/// the announce, which can wait up to 30s: an eviction in that window has its
+/// advertisement retracted here and nothing is registered. Neither check is
+/// atomic with eviction; a flag set just before an eviction is cleared and
+/// retracted by the hosting sweep's reconciliation (`RECONCILE_MIN_UNUSED_AGE`).
 pub(crate) async fn complete_host_formation(
     op_manager: &OpManager,
     key: ContractKey,
     removed: Vec<ContractKey>,
 ) {
     announce_contract_hosted(op_manager, &key).await;
+    if !op_manager.ring.is_hosting_contract(&key) {
+        retract_advertisement_for_evicted_contract(op_manager, &key);
+        if !removed.is_empty() {
+            broadcast_change_interests(op_manager, Vec::new(), removed).await;
+        }
+        return;
+    }
     // Directed-subscribe placement (#4404): best-effort nudge the node to
     // consider migrating this freshly-hosted contract toward a closer
     // neighbor. Dropped silently if the event channel is full; the next
