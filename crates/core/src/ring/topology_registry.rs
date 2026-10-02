@@ -102,6 +102,10 @@ pub struct TopologySnapshot {
     /// Stamped by the registration sites; `None` when the `OpManager` was not
     /// attached at snapshot time. See `Ring::orphan_interest_contract_count`.
     pub orphan_interest_contracts: Option<usize>,
+    /// Contracts whose neighbour records this peer's interest reconciliation
+    /// has dropped since startup (#5780). `None` when the `OpManager` was not
+    /// attached at snapshot time.
+    pub reconcile_contracts_dropped: Option<u64>,
 }
 
 impl TopologySnapshot {
@@ -115,6 +119,7 @@ impl TopologySnapshot {
             timestamp_nanos: 0,
             connection_count: 0,
             orphan_interest_contracts: None,
+            reconcile_contracts_dropped: None,
         }
     }
 

@@ -18856,6 +18856,7 @@ fn test_evicted_contracts_keep_no_interest_records() {
         sim.with_controlled_op_interval(Duration::from_secs(45));
         sim
     });
+    let hub_addr = sim.node_address(&hub).expect("hub address");
 
     let mut ops = Vec::new();
     for (i, c) in contracts.iter().enumerate() {
@@ -18896,27 +18897,50 @@ fn test_evicted_contracts_keep_no_interest_records() {
     );
 
     let hub_hosting = result.node_hosting_count(&hub);
-    // Scenario sanity: eviction actually happened at the hub, so the assertion
-    // below is about evicted contracts and not a run where nothing was evicted.
+    // Scenario sanity: the hub's GETs landed (it hosts some contracts) and
+    // the budget forced eviction (it does not host them all), so the
+    // assertions below are about evicted contracts.
     assert!(
-        hub_hosting < CONTRACTS as usize,
-        "hub hosts {hub_hosting} of {CONTRACTS} contracts; the budget did not force eviction"
+        (2..CONTRACTS as usize).contains(&hub_hosting),
+        "hub hosts {hub_hosting} of {CONTRACTS} contracts; expected the GETs to land and \
+         the budget to force eviction"
     );
 
-    // Each node's latest topology snapshot (taken every virtual second while
+    // Each peer's latest topology snapshot (taken every virtual second while
     // its `OpManager` was attached) carries its orphan-record count; the live
-    // `OpManager` is gone by the time the run returns.
-    let mut measured = 0;
-    for snap in &result.topology_snapshots {
-        let Some(orphans) = snap.orphan_interest_contracts else {
-            continue;
-        };
-        measured += 1;
+    // `OpManager` is gone by the time the run returns. Every peer must have
+    // been measured, at the end of the run, so a peer whose snapshots stopped
+    // early cannot pass on a stale reading.
+    let snaps = &result.topology_snapshots;
+    assert_eq!(snaps.len(), 4, "expected a snapshot from every peer");
+    assert!(
+        snaps.iter().any(|snap| snap.peer_addr == hub_addr),
+        "the hub was not measured"
+    );
+    let latest = snaps
+        .iter()
+        .map(|snap| snap.timestamp_nanos)
+        .max()
+        .expect("snapshots");
+    let mut dropped_total = 0;
+    for snap in snaps {
+        let orphans = snap
+            .orphan_interest_contracts
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        let dropped = snap
+            .reconcile_contracts_dropped
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        dropped_total += dropped;
         eprintln!(
-            "[#5780] peer={} hosting={} orphan_interest_contracts={orphans} at={}s",
+            "[#5780] peer={} hosting={} orphan_interest_contracts={orphans} \
+             reconcile_contracts_dropped={dropped}",
             snap.peer_addr,
             snap.contracts.len(),
-            snap.timestamp_nanos / 1_000_000_000
+        );
+        assert!(
+            latest - snap.timestamp_nanos <= Duration::from_secs(5).as_nanos() as u64,
+            "peer {}'s last snapshot is stale",
+            snap.peer_addr
         );
         assert_eq!(
             orphans, 0,
@@ -18925,5 +18949,10 @@ fn test_evicted_contracts_keep_no_interest_records() {
             snap.peer_addr
         );
     }
-    assert!(measured >= 2, "only {measured} node(s) were measurable");
+    // Premise: records for evicted contracts did form and were dropped. A run
+    // in which none formed would pass the orphan check without testing it.
+    assert!(
+        dropped_total > 0,
+        "reconciliation dropped no records anywhere; the scenario did not exercise it"
+    );
 }

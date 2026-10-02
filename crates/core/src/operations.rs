@@ -281,9 +281,11 @@ pub(crate) fn reject_if_contract_banned_on(
 /// together with any `removed` contracts from the same event.
 ///
 /// One helper so every path that forms a host runs the whole sequence: the GET
-/// cache path and the hosting sweep's reconciliation both call it. A path that
-/// registered without announcing left a re-hosted copy unadvertised after its
-/// eviction had retracted the advertisement.
+/// cache path and the PUT relay store both call it. A path that registered
+/// without announcing left a re-hosted copy unadvertised after its eviction had
+/// retracted the advertisement; one that announced without checking the
+/// contract was still hosted left an advertisement and a hosting flag for a
+/// contract it no longer held. Callers check `is_hosting_contract` first.
 pub(crate) async fn complete_host_formation(
     op_manager: &OpManager,
     key: ContractKey,

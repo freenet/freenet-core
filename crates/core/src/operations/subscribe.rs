@@ -504,15 +504,13 @@ pub(super) async fn fetch_contract_if_missing(
 ///    the body is locally present after step 4*. Announcing without a
 ///    body would tell neighbors to forward UPDATEs to a peer that
 ///    cannot validate or store them. If the body lands later via the
-///    sub-op GET's own cache path, `get/op_ctx_task.rs` calls
-///    `announce_contract_hosted` there *on first-time cache* (gated
-///    on `is_new && put_persisted`). A niche case where the contract
-///    was previously hosted then evicted, the lease expires, and the
-///    re-subscribe fetch then times out, would not re-trigger the
-///    announce via that fallback — neighbors learn we host the
-///    contract again either through the next renewal cycle's
-///    finalization (if the body has arrived by then) or via UPDATE
-///    delivery + auto-fetch.
+///    sub-op GET's own cache path, `get/op_ctx_task.rs` announces
+///    there when that cache newly hosts the contract with its state
+///    held locally, whether persisted now or already on disk (#5780).
+///    If the re-subscribe fetch times out, that fallback does not run
+///    and neighbors learn we host the contract again either through
+///    the next renewal cycle's finalization (if the body has arrived
+///    by then) or via UPDATE delivery + auto-fetch.
 /// 6. Register the contract in our local interest manager (so inbound
 ///    `ChangeInterests` for this contract get processed) and broadcast
 ///    a `ChangeInterests` so connected peers learn we became interested.

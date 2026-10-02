@@ -3593,38 +3593,33 @@ impl Ring {
 
             // Interest-record reconciliation (#5780): drop neighbour records for
             // contracts this node has neither hosted nor used for
-            // `RECONCILE_MIN_UNUSED_AGE`, and repair hosted contracts that lack
-            // their local-hosting registration. A repair runs only after an
-            // authoritative state probe (the synchronous check assumes present
-            // on SQLite) and a fresh hosted check, and goes through the same
-            // host-formation sequence as a GET, so the copy is both advertised
-            // and in anti-entropy. Dropped records reach neighbours through the
-            // next interest heartbeat, which is a full replace.
+            // `RECONCILE_MIN_UNUSED_AGE`. Dropped records reach neighbours
+            // through the next interest heartbeat, which is a full replace. A
+            // stale local-hosting flag cleared here is retracted the way an
+            // eviction retracts one: the co-host advertisement and the interest.
             if let Some(op_manager) = &op_manager {
-                let hosted = ring.hosting_contract_keys();
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
-                    &hosted,
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
                 );
-                let mut repaired = 0usize;
-                for key in &outcome.missing_registration {
-                    if ring.contract_state_present_async(key).await && ring.is_hosting_contract(key)
-                    {
-                        crate::operations::complete_host_formation(op_manager, *key, Vec::new())
-                            .await;
-                        repaired += 1;
-                    }
+                for key in &outcome.hosting_unregistered {
+                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
                 }
-                if repaired > 0 || outcome.hosting_unregistered > 0 || outcome.contracts_dropped > 0
-                {
+                if !outcome.hosting_unregistered.is_empty() || outcome.contracts_dropped > 0 {
                     tracing::info!(
-                        hosting_repaired = repaired,
-                        hosting_unregistered = outcome.hosting_unregistered,
+                        hosting_unregistered = outcome.hosting_unregistered.len(),
                         contracts_dropped = outcome.contracts_dropped,
                         records_dropped = outcome.records_dropped,
                         "interest records reconciled with the hosted set"
                     );
+                }
+                if !outcome.hosting_unregistered.is_empty() {
+                    crate::operations::broadcast_change_interests(
+                        op_manager,
+                        Vec::new(),
+                        outcome.hosting_unregistered,
+                    )
+                    .await;
                 }
             }
 
@@ -3785,6 +3780,9 @@ impl Ring {
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
             snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
+            snapshot.reconcile_contracts_dropped = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -7019,6 +7017,9 @@ impl Ring {
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
         snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
+        snapshot.reconcile_contracts_dropped = self
+            .upgrade_op_manager()
+            .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
@@ -7880,17 +7881,17 @@ mod k_closest_source_tests {
         for needle in [
             // the call, with the hosting facts in the right order
             concat!(
-                "interest_manager.reconcile_with_hosting(&hosted,",
+                "interest_manager.reconcile_with_hosting(",
                 "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
             ),
-            // repairs only after an authoritative probe and a fresh hosted check
+            // a cleared stale flag is retracted like an eviction
             concat!(
-                "ifring.contract_state_present_async(key).await",
-                "&&ring.is_hosting_contract(key)"
+                "forkeyin&outcome.hosting_unregistered{crate::operations::",
+                "retract_advertisement_for_evicted_contract(op_manager,key);}"
             ),
             concat!(
-                "crate::operations::",
-                "complete_host_formation(op_manager,*key,"
+                "crate::operations::broadcast_change_interests(op_manager,",
+                "Vec::new(),outcome.hosting_unregistered,)"
             ),
             // the post-eviction unregister skips a re-hosted contract
             concat!(
