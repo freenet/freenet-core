@@ -1282,19 +1282,8 @@ fn read_windows_total_phys_bytes() -> Option<usize> {
     windows_memory_status_to_ram_bytes(windows_read_memory_status().map(|s| s.ullTotalPhys))
 }
 
-/// LIVE available memory (bytes) via the SAME `GlobalMemoryStatusEx` call
-/// (#5333) — `ullAvailPhys`, not `ullTotalPhys`. Backs the resident-overhead
-/// hosting budget's live-surplus term on Windows, mirroring the Linux
-/// `MemAvailable` reader.
-#[cfg(windows)]
-fn read_windows_avail_phys_bytes() -> Option<usize> {
-    windows_memory_status_to_ram_bytes(windows_read_memory_status().map(|s| s.ullAvailPhys))
-}
-
-/// Shared `GlobalMemoryStatusEx` FFI call behind [`read_windows_total_phys_bytes`]
-/// and [`read_windows_avail_phys_bytes`] (#5333) — one call site for the one
-/// unsafe FFI invocation, so the two readers differ only in which field of
-/// the SAME snapshot they extract, not in how they call the API.
+/// The `GlobalMemoryStatusEx` FFI call behind [`read_windows_total_phys_bytes`],
+/// kept separate so the one unsafe invocation lives in one place.
 #[cfg(windows)]
 fn windows_read_memory_status() -> Option<winapi::um::sysinfoapi::MEMORYSTATUSEX> {
     use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -1320,9 +1309,7 @@ fn windows_read_memory_status() -> Option<winapi::um::sysinfoapi::MEMORYSTATUSEX
 
 /// Own-process working-set size (bytes) via `GetProcessMemoryInfo` (#5333) —
 /// Windows' closest analogue to Linux `VmRSS`: physical memory currently
-/// charged to this process. Backs the resident-overhead budget's `own_rss`
-/// term, which is never discounted by `mem_share` — see
-/// `ring::hosting::cache::resident_overhead_budget_for`.
+/// charged to this process. Backs [`read_own_rss_bytes`] on Windows.
 #[cfg(windows)]
 fn read_windows_own_rss_bytes() -> Option<usize> {
     use winapi::um::processthreadsapi::GetCurrentProcess;
@@ -1360,8 +1347,7 @@ fn read_windows_own_rss_bytes() -> Option<usize> {
 }
 
 /// Pure `Option<DWORDLONG> -> Option<usize>` conversion shared by every
-/// Windows memory reader in this file (#5329, extended #5333 to also cover
-/// the live-available and own-RSS readers, not just total RAM) — split out
+/// Windows memory reader in this file (#5329) — split out
 /// so the actual decision logic (the `u64 -> usize` narrowing) is
 /// unit-testable on ANY host, not just a real Windows CI runner. Takes an
 /// already-`Option`-collapsed value (the caller folds the API's
@@ -1375,114 +1361,15 @@ fn windows_memory_status_to_ram_bytes(raw_bytes: Option<u64>) -> Option<usize> {
     usize::try_from(raw_bytes?).ok()
 }
 
-/// LIVE available memory (bytes) on macOS via `host_statistics64` (#5333) —
-/// there is no `MemAvailable`-equivalent kernel figure to just read, so this
-/// computes the same reclaimable-aware approximation `vm_stat` and Activity
-/// Monitor use: free + inactive (clean, reclaimable under pressure) +
-/// purgeable (explicitly reclaimable) pages, converted to bytes via the
-/// host's real page size (`vm_stat`'s own "Mach Virtual Memory Statistics"
-/// header cites the same three categories as what a process can expect to
-/// obtain without swapping).
-#[cfg(target_os = "macos")]
-fn read_macos_available_bytes() -> Option<usize> {
-    // `mach2` (workspace dep pinned at 0.4) does NOT export `mach_host`,
-    // `HOST_VM_INFO64`, or a `vm_statistics64` struct at this version — `libc`
-    // has all three (its own `apple::mach_host_self`/`mach_task_self` doc
-    // comments say "use mach2 instead", which is stale advice for the pinned
-    // version; `host_statistics64`/`task_info` below carry no such notice).
-    use libc::{HOST_VM_INFO64, host_statistics64, kern_return_t, vm_statistics64};
-
-    // SAFETY: `vm_statistics64` is a C-repr struct of plain integer fields
-    // (natural_t/uint64_t) with no padding-sensitive invariants or
-    // pointers — an all-zero bit pattern is a valid value for every field,
-    // entirely overwritten by the FFI call below on success.
-    let mut stats: vm_statistics64 = unsafe { std::mem::zeroed() };
-    let mut count = libc::HOST_VM_INFO64_COUNT;
-    // SAFETY: `host_statistics64` is an FFI call that reads host VM
-    // statistics into a caller-owned `vm_statistics64` buffer. We pass a
-    // valid host port (`macos_cached_host_port()`, below — a real Mach send
-    // right, acquired once and cached; see its own doc), the `HOST_VM_INFO64`
-    // flavor matching the `vm_statistics64` struct we're reading into, a
-    // correctly-sized stack-owned out-buffer (`HOST_VM_INFO64_COUNT`, the
-    // same libc-provided constant the API expects rather than a hand-rolled
-    // `size_of` count), and a correctly-initialized in/out count matching
-    // that buffer's size (the API's documented contract). It writes only
-    // into that buffer, up to `count` natural_t words, and returns
-    // `KERN_SUCCESS` (0) on success (checked below); it borrows no memory
-    // past the call. No aliasing or lifetime hazards.
-    let kr: kern_return_t = unsafe {
-        host_statistics64(
-            macos_cached_host_port(),
-            HOST_VM_INFO64,
-            (&mut stats as *mut vm_statistics64).cast(),
-            &mut count,
-        )
-    };
-    if kr != libc::KERN_SUCCESS {
-        return None;
-    }
-    let page_size = macos_page_size_bytes()?;
-    macos_vm_stats_to_available_bytes(
-        u64::from(stats.free_count),
-        u64::from(stats.inactive_count),
-        u64::from(stats.purgeable_count),
-        page_size,
-    )
-}
-
-/// The Mach host port, acquired via `mach_host_self()` exactly ONCE for the
-/// life of the process and cached (#5333 review, MEDIUM finding). Unlike
-/// `mach_task_self()` — which `libc`'s own binding shows is just a read of a
-/// process-global static the Mach runtime initializes at startup, never a
-/// fresh kernel call — `mach_host_self()` is a real MIG trap that mints a NEW
-/// send right (a distinct `uref` in this process's IPC space) on every call.
-/// Calling it on every 60s sweep tick forever would accumulate one uref per
-/// tick with nothing ever deallocating it, which is reachable in practice:
-/// this is the exact pattern the mature, widely-used `sysinfo` crate avoids
-/// (`sysinfo::unix::apple::system::SystemInner::new`, which acquires the port
-/// once at construction and reuses it for the process's whole lifetime — see
-/// its `src/unix/apple/system.rs`). A `OnceLock` gives the same one-acquisition
-/// guarantee without restructuring this module's stateless-function shape
-/// into a persistent struct.
-#[cfg(target_os = "macos")]
-fn macos_cached_host_port() -> libc::mach_port_t {
-    static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
-    #[allow(deprecated)]
-    *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() })
-}
-
-/// Pure arithmetic behind [`read_macos_available_bytes`], split out from the
-/// `host_statistics64` FFI call so it is unit-testable on every CI platform
-/// (mirroring [`windows_memory_status_to_ram_bytes`]'s split for the same
-/// reason — the FFI call itself only compiles and runs on a real macOS
-/// host/CI runner, but the arithmetic on its output can be exercised
-/// everywhere). `checked_mul` + `try_from` guard against overflow on an
-/// implausible page count rather than panicking or silently wrapping.
-#[cfg(any(target_os = "macos", test))]
-fn macos_vm_stats_to_available_bytes(
-    free_count: u64,
-    inactive_count: u64,
-    purgeable_count: u64,
-    page_size: u64,
-) -> Option<usize> {
-    let reclaimable_pages = free_count
-        .saturating_add(inactive_count)
-        .saturating_add(purgeable_count);
-    reclaimable_pages
-        .checked_mul(page_size)
-        .and_then(|b| usize::try_from(b).ok())
-}
-
 /// Own-process resident set size (bytes) on macOS via `task_info`'s
 /// `MACH_TASK_BASIC_INFO` flavor (#5333) — macOS's closest analogue to Linux
-/// `VmRSS`: physical memory currently resident for this task. Backs the
-/// resident-overhead budget's `own_rss` term, which is never discounted by
-/// `mem_share` — see `ring::hosting::cache::resident_overhead_budget_for`.
+/// `VmRSS`: physical memory currently resident for this task. Backs
+/// [`read_own_rss_bytes`] on macOS.
 #[cfg(target_os = "macos")]
 fn read_macos_own_rss_bytes() -> Option<usize> {
-    // Same `mach2`-does-not-have-this-at-the-pinned-version situation as
-    // `read_macos_available_bytes` above — `libc` has `task_info`,
-    // `MACH_TASK_BASIC_INFO`(_COUNT), and `mach_task_basic_info`.
+    // `mach2` (workspace dep pinned at 0.4) does not export these at that
+    // version; `libc` has `task_info`, `MACH_TASK_BASIC_INFO`(_COUNT), and
+    // `mach_task_basic_info`.
     use libc::{MACH_TASK_BASIC_INFO, kern_return_t, mach_task_basic_info, task_info};
 
     // SAFETY: `mach_task_basic_info` is a C-repr struct of plain integer
@@ -1531,19 +1418,6 @@ fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
     usize::try_from(resident_size).ok()
 }
 
-/// Host page size (bytes) via `sysconf(_SC_PAGESIZE)` — the same POSIX call
-/// [`read_total_ram_bytes`]'s non-Linux-unix branch already uses, reused here
-/// rather than pulling in a second, mach-specific page-size query.
-#[cfg(target_os = "macos")]
-fn macos_page_size_bytes() -> Option<u64> {
-    // SAFETY: `sysconf` is an FFI call that is always sound to invoke with a
-    // valid name constant. It takes no pointers, has no preconditions for
-    // this name, and returns the value or -1 on error (handled by the `> 0`
-    // check below).
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    (page_size > 0).then_some(page_size as u64)
-}
-
 /// Parse physical RAM (bytes) from `/proc/meminfo`'s `MemTotal:` line.
 #[cfg(target_os = "linux")]
 fn read_proc_meminfo_total_bytes() -> Option<usize> {
@@ -1564,70 +1438,15 @@ fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
     None
 }
 
-/// Best-effort read of LIVE system-wide available memory, in bytes — as
-/// opposed to [`read_total_ram_bytes`], which is a static capacity figure.
-/// Backs the resident-overhead hosting budget's live-surplus term (#5333):
-/// on an unconstrained host, "how much of the box is genuinely free right
-/// now" is what lets that budget shrink automatically under real user memory
-/// pressure and grow when there's real surplus, without any static guess.
-///
-/// Linux: `MemAvailable` in `/proc/meminfo` — the reclaimable-cache-aware
-/// figure the kernel itself computes, NOT the naive `MemFree`, which
-/// undercounts reclaimable page cache and would make the budget shrink far
-/// more aggressively than real pressure warrants. Windows: `ullAvailPhys`
-/// from `GlobalMemoryStatusEx`. macOS: `host_statistics64`'s free, inactive,
-/// and purgeable page counts summed (the same reclaimable-aware
-/// approximation `vm_stat` and Activity Monitor use). Any other platform:
-/// `None` — the caller falls back to the static, total-RAM-only formula
-/// (unchanged, still an improvement over the #5325 fixed ceiling this
-/// replaces).
-pub(crate) fn read_available_memory_bytes() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        parse_meminfo_available_bytes(&meminfo)
-    }
-    #[cfg(windows)]
-    {
-        read_windows_avail_phys_bytes()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        read_macos_available_bytes()
-    }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-    {
-        None
-    }
-}
-
-/// Pure parse of `MemAvailable` (KiB) from `/proc/meminfo` contents into
-/// bytes. Split out for the same reason [`parse_meminfo_total_bytes`] is:
-/// unit-testable without a real `/proc/meminfo`.
-#[cfg(target_os = "linux")]
-fn parse_meminfo_available_bytes(meminfo: &str) -> Option<usize> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
-            return kib.checked_mul(1024);
-        }
-    }
-    None
-}
-
 /// Best-effort read of THIS PROCESS's own live resident memory (RSS), in
-/// bytes. The other half of the resident-overhead budget's live-surplus term
-/// (#5333): `own_rss` is never discounted by `mem_share` (see
-/// `ring::hosting::cache::resident_overhead_budget_for`), so the mechanism
-/// can never demand shrinking below what is already resident merely because
-/// the configured share is conservative — only genuine external pressure
-/// (available memory actually dropping) does that.
+/// bytes: Linux (`/proc/self/status` `VmRSS`), Windows
+/// (`GetProcessMemoryInfo`'s working-set size), and macOS (`task_info`'s
+/// `resident_size`). `None` on any other platform or if the read fails.
 ///
-/// Linux (`/proc/self/status` `VmRSS`), Windows (`GetProcessMemoryInfo`'s
-/// working-set size), and macOS (`task_info`'s `resident_size`). Any other
-/// platform: `None` — the caller falls back to the static, total-RAM-only
-/// formula (unchanged, still an improvement over the #5325 fixed ceiling
-/// this replaces).
+/// Reported in telemetry as `memory_rss_bytes` (`node::resource_metrics`),
+/// where it is compared with the bytes each component accounts for (#5647).
+/// It does not drive eviction: each memory consumer enforces its own byte
+/// budget.
 pub(crate) fn read_own_rss_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -2145,19 +1964,6 @@ mod tests {
         assert_eq!(parse_meminfo_total_bytes("SwapTotal: 0 kB\n"), None);
     }
 
-    /// #5333: `MemAvailable` parsing (the kernel's reclaimable-cache-aware
-    /// figure), not `MemFree` — the two lines can carry very different values
-    /// on a real host with a large page cache, so pulling the wrong one would
-    /// make the live resident-overhead budget shrink far more aggressively
-    /// than real memory pressure warrants.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_meminfo_available_reads_kib_as_bytes_not_memfree() {
-        let sample = "MemTotal: 16331752 kB\nMemFree: 500000 kB\nMemAvailable: 9000000 kB\n";
-        assert_eq!(parse_meminfo_available_bytes(sample), Some(9000000 * 1024));
-        assert_eq!(parse_meminfo_available_bytes("MemFree: 500000 kB\n"), None);
-    }
-
     /// #5333: `VmRSS` parsing from `/proc/self/status` — the own-process
     /// resident-memory signal that, unlike the surplus term, is never
     /// discounted by `mem_share` in the resident-overhead budget composition.
@@ -2249,58 +2055,20 @@ mod tests {
         );
     }
 
-    /// #5333: same rationale and same CI-coverage caveat as
-    /// [`read_total_ram_bytes_returns_a_sane_value_on_windows`] above — this
-    /// compiles and runs ONLY on a real Windows host (tracked by #5331, which
-    /// as of this PR also covers `read_windows_avail_phys_bytes`/
-    /// `read_windows_own_rss_bytes` since neither Windows CI job runs the
-    /// library's `--lib` test target). `GetProcessMemoryInfo`'s own working
-    /// set can legitimately exceed available RAM on a heavily swapped host,
-    /// so this only sanity-checks the low end and that the call succeeds at
-    /// all — a `None` here means the FFI plumbing itself (not just the pure
-    /// narrowing already covered by `windows_memory_status_to_ram_bytes`'s
-    /// platform-independent unit test) is broken.
+    /// Same rationale and CI-coverage caveat as
+    /// [`read_total_ram_bytes_returns_a_sane_value_on_windows`] above: compiles
+    /// and runs ONLY on a real Windows host (#5331). `GetProcessMemoryInfo`'s
+    /// working set can legitimately exceed available RAM on a heavily swapped
+    /// host, so this only checks that the call succeeds and is non-zero.
     #[cfg(windows)]
     #[test]
-    fn read_windows_avail_and_own_rss_return_sane_values_on_windows() {
-        let avail = read_windows_avail_phys_bytes();
-        assert!(
-            avail.is_some(),
-            "GlobalMemoryStatusEx must succeed on any real Windows host"
-        );
-        // A CI runner always has SOME available memory; a `0` reading would
-        // indicate the FFI call read garbage rather than a genuine value.
-        assert!(
-            avail.unwrap() > 0,
-            "implausible zero available-memory reading"
-        );
-
+    fn read_windows_own_rss_returns_a_sane_value_on_windows() {
         let rss = read_windows_own_rss_bytes();
         assert!(
             rss.is_some(),
             "GetProcessMemoryInfo must succeed for the calling process's own handle"
         );
         assert!(rss.unwrap() > 0, "implausible zero own-RSS reading");
-    }
-
-    /// Pure arithmetic, testable on every platform even though the real
-    /// `host_statistics64` FFI call only compiles on macOS.
-    #[test]
-    fn macos_vm_stats_to_available_bytes_sums_reclaimable_categories() {
-        // 100 free + 50 inactive + 25 purgeable pages, 4 KiB pages.
-        assert_eq!(
-            macos_vm_stats_to_available_bytes(100, 50, 25, 4096),
-            Some(175 * 4096)
-        );
-    }
-
-    #[test]
-    fn macos_vm_stats_to_available_bytes_rejects_overflow() {
-        assert_eq!(
-            macos_vm_stats_to_available_bytes(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
-            None,
-            "an implausible page count must fail closed (None), not wrap"
-        );
     }
 
     #[test]
@@ -2312,28 +2080,13 @@ mod tests {
         );
     }
 
-    /// #5333: same rationale as the Windows FFI smoke test above — compiles
-    /// and runs ONLY on a real macOS host. Neither macOS CI job
-    /// (`macos_check` = `cargo check` only; `macos_unit` = narrow
-    /// `commands::service` nextest filter scoped to the `--bin freenet`
-    /// target) runs the library's `--lib` test target, so this needs a
-    /// future CI job extending #5331's fix to macOS, or manual verification
-    /// on a real Mac. The pure arithmetic above IS covered on every CI run;
-    /// this additionally covers the FFI plumbing itself (struct layout,
-    /// mach port validity, the real syscalls).
+    /// Same rationale as the Windows FFI smoke test above: compiles and runs
+    /// ONLY on a real macOS host. Neither macOS CI job runs the library's
+    /// `--lib` test target, so this needs manual verification on a real Mac;
+    /// the pure narrowing above IS covered on every CI run.
     #[cfg(target_os = "macos")]
     #[test]
-    fn read_macos_available_and_own_rss_return_sane_values_on_macos() {
-        let avail = read_macos_available_bytes();
-        assert!(
-            avail.is_some(),
-            "host_statistics64 must succeed on any real macOS host"
-        );
-        assert!(
-            avail.unwrap() > 0,
-            "implausible zero available-memory reading"
-        );
-
+    fn read_macos_own_rss_returns_a_sane_value_on_macos() {
         let rss = read_macos_own_rss_bytes();
         assert!(
             rss.is_some(),

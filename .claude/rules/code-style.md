@@ -133,10 +133,12 @@ actors (clients, network peers) can influence.
      for coverage + hard byte budget + per-entry overhead floor); do not
      hand-roll byte accounting a third time (#4804 wrote it, #4805 shared it)
    → Name any new cache byte budget in
-     contract::executor::declared_cache_ceiling. The hosting budget
-     (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
-     that sum, so an unnamed budget silently over-grants hosted contracts
-     against memory already committed. Pinned by
+     contract::executor::declared_cache_ceiling (test-only since #5647).
+     Each memory consumer has its own byte budget; the test
+     ring::hosting::cache::tests::declared_caches_plus_hosting_budget_leave_room_for_the_runtime
+     checks that the declared caches plus the hosting budget stay within 75%
+     of the memory limit at the shipped shapes, so an unnamed budget is
+     memory that check never sees. Naming is pinned by
      declared_cache_ceiling_names_every_budget.
 
 WHY: Unbounded collections are amplification vectors.

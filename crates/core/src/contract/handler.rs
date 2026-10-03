@@ -120,7 +120,7 @@ impl ContractHandler for NetworkContractHandler {
             config.hosting_disk_pct,
             config.max_hosting_disk,
         );
-        // Resident-overhead (count-derived) budget's live-surplus share (#5333).
+        // Share of the memory limit hosted contracts may hold in RAM (#5647).
         op_manager
             .ring
             .configure_resident_overhead_mem_share(config.hosting_mem_share);

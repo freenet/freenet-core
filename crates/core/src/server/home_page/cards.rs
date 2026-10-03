@@ -1407,15 +1407,15 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
 /// and red reads as "broken".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CeilingKind {
-    /// A cache ceiling (contract state bytes, contract slots). Never coloured,
+    /// A cache ceiling (contract state bytes, contract memory). Never coloured,
     /// at any utilisation, because both "full" and "a little over" are how a
     /// busy node normally runs:
     ///
     /// - contract state is trimmed back under its budget on every insert, so
     ///   it rests just below 100%;
-    /// - contract slots are trimmed only after the ceiling has been exceeded
-    ///   for ~2.5 minutes, so a node with contracts still arriving sits a few
-    ///   over, trims to exactly N of N, and goes over again.
+    /// - contract memory is trimmed only after the ceiling has been exceeded
+    ///   for ~2.5 minutes, so a node with summaries still arriving sits a
+    ///   little over, trims back under, and goes over again.
     ///
     /// Being over is the eviction sweep's trigger, not a fault, and a
     /// subscribed contract is shed as a last resort, so the sweep is not
@@ -1590,7 +1590,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // before this they were three flat rows of identical tiles with nothing
     // saying which one binds. On a real low-RAM peer that is not academic: a
     // measured framework node sat at 34% of its state-byte budget, 1% of its
-    // disk budget, and 99.2% of its contract-slot ceiling — the one number
+    // disk budget, and 99.2% of its then contract-slot ceiling (since #5647 the
+    // contract-memory ceiling) — the one number
     // that mattered, rendered in the same muted grey as the two that had room
     // to spare.
     //
@@ -1601,18 +1602,11 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // node's life, and ranking an absent denominator as full would report a
     // phantom emergency on every fresh start.
     //
-    // For the slot axis this is defensive rather than load-bearing, though the
-    // reason is narrower than "the budget is floored": the SETTER
-    // (`HostingCache::set_resident_overhead_budget_bytes`) does not clamp, but
-    // its only production caller
-    // (`HostingManager::recompute_resident_overhead_budget`) passes the output
-    // of `resident_overhead_budget_for`, which ends in
-    // `.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)` — 128 MiB, i.e. 128 slots.
-    // Every other caller is a test. So 0 slots is unreachable in production
-    // TODAY, by call-site convention rather than by construction; a future
-    // caller that set the budget directly could break that. If a node ever can
-    // reach 0 slots, the honest fix is to say so explicitly rather than let
-    // this branch quietly imply "fine".
+    // For the contract-memory axis this is defensive: its budget ends in
+    // `.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)` (64 MiB) in
+    // `resident_overhead_budget_for`, the only production source. The setter
+    // does not clamp, so 0 is unreachable by call-site convention, not by
+    // construction.
     let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
         (budget > 0).then(|| used as f64 / budget as f64)
     };
@@ -1622,7 +1616,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     //
     //   - contract state: the sweep's own condition (`current_bytes >
     //     budget_bytes`), so crossing fires it directly.
-    //   - contract slots: also a sweep condition, but only once the breach has
+    //   - contract memory: also a sweep condition, but only once the breach has
     //     been SUSTAINED (`resident_overhead_over_budget` requires half of
     //     RESIDENT_OVERHEAD_SUSTAINED_WINDOW, ~2.5 min). A transient spike to
     //     99% here self-resolves without evicting anything, so the strip must
@@ -1669,15 +1663,20 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             });
         }
     }
-    if let Some(u) = axis_utilisation(h.contract_count, h.contract_slot_budget) {
+    if let Some(u) = axis_utilisation(h.resident_overhead_bytes, h.resident_overhead_budget_bytes) {
         axes.push(LimitAxis {
-            name: "contract slots",
+            name: "contract memory",
             kind: CeilingKind::Cache,
             utilisation: u,
-            detail: format!("{} of {}", h.contract_count, h.contract_slot_budget),
-            tooltip: "Crossing this triggers a sweep only if it stays over for a few minutes, \
-             so a brief spike here resolves on its own.",
-            over_note: "A little over is normal while new contracts arrive. If it stays \
+            detail: format!(
+                "{} of {}",
+                format_bytes(h.resident_overhead_bytes),
+                format_bytes(h.resident_overhead_budget_bytes)
+            ),
+            tooltip: "Memory hosted contracts hold to stay up to date (neighbours' \
+             summaries). Crossing this triggers a sweep only if it stays over for a \
+             few minutes, so a brief spike here resolves on its own.",
+            over_note: "A little over is normal while summaries arrive. If it stays \
              over for a few minutes the node evicts its least-demanded contracts.",
         });
     }
@@ -1687,7 +1686,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     //
     // The closest axis is always shown. Any OTHER axis that is in a warning
     // state is shown as well: a cache axis renders neutral however full it is,
-    // so a full slot ceiling would otherwise outrank — and hide — a disk at
+    // so a full contract-memory ceiling would otherwise outrank — and hide — a disk at
     // 95%, which is the one axis here where nearly-full is a real problem.
     axes.sort_by(|a, b| b.utilisation.total_cmp(&a.utilisation));
     let binding: String = axes
@@ -1836,8 +1835,9 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // actual RSS is the `memory_rss_bytes` / `memory_limit_bytes` pair from
     // `node::resource_metrics`, which is exported to telemetry and is NOT
     // rendered anywhere on this page — so the tooltip must not send an operator
-    // looking for it here. Same failure the slot tile below already fixed; do
-    // NOT re-label this as memory.
+    // looking for it here. Do NOT re-label this as memory: it is on-disk state.
+    // (The contract-memory tile below IS memory, and says so, because since
+    // #5647 its figure is counted bytes held in RAM.)
     //
     // The ceiling is NOT simply "RAM/8". `budget_bytes` is documented as "the
     // RAM-scaled default, OR THE OPERATOR OVERRIDE" (`HostingCacheStats`), and
@@ -1859,37 +1859,24 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         budget = format_bytes(h.budget_bytes),
     );
 
-    // The tile shows slots because that is the unit the ceiling constrains;
-    // the tooltip keeps the RAM derivation available, so an operator who wants
-    // to know WHY the ceiling is where it is can still get there. Estimated,
-    // never measured — say so, since the whole failure this replaces was a
-    // derived count reading as a memory measurement.
-    let slot_tooltip = format!(
-        "A contract-count ceiling, not a memory measurement. Each hosted contract is \
-         charged a flat estimate for per-contract bookkeeping (subscriptions, redb/index \
-         entries) that the contract-state budget does not count, so the RAM-scaled byte \
-         budget behind this (#5325) works out to a maximum number of contracts. \
-         Currently {used} estimated against a {budget} ceiling.",
-        used = format_bytes(h.estimated_resident_overhead_bytes),
+    // Contract-memory tiles (#5325, #5647): the state-byte budget above bounds
+    // contract STATE bytes, which live on disk. This axis bounds the memory
+    // hosted contracts hold in RAM, mostly neighbours' summaries, counted from
+    // what is stored rather than estimated per contract, so printing it in
+    // bytes is accurate.
+    let memory_tooltip = format!(
+        "Memory hosted contracts hold to stay up to date: each neighbour's summary of \
+         its copy, plus a small fixed amount per contract. Counted from what is \
+         stored. The budget is the --hosting-mem-share of this node's memory limit. \
+         Currently {used} of {budget}.",
+        used = format_bytes(h.resident_overhead_bytes),
         budget = format_bytes(h.resident_overhead_budget_bytes),
     );
-
-    // Contract-slot tiles (#5325): the state-byte budget above bounds contract
-    // STATE bytes only. This axis is the count-derived one that closes the gap
-    // where many small-state contracts (negligible impact on the state-byte
-    // tile) still exhaust a peer's real resident memory via per-contract
-    // subscription/index bookkeeping.
-    //
-    // Rendered as SLOTS rather than the underlying bytes. The byte pair was
-    // `contract_count * 1 MiB` against a RAM-scaled ceiling, which prints as
-    // e.g. "520.0 MB / 524.0 MB" and reads as measured memory — it is not
-    // measured, and what it constrains is a number of contracts. The tooltip
-    // keeps the RAM derivation available for anyone who needs it.
 
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the resident-overhead ceiling that scales with hosted-contract count (#5325), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the memory hosted contracts hold to stay up to date (#5325, #5647), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
             {binding}
             <div class="g-verdict-row">
                 <div class="g-norms">
@@ -1909,9 +1896,9 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             </div>
             <div class="g-verdict-row">
                 <div class="g-norms">
-                    <div class="g-norm" title="{slot_tooltip}"><div class="g-norm-label">Contract slots used</div><div class="g-norm-value">{slots_used} / {slots_budget}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Slots free</div><div class="g-norm-value">{slots_free}</div></div>
-                    <div class="g-norm" title="Evictions where the contract-slot ceiling was the active pressure (#5325). May overlap with budget evictions."><div class="g-norm-label">Slot-pressure evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
+                    <div class="g-norm" title="{memory_tooltip}"><div class="g-norm-label">Contract memory</div><div class="g-norm-value">{memory_used} / {memory_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Memory headroom</div><div class="g-norm-value">{memory_headroom}</div></div>
+                    <div class="g-norm" title="Evictions where contract memory was the active pressure (#5325). May overlap with budget evictions."><div class="g-norm-label">Memory-pressure evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
                 </div>
             </div>
             <div class="table-wrap">
@@ -1935,10 +1922,13 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         disk_used = disk_used_value,
         disk_budget = disk_budget_value,
         disk_headroom = disk_headroom_value,
-        slot_tooltip = html_escape(&slot_tooltip),
-        slots_used = h.contract_count,
-        slots_budget = h.contract_slot_budget,
-        slots_free = h.contract_slot_budget.saturating_sub(h.contract_count),
+        memory_tooltip = html_escape(&memory_tooltip),
+        memory_used = format_bytes(h.resident_overhead_bytes),
+        memory_budget = format_bytes(h.resident_overhead_budget_bytes),
+        memory_headroom = format_bytes(
+            h.resident_overhead_budget_bytes
+                .saturating_sub(h.resident_overhead_bytes)
+        ),
         resident_overhead_evictions = h.resident_overhead_evictions_total,
         rows = rows,
         footer = footer,

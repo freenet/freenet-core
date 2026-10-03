@@ -38,6 +38,9 @@ pub(crate) mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
+/// Fixed per-entry resident charge; re-exported for the `Ring` wiring test (#5647).
+#[cfg(test)]
+pub(crate) use cache::HOSTED_ENTRY_BYTES;
 /// Hosting-BEGIN attribution (#5090-family observability): WHY a peer started
 /// hosting a contract. Re-exported so the operation drivers — the only code that
 /// knows whether a store is client-originated, transit, or a sub-op fetch — can
@@ -902,9 +905,9 @@ impl HostingManager {
         Some(effective)
     }
 
-    /// Install the operator-configured resident-overhead sizing knob (#5333):
-    /// the default share of genuine live host-wide surplus memory the
-    /// resident-overhead budget is willing to claim, mirroring
+    /// Install the operator-configured resident-overhead sizing knob
+    /// (`--hosting-mem-share`, #5333/#5647): the share of the node's memory
+    /// limit that hosted contracts may hold in RAM, mirroring
     /// [`Self::configure_disk_budget`] for the disk axis. Called once at
     /// startup (the config is only reachable there). If never called, the
     /// default set in the ctor applies.
@@ -913,58 +916,38 @@ impl HostingManager {
             .store(mem_share.to_bits(), Ordering::Relaxed);
     }
 
-    /// Recompute the resident-overhead hosting budget from LIVE memory
-    /// signals and install it via
-    /// [`HostingCache::set_resident_overhead_budget_bytes`] (#5333). Run on
-    /// the SAME 60s sweep as [`Self::recompute_effective_budget`], mirroring
-    /// its shape: the (cheap — a couple of `/proc` reads, no directory walk)
-    /// signal sampling happens here, and only the O(1)
-    /// `set_resident_overhead_budget_bytes` touches the cache lock.
+    /// Install the reader for the bytes the interest manager holds per hosted
+    /// contract (neighbour summaries), so the resident-overhead axis charges
+    /// what is actually stored (#5647). Called by `Ring::attach_op_manager`.
+    pub(crate) fn set_interest_bytes_provider(&self, provider: cache::InterestBytesProvider) {
+        self.hosting_cache
+            .write()
+            .set_interest_bytes_provider(provider);
+    }
+
+    /// Recompute the resident-overhead budget from the node's memory limit and
+    /// the configured share, and install it via
+    /// [`HostingCache::set_resident_overhead_budget_bytes`]. Run on the same
+    /// 60s sweep as [`Self::recompute_effective_budget`], so a changed cgroup
+    /// limit is picked up without a restart.
     ///
-    /// `total_ram`/`pool_size`/`live_signals` are injected as parameters —
-    /// same determinism seam [`Self::recompute_effective_budget`] uses for
-    /// `available` — so tests can drive this without depending on the test
-    /// host's real RAM, core count, or `/proc` contents.
+    /// `total_ram` is injected (the same determinism seam
+    /// [`Self::recompute_effective_budget`] uses for `available`) so tests do
+    /// not depend on the test host's RAM.
+    ///
+    /// Before #5647 this took live RSS and available memory and subtracted the
+    /// count-based estimate from RSS; when the estimate exceeded the whole
+    /// process, the node's real usage dropped out and the budget collapsed to a
+    /// share of free memory. The budget now depends only on the limit, and the
+    /// quantity it bounds is counted (`HostingCache::resident_overhead_bytes`).
     ///
     /// Returns the budget it installed (for telemetry/tests).
-    pub(crate) fn recompute_resident_overhead_budget(
-        &self,
-        total_ram: u64,
-        pool_size: usize,
-        live_signals: Option<(u64, u64)>,
-    ) -> u64 {
+    pub(crate) fn recompute_resident_overhead_budget(&self, total_ram: u64) -> u64 {
         let mem_share = f64::from_bits(
             self.resident_overhead_mem_share_bits
                 .load(Ordering::Relaxed),
         );
-        // #5333 review (skeptical lens, Blocker 2): `own_rss` as read by
-        // `read_own_rss_bytes()` is the WHOLE process's resident memory,
-        // which already includes the very hosting overhead this budget is
-        // meant to bound (`estimated_resident_overhead_bytes()`, the `C` the
-        // eviction predicate compares against). Passing it through
-        // unadjusted made the live-surplus term self-referential: as C grows
-        // by hosting one more contract, `own_rss` grows by (approximately,
-        // per the same 1 MiB/contract calibration) the SAME amount, so the
-        // budget `own_rss + mem_share*available` grows in lockstep with the
-        // cost it is supposed to cap — the axis could never actually bind on
-        // an unconstrained host. Strip `C` out here, before the live signal
-        // reaches the pure formula, so `own_rss` reflects only the process's
-        // NON-hosting-attributable resident memory (base runtime, transport
-        // buffers, other caches) — the genuine "never shrink below this"
-        // floor the mechanism intends, without cancelling out the growth
-        // it's meant to detect.
-        let current_estimated_overhead = self
-            .hosting_cache
-            .read()
-            .estimated_resident_overhead_bytes();
-        let live_signals = live_signals.map(|(own_rss, available)| {
-            (
-                own_rss.saturating_sub(current_estimated_overhead),
-                available,
-            )
-        });
-        let budget =
-            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
+        let budget = cache::resident_overhead_budget_for(total_ram, mem_share);
         self.hosting_cache
             .write()
             .set_resident_overhead_budget_bytes(budget);
@@ -8019,35 +8002,20 @@ mod tests {
             "without raising --max-hosting-disk, the 32 GiB disk cap binds"
         );
 
-        // (2) The contract-count budget is identical whether the node contributes
-        // 1 GiB or 20 GiB of state: same host, same signals, same result — on
-        // BOTH paths through the formula.
+        // (2) The resident-overhead (RAM) budget is identical whether the node
+        // contributes 1 GiB or 20 GiB of state: it depends only on the memory
+        // limit and the share.
         let total_ram = 4 * GIB;
-        let pool_size = 4;
         let default_node = HostingManager::new(GIB);
-        for (path, live_signals) in [
-            ("live-signal", Some((GIB, 2 * GIB))),
-            // No live signals: the structural residual is the only term, so a
-            // change to it cannot hide behind `min()` picking the live term.
-            ("structural", None),
-        ] {
-            let default_count_budget =
-                default_node.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
-            let donor_count_budget =
-                donor.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
-            assert_eq!(
-                donor_count_budget, default_count_budget,
-                "{path} path: contributing more disk must not change the RAM-derived \
-                 contract-count budget"
-            );
-        }
-        // Guard against the structural comparison passing vacuously because both
-        // values collapsed to the floor: on this host shape the structural term
-        // must sit above it, or equality proves nothing.
+        assert_eq!(
+            donor.recompute_resident_overhead_budget(total_ram),
+            default_node.recompute_resident_overhead_budget(total_ram),
+            "contributing more disk must not change the RAM-derived resident budget"
+        );
         assert!(
-            default_node.recompute_resident_overhead_budget(total_ram, pool_size, None)
+            default_node.recompute_resident_overhead_budget(total_ram)
                 > cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
-            "test shape must keep the structural term off its floor"
+            "test shape must keep the budget off its floor, or equality proves nothing"
         );
     }
 
@@ -8072,67 +8040,54 @@ mod tests {
         assert_eq!(manager.hosting_budget_bytes(), GIB);
     }
 
-    /// #5333: end-to-end wiring test for the resident-overhead budget's live
-    /// recompute path — mirrors `recompute_installs_min_of_ram_and_disk`
-    /// above for the disk axis. Verifies (a) the ctor installs the
-    /// CONSTRUCTION-TIME default via `default_resident_overhead_budget_bytes`
-    /// before any config/recompute runs, (b) `configure_resident_overhead_mem_share`
-    /// survives the `f64` <-> `AtomicU64`-bits round trip, and (c)
+    /// End-to-end wiring for the resident-overhead budget (#5333, #5647): the
+    /// ctor installs a floored default, `configure_resident_overhead_mem_share`
+    /// survives the `f64` <-> `AtomicU64`-bits round trip, and
     /// `recompute_resident_overhead_budget` installs exactly what the pure
-    /// `cache::resident_overhead_budget_for` formula would compute for the
-    /// same inputs — true here because the cache is EMPTY (no hosted
-    /// contracts, so the manager's `own_rss` pre-adjustment, see the pure
-    /// formula's own doc, is a no-op). With a non-empty cache the two
-    /// intentionally diverge — see
-    /// `resident_overhead_budget_can_actually_fire_on_an_unconstrained_host`
-    /// for that case.
+    /// `cache::resident_overhead_budget_for` computes for the configured share.
     #[test]
     fn configure_and_recompute_resident_overhead_installs_the_pure_formula_result() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let manager = HostingManager::new(4 * GIB);
-
-        // Ctor default: whatever the live host's own real signals produce —
-        // just assert it's floored sanely, not a specific value (this test
-        // host's real RAM is unknown/irrelevant here).
         assert!(
             manager.resident_overhead_budget_bytes() >= cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
         );
 
-        // A non-default share, to prove the configured value (not the
-        // DEFAULT) is what the recompute actually uses.
-        let mem_share = 0.3;
-        manager.configure_resident_overhead_mem_share(mem_share);
-
         let total_ram = 64 * GIB;
-        let pool_size = 8;
-        let live_signals = Some((2 * GIB, 40 * GIB));
-        let installed =
-            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+        manager.configure_resident_overhead_mem_share(0.3);
+        let installed = manager.recompute_resident_overhead_budget(total_ram);
+        let expected = cache::resident_overhead_budget_for(total_ram, 0.3);
+        assert_eq!(installed, expected);
+        assert_eq!(manager.resident_overhead_budget_bytes(), expected);
 
-        let expected =
-            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
-        assert_eq!(
-            installed, expected,
-            "the manager's recompute must install exactly what the pure formula \
-             computes for the same (total_ram, pool_size, live_signals, mem_share)"
-        );
-        assert_eq!(
-            manager.resident_overhead_budget_bytes(),
-            expected,
-            "the installed value must actually be readable back off the cache"
-        );
-
-        // A DIFFERENT share on the same inputs must (for this shape, where
-        // the live-surplus term binds) install a DIFFERENT budget — proves
-        // configure_resident_overhead_mem_share actually reaches the
-        // recompute rather than being silently ignored.
+        // A different share must reach the recompute, not be ignored.
         manager.configure_resident_overhead_mem_share(0.05);
-        let installed_lower_share =
-            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
         assert_ne!(
-            installed, installed_lower_share,
-            "changing the configured share must change the installed budget \
-             on a shape where the live-surplus term binds"
+            manager.recompute_resident_overhead_budget(total_ram),
+            installed
+        );
+    }
+
+    /// The interest-bytes provider installed through the manager (what
+    /// `Ring::attach_op_manager` does in production) must reach the cache's
+    /// counted bytes on the next sweep (#5647).
+    #[test]
+    fn interest_bytes_provider_reaches_the_hosting_cache() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(GIB);
+        manager.set_interest_bytes_provider(std::sync::Arc::new(|_: &ContractKey| 5_000));
+        for i in 0..3u32 {
+            manager.record_contract_access(
+                make_key_u32(i),
+                1,
+                AccessType::Get,
+                HostingCause::Other,
+            );
+        }
+        let _ = manager.sweep_expired_hosting();
+        assert_eq!(
+            manager.hosting_cache_stats().resident_overhead_bytes,
+            3 * (cache::HOSTED_ENTRY_BYTES + 5_000)
         );
     }
 
@@ -8145,77 +8100,6 @@ mod tests {
         let mut code_bytes = [0u8; 32];
         code_bytes[..4].copy_from_slice(&seed.wrapping_add(1).to_le_bytes());
         ContractKey::from_id_and_code(ContractInstanceId::new(id_bytes), CodeHash::new(code_bytes))
-    }
-
-    /// #5333 review (skeptical lens, Blocker 2): the live-surplus term is
-    /// SELF-REFERENTIAL if `own_rss` is passed through unadjusted, because
-    /// `own_rss` already includes the very hosting cost
-    /// (`estimated_resident_overhead_bytes()`, `C`) this budget is compared
-    /// against. Algebraically (`live_term = own_rss + mem_share*available`,
-    /// `own_rss = base_other_rss + C` under the calibration
-    /// `ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` assumes): the eviction
-    /// predicate `C > budget` reduces to `0 > base_other_rss +
-    /// mem_share*available`, which — since every term on the right is
-    /// non-negative — is NEVER true, however large `C` grows or however far
-    /// `available` shrinks. The live-surplus branch could therefore NEVER
-    /// actually bind on an unconstrained host, silently defeating the whole
-    /// OOM-protection purpose of this axis on exactly the case it targets.
-    /// The fix (`recompute_resident_overhead_budget` subtracting the
-    /// cache's current `C` from `own_rss` before calling the pure formula)
-    /// restores a genuine, reachable fixed point.
-    ///
-    /// This test hosts enough contracts to exhaust a small, fixed `available`
-    /// budget, then asserts the axis CAN fire (`cost > installed_budget`) —
-    /// the direct, end-to-end version of "is OOM protection reachable at
-    /// all", not an indirect proxy for it. Reverting the fix makes this test
-    /// fail (mutation-tested): without it, `cost` never exceeds the budget.
-    #[test]
-    fn resident_overhead_budget_can_actually_fire_on_an_unconstrained_host() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        const MIB: u64 = 1024 * 1024;
-        let total_ram = 64 * GIB; // generous enough the structural term never binds
-        let pool_size = 8;
-        let base_other_rss = 50 * MIB; // non-hosting resident memory, held constant
-        let available0 = 200 * MIB; // small on purpose: cheap to exhaust by hosting
-
-        let manager = HostingManager::new(total_ram);
-        manager.configure_resident_overhead_mem_share(0.125);
-
-        // Host enough contracts that cost alone exceeds `available0` — i.e.
-        // this process has consumed all the memory that was "available",
-        // the scenario genuine OOM protection must catch.
-        for i in 0..300u32 {
-            manager.record_contract_access(
-                make_key_u32(i),
-                1,
-                AccessType::Get,
-                HostingCause::Other,
-            );
-        }
-        let cost =
-            manager.hosting_contracts_count() as u64 * cache::ESTIMATED_RESIDENT_BYTES_PER_CONTRACT;
-        assert!(
-            cost > available0,
-            "test setup: hosted cost ({cost}) must exceed available0 ({available0}) \
-             to exercise the exhausted-available regime"
-        );
-        let own_rss = base_other_rss + cost;
-        let available = available0.saturating_sub(cost); // saturates to 0
-
-        let installed_budget = manager.recompute_resident_overhead_budget(
-            total_ram,
-            pool_size,
-            Some((own_rss, available)),
-        );
-
-        assert!(
-            cost > installed_budget,
-            "cost ({cost}) must exceed the installed budget ({installed_budget}) once \
-             available memory is exhausted by hosting — if it doesn't, the \
-             live-surplus term is self-referential (own_rss not adjusted for the \
-             current hosting cost) and this axis can NEVER actually protect \
-             against OOM on an unconstrained host — the #5333 Blocker 2 regression."
-        );
     }
 
     /// The recompute takes only the O(1) `set_budget_bytes` cache write lock, so

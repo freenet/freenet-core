@@ -99,6 +99,19 @@ pub(crate) const RECONCILE_MIN_UNUSED_AGE: Duration = Duration::from_secs(120);
 /// contract, a small fraction of the records being cleaned up).
 pub(crate) const MAX_RECONCILE_KEYS_PER_PASS: usize = 4096;
 
+/// Fixed bytes charged for one neighbour's interest record, excluding its
+/// summary bytes (counted separately by [`InterestManager::resident_bytes_for`]).
+///
+/// Derived from the stored types: the `interested_peers` map entry
+/// (`PeerKey` + `PeerInterest`), the matching `peer_contracts` reverse-index
+/// entry (`ContractKey`), and one hash-table control word for each. A small
+/// floor from the types, so a contract with many summaryless records still
+/// costs something; allocator slack is not included.
+pub(crate) const PEER_INTEREST_ENTRY_BYTES: u64 = (std::mem::size_of::<PeerKey>()
+    + std::mem::size_of::<PeerInterest>()
+    + std::mem::size_of::<ContractKey>()
+    + 2 * std::mem::size_of::<u64>()) as u64;
+
 /// Grace period before removing a disconnected peer's interests.
 ///
 /// When a peer disconnects, we defer interest removal for this duration instead of
@@ -565,15 +578,21 @@ pub(crate) enum SummaryPopulationOutcome {
     RefreshedKnown,
     CreatedUntracked,
     RejectedAtCap,
+    /// The summary was larger than [`crate::wasm_runtime::MAX_STATE_SIZE`]. A
+    /// summary describes a state and no legal state is larger, so it is not
+    /// stored, and an existing record keeps its previous summary (#5647).
+    /// Appended last so existing telemetry positions do not move.
+    RejectedOversized,
 }
 
 impl SummaryPopulationOutcome {
-    pub(crate) const COUNT: usize = 4;
+    pub(crate) const COUNT: usize = 5;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::FilledMissing,
         Self::RefreshedKnown,
         Self::CreatedUntracked,
         Self::RejectedAtCap,
+        Self::RejectedOversized,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -586,6 +605,7 @@ impl SummaryPopulationOutcome {
             Self::RefreshedKnown => "refreshed_known",
             Self::CreatedUntracked => "created_untracked",
             Self::RejectedAtCap => "rejected_at_cap",
+            Self::RejectedOversized => "rejected_oversized",
         }
     }
 }
@@ -2167,7 +2187,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// The insert respects [`MAX_INTERESTED_PEERS_PER_CONTRACT`] (returns
     /// `false` at cap with no side writes, same shape as
-    /// [`Self::register_peer_interest`]) and creates the entry with
+    /// [`Self::register_peer_interest`]), returns `false` without storing for a
+    /// summary over `MAX_STATE_SIZE` (#5647), and creates the entry with
     /// `is_upstream = false`. It does NOT touch the demand counters
     /// (`downstream_subscriber_count` / `local_client_count`) that feed
     /// eviction's demand ranking — an upserted entry is summary bookkeeping
@@ -2179,8 +2200,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         summary: StateSummary<'static>,
     ) -> bool {
-        self.upsert_peer_summary_from(contract, peer, summary, SummaryPopulationSource::Unknown)
-            != SummaryPopulationOutcome::RejectedAtCap
+        !matches!(
+            self.upsert_peer_summary_from(
+                contract,
+                peer,
+                summary,
+                SummaryPopulationSource::Unknown
+            ),
+            SummaryPopulationOutcome::RejectedAtCap | SummaryPopulationOutcome::RejectedOversized
+        )
     }
 
     pub(crate) fn upsert_peer_summary_from(
@@ -2190,6 +2218,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         summary: StateSummary<'static>,
         source: SummaryPopulationSource,
     ) -> SummaryPopulationOutcome {
+        if summary.as_ref().len() > crate::wasm_runtime::MAX_STATE_SIZE {
+            let outcome = SummaryPopulationOutcome::RejectedOversized;
+            self.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .fetch_add(1, Ordering::Relaxed);
+            return outcome;
+        }
         let now = self.time_source.now();
         // Hold the `interested_peers` shard guard across the `peer_contracts`
         // and hash-index writes — same #4129/#4171 discipline as
@@ -2381,6 +2415,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.interested_peers
             .get(contract)
             .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary.is_some()))
+    }
+
+    /// Bytes this node holds to track neighbours' interest in `contract`: every
+    /// cached neighbour summary plus a fixed per-record charge
+    /// ([`PEER_INTEREST_ENTRY_BYTES`]) (#5647).
+    ///
+    /// This is the part of hosting a contract that varies with the contract and
+    /// with how many neighbours follow it, so the hosting cache charges it to
+    /// the contract instead of a uniform per-contract estimate. It reads the
+    /// canonical `interested_peers` map, so it cannot drift from what is held.
+    pub fn resident_bytes_for(&self, contract: &ContractKey) -> u64 {
+        self.interested_peers.get(contract).map_or(0, |peers| {
+            peers
+                .values()
+                .map(|interest| {
+                    PEER_INTEREST_ENTRY_BYTES
+                        + interest
+                            .summary
+                            .as_ref()
+                            .map_or(0, |s| s.as_ref().len() as u64)
+                })
+                .sum()
+        })
     }
 
     /// Check if enough time has elapsed to send a proactive summary notification
@@ -5317,6 +5374,95 @@ mod tests {
                 "{c} never reached"
             );
         }
+    }
+
+    /// #5647: the hosting cache charges each contract what the interest manager
+    /// actually holds for it, so the figure must follow summary bytes exactly as
+    /// they are stored, replaced and removed, and must not leak across contracts.
+    #[test]
+    fn resident_bytes_for_tracks_stored_summary_bytes() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let other = make_contract_key(2);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+
+        assert_eq!(manager.resident_bytes_for(&contract), 0);
+
+        assert!(manager.upsert_peer_summary(&contract, &a, StateSummary::from(vec![0u8; 1000])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            PEER_INTEREST_ENTRY_BYTES + 1000
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &b, StateSummary::from(vec![0u8; 300])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 1300
+        );
+
+        // Replacing a summary charges the new size, not the sum of both.
+        assert!(manager.upsert_peer_summary(&contract, &a, StateSummary::from(vec![0u8; 10])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 310
+        );
+
+        // Another contract's records are not charged here.
+        assert!(manager.upsert_peer_summary(&other, &a, StateSummary::from(vec![0u8; 5000])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 310
+        );
+
+        assert!(manager.remove_peer_interest(&contract, &b));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            PEER_INTEREST_ENTRY_BYTES + 10
+        );
+    }
+
+    /// #5647: a neighbour summary larger than any legal state is not stored,
+    /// for a new record or over an existing one, and is counted as rejected.
+    #[test]
+    fn oversized_summary_is_rejected_and_keeps_the_previous_one() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let oversized = StateSummary::from(vec![0u8; crate::wasm_runtime::MAX_STATE_SIZE + 1]);
+
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                oversized.clone(),
+                SummaryPopulationSource::Unknown
+            ),
+            SummaryPopulationOutcome::RejectedOversized
+        );
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+        assert_eq!(manager.resident_bytes_for(&contract), 0);
+        assert_eq!(
+            manager.interest_lifecycle_metrics.population[SummaryPopulationSource::Unknown.index()]
+                [SummaryPopulationOutcome::RejectedOversized.index()]
+            .load(Ordering::Relaxed),
+            1,
+            "the rejection must be counted"
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![7u8; 10])));
+        assert!(!manager.upsert_peer_summary(&contract, &peer, oversized));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![7u8; 10]),
+            "an oversized replacement must leave the previous summary in place"
+        );
+
+        // A summary exactly at the limit is a legal size.
+        let at_limit = StateSummary::from(vec![0u8; crate::wasm_runtime::MAX_STATE_SIZE]);
+        assert!(manager.upsert_peer_summary(&contract, &peer, at_limit));
     }
 
     /// [`summary_digest`] must be a FIXED function of the bytes — identical on

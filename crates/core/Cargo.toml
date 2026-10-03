@@ -207,7 +207,7 @@ tao = { workspace = true }
 # had not actually been confirmed by (the job was still pending). `libc`
 # has every symbol needed, including the `_COUNT` size constants that avoid
 # hand-rolled `size_of` arithmetic — see `wasm_runtime::module_cache`'s
-# `read_macos_available_bytes`/`read_macos_own_rss_bytes`.
+# `read_macos_own_rss_bytes`.
 
 [dev-dependencies]
 arbitrary = { workspace = true }
