@@ -2817,6 +2817,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Get or create local interest entry, returning mutable reference.
+    /// Every call, a read included, restarts reconciliation's wait (#5782),
+    /// so polling it keeps the contract's records from being dropped; use
+    /// [`Self::has_local_interest`] to read.
     pub fn with_local_interest<F, R>(&self, contract: &ContractKey, f: F) -> R
     where
         F: FnOnce(&mut LocalInterest) -> R,
