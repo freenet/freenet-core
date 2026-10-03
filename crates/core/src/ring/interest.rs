@@ -2034,7 +2034,28 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         cause: InterestRemovalCause,
     ) -> bool {
+        self.remove_peer_interest_if(contract, peer, cause, || true)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::remove_peer_interest_for`], but `allowed` is evaluated while
+    /// holding the contract's `interested_peers` shard guard, and nothing is
+    /// removed (`None`) when it returns false. Reconciliation passes a check
+    /// that its wait has not restarted (#5782): `refresh_peer_interest_with_upstream`
+    /// restarts the wait before it takes this guard, so either the check sees
+    /// the restart, or the refresh finds the record gone and its caller
+    /// registers a new one.
+    fn remove_peer_interest_if(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        cause: InterestRemovalCause,
+        allowed: impl FnOnce() -> bool,
+    ) -> Option<bool> {
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            if !allowed() {
+                return None;
+            }
             let removed_interest = entry.remove(peer);
             let removed = removed_interest.is_some();
 
@@ -2081,9 +2102,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 self.cleanup_contract_if_no_interest(contract);
             }
 
-            removed
+            Some(removed)
         } else {
-            false
+            Some(false)
         }
     }
 
@@ -3015,10 +3036,13 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// records. Several paths create records without a hosting check, so a
     /// cleanup run only when interest ends can be undone by a registration
     /// already in flight. Re-checking every pass, waiting out
-    /// [`RECONCILE_MIN_UNUSED_AGE`], and re-checking hosted, in-use and local
-    /// interest immediately before each action covers those paths. The checks
-    /// are not atomic with concurrent registrations; a registration that lands
-    /// after a record is dropped is restored by the next heartbeat or renewal.
+    /// [`RECONCILE_MIN_UNUSED_AGE`], and re-checking hosted, in-use, local
+    /// interest and this node's own lease before each record is dropped covers
+    /// those paths; the record's removal also re-checks, under its shard
+    /// guard, that the wait has not restarted. Hosting and use are read
+    /// through closures, so they are not atomic with a concurrent re-host; a
+    /// neighbour registration that lands after its record is dropped is
+    /// restored by the next heartbeat (as non-upstream) or renewal.
     /// A re-host that lands while the stale flag is being cleared is caught by
     /// a check after the clear, which puts the flag back and reports nothing.
     pub(crate) fn reconcile_with_hosting(
@@ -3121,16 +3145,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 // downstream subscriber), a re-host, a lease, or anything that
                 // restarted the wait (an upstream registration by a subscribe
                 // starting) that lands mid-loop stops the drop.
+                // `has_local_interest` backstops a local-interest writer that
+                // does not restart the wait; every current one does.
                 if self.has_local_interest(&key)
                     || is_hosted(&key)
                     || in_use(&key)
                     || holds_lease(&key)
-                    || self.reconcile_candidates.get(&key).map(|seen| *seen) != Some(first_seen)
                 {
                     break;
                 }
-                if self.remove_peer_interest_for(&key, &peer, InterestRemovalCause::Eviction) {
-                    dropped += 1;
+                // The wait check runs under the record's shard guard, so a
+                // subscribe refreshing this very record cannot slip between
+                // the check and the removal.
+                let wait_unchanged =
+                    || self.reconcile_candidates.get(&key).map(|seen| *seen) == Some(first_seen);
+                match self.remove_peer_interest_if(
+                    &key,
+                    &peer,
+                    InterestRemovalCause::Eviction,
+                    wait_unchanged,
+                ) {
+                    None => break,
+                    Some(true) => dropped += 1,
+                    Some(false) => {}
                 }
             }
             if dropped > 0 {
@@ -4478,6 +4515,14 @@ mod tests {
                 "{sig} removes unconditionally"
             );
         }
+        let unregister = body("    pub fn unregister_local_hosting(");
+        assert!(
+            unregister.contains(concat!(
+                "self.reset_reconcile_wait(contract);",
+                "self.clear_local_hosting_flag(contract)"
+            )),
+            "unregister_local_hosting must restart the wait, then clear the flag"
+        );
         let cleanup = body("    pub fn cleanup_local_interest(");
         assert!(
             cleanup.contains(conditional),
@@ -4947,9 +4992,10 @@ mod tests {
         assert_eq!(lapsed.records_dropped, 2);
     }
 
-    /// An upstream registration (a subscribe starting) that lands while a
-    /// pass is dropping a contract's records restarts the wait, which stops
-    /// the drop, so the fresh upstream record survives (#5782).
+    /// A subscribe refreshing a record already in the pass's snapshot as its
+    /// upstream restarts the wait; the removal re-checks the wait under the
+    /// record's shard guard, so the drop stops and the refreshed upstream
+    /// record survives (#5782).
     #[test]
     fn reconcile_stops_dropping_when_the_wait_restarts_mid_loop() {
         let (manager, time) = make_manager();
@@ -4960,23 +5006,74 @@ mod tests {
         let no = |_: &ContractKey| false;
         manager.reconcile_with_hosting(&[], no, no, no);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        // `in_use` calls: the window check, then one per record. The upstream
-        // registers during the first record's check.
+        // `in_use` calls: the window check, then one per record. The first
+        // record is refreshed as upstream during its own check.
         let calls = std::cell::Cell::new(0);
-        let upstream_arrives = |k: &ContractKey| {
+        let refreshed = std::cell::Cell::new(false);
+        let upstream_refreshes = |k: &ContractKey| {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
-                manager.register_peer_interest(k, make_peer_key(9), None, true);
+                let peers = manager.get_interested_peers(k);
+                refreshed.set(manager.refresh_peer_interest_with_upstream(k, &peers[0].0, true));
             }
             false
         };
-        let outcome = manager.reconcile_with_hosting(&[], no, upstream_arrives, no);
+        let outcome = manager.reconcile_with_hosting(&[], no, upstream_refreshes, no);
+        assert!(refreshed.get(), "the refresh found the record");
         assert_eq!(outcome.records_dropped, 0);
-        assert!(
-            manager
-                .get_peer_interest(&contract, &make_peer_key(9))
-                .is_some()
-        );
+        let peers = manager.get_interested_peers(&contract);
+        assert_eq!(peers.len(), 4);
+        assert!(peers.iter().any(|(_, interest)| interest.is_upstream));
+    }
+
+    /// `unregister_local_hosting` restarts the wait (every caller other than
+    /// reconciliation itself, e.g. the eviction loops, goes through it).
+    #[test]
+    fn unregister_local_hosting_restarts_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(10));
+        manager.unregister_local_hosting(&contract);
+        time.advance_time(Duration::from_secs(10));
+        let outcome = manager.reconcile_with_hosting(&[], no, no, no);
+        assert_eq!(outcome.records_dropped, 0, "the wait restarted");
+    }
+
+    /// Local interest added without restarting the wait (no current writer
+    /// does that, so the test writes the entry directly) still stops a drop
+    /// at the next record.
+    #[test]
+    fn reconcile_stops_dropping_for_local_interest_that_skips_the_wait_reset() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `in_use` calls: the window check, then one per record, after that
+        // record's local-interest check. Interest appears during the first
+        // record's check, so that record is dropped and the second stops.
+        let calls = std::cell::Cell::new(0);
+        let interest_appears = |k: &ContractKey| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                manager
+                    .local_interests
+                    .entry(*k)
+                    .or_default()
+                    .local_client_count = 1;
+            }
+            false
+        };
+        let outcome = manager.reconcile_with_hosting(&[], no, interest_appears, no);
+        assert_eq!(outcome.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 3);
     }
 
     /// A lease that appears while a pass is dropping a contract's records

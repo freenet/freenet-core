@@ -805,7 +805,13 @@ unchecked writer.
   apart.
 - **Restart the wait on every change to the mirror**, not only when a pass
   observes the source: a re-host and re-eviction between two passes is
-  invisible to the passes.
+  invisible to the passes. A pass treats a restart as a stop signal: its
+  record removal re-checks, under the record's shard guard, that the wait
+  entry it started from is unchanged, so a subscribe refreshing an upstream
+  record mid-pass keeps it. The one write that must NOT restart the wait is
+  the pass's own stale-flag clear (`clear_local_hosting_flag`); going
+  through `unregister_local_hosting` there would stop the pass dropping the
+  records it just made eligible.
 - **Re-check the source immediately before each destructive step**, and say in
   the doc comment that the checks are not atomic and what restores state when
   a registration lands just after a drop.
@@ -859,7 +865,8 @@ subscriber) rather than cache hosting, so they are not cache host formation.
 # test modules of interest.rs, node.rs and operations/, and the simulation
 # harness node/testing_impl/in_memory.rs, also match, so read the file
 # position of each hit. Expected: the GET/PUT eviction loops and the sweep
-# (guarded unregister), complete_host_formation, reconcile_with_hosting, and
+# (guarded unregister), complete_host_formation, reconcile_with_hosting (its
+# flag-clear restore; the clear itself is `clear_local_hosting_flag(`), and
 # startup rehydration in node/op_state_manager.rs, which registers from
 # `contract_state_present` and so inherits the inconclusive-probe caveat above.
 grep -rn "register_local_hosting(\|unregister_local_hosting(" crates/core/src --include=*.rs | grep -v ':\s*//'
