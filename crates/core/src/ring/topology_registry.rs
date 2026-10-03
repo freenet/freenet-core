@@ -106,6 +106,11 @@ pub struct TopologySnapshot {
     /// has dropped since startup (#5780). `None` when the `OpManager` was not
     /// attached at snapshot time.
     pub reconcile_contracts_dropped: Option<u64>,
+    /// Contracts this peer still advertises to co-hosts although it neither
+    /// hosts nor uses them and holds no live lease toward them (#5782). `None`
+    /// when the `OpManager` was not attached at snapshot time. See
+    /// `Ring::stale_advertisement_count`.
+    pub stale_advertisements: Option<usize>,
 }
 
 impl TopologySnapshot {
@@ -120,6 +125,7 @@ impl TopologySnapshot {
             connection_count: 0,
             orphan_interest_contracts: None,
             reconcile_contracts_dropped: None,
+            stale_advertisements: None,
         }
     }
 

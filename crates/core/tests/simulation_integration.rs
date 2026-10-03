@@ -18930,10 +18930,13 @@ fn test_evicted_contracts_keep_no_interest_records() {
         let dropped = snap
             .reconcile_contracts_dropped
             .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        let stale_ads = snap
+            .stale_advertisements
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
         dropped_total += dropped;
         eprintln!(
             "[#5780] peer={} hosting={} orphan_interest_contracts={orphans} \
-             reconcile_contracts_dropped={dropped}",
+             reconcile_contracts_dropped={dropped} stale_advertisements={stale_ads}",
             snap.peer_addr,
             snap.contracts.len(),
         );
@@ -18946,6 +18949,12 @@ fn test_evicted_contracts_keep_no_interest_records() {
             orphans, 0,
             "peer {} keeps interest records for {orphans} contract(s) it neither hosts nor \
              uses; they stay advertised and their summaries are never freed (#5780)",
+            snap.peer_addr
+        );
+        assert_eq!(
+            stale_ads, 0,
+            "peer {} still advertises {stale_ads} contract(s) it neither hosts nor uses and \
+             holds no lease toward; co-hosts keep sending it updates (#5782)",
             snap.peer_addr
         );
     }

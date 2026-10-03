@@ -570,6 +570,12 @@ impl NeighborHostingManager {
         self.my_contracts.contains(contract_key.id())
     }
 
+    /// The contracts this node advertises hosting (`my_contracts`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn advertised_contract_ids(&self) -> Vec<ContractInstanceId> {
+        self.my_contracts.iter().map(|id| *id.key()).collect()
+    }
+
     /// Get the number of contracts we advertise hosting locally (`my_contracts`).
     #[allow(dead_code)]
     pub fn local_hosted_count(&self) -> usize {

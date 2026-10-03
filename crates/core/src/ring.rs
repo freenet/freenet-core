@@ -2938,6 +2938,19 @@ impl Ring {
                     "Expired {} stale subscriptions",
                     expired.len()
                 );
+                // A lapsed lease no longer blocks the co-host advertisement's
+                // retraction (#5782). Retract here for a contract that may
+                // have no interest record left to keep reconciliation
+                // retrying it; the helper re-checks hosting, use and lease and
+                // does nothing for a contract still hosted.
+                if let Some(op_manager) = ring.upgrade_op_manager() {
+                    for key in &expired {
+                        crate::operations::retract_advertisement_for_evicted_contract(
+                            &op_manager,
+                            key,
+                        );
+                    }
+                }
             }
 
             // Expire stale downstream subscribers and decrement interest manager
@@ -3599,13 +3612,15 @@ impl Ring {
             // advertisement retracted, as an eviction would; neighbours are told
             // the interest ended only if it did (a delegate or local client can
             // keep it). Advertisements are retracted every pass for every
-            // contract past the wait that is unhosted and unused; the
-            // retraction refuses while this node's own lease is live, and that
-            // lease, which is not demand, lapses unrenewed.
+            // contract past the wait that is unhosted, unused and holds no
+            // lease of this node's own. A contract whose lease is live keeps
+            // its records until the lease, which is not demand, lapses
+            // unrenewed.
             if let Some(op_manager) = &op_manager {
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
+                    |key| ring.is_subscribed(key),
                 );
                 for key in &outcome.advertisements_to_retract {
                     crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
@@ -3792,6 +3807,7 @@ impl Ring {
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
             snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
+            snapshot.stale_advertisements = ring.stale_advertisement_count();
             snapshot.reconcile_contracts_dropped = ring
                 .upgrade_op_manager()
                 .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
@@ -5017,6 +5033,31 @@ impl Ring {
                         && !self.contract_in_use(key)
                         && !op_manager.interest_manager.has_local_interest(key)
                 })
+                .count()
+        })
+    }
+
+    /// Number of contracts this node still advertises to co-hosts although it
+    /// neither hosts nor uses them and holds no live lease toward them (#5782).
+    /// Such an advertisement keeps co-hosts sending updates for a copy this
+    /// node no longer holds. A live lease is excluded because the retraction
+    /// deliberately waits for it to lapse. `None` if the `OpManager` is not
+    /// attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stale_advertisement_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            let mut held: HashSet<ContractInstanceId> = self
+                .hosting_contract_keys()
+                .iter()
+                .chain(self.get_subscribed_contracts().iter())
+                .map(|key| *key.id())
+                .collect();
+            held.extend(self.hosting_manager.in_use_contract_ids());
+            op_manager
+                .neighbor_hosting
+                .advertised_contract_ids()
+                .into_iter()
+                .filter(|id| !held.contains(id))
                 .count()
         })
     }
@@ -7029,6 +7070,7 @@ impl Ring {
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
         snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
+        snapshot.stale_advertisements = self.stale_advertisement_count();
         snapshot.reconcile_contracts_dropped = self
             .upgrade_op_manager()
             .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
@@ -7871,6 +7913,35 @@ mod k_closest_source_tests {
         );
     }
 
+    /// #5782 round 8: a lapsed lease must retract the co-host advertisement
+    /// at expiry, since the contract may have no interest record left to keep
+    /// reconciliation retrying it. Code lines only.
+    #[test]
+    fn lease_expiry_retracts_the_advertisement() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = "letexpired=ring.expire_stale_subscriptions();if!expired.is_empty(){";
+        let at = code.find(needle).expect("expiry");
+        let rest = &code[at..];
+        let block_end = rest.find("letds_expired=").expect("next step");
+        assert!(
+            rest[..block_end].contains(concat!(
+                "forkeyin&expired{crate::operations::",
+                "retract_advertisement_for_evicted_contract(&op_manager,key,);}"
+            )),
+            "recover_orphaned_subscriptions must retract each expired lease's advertisement (#5782)"
+        );
+    }
+
     /// #5780: the periodic hosting sweep must run the interest-record
     /// reconciliation, or evicted contracts keep their neighbours' records and
     /// stay advertised. Requires the call on a code line (not a comment), so a
@@ -7894,7 +7965,8 @@ mod k_closest_source_tests {
             // the call, with the hosting facts in the right order
             concat!(
                 "interest_manager.reconcile_with_hosting(",
-                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
+                "|key|ring.is_subscribed(key),)"
             ),
             // every aged, unhosted, unused, lease-free contract has any
             // standing advertisement retracted, every pass

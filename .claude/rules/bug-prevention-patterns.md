@@ -823,8 +823,11 @@ unchecked writer.
   copy for it: the lease is renewed only for demand, so it lapses within one
   lease period. The advertisement retraction refuses while a lease is live (a
   subscribe installs it before the body arrives, so a live lease may mean a
-  host is forming), so the retraction is retried every pass for every
-  unhosted, unused contract past the wait and goes once the lease lapses. Do
+  host is forming), so something must retract when the lease lapses: the
+  lease expiry does it directly, and reconciliation retries every pass for
+  every unhosted, unused, lease-free contract past the wait. Keep the
+  contract's records while its lease lives: dropping them untracks the
+  contract, so the refused retraction is never retried (#5782 round 8). Do
   not retract only at the moment a flag is cleared: nothing comes back to
   retry.
 
