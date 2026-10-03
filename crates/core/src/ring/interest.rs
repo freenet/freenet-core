@@ -1180,12 +1180,14 @@ pub(crate) struct ReconcileOutcome {
     /// The subset of `hosting_flags_cleared` whose local interest ended with
     /// the flag. The caller tells neighbours.
     pub interest_lost: Vec<ContractKey>,
-    /// Contracts that are neither hosted nor in use but for which this node
-    /// still holds its own subscription lease toward the contract. That lease
-    /// only exists to receive updates for a hosted copy, so it is no reason to
-    /// keep anything. The caller releases it (unsubscribing upstream, which
-    /// reads the upstream record, so this pass keeps the contract's records),
-    /// then retracts the advertisement; the next pass drops the records.
+    /// Contracts that are neither hosted nor in use and have no local interest
+    /// (no local client, delegate or downstream subscriber), but for which this
+    /// node still holds its own subscription lease toward the contract. That
+    /// lease only exists to receive updates for a hosted copy, so it is no
+    /// reason to keep anything. The caller checks again, releases it
+    /// (unsubscribing upstream, which reads the upstream record, so this pass
+    /// keeps the contract's records), then retracts the advertisement; a later
+    /// pass drops the records.
     pub leases_to_release: Vec<ContractKey>,
     /// Contracts whose neighbour records were all dropped.
     pub contracts_dropped: usize,
@@ -3065,7 +3067,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 }
             }
             if holds_lease(&key) {
-                outcome.leases_to_release.push(key);
+                // Released only with no demand at all, checked now: a delegate
+                // subscribes through local interest alone, which `in_use` does
+                // not see, and its lease may be the only way the body arrives.
+                if !is_hosted(&key) && !in_use(&key) && !self.has_local_interest(&key) {
+                    outcome.leases_to_release.push(key);
+                }
                 continue;
             }
             let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
@@ -4807,7 +4814,7 @@ mod tests {
         );
     }
 
-    /// Ian, #5782 review: this node's own subscription lease toward a contract
+    /// @sanity's #5782 review: this node's own subscription lease toward a contract
     /// only exists to receive updates for a hosted copy, so it is no reason to
     /// keep anything once the copy is gone. Reconciliation reports the lease
     /// for release and keeps the records this pass (the unsubscribe reads the
@@ -4829,13 +4836,32 @@ mod tests {
         assert_eq!(outcome.records_dropped, 0, "kept for the unsubscribe");
         assert!(manager.get_peer_interest(&contract, &upstream).is_some());
         // The lease is released. Clearing the flag restarted the wait, so the
-        // records go one wait later.
+        // records survive the next pass and go one wait later.
         manager.reconcile_with_hosting(no, no, no);
+        assert!(manager.get_peer_interest(&contract, &upstream).is_some());
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         let outcome = manager.reconcile_with_hosting(no, no, no);
         assert!(outcome.leases_to_release.is_empty());
         assert_eq!(outcome.records_dropped, 1);
         assert!(manager.get_peer_interest(&contract, &upstream).is_none());
+    }
+
+    /// Skeptical review, #5782 round 6: a delegate subscribes through local
+    /// interest alone, which `in_use` does not see. Its lease is demand and is
+    /// not released, however long the contract stays unhosted.
+    #[test]
+    fn reconcile_keeps_the_lease_of_a_delegate_subscription() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, true);
+        manager.add_local_client(&contract);
+        let no = |_: &ContractKey| false;
+        let leased = |_: &ContractKey| true;
+        for _ in 0..3 {
+            let outcome = manager.reconcile_with_hosting(no, no, leased);
+            assert!(outcome.leases_to_release.is_empty());
+            time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        }
     }
 
     /// A lease does not count as use: a contract kept only by this node's own

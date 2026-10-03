@@ -1948,7 +1948,8 @@ impl HostingManager {
     ///
     /// The narrow case "subscribed but no local interest" should be handled
     /// by tearing down the orphaned upstream subscription, not by carrying
-    /// an unbounded GC exemption here.
+    /// an unbounded GC exemption here. The hosting sweep does that through
+    /// `InterestManager::reconcile_with_hosting`'s `leases_to_release` (#5782).
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }

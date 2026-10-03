@@ -439,9 +439,12 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// - `is_hosting_contract` — a GET/PUT re-hosted it into the hosting cache.
 /// - `contract_in_use` — a client or downstream subscriber re-registered.
 ///   (These two match guards 1 and 2 in `RuntimePool::remove_contract`.)
-/// - `is_subscribed` — we hold a live upstream subscription lease, so we are
-///   wired into the contract's update mesh and therefore a host under invariant
-///   1, even with no cache entry and no subscriber of our own yet.
+/// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
+///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
+///   installs it before the body fetch and the announce, so a live lease may
+///   mean a host is forming. A lease left on a contract with no host and no
+///   demand is released by the hosting sweep's reconciliation (#5782), after
+///   which this retraction proceeds.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK

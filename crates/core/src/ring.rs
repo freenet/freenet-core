@@ -3619,6 +3619,15 @@ impl Ring {
                 for &key in &outcome.leases_to_release {
                     let op_mgr = op_manager.clone();
                     GlobalExecutor::spawn(async move {
+                        // Checked again when the task runs: a re-host, a
+                        // client, a downstream subscriber or a delegate may
+                        // have arrived since the pass.
+                        if op_mgr.ring.is_hosting_contract(&key)
+                            || op_mgr.ring.contract_in_use(&key)
+                            || op_mgr.interest_manager.has_local_interest(&key)
+                        {
+                            return;
+                        }
                         op_mgr.send_unsubscribe_upstream(&key).await;
                         crate::operations::retract_advertisement_for_evicted_contract(
                             &op_mgr, &key,
@@ -7922,7 +7931,13 @@ mod k_closest_source_tests {
                 "forkeyin&outcome.hosting_flags_cleared{if!outcome.leases_to_release.contains(key)",
                 "{crate::operations::retract_advertisement_for_evicted_contract(op_manager,key,);}}"
             ),
-            // our own lease is released (unsubscribe upstream), then retracted
+            // our own lease is released only if still unhosted and unused,
+            // then retracted
+            concat!(
+                "ifop_mgr.ring.is_hosting_contract(&key)||op_mgr.ring.contract_in_use(&key)",
+                "||op_mgr.interest_manager.has_local_interest(&key){return;}",
+                "op_mgr.send_unsubscribe_upstream(&key).await;"
+            ),
             concat!(
                 "op_mgr.send_unsubscribe_upstream(&key).await;",
                 "crate::operations::retract_advertisement_for_evicted_contract(&op_mgr,&key,);"

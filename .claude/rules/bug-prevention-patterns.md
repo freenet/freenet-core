@@ -818,10 +818,14 @@ unchecked writer.
   such a repair rather than gate it; the residual is #5784.
 - **A node's own subscription lease is not demand.** It exists to receive
   updates for a hosted copy, so it follows hosting and never justifies it.
-  Demand is a local client or a downstream subscriber (`contract_in_use`).
-  When the copy is gone, release the lease (unsubscribe upstream) rather than
-  count it as use; the advertisement retraction refuses while a lease is live,
-  so the lease has to go first.
+  Demand is a local client or a downstream subscriber (`contract_in_use`) AND
+  any local interest in the interest manager: a delegate subscribes through
+  local interest alone, which `contract_in_use` does not see. When the copy is
+  gone and there is no demand, release the lease (unsubscribe upstream) rather
+  than count it as use, checking again when the release runs; the
+  advertisement retraction refuses while a lease is live, so the lease has to
+  go first. The contract's records are kept for that pass (the unsubscribe
+  reads the upstream record) and go a wait later.
 
 The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration

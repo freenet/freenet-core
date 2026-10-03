@@ -2055,13 +2055,6 @@ async fn cache_contract_locally(
         crate::operations::reclaim_evicted_contract(op_manager, *evicted_key, *expected_generation);
     }
 
-    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-    // HOST-FORMATION site (GET cache path). About to (conditionally) announce
-    // hosting; does the controller agree? Focused on `Announce`. Actual =
-    // `{Announce}` iff production announces a NOT-yet-advertised host this event
-    // (`forms_host` AND not already advertised — the announce is
-    // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
-    // reflects the pre-announce state. DRIVES NOTHING.
     // A re-host from state already on disk forms a host only if the contract
     // code is on disk too: a partial reclamation can delete the code and leave
     // the state, and `state_matches` reads the state alone (#5782). Checked
@@ -2091,6 +2084,13 @@ async fn cache_contract_locally(
     let forms_host = access_result.is_new
         && (put_persisted || rehost_has_code)
         && op_manager.ring.is_hosting_contract(&key);
+    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+    // HOST-FORMATION site (GET cache path). About to (conditionally) announce
+    // hosting; does the controller agree? Focused on `Announce`. Actual =
+    // `{Announce}` iff production announces a NOT-yet-advertised host this event
+    // (`forms_host` AND not already advertised — the announce is
+    // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
+    // reflects the pre-announce state. DRIVES NOTHING.
     {
         let will_announce = forms_host;
         op_manager.record_reconcile_shadow_event(

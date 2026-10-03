@@ -1399,9 +1399,13 @@ impl OpManager {
         }
 
         // NOTE (keystone P6 flip, #4642): the reconcile COLLAPSE decision no longer
-        // lives here as a record-only shadow — it DRIVES, one level up. Every caller
-        // of `send_unsubscribe_upstream` now gates on `reconcile_wants_collapse`
-        // (the strict-farther `!contract_in_use` gate), which also owns the
+        // lives here as a record-only shadow — it DRIVES, one level up. Every
+        // collapse caller of `send_unsubscribe_upstream` gates on
+        // `reconcile_wants_collapse` (the strict-farther `!contract_in_use`
+        // gate). The one other caller is the hosting sweep's lease release
+        // (#5782), which gates on interest reconciliation instead: past
+        // `RECONCILE_MIN_UNUSED_AGE`, not hosted, not in use, no local interest,
+        // checked again when its task runs. `reconcile_wants_collapse` also owns the
         // repurposed `Collapse` reconcile counter (driven strict-vs-legacy
         // divergence). So this function performs the teardown it is asked to; the
         // only shadow it still records is the upstream-IDENTITY comparison above
