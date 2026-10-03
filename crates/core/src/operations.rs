@@ -303,6 +303,16 @@ pub(crate) async fn complete_host_formation(
     removed: Vec<ContractKey>,
 ) {
     announce_contract_hosted(op_manager, &key).await;
+    // The announce can wait up to 30s; an evicted contract re-hosted or
+    // re-subscribed meanwhile must not be sent as removed after its own
+    // addition went out.
+    let removed: Vec<ContractKey> = removed
+        .into_iter()
+        .filter(|k| {
+            !op_manager.ring.is_hosting_contract(k)
+                && !op_manager.interest_manager.has_local_interest(k)
+        })
+        .collect();
     if !op_manager.ring.is_hosting_contract(&key) {
         retract_advertisement_for_evicted_contract(op_manager, &key);
         if !removed.is_empty() {
@@ -442,9 +452,12 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
 ///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
 ///   installs it before the body fetch and the announce, so a live lease may
-///   mean a host is forming. A lease left on a contract with no host and no
-///   demand is released by the hosting sweep's reconciliation (#5782), after
-///   which this retraction proceeds.
+///   mean a host is forming. The hosting sweep's reconciliation (#5782)
+///   releases a lease left on a contract with no host and no demand, and
+///   retries this retraction every pass for a tracked contract that is
+///   unhosted, unused and lease-free, so an advertisement kept while a lease
+///   lived goes once it lapses. A lease with no interest record at all is not
+///   tracked and lapses at its expiry.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK

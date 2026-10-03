@@ -2072,8 +2072,8 @@ async fn cache_contract_locally(
                     .await,
                 Ok(ContractHandlerEvent::GetResponse {
                     response: Ok(StoreResponse {
+                        state: Some(_),
                         contract: Some(_),
-                        ..
                     }),
                     ..
                 })
@@ -6105,7 +6105,7 @@ mod tests {
                 "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
                 "{matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
                 "instance_id:*key.id(),return_contract_code:true,})"
-            )) && check.contains("contract:Some(_),"),
+            )) && check.contains("state:Some(_),contract:Some(_),"),
             "a state-only re-host must check the contract code is present"
         );
         assert!(

@@ -3609,12 +3609,8 @@ impl Ring {
                     |key| ring.contract_in_use(key),
                     |key| ring.is_subscribed(key),
                 );
-                for key in &outcome.hosting_flags_cleared {
-                    if !outcome.leases_to_release.contains(key) {
-                        crate::operations::retract_advertisement_for_evicted_contract(
-                            op_manager, key,
-                        );
-                    }
+                for key in &outcome.advertisements_to_retract {
+                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
                 }
                 for &key in &outcome.leases_to_release {
                     let op_mgr = op_manager.clone();
@@ -3624,7 +3620,7 @@ impl Ring {
                         // have arrived since the pass.
                         if op_mgr.ring.is_hosting_contract(&key)
                             || op_mgr.ring.contract_in_use(&key)
-                            || op_mgr.interest_manager.has_local_interest(&key)
+                            || op_mgr.interest_manager.has_local_demand(&key)
                         {
                             return;
                         }
@@ -7925,17 +7921,17 @@ mod k_closest_source_tests {
                 "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
                 "|key|ring.is_subscribed(key),)"
             ),
-            // every cleared stale flag is retracted like an eviction, except
-            // where a lease must be released first
+            // every aged, unhosted, unused, lease-free contract has any
+            // standing advertisement retracted, every pass
             concat!(
-                "forkeyin&outcome.hosting_flags_cleared{if!outcome.leases_to_release.contains(key)",
-                "{crate::operations::retract_advertisement_for_evicted_contract(op_manager,key,);}}"
+                "forkeyin&outcome.advertisements_to_retract{crate::operations::",
+                "retract_advertisement_for_evicted_contract(op_manager,key);}"
             ),
             // our own lease is released only if still unhosted and unused,
             // then retracted
             concat!(
                 "ifop_mgr.ring.is_hosting_contract(&key)||op_mgr.ring.contract_in_use(&key)",
-                "||op_mgr.interest_manager.has_local_interest(&key){return;}",
+                "||op_mgr.interest_manager.has_local_demand(&key){return;}",
                 "op_mgr.send_unsubscribe_upstream(&key).await;"
             ),
             concat!(
@@ -7965,7 +7961,7 @@ mod k_closest_source_tests {
         }
         // The retraction runs before the interest broadcast for the same pass.
         let retract = code
-            .find("forkeyin&outcome.hosting_flags_cleared{")
+            .find("forkeyin&outcome.advertisements_to_retract{")
             .expect("retraction loop");
         let broadcast = code
             .find("Vec::new(),interest_lost,)")

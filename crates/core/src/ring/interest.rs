@@ -1189,6 +1189,11 @@ pub(crate) struct ReconcileOutcome {
     /// keeps the contract's records), then retracts the advertisement; a later
     /// pass drops the records.
     pub leases_to_release: Vec<ContractKey>,
+    /// Contracts past the wait that are neither hosted nor in use and hold no
+    /// lease. The caller retracts any co-host advertisement still standing for
+    /// them (a no-op if there is none). Reported every pass, so an
+    /// advertisement kept while a lease lived is retracted once it lapses.
+    pub advertisements_to_retract: Vec<ContractKey>,
     /// Contracts whose neighbour records were all dropped.
     pub contracts_dropped: usize,
     /// Neighbour records dropped across those contracts.
@@ -1930,6 +1935,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         is_upstream: bool,
         source: InterestRegistrationSource,
     ) -> bool {
+        if is_upstream {
+            // A subscribe through this upstream is starting (#5782): restart
+            // reconciliation's wait so its lease is not released mid-fetch.
+            self.reset_reconcile_wait(contract);
+        }
         let now = self.time_source.now();
         // Hold the `interested_peers` shard guard across `peer_contracts`
         // insertion and `index_contract_hash` to keep the three writes
@@ -2275,6 +2285,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         is_upstream: bool,
     ) -> bool {
+        if is_upstream {
+            // As in `register_peer_interest_from` (#5782).
+            self.reset_reconcile_wait(contract);
+        }
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
@@ -2786,6 +2800,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .unwrap_or(false)
     }
 
+    /// Whether `contract` has local DEMAND: a local client (a WebSocket
+    /// client or a delegate) or a downstream subscriber. Unlike
+    /// [`Self::has_local_interest`], the cache-only hosting flag does not
+    /// count (#5782).
+    pub(crate) fn has_local_demand(&self, contract: &ContractKey) -> bool {
+        self.local_interests.get(contract).is_some_and(|entry| {
+            entry.local_client_count > 0 || entry.downstream_subscriber_count > 0
+        })
+    }
+
     /// Count contracts backed by *real demand*: a local client subscription or
     /// a downstream subscriber. This deliberately EXCLUDES the cache-only
     /// `hosting` reason, so it does not grow with the hosting cache.
@@ -3070,11 +3094,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 // Released only with no demand at all, checked now: a delegate
                 // subscribes through local interest alone, which `in_use` does
                 // not see, and its lease may be the only way the body arrives.
-                if !is_hosted(&key) && !in_use(&key) && !self.has_local_interest(&key) {
+                // While the lease is kept its advertisement stands; it is
+                // retracted on a pass after the lease lapses (below).
+                if !is_hosted(&key) && !in_use(&key) && !self.has_local_demand(&key) {
                     outcome.leases_to_release.push(key);
                 }
                 continue;
             }
+            // No hosting re-check here: the retraction re-checks hosting, use
+            // and lease itself, after removing the advertisement entry.
+            outcome.advertisements_to_retract.push(key);
             let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
                 Some(entry) => entry.keys().cloned().collect(),
                 None => {
@@ -4862,6 +4891,74 @@ mod tests {
             assert!(outcome.leases_to_release.is_empty());
             time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         }
+    }
+
+    /// Skeptical review, #5782 round 7: a stale hosting flag on a contract
+    /// whose lease a delegate keeps. The flag is cleared, the lease is kept,
+    /// and the advertisement is not retracted while the lease lives. Once the
+    /// lease lapses, the advertisement is reported for retraction on every
+    /// pass, so it does not outlive the lease.
+    #[test]
+    fn reconcile_retracts_an_advertisement_once_a_kept_lease_lapses() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        manager.add_local_client(&contract);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, true);
+        let no = |_: &ContractKey| false;
+        let leased = |_: &ContractKey| true;
+        manager.reconcile_with_hosting(no, no, leased);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(no, no, leased);
+        assert_eq!(outcome.hosting_flags_cleared, vec![contract]);
+        assert!(
+            outcome.leases_to_release.is_empty(),
+            "the delegate keeps it"
+        );
+        assert!(
+            outcome.advertisements_to_retract.is_empty(),
+            "the lease is live"
+        );
+        // Clearing the flag restarted the wait; the lease then lapses.
+        manager.reconcile_with_hosting(no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        for _ in 0..2 {
+            let outcome = manager.reconcile_with_hosting(no, no, no);
+            assert_eq!(outcome.advertisements_to_retract, vec![contract]);
+        }
+    }
+
+    /// The hosting flag alone is not demand: a contract whose only local
+    /// interest is a stale flag still has its lease released.
+    #[test]
+    fn reconcile_does_not_count_the_hosting_flag_as_demand_for_a_lease() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, true);
+        assert!(!manager.has_local_demand(&contract));
+        let no = |_: &ContractKey| false;
+        let leased = |_: &ContractKey| true;
+        manager.reconcile_with_hosting(no, no, leased);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(no, no, leased);
+        assert_eq!(outcome.leases_to_release, vec![contract]);
+    }
+
+    /// A subscribe registering its upstream restarts the wait, so its lease
+    /// is not released while it fetches the body.
+    #[test]
+    fn reconcile_wait_restarts_when_an_upstream_is_registered() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, false);
+        let no = |_: &ContractKey| false;
+        let leased = |_: &ContractKey| true;
+        manager.reconcile_with_hosting(no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.register_peer_interest(&contract, make_peer_key(2), None, true);
+        let outcome = manager.reconcile_with_hosting(no, no, leased);
+        assert!(outcome.leases_to_release.is_empty(), "the wait restarted");
     }
 
     /// A lease does not count as use: a contract kept only by this node's own
