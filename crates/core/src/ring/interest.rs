@@ -4671,7 +4671,7 @@ mod tests {
         assert!(manager.reconcile_candidates.is_empty());
     }
 
-    /// Review finding (#5782 round 2): a re-host and re-eviction between two
+    /// A re-host and re-eviction between two
     /// passes is invisible to the passes themselves, so the wait must restart
     /// on any change in local interest. Otherwise records are dropped seconds
     /// after the latest eviction.
@@ -4808,7 +4808,7 @@ mod tests {
         );
     }
 
-    /// Codex finding (#5782 round 4): a re-host that lands between the
+    /// A re-host that lands between the
     /// "still unhosted" check and the flag clear must not leave a hosted
     /// contract without its flag. The flag is put back and nothing is
     /// reported as cleared or lost (the advertisement retraction this pass
@@ -4908,11 +4908,10 @@ mod tests {
         assert_eq!(third.advertisements_to_retract, expected, "reported again");
     }
 
-    /// Review round 8 (#5782): while this node's own lease is live a contract
-    /// keeps its records, so it stays tracked and is retried; once the lease
-    /// lapses the next pass reports it for retraction and drops the records.
-    /// Dropping them while the lease lived left the contract untracked, so
-    /// the retraction that refused was never retried.
+    /// While this node's own lease is live a contract keeps its records (a
+    /// subscribe still fetching the body needs the upstream one) and is not
+    /// reported for retraction; once the lease lapses the next pass reports
+    /// it and drops the records (#5782).
     #[test]
     fn reconcile_keeps_records_while_an_own_lease_is_live() {
         let (manager, time) = make_manager();
@@ -5046,7 +5045,7 @@ mod tests {
         );
     }
 
-    /// Codex finding (#5782 round 2): with more tracked contracts than one
+    /// With more tracked contracts than one
     /// pass examines, coverage must not depend on map iteration order or on
     /// keys coming and going. The cursor is a contract id, so every contract
     /// is reached within ceil(n / MAX) passes even while others are added.
