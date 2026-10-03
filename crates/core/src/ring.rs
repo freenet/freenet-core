@@ -3562,7 +3562,12 @@ impl Ring {
                     "Cleaned up expired hosting subscription from local state"
                 );
                 if let Some(op_manager) = &op_manager {
-                    if op_manager.interest_manager.unregister_local_hosting(&key) {
+                    // A GET/PUT may have re-hosted it since the eviction decision
+                    // (#5780); unregistering then would leave a hosted contract
+                    // outside anti-entropy (until a restart; see #5784).
+                    if !ring.is_hosting_contract(&key)
+                        && op_manager.interest_manager.unregister_local_hosting(&key)
+                    {
                         removed_contracts.push(key);
                     }
                     crate::operations::reclaim_evicted_contract(
@@ -3584,6 +3589,54 @@ impl Ring {
                     removed_contracts,
                 )
                 .await;
+            }
+
+            // Interest-record reconciliation (#5780): drop neighbour records for
+            // contracts this node has neither hosted nor used for
+            // `RECONCILE_MIN_UNUSED_AGE`. Dropped records reach neighbours
+            // through the next interest heartbeat, which is a full replace. A
+            // stale local-hosting flag cleared here has its co-host
+            // advertisement retracted, as an eviction would; neighbours are told
+            // the interest ended only if it did (a delegate or local client can
+            // keep it). Advertisements are retracted every pass for every
+            // contract past the wait that is unhosted, unused and holds no
+            // lease of this node's own, including advertised contracts with no
+            // records left, so it does not matter how a lease or the records
+            // ended. A contract whose lease is live is left alone until the
+            // lease, which is not demand, lapses unrenewed.
+            if let Some(op_manager) = &op_manager {
+                let outcome = op_manager.interest_manager.reconcile_with_hosting(
+                    &op_manager.neighbor_hosting.advertised_contract_keys(),
+                    |key| ring.is_hosting_contract(key),
+                    |key| ring.contract_in_use(key),
+                    |key| ring.is_subscribed(key),
+                );
+                for key in &outcome.advertisements_to_retract {
+                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
+                }
+                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
+                    tracing::info!(
+                        hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
+                        contracts_dropped = outcome.contracts_dropped,
+                        records_dropped = outcome.records_dropped,
+                        "interest records reconciled with the hosted set"
+                    );
+                }
+                // Skip any contract that regained local interest since the pass,
+                // so this removal cannot follow a concurrent re-host's addition.
+                let interest_lost: Vec<ContractKey> = outcome
+                    .interest_lost
+                    .into_iter()
+                    .filter(|key| !op_manager.interest_manager.has_local_interest(key))
+                    .collect();
+                if !interest_lost.is_empty() {
+                    crate::operations::broadcast_change_interests(
+                        op_manager,
+                        Vec::new(),
+                        interest_lost,
+                    )
+                    .await;
+                }
             }
 
             // Retry pending reclamations queued by the two skip points
@@ -3742,6 +3795,11 @@ impl Ring {
             // join/peer_ready progress signal (snapshot presence alone only
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
+            snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
+            snapshot.stale_advertisements = ring.stale_advertisement_count();
+            snapshot.reconcile_contracts_dropped = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -4945,6 +5003,52 @@ impl Ring {
     pub fn active_demand_count(&self) -> Option<usize> {
         self.upgrade_op_manager()
             .map(|op_manager| op_manager.interest_manager.active_demand_count())
+    }
+
+    /// Number of contracts this node keeps neighbour records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Such records keep the contract indexed and advertised in the interest
+    /// heartbeat, so neighbours keep refreshing them; reconciliation removes
+    /// them. `None` if the `OpManager` is not attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn orphan_interest_contract_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .contracts_with_peer_records()
+                .into_iter()
+                .filter(|key| {
+                    !self.is_hosting_contract(key)
+                        && !self.contract_in_use(key)
+                        && !op_manager.interest_manager.has_local_interest(key)
+                })
+                .count()
+        })
+    }
+
+    /// Number of contracts this node still advertises to co-hosts although it
+    /// neither hosts nor uses them and holds no live lease toward them (#5782).
+    /// Such an advertisement keeps co-hosts sending updates for a copy this
+    /// node no longer holds. A live lease is excluded because the retraction
+    /// deliberately waits for it to lapse. `None` if the `OpManager` is not
+    /// attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stale_advertisement_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            let mut held: HashSet<ContractInstanceId> = self
+                .hosting_contract_keys()
+                .iter()
+                .chain(self.get_subscribed_contracts().iter())
+                .map(|key| *key.id())
+                .collect();
+            held.extend(self.hosting_manager.in_use_contract_ids());
+            op_manager
+                .neighbor_hosting
+                .advertised_contract_keys()
+                .iter()
+                .filter(|key| !held.contains(key.id()))
+                .count()
+        })
     }
 
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.
@@ -6954,6 +7058,11 @@ impl Ring {
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
+        snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
+        snapshot.stale_advertisements = self.stale_advertisement_count();
+        snapshot.reconcile_contracts_dropped = self
+            .upgrade_op_manager()
+            .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
@@ -7790,6 +7899,73 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// #5780: the periodic hosting sweep must run the interest-record
+    /// reconciliation, or evicted contracts keep their neighbours' records and
+    /// stay advertised. Requires the call on a code line (not a comment), so a
+    /// commented-out call fails this pin.
+    #[test]
+    fn sweep_reconciles_interest_records_with_the_hosted_set() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Code only, whitespace removed: layout-proof, and a commented-out
+        // line cannot satisfy it.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for needle in [
+            // the call, with the hosting facts in the right order
+            concat!(
+                "interest_manager.reconcile_with_hosting(",
+                "&op_manager.neighbor_hosting.advertised_contract_keys(),",
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
+                "|key|ring.is_subscribed(key),)"
+            ),
+            // every aged, unhosted, unused, lease-free contract has any
+            // standing advertisement retracted, every pass
+            concat!(
+                "forkeyin&outcome.advertisements_to_retract{crate::operations::",
+                "retract_advertisement_for_evicted_contract(op_manager,key);}"
+            ),
+            // neighbours are told only when interest actually ended, and still
+            // has not come back
+            concat!(
+                ".filter(|key|!op_manager.interest_manager.has_local_interest(key))",
+                ".collect();if!interest_lost.is_empty(){"
+            ),
+            concat!(
+                "crate::operations::broadcast_change_interests(op_manager,",
+                "Vec::new(),interest_lost,)"
+            ),
+            // the post-eviction unregister skips a re-hosted contract
+            concat!(
+                "if!ring.is_hosting_contract(&key)&&op_manager",
+                ".interest_manager.unregister_local_hosting(&key)"
+            ),
+        ] {
+            assert!(
+                code.contains(needle),
+                "sweep_get_subscription_cache must contain `{needle}` (#5780)"
+            );
+        }
+        // The retraction runs before the interest broadcast for the same pass.
+        let retract = code
+            .find("forkeyin&outcome.advertisements_to_retract{")
+            .expect("retraction loop");
+        let broadcast = code
+            .find("Vec::new(),interest_lost,)")
+            .expect("interest broadcast");
+        assert!(
+            retract < broadcast,
+            "retract before broadcasting lost interest"
         );
     }
 

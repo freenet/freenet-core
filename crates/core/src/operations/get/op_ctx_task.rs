@@ -43,7 +43,7 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
-use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 #[rustfmt::skip]
@@ -1853,6 +1853,26 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
     ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
+/// Whether a local `GetQuery` reply holds both state and code for `key`,
+/// stored under the same full key (#5782). `ContractKey` equality ignores the
+/// code hash, so the stored key's code hash is compared explicitly: a reply
+/// with the right instance and a different code hash does not count.
+fn stored_state_and_code_match(
+    stored: &Result<ContractHandlerEvent, crate::contract::ContractError>,
+    key: &ContractKey,
+) -> bool {
+    matches!(
+        stored,
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(stored_key),
+            response: Ok(StoreResponse {
+                state: Some(_),
+                contract: Some(_),
+            }),
+        }) if stored_key.code_hash() == key.code_hash()
+    )
+}
+
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
 /// `process_message` Response{Found} branch at `get.rs:2218-2450`.
@@ -1884,9 +1904,11 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    `get.rs:2260-2262, :2353-2355, :3056-3058`
 ///    all gate the call on `is_original_requester =
 ///    upstream_addr.is_none()`.
-/// 4. **Newly-hosted announcement** — only runs when the local
-///    store actually transitioned from no-state to has-state
-///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
+/// 4. **Newly-hosted announcement** — runs through
+///    `operations::complete_host_formation` when this access newly hosts
+///    the contract with its state held locally, whether persisted now or
+///    already on disk with its code, and it is still hosted (`forms_host`,
+///    #5780). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
 ///
@@ -2037,9 +2059,13 @@ async fn cache_contract_locally(
 
     let mut removed_contracts = Vec::new();
     for (evicted_key, expected_generation) in &access_result.evicted {
-        if op_manager
-            .interest_manager
-            .unregister_local_hosting(evicted_key)
+        // Skip if re-hosted since the eviction decision (#5780): the
+        // re-host registered it, and unregistering here would take a
+        // hosted contract out of anti-entropy.
+        if !op_manager.ring.is_hosting_contract(evicted_key)
+            && op_manager
+                .interest_manager
+                .unregister_local_hosting(evicted_key)
         {
             removed_contracts.push(*evicted_key);
         }
@@ -2049,15 +2075,39 @@ async fn cache_contract_locally(
         crate::operations::reclaim_evicted_contract(op_manager, *evicted_key, *expected_generation);
     }
 
+    // A re-host from state already on disk forms a host only if the contract
+    // code is on disk too: a partial reclamation can delete the code and leave
+    // the state, and `state_matches` reads the state alone (#5782). Checked
+    // only on this branch, and only while still hosted, since it loads the
+    // WASM. It reads the code on disk and ignores code carried by the GET:
+    // restoring missing code from the GET is #5784. The stored key's code
+    // hash must match the key being hosted: `ContractKey` equality ignores
+    // the code hash, so a reply with the right instance and a wrong code hash
+    // would otherwise be registered and advertised under a malformed key.
+    let rehost_has_code =
+        if access_result.is_new && state_matches && op_manager.ring.is_hosting_contract(&key) {
+            let stored = op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: true,
+                })
+                .await;
+            stored_state_and_code_match(&stored, &key)
+        } else {
+            false
+        };
+    let forms_host = access_result.is_new
+        && (put_persisted || rehost_has_code)
+        && op_manager.ring.is_hosting_contract(&key);
     // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
     // HOST-FORMATION site (GET cache path). About to (conditionally) announce
     // hosting; does the controller agree? Focused on `Announce`. Actual =
     // `{Announce}` iff production announces a NOT-yet-advertised host this event
-    // (`is_new && put_persisted` AND not already advertised — the announce is
+    // (`forms_host` AND not already advertised — the announce is
     // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
     // reflects the pre-announce state. DRIVES NOTHING.
     {
-        let will_announce = access_result.is_new && put_persisted;
+        let will_announce = forms_host;
         op_manager.record_reconcile_shadow_event(
             crate::node::network_status::ReconcileShadowSite::HostFormation,
             &key,
@@ -2072,26 +2122,15 @@ async fn cache_contract_locally(
         );
     }
 
-    // (4) Newly-hosted announcement gates on BOTH first-time access
-    // AND the fact that we actually persisted new state. Without
-    // persistence there's nothing to announce hosting for.
-    if access_result.is_new && put_persisted {
-        crate::operations::announce_contract_hosted(op_manager, &key).await;
-        // Directed-subscribe placement (#4404): best-effort nudge the node to
-        // consider migrating this freshly-hosted contract toward a closer
-        // neighbor. Dropped silently if the event channel is full — the next
-        // hosting/peer event re-triggers consideration.
-        if let Err(err) =
-            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
-        {
-            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (GET)");
-        }
-        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-        let added = if became_interested { vec![key] } else { vec![] };
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
-        }
+    // (4) A fresh host whose state is held locally, either persisted now or
+    // already on disk (`state_matches`, e.g. re-hosted after an eviction that
+    // kept the state), runs the full host-formation sequence: announce,
+    // register, interest change (#5780). Skipped if the contract is no
+    // longer hosted by the time this runs (a concurrent sweep eviction, or
+    // this access evicting the newcomer itself), so a contract being
+    // reclaimed is never re-announced.
+    if forms_host {
+        crate::operations::complete_host_formation(op_manager, key, removed_contracts).await;
     } else if !removed_contracts.is_empty() {
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
@@ -4471,11 +4510,11 @@ where
                 // Found payloads). `is_client_requester=false` so this node
                 // does NOT set `mark_local_client_access` — the sticky flag
                 // belongs to the upstream client-originating node, not a
-                // forwarder. `announce_contract_hosted` DOES fire when
-                // `access_result.is_new && put_persisted` so first-time
-                // hosting at a relay is still broadcast (matches legacy
-                // `get.rs:2370` which announces on any first-time relay
-                // cache).
+                // forwarder. The host-formation sequence (announce included)
+                // DOES run when this cache newly hosts the contract with its
+                // state held locally (`forms_host`), so first-time hosting at
+                // a relay is still broadcast (matches legacy `get.rs:2370`,
+                // which announces on any first-time relay cache).
                 let state_present =
                     cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
                         .await;
@@ -4891,6 +4930,50 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored_reply(
+        stored_key: Option<ContractKey>,
+        with_code: bool,
+    ) -> Result<ContractHandlerEvent, crate::contract::ContractError> {
+        let contract = with_code.then(|| {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+                Parameters::from(vec![]),
+            )))
+        });
+        Ok(ContractHandlerEvent::GetResponse {
+            key: stored_key,
+            response: Ok(StoreResponse {
+                state: Some(WrappedState::new(vec![7u8])),
+                contract,
+            }),
+        })
+    }
+
+    /// A state-only re-host forms a host only if the stored copy has code
+    /// and was stored under the same full key, code hash included (#5782).
+    #[test]
+    fn stored_state_and_code_match_requires_code_and_the_same_code_hash() {
+        let id = ContractInstanceId::new([5u8; 32]);
+        let key = ContractKey::from_id_and_code(id, CodeHash::new([6u8; 32]));
+        let other_code = ContractKey::from_id_and_code(id, CodeHash::new([9u8; 32]));
+        assert!(stored_state_and_code_match(
+            &stored_reply(Some(key), true),
+            &key
+        ));
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(other_code), true), &key),
+            "same instance, different code hash"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(key), false), &key),
+            "no code on disk"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(None, true), &key),
+            "no stored key"
+        );
+    }
 
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
@@ -6040,6 +6123,153 @@ mod tests {
             "GET eviction handler must call interest_manager.remove_evicted_in_use \
              to sync the InterestManager after a subscribed eviction"
         );
+    }
+
+    /// Code-only, whitespace-free text of `src`: comment lines dropped and all
+    /// whitespace removed, so a pin matches the code whatever rustfmt does to
+    /// its layout and is never satisfied by a commented-out line.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// #5780: a GET that re-hosts a contract whose state was already on disk
+    /// (`state_matches`) must form a host exactly like one that persisted new
+    /// state, through the shared helper, and only if the newcomer is still
+    /// hosted (a concurrent eviction can remove it before this runs).
+    #[test]
+    fn cache_contract_locally_forms_a_host_whenever_state_is_held() {
+        let body = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        let gate = concat!(
+            "letforms_host=access_result.is_new&&(put_persisted||rehost_has_code)",
+            "&&op_manager.ring.is_hosting_contract(&key);"
+        );
+        // A state-only re-host must also find the code on disk: the query
+        // asks for the code and only a returned contract counts.
+        let check = body
+            .split_once("letrehost_has_code=")
+            .expect("rehost_has_code")
+            .1
+            .split_once("letforms_host=")
+            .expect("forms_host after rehost_has_code")
+            .0;
+        assert!(
+            check.starts_with(concat!(
+                "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
+                "{letstored=op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
+                "instance_id:*key.id(),return_contract_code:true,})"
+            )) && check.contains("stored_state_and_code_match(&stored,&key)"),
+            "a state-only re-host must check the contract code is present, under the same key"
+        );
+        assert!(
+            body.contains(gate),
+            "forms_host must require is_new, held state and still hosted"
+        );
+        let call = concat!(
+            "ifforms_host{crate::operations::",
+            "complete_host_formation("
+        );
+        assert!(
+            body.contains(call),
+            "a forming host must run the shared host-formation helper"
+        );
+    }
+
+    /// #5780: the shared host-formation helper runs the whole sequence, so no
+    /// caller can register without advertising (or the reverse).
+    #[test]
+    fn complete_host_formation_runs_announce_register_and_interest_change() {
+        const OPS: &str = include_str!("../../operations.rs");
+        let body = code_only(extract_fn_body(
+            OPS,
+            "pub(crate) async fn complete_host_formation(",
+        ));
+        // Order: announce, then the re-check (which returns early), then the
+        // migration nudge and the registration.
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("complete_host_formation must contain `{needle}`"))
+        };
+        let announce = pos(concat!(
+            "announce_contract_hosted(",
+            "op_manager,&key).await;"
+        ));
+        let recheck = pos(concat!(
+            "if!op_manager.ring.is_hosting_contract(&key){",
+            "retract_"
+        ));
+        let bail = pos(concat!(
+            "broadcast_change_interests(op_manager,Vec::new(),removed)",
+            ".await;}return;}"
+        ));
+        let register = pos(concat!("interest_manager.", "register_local_hosting(&key)"));
+        assert!(announce < recheck && recheck < bail && bail < register);
+        for leg in [
+            concat!("announce_contract_hosted(", "op_manager,&key).await;"),
+            // re-checked after the announce await; an eviction there is retracted
+            concat!(
+                "if!op_manager.ring.is_hosting_contract(&key){",
+                "retract_advertisement_for_evicted_contract(op_manager,&key);"
+            ),
+            concat!("interest_manager.", "register_local_hosting(&key)"),
+            concat!(
+                "broadcast_change_interests(",
+                "op_manager,added,removed).await;"
+            ),
+        ] {
+            assert!(
+                body.contains(leg),
+                "complete_host_formation must contain `{leg}`"
+            );
+        }
+    }
+
+    /// #5780: the PUT relay store forms its host through the shared helper,
+    /// and only while the contract is still hosted, so a concurrent eviction
+    /// cannot leave an advertisement and a local-hosting flag behind.
+    #[test]
+    fn relay_put_store_forms_a_host_only_while_still_hosted() {
+        const PUT: &str = include_str!("../put/op_ctx_task.rs");
+        let put = code_only(extract_fn_body(PUT, "async fn relay_put_store_locally("));
+        assert!(put.contains(concat!(
+            "ifop_manager.ring.is_hosting_contract(&key){crate::operations::",
+            "complete_host_formation(op_manager,key,removed_contracts).await;}"
+        )));
+        for inlined in [
+            concat!("announce_contract_", "hosted("),
+            concat!("interest_manager.", "register_local_hosting("),
+        ] {
+            assert!(!put.contains(inlined), "PUT must not inline `{inlined}`");
+        }
+    }
+
+    /// #5780: the GET and PUT eviction loops must not unregister a contract
+    /// that has been re-hosted since the eviction decision.
+    #[test]
+    fn eviction_loops_skip_unregister_for_a_rehosted_contract() {
+        let get = code_only(extract_fn_body(
+            production_source(),
+            "async fn cache_contract_locally(",
+        ));
+        // The guard, and the retraction push gated on its result.
+        assert!(get.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(evicted_key){",
+            "removed_contracts.push(*evicted_key);"
+        )));
+        const PUT: &str = include_str!("../put/op_ctx_task.rs");
+        let put = code_only(extract_fn_body(PUT, "async fn relay_put_store_locally("));
+        assert!(put.contains(concat!(
+            "if!op_manager.ring.is_hosting_contract(&evicted_key)&&op_manager",
+            ".interest_manager.unregister_local_hosting(&evicted_key){",
+            "removed_contracts.push(evicted_key);"
+        )));
     }
 
     /// Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED.

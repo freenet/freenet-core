@@ -29,7 +29,7 @@ use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
-use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 use crate::node::WaiterReply;
@@ -2654,8 +2654,9 @@ where
 /// Store a relayed PUT's contract locally: `put_contract` + `host_contract`
 /// (unconditional, so EVERY genuine PUT refreshes hosting recency —
 /// invariant 3 / #4903 review Fix 1) + (on first host, gated on the atomic
-/// `host_contract` `is_new` result) `announce_contract_hosted` + interest
-/// register/unregister + broadcast interest changes.
+/// `host_contract` `is_new` result) eviction teardown, then host formation
+/// through `operations::complete_host_formation` (announce, interest register,
+/// interest changes) while the contract is still hosted (#5780).
 ///
 /// Shared between the non-streaming relay driver (`drive_relay_put`)
 /// and the streaming relay driver (`drive_relay_put_streaming`) so both
@@ -2812,8 +2813,9 @@ async fn relay_put_store_locally(
     // result (`is_new`), NOT a pre-await `is_hosting_contract` snapshot
     // (#4903 review round-3 Fix 1): a sweep can evict this contract during the
     // `put_contract().await` above, in which case `host_contract` re-adds it
-    // (`is_new = true`) and we MUST run announce / interest-register /
-    // evicted-teardown here. A stale pre-await "was already hosting" snapshot
+    // (`is_new = true`) and we MUST run evicted-teardown and host formation
+    // here (host formation itself is skipped if the contract has been evicted
+    // again by then). A stale pre-await "was already hosting" snapshot
     // would skip them AND drop `access_result.evicted` (leaking the contracts
     // this re-add shed to make room). On the already-hosted refresh path
     // `is_new` is false and `evicted` is empty (`record_access_with_demand`
@@ -2837,23 +2839,15 @@ async fn relay_put_store_locally(
             );
         }
 
-        crate::operations::announce_contract_hosted(op_manager, &key).await;
-
-        // Directed-subscribe placement (#4404): best-effort nudge the node to
-        // consider migrating this freshly-hosted contract toward a closer
-        // neighbor. Dropped silently if the event channel is full — the next
-        // hosting/peer event re-triggers consideration.
-        if let Err(err) =
-            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
-        {
-            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (PUT)");
-        }
-
         let mut removed_contracts = Vec::new();
         for (evicted_key, expected_generation) in evicted {
-            if op_manager
-                .interest_manager
-                .unregister_local_hosting(&evicted_key)
+            // Skip if re-hosted since the eviction decision (#5780): the
+            // re-host registered it, and unregistering here would take a
+            // hosted contract out of anti-entropy.
+            if !op_manager.ring.is_hosting_contract(&evicted_key)
+                && op_manager
+                    .interest_manager
+                    .unregister_local_hosting(&evicted_key)
             {
                 removed_contracts.push(evicted_key);
             }
@@ -2867,18 +2861,23 @@ async fn relay_put_store_locally(
             );
         }
 
-        let became_interested = op_manager.interest_manager.register_local_hosting(&key);
-        let added = if became_interested { vec![key] } else { vec![] };
-        if !added.is_empty() || !removed_contracts.is_empty() {
-            crate::operations::broadcast_change_interests(op_manager, added, removed_contracts)
-                .await;
+        // Form the host through the shared helper (announce, migration nudge,
+        // register, interest change), and only while the contract is still
+        // hosted: a sweep eviction between `host_contract` and here has already
+        // retracted it, and announcing afterwards would leave an advertisement
+        // and a local-hosting flag for a contract this node no longer holds
+        // (#5780).
+        if op_manager.ring.is_hosting_contract(&key) {
+            crate::operations::complete_host_formation(op_manager, key, removed_contracts).await;
+        } else if !removed_contracts.is_empty() {
+            crate::operations::broadcast_change_interests(
+                op_manager,
+                Vec::new(),
+                removed_contracts,
+            )
+            .await;
         }
     }
-
-    debug_assert!(
-        op_manager.ring.is_hosting_contract(&key),
-        "PUT relay: contract {key} must be in hosting list after put_contract + host_contract"
-    );
 
     Ok(merged_value)
 }
@@ -6844,9 +6843,14 @@ mod tests {
             helper_src.contains("host_contract("),
             "helper MUST call ring.host_contract for first-time hosting"
         );
+        // #5780: the announce lives in `complete_host_formation`. Match the
+        // call at statement position, so a doc comment naming it cannot
+        // satisfy the pin.
         assert!(
-            helper_src.contains("announce_contract_hosted"),
-            "helper MUST call announce_contract_hosted for first-time hosting"
+            helper_src.lines().any(|line| line
+                .trim_start()
+                .starts_with("crate::operations::complete_host_formation(")),
+            "helper MUST form the host through complete_host_formation (announce + register)"
         );
         // PR #4734 Fix 1: the eviction handler must sync the InterestManager for
         // any subscribed contract the subscriber-primary eviction shed + tore

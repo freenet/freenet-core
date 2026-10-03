@@ -97,6 +97,20 @@ pub struct TopologySnapshot {
     /// one handshake and can originate operations. See
     /// `SimNetwork::wait_for_join_convergence_before_ops`.
     pub connection_count: usize,
+    /// Contracts this peer keeps neighbour interest records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Stamped by the registration sites; `None` when the `OpManager` was not
+    /// attached at snapshot time. See `Ring::orphan_interest_contract_count`.
+    pub orphan_interest_contracts: Option<usize>,
+    /// Contracts whose neighbour records this peer's interest reconciliation
+    /// has dropped since startup (#5780). `None` when the `OpManager` was not
+    /// attached at snapshot time.
+    pub reconcile_contracts_dropped: Option<u64>,
+    /// Contracts this peer still advertises to co-hosts although it neither
+    /// hosts nor uses them and holds no live lease toward them (#5782). `None`
+    /// when the `OpManager` was not attached at snapshot time. See
+    /// `Ring::stale_advertisement_count`.
+    pub stale_advertisements: Option<usize>,
 }
 
 impl TopologySnapshot {
@@ -109,6 +123,9 @@ impl TopologySnapshot {
             active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
             connection_count: 0,
+            orphan_interest_contracts: None,
+            reconcile_contracts_dropped: None,
+            stale_advertisements: None,
         }
     }
 
