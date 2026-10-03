@@ -3027,24 +3027,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_budget_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_budget_evictions_total),
                 );
-                // Resident-overhead pressure axis (#5325) — the SECOND, independent
-                // eviction pressure alongside the state-byte budget above. Same
+                // Resident-overhead pressure axis (#5325, #5647) — the SECOND,
+                // independent eviction pressure alongside the state-byte budget
+                // above: the memory hosted contracts hold in RAM, counted. Same
                 // hand-mirrored footgun; pinned by
-                // `router_snapshot_json_includes_resident_overhead_gauges`. Note the
-                // budget/estimate pair is a contract-COUNT ceiling in memory units,
-                // not measured RAM (see the `RouterSnapshotInfo` doc), which is why
-                // `hosting_contract_slot_budget` travels with it.
+                // `router_snapshot_json_includes_resident_overhead_gauges`.
                 obj.insert(
                     "hosting_resident_overhead_budget_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_resident_overhead_budget_bytes),
                 );
                 obj.insert(
-                    "hosting_estimated_resident_overhead_bytes".to_string(),
-                    serde_json::json!(snapshot.hosting_estimated_resident_overhead_bytes),
-                );
-                obj.insert(
-                    "hosting_contract_slot_budget".to_string(),
-                    serde_json::json!(snapshot.hosting_contract_slot_budget),
+                    "hosting_resident_overhead_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_resident_overhead_bytes),
                 );
                 obj.insert(
                     "hosting_resident_overhead_evictions_total".to_string(),
@@ -3637,9 +3631,13 @@ mod tests {
         // Raised from 14_336 alongside the busy budget, same 40 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
         // measured 15195; no fleet value approaches it, so it constrains
-        // schema shape rather than real bytes.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
-        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
+        // schema shape rather than real bytes. Raised to 15_616 by #5647 for 6
+        // new counters (the `rejected_oversized` population outcome across the
+        // 6 sources): 6 x 21 bytes at u64::MAX = 126, so about 15321.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 15_616;
+        // Raised from 2_048 by #5647 for the same 6 new counters, about 2 bytes
+        // each in an all-zero block.
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_112;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
         // arithmetic, not to forbid growth, so here it is:
@@ -3666,8 +3664,9 @@ mod tests {
         // two blocks merged onto this soak branch — measured 15267. This
         // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
         // digits); no fleet value approaches it, so it constrains schema shape
-        // rather than real bytes.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_360;
+        // rather than real bytes. Raised to 15_616 by #5647 for the same 6
+        // counters as MAX_WORST_CASE_JSON_BYTES (126 bytes at u64::MAX).
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_616;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3682,10 +3681,10 @@ mod tests {
             reg_new_k: [value; 7],
             reg_new_m: [value; 7],
             reg_cap: [value; 7],
-            removed: [value; 7],
+            removed: [value; crate::ring::interest::InterestRemovalCause::COUNT],
             current: [value; 5],
-            recreated: [value; 7],
-            populated: [[value; 4]; 6],
+            recreated: [value; crate::ring::interest::InterestRemovalCause::COUNT],
+            populated: [[value; crate::ring::interest::SummaryPopulationOutcome::COUNT]; 6],
             corr_ovf: [value; 2],
             queue: [value; 15],
             recv_n: [[value; 9]; 4],
@@ -3917,14 +3916,12 @@ mod tests {
         let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
             .expect("construct RouterSnapshotInfo for test");
         info.hosting_resident_overhead_budget_bytes = Some(277);
-        info.hosting_estimated_resident_overhead_bytes = Some(281);
-        info.hosting_contract_slot_budget = Some(283);
+        info.hosting_resident_overhead_bytes = Some(281);
         info.hosting_resident_overhead_evictions_total = Some(293);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_resident_overhead_budget_bytes", 277),
-            ("hosting_estimated_resident_overhead_bytes", 281),
-            ("hosting_contract_slot_budget", 283),
+            ("hosting_resident_overhead_bytes", 281),
             ("hosting_resident_overhead_evictions_total", 293),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");

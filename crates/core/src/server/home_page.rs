@@ -3025,11 +3025,16 @@ mod tests {
         // The explanatory paragraph must name the pressures that can actually
         // trigger a sweep. It used to claim the floor was "min(RAM budget,
         // disk budget)", and this assertion pinned that wording — which is how
-        // the claim outlived the two axes added since: the count-derived
-        // resident-overhead ceiling (#5325, the one that binds first on a
-        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
-        // phrasing, so adding a fifth fails here instead of going unnoticed.
-        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+        // the claim outlived the two axes added since: the contract-memory
+        // ceiling (#5325, counted since #5647) and cost pressure (#4861). Pin
+        // the axes, not the phrasing, so adding a fifth fails here instead of
+        // going unnoticed.
+        for axis in [
+            "state bytes",
+            "disk",
+            "memory hosted contracts hold",
+            "update work",
+        ] {
             assert!(
                 html.contains(axis),
                 "explanatory paragraph must name the {axis:?} eviction pressure \
@@ -3038,16 +3043,13 @@ mod tests {
         }
     }
 
-    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
-    /// not as bytes.
+    /// The resident-overhead axis (#5325, #5647) renders as MEMORY in bytes.
     ///
-    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
-    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
-    /// memory. It is not measured, and what it constrains is a number of
-    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
-    /// statement was "520 of 524 contract slots used".
+    /// Before #5647 it rendered as contract SLOTS, because the figure was
+    /// `contract_count * 1 MiB`, a count wearing memory units. It is now the
+    /// counted bytes hosted contracts hold in RAM, so bytes are the honest unit.
     #[test]
-    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
+    fn hosting_card_renders_memory_axis_as_bytes() {
         use crate::node::network_status::HostingSnapshot;
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
@@ -3056,29 +3058,26 @@ mod tests {
             contract_count: 30,
             contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
-            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
-            contract_slot_budget: 100,
+            resident_overhead_bytes: 30 * 1024 * 1024,
             resident_overhead_evictions_total: 7,
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Contract slots used") && html.contains("30 / 100"),
-            "slot axis must render as counts — got:\n{html}"
+            html.contains("Contract memory") && html.contains("30.0 MB / 100.0 MB"),
+            "memory axis must render as bytes — got:\n{html}"
         );
         assert!(
-            html.contains(">70<"),
-            "slots free = budget(100) - used(30) — got:\n{html}"
+            html.contains(">70.0 MB<"),
+            "memory headroom = budget(100 MB) - used(30 MB) — got:\n{html}"
         );
         assert!(
             html.contains(">7<"),
-            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+            "memory-pressure eviction counter renders the snapshot value — got:\n{html}"
         );
-        // The byte framing must be gone: it is what made this read as RAM.
         assert!(
-            !html.contains("Resident overhead (est.)")
-                && !html.contains("Resident overhead budget"),
-            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+            !html.contains("Contract slots used") && !html.contains("Slots free"),
+            "the slot tiles are gone: there is no per-contract constant to divide by — got:\n{html}"
         );
     }
 
@@ -3086,7 +3085,7 @@ mod tests {
     /// closest to binding.
     ///
     /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
-    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// the disk budget, 99.2% of the contract-memory ceiling. All three rendered
     /// as identical muted tiles, so the only number that mattered was
     /// indistinguishable from the two with room to spare.
     #[test]
@@ -3097,9 +3096,10 @@ mod tests {
             // State bytes: 34% used.
             budget_bytes: 1000,
             used_bytes: 340,
-            // Slots: 99% used — this is the binding axis.
+            // Contract memory: 99% used — this is the binding axis.
             contract_count: 99,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 99,
             // Disk: 1% used.
             disk_total_bytes: Some(10),
             disk_budget_bytes: Some(1000),
@@ -3108,14 +3108,14 @@ mod tests {
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Closest limit:") && html.contains("contract slots"),
+            html.contains("Closest limit:") && html.contains("contract memory"),
             "the binding axis must be named — got:\n{html}"
         );
         assert!(
-            html.contains("99 of 100"),
+            html.contains("99 B of 100 B"),
             "the binding axis detail must show its own units — got:\n{html}"
         );
-        // Naming it is the whole signal. It is NOT coloured: a slot ceiling
+        // Naming it is the whole signal. It is NOT coloured: a contract-memory ceiling
         // is a cache ceiling and 99% is where a busy node is supposed to sit
         // (this test used to assert red here, which is the false alarm
         // `hosting_card_full_cache_axis_is_not_an_alarm` now pins against).
@@ -3140,7 +3140,7 @@ mod tests {
 
     /// A full cache is the steady state, not an alarm.
     ///
-    /// Reported from a live peer: "Closest limit: contract slots — 508 of 508
+    /// Reported from a live peer: "Closest limit: contract memory — 508 of 508
     /// (100%)" over a solid red bar. Nothing was wrong. A cache is supposed to
     /// be full: the sweep trims back to the budget and stops, so a busy node
     /// sits at or around N of N for as long as it stays busy. The strip
@@ -3157,7 +3157,8 @@ mod tests {
                     budget_bytes: 1000,
                     used_bytes: 100,
                     contract_count: 508,
-                    contract_slot_budget: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 508,
                     contracts: vec![mk_hosted_entry("A", true)],
                     ..Default::default()
                 },
@@ -3168,7 +3169,8 @@ mod tests {
                     budget_bytes: 1_000_000,
                     used_bytes: 999_900,
                     contract_count: 5,
-                    contract_slot_budget: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 5,
                     contracts: vec![mk_hosted_entry("A", true)],
                     ..Default::default()
                 },
@@ -3206,7 +3208,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 500,
             contract_count: 5,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 5,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3228,7 +3231,8 @@ mod tests {
                 budget_bytes: 1000,
                 used_bytes: 100,
                 contract_count: count,
-                contract_slot_budget: 100,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: count,
                 contracts: vec![mk_hosted_entry("A", true)],
                 ..Default::default()
             };
@@ -3252,20 +3256,21 @@ mod tests {
     fn hosting_card_over_budget_cache_axis_is_explained_not_coloured() {
         use crate::node::network_status::HostingSnapshot;
         for (count, budget, printed) in [
-            // One over at the slot floor.
-            (129, 128, "129 of 128 (101%)"),
+            // One over at a small budget.
+            (129, 128, "129 B of 128 B (101%)"),
             // One over on a bigger node: prints as 100%, but the detail text
-            // says 509 of 508, so the note must say "over" and not "full".
-            (509, 508, "509 of 508 (100%)"),
+            // says 509 B of 508 B, so the note must say "over" and not "full".
+            (509, 508, "509 B of 508 B (100%)"),
             // Well over.
-            (120, 100, "120 of 100 (120%)"),
+            (120, 100, "120 B of 100 B (120%)"),
         ] {
             let mut snap = base_snapshot();
             snap.hosting = HostingSnapshot {
                 budget_bytes: 1000,
                 used_bytes: 100,
                 contract_count: count,
-                contract_slot_budget: budget,
+                resident_overhead_budget_bytes: budget,
+                resident_overhead_bytes: count,
                 contracts: vec![mk_hosted_entry("A", true)],
                 ..Default::default()
             };
@@ -3291,7 +3296,8 @@ mod tests {
             budget_bytes: 100,
             used_bytes: 150,
             contract_count: 1,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3321,7 +3327,8 @@ mod tests {
                 budget_bytes: 1000,
                 used_bytes: 10,
                 contract_count: 1,
-                contract_slot_budget: 100,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: 1,
                 disk_total_bytes: Some(used),
                 disk_budget_bytes: Some(1000),
                 contracts: vec![mk_hosted_entry("A", true)],
@@ -3344,7 +3351,7 @@ mod tests {
     ///
     /// The strip names the single highest-utilisation axis. Before full cache
     /// axes went neutral that was harmless, since whichever axis won was red
-    /// anyway. Now a slot ceiling at its normal 100% would outrank a disk at
+    /// anyway. Now a contract-memory ceiling at its normal 100% would outrank a disk at
     /// 95% and the one real warning on the card would disappear behind a grey
     /// bar, so any other axis in a warning state gets its own strip.
     #[test]
@@ -3355,7 +3362,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 508,
-            contract_slot_budget: 508,
+            resident_overhead_budget_bytes: 508,
+            resident_overhead_bytes: 508,
             disk_total_bytes: Some(950),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3364,7 +3372,7 @@ mod tests {
         let html = build_hosting_card(&Some(snap));
         let strips = binding_strips(&html);
         assert!(
-            strips.contains("Closest limit: <strong>contract slots</strong>"),
+            strips.contains("Closest limit: <strong>contract memory</strong>"),
             "the highest-utilisation axis is still the closest — got:\n{strips}"
         );
         assert!(
@@ -3389,7 +3397,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 130,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 130,
             disk_total_bytes: Some(1200),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3398,7 +3407,7 @@ mod tests {
         let html = build_hosting_card(&Some(snap));
         let strips = binding_strips(&html);
         assert!(
-            strips.contains("Closest limit: <strong>contract slots</strong>")
+            strips.contains("Closest limit: <strong>contract memory</strong>")
                 && strips.contains("Also over its limit: <strong>disk</strong>")
                 && strips.contains("new writes are being refused"),
             "a disk over its limit must say so — got:\n{strips}"
@@ -3411,7 +3420,8 @@ mod tests {
             budget_bytes: 1000,
             used_bytes: 100,
             contract_count: 1,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
             disk_total_bytes: Some(1000),
             disk_budget_bytes: Some(1000),
             contracts: vec![mk_hosted_entry("A", true)],
@@ -3438,7 +3448,8 @@ mod tests {
             used_bytes: 900,
             // Slots only 10%.
             contract_count: 10,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 10,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3448,7 +3459,7 @@ mod tests {
             "state bytes at 90% must outrank slots at 10% — got:\n{html}"
         );
         assert!(
-            !html.contains("Closest limit: <strong>contract slots"),
+            !html.contains("Closest limit: <strong>contract memory"),
             "the slack axis must not be reported as closest — got:\n{html}"
         );
     }
@@ -3509,7 +3520,8 @@ mod tests {
             used_bytes: 100,
             contract_count: 5,
             // A slot budget of 0 means "not configured", NOT "no slots left".
-            contract_slot_budget: 0,
+            resident_overhead_budget_bytes: 0,
+            resident_overhead_bytes: 5,
             // Disk tracker unseeded.
             disk_total_bytes: None,
             disk_budget_bytes: None,
@@ -3522,7 +3534,7 @@ mod tests {
             "the one configured axis must be reported — got:\n{html}"
         );
         assert!(
-            !html.contains("contract slots</strong>"),
+            !html.contains("contract memory</strong>"),
             "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
     }
