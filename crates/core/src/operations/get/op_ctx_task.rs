@@ -1853,6 +1853,26 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
     ContractKey::from_id_and_code(*instance_id, CodeHash::new([0u8; 32]))
 }
 
+/// Whether a local `GetQuery` reply holds both state and code for `key`,
+/// stored under the same full key (#5782). `ContractKey` equality ignores the
+/// code hash, so the stored key's code hash is compared explicitly: a reply
+/// with the right instance and a different code hash does not count.
+fn stored_state_and_code_match(
+    stored: &Result<ContractHandlerEvent, crate::contract::ContractError>,
+    key: &ContractKey,
+) -> bool {
+    matches!(
+        stored,
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(stored_key),
+            response: Ok(StoreResponse {
+                state: Some(_),
+                contract: Some(_),
+            }),
+        }) if stored_key.code_hash() == key.code_hash()
+    )
+}
+
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
 /// `process_message` Response{Found} branch at `get.rs:2218-2450`.
@@ -2066,21 +2086,13 @@ async fn cache_contract_locally(
     // would otherwise be registered and advertised under a malformed key.
     let rehost_has_code =
         if access_result.is_new && state_matches && op_manager.ring.is_hosting_contract(&key) {
-            matches!(
-                op_manager
-                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                        instance_id: *key.id(),
-                        return_contract_code: true,
-                    })
-                    .await,
-                Ok(ContractHandlerEvent::GetResponse {
-                    key: Some(stored_key),
-                    response: Ok(StoreResponse {
-                        state: Some(_),
-                        contract: Some(_),
-                    }),
-                }) if stored_key.code_hash() == key.code_hash()
-            )
+            let stored = op_manager
+                .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: true,
+                })
+                .await;
+            stored_state_and_code_match(&stored, &key)
         } else {
             false
         };
@@ -4919,6 +4931,50 @@ where
 mod tests {
     use super::*;
 
+    fn stored_reply(
+        stored_key: Option<ContractKey>,
+        with_code: bool,
+    ) -> Result<ContractHandlerEvent, crate::contract::ContractError> {
+        let contract = with_code.then(|| {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+                Parameters::from(vec![]),
+            )))
+        });
+        Ok(ContractHandlerEvent::GetResponse {
+            key: stored_key,
+            response: Ok(StoreResponse {
+                state: Some(WrappedState::new(vec![7u8])),
+                contract,
+            }),
+        })
+    }
+
+    /// A state-only re-host forms a host only if the stored copy has code
+    /// and was stored under the same full key, code hash included (#5782).
+    #[test]
+    fn stored_state_and_code_match_requires_code_and_the_same_code_hash() {
+        let id = ContractInstanceId::new([5u8; 32]);
+        let key = ContractKey::from_id_and_code(id, CodeHash::new([6u8; 32]));
+        let other_code = ContractKey::from_id_and_code(id, CodeHash::new([9u8; 32]));
+        assert!(stored_state_and_code_match(
+            &stored_reply(Some(key), true),
+            &key
+        ));
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(other_code), true), &key),
+            "same instance, different code hash"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(Some(key), false), &key),
+            "no code on disk"
+        );
+        assert!(
+            !stored_state_and_code_match(&stored_reply(None, true), &key),
+            "no stored key"
+        );
+    }
+
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
     }
@@ -6106,12 +6162,9 @@ mod tests {
         assert!(
             check.starts_with(concat!(
                 "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
-                "{matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
+                "{letstored=op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
                 "instance_id:*key.id(),return_contract_code:true,})"
-            )) && check.contains(concat!(
-                "key:Some(stored_key),response:Ok(StoreResponse{state:Some(_),contract:Some(_),}),})",
-                "ifstored_key.code_hash()==key.code_hash()"
-            )),
+            )) && check.contains("stored_state_and_code_match(&stored,&key)"),
             "a state-only re-host must check the contract code is present, under the same key"
         );
         assert!(

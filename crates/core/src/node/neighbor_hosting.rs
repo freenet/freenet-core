@@ -1338,8 +1338,12 @@ mod tests {
         // Initialize from hosting cache
         manager.initialize_from_hosting_cache(vec![key1, key2].into_iter());
 
-        // Should now report both contracts
+        // Should now report both contracts, under their full keys
         assert_eq!(manager.local_hosted_count(), 2);
+        let mut keys = manager.advertised_contract_keys();
+        keys.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        let code_hashes: Vec<CodeHash> = keys.iter().map(|k| *k.code_hash()).collect();
+        assert_eq!(code_hashes, vec![*key1.code_hash(), *key2.code_hash()]);
         assert!(manager.is_hosted_locally(&key1));
         assert!(manager.is_hosted_locally(&key2));
 
@@ -1553,6 +1557,13 @@ mod tests {
                 .on_contract_unhosted_unless_rehosted(&key, || true)
                 .is_none(),
             "a re-hosted contract must not be retracted"
+        );
+        let restored = manager.advertised_contract_keys();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].code_hash(),
+            key.code_hash(),
+            "the restored entry must carry the full key (#5782)"
         );
         assert!(
             manager.is_hosted_locally(&key),

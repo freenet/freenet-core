@@ -826,7 +826,8 @@ unchecked writer.
   host is forming), so something must retract after the lease ends. A
   lease ends several ways (expiry, an upstream unsubscribe on collapse,
   eviction), so reconcile against the advertised set itself: the sweep
-  examines every advertised contract, not only those with interest records,
+  examines every advertised contract, not only those with interest records
+  (up to `MAX_RECONCILE_KEYS_PER_PASS` per pass, resuming where it stopped),
   and retracts each that is unhosted, unused and lease-free past the wait.
   A contract tracked only by its records goes untracked once they are
   dropped, and a retraction refused earlier is then never retried. Do not

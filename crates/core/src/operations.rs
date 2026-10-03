@@ -455,9 +455,9 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 ///   mean a host is forming. A lease left on a contract with no host and no
 ///   demand is not renewed, so it lapses within one lease period (#5782). The
 ///   hosting sweep's reconciliation calls this retraction every pass for each
-///   advertised or tracked contract that is unhosted, unused and lease-free,
-///   so the advertisement goes on the first pass after the lease ends, however
-///   it ended.
+///   advertised or tracked contract that has been unhosted and unused for
+///   `RECONCILE_MIN_UNUSED_AGE` and is lease-free, so the advertisement goes
+///   on the first such pass after the lease ends, however it ended.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK
@@ -1399,6 +1399,73 @@ mod sub_op_subscribe_pin_tests {
              subscribe driver `subscribe::run_client_subscribe` — \
              matches the `maybe_subscribe_child` pattern in \
              `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."
+        );
+    }
+}
+
+/// Behaviour of `retract_advertisement_for_evicted_contract` against a real
+/// `OpManager` (#5782): the hosting sweep calls it every pass for unhosted,
+/// unused contracts, and it must leave the advertisement while this node's own
+/// lease is live and retract it once the lease has ended.
+#[cfg(test)]
+mod retraction_lease_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    async fn op_manager(id: &str) -> Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    #[tokio::test]
+    async fn retraction_waits_for_an_own_lease_to_end() {
+        let op_manager = op_manager("retraction-lease-5782").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        op_manager.neighbor_hosting.on_contract_hosted(&key);
+        op_manager.ring.subscribe(key);
+
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "a live lease keeps the advertisement"
+        );
+
+        op_manager.ring.unsubscribe(&key);
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "once the lease has ended the advertisement is retracted"
         );
     }
 }

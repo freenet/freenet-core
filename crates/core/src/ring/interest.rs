@@ -2639,6 +2639,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Returns true if this caused us to lose interest (no other reasons remain).
     pub fn unregister_local_hosting(&self, contract: &ContractKey) -> bool {
         self.reset_reconcile_wait(contract);
+        self.clear_local_hosting_flag(contract)
+    }
+
+    /// The body of [`Self::unregister_local_hosting`] without restarting
+    /// reconciliation's wait, for reconciliation's own flag clear: restarting
+    /// the wait there would read as a concurrent change and stop the pass
+    /// dropping the records it just made eligible (#5782).
+    fn clear_local_hosting_flag(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
             entry.hosting = false;
             let lost_interest = !entry.is_interested();
@@ -3031,6 +3039,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .chain(self.local_interests.iter().map(|e| *e.key()))
             .chain(advertised.iter().copied())
             .collect();
+        // Deduplicated by instance id, so which of two same-id keys survives
+        // is unspecified: keys in the outcome identify a contract by id only
+        // (retraction, interest change, unindex) and must not be used to load
+        // code.
         tracked.sort_unstable_by(by_id);
         tracked.dedup_by(|a, b| a.id() == b.id());
 
@@ -3081,7 +3093,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .get(&key)
                 .is_some_and(|entry| entry.hosting);
             if flagged && !is_hosted(&key) {
-                let lost = self.unregister_local_hosting(&key);
+                let lost = self.clear_local_hosting_flag(&key);
                 if is_hosted(&key) {
                     // Re-hosted between the check and the clear: put the flag
                     // back and report nothing (#5782).
@@ -3106,12 +3118,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             let mut dropped = 0;
             for peer in peers {
                 // Checked per record, so local interest (a client, delegate or
-                // downstream subscriber) or a re-host that lands mid-loop stops
-                // the drop.
+                // downstream subscriber), a re-host, a lease, or anything that
+                // restarted the wait (an upstream registration by a subscribe
+                // starting) that lands mid-loop stops the drop.
                 if self.has_local_interest(&key)
                     || is_hosted(&key)
                     || in_use(&key)
                     || holds_lease(&key)
+                    || self.reconcile_candidates.get(&key).map(|seen| *seen) != Some(first_seen)
                 {
                     break;
                 }
@@ -4443,7 +4457,7 @@ mod tests {
             "|_,v|!v.is_interested())"
         );
         for sig in [
-            "    pub fn unregister_local_hosting(",
+            "    fn clear_local_hosting_flag(",
             "    pub fn remove_local_client(",
             "    pub fn remove_downstream_subscriber(",
         ] {
@@ -4763,10 +4777,10 @@ mod tests {
         let no = |_: &ContractKey| false;
         manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        // `in_use` is called once in the window check and then once per record,
-        // after that record's local-interest check. A client subscribes during
-        // the first record's check, so that record is dropped and the second
-        // record's local-interest check stops the loop.
+        // `in_use` is called once in the window check and then once per record.
+        // A client subscribes during the first record's check; adding it
+        // restarts the wait, which that record's next check sees, so nothing
+        // is dropped.
         let calls = std::cell::Cell::new(0);
         let client_arrives = |k: &ContractKey| {
             calls.set(calls.get() + 1);
@@ -4777,8 +4791,8 @@ mod tests {
         };
         let outcome =
             manager.reconcile_with_hosting(&[], no, client_arrives, |_: &ContractKey| false);
-        assert_eq!(outcome.records_dropped, 1);
-        assert_eq!(manager.get_interested_peers(&contract).len(), 3);
+        assert_eq!(outcome.records_dropped, 0);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 4);
     }
 
     /// A re-host between the window check and the flag clear keeps the flag:
@@ -4931,6 +4945,38 @@ mod tests {
         let lapsed = manager.reconcile_with_hosting(&[], no, no, holds_lease);
         assert_eq!(lapsed.advertisements_to_retract, vec![contract]);
         assert_eq!(lapsed.records_dropped, 2);
+    }
+
+    /// An upstream registration (a subscribe starting) that lands while a
+    /// pass is dropping a contract's records restarts the wait, which stops
+    /// the drop, so the fresh upstream record survives (#5782).
+    #[test]
+    fn reconcile_stops_dropping_when_the_wait_restarts_mid_loop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `in_use` calls: the window check, then one per record. The upstream
+        // registers during the first record's check.
+        let calls = std::cell::Cell::new(0);
+        let upstream_arrives = |k: &ContractKey| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                manager.register_peer_interest(k, make_peer_key(9), None, true);
+            }
+            false
+        };
+        let outcome = manager.reconcile_with_hosting(&[], no, upstream_arrives, no);
+        assert_eq!(outcome.records_dropped, 0);
+        assert!(
+            manager
+                .get_peer_interest(&contract, &make_peer_key(9))
+                .is_some()
+        );
     }
 
     /// A lease that appears while a pass is dropping a contract's records
