@@ -452,12 +452,11 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
 ///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
 ///   installs it before the body fetch and the announce, so a live lease may
-///   mean a host is forming. The hosting sweep's reconciliation (#5782)
-///   releases a lease left on a contract with no host and no demand, and
-///   retries this retraction every pass for a tracked contract that is
-///   unhosted, unused and lease-free, so an advertisement kept while a lease
-///   lived goes once it lapses. A lease with no interest record at all is not
-///   tracked and lapses at its expiry.
+///   mean a host is forming. A lease left on a contract with no host and no
+///   demand is not renewed, so it lapses; the hosting sweep's reconciliation
+///   (#5782) retries this retraction every pass for a tracked contract that is
+///   unhosted and unused, so the advertisement goes on the first pass after
+///   the lease lapses.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK

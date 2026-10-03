@@ -818,19 +818,15 @@ unchecked writer.
   such a repair rather than gate it; the residual is #5784.
 - **A node's own subscription lease is not demand.** It exists to receive
   updates for a hosted copy, so it follows hosting and never justifies it.
-  Demand is a local client or a downstream subscriber, whether it shows in
-  `contract_in_use` or only in the interest manager (`has_local_demand`): a
-  delegate subscribes through the interest manager alone, which
-  `contract_in_use` does not see. The cache-only hosting flag is not demand.
-  When the copy is gone and there is no demand, release the lease (unsubscribe
-  upstream) rather than count it as use, checking again when the release
-  runs; the advertisement retraction refuses while a lease is live, so the
-  lease has to go first. The contract's records are kept for that pass (the
-  unsubscribe reads the upstream record) and go a wait later. A lease kept
-  for demand keeps its advertisement; the retraction is retried every pass
-  for every unhosted, unused, lease-free contract past the wait, so it goes
-  once the lease lapses. Do not retract only at the moment a flag is cleared:
-  nothing comes back to retry.
+  Demand is a local client or a downstream subscriber. When the copy is gone
+  and there is no demand, do not count the lease as use and do not keep the
+  copy for it: the lease is renewed only for demand, so it lapses within one
+  lease period. The advertisement retraction refuses while a lease is live (a
+  subscribe installs it before the body arrives, so a live lease may mean a
+  host is forming), so the retraction is retried every pass for every
+  unhosted, unused contract past the wait and goes once the lease lapses. Do
+  not retract only at the moment a flag is cleared: nothing comes back to
+  retry.
 
 The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration

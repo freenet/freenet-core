@@ -3598,45 +3598,21 @@ impl Ring {
             // stale local-hosting flag cleared here has its co-host
             // advertisement retracted, as an eviction would; neighbours are told
             // the interest ended only if it did (a delegate or local client can
-            // keep it). This node's own subscription lease toward the contract
-            // is not demand: it only exists to receive updates for a hosted
-            // copy, so once the copy is gone it is released (unsubscribe
-            // upstream), and only then can the advertisement be retracted,
-            // since the retraction keeps an advertisement while a lease is live.
+            // keep it). Advertisements are retracted every pass for every
+            // contract past the wait that is unhosted and unused; the
+            // retraction refuses while this node's own lease is live, and that
+            // lease, which is not demand, lapses unrenewed.
             if let Some(op_manager) = &op_manager {
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
-                    |key| ring.is_subscribed(key),
                 );
                 for key in &outcome.advertisements_to_retract {
                     crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
                 }
-                for &key in &outcome.leases_to_release {
-                    let op_mgr = op_manager.clone();
-                    GlobalExecutor::spawn(async move {
-                        // Checked again when the task runs: a re-host, a
-                        // client, a downstream subscriber or a delegate may
-                        // have arrived since the pass.
-                        if op_mgr.ring.is_hosting_contract(&key)
-                            || op_mgr.ring.contract_in_use(&key)
-                            || op_mgr.interest_manager.has_local_demand(&key)
-                        {
-                            return;
-                        }
-                        op_mgr.send_unsubscribe_upstream(&key).await;
-                        crate::operations::retract_advertisement_for_evicted_contract(
-                            &op_mgr, &key,
-                        );
-                    });
-                }
-                if !outcome.hosting_flags_cleared.is_empty()
-                    || !outcome.leases_to_release.is_empty()
-                    || outcome.contracts_dropped > 0
-                {
+                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
                     tracing::info!(
                         hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
-                        leases_released = outcome.leases_to_release.len(),
                         contracts_dropped = outcome.contracts_dropped,
                         records_dropped = outcome.records_dropped,
                         "interest records reconciled with the hosted set"
@@ -7918,25 +7894,13 @@ mod k_closest_source_tests {
             // the call, with the hosting facts in the right order
             concat!(
                 "interest_manager.reconcile_with_hosting(",
-                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
-                "|key|ring.is_subscribed(key),)"
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),)"
             ),
             // every aged, unhosted, unused, lease-free contract has any
             // standing advertisement retracted, every pass
             concat!(
                 "forkeyin&outcome.advertisements_to_retract{crate::operations::",
                 "retract_advertisement_for_evicted_contract(op_manager,key);}"
-            ),
-            // our own lease is released only if still unhosted and unused,
-            // then retracted
-            concat!(
-                "ifop_mgr.ring.is_hosting_contract(&key)||op_mgr.ring.contract_in_use(&key)",
-                "||op_mgr.interest_manager.has_local_demand(&key){return;}",
-                "op_mgr.send_unsubscribe_upstream(&key).await;"
-            ),
-            concat!(
-                "op_mgr.send_unsubscribe_upstream(&key).await;",
-                "crate::operations::retract_advertisement_for_evicted_contract(&op_mgr,&key,);"
             ),
             // neighbours are told only when interest actually ended, and still
             // has not come back
