@@ -2040,7 +2040,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 
     /// [`Self::remove_peer_interest_for`], but `allowed` is evaluated while
     /// holding the contract's `interested_peers` shard guard, and nothing is
-    /// removed (`None`) when it returns false. Reconciliation passes a check
+    /// removed when it returns false. Returns `None` when `allowed` refused,
+    /// otherwise `Some(removed)` (`Some(false)` if the record or the contract
+    /// was already gone). `allowed` may read `reconcile_candidates` but must
+    /// not take any other `interested_peers` guard. Reconciliation passes a check
     /// that its wait has not restarted (#5782): `refresh_peer_interest_with_upstream`
     /// restarts the wait before it takes this guard, so either the check sees
     /// the restart, or the refresh finds the record gone and its caller
@@ -2295,6 +2298,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// Returns `true` if an entry existed and was updated, `false` if there was
     /// nothing to refresh (the caller should then register).
+    ///
+    /// When `is_upstream`, it restarts reconciliation's wait BEFORE taking the
+    /// shard guard (#5782), so a pass removing this record either sees the
+    /// restart or has already removed it, and then this returns `false`. A
+    /// non-upstream refresh does not restart the wait.
     pub fn refresh_peer_interest_with_upstream(
         &self,
         contract: &ContractKey,
@@ -2634,6 +2642,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// [`Self::register_local_hosting`] applies so the method is not a
     /// PR #4129–shaped race footgun.
     pub fn register_local_interest(&self, contract: &ContractKey) -> &Self {
+        self.reset_reconcile_wait(contract);
         let entry = self.local_interests.entry(*contract).or_default();
         self.index_contract_hash(contract);
         drop(entry);
@@ -2812,6 +2821,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     where
         F: FnOnce(&mut LocalInterest) -> R,
     {
+        self.reset_reconcile_wait(contract);
         let mut entry = self.local_interests.entry(*contract).or_default();
         f(entry.value_mut())
     }
@@ -2994,8 +3004,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Restart the reconciliation wait for `contract` (#5780): any change in
-    /// local interest means it was hosted or used after a pass last looked.
-    /// Called before the caller takes any other guard.
+    /// local interest, or an upstream registration, means it was hosted or
+    /// used after a pass last looked. Called before the caller takes any other
+    /// guard. Lock order: a reconciliation pass reads `reconcile_candidates`
+    /// while holding an `interested_peers` shard guard
+    /// ([`Self::remove_peer_interest_if`]), so no code may hold a
+    /// `reconcile_candidates` guard while taking an `interested_peers` one.
     fn reset_reconcile_wait(&self, contract: &ContractKey) {
         self.reconcile_candidates.remove(contract);
     }
@@ -4993,9 +5007,11 @@ mod tests {
     }
 
     /// A subscribe refreshing a record already in the pass's snapshot as its
-    /// upstream restarts the wait; the removal re-checks the wait under the
-    /// record's shard guard, so the drop stops and the refreshed upstream
-    /// record survives (#5782).
+    /// upstream restarts the wait, and the drop stops, so the refreshed
+    /// upstream record survives (#5782). The removal's wait check is the only
+    /// one in the loop, so this fails without it; that it runs under the
+    /// shard guard is pinned by `remove_checks_the_wait_under_the_shard_guard`
+    /// (a single-threaded test cannot interleave inside the guard).
     #[test]
     fn reconcile_stops_dropping_when_the_wait_restarts_mid_loop() {
         let (manager, time) = make_manager();
@@ -5024,6 +5040,80 @@ mod tests {
         let peers = manager.get_interested_peers(&contract);
         assert_eq!(peers.len(), 4);
         assert!(peers.iter().any(|(_, interest)| interest.is_upstream));
+    }
+
+    /// `remove_peer_interest_if` leaves the record and every index untouched
+    /// when `allowed` refuses, and reports an absent record as `Some(false)`.
+    #[test]
+    fn remove_peer_interest_if_refused_leaves_the_record() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        manager.register_peer_interest(&contract, peer.clone(), None, true);
+        let refused = manager.remove_peer_interest_if(
+            &contract,
+            &peer,
+            InterestRemovalCause::Eviction,
+            || false,
+        );
+        assert_eq!(refused, None);
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+        assert_eq!(manager.get_interested_peers(&contract).len(), 1);
+        let absent = manager.remove_peer_interest_if(
+            &contract,
+            &make_peer_key(2),
+            InterestRemovalCause::Eviction,
+            || true,
+        );
+        assert_eq!(absent, Some(false));
+    }
+
+    /// The race argument behind reconciliation's removal (#5782) is an
+    /// ordering: the removal evaluates `allowed` after taking the contract's
+    /// shard guard and before removing, the upstream refresh restarts the
+    /// wait before taking that guard, and the pass passes its wait check as
+    /// `allowed`. Code lines only.
+    #[test]
+    fn remove_checks_the_wait_under_the_shard_guard() {
+        const FULL: &str = include_str!("interest.rs");
+        let prod = &FULL[..FULL.find("\nmod tests {").expect("test module")];
+        let body = |sig: &str| -> String {
+            let at = prod
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` not found"));
+            let end = at + prod[at..].find("\n    }\n").expect("method end");
+            prod[at..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let remove = body("    fn remove_peer_interest_if(");
+        assert!(remove.contains(concat!(
+            "ifletSome(mutentry)=self.interested_peers.get_mut(contract){",
+            "if!allowed(){returnNone;}letremoved_interest=entry.remove(peer);"
+        )));
+        let refresh = body("    pub fn refresh_peer_interest_with_upstream(");
+        let reset = refresh
+            .find("self.reset_reconcile_wait(contract);")
+            .expect("reset");
+        let guard = refresh
+            .find("self.interested_peers.get_mut(contract)")
+            .expect("guard");
+        assert!(
+            reset < guard,
+            "the refresh must restart the wait before the guard"
+        );
+        let pass = body("    pub(crate) fn reconcile_with_hosting(");
+        assert!(pass.contains(concat!(
+            "matchself.remove_peer_interest_if(&key,&peer,",
+            "InterestRemovalCause::Eviction,wait_unchanged,){None=>break,"
+        )));
+        assert!(pass.contains(concat!(
+            "letwait_unchanged=||self.reconcile_candidates.get(&key)",
+            ".map(|seen|*seen)==Some(first_seen);"
+        )));
     }
 
     /// `unregister_local_hosting` restarts the wait (every caller other than
