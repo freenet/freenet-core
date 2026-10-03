@@ -823,13 +823,15 @@ unchecked writer.
   copy for it: the lease is renewed only for demand, so it lapses within one
   lease period. The advertisement retraction refuses while a lease is live (a
   subscribe installs it before the body arrives, so a live lease may mean a
-  host is forming), so something must retract when the lease lapses: the
-  lease expiry does it directly, and reconciliation retries every pass for
-  every unhosted, unused, lease-free contract past the wait. Keep the
-  contract's records while its lease lives: dropping them untracks the
-  contract, so the refused retraction is never retried (#5782 round 8). Do
-  not retract only at the moment a flag is cleared: nothing comes back to
-  retry.
+  host is forming), so something must retract after the lease ends. A
+  lease ends several ways (expiry, an upstream unsubscribe on collapse,
+  eviction), so reconcile against the advertised set itself: the sweep
+  examines every advertised contract, not only those with interest records,
+  and retracts each that is unhosted, unused and lease-free past the wait.
+  A contract tracked only by its records goes untracked once they are
+  dropped, and a retraction refused earlier is then never retried. Do not
+  retract only at the moment a flag is cleared or a lease expires: other
+  paths end the same state and nothing comes back to retry.
 
 The two paths that form a CACHE host (the GET cache path and the PUT relay
 store) go through `operations::complete_host_formation` (announce, migration

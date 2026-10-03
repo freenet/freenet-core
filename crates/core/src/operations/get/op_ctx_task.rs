@@ -2060,7 +2060,10 @@ async fn cache_contract_locally(
     // the state, and `state_matches` reads the state alone (#5782). Checked
     // only on this branch, and only while still hosted, since it loads the
     // WASM. It reads the code on disk and ignores code carried by the GET:
-    // restoring missing code from the GET is #5784.
+    // restoring missing code from the GET is #5784. The stored key's code
+    // hash must match the key being hosted: `ContractKey` equality ignores
+    // the code hash, so a reply with the right instance and a wrong code hash
+    // would otherwise be registered and advertised under a malformed key.
     let rehost_has_code =
         if access_result.is_new && state_matches && op_manager.ring.is_hosting_contract(&key) {
             matches!(
@@ -2071,12 +2074,12 @@ async fn cache_contract_locally(
                     })
                     .await,
                 Ok(ContractHandlerEvent::GetResponse {
+                    key: Some(stored_key),
                     response: Ok(StoreResponse {
                         state: Some(_),
                         contract: Some(_),
                     }),
-                    ..
-                })
+                }) if stored_key.code_hash() == key.code_hash()
             )
         } else {
             false
@@ -6105,8 +6108,11 @@ mod tests {
                 "ifaccess_result.is_new&&state_matches&&op_manager.ring.is_hosting_contract(&key)",
                 "{matches!(op_manager.notify_contract_handler(ContractHandlerEvent::GetQuery{",
                 "instance_id:*key.id(),return_contract_code:true,})"
-            )) && check.contains("state:Some(_),contract:Some(_),"),
-            "a state-only re-host must check the contract code is present"
+            )) && check.contains(concat!(
+                "key:Some(stored_key),response:Ok(StoreResponse{state:Some(_),contract:Some(_),}),})",
+                "ifstored_key.code_hash()==key.code_hash()"
+            )),
+            "a state-only re-host must check the contract code is present, under the same key"
         );
         assert!(
             body.contains(gate),

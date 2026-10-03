@@ -2938,19 +2938,6 @@ impl Ring {
                     "Expired {} stale subscriptions",
                     expired.len()
                 );
-                // A lapsed lease no longer blocks the co-host advertisement's
-                // retraction (#5782). Retract here for a contract that may
-                // have no interest record left to keep reconciliation
-                // retrying it; the helper re-checks hosting, use and lease and
-                // does nothing for a contract still hosted.
-                if let Some(op_manager) = ring.upgrade_op_manager() {
-                    for key in &expired {
-                        crate::operations::retract_advertisement_for_evicted_contract(
-                            &op_manager,
-                            key,
-                        );
-                    }
-                }
             }
 
             // Expire stale downstream subscribers and decrement interest manager
@@ -3613,11 +3600,13 @@ impl Ring {
             // the interest ended only if it did (a delegate or local client can
             // keep it). Advertisements are retracted every pass for every
             // contract past the wait that is unhosted, unused and holds no
-            // lease of this node's own. A contract whose lease is live keeps
-            // its records until the lease, which is not demand, lapses
-            // unrenewed.
+            // lease of this node's own, including advertised contracts with no
+            // records left, so it does not matter how a lease or the records
+            // ended. A contract whose lease is live is left alone until the
+            // lease, which is not demand, lapses unrenewed.
             if let Some(op_manager) = &op_manager {
                 let outcome = op_manager.interest_manager.reconcile_with_hosting(
+                    &op_manager.neighbor_hosting.advertised_contract_keys(),
                     |key| ring.is_hosting_contract(key),
                     |key| ring.contract_in_use(key),
                     |key| ring.is_subscribed(key),
@@ -5055,9 +5044,9 @@ impl Ring {
             held.extend(self.hosting_manager.in_use_contract_ids());
             op_manager
                 .neighbor_hosting
-                .advertised_contract_ids()
-                .into_iter()
-                .filter(|id| !held.contains(id))
+                .advertised_contract_keys()
+                .iter()
+                .filter(|key| !held.contains(key.id()))
                 .count()
         })
     }
@@ -7913,35 +7902,6 @@ mod k_closest_source_tests {
         );
     }
 
-    /// #5782 round 8: a lapsed lease must retract the co-host advertisement
-    /// at expiry, since the contract may have no interest record left to keep
-    /// reconciliation retrying it. Code lines only.
-    #[test]
-    fn lease_expiry_retracts_the_advertisement() {
-        let src = production_source();
-        let body = extract_fn_body(
-            src,
-            "async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {",
-        );
-        let code: String = body
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .flat_map(|line| line.chars())
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let needle = "letexpired=ring.expire_stale_subscriptions();if!expired.is_empty(){";
-        let at = code.find(needle).expect("expiry");
-        let rest = &code[at..];
-        let block_end = rest.find("letds_expired=").expect("next step");
-        assert!(
-            rest[..block_end].contains(concat!(
-                "forkeyin&expired{crate::operations::",
-                "retract_advertisement_for_evicted_contract(&op_manager,key,);}"
-            )),
-            "recover_orphaned_subscriptions must retract each expired lease's advertisement (#5782)"
-        );
-    }
-
     /// #5780: the periodic hosting sweep must run the interest-record
     /// reconciliation, or evicted contracts keep their neighbours' records and
     /// stay advertised. Requires the call on a code line (not a comment), so a
@@ -7965,6 +7925,7 @@ mod k_closest_source_tests {
             // the call, with the hosting facts in the right order
             concat!(
                 "interest_manager.reconcile_with_hosting(",
+                "&op_manager.neighbor_hosting.advertised_contract_keys(),",
                 "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
                 "|key|ring.is_subscribed(key),)"
             ),

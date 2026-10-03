@@ -160,10 +160,9 @@ impl ContractHandler for NetworkContractHandler {
         // Populate neighbor hosting from hosted contracts so HostingStateResponse
         // reports our full contract set when ring connections establish.
         let hosted_keys = op_manager.ring.hosting_contract_keys();
-        let hosted_ids = hosted_keys.iter().map(|k| *k.id());
         op_manager
             .neighbor_hosting
-            .initialize_from_hosting_cache(hosted_ids);
+            .initialize_from_hosting_cache(hosted_keys.into_iter());
 
         // #4780: also rehydrate InterestManager local-hosting for every restored
         // hosted contract, so a client GET for a cached contract serves LOCALLY

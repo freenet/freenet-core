@@ -454,10 +454,10 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 ///   installs it before the body fetch and the announce, so a live lease may
 ///   mean a host is forming. A lease left on a contract with no host and no
 ///   demand is not renewed, so it lapses within one lease period (#5782). The
-///   lease expiry calls this retraction for each lapsed lease, and the hosting
-///   sweep's reconciliation retries it every pass for a tracked contract that
-///   is unhosted, unused and lease-free, keeping its records while the lease
-///   lives.
+///   hosting sweep's reconciliation calls this retraction every pass for each
+///   advertised or tracked contract that is unhosted, unused and lease-free,
+///   so the advertisement goes on the first pass after the lease ends, however
+///   it ended.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK

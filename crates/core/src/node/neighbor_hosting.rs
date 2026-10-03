@@ -25,7 +25,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tracing::{debug, info, trace};
 
@@ -88,8 +88,10 @@ impl NeighborHostingResult {
 /// This information is used to forward UPDATEs to hosts who have a contract
 /// but may not be explicitly subscribed to it.
 pub struct NeighborHostingManager {
-    /// Contracts we are hosting locally.
-    my_contracts: Arc<DashSet<ContractInstanceId>>,
+    /// Contracts we are hosting locally, with the full key of each so the
+    /// hosting sweep can reconcile the advertised set against the hosted set
+    /// (#5782).
+    my_contracts: Arc<DashMap<ContractInstanceId, ContractKey>>,
 
     /// What we know about our neighbors' hosted contracts.
     /// Maps neighbor public key to the set of contracts they're hosting.
@@ -108,7 +110,7 @@ impl NeighborHostingManager {
     /// Create a new neighbor hosting manager.
     pub fn new() -> Self {
         Self {
-            my_contracts: Arc::new(DashSet::new()),
+            my_contracts: Arc::new(DashMap::new()),
             neighbor_contracts: DashMap::new(),
         }
     }
@@ -120,7 +122,11 @@ impl NeighborHostingManager {
     pub fn on_contract_hosted(&self, contract_key: &ContractKey) -> Option<NeighborHostingMessage> {
         let contract_id = *contract_key.id();
 
-        if self.my_contracts.insert(contract_id) {
+        if self
+            .my_contracts
+            .insert(contract_id, *contract_key)
+            .is_none()
+        {
             info!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: Added contract to locally hosted"
@@ -223,7 +229,7 @@ impl NeighborHostingManager {
         if still_hosted() {
             // Re-host / re-subscribe raced us: put the advertisement back and
             // emit nothing. Neighbors never observed the removal.
-            self.my_contracts.insert(contract_id);
+            self.my_contracts.insert(contract_id, *contract_key);
             trace!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: eviction retraction skipped — contract re-hosted \
@@ -325,7 +331,7 @@ impl NeighborHostingManager {
                 let overlapping: Vec<ContractInstanceId> = added
                     .iter()
                     .filter(|id| !previously_known.contains(id)) // Only NEW contracts
-                    .filter(|id| self.my_contracts.contains(*id)) // That we also have
+                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also have
                     .copied()
                     .collect();
 
@@ -406,7 +412,7 @@ impl NeighborHostingManager {
                 let overlapping: Vec<ContractInstanceId> = contracts
                     .iter()
                     .filter(|id| !previously_known.contains(*id)) // Only NEW from this peer
-                    .filter(|id| self.my_contracts.contains(*id)) // That we also host
+                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also host
                     .copied()
                     .collect();
 
@@ -547,13 +553,10 @@ impl NeighborHostingManager {
 
     /// Initialize my_contracts from contracts loaded from disk.
     /// Must be called after loading the hosting cache and before ring connections establish.
-    pub fn initialize_from_hosting_cache(
-        &self,
-        contract_ids: impl Iterator<Item = ContractInstanceId>,
-    ) {
+    pub fn initialize_from_hosting_cache(&self, contract_keys: impl Iterator<Item = ContractKey>) {
         let mut count = 0;
-        for id in contract_ids {
-            self.my_contracts.insert(id);
+        for key in contract_keys {
+            self.my_contracts.insert(*key.id(), key);
             count += 1;
         }
         if count > 0 {
@@ -567,13 +570,15 @@ impl NeighborHostingManager {
     /// Check if we are hosting a contract locally.
     #[allow(dead_code)]
     pub fn is_hosted_locally(&self, contract_key: &ContractKey) -> bool {
-        self.my_contracts.contains(contract_key.id())
+        self.my_contracts.contains_key(contract_key.id())
     }
 
     /// The contracts this node advertises hosting (`my_contracts`).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn advertised_contract_ids(&self) -> Vec<ContractInstanceId> {
-        self.my_contracts.iter().map(|id| *id.key()).collect()
+    pub(crate) fn advertised_contract_keys(&self) -> Vec<ContractKey> {
+        self.my_contracts
+            .iter()
+            .map(|entry| *entry.value())
+            .collect()
     }
 
     /// Get the number of contracts we advertise hosting locally (`my_contracts`).
@@ -1331,7 +1336,7 @@ mod tests {
         assert_eq!(manager.local_hosted_count(), 0);
 
         // Initialize from hosting cache
-        manager.initialize_from_hosting_cache(vec![*key1.id(), *key2.id()].into_iter());
+        manager.initialize_from_hosting_cache(vec![key1, key2].into_iter());
 
         // Should now report both contracts
         assert_eq!(manager.local_hosted_count(), 2);

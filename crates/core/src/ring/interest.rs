@@ -1185,8 +1185,8 @@ pub(crate) struct ReconcileOutcome {
     /// still standing for them (a no-op if there is none). Reported every
     /// pass. A contract whose lease is live is skipped, records and all,
     /// until the lease lapses (it is renewed only for demand, so within one
-    /// lease period); the lease expiry also retracts directly, which covers a
-    /// contract with no records to keep it tracked.
+    /// lease period). Advertised contracts are examined whether or not they
+    /// have records, so the retraction does not depend on how the lease ended.
     pub advertisements_to_retract: Vec<ContractKey>,
     /// Contracts whose neighbour records were all dropped.
     pub contracts_dropped: usize,
@@ -2988,14 +2988,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// It records when each was first seen neither hosted nor in use. Once
     /// that has lasted [`RECONCILE_MIN_UNUSED_AGE`] with no change in local
     /// interest, it clears a stale local-hosting flag (reported in
-    /// [`ReconcileOutcome::hosting_flags_cleared`]). Unless this node holds
-    /// its own lease toward the contract (`holds_lease`), it then reports the
-    /// contract for advertisement retraction, on every such pass and not only
-    /// once, and, if nothing else keeps a local interest in the contract (a
-    /// local client or delegate, a downstream subscriber), drops every
-    /// neighbour record. That also unindexes the contract, so the heartbeat
-    /// stops advertising it. A contract whose lease is live keeps its records
-    /// and stays tracked until the lease lapses.
+    /// [`ReconcileOutcome::hosting_flags_cleared`]), reports the contract for
+    /// advertisement retraction on every such pass, and, if nothing else keeps
+    /// a local interest in the contract (a local client or delegate, a
+    /// downstream subscriber), drops every neighbour record. That also
+    /// unindexes the contract, so the heartbeat stops advertising it. A
+    /// contract this node holds its own lease toward (`holds_lease`) is left
+    /// alone, flag, records and advertisement, until the lease lapses.
+    ///
+    /// The tracked set is the contracts with interest records or local
+    /// interest plus `advertised` (this node's co-host advertisements), so an
+    /// advertisement with nothing else left to keep its contract tracked is
+    /// still retracted, however the lease or the records ended.
     ///
     /// Why level-triggered: neighbour records used to outlive eviction because
     /// the contract stayed in `contract_hash_index` while any record existed,
@@ -3011,6 +3015,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// a check after the clear, which puts the flag back and reports nothing.
     pub(crate) fn reconcile_with_hosting(
         &self,
+        advertised: &[ContractKey],
         is_hosted: impl Fn(&ContractKey) -> bool,
         in_use: impl Fn(&ContractKey) -> bool,
         holds_lease: impl Fn(&ContractKey) -> bool,
@@ -3024,6 +3029,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .iter()
             .map(|e| *e.key())
             .chain(self.local_interests.iter().map(|e| *e.key()))
+            .chain(advertised.iter().copied())
             .collect();
         tracked.sort_unstable_by(by_id);
         tracked.dedup_by(|a, b| a.id() == b.id());
@@ -3061,6 +3067,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             if now.saturating_duration_since(first_seen) < RECONCILE_MIN_UNUSED_AGE {
                 continue;
             }
+            if holds_lease(&key) {
+                // This node's own lease is live (#5782): a subscribe may still
+                // be fetching the body, it needs the upstream record and the
+                // interest it announced, and the retraction would refuse. The
+                // lease is not demand and is renewed only for demand, so it
+                // lapses within one lease period; the contract is handled on
+                // the first pass after that.
+                continue;
+            }
             let flagged = self
                 .local_interests
                 .get(&key)
@@ -3077,15 +3092,6 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                         outcome.interest_lost.push(key);
                     }
                 }
-            }
-            if holds_lease(&key) {
-                // This node's own lease is live (#5782): a subscribe may still
-                // be fetching the body, it needs the upstream record, and the
-                // retraction would refuse. The lease is not demand and is
-                // renewed only for demand, so it lapses within one lease
-                // period; the records go and the advertisement is retracted on
-                // the first pass after that.
-                continue;
             }
             // No hosting re-check here: the retraction re-checks hosting, use
             // and lease itself, after removing the advertisement entry.
@@ -4491,7 +4497,7 @@ mod tests {
         );
 
         let no = |_: &ContractKey| false;
-        let first = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let first = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(
             first,
             ReconcileOutcome::default(),
@@ -4499,13 +4505,13 @@ mod tests {
         );
         time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(1));
         assert_eq!(
-            manager.reconcile_with_hosting(no, no, |_: &ContractKey| false),
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false),
             ReconcileOutcome::default()
         );
         assert!(manager.get_peer_interest(&contract, &a).is_some());
 
         time.advance_time(Duration::from_secs(1));
-        let done = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let done = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(done.contracts_dropped, 1);
         assert_eq!(done.records_dropped, 2);
         assert!(manager.get_peer_interest(&contract, &a).is_none());
@@ -4531,7 +4537,7 @@ mod tests {
         let no = |_: &ContractKey| false;
         for _ in 0..10 {
             assert_eq!(
-                manager.reconcile_with_hosting(no, no, |_: &ContractKey| false),
+                manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false),
                 ReconcileOutcome::default()
             );
         }
@@ -4553,9 +4559,9 @@ mod tests {
         let no = |_: &ContractKey| false;
         // Start mid-way through the key order, so the pass has to wrap.
         *manager.reconcile_cursor.lock() = Some(contracts[2]);
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        let outcome = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(outcome.contracts_dropped, contracts.len());
         for c in &contracts {
             assert!(manager.get_peer_interest(c, &a).is_none());
@@ -4571,18 +4577,18 @@ mod tests {
         let a = make_peer_key(1);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2);
         let hosted = |k: &ContractKey| *k == contract;
-        manager.reconcile_with_hosting(hosted, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], hosted, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2 + Duration::from_secs(1));
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert!(
             manager.get_peer_interest(&contract, &a).is_some(),
             "unhosted again for less than the full age: kept"
         );
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert!(manager.get_peer_interest(&contract, &a).is_none());
     }
 
@@ -4601,7 +4607,7 @@ mod tests {
         let in_use = |k: &ContractKey| *k == in_use_key;
         let no = |_: &ContractKey| false;
         for _ in 0..3 {
-            manager.reconcile_with_hosting(no, in_use, |_: &ContractKey| false);
+            manager.reconcile_with_hosting(&[], no, in_use, |_: &ContractKey| false);
             time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         }
         let upstream = manager.get_peer_interest(&in_use_key, &a).expect("kept");
@@ -4622,9 +4628,9 @@ mod tests {
         let upstream = make_peer_key(1);
         manager.register_peer_interest(&contract, upstream.clone(), None, true);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        let outcome = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(outcome.records_dropped, 1);
         assert!(manager.get_peer_interest(&contract, &upstream).is_none());
     }
@@ -4639,9 +4645,9 @@ mod tests {
         manager.register_local_hosting(&contract);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        let outcome = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(outcome.hosting_flags_cleared, vec![contract]);
         assert_eq!(outcome.interest_lost, vec![contract]);
         assert_eq!(outcome.records_dropped, 1);
@@ -4658,10 +4664,10 @@ mod tests {
         let a = make_peer_key(1);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(manager.reconcile_candidates.len(), 1);
         assert!(manager.remove_peer_interest(&contract, &a));
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert!(manager.reconcile_candidates.is_empty());
     }
 
@@ -4676,19 +4682,19 @@ mod tests {
         let a = make_peer_key(1);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(10));
         // Hosted and evicted again between passes; no pass sees it hosted.
         manager.register_local_hosting(&contract);
         manager.unregister_local_hosting(&contract);
         time.advance_time(Duration::from_secs(10));
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert!(
             manager.get_peer_interest(&contract, &a).is_some(),
             "10s after the latest eviction: kept"
         );
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert!(manager.get_peer_interest(&contract, &a).is_none());
     }
 
@@ -4704,9 +4710,9 @@ mod tests {
         manager.add_local_client(&contract);
         manager.register_peer_interest(&contract, a.clone(), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        let outcome = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(outcome.hosting_flags_cleared, vec![contract]);
         assert!(outcome.interest_lost.is_empty());
         assert_eq!(outcome.records_dropped, 0);
@@ -4731,7 +4737,7 @@ mod tests {
             manager.register_peer_interest(&contract, make_peer_key(i), None, false);
         }
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         // Calls: the window check, then one per record. Hosted from the
         // third call on, so exactly one record is dropped.
@@ -4740,7 +4746,7 @@ mod tests {
             calls.set(calls.get() + 1);
             calls.get() >= 3
         };
-        let outcome = manager.reconcile_with_hosting(rehosted, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], rehosted, no, |_: &ContractKey| false);
         assert_eq!(outcome.records_dropped, 1);
         assert_eq!(manager.get_interested_peers(&contract).len(), 3);
     }
@@ -4755,7 +4761,7 @@ mod tests {
             manager.register_peer_interest(&contract, make_peer_key(i), None, false);
         }
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         // `in_use` is called once in the window check and then once per record,
         // after that record's local-interest check. A client subscribes during
@@ -4769,7 +4775,8 @@ mod tests {
             }
             false
         };
-        let outcome = manager.reconcile_with_hosting(no, client_arrives, |_: &ContractKey| false);
+        let outcome =
+            manager.reconcile_with_hosting(&[], no, client_arrives, |_: &ContractKey| false);
         assert_eq!(outcome.records_dropped, 1);
         assert_eq!(manager.get_interested_peers(&contract).len(), 3);
     }
@@ -4782,7 +4789,7 @@ mod tests {
         let contract = make_contract_key(1);
         manager.register_local_hosting(&contract);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         // Unhosted at the window check, hosted from the next check on.
         let calls = std::cell::Cell::new(0);
@@ -4790,7 +4797,7 @@ mod tests {
             calls.set(calls.get() + 1);
             calls.get() >= 2
         };
-        let outcome = manager.reconcile_with_hosting(rehosted, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], rehosted, no, |_: &ContractKey| false);
         assert!(outcome.hosting_flags_cleared.is_empty());
         assert!(
             manager
@@ -4812,7 +4819,7 @@ mod tests {
         let contract = make_contract_key(1);
         manager.register_local_hosting(&contract);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         // Calls: the window check, the check before the clear, the check
         // after it. Hosted only by the third.
@@ -4822,7 +4829,7 @@ mod tests {
             calls.get() >= 3
         };
         let outcome =
-            manager.reconcile_with_hosting(rehosted_during_clear, no, |_: &ContractKey| false);
+            manager.reconcile_with_hosting(&[], rehosted_during_clear, no, |_: &ContractKey| false);
         assert!(outcome.hosting_flags_cleared.is_empty());
         assert!(outcome.interest_lost.is_empty());
         assert!(
@@ -4842,7 +4849,7 @@ mod tests {
         manager.register_local_hosting(&contract);
         manager.add_local_client(&contract);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         let calls = std::cell::Cell::new(0);
         let rehosted_during_clear = |_: &ContractKey| {
@@ -4850,7 +4857,7 @@ mod tests {
             calls.get() >= 3
         };
         let outcome =
-            manager.reconcile_with_hosting(rehosted_during_clear, no, |_: &ContractKey| false);
+            manager.reconcile_with_hosting(&[], rehosted_during_clear, no, |_: &ContractKey| false);
         assert_eq!(
             calls.get(),
             3,
@@ -4884,19 +4891,19 @@ mod tests {
         manager.add_local_client(&watched);
         let is_hosted = |k: &ContractKey| *k == hosted;
         let no = |_: &ContractKey| false;
-        let first = manager.reconcile_with_hosting(is_hosted, no, |_: &ContractKey| false);
+        let first = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
         assert!(
             first.advertisements_to_retract.is_empty(),
             "not past the wait"
         );
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         let mut expected = vec![watched];
-        let second = manager.reconcile_with_hosting(is_hosted, no, |_: &ContractKey| false);
+        let second = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
         // `unhosted` was dropped this pass; `watched` stays tracked.
         assert!(second.advertisements_to_retract.contains(&unhosted));
         assert!(second.advertisements_to_retract.contains(&watched));
         assert!(!second.advertisements_to_retract.contains(&hosted));
-        let third = manager.reconcile_with_hosting(is_hosted, no, |_: &ContractKey| false);
+        let third = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
         expected.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
         assert_eq!(third.advertisements_to_retract, expected, "reported again");
     }
@@ -4915,14 +4922,14 @@ mod tests {
         let no = |_: &ContractKey| false;
         let lease = std::cell::Cell::new(true);
         let holds_lease = |_: &ContractKey| lease.get();
-        manager.reconcile_with_hosting(no, no, holds_lease);
+        manager.reconcile_with_hosting(&[], no, no, holds_lease);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        let live = manager.reconcile_with_hosting(no, no, holds_lease);
+        let live = manager.reconcile_with_hosting(&[], no, no, holds_lease);
         assert!(live.advertisements_to_retract.is_empty(), "lease live");
         assert_eq!(live.records_dropped, 0, "lease live");
         assert_eq!(manager.get_interested_peers(&contract).len(), 2);
         lease.set(false);
-        let lapsed = manager.reconcile_with_hosting(no, no, holds_lease);
+        let lapsed = manager.reconcile_with_hosting(&[], no, no, holds_lease);
         assert_eq!(lapsed.advertisements_to_retract, vec![contract]);
         assert_eq!(lapsed.records_dropped, 2);
     }
@@ -4937,18 +4944,70 @@ mod tests {
             manager.register_peer_interest(&contract, make_peer_key(i), None, false);
         }
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, no);
+        manager.reconcile_with_hosting(&[], no, no, no);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
-        // Calls: the window check, then one per record. Held from the third
-        // call on, so exactly one record is dropped.
+        // `holds_lease` calls: the check before the flag clear, then one per
+        // record. Held from the third call on, so exactly one record is
+        // dropped.
         let calls = std::cell::Cell::new(0);
         let lease_arrives = |_: &ContractKey| {
             calls.set(calls.get() + 1);
             calls.get() >= 3
         };
-        let outcome = manager.reconcile_with_hosting(no, no, lease_arrives);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, lease_arrives);
         assert_eq!(outcome.records_dropped, 1);
         assert_eq!(manager.get_interested_peers(&contract).len(), 3);
+    }
+
+    /// An advertised contract with no interest record and no local interest is
+    /// still examined (#5782): once it is past the wait, unhosted, unused and
+    /// unleased it is reported for retraction. Before, such a contract was
+    /// untracked, so an advertisement left after its records went (for
+    /// example by an upstream unsubscribe) stood until restart.
+    #[test]
+    fn reconcile_reports_an_advertised_contract_with_no_records() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let advertised = [contract];
+        let no = |_: &ContractKey| false;
+        let lease = std::cell::Cell::new(true);
+        let holds_lease = |_: &ContractKey| lease.get();
+        let first = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert!(
+            first.advertisements_to_retract.is_empty(),
+            "not past the wait"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let leased = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert!(leased.advertisements_to_retract.is_empty(), "lease live");
+        lease.set(false);
+        let lapsed = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert_eq!(lapsed.advertisements_to_retract, vec![contract]);
+        let hosted = manager.reconcile_with_hosting(&advertised, |_: &ContractKey| true, no, no);
+        assert!(hosted.advertisements_to_retract.is_empty(), "hosted");
+    }
+
+    /// A leased contract keeps its stale hosting flag too: clearing it would
+    /// tell neighbours interest ended while a subscribe is still forming.
+    #[test]
+    fn reconcile_keeps_the_flag_of_a_leased_contract() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        let no = |_: &ContractKey| false;
+        let yes = |_: &ContractKey| true;
+        manager.reconcile_with_hosting(&[], no, no, yes);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, yes);
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(outcome.interest_lost.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("kept")
+                .hosting
+        );
     }
 
     /// Only an upstream registration restarts the wait: a neighbour's
@@ -4960,10 +5019,10 @@ mod tests {
         let contract = make_contract_key(1);
         manager.register_peer_interest(&contract, make_peer_key(1), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, no);
+        manager.reconcile_with_hosting(&[], no, no, no);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         manager.register_peer_interest(&contract, make_peer_key(2), None, false);
-        let outcome = manager.reconcile_with_hosting(no, no, no);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, no);
         assert_eq!(outcome.records_dropped, 2, "the wait did not restart");
     }
 
@@ -4975,10 +5034,10 @@ mod tests {
         let contract = make_contract_key(1);
         manager.register_peer_interest(&contract, make_peer_key(1), None, false);
         let no = |_: &ContractKey| false;
-        manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         manager.register_peer_interest(&contract, make_peer_key(2), None, true);
-        let outcome = manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         assert_eq!(outcome.records_dropped, 0, "the wait restarted");
         assert!(
             manager
@@ -5010,12 +5069,12 @@ mod tests {
                 None,
                 false,
             );
-            manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         }
         time.advance_time(RECONCILE_MIN_UNUSED_AGE);
         // The original contracts plus the newcomers fit in one more round.
         for _ in 0..=passes {
-            manager.reconcile_with_hosting(no, no, |_: &ContractKey| false);
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
         }
         for c in &contracts {
             assert!(

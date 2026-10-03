@@ -1948,9 +1948,9 @@ impl HostingManager {
     ///
     /// The narrow case "subscribed but no local interest" is handled by the
     /// orphaned upstream subscription lapsing, not by carrying an unbounded GC
-    /// exemption here: a lease is renewed only for demand, and its expiry
-    /// retracts the advertisement (`recover_orphaned_subscriptions`, with
-    /// `InterestManager::reconcile_with_hosting` retrying every pass, #5782).
+    /// exemption here: a lease is renewed only for demand, and the hosting
+    /// sweep retracts the advertisement on the first pass after the lease ends
+    /// (`InterestManager::reconcile_with_hosting`, #5782).
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
