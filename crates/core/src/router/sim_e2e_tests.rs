@@ -45,7 +45,10 @@
 //! - what `isotonic_fallback_enabled()` returned on each route event a router
 //!   learned (`Router::events_by_fallback_switch_for_test`). Every node learns
 //!   events in this workload, so this guard can fire today: the OFF arm must
-//!   see the switch on for every event, the ON arm never.
+//!   see the switch on for every event. That is the real guard. The matching
+//!   ON-arm check (never on) is much weaker: a node that lost its override
+//!   falls through to the process default, which IS the ON setting, so it
+//!   catches only a fallback switched on in the process environment.
 //! - which path each prediction took (`Router::predictions_by_model_for_test`).
 //!   This one still holds vacuously, because no router in this workload reaches
 //!   prediction-based routing at all (#5789). The event guard shows the
@@ -824,7 +827,10 @@ fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
     // events, and each event records what `isotonic_fallback_enabled()`
     // returned on the thread that learned it. If the OFF arm's routers fell
     // through to the process default, they would record the switch OFF and
-    // the assertion below fails. The per-model prediction counts are the
+    // the assertion below fails. That OFF-arm check is the guard; the ON-arm
+    // twin cannot see a lost override (the default it falls through to is
+    // the ON setting) and only catches the switch set in the process env.
+    // The per-model prediction counts are the
     // second check, and the one that shows routing itself took each arm's
     // path, but they hold vacuously until the workload makes predictions at
     // all (#5789, see below).
@@ -857,7 +863,9 @@ fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
     assert!(
         on.events_with_fallback_off > 0 && on.events_with_fallback_on == 0,
         "seed {seed:x}: the ON arm's routers learned {} route events with the isotonic \
-         fallback switch off and {} with it on. None may see it on.",
+         fallback switch off and {} with it on. None may see it on: is \
+         FREENET_ROUTING_FALLBACK_ISOTONIC set in this process's environment? (This check \
+         cannot detect an ON node that lost its override; the OFF-arm check does that.)",
         on.events_with_fallback_off,
         on.events_with_fallback_on
     );
