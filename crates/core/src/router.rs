@@ -1502,7 +1502,7 @@ const ISOTONIC_FALLBACK_ENV: &str = "FREENET_ROUTING_FALLBACK_ISOTONIC";
 /// configuration as a whole: it is the path every timing stage takes before
 /// its hierarchical curve exists (the isotonic estimate with the per-peer
 /// EWMA), applied to every stage. Default off, and slated for removal once
-/// the hierarchical estimator has proven itself (#4485). The hierarchical
+/// the hierarchical estimator has proven itself (#5792, #4485). The hierarchical
 /// estimator keeps learning while it is on, so switching back finds it warm.
 fn isotonic_fallback_enabled() -> bool {
     // Tests override ahead of the cached read: the `OnceLock` is resolved by

@@ -322,7 +322,7 @@ parse) routes EVERY stage on the isotonic estimate with the per-peer EWMA, the
 path a cold timing stage already takes. For use only if the hierarchical
 estimator misbehaves in production; no release has routed on it as a whole;
 WARN at startup when set (and when set to a value it does not recognise);
-slated for removal once hierarchical is proven. Every node logs its mode once at
+slated for removal once hierarchical is proven (#5792). Every node logs its mode once at
 startup at INFO (router.rs routing_mode_line): grep `estimator: enabled
 (default)` or `estimator: disabled via`, never the bare prefix.
 Pinned by the_isotonic_fallback_switch_routes_every_stage_on_the_isotonic_estimate;
