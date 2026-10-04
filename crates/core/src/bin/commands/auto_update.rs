@@ -4279,7 +4279,9 @@ mod tests {
         // and what actually matters, is that every HTTP client on this path is
         // bounded by SOMETHING — so a stalled connection can never hang until
         // systemd SIGKILLs the updater mid-install.
-        let update_src = include_str!("update.rs");
+        // `update/staged.rs` too (#5790): the installer reads its cache, and its
+        // downloader shares the update path's clients' obligations.
+        let update_src = concat!(include_str!("update.rs"), include_str!("update/staged.rs"));
         let clients = update_src.matches("reqwest::Client::builder()").count();
         let bounded =
             update_src.matches(".timeout(").count() + update_src.matches(".read_timeout(").count();

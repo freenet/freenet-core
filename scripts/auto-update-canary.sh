@@ -1099,7 +1099,12 @@ run_node_until_check() {
         # It was bounded in practice only because the node dies at its own
         # `timeout $CANARY_TIMEOUT_SECS` -- an accident of a sibling mechanism,
         # not a guarantee this loop makes.
-        local settle_deadline=$(( $(date +%s) + 60 ))
+        #
+        # 180s, not 60s: since #5790 the node downloads and verifies the release
+        # (~40 MB) BEFORE it exits 42, so the time from "triggering auto-update"
+        # to the exit now includes that download. Killing it mid-download would
+        # read as "no update requested".
+        local settle_deadline=$(( $(date +%s) + 180 ))
         [ "$settle_deadline" -gt "$deadline" ] && settle_deadline="$deadline"
         while kill -0 "$node_pid" 2>/dev/null && [ "$(date +%s)" -lt "$settle_deadline" ]; do
           sleep 2

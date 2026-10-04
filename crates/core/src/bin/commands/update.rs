@@ -10,6 +10,9 @@ use std::process::Command;
 
 use super::rollback;
 
+mod staged;
+pub(crate) use staged::stage_latest_release;
+
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
 #[cfg(target_os = "linux")]
@@ -428,6 +431,8 @@ impl UpdateCommand {
             // target install to gate anymore — clear the per-version
             // install-failure counter too (#4073).
             super::rollback::clear_install_failures();
+            // Nothing to install, so nothing staged in advance (#5790) is useful.
+            staged::discard();
             // Exit with a distinct code so the service wrapper knows no update
             // was performed and can skip the unnecessary restart.
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
@@ -504,7 +509,12 @@ impl UpdateCommand {
         // deterministic-vs-transient distinction.
         let install_result = self.download_and_install(&latest, current_version).await;
         match &install_result {
-            Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures(),
+            Ok(InstallOutcome::Installed) => {
+                super::rollback::clear_install_failures();
+                // The staged copy (#5790) has served its purpose. Kept on any
+                // failure, so the next attempt need not download it again.
+                staged::discard();
+            }
             Ok(InstallOutcome::BundleSkipped {
                 verification_failure,
             }) => {
@@ -625,9 +635,8 @@ impl UpdateCommand {
         }
 
         let target = get_target_triple();
-        let extension = get_archive_extension();
-        let freenet_asset_name = format!("freenet-{}.{}", target, extension);
-        let fdev_asset_name = format!("fdev-{}.{}", target, extension);
+        let freenet_asset_name = staged::freenet_asset_name();
+        let fdev_asset_name = staged::fdev_asset_name();
 
         let freenet_asset = release
             .assets
@@ -666,18 +675,32 @@ impl UpdateCommand {
         // (the only site that calls `record_update_failure`), so it is a
         // retryable `OtherFailure` (-> `NoChange`), never a
         // `MAX_UPDATE_FAILURES` lockout.
-        let checksums = self.download_and_verify_checksums(release).await?;
-
+        //
+        // #5790: the node normally downloaded the release before it exited, so
+        // under systemd this runs inside `TimeoutStopSec` without a large
+        // download. `staged::load` holds the cached files to the same
+        // signature and checksum checks as a download, and returns `None`
+        // (falling back to downloading) for anything missing or wrong.
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-
-        // Download and install freenet
-        let freenet_archive_path = temp_dir.path().join(&freenet_asset_name);
-        download_file(
-            &freenet_asset.browser_download_url,
-            &freenet_archive_path,
-            self.quiet,
-        )
-        .await?;
+        let (checksums, freenet_archive_path, staged_fdev) = match staged::load(release, self.quiet)
+        {
+            Some(staged) => {
+                if !self.quiet {
+                    println!("Using the update downloaded in advance.");
+                }
+                (
+                    Some(staged.checksums),
+                    staged.freenet_archive,
+                    staged.fdev_archive,
+                )
+            }
+            None => {
+                let checksums = self.download_and_verify_checksums(release).await?;
+                let path = temp_dir.path().join(&freenet_asset_name);
+                download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
+                (checksums, path, None)
+            }
+        };
 
         // Fail-closed checksum gate. A missing manifest, a missing entry
         // for our asset, or a hash mismatch all REFUSE the install. This
@@ -802,6 +825,7 @@ impl UpdateCommand {
                 &fdev_asset_name,
                 &checksums,
                 temp_dir.path(),
+                staged_fdev,
                 &current_exe,
             )
             .await;
@@ -977,19 +1001,26 @@ impl UpdateCommand {
         asset_name: &str,
         checksums: &Option<Checksums>,
         temp_dir: &Path,
+        staged_archive: Option<PathBuf>,
         freenet_exe: &Path,
     ) {
-        let archive_path = temp_dir.join(asset_name);
-        if let Err(e) = download_file(&asset.browser_download_url, &archive_path, self.quiet).await
-        {
-            if !self.quiet {
-                eprintln!(
-                    "Warning: Failed to download fdev: {}. Skipping fdev update.",
-                    e
-                );
+        let archive_path = match staged_archive {
+            Some(path) => path,
+            None => {
+                let path = temp_dir.join(asset_name);
+                if let Err(e) = download_file(&asset.browser_download_url, &path, self.quiet).await
+                {
+                    if !self.quiet {
+                        eprintln!(
+                            "Warning: Failed to download fdev: {}. Skipping fdev update.",
+                            e
+                        );
+                    }
+                    return;
+                }
+                path
             }
-            return;
-        }
+        };
 
         // Fail-closed, like the freenet binary: never install fdev
         // unverified. Because fdev updates are best-effort (they must never
@@ -1414,6 +1445,15 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
 /// signature. Exceeding the cap is treated as a (retryable) download failure,
 /// never a lockout.
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
+    download_optional_bytes(url)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Download failed: {}", reqwest::StatusCode::NOT_FOUND))
+}
+
+/// [`download_bytes`], but a `404` is `Ok(None)` rather than an error. Used
+/// where an asset may legitimately be absent, such as `SHA256SUMS.txt.sig`
+/// when downloading by URL without the release's asset list (#5790).
+async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
     // Generous vs. any real manifest (a few hundred bytes) or signature (64
     // bytes), small enough to bound memory.
     const MAX_ASSET_BYTES: usize = 4 * 1024 * 1024;
@@ -1435,6 +1475,9 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         .await
         .context("Failed to download release asset")?;
 
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !response.status().is_success() {
         anyhow::bail!("Download failed: {}", response.status());
     }
@@ -1456,7 +1499,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf)
+    Ok(Some(buf))
 }
 
 /// Authenticate the raw bytes of `SHA256SUMS.txt` against the baked-in
@@ -4032,10 +4075,13 @@ done
             .expect("end of install-result match not found");
 
         // The Installed outcome clears the gate.
+        let (_, installed_arm) = matchbody
+            .split_once("Ok(InstallOutcome::Installed) => {")
+            .expect("Installed arm not found");
+        let installed_arm =
+            &installed_arm[..installed_arm.find('}').unwrap_or(installed_arm.len())];
         assert!(
-            matchbody.contains(
-                "Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures()"
-            ),
+            installed_arm.contains("super::rollback::clear_install_failures();"),
             "the Installed outcome must clear the install-failure gate"
         );
         // The deterministic-verification Err arm records a failure.
