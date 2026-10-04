@@ -65,11 +65,10 @@
 //! every other decision must still match. So the floor cannot reach any
 //! decision beyond the listed ones without this test failing.
 //!
-//! The floor is a lower bound on every isotonic estimate, so it also lifts a
-//! positive estimate below it. That added no decision to the list: in these
-//! scenarios a positive estimate below the floor occurs only while the
-//! hierarchical transfer stage is warm, where routing does not read the
-//! isotonic speed.
+//! The floor is 1 B/s, a lower bound on every isotonic estimate, so it would
+//! also lift a positive estimate below 1 B/s; none occurs in these scenarios.
+//! (An earlier floor relative to the distance curve could reorder candidates
+//! across distances; see `DEGENERATE_SPEED_FLOOR_BPS` in `router.rs`.)
 //!
 //! The window is computed without looking at the decision, so a few early
 //! distance-only decisions (the first 50 events, before prediction starts)

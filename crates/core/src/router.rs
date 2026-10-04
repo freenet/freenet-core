@@ -2469,10 +2469,9 @@ impl Router {
     }
 
     /// The isotonic transfer-speed estimate routing uses: the estimator's own
-    /// value, raised to the floor described at
-    /// [`DEGENERATE_SPEED_FLOOR_FRACTION`] when it falls below it. `None` when
-    /// the estimator cannot estimate at all (too few transfers, or no peer
-    /// location).
+    /// value, raised to [`DEGENERATE_SPEED_FLOOR_BPS`] when it falls below it.
+    /// `None` when the estimator cannot estimate at all (too few transfers, or
+    /// no peer location).
     fn isotonic_transfer_speed(
         &self,
         peer: &PeerKeyLocation,
@@ -2482,15 +2481,7 @@ impl Router {
             .transfer_rate_estimator
             .estimate_retrieval_time(peer, contract_location)
             .ok()?;
-        let global = self
-            .transfer_rate_estimator
-            .estimate_global(peer, contract_location)
-            .ok()
-            .filter(|speed| speed.is_finite() && *speed > 0.0);
-        let floor = global.map_or(DEGENERATE_SPEED_FLOOR_BPS, |speed| {
-            (speed * DEGENERATE_SPEED_FLOOR_FRACTION).max(DEGENERATE_SPEED_FLOOR_BPS)
-        });
-        Some(raw.max(floor))
+        Some(raw.max(DEGENERATE_SPEED_FLOOR_BPS))
     }
 
     /// Score the hierarchical forecasts made for an event against what
@@ -2591,11 +2582,10 @@ impl Router {
     /// `FREENET_ROUTING_FALLBACK_ISOTONIC` (off by default) sends every stage
     /// down that fallback path.
     ///
-    /// The isotonic transfer speed is floored at a tenth of the distance curve,
-    /// so a degenerate (zero or near-zero) one is not priced as an unroutable
-    /// transfer; the soaked build did not floor it (see
-    /// `DEGENERATE_SPEED_FLOOR_FRACTION`), which is the second, and narrower,
-    /// difference from it.
+    /// The isotonic transfer speed is floored at 1 B/s, so a degenerate (zero
+    /// or near-zero) one is not priced as an unroutable transfer; the soaked
+    /// build did not floor it (see `DEGENERATE_SPEED_FLOOR_BPS`), which is the
+    /// second, and narrower, difference from it.
     ///
     /// The first difference from the soaked build is in that fallback: it also
     /// blended Renegade in once Renegade held 10 samples of the stage, and that
@@ -2654,7 +2644,7 @@ impl Router {
             .response_start_time_estimator
             .estimate_retrieval_time(peer, target_location)
             .ok();
-        // Floored: see `DEGENERATE_SPEED_FLOOR_FRACTION`.
+        // Floored: see `DEGENERATE_SPEED_FLOOR_BPS`.
         let transfer_estimate = self.isotonic_transfer_speed(peer, target_location);
 
         let distance = peer
@@ -3377,28 +3367,35 @@ struct IsotonicTimingForecast {
     transfer_speed_bps: Option<f64>,
 }
 
-/// Floor on the isotonic transfer-speed estimate, as a share of the global
-/// isotonic curve at the query's distance.
+/// Floor, in bytes/s, under every isotonic transfer-speed estimate routing
+/// uses.
 ///
 /// The transfer-rate estimator adjusts per peer ADDITIVELY, so a peer whose
 /// transfers ran slower than the curve can be driven to zero (the estimator
-/// clamps there), and routing then priced that peer's transfer at the
-/// `f64::MAX / 2` sentinel: effectively unroutable for as long as the stage
-/// fell back to the isotonic estimate. The floor judges such a peer at most an
-/// order of magnitude slower than the distance curve, the same "an order of
-/// magnitude off" convention as `ERROR_CLIP_MULTIPLE`.
+/// clamps there), and the curve itself extrapolates to zero beyond its data;
+/// routing then priced that peer's transfer at the `f64::MAX / 2` sentinel. The
+/// floor keeps the price finite, so such a peer still sorts last but is
+/// ordered among its peers by its other costs, and no estimate is ever zero.
 ///
-/// It is a lower bound on EVERY estimate, not a replacement for a zero one:
-/// replacing only zero would leave a peer the additive EWMA drove to a tiny
-/// positive speed priced near-unroutable while a worse peer, clamped to zero,
-/// was lifted to the floor and ranked above it. With `max`, a lower learned
-/// speed never yields a higher speed than a higher learned one. Estimates at or
-/// above the floor route exactly as before.
-const DEGENERATE_SPEED_FLOOR_FRACTION: f64 = 0.1;
-
-/// Last-resort floor, in bytes/s, when the global curve cannot give a
-/// positive speed at the query either. Finite, so the peer still sorts on its
-/// other costs rather than off the scale.
+/// It is ONE absolute value, the same for every candidate, and a lower bound
+/// on every estimate (`max(raw, floor)`). Both are needed for routing to
+/// preserve the order of the raw estimates, so that a peer the estimator
+/// learned to be slower never routes faster than one it learned to be faster:
+///   - Replacing only a zero estimate left a peer driven to a tiny positive
+///     speed priced near-unroutable while a worse peer, clamped to zero, was
+///     lifted above it.
+///   - A floor relative to the curve at each candidate's OWN distance (it was
+///     a tenth of it) lifted a degenerate NEAR peer, where the curve is high,
+///     above a FAR peer that had learned a positive speed: the curve falls with
+///     distance and the additive adjustment does not. Pinned by
+///     `a_floored_transfer_speed_ranks_monotonically_across_distances`.
+///
+/// Not a share of the curve's minimum either: the curve is fitted to its data
+/// and extrapolates toward zero beyond it, so on the production-like golden
+/// replay a tenth of the smallest fitted value was 11.7 kB/s while candidates
+/// sitting exactly on the curve were estimated at 0.3 to 9 kB/s. That floor
+/// tied them all and moved four compared decisions; 1 B/s lifts only
+/// estimates that are zero for practical purposes and moves none.
 const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1.0;
 
 /// Recent forecast/outcome pairs kept per stage for the accuracy panel.
@@ -4850,14 +4847,11 @@ mod tests {
         estimator
     }
 
-    /// The isotonic transfer speed routing uses is floored at a tenth of the
-    /// global distance curve, and at 1 B/s when that curve gives no positive
-    /// speed. The floor is a LOWER BOUND on every estimate, not a replacement
-    /// for a zero one: a peer the additive EWMA drove to a tiny positive speed
-    /// is lifted to it exactly like one clamped to zero, so a worse-learned
-    /// peer can never rank above a better-learned one. (Replacing only zero
-    /// did exactly that: a peer at 0.01 B/s priced near-unroutable while a
-    /// worse one, clamped to 0, was lifted to the floor and ranked above it.)
+    /// The isotonic transfer speed routing uses is floored at 1 B/s, whatever
+    /// the curve, and the floor is a LOWER BOUND on every estimate, not a
+    /// replacement for a zero one: a peer driven to a tiny positive speed is
+    /// lifted exactly like one clamped to zero, and every estimate above the
+    /// floor is kept as it is.
     #[test]
     fn a_degenerate_isotonic_transfer_speed_is_floored() {
         let _seed = GlobalRng::seed_guard(0x4485_F100);
@@ -4867,59 +4861,41 @@ mod tests {
                 .isotonic_transfer_speed(peer, target)
                 .expect("the estimator estimates")
         };
-
-        // A global curve of 1000 B/s floors at 100 B/s.
-        let [zero, tiny, slow, at, fast] = std::array::from_fn(|_| PeerKeyLocation::random());
-        let mut router = Router::new(&[]);
-        router.transfer_rate_estimator = transfer_estimator_with(
-            1000.0,
-            &[
-                (zero.clone(), -500.0),
-                (tiny.clone(), 0.01),
-                (slow.clone(), 50.0),
-                (at.clone(), 500.0),
-                (fast.clone(), 2000.0),
-            ],
-        );
-        assert_eq!(speed(&router, &zero), 100.0, "a zero estimate is lifted");
-        assert_eq!(speed(&router, &tiny), 100.0, "a tiny positive one too");
-        assert_eq!(speed(&router, &slow), 100.0);
-        assert_eq!(speed(&router, &at), 500.0, "one above the floor is kept");
-        assert_eq!(speed(&router, &fast), 2000.0);
-
-        // No positive global curve: the last-resort floor of 1 B/s.
-        let mut router = Router::new(&[]);
-        router.transfer_rate_estimator = transfer_estimator_with(
-            0.0,
-            &[
-                (zero.clone(), 0.0),
-                (tiny.clone(), 0.5),
-                (fast.clone(), 5.0),
-            ],
-        );
-        assert_eq!(speed(&router, &zero), 1.0);
-        assert_eq!(speed(&router, &tiny), 1.0);
-        assert_eq!(speed(&router, &fast), 5.0);
-
-        // A positive global curve whose tenth is below 1 B/s floors at 1 B/s.
-        let mut router = Router::new(&[]);
-        router.transfer_rate_estimator = transfer_estimator_with(5.0, &[(zero.clone(), 0.0)]);
-        assert_eq!(speed(&router, &zero), 1.0);
+        let [zero, tiny, slow, fast] = std::array::from_fn(|_| PeerKeyLocation::random());
+        for curve in [1000.0, 5.0, 0.0] {
+            let mut router = Router::new(&[]);
+            router.transfer_rate_estimator = transfer_estimator_with(
+                curve,
+                &[
+                    (zero.clone(), -2000.0),
+                    (tiny.clone(), 0.5),
+                    (slow.clone(), 2.0),
+                    (fast.clone(), 1500.0),
+                ],
+            );
+            assert_eq!(
+                speed(&router, &zero),
+                1.0,
+                "a zero estimate is lifted ({curve})"
+            );
+            assert_eq!(
+                speed(&router, &tiny),
+                1.0,
+                "a tiny positive one too ({curve})"
+            );
+            assert_eq!(
+                speed(&router, &slow),
+                2.0,
+                "one above the floor is kept ({curve})"
+            );
+            assert_eq!(speed(&router, &fast), 1500.0);
+        }
     }
 
-    /// Routing on the floored isotonic transfer speed is monotone in what the
-    /// estimator learned: a peer that learned a lower speed never ranks above
-    /// one that learned a higher speed, unless the floor makes them equal.
-    /// Every other cost term is the same for every candidate here, so the rank
-    /// is decided by the transfer speed alone.
-    #[test]
-    fn a_floored_transfer_speed_never_ranks_a_slower_peer_above_a_faster_one() {
-        let _seed = GlobalRng::seed_guard(0x4485_F101);
-        let _routing = force_isotonic_fallback(true);
-        let learned: Vec<(PeerKeyLocation, f64)> = [-500.0, 0.01, 50.0, 150.0, 500.0, 2000.0]
-            .into_iter()
-            .map(|speed| (PeerKeyLocation::random(), speed))
-            .collect();
+    /// A router past the 50-event gate with no failures and a 100 ms response
+    /// anywhere, so that only the transfer term differs between candidates,
+    /// routing on `transfer` as its isotonic transfer-speed estimator.
+    fn router_ranking_on_transfer_speed(transfer: IsotonicEstimator) -> Router {
         let reference = |result: f64| {
             (0..60).map(move |index| IsotonicEvent {
                 peer: PeerKeyLocation::random(),
@@ -4928,27 +4904,34 @@ mod tests {
             })
         };
         let mut router = Router::new(&[]);
-        // Past the 50-event gate, no failures and 100 ms to respond anywhere,
-        // so only the transfer term differs between candidates.
         router.failure_estimator = IsotonicEstimator::new(reference(0.0), EstimatorType::Positive);
         router.response_start_time_estimator = IsotonicEstimator::new_with_mode(
             reference(0.1),
             EstimatorType::Positive,
             AdjustmentMode::Multiplicative,
         );
-        router.transfer_rate_estimator = transfer_estimator_with(1000.0, &learned);
+        router.transfer_rate_estimator = transfer;
+        router
+    }
 
-        let target = Location::new(0.3);
-        let candidates: Vec<PeerKeyLocation> =
-            learned.iter().rev().map(|(peer, _)| peer.clone()).collect();
+    /// Rank `candidates` for `target` and assert the order is monotone in each
+    /// candidate's RAW isotonic transfer-speed estimate (what the estimator
+    /// learned for that peer at that target, before any floor): a peer with a
+    /// lower raw estimate never ranks above one with a higher, unless the
+    /// floor makes their routed speeds equal. Returns the number of candidates
+    /// whose routed speed was lifted by the floor.
+    fn assert_transfer_ranking_is_monotone(
+        router: &Router,
+        candidates: &[PeerKeyLocation],
+        target: Location,
+    ) -> usize {
         let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
-        assert_eq!(ranked.len(), learned.len());
-        let learned_speed = |peer: &PeerKeyLocation| {
-            learned
-                .iter()
-                .find(|(candidate, _)| candidate == peer)
-                .map(|(_, speed)| *speed)
-                .expect("a candidate")
+        assert_eq!(ranked.len(), candidates.len());
+        let raw = |peer: &PeerKeyLocation| {
+            router
+                .transfer_rate_estimator
+                .estimate_retrieval_time(peer, target)
+                .expect("the estimator estimates")
         };
         let used: Vec<f64> = ranked
             .iter()
@@ -4966,17 +4949,99 @@ mod tests {
             .collect();
         for earlier in 0..ranked.len() {
             for later in earlier + 1..ranked.len() {
-                let (better, worse) =
-                    (learned_speed(ranked[earlier]), learned_speed(ranked[later]));
+                let (better, worse) = (raw(ranked[earlier]), raw(ranked[later]));
                 assert!(
                     better >= worse || used[earlier] == used[later],
-                    "a peer that learned {better} B/s (routed at {}) ranks above one that \
-                     learned {worse} B/s (routed at {})",
+                    "a peer whose estimate is {better} B/s (routed at {}) ranks above one \
+                     whose estimate is {worse} B/s (routed at {})",
                     used[earlier],
                     used[later]
                 );
             }
         }
+        ranked
+            .iter()
+            .zip(&used)
+            .filter(|(peer, used)| **used > raw(peer))
+            .count()
+    }
+
+    /// Routing on the floored isotonic transfer speed is monotone in what the
+    /// estimator learned: a peer that learned a lower speed never ranks above
+    /// one that learned a higher speed, unless the floor makes them equal.
+    /// Every other cost term is the same for every candidate here, so the rank
+    /// is decided by the transfer speed alone.
+    #[test]
+    fn a_floored_transfer_speed_never_ranks_a_slower_peer_above_a_faster_one() {
+        let _seed = GlobalRng::seed_guard(0x4485_F101);
+        let _routing = force_isotonic_fallback(true);
+        let learned: Vec<(PeerKeyLocation, f64)> = [-500.0, 0.01, 50.0, 150.0, 500.0, 2000.0]
+            .into_iter()
+            .map(|speed| (PeerKeyLocation::random(), speed))
+            .collect();
+        let router = router_ranking_on_transfer_speed(transfer_estimator_with(1000.0, &learned));
+        let candidates: Vec<PeerKeyLocation> =
+            learned.iter().rev().map(|(peer, _)| peer.clone()).collect();
+        let lifted = assert_transfer_ranking_is_monotone(&router, &candidates, Location::new(0.3));
+        assert!(lifted >= 2, "the floor must be in play: {lifted} lifted");
+    }
+
+    /// The same across distances, where it is easy to get wrong: the global
+    /// curve falls with distance and the per-peer adjustment does not, so a
+    /// floor taken from the curve at each candidate's OWN distance lifts a
+    /// degenerate NEAR peer above a far peer that learned a positive speed.
+    /// Here the near peer's estimate is 0 and the far one's lies between the
+    /// two candidates' per-distance floors.
+    #[test]
+    fn a_floored_transfer_speed_ranks_monotonically_across_distances() {
+        let _seed = GlobalRng::seed_guard(0x4485_F102);
+        let _routing = force_isotonic_fallback(true);
+        // A falling curve, 1000 B/s at distance 0 to 100 B/s at 0.5, from
+        // points spread over the whole of [0, 0.5] so nothing is extrapolated.
+        let reference = PeerKeyLocation::random();
+        let origin = reference.location().expect("located").as_f64();
+        let events = (0..40).map(|index| {
+            let distance = 0.5 * f64::from(index) / 39.0;
+            IsotonicEvent {
+                peer: reference.clone(),
+                contract_location: Location::new((origin + distance).rem_euclid(1.0)),
+                result: 1000.0 - 1800.0 * distance,
+            }
+        });
+        let mut transfer = IsotonicEstimator::new(events, EstimatorType::Negative);
+
+        let pool: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        let near = pool[0].clone();
+        let target = near.location().expect("located");
+        let distance =
+            |peer: &PeerKeyLocation| target.distance(peer.location().expect("located")).as_f64();
+        let far = pool
+            .iter()
+            .max_by(|a, b| distance(a).total_cmp(&distance(b)))
+            .expect("a pool")
+            .clone();
+        let global = |peer: &PeerKeyLocation| {
+            transfer
+                .estimate_global(peer, target)
+                .expect("the curve estimates")
+        };
+        let (near_global, far_global) = (global(&near), global(&far));
+        assert!(
+            near_global >= 2.0 * far_global && far_global > 0.0,
+            "the curve must fall with distance: {near_global} near vs {far_global} at {}",
+            distance(&far)
+        );
+        // Near: driven to zero. Far: a positive estimate above a tenth of the
+        // curve at its own distance and below a tenth of it at the near one,
+        // which is what a floor relative to each candidate's distance got
+        // wrong.
+        let far_raw = 0.1 * (near_global * far_global).sqrt();
+        transfer.set_peer_adjustment_for_test(near.clone(), -2.0 * near_global);
+        transfer.set_peer_adjustment_for_test(far.clone(), far_raw - far_global);
+
+        let router = router_ranking_on_transfer_speed(transfer);
+        let lifted = assert_transfer_ranking_is_monotone(&router, &[near, far], target);
+        assert!(lifted >= 1, "the floor must be in play: {lifted} lifted");
     }
 
     /// Whether any candidate in a replayed decision prices its transfer as
