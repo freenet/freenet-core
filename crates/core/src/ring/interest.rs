@@ -116,19 +116,14 @@ pub(crate) const PEER_INTEREST_ENTRY_BYTES: u64 = (std::mem::size_of::<PeerKey>(
     + std::mem::size_of::<ContractKey>()
     + 2 * std::mem::size_of::<u64>()) as u64;
 
-/// Bytes held for one contract's neighbour records: [`PEER_INTEREST_ENTRY_BYTES`]
-/// per record plus each cached summary's length (#5647).
-fn records_resident_bytes(peers: &HashMap<PeerKey, PeerInterest>) -> u64 {
-    peers
-        .values()
-        .map(|interest| {
-            PEER_INTEREST_ENTRY_BYTES
-                + interest
-                    .summary
-                    .as_ref()
-                    .map_or(0, |s| s.as_ref().len() as u64)
-        })
-        .fold(0u64, u64::saturating_add)
+/// Bytes held for one contract's neighbour records (#5647):
+/// [`PEER_INTEREST_ENTRY_BYTES`] per record plus each DISTINCT summary once,
+/// since identical summaries from several neighbours share one allocation
+/// (#5786).
+fn records_resident_bytes(peers: &ContractPeers) -> u64 {
+    (peers.len() as u64)
+        .saturating_mul(PEER_INTEREST_ENTRY_BYTES)
+        .saturating_add(peers.held_summary_bytes())
 }
 
 /// Whether a neighbour's summary is small enough to store: at most
@@ -2377,26 +2372,37 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// should use (#5779): identical summaries from many neighbours share one
     /// allocation, so summing each record's summary length would overcount.
     /// Excludes the fixed per-record overhead.
-    // Production caller lands with #5779; until then only tests read it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn distinct_summary_bytes_for(&self, contract: &ContractKey) -> u64 {
         self.interested_peers
             .get(contract)
             .map_or(0, |entry| entry.held_summary_bytes())
     }
 
-    /// Bytes this node holds to track neighbours' interest in `contract`: every
-    /// cached neighbour summary plus a fixed per-record charge
-    /// ([`PEER_INTEREST_ENTRY_BYTES`]) (#5647).
+    /// Bytes this node holds to track neighbours' interest in `contract`: a
+    /// fixed per-record charge ([`PEER_INTEREST_ENTRY_BYTES`]) for every
+    /// neighbour record, plus each distinct cached summary once
+    /// ([`Self::distinct_summary_bytes_for`]) (#5647). N neighbours that sent
+    /// identical summaries cost one summary's bytes plus N record charges.
     ///
     /// This is the part of hosting a contract that varies with the contract and
     /// with how many neighbours follow it, so the hosting cache charges it to
     /// the contract instead of a uniform per-contract estimate. It reads the
     /// canonical `interested_peers` map, so it cannot drift from what is held.
+    /// The record count and the summary bytes are two reads, so a record
+    /// added or removed between them can make one call off by that record;
+    /// the hosting cache samples this once per 60s sweep, so that is within
+    /// the staleness it already accepts.
     pub fn resident_bytes_for(&self, contract: &ContractKey) -> u64 {
-        self.interested_peers
+        let records = self
+            .interested_peers
             .get(contract)
-            .map_or(0, |peers| records_resident_bytes(&peers))
+            .map_or(0, |peers| peers.len() as u64);
+        if records == 0 {
+            return 0;
+        }
+        records
+            .saturating_mul(PEER_INTEREST_ENTRY_BYTES)
+            .saturating_add(self.distinct_summary_bytes_for(contract))
     }
 
     /// [`Self::resident_bytes_for`] summed over EVERY contract with neighbour
@@ -5676,6 +5682,60 @@ mod tests {
         assert_eq!(
             manager.resident_bytes_for(&contract),
             PEER_INTEREST_ENTRY_BYTES + 10
+        );
+    }
+
+    /// #5647 with #5786: N neighbours that sent identical summaries are charged
+    /// one summary's bytes plus N record charges, and the shared summary stops
+    /// being charged only when its last holder changes or leaves.
+    #[test]
+    fn resident_bytes_for_charges_identical_summaries_once() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peers: Vec<PeerKey> = (1..=20).map(make_unique_peer_key).collect();
+        let summary = vec![9u8; 33_000];
+
+        for peer in &peers {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                peer,
+                StateSummary::from(summary.clone())
+            ));
+        }
+        assert_eq!(manager.distinct_summary_bytes_for(&contract), 33_000);
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 20 * PEER_INTEREST_ENTRY_BYTES,
+            "20 identical summaries are one summary's bytes plus 20 record charges"
+        );
+
+        // One neighbour moves to a different version: two distinct summaries.
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peers[0],
+            StateSummary::from(vec![1u8; 500])
+        ));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 500 + 20 * PEER_INTEREST_ENTRY_BYTES
+        );
+
+        // The shared summary is charged until its last holder leaves.
+        for peer in &peers[1..19] {
+            assert!(manager.remove_peer_interest(&contract, peer));
+        }
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 500 + 2 * PEER_INTEREST_ENTRY_BYTES
+        );
+        assert!(manager.remove_peer_interest(&contract, &peers[19]));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            500 + PEER_INTEREST_ENTRY_BYTES
+        );
+        assert_eq!(
+            manager.total_resident_bytes(),
+            manager.resident_bytes_for(&contract)
         );
     }
 
