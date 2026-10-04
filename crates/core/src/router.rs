@@ -1786,6 +1786,24 @@ impl SelectionRankSnapshot {
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
         warn_about_routing_flags();
+        // The same hardening as `add_event_recording`: the isotonic estimators
+        // panic on an event about a peer with no location, so such events are
+        // left out of the history rather than trusted not to occur.
+        let located: Vec<RouteEvent>;
+        let history = if history.iter().all(|event| event.peer.location().is_some()) {
+            history
+        } else {
+            located = history
+                .iter()
+                .filter(|event| event.peer.location().is_some())
+                .cloned()
+                .collect();
+            tracing::debug!(
+                skipped = history.len() - located.len(),
+                "route history events about peers with no known location; not learned"
+            );
+            &located
+        };
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
@@ -5048,6 +5066,47 @@ mod tests {
             state(&router),
             before,
             "an event about a peer with no location must not be recorded"
+        );
+    }
+
+    /// The same guard on the history path: `Router::new` skips events about
+    /// a peer with no known location instead of panicking in the isotonic
+    /// estimators, and learns every other event in the history.
+    #[test]
+    fn a_history_event_for_a_peer_without_a_location_is_skipped() {
+        let unlocated =
+            PeerKeyLocation::with_unknown_addr(PeerKeyLocation::random().pub_key().clone());
+        assert!(unlocated.location().is_none(), "sanity: no location");
+        let event = |peer: &PeerKeyLocation, outcome: RouteOutcome| RouteEvent {
+            peer: peer.clone(),
+            contract_location: Location::random(),
+            outcome,
+            op_type: Some(OpType::Get),
+        };
+        let timed = || RouteOutcome::Success {
+            time_to_response_start: Duration::from_millis(100),
+            payload_size: 5000,
+            payload_transfer_time: Duration::from_millis(50),
+        };
+        let mut history = Vec::new();
+        for _ in 0..10 {
+            let located = PeerKeyLocation::random();
+            history.push(event(&located, RouteOutcome::Failure));
+            history.push(event(&located, timed()));
+            history.push(event(&unlocated, RouteOutcome::Failure));
+            history.push(event(&unlocated, RouteOutcome::SuccessUntimed));
+            history.push(event(&unlocated, timed()));
+        }
+        let router = Router::new(&history);
+        assert_eq!(router.failure_estimator.len(), 20);
+        assert_eq!(router.response_start_time_estimator.len(), 10);
+        assert_eq!(router.transfer_rate_estimator.len(), 10);
+        assert_eq!(
+            router
+                .per_op_failure
+                .get(&OpType::Get)
+                .map(IsotonicEstimator::len),
+            Some(20)
         );
     }
 
