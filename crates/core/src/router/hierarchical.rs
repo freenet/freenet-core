@@ -3065,8 +3065,9 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 
     /// The forecast for `peer`, or for a peer the stage holds no record of,
     /// across distance `[0, 0.5]` on the stage's own scale, with band effects
-    /// and the contract term left out: `(distance, value, spread)` per sample. Empty until the stage
-    /// has a curve. For the dashboard's distance charts.
+    /// and the contract term left out: `(distance, value, spread)` per
+    /// sample. Empty until the stage has a curve. For the dashboard's distance
+    /// charts.
     pub(crate) fn peer_curve(
         &self,
         peer: Option<&K>,

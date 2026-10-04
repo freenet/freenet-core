@@ -5614,8 +5614,8 @@ mod tests {
 
     /// Timing and transfer non-regression gate against the isotonic fallback,
     /// in seconds, at the same a-priori 1.10 ratio as the failure gate. Until
-    /// #4485's removal this compared against the legacy blend (isotonic plus
-    /// Renegade); its last figures are in the removal PR.
+    /// #4485's removal (#5681) this compared against the legacy blend
+    /// (isotonic plus Renegade); its last figures are in #5681.
     #[test]
     fn hierarchical_timing_is_not_materially_worse_than_the_isotonic_fallback_in_seconds() {
         use recoverability::SEEDS;
@@ -5749,8 +5749,8 @@ mod tests {
     /// peer x contract TARGETED subset is printed but not gated: a +-0.02 band
     /// is diluted inside a 1/8-ring cell, which a band hierarchy cannot resolve,
     /// and asserting otherwise would assert a property the design does not
-    /// claim. Until #4485's removal this compared against the legacy blend
-    /// (isotonic plus Renegade); its last figures are in the removal PR.
+    /// claim. Until #4485's removal (#5681) this compared against the legacy
+    /// blend (isotonic plus Renegade); its last figures are in #5681.
     #[test]
     fn hierarchical_estimator_is_not_materially_worse_than_the_isotonic_fallback() {
         use recoverability::{Model, SEEDS};

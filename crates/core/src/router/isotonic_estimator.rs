@@ -559,7 +559,7 @@ impl IsotonicEstimator {
     /// Renegade predictor: in a perf profile about 22% of samples were under
     /// `PredictionStage::train` (renegade's `get_optimal_k`) and about 11% in
     /// its kNN sort, with no isotonic function above 3% (#5662). Renegade was
-    /// removed in #4485's removal PR, which re-measured `add_event` without it.
+    /// removed in #5681, which re-measured `add_event` without it.
     ///
     /// The figures this paragraph used to quote (~39µs per `add_event`, ~150µs
     /// per refit, from #4811) no longer reproduce on this build and have been
