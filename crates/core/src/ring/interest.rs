@@ -6639,6 +6639,39 @@ mod tests {
         ));
     }
 
+    /// #5781: a delivery that completes after our summary has moved on (a
+    /// different length from the one recorded) does not rewind our recorded
+    /// summary, so the cap stays sized from the current one.
+    #[test]
+    fn late_delivery_does_not_rewind_our_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let ours = StateSummary::from(vec![1u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        // An older, 2,000-byte summary of ours finishes delivering.
+        manager.upsert_peer_summary_from(
+            &contract,
+            &peer(2),
+            StateSummary::from(vec![2u8; 2_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        // Cap from our 1,000 bytes: 69,536. Held 3,000; a 68,000-byte summary
+        // would make 71,000. Rewound to 2,000 bytes the cap would be 73,536.
+        assert!(!manager.upsert_peer_summary(
+            &contract,
+            &peer(3),
+            StateSummary::from(vec![3u8; 68_000])
+        ));
+        assert_summary_tables_consistent(&manager);
+    }
+
     /// #5781: the cap trim chooses among equal-size summaries by their bytes,
     /// so every node and run drops the same one.
     #[test]

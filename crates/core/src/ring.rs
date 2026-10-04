@@ -8013,7 +8013,12 @@ mod k_closest_source_tests {
             production_source(),
             "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
         );
-        let code: String = body
+        // Only the loop body runs every tick; a recompute before the loop
+        // would run once at startup.
+        let (_, loop_body) = body
+            .split_once("loop {")
+            .expect("sweep_get_subscription_cache must have its tick loop");
+        let code: String = loop_body
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .flat_map(|line| line.chars())
@@ -9938,10 +9943,12 @@ mod cost_pressure_seam_tests {
     }
 
     /// #5781 review blocker, at the 64 MiB floor budget: identities acting
-    /// together, sending identical and distinct oversized summaries for
-    /// every hosted contract, cannot push the resident axis over budget, so
-    /// they cannot get any contract evicted. The per-contract cap does not
-    /// depend on who sent a summary.
+    /// together, sending identical and distinct oversized summaries for 600
+    /// hosted contracts, cannot push the resident axis over budget, so they
+    /// cannot get any contract evicted. 600 contracts at the 128 KiB
+    /// per-contract cap would be 75 MiB; the node-wide budget (a quarter of
+    /// the resident budget, enforced at write time) is what keeps the total
+    /// under 64 MiB, and the counter never exceeds it.
     #[tokio::test]
     async fn colluding_peers_flooding_summaries_cannot_push_hosting_over_budget() {
         use freenet_stdlib::prelude::StateSummary;
@@ -9952,34 +9959,48 @@ mod cost_pressure_seam_tests {
         hosting.configure_resident_overhead_mem_share(0.125);
         let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
         assert_eq!(budget, 64 * MIB);
+        let node_cap = budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR;
+        // What the sweep installs; installed here so the flood below is
+        // judged against the floor budget from the first write.
+        op_manager
+            .interest_manager
+            .set_neighbour_summary_budget(node_cap);
 
+        let im = &op_manager.interest_manager;
         let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
-        let hosted = 80u32;
+        let hosted = 600u32;
         let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
         for i in 0..hosted {
             let key = wiring_key(i);
             host_for_wiring(&op_manager, key);
             for (n, peer) in colluders.iter().enumerate() {
-                let im = &op_manager.interest_manager;
-                // 1 MiB each, identical across identities: refused.
+                // 1 MiB each, identical across identities: over the cap.
                 im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0u8; MIB as usize]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
                 // Distinct per identity, each under the cap but together over it.
                 im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
                 // Identical and exactly at the cap: stored once if it fits.
                 im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
             }
         }
+        assert!(
+            im.neighbour_summary_bytes() > 0,
+            "the flood was partly admitted"
+        );
+        let mut with_summaries = 0;
+        for i in 0..hosted {
+            let held = im.distinct_summary_bytes_for(&wiring_key(i));
+            assert!(held <= cap as u64, "contract {i} holds {held} bytes");
+            if held > 0 {
+                with_summaries += 1;
+            }
+        }
+        assert!(with_summaries > 0 && with_summaries < hosted);
 
         let _ = op_manager.ring.sweep_expired_hosting();
         let stats = hosting.hosting_cache_stats();
-        let records = u64::from(hosted) * colluders.len() as u64;
-        assert!(
-            stats.resident_overhead_bytes
-                <= u64::from(hosted) * (crate::ring::hosting::HOSTED_ENTRY_BYTES + cap as u64)
-                    + records * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES,
-            "each contract holds at most its cap: {} bytes charged",
-            stats.resident_overhead_bytes
-        );
         assert!(
             stats.resident_overhead_bytes <= budget,
             "the colluders pushed the resident axis to {} bytes against a {budget} budget",
