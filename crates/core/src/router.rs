@@ -5069,10 +5069,11 @@ mod tests {
         hierarchical_transfer_mse: f64,
         /// Events both transfer errors were scored on.
         transfer_scored: usize,
-        /// Events where the isotonic fallback had no positive speed estimate
-        /// (its additive per-peer EWMA drove it to zero), left out of BOTH
-        /// transfer errors. Leaving them out flatters the fallback, which is
-        /// the conservative direction for this gate.
+        /// Events where the isotonic fallback had no transfer-speed estimate,
+        /// left out of BOTH transfer errors. Leaving them out flatters the
+        /// fallback, which is the conservative direction for this gate. (A
+        /// speed the additive per-peer EWMA drives to zero no longer counts
+        /// here: routing floors it, and so does this comparison.)
         isotonic_speed_missing: usize,
     }
 
@@ -5084,12 +5085,21 @@ mod tests {
         const EVENTS: usize = 2_000;
         const WARMUP: usize = 300;
         const BYTES: f64 = 5_000.0;
+        // Routing's side must be the hierarchical estimator whatever
+        // FREENET_ROUTING_FALLBACK_ISOTONIC says, or with it set both sides
+        // are the isotonic estimate and the 1.10 ratio passes trivially. The
+        // isotonic side is read from `isotonic_timing_forecast` directly.
+        let _routing = force_isotonic_fallback(false);
         let _seed = GlobalRng::seed_guard(seed);
         let peers: Vec<PeerKeyLocation> = (0..PEERS).map(|_| PeerKeyLocation::random()).collect();
         let time_effect: Vec<f64> = (0..PEERS).map(|_| 0.5 * uniform_normal()).collect();
         let speed_effect: Vec<f64> = (0..PEERS).map(|_| 0.5 * uniform_normal()).collect();
         let (sd_time, sd_speed) = (0.6, 0.7);
-        let mut router = Router::new(&[]);
+        // A frozen clock: the hierarchical estimator's horizons otherwise read
+        // the host's wall clock, and the figures drift from run to run.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
         let mut acc = [0.0f64; 4];
         let (mut scored, mut transfer_scored, mut isotonic_speed_missing) =
             (0usize, 0usize, 0usize);
@@ -5184,7 +5194,7 @@ mod tests {
         eprintln!(
             "#4485 timing in seconds: response-time mse {ht:.6} vs isotonic {it:.6} (ratio {:.3}); \
              transfer-time mse {hx:.6} vs isotonic {ix:.6} (ratio {:.3}) over {transfer_scored} \
-             events, {missing} more where the isotonic fallback had no positive speed",
+             events, {missing} more where the isotonic fallback had no speed estimate",
             ht / it,
             hx / ix
         );
@@ -5218,9 +5228,17 @@ mod tests {
 
     fn head_to_head(model: recoverability::Model, seed: u64) -> HeadToHead {
         use recoverability::{RECOVERY_BUDGET_EVENTS, Scenario, WARMUP_EVENTS};
+        // As in `timing_head_to_head`: pin routing to the hierarchical
+        // estimator so the gate cannot compare the isotonic estimate with
+        // itself. The isotonic side is read from `isotonic_baseline` directly.
+        let _routing = force_isotonic_fallback(false);
         let _seed = GlobalRng::seed_guard(seed);
         let scenario = Scenario::new();
-        let mut router = Router::new(&[]);
+        // A frozen clock: the hierarchical estimator's horizons otherwise read
+        // the host's wall clock, and the figures drift from run to run.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
         let (mut isotonic, mut hierarchical, mut scored) = (0.0, 0.0, 0usize);
         let (mut t_isotonic, mut t_hierarchical, mut targeted) = (0.0, 0.0, 0usize);
         for index in 0..RECOVERY_BUDGET_EVENTS {
