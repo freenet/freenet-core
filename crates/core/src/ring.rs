@@ -2107,6 +2107,14 @@ impl Ring {
             snapshot.hosting_resident_overhead_bytes = Some(hosting.resident_overhead_bytes);
             snapshot.hosting_resident_overhead_evictions_total =
                 Some(hosting.resident_overhead_evictions_total);
+            snapshot.hosting_resident_overhead_evicted_bytes_total =
+                Some(hosting.resident_overhead_evicted_bytes_total);
+            // All neighbour-record bytes, hosted or not (#5647): compared with
+            // the hosted part of `hosting_resident_overhead_bytes`, the excess
+            // is what #5782's reconciliation has not yet freed.
+            snapshot.interest_resident_bytes_total = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.total_resident_bytes());
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -3932,9 +3940,9 @@ impl Ring {
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
-    /// Install the operator-configurable share of live host-wide surplus
-    /// memory the resident-overhead (count-derived) eviction budget may claim
-    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    /// Install the operator-configurable share of the node's memory limit
+    /// that hosted contracts may hold in RAM (`--hosting-mem-share`, #5333,
+    /// #5647). Called once at startup; the 60s sweep's recompute reads it.
     pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
         self.hosting_manager
             .configure_resident_overhead_mem_share(mem_share);
@@ -10605,9 +10613,11 @@ mod hosting_stats_mirror_source_tests {
     /// scrape below can only under-count (a declaration shape it cannot parse),
     /// and a floor set below the true count lets exactly that go unnoticed.
     /// Adding a field means bumping this deliberately AND mirroring the field.
-    // 18 since #5647 removed `contract_slot_budget` (no per-contract constant
-    // to divide by) and renamed the estimated field to `resident_overhead_bytes`.
-    const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 18;
+    // 19 since #5647: `contract_slot_budget` was removed (no per-contract
+    // constant to divide by), the estimated field was renamed
+    // `resident_overhead_bytes`, and `resident_overhead_evicted_bytes_total`
+    // was added.
+    const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
 
     fn production_source() -> &'static str {
         const FULL: &str = include_str!("ring.rs");
