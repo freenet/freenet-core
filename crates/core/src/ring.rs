@@ -3497,6 +3497,18 @@ impl Ring {
                 return;
             }
 
+            // Resident-overhead budget (#5325, #5647): the share of the node's
+            // memory limit hosted contracts may hold in RAM. Recomputed every
+            // tick so a cgroup limit changed at runtime is picked up, and
+            // BEFORE the sweep below, so the neighbour-summary budget it
+            // installs and the eviction it runs both use the current value.
+            // Falls back to 1 GiB in the rare case the RAM read itself fails.
+            let total_ram = crate::ring::hosting::total_ram_or_fallback(
+                crate::wasm_runtime::read_total_ram_bytes(),
+            );
+            ring.hosting_manager
+                .recompute_resident_overhead_budget(total_ram);
+
             // Sweep expired entries from GET subscription cache
             let crate::ring::hosting::HostingSweepResult {
                 expired,
@@ -3732,16 +3744,6 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
-
-            // Resident-overhead budget (#5325, #5647): the share of the node's
-            // memory limit hosted contracts may hold in RAM. Recomputed every
-            // tick so a cgroup limit changed at runtime is picked up. Falls
-            // back to 1 GiB in the rare case the RAM read itself fails.
-            let total_ram = crate::ring::hosting::total_ram_or_fallback(
-                crate::wasm_runtime::read_total_ram_bytes(),
-            );
-            ring.hosting_manager
-                .recompute_resident_overhead_budget(total_ram);
         }
     }
 
@@ -8033,10 +8035,18 @@ mod k_closest_source_tests {
             "crate::wasm_runtime::read_total_ram_bytes(),);",
             "ring.hosting_manager.recompute_resident_overhead_budget(total_ram);"
         );
+        let recompute_at = code.find(needle).unwrap_or_else(|| {
+            panic!(
+                "sweep_get_subscription_cache must read the memory limit and recompute \
+                 the resident budget each tick (#5647)"
+            )
+        });
+        let sweep_at = code
+            .find("ring.sweep_expired_get_subscriptions()")
+            .expect("the tick must run the hosting sweep");
         assert!(
-            code.contains(needle),
-            "sweep_get_subscription_cache must read the memory limit and recompute \
-             the resident budget each tick (#5647)"
+            recompute_at < sweep_at,
+            "the budget must be recomputed before the sweep uses it"
         );
     }
 

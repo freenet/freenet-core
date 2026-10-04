@@ -138,6 +138,12 @@ fn summary_over_bound(
         || peers.projected_node_neighbour_bytes(peer, bytes) > node_budget
 }
 
+/// Most repetitions of the per-peer share pass in one sweep (#5781). Each
+/// repetition that changes anything clears at least one summary, so this only
+/// bounds the work of an adversarial set of holders; whatever is left over is
+/// trimmed by the next sweep.
+const MAX_SHARE_PASSES: usize = 8;
+
 /// One summary charged to a peer: `(charge, allocation, contract)`. The
 /// `Weak` keeps the allocation's address from being reused while the share
 /// pass compares it, without keeping the bytes alive.
@@ -2704,55 +2710,72 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }
         }
 
-        // 2. Per peer.
-        let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<ChargedSummary>)> =
-            std::collections::HashMap::new();
-        for key in &keys {
-            if let Some(entry) = self.interested_peers.get(key) {
-                for (peer, charge, identity) in entry.charged_summaries() {
-                    let held = by_peer.entry(peer).or_default();
-                    held.0 = held.0.saturating_add(charge);
-                    held.1.push((charge, identity, *key));
+        // 2. Per peer. Clearing one holder of a shared summary moves its
+        // charge onto the remaining holders, who may then be over their own
+        // share, so the pass repeats with fresh charges until no peer is over
+        // (or `MAX_SHARE_PASSES`, after which the next sweep continues).
+        let mut peers_over: HashSet<PeerKey> = HashSet::new();
+        for _ in 0..MAX_SHARE_PASSES {
+            let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<ChargedSummary>)> =
+                std::collections::HashMap::new();
+            for key in &keys {
+                if let Some(entry) = self.interested_peers.get(key) {
+                    for (peer, charge, identity) in entry.charged_summaries() {
+                        let held = by_peer.entry(peer).or_default();
+                        held.0 = held.0.saturating_add(charge);
+                        held.1.push((charge, identity, *key));
+                    }
                 }
             }
+            let mut over: Vec<_> = by_peer
+                .into_iter()
+                .filter(|(_, (total, _))| *total > share_bytes)
+                .collect();
+            if over.is_empty() {
+                break;
+            }
+            over.sort_by(|a, b| a.0.0.as_bytes().cmp(b.0.0.as_bytes()));
+            let mut cleared_this_pass = 0;
+            for (peer, (total, held)) in over {
+                peers_over.insert(peer.clone());
+                let (cleared, bytes, total) =
+                    trim_peer_to_share(total, held, share_bytes, |contract, identity| {
+                        self.interested_peers
+                            .get_mut(contract)
+                            .is_some_and(|mut entry| {
+                                // Only the exact summary that was counted (the
+                                // same allocation); a newer one is judged on a
+                                // later pass.
+                                entry
+                                    .get(&peer)
+                                    .and_then(|r| r.summary())
+                                    .is_some_and(|s| std::ptr::eq(s, identity.as_ptr()))
+                                    && entry.clear_summary(
+                                        &peer,
+                                        SummaryMissingReason::ClearedOverSizeBound,
+                                        now,
+                                    )
+                            })
+                    });
+                cleared_this_pass += cleared;
+                trim.summaries_cleared += cleared;
+                trim.bytes_cleared = trim.bytes_cleared.saturating_add(bytes);
+                // debug!, not warn!: a peer that keeps resending would log
+                // every sweep. The counters below carry the signal in release
+                // builds.
+                tracing::debug!(
+                    peer = ?peer,
+                    share_bytes,
+                    held_after = total,
+                    "a peer held more neighbour-summary bytes than its share; dropped \
+                     its largest summaries (#5781)"
+                );
+            }
+            if cleared_this_pass == 0 {
+                break;
+            }
         }
-        let mut over: Vec<_> = by_peer
-            .into_iter()
-            .filter(|(_, (total, _))| *total > share_bytes)
-            .collect();
-        over.sort_by(|a, b| a.0.0.as_bytes().cmp(b.0.0.as_bytes()));
-        for (peer, (total, held)) in over {
-            trim.peers_over_share += 1;
-            let (cleared, bytes, total) =
-                trim_peer_to_share(total, held, share_bytes, |contract, identity| {
-                    self.interested_peers
-                        .get_mut(contract)
-                        .is_some_and(|mut entry| {
-                            // Only the exact summary that was counted (the same
-                            // allocation); a newer one is judged next pass.
-                            entry
-                                .get(&peer)
-                                .and_then(|r| r.summary())
-                                .is_some_and(|s| std::ptr::eq(s, identity.as_ptr()))
-                                && entry.clear_summary(
-                                    &peer,
-                                    SummaryMissingReason::ClearedOverSizeBound,
-                                    now,
-                                )
-                        })
-                });
-            trim.summaries_cleared += cleared;
-            trim.bytes_cleared = trim.bytes_cleared.saturating_add(bytes);
-            // debug!, not warn!: a peer that keeps resending would log every
-            // sweep. The counters below carry the signal in release builds.
-            tracing::debug!(
-                peer = ?peer,
-                share_bytes,
-                held_after = total,
-                "a peer held more neighbour-summary bytes than its share; dropped its \
-                 largest summaries (#5781)"
-            );
-        }
+        trim.peers_over_share = peers_over.len();
         // 3. Node-wide, over hosted contracts: what the hosting cache charges.
         let budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
         let mut hosted_counted: u64 = keys
@@ -2800,6 +2823,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.summary_bound_trimmed_bytes
             .fetch_add(trim.bytes_cleared, Ordering::Relaxed);
         trim
+    }
+
+    /// Record this node's own summary of `contract` for an existing record set
+    /// (#5781), so its summary cap is relative to it, when the caller computed
+    /// ours but has no peer summary to store. Creates nothing.
+    pub(crate) fn note_own_summary(&self, contract: &ContractKey, ours: &StateSummary<'_>) {
+        if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            entry.note_own_summary(ours.as_ref());
+        }
     }
 
     /// Install the node-wide neighbour-summary budget (#5781). `Ring` calls
@@ -6894,6 +6926,55 @@ mod tests {
         assert_eq!(trim, SummaryBoundTrim::default());
         assert!(manager.get_peer_summary(&hosted, &peer(1)).is_some());
         assert!(manager.get_peer_summary(&not_hosted, &peer(2)).is_some());
+    }
+
+    /// #5781 (Codex P2): dropping one holder of a shared summary moves its
+    /// whole charge onto the other holder; the share pass repeats so that
+    /// holder is not left over its share.
+    #[test]
+    fn share_pass_repeats_when_a_drop_shifts_a_charge() {
+        let (manager, _time) = make_manager();
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        let c1 = make_contract_key(1);
+        let c2 = make_contract_key(2);
+        let shared = vec![1u8; 120_000];
+        assert!(manager.upsert_peer_summary(&c1, &a, StateSummary::from(shared.clone())));
+        assert!(manager.upsert_peer_summary(&c1, &b, StateSummary::from(shared)));
+        assert!(manager.upsert_peer_summary(&c2, &a, StateSummary::from(vec![2u8; 10_000])));
+        // A is charged 60,000 + 10,000, B 60,000, against a 65,000 share. A
+        // drops its share of the 120,000-byte summary; B then holds it alone.
+        let trim = manager.enforce_summary_bounds(65_000, all_hosted);
+        assert_eq!(trim.peers_over_share, 2);
+        assert!(manager.get_peer_summary(&c1, &a).is_none());
+        assert!(
+            manager.get_peer_summary(&c1, &b).is_none(),
+            "B, now charged 120,000, must be trimmed in the same sweep"
+        );
+        assert!(manager.get_peer_summary(&c2, &a).is_some());
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781 (Codex P2): our own summary recorded without a peer summary to
+    /// store (a `Summaries` entry with none) still sizes the contract's cap.
+    #[test]
+    fn our_summary_recorded_without_a_peer_summary_sizes_the_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key(1);
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer,
+            StateSummary::from(vec![1u8; 100_000])
+        ));
+        // Ours is 1,000 bytes: cap 69,536.
+        manager.note_own_summary(&contract, &StateSummary::from(vec![2u8; 1_000]));
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(trim.contracts_over_cap, 1);
+        assert!(manager.get_peer_summary(&contract, &peer).is_none());
+        // Nothing is created for a contract without records.
+        manager.note_own_summary(&make_contract_key(9), &StateSummary::from(vec![0u8; 10]));
+        assert_eq!(manager.contracts_with_peer_records().len(), 1);
     }
 
     /// #5781: when our summary changes, the bytes that were ours become a

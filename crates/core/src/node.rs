@@ -4583,11 +4583,21 @@ async fn handle_interest_sync_message(
                                     our_summary.as_ref(),
                                 );
                             }
-                            None => op_manager.interest_manager.clear_peer_summary(
-                                &contract,
-                                &pk,
-                                crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
-                            ),
+                            None => {
+                                // Our summary, when we computed it, sizes the
+                                // contract's summary cap even if this peer sent
+                                // none (#5781).
+                                if let Some(ours) = our_summary.as_ref() {
+                                    op_manager
+                                        .interest_manager
+                                        .note_own_summary(&contract, ours);
+                                }
+                                op_manager.interest_manager.clear_peer_summary(
+                                    &contract,
+                                    &pk,
+                                    crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
+                                )
+                            }
                         }
 
                         if is_stale && !stale_contracts.contains(&contract) {
@@ -6465,6 +6475,11 @@ mod tests {
             body.contains("upsert_peer_summary_bounded(&contract,&pk,theirs,"),
             "Summaries arm must upsert a Some(summary) report (seeds untracked \
              co-hosts, #4952)"
+        );
+        assert!(
+            body.contains("ifletSome(ours)=our_summary.as_ref(){op_manager.interest_manager.note_own_summary(&contract,ours);}"),
+            "a Summaries entry without the peer's summary must still record our own \
+             summary when we computed it (#5781)"
         );
         assert!(
             !body.contains("update_peer_summary(&contract,&pk,Some"),
