@@ -1763,7 +1763,6 @@ dependencies = [
  "rand 0.9.3",
  "rand_core 0.10.1",
  "redb",
- "renegade-ml",
  "reqwest",
  "rpassword",
  "semver",
@@ -4710,15 +4709,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "renegade-ml"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84e211a18baa131a6fdbb95c6b785fbb8107203ea9e71a5f492a7bf43bd50d30"
-dependencies = [
- "pav_regression",
-]
 
 [[package]]
 name = "reqwest"
