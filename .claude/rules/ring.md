@@ -237,9 +237,29 @@ WHEN touching the router:
     regenerated once for #5702, see its module doc). Keep it green.
     Regenerate its golden files ONLY on a shipped or soaked build and for a
     change you can attribute number by number, never to make it pass.
-  → The one known divergence from that build: a timing stage holding 10-29
-    samples no longer blends Renegade into its isotonic fallback. Pinned by
-    a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
+  → The two known divergences from that build:
+    (1) a timing stage holding 10-29 samples no longer blends Renegade into
+        its isotonic fallback. Pinned by
+        a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
+    (2) the isotonic transfer-speed estimate routing uses is floored at
+        DEGENERATE_SPEED_FLOOR_BPS (1 B/s), a lower bound on EVERY estimate
+        (`raw.max(floor)`), where the reference build priced a zero estimate
+        at the f64::MAX/2 sentinel. The floor must stay ONE value for every
+        candidate: a floor relative to the curve at each candidate's own
+        distance reordered peers across distances (the curve falls with
+        distance, the additive per-peer adjustment does not), and one relative
+        to the curve's minimum tied real estimates because the curve
+        extrapolates toward zero. Pinned by
+        a_degenerate_isotonic_transfer_speed_is_floored and the
+        a_floored_transfer_speed_* ranking tests; golden_replay skips the
+        decisions it changes (golden/degenerate.txt).
+    Both act only while a timing stage has no hierarchical curve, which is
+    the window golden_replay does NOT compare. That window is not a startup
+    curiosity: the router is rebuilt empty on every restart, and timed
+    samples are about 4% of route events (payload transfers about 2%), so it
+    recurs after every restart and lasts a long time. A confirmation soak
+    must therefore include decisions made soon after a node restart, not only
+    a long-running node.
   → Routing-behaviour guards cover BOTH paths through Training: History (a
     history-built router never feeds the hierarchical estimator, so it routes
     on the isotonic fallback) and WarmHierarchical (trained through add_event
