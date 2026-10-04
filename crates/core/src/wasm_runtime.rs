@@ -62,6 +62,8 @@ impl SharedStores {
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
+#[cfg(test)]
+pub(crate) use module_cache::combine_ram_limits;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,

@@ -240,10 +240,17 @@ pub const DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE: f64 = 0.125;
 /// value only; `super::HostingManager::recompute_resident_overhead_budget`
 /// installs the configured share on the periodic sweep.
 pub fn default_resident_overhead_budget_bytes() -> u64 {
-    let total_ram = read_total_ram_bytes()
-        .map(|v| v as u64)
-        .unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
-    resident_overhead_budget_for(total_ram, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE)
+    resident_overhead_budget_for(
+        total_ram_or_fallback(read_total_ram_bytes()),
+        DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+    )
+}
+
+/// The memory limit the resident budget is sized from: what
+/// `read_total_ram_bytes` reported, or [`FALLBACK_TOTAL_RAM_BYTES`] (1 GiB)
+/// if it could not read anything.
+pub(crate) fn total_ram_or_fallback(read: Option<usize>) -> u64 {
+    read.map(|v| v as u64).unwrap_or(FALLBACK_TOTAL_RAM_BYTES)
 }
 
 /// Resident-overhead budget for a node whose memory limit is `total_ram`:
@@ -4881,16 +4888,6 @@ mod tests {
             cache.stats().resident_overhead_bytes,
             3 * (HOSTED_ENTRY_BYTES + per_contract)
         );
-    }
-
-    /// The measured per-entry charge is what bounds a hosted set of contracts
-    /// with tiny state and no neighbour summaries (#5647 re-review): at the
-    /// default share of a 2 GiB limit, 32,768 of them fit, a finite bound well
-    /// above the 508 the old flat 1 MiB estimate allowed.
-    #[test]
-    fn per_entry_charge_bounds_tiny_contracts_on_a_2_gib_node() {
-        let budget = resident_overhead_budget_for(2 * GIB, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
-        assert_eq!(budget / HOSTED_ENTRY_BYTES, 32_768);
     }
 
     /// Without a provider (unit tests, or before the op manager attaches) the

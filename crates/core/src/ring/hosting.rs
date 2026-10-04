@@ -70,6 +70,7 @@ pub(crate) use cache::budget_for_ram as hosting_budget_for_ram;
 /// the operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
+pub(crate) use cache::total_ram_or_fallback;
 pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
 /// Cost-pressure eviction inputs + day-one calibration constants (cost-aware
 /// eviction, #4861). Re-exported so `Ring` (which reads the topology meter)
@@ -8090,6 +8091,81 @@ mod tests {
             manager.recompute_resident_overhead_budget(total_ram),
             installed
         );
+    }
+
+    /// End to end from the memory limit to how many contracts a node keeps
+    /// (#5647): a 2 GiB limit installs a 256 MiB budget at the default share,
+    /// and contracts with tiny state and no neighbour summaries are then kept
+    /// up to the measured 8 KiB per-entry charge, 32,768 of them. The
+    /// per-entry charge is the only thing bounding this case, so a smaller one
+    /// lets more stay and a larger one fewer.
+    #[test]
+    fn memory_limit_sets_how_many_tiny_contracts_are_kept() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(GIB, std::sync::Arc::new(clock.clone()));
+        manager.configure_resident_overhead_mem_share(cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
+        let installed = manager.recompute_resident_overhead_budget(2 * GIB);
+        assert_eq!(installed, 256 * 1024 * 1024);
+
+        let kept = (installed / cache::HOSTED_ENTRY_BYTES) as u32;
+        assert_eq!(kept, 32_768);
+        for i in 0..kept + 40 {
+            manager.record_contract_access(
+                make_key_u32(i),
+                1,
+                AccessType::Put,
+                HostingCause::Other,
+            );
+        }
+        // Over budget, but not yet for the sustained window: nothing goes.
+        let _ = manager.sweep_expired_hosting();
+        assert_eq!(manager.hosting_contracts_count(), kept as usize + 40);
+        clock.advance_time(cache::RESIDENT_OVERHEAD_SUSTAINED_WINDOW);
+        let _ = manager.sweep_expired_hosting();
+        assert_eq!(manager.hosting_contracts_count(), kept as usize);
+    }
+
+    /// On a host with no cgroup memory limit the budget comes from physical
+    /// RAM, and if no memory figure can be read at all it falls back to a
+    /// 1 GiB limit (#5647).
+    #[test]
+    fn uncapped_and_unreadable_memory_limits_size_the_budget() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        use crate::wasm_runtime::combine_ram_limits;
+        let share = cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE;
+        // No cgroup limit: physical RAM (16 GiB) sets a 2 GiB budget.
+        let uncapped = total_ram_or_fallback(combine_ram_limits(Some(16 * GIB), None));
+        assert_eq!(uncapped, 16 * GIB as u64);
+        assert_eq!(
+            cache::resident_overhead_budget_for(uncapped, share),
+            2 * GIB as u64
+        );
+        // A cgroup limit below physical RAM wins.
+        assert_eq!(
+            combine_ram_limits(Some(16 * GIB), Some(2 * GIB)),
+            Some(2 * GIB)
+        );
+        // Nothing readable: 1 GiB, so a 128 MiB budget.
+        let unreadable = total_ram_or_fallback(combine_ram_limits(None, None));
+        assert_eq!(unreadable, GIB as u64);
+        assert_eq!(
+            cache::resident_overhead_budget_for(unreadable, share),
+            128 * 1024 * 1024
+        );
+    }
+
+    /// `--hosting-mem-share` above one half draws a startup warning (#5647):
+    /// the share now applies to the whole memory limit, so a value persisted
+    /// from the old meaning can hand hosting most of the node's memory.
+    #[test]
+    fn hosting_mem_share_above_half_is_flagged() {
+        assert!(!mem_share_leaves_little_for_the_rest(
+            cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
+        ));
+        assert!(!mem_share_leaves_little_for_the_rest(0.5));
+        assert!(mem_share_leaves_little_for_the_rest(0.51));
+        assert!(mem_share_leaves_little_for_the_rest(1.0));
     }
 
     /// The interest-bytes provider installed through the manager (what

@@ -1234,6 +1234,19 @@ pub(crate) fn budget_for_ram(total_ram: usize) -> usize {
 /// `node::resource_metrics`) and — later — the capability-relative hosting
 /// budget (piece A2). Keeping a single source avoids two drifting notions of
 /// "how much memory does this node have". See `docs/design/hosting-eviction.md`.
+/// The node's memory limit from physical RAM and the cgroup limit, either of
+/// which may be unreadable: the smaller of the two, or whichever exists. With
+/// no cgroup limit (an uncapped host) this is physical RAM.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn combine_ram_limits(phys: Option<usize>, cgroup: Option<usize>) -> Option<usize> {
+    match (phys, cgroup) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
 pub(crate) fn read_total_ram_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -1241,12 +1254,7 @@ pub(crate) fn read_total_ram_bytes() -> Option<usize> {
         // Clamp to the cgroup limit when one applies. If we can read physical
         // RAM, take the min; if not, fall back to the cgroup limit alone (a
         // container with no readable /proc/meminfo still gets a sane bound).
-        match (phys, read_cgroup_memory_limit_bytes()) {
-            (Some(p), Some(c)) => Some(p.min(c)),
-            (Some(p), None) => Some(p),
-            (None, Some(c)) => Some(c),
-            (None, None) => None,
-        }
+        combine_ram_limits(phys, read_cgroup_memory_limit_bytes())
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
