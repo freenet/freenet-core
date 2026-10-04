@@ -1185,6 +1185,14 @@ pub(crate) struct RouterSnapshotInfo {
     /// targets `E[bytes / V]` while the isotonic one estimates `bytes / E[V]`,
     /// so wherever speeds vary the hierarchical model is favoured by Jensen's
     /// inequality, and the one-sided clip (above) compounds that.
+    ///
+    /// POPULATION CHANGE at the release carrying #5681: an event whose
+    /// isotonic speed estimate was zero used to be dropped from BOTH models'
+    /// scoring; it is now scored at `DEGENERATE_SPEED_FLOOR_BPS`, i.e. a
+    /// transfer time of `bytes / 1e-6`, whose error the clip bounds at
+    /// `10 x` the actual time. So the isotonic figure can read worse than an
+    /// earlier release's on the same traffic, and the hierarchical one now
+    /// includes those events too.
     #[serde(default)]
     pub transfer_time_rmse_secs_isotonic: Option<f64>,
     #[serde(default)]
