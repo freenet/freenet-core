@@ -106,6 +106,14 @@ MARKER_PARSE_FAIL='Startup update check: failed to parse'
 MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build
 MARKER_DISABLED='Auto-update is DISABLED'
+# update/staged.rs -- #5790: before exiting 42 the node downloads the release,
+# so `freenet update` only installs it. Both INFO. A previous release that logs
+# STARTED stages, and from then on Gate B requires DONE: a staging that silently
+# fails falls back to downloading inside systemd's TimeoutStopSec, which is the
+# #5790 restart loop on a slow link -- and CI's fast network would never show it.
+# Self-arming on STARTED, so releases that predate staging pass unchanged.
+MARKER_STAGE_STARTED='Downloading the update before exiting'
+MARKER_STAGE_DONE='Update downloaded and verified'
 # freenet.rs -- detection succeeded and an update was requested. There are
 # FIVE such sites and one REFUSAL that shares the phrase:
 # Cited by PHRASE, never by line number. The six that were here were all low
@@ -1093,7 +1101,7 @@ run_node_until_check() {
       # assertion -- the canary would report "no update requested" for a node
       # that requested one. Let it finish.
       if node_decided_to_update "$work/logs"; then
-        # Clamped by `deadline` as well as by its own 60s budget. Every other
+        # Clamped by `deadline` as well as by its own settle budget. Every other
         # wait in this loop honours the outer ceiling; this was the one arm that
         # ignored it, so CANARY_TIMEOUT_SECS could be overrun by up to a minute.
         # It was bounded in practice only because the node dies at its own
@@ -1102,8 +1110,9 @@ run_node_until_check() {
         #
         # 180s, not 60s: since #5790 the node downloads and verifies the release
         # (~40 MB) BEFORE it exits 42, so the time from "triggering auto-update"
-        # to the exit now includes that download. Killing it mid-download would
-        # read as "no update requested".
+        # to the exit now includes that download. Gate B names a node killed
+        # mid-download as such (MARKER_STAGE_STARTED) rather than as one that
+        # never asked to update.
         local settle_deadline=$(( $(date +%s) + 180 ))
         [ "$settle_deadline" -gt "$deadline" ] && settle_deadline="$deadline"
         while kill -0 "$node_pid" 2>/dev/null && [ "$(date +%s)" -lt "$settle_deadline" ]; do
@@ -2012,8 +2021,27 @@ cmd_selfupdate() {
   fi
 
   if [ "$NODE_EXIT" != "42" ]; then
+    if log_has "$work/logs" "$MARKER_STAGE_STARTED" && ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
+      fail "v$prev_version decided to update and was still downloading v$expected_version in advance (#5790) when the canary's deadline stopped it (exit $NODE_EXIT). That is a slow or failing GitHub asset download on this runner, not a node that refused to update; re-run the job."
+      return 1
+    fi
     fail "expected the node to exit 42 (update requested) but it exited $NODE_EXIT. The supervisor contract is what applies the update; without exit 42 the fleet never restarts onto the new binary."
     return 1
+  fi
+
+  # #5790: a previous release that stages must stage SUCCESSFULLY. A failed
+  # staging still exits 42 and the installer below still works here, on a fast
+  # runner -- so without this, a broken staging path ships green and every
+  # slow-link node is back in the TimeoutStopSec restart loop.
+  if log_has "$work/logs" "$MARKER_STAGE_STARTED"; then
+    if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
+      fail "v$prev_version started downloading v$expected_version before exiting 42 (#5790) but never finished: the installer will download it inside systemd's TimeoutStopSec instead, which loops on slow links. The node's staging lines follow."
+      log_lines "$work/logs" "the update in advance" | head -5 >&2
+      return 1
+    fi
+    log "OK: v$prev_version downloaded and verified v$expected_version before exiting 42 (#5790)."
+  else
+    note "NOTE: v$prev_version predates downloading updates before exit (#5790), so Gate B's staging check is skipped. It arms itself once the previous release stages; no action needed."
   fi
 
   # The supervisor half of the contract, exactly as the systemd unit does it:

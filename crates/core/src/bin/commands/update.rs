@@ -11,7 +11,7 @@ use std::process::Command;
 use super::rollback;
 
 mod staged;
-pub(crate) use staged::stage_latest_release;
+pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
 
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
@@ -682,25 +682,25 @@ impl UpdateCommand {
         // signature and checksum checks as a download, and returns `None`
         // (falling back to downloading) for anything missing or wrong.
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-        let (checksums, freenet_archive_path, staged_fdev) = match staged::load(release, self.quiet)
-        {
-            Some(staged) => {
-                if !self.quiet {
-                    println!("Using the update downloaded in advance.");
+        let (checksums, freenet_archive_path, staged_fdev) =
+            match staged::load(release, self.quiet).await {
+                Some(staged) => {
+                    if !self.quiet {
+                        println!("Using the update downloaded in advance.");
+                    }
+                    (
+                        Some(staged.checksums),
+                        staged.freenet_archive,
+                        staged.fdev_archive,
+                    )
                 }
-                (
-                    Some(staged.checksums),
-                    staged.freenet_archive,
-                    staged.fdev_archive,
-                )
-            }
-            None => {
-                let checksums = self.download_and_verify_checksums(release).await?;
-                let path = temp_dir.path().join(&freenet_asset_name);
-                download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
-                (checksums, path, None)
-            }
-        };
+                None => {
+                    let checksums = self.download_and_verify_checksums(release).await?;
+                    let path = temp_dir.path().join(&freenet_asset_name);
+                    download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
+                    (checksums, path, None)
+                }
+            };
 
         // Fail-closed checksum gate. A missing manifest, a missing entry
         // for our asset, or a hash mismatch all REFUSE the install. This
@@ -813,9 +813,23 @@ impl UpdateCommand {
             );
         }
 
+        // Check if service file needs updating (for users who installed before v0.1.75).
+        // Before fdev (#5790): fdev may still need a download, and under
+        // systemd's `TimeoutStopSec` a slow one can be killed; the unit refresh
+        // must not depend on it finishing.
+        if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
+            if !self.quiet {
+                eprintln!(
+                    "Warning: Failed to update service file: {}. \
+                     Run 'freenet service install' to update manually.",
+                    e
+                );
+            }
+        }
+
         // Download and install fdev alongside freenet.
         // All fdev failures are non-fatal — a failed fdev update must never
-        // prevent the service file update or service restart that follows.
+        // prevent the service restart that follows.
         if let Some(fdev_asset) = fdev_asset {
             if !self.quiet {
                 println!("Downloading fdev...");
@@ -831,17 +845,6 @@ impl UpdateCommand {
             .await;
         } else if !self.quiet {
             eprintln!("Warning: fdev not found in release assets. Skipping fdev update.");
-        }
-
-        // Check if service file needs updating (for users who installed before v0.1.75)
-        if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
-            if !self.quiet {
-                eprintln!(
-                    "Warning: Failed to update service file: {}. \
-                     Run 'freenet service install' to update manually.",
-                    e
-                );
-            }
         }
 
         // Automatically restart service if running
@@ -1454,6 +1457,14 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
 /// where an asset may legitimately be absent, such as `SHA256SUMS.txt.sig`
 /// when downloading by URL without the release's asset list (#5790).
 async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
+    download_optional_bytes_within(url, MANIFEST_DOWNLOAD_TIMEOUT).await
+}
+
+/// [`download_optional_bytes`] with a caller-chosen total deadline.
+async fn download_optional_bytes_within(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<Vec<u8>>> {
     // Generous vs. any real manifest (a few hundred bytes) or signature (64
     // bytes), small enough to bound memory.
     const MAX_ASSET_BYTES: usize = 4 * 1024 * 1024;
@@ -1466,7 +1477,7 @@ async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
         // transfer to protect. Unbounded, a half-open connection would hang until
         // systemd SIGKILLs the post-stop updater — the exact hazard the sibling
         // timeout on the asset-list fetch was added to prevent.
-        .timeout(MANIFEST_DOWNLOAD_TIMEOUT)
+        .timeout(timeout)
         .build()?;
 
     let response = client
@@ -1475,6 +1486,12 @@ async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
         .await
         .context("Failed to download release asset")?;
 
+    // Typed, so a caller that retries (#5790's staging) can stop instead of
+    // knocking on a limit. Not recorded as a cooldown here: that is the
+    // caller's decision, and tests must not write the real state directory.
+    if super::auto_update::is_rate_limited_status(response.status()) {
+        return Err(rate_limited(&response).into());
+    }
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1500,6 +1517,19 @@ async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
         buf.extend_from_slice(&chunk);
     }
     Ok(Some(buf))
+}
+
+/// The rate limit a `403`/`429` response carries, with any wait it asked for.
+fn rate_limited(response: &reqwest::Response) -> super::auto_update::GithubRateLimitedError {
+    super::auto_update::GithubRateLimitedError {
+        retry_after: super::auto_update::parse_retry_after(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        }),
+    }
 }
 
 /// Authenticate the raw bytes of `SHA256SUMS.txt` against the baked-in

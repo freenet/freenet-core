@@ -523,6 +523,10 @@ async fn run_network_node_with_signals(
             return;
         }
 
+        // A release staged for an update this binary already is (#5790) has
+        // served its purpose, however the update was applied.
+        commands::update::discard_stale_staged(build_info::VERSION);
+
         // --- Startup update check (#3864) ---
         //
         // Ask GitHub directly, once at boot, whether a newer release exists.
@@ -2795,6 +2799,9 @@ mod tests {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with("#["))
             .collect();
+        // Every send, in whatever form, so a trigger spelled differently from
+        // the `let _ =` form cannot slip past the check below.
+        let all_sends = production.matches(concat!("update_tx", ".send(")).count();
         let mut sends = 0;
         for (i, stmt) in statements.iter().enumerate() {
             if stmt.starts_with(concat!("let _ = update_tx", ".send(")) {
@@ -2809,6 +2816,10 @@ mod tests {
         assert_eq!(
             sends, 7,
             "expected the 7 update trigger sites in freenet.rs"
+        );
+        assert_eq!(
+            all_sends, sends,
+            "every send on update_tx must use the checked `let _ =` trigger form"
         );
     }
 

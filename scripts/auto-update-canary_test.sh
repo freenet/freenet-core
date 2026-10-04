@@ -2546,6 +2546,26 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# The #5790 staging markers, pinned to their emitting `tracing::info!` calls in
+# update/staged.rs (whitespace stripped, so a rustfmt reflow cannot disarm it).
+# Gate B self-arms on STARTED and then requires DONE; rewording either in the
+# source would silently disarm it (STARTED) or fail every release (DONE). INFO
+# for the usual reason: release builds compile out anything below.
+STAGED_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/update/staged.rs"
+staged_flat="$(tr -d '[:space:]' < "$STAGED_SRC" 2>/dev/null)"
+for pin in \
+    "tracing::info!(tag=%tag,\"${MARKER_STAGE_STARTED//[[:space:]]/}" \
+    "elapsed_secs=started.elapsed().as_secs(),\"${MARKER_STAGE_DONE//[[:space:]]/}"; do
+    if [[ "$staged_flat" == *"$pin"* ]]; then
+        echo "ok   - source pin: staging marker emitted at INFO: ${pin%%,*}..."
+    else
+        echo "FAIL - source pin: update/staged.rs no longer emits '$pin' (whitespace stripped)." >&2
+        echo "       Gate B's #5790 staging check greps the node log for MARKER_STAGE_STARTED and" >&2
+        echo "       MARKER_STAGE_DONE; change the markers in auto-update-canary.sh together with the source." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
 # --- the trigger-site ENUMERATION -------------------------------------------
 # `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
 # missed the urgent one ("triggering IMMEDIATE auto-update") for as long as that
