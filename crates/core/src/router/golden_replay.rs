@@ -62,8 +62,12 @@
 //! unroutable transfer cost. This build floors that estimate. The decisions
 //! where the reference build did this OUTSIDE the cold window are listed in
 //! `golden/degenerate.txt`, derived from its decision trace, and skipped here;
-//! every other decision must still match. So the floor cannot reach any
-//! decision beyond the listed ones without this test failing.
+//! every other decision must still match. So, OUTSIDE the skipped cold window
+//! (`W`), the floor cannot reach any decision beyond the listed ones without
+//! this test failing. Inside the window nothing here compares it; there the
+//! floor is pinned by the unit tests in `router.rs`
+//! (`a_degenerate_isotonic_transfer_speed_is_floored` and the
+//! `a_floored_transfer_speed_*` ranking tests).
 //!
 //! The floor is 1 B/s, a lower bound on every isotonic estimate, so it would
 //! also lift a positive estimate below 1 B/s; none occurs in these scenarios.
