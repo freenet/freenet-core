@@ -2648,11 +2648,13 @@ impl Router {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
         }
-        // Only the model routing acts on: the candidate log also computes the
-        // other one for every candidate, and counting that would read as
-        // routing on both.
+        // The test-only counters below count only the model routing acts on:
+        // the candidate log also computes the other one for every candidate,
+        // and counting that would read as routing on both.
         #[cfg(test)]
-        if use_hierarchical != isotonic_fallback_enabled() {
+        let acting = use_hierarchical != isotonic_fallback_enabled();
+        #[cfg(test)]
+        if acting {
             self.predictions_by_model[usize::from(use_hierarchical)]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2705,9 +2707,10 @@ impl Router {
             .filter(|v| v.is_finite() && *v > 0.0);
 
         #[cfg(test)]
-        if hierarchical_failure.is_none()
-            || (hierarchical_time.is_none() && time_estimate.is_some())
-            || (hierarchical_speed.is_none() && transfer_estimate.is_some())
+        if acting
+            && (hierarchical_failure.is_none()
+                || (hierarchical_time.is_none() && time_estimate.is_some())
+                || (hierarchical_speed.is_none() && transfer_estimate.is_some()))
         {
             FALLBACK_STAGE_EVALUATIONS.with(|count| count.set(count.get() + 1));
         }
@@ -5221,6 +5224,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `FALLBACK_STAGE_EVALUATIONS` counts only the acting model's
+    /// predictions, like `predictions_by_model`: the candidate log computes
+    /// the isotonic fallback for every candidate as the non-acting model, and
+    /// counting that would make a warm hierarchical router look as if it had
+    /// fallen back.
+    #[test]
+    fn fallback_stage_evaluations_ignore_the_candidate_logs_other_model() {
+        let _seed = GlobalRng::seed_guard(0x4485_FA11);
+        let _routing = force_isotonic_fallback(false);
+        let mut router = Router::new(&[]);
+        // Untimed traffic: the failure stage is warm and no timing stage has
+        // an isotonic estimate to fall back to, so the acting (hierarchical)
+        // model falls back on nothing.
+        add_relay_recorded_successes(&mut router, 60);
+        let candidates: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+        let before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+        let (_, _, captured) = router.select_k_best_peers_capturing(
+            candidates.iter(),
+            Location::new(0.3),
+            candidates.len(),
+            true,
+        );
+        let captured = captured.expect("a prediction-based decision is captured");
+        assert!(
+            captured
+                .candidates
+                .iter()
+                .any(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+            "the capture must have computed both models, or this is vacuous"
+        );
+        assert_eq!(
+            FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - before,
+            0,
+            "the non-acting isotonic predictions must not count as fallbacks"
+        );
     }
 
     /// Whether any candidate in a replayed decision prices its transfer as
