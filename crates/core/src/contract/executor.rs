@@ -1394,15 +1394,11 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
 /// safety on a >32 GiB host is guarded separately by
 /// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
 ///
-/// Promoted from a `#[cfg(test)]`-only helper (originally written purely to
-/// verify [`cache_byte_budgets_are_aggregate_safe`] below) to a real
-/// production function (#5333 review): the resident-overhead hosting budget
-/// (`ring::hosting::cache::resident_overhead_budget_for`) needs the SAME
-/// real figure — what every OTHER memory consumer has already declared — to
-/// derive its own budget as a residual rather than an independently-clamped
-/// guess. Using this one function in both places means the aggregate-safety
-/// test now checks the ACTUAL formula the resident-overhead budget composes
-/// against, not a second, potentially-drifting re-derivation of it.
+/// Test-only again since #5647. #5333 promoted it to production so the
+/// resident-overhead hosting budget could be derived as a residual of it; that
+/// budget is now its own share of the memory limit, so this sum is used only
+/// by the aggregate-safety tests, which keep every declared cache in one place.
+#[cfg(test)]
 pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
     // PER-EXECUTOR — multiplied by the pool.
     let summary = summary_budget_for(memory_limit, pool_size);

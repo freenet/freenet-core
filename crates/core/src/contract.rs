@@ -28,11 +28,12 @@ mod state_size_metrics;
 pub mod storages;
 pub(crate) mod user_input;
 
+#[cfg(test)]
+pub(crate) use executor::declared_cache_ceiling;
 pub(crate) use executor::{
     ContractExecutor, ExecutorTransactionStream, ExportBusy, MAX_CREATED_DELEGATES_PER_NODE,
     MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL,
-    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, declared_cache_ceiling,
-    mock_runtime::MockRuntime,
+    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, mock_runtime::MockRuntime,
 };
 
 // Re-export CRDT emulation functions for testing

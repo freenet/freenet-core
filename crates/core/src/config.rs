@@ -181,17 +181,17 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
 
-    /// Fraction (0.0 to 1.0) of spare host memory (this process's resident size
-    /// plus the memory the system reports as available) that the
-    /// resident-overhead budget may claim on top of what it already uses. That
-    /// budget limits how far an otherwise idle host grows the number of
-    /// contracts it hosts, so Freenet does not dominate the process list on a
-    /// machine with plenty of free memory. It is a separate axis from
-    /// `--max-hosting-storage`, which bounds state bytes. Default: 0.125.
-    // Internal (#5333): applies to the resident-overhead (count-derived)
-    // eviction budget, and never shrinks it below the host's already-declared
-    // static caches. The 1/8 default matches qBittorrent's disk-cache "auto"
-    // default and this codebase's own pre-existing `/8` convention.
+    /// Fraction (0.0 to 1.0) of this node's memory limit that hosted contracts
+    /// may hold in RAM (mainly the summaries neighbours send so the node can
+    /// keep each hosted contract up to date). The limit is physical RAM, or a
+    /// smaller cgroup / systemd `MemoryMax` limit when one applies; the budget
+    /// is never below 64 MiB. Past it, the node stops hosting its
+    /// least-demanded contracts. A separate axis from `--max-hosting-storage`,
+    /// which bounds state bytes on disk. Default: 0.125.
+    // Internal (#5647): before #5647 this was a share of LIVE spare memory added
+    // to current RSS, applied to a count-based estimate; a persisted
+    // non-default value now means a share of the whole limit. The 1/8 default
+    // matches this codebase's other RAM-scaled budgets.
     #[arg(long, env = "HOSTING_MEM_SHARE")]
     pub hosting_mem_share: Option<f64>,
 
@@ -1782,10 +1782,9 @@ pub struct Config {
     /// operator override survives a flag-less restart.
     #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
     pub max_hosting_disk: u64,
-    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory the resident-
-    /// overhead (count-derived) eviction budget may claim on top of its own
-    /// RSS (#5333). Default 0.125 (1/8). Persisted so an operator override
-    /// survives a flag-less restart.
+    /// Fraction (0.0-1.0) of the node's memory limit (cgroup-aware) that hosted
+    /// contracts may hold in RAM (#5647). Default 0.125 (1/8). Persisted so an
+    /// operator override survives a flag-less restart.
     #[serde(default = "default_hosting_mem_share", rename = "hosting-mem-share")]
     pub hosting_mem_share: f64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
@@ -1985,8 +1984,8 @@ fn default_max_hosting_disk() -> u64 {
     crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
 }
 
-/// Default fraction of live host-wide surplus memory the resident-overhead
-/// eviction budget may claim (#5333): resolves to
+/// Default fraction of the node's memory limit that hosted contracts may hold
+/// in RAM (#5647): resolves to
 /// [`crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`] (0.125), the single
 /// source of truth shared with the sizing math.
 fn default_hosting_mem_share() -> f64 {

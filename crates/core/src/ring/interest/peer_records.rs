@@ -26,12 +26,15 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use freenet_stdlib::prelude::StateSummary;
 use tokio::time::Instant;
 
-use super::{INTEREST_TTL, NeverPopulatedOrigin, PeerKey, SummaryMissingReason};
+use super::{
+    INTEREST_TTL, NeverPopulatedOrigin, PeerKey, SummaryMissingReason, contract_summary_cap,
+};
 
 /// Tracking information for a peer's interest in a specific contract.
 #[derive(Clone, Debug)]
@@ -151,6 +154,25 @@ pub(super) struct ContractPeers {
     /// Distinct summary bytes held by `peers`, each with the number of records
     /// holding it. Never contains a zero count.
     summaries: HashMap<InternedBytes, Slot>,
+    /// Length of this node's own summary of the contract, as last seen by a
+    /// path that had it (#5647, #5781). Sizes [`Self::summary_cap`]. Lives
+    /// here so it goes with the contract's records and needs no cleanup.
+    own_len: Option<usize>,
+    /// The allocation holding this node's own summary bytes, when a record
+    /// holds them (a neighbour that is in sync with us). Such a summary costs
+    /// nothing a neighbour caused: the per-peer share does not charge it, and
+    /// the cap never drops it. A `Weak` keeps the allocation's address from
+    /// being reused while it is compared, without keeping the bytes alive.
+    own_shared: Weak<StateSummary<'static>>,
+    /// Node-wide count of distinct neighbour-summary bytes, shared by every
+    /// contract's records (#5781): this contract adds [`Self::counted`] to
+    /// it. Read by the write-time node-wide budget check.
+    counter: Arc<AtomicU64>,
+    /// This contract's contribution to `counter`: its distinct summary bytes
+    /// other than the allocation holding our own summary. Kept exact by
+    /// [`Self::resync_neighbour_bytes`] after every change, and subtracted
+    /// when the records are dropped.
+    counted: u64,
     /// Calls to `acquire` and `release`, so tests can tell the same-bytes
     /// early returns apart from an acquire/release pair that nets to zero.
     #[cfg(test)]
@@ -172,7 +194,79 @@ impl Deref for ContractPeers {
     }
 }
 
+impl Drop for ContractPeers {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.counted, Ordering::Relaxed);
+    }
+}
+
 impl ContractPeers {
+    /// Empty records for a contract, contributing to the node-wide
+    /// neighbour-summary counter `counter` (#5781).
+    pub(super) fn with_counter(counter: Arc<AtomicU64>) -> Self {
+        let mut peers = Self::default();
+        peers.counter = counter;
+        peers
+    }
+
+    /// This contract's current contribution to the node-wide counter.
+    pub(super) fn counted_bytes(&self) -> u64 {
+        self.counted
+    }
+
+    /// Distinct summary bytes other than our own summary's allocation.
+    pub(super) fn neighbour_bytes(&self) -> u64 {
+        self.summaries
+            .values()
+            .filter(|slot| !self.is_own(&slot.shared))
+            .map(|slot| slot.shared.as_ref().as_ref().len() as u64)
+            .sum()
+    }
+
+    /// Bring this contract's contribution to the node-wide counter up to date
+    /// after a change (#5781). O(distinct summaries).
+    fn resync_neighbour_bytes(&mut self) {
+        let now = self.neighbour_bytes();
+        if now >= self.counted {
+            self.counter
+                .fetch_add(now - self.counted, Ordering::Relaxed);
+        } else {
+            self.counter
+                .fetch_sub(self.counted - now, Ordering::Relaxed);
+        }
+        self.counted = now;
+    }
+
+    /// Whether these exact bytes are already stored for this contract.
+    /// Storing them again adds nothing, so no bound ever refuses them.
+    pub(super) fn holds_bytes(&self, bytes: &[u8]) -> bool {
+        self.summaries.contains_key(bytes)
+    }
+
+    /// The node-wide neighbour-summary bytes if `peer`'s summary became
+    /// `bytes`, which are not already held here (#5781): the current count,
+    /// plus the new bytes, minus `peer`'s current summary if only it holds it
+    /// and it is not our own.
+    pub(super) fn projected_node_neighbour_bytes(&self, peer: &PeerKey, bytes: &[u8]) -> u64 {
+        let freed = self
+            .peers
+            .get(peer)
+            .and_then(|r| r.summary.as_ref())
+            .filter(|old| !self.is_own(old))
+            .and_then(|old| {
+                let old_bytes: &[u8] = old.as_ref().as_ref();
+                self.summaries
+                    .get(old_bytes)
+                    .filter(|slot| slot.holders == 1)
+                    .map(|_| old_bytes.len() as u64)
+            })
+            .unwrap_or(0);
+        self.counter
+            .load(Ordering::Relaxed)
+            .saturating_sub(freed)
+            .saturating_add(bytes.len() as u64)
+    }
+
     /// Take one holder reference on `summary`'s bytes, returning the shared
     /// allocation. Identical bytes already held by another record are reused
     /// and `summary` is dropped.
@@ -274,6 +368,7 @@ impl ContractPeers {
         if !reuse && let Some(old) = previous.as_ref().and_then(|p| p.summary.as_deref()) {
             self.release(old);
         }
+        self.resync_neighbour_bytes();
         self.peers
             .get_mut(&peer)
             .expect("record was inserted under this &mut borrow")
@@ -286,6 +381,7 @@ impl ContractPeers {
         if let Some(summary) = removed.summary.as_deref() {
             self.release(summary);
         }
+        self.resync_neighbour_bytes();
         Some(removed)
     }
 
@@ -317,6 +413,7 @@ impl ContractPeers {
         if let Some(old) = previous.as_deref() {
             self.release(old);
         }
+        self.resync_neighbour_bytes();
         Some(had_summary)
     }
 
@@ -336,7 +433,203 @@ impl ContractPeers {
         if let Some(old) = previous.as_deref() {
             self.release(old);
         }
+        self.resync_neighbour_bytes();
         true
+    }
+
+    /// Every record holding a summary other than this node's own, with the
+    /// bytes charged to that peer for it and the allocation address (#5781):
+    /// the summary's length divided by the number of records holding it,
+    /// rounded up. A summary only one peer sent is charged to it in full;
+    /// identical bytes from several peers split the charge, so peers sending
+    /// the same bytes together still use up their shares.
+    ///
+    /// Identical bytes always share one allocation (the table's invariant,
+    /// checked by [`Self::assert_consistent`]), so holders are counted by
+    /// allocation without hashing bytes.
+    pub(super) fn charged_summaries(&self) -> Vec<(PeerKey, u64, Weak<StateSummary<'static>>)> {
+        let mut holders: HashMap<*const StateSummary<'static>, u64> = HashMap::new();
+        for record in self.peers.values() {
+            if let Some(shared) = &record.summary {
+                *holders.entry(Arc::as_ptr(shared)).or_default() += 1;
+            }
+        }
+        self.peers
+            .iter()
+            .filter_map(|(peer, record)| {
+                let shared = record.summary.as_ref()?;
+                if self.is_own(shared) {
+                    return None;
+                }
+                let ptr = Arc::as_ptr(shared);
+                let len = shared.as_ref().as_ref().len() as u64;
+                let count = holders.get(&ptr).copied().unwrap_or(1).max(1);
+                Some((peer.clone(), len.div_ceil(count), Arc::downgrade(shared)))
+            })
+            .collect()
+    }
+
+    /// The distinct summaries counted toward the node-wide budget (every one
+    /// but our own allocation), for the node-wide trim (#5781).
+    pub(super) fn counted_summaries(&self) -> Vec<Arc<StateSummary<'static>>> {
+        self.summaries
+            .values()
+            .filter(|slot| !self.is_own(&slot.shared))
+            .map(|slot| Arc::clone(&slot.shared))
+            .collect()
+    }
+
+    /// Clear every record holding exactly `victim` (by allocation), in
+    /// peer-key order, keeping the records (#5781). Returns the records
+    /// cleared.
+    pub(super) fn clear_allocation(
+        &mut self,
+        victim: &Arc<StateSummary<'static>>,
+        now: Instant,
+    ) -> u64 {
+        // Never our own summary, even if it became ours after collection.
+        if self.is_own(victim) {
+            return 0;
+        }
+        let mut holders: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, r)| r.summary.as_ref().is_some_and(|s| Arc::ptr_eq(s, victim)))
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        holders.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut cleared = 0;
+        for peer in &holders {
+            if self.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now) {
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
+    /// Whether `bytes` are this node's own summary as currently marked.
+    pub(super) fn is_own_bytes(&self, bytes: &[u8]) -> bool {
+        self.own_shared.upgrade().is_some_and(|marked| {
+            let marked: &[u8] = marked.as_ref().as_ref();
+            marked.len() == bytes.len() && marked == bytes
+        })
+    }
+
+    /// Whether `shared` is the allocation holding this node's own summary.
+    fn is_own(&self, shared: &Arc<StateSummary<'static>>) -> bool {
+        std::ptr::eq(Weak::as_ptr(&self.own_shared), Arc::as_ptr(shared))
+    }
+
+    /// The length of this node's own summary of the contract, if known.
+    pub(super) fn own_summary_len(&self) -> Option<usize> {
+        self.own_len
+    }
+
+    /// Record this node's current own summary of the contract (#5781),
+    /// computed fresh by the caller. The marked allocation is forgotten only
+    /// if our bytes changed: the same bytes reported again keep it, so a
+    /// neighbour that is in sync stays uncharged.
+    pub(super) fn note_own_summary(&mut self, ours: &[u8]) {
+        self.own_len = Some(ours.len());
+        let unchanged = self.own_shared.upgrade().is_some_and(|marked| {
+            let marked: &[u8] = marked.as_ref().as_ref();
+            marked.len() == ours.len() && marked == ours
+        });
+        if !unchanged {
+            self.own_shared = Weak::new();
+            self.resync_neighbour_bytes();
+        }
+    }
+
+    /// Record that `peer`'s stored summary is this node's own summary bytes
+    /// (#5781). `authoritative` when the digests matched or the peer reported
+    /// exactly the summary we just computed. A delivery is not: it can
+    /// complete after our summary has moved on, so it marks our summary only
+    /// when none is recorded yet ([`Self::delivery_marks_ours`]).
+    pub(super) fn note_own_summary_held_by(&mut self, peer: &PeerKey, authoritative: bool) {
+        let Some(shared) = self.peers.get(peer).and_then(|r| r.summary.clone()) else {
+            return;
+        };
+        let len = shared.as_ref().as_ref().len();
+        if !authoritative && !self.delivery_marks_ours() {
+            return;
+        }
+        self.own_len = Some(len);
+        self.own_shared = Arc::downgrade(&shared);
+        self.resync_neighbour_bytes();
+    }
+
+    /// Whether a delivered summary (not authoritative) may be recorded as our
+    /// own: only while no own summary is recorded yet.
+    pub(super) fn delivery_marks_ours(&self) -> bool {
+        self.own_len.is_none()
+    }
+
+    /// Most distinct summary bytes this contract may hold
+    /// ([`contract_summary_cap`] of our own summary length).
+    pub(super) fn summary_cap(&self) -> u64 {
+        contract_summary_cap(self.own_len)
+    }
+
+    /// Distinct summary bytes held if `peer`'s summary became `bytes`
+    /// (#5781). Bytes already in the table add nothing; a summary only `peer`
+    /// held is released by the replacement.
+    pub(super) fn projected_summary_bytes(&self, peer: &PeerKey, bytes: &[u8]) -> u64 {
+        let held = self.held_summary_bytes();
+        if self.holds_bytes(bytes) {
+            return held;
+        }
+        let freed = self
+            .peers
+            .get(peer)
+            .and_then(|r| r.summary.as_deref())
+            .and_then(|old| {
+                let old_bytes: &[u8] = old.as_ref();
+                self.summaries
+                    .get(old_bytes)
+                    .filter(|slot| slot.holders == 1)
+                    .map(|_| old_bytes.len() as u64)
+            })
+            .unwrap_or(0);
+        held.saturating_sub(freed)
+            .saturating_add(bytes.len() as u64)
+    }
+
+    /// Drop the largest distinct summaries, other than this node's own, until
+    /// the contract holds at most [`Self::summary_cap`] (#5781). Every record
+    /// holding a dropped summary keeps its record and loses the summary
+    /// ([`SummaryMissingReason::ClearedOverSizeBound`]). Returns the records
+    /// cleared and the distinct bytes freed.
+    pub(super) fn trim_to_cap(&mut self, now: Instant) -> (u64, u64) {
+        let cap = self.summary_cap();
+        let mut held = self.held_summary_bytes();
+        if held <= cap {
+            return (0, 0);
+        }
+        let mut distinct: Vec<Arc<StateSummary<'static>>> = self
+            .summaries
+            .values()
+            .filter(|slot| !self.is_own(&slot.shared))
+            .map(|slot| Arc::clone(&slot.shared))
+            .collect();
+        // Largest first, then by the bytes themselves, so the order is the
+        // same on every node and every run.
+        distinct.sort_by(|a, b| {
+            let (a, b): (&[u8], &[u8]) = (a.as_ref().as_ref(), b.as_ref().as_ref());
+            b.len().cmp(&a.len()).then_with(|| a.cmp(b))
+        });
+        let mut records_cleared = 0;
+        let mut bytes_freed = 0u64;
+        for victim in distinct {
+            if held <= cap {
+                break;
+            }
+            let len = victim.as_ref().as_ref().len() as u64;
+            records_cleared += self.clear_allocation(&victim, now);
+            held = held.saturating_sub(len);
+            bytes_freed = bytes_freed.saturating_add(len);
+        }
+        (records_cleared, bytes_freed)
     }
 
     /// Number of distinct summaries stored for this contract.

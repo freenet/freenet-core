@@ -62,13 +62,18 @@ impl SharedStores {
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
+#[cfg(test)]
+pub(crate) use module_cache::combine_ram_limits;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,
-    budget_for_ram, contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct,
-    interest_tiered_enabled, migration_admission_recovered_now, read_available_memory_bytes,
-    read_own_rss_bytes, read_total_ram_bytes,
+    contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct, interest_tiered_enabled,
+    migration_admission_recovered_now, read_own_rss_bytes, read_total_ram_bytes,
 };
+// Only `contract::executor::declared_cache_ceiling` reads this through the
+// module root, and that is test-only since #5647.
+#[cfg(test)]
+pub(crate) use module_cache::budget_for_ram;
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
 // byte values (so the test can't drift from the clamp). Gated to test builds so
