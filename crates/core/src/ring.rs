@@ -10027,6 +10027,90 @@ mod cost_pressure_seam_tests {
         assert_eq!(stats.resident_overhead_evictions_total, 0);
     }
 
+    /// #5781: `Ring::attach_op_manager` installs the node-wide summary budget
+    /// at once (a real value, never 0 or the unset `u64::MAX`), and every
+    /// sweep re-installs it from the current resident budget.
+    #[tokio::test]
+    async fn neighbour_summary_budget_is_installed_at_attach_and_each_sweep() {
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-budget-install-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        let at_attach = im.neighbour_summary_budget();
+        assert_eq!(
+            at_attach,
+            hosting.resident_overhead_budget_bytes()
+                / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+        );
+        assert!(at_attach > 0 && at_attach < u64::MAX);
+
+        hosting.configure_resident_overhead_mem_share(0.125);
+        assert_eq!(
+            hosting.recompute_resident_overhead_budget(512 * MIB),
+            64 * MIB
+        );
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(im.neighbour_summary_budget(), 16 * MIB);
+    }
+
+    /// #5781: on a node whose hosted entries already take ~90% of the
+    /// resident budget, the summary allowance shrinks to what is left, so
+    /// colluding neighbours flooding summaries still cannot push it over
+    /// budget or cause an eviction.
+    #[tokio::test]
+    async fn summaries_cannot_push_a_nearly_full_node_over_budget() {
+        use freenet_stdlib::prelude::StateSummary;
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-full-node-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        hosting.configure_resident_overhead_mem_share(0.125);
+        let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
+        assert_eq!(budget, 64 * MIB);
+        // 90% of the budget in hosted entries.
+        let hosted = (budget * 9 / 10 / crate::ring::hosting::HOSTED_ENTRY_BYTES) as u32;
+        for i in 0..hosted {
+            hosting.record_contract_access(
+                wiring_key(i),
+                10,
+                crate::ring::hosting::AccessType::Get,
+                crate::ring::hosting::HostingCause::Other,
+            );
+        }
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let allowance = im.neighbour_summary_budget();
+        assert!(
+            allowance < budget / 4,
+            "allowance {allowance} must shrink below a quarter"
+        );
+
+        let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
+        let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
+        for i in 0..200u32 {
+            let key = wiring_key(i);
+            im.register_local_hosting(&key);
+            for (n, peer) in colluders.iter().enumerate() {
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
+            }
+        }
+        assert!(im.neighbour_summary_bytes() > 0);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let stats = hosting.hosting_cache_stats();
+        assert!(
+            stats.resident_overhead_bytes <= budget,
+            "summaries pushed a nearly full node to {} bytes against {budget}",
+            stats.resident_overhead_bytes
+        );
+        assert_eq!(
+            stats.contract_count,
+            u64::from(hosted),
+            "nothing was evicted"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+    }
+
     /// #5781 relative cap, end to end through the production sweep: a
     /// neighbour's 100,000-byte summary fits the 128 KiB cap while our own
     /// summary is unknown. Once a delivery records our own 1,000-byte summary

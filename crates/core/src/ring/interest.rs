@@ -6762,6 +6762,254 @@ mod tests {
         assert_summary_tables_consistent(&manager);
     }
 
+    /// #5781: peers sending identical bytes split each summary's charge, so
+    /// together they still use up their shares rather than escaping them.
+    #[test]
+    fn colluders_sending_identical_bytes_split_but_use_their_shares() {
+        let (manager, _time) = make_manager();
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        for i in 1..=10u8 {
+            let c = make_contract_key(i);
+            let bytes = vec![i; 50_000];
+            assert!(manager.upsert_peer_summary(&c, &a, StateSummary::from(bytes.clone())));
+            assert!(manager.upsert_peer_summary(&c, &b, StateSummary::from(bytes)));
+        }
+        // Each is charged 25,000 per contract, 250,000 in all, against 100,000.
+        let trim = manager.enforce_summary_bounds(100_000, all_hosted);
+        assert_eq!(trim.peers_over_share, 2);
+        // Each drops its six largest charges (all 25,000; contract-key order)
+        // and keeps four: 100,000. Charged in full (50,000) it would keep two;
+        // charged only for bytes nobody else sent, all ten.
+        for peer in [&a, &b] {
+            let kept = (1..=10u8)
+                .filter(|i| {
+                    manager
+                        .get_peer_summary(&make_contract_key(*i), peer)
+                        .is_some()
+                })
+                .count();
+            assert_eq!(kept, 4);
+        }
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781 node-wide trim: when the counter is over the budget (here the
+    /// budget shrank), the sweep drops the largest counted summaries until it
+    /// fits, never our own, and an honest summary gets in again afterwards.
+    #[test]
+    fn node_wide_trim_restores_the_budget_and_readmits_honest_summaries() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        let peer = make_unique_peer_key;
+        let c = make_contract_key;
+        // Our own 30,000-byte summary, held by peer 1 on contract 1.
+        let ours = StateSummary::from(vec![9u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &c(1),
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        for (i, len) in [(2u8, 60_000usize), (3, 40_000)] {
+            assert!(manager.upsert_peer_summary(
+                &c(i),
+                &peer(i as u32),
+                StateSummary::from(vec![i; len])
+            ));
+        }
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+        // An honest newcomer does not fit.
+        assert!(!manager.upsert_peer_summary(
+            &c(4),
+            &peer(4),
+            StateSummary::from(vec![4u8; 10_000])
+        ));
+
+        manager.set_neighbour_summary_budget(50_000);
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(
+            trim.node_budget_drops, 1,
+            "the 60,000-byte summary goes first"
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 40_000);
+        assert!(manager.get_peer_summary(&c(2), &peer(2)).is_none());
+        assert_eq!(
+            manager
+                .get_peer_summary(&c(1), &peer(1))
+                .map(|s| s.as_ref().len()),
+            Some(30_000),
+            "our own summary is never trimmed"
+        );
+        // Room again for the honest newcomer.
+        assert!(manager.upsert_peer_summary(
+            &c(4),
+            &peer(4),
+            StateSummary::from(vec![4u8; 10_000])
+        ));
+        assert_summary_tables_consistent(&manager);
+
+        // A budget of 0 clears every counted summary; ours stays.
+        manager.set_neighbour_summary_budget(0);
+        manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+        assert!(manager.get_peer_summary(&c(1), &peer(1)).is_some());
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: when our summary changes, the bytes that were ours become a
+    /// neighbour's and are counted without passing the write-time check; the
+    /// node-wide trim brings the counter back under the budget.
+    #[test]
+    fn node_wide_trim_covers_our_old_summary_becoming_counted() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(60_000);
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let old_ours = StateSummary::from(vec![1u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            old_ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&old_ours),
+        );
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(2),
+            StateSummary::from(vec![2u8; 50_000])
+        ));
+        assert_eq!(manager.neighbour_summary_bytes(), 50_000);
+        // Our summary moves on; peer 3 reports the new bytes.
+        let new_ours = StateSummary::from(vec![3u8; 20_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(3),
+            new_ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&new_ours),
+        );
+        assert_eq!(
+            manager.neighbour_summary_bytes(),
+            80_000,
+            "the old bytes now count"
+        );
+        manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert!(manager.neighbour_summary_bytes() <= 60_000);
+        assert!(
+            manager.get_peer_summary(&contract, &peer(2)).is_none(),
+            "largest goes"
+        );
+        assert!(
+            manager.get_peer_summary(&contract, &peer(3)).is_some(),
+            "ours stays"
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: a delivery that will not be recorded as our own summary (ours
+    /// has moved on) is counted, so it must fit the node-wide budget.
+    #[test]
+    fn late_delivery_must_fit_the_node_budget() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let ours = StateSummary::from(vec![1u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        manager.set_neighbour_summary_budget(5_000);
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer(2),
+                StateSummary::from(vec![2u8; 6_000]),
+                SummaryPopulationSource::Delivery,
+            ),
+            SummaryPopulationOutcome::RejectedOversized
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+    }
+
+    /// #5781: a registration whose summary would take the node over its
+    /// budget records the interest without the summary, tagged and counted.
+    #[test]
+    fn register_over_the_node_budget_is_refused() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(10_000);
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key(1);
+        assert!(manager.register_peer_interest(
+            &contract,
+            peer.clone(),
+            Some(StateSummary::from(vec![1u8; 20_000])),
+            false
+        ));
+        let record = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("registered");
+        assert!(record.summary().is_none());
+        assert_eq!(
+            record.summary_missing_reason(),
+            Some(SummaryMissingReason::ClearedOverSizeBound)
+        );
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::Unknown),
+            1
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+    }
+
+    /// #5781: the node-wide projection frees a replaced summary only when the
+    /// replacing peer was its sole holder and it is not our own.
+    #[test]
+    fn node_budget_projection_frees_only_a_sole_held_neighbour_summary() {
+        let peer = make_unique_peer_key;
+        // Sole holder replacing near the budget: admitted.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        let c = make_contract_key(1);
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![2u8; 40_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![3u8; 60_000])));
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+
+        // Shared holder: the old bytes stay held by the other peer, so
+        // nothing is freed and the replacement does not fit.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(3), StateSummary::from(vec![2u8; 40_000])));
+        assert!(!manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![3u8; 60_000])));
+
+        // Own summary: it was never counted, so replacing it frees nothing.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(99_000);
+        let ours = StateSummary::from(vec![9u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &c,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![2u8; 40_000])));
+        let other = make_contract_key(2);
+        assert!(manager.upsert_peer_summary(
+            &other,
+            &peer(3),
+            StateSummary::from(vec![4u8; 30_000])
+        ));
+        assert_eq!(manager.neighbour_summary_bytes(), 70_000);
+        assert!(!manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![5u8; 30_000])));
+    }
+
     /// #5781: one peer may hold at most its share of summary bytes that no
     /// other neighbour also sent. Over it, its largest such summaries are
     /// dropped until it fits; summaries shared with another neighbour, and
