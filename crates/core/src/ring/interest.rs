@@ -2306,6 +2306,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary().is_some()))
     }
 
+    /// Bytes of neighbour summaries stored for `contract`, counting each
+    /// distinct summary once, read under one shard guard (#5786).
+    ///
+    /// This is the figure a per-contract memory charge for neighbour summaries
+    /// should use (#5779): identical summaries from many neighbours share one
+    /// allocation, so summing each record's summary length would overcount.
+    /// Excludes the fixed per-record overhead.
+    // Production caller lands with #5779; until then only tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn distinct_summary_bytes_for(&self, contract: &ContractKey) -> u64 {
+        self.interested_peers
+            .get(contract)
+            .map_or(0, |entry| entry.held_summary_bytes())
+    }
+
     /// Check if enough time has elapsed to send a proactive summary notification
     /// for this contract. Returns `true` if at least 100ms has passed since the last
     /// notification (or if no notification was ever sent). Updates the timestamp on success.
@@ -4393,14 +4408,11 @@ mod tests {
 
         assert_eq!(distinct_summaries(&manager, &contract), 1);
         assert_eq!(
-            manager
-                .interested_peers
-                .get(&contract)
-                .expect("records exist")
-                .held_summary_bytes(),
+            manager.distinct_summary_bytes_for(&contract),
             1000,
             "ten identical summaries must cost one copy"
         );
+        assert_eq!(manager.distinct_summary_bytes_for(&make_contract_key(9)), 0);
         let entry = manager
             .interested_peers
             .get(&contract)
@@ -4463,6 +4475,42 @@ mod tests {
             StateSummary::from(UNIQUE_BYTES.to_vec())
         ));
         assert_eq!(distinct_summaries(&manager, &contract), 2);
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// A second upsert on a populated record is reported and counted as
+    /// `RefreshedKnown`, with the same bytes and with different bytes.
+    #[test]
+    fn upsert_on_a_populated_record_reports_refreshed_known() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let source = SummaryPopulationSource::Unknown;
+        let count = |outcome: SummaryPopulationOutcome| {
+            manager.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .load(Ordering::Relaxed)
+        };
+        let upsert = |bytes: &[u8]| {
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                StateSummary::from(bytes.to_vec()),
+                source,
+            )
+        };
+
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::CreatedUntracked);
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 1);
+        assert_eq!(upsert(&[2; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 2);
+        assert_eq!(count(SummaryPopulationOutcome::FilledMissing), 0);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.to_vec()),
+            Some(vec![2; 8])
+        );
         assert_summary_tables_consistent(&manager);
     }
 

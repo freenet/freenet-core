@@ -23,6 +23,7 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -150,6 +151,10 @@ pub(super) struct ContractPeers {
     /// Distinct summary bytes held by `peers`, each with the number of records
     /// holding it. Never contains a zero count.
     summaries: HashMap<InternedBytes, Slot>,
+    /// Calls to `acquire` and `release`, so tests can tell the same-bytes
+    /// early returns apart from an acquire/release pair that nets to zero.
+    #[cfg(test)]
+    table_ops: usize,
 }
 
 /// One distinct summary and the number of records holding it.
@@ -172,32 +177,70 @@ impl ContractPeers {
     /// allocation. Identical bytes already held by another record are reused
     /// and `summary` is dropped.
     fn acquire(&mut self, summary: StateSummary<'static>) -> Arc<StateSummary<'static>> {
-        if let Some(slot) = self.summaries.get_mut(summary.as_ref()) {
-            slot.holders += 1;
-            return Arc::clone(&slot.shared);
+        #[cfg(test)]
+        {
+            self.table_ops += 1;
         }
-        let shared = Arc::new(summary);
-        self.summaries.insert(
-            InternedBytes(Arc::clone(&shared)),
-            Slot {
-                shared: Arc::clone(&shared),
-                holders: 1,
-            },
-        );
-        shared
+        // One hash per acquire: the entry API needs an owned key, and moving
+        // the summary into an `Arc` copies no bytes. On a hit the new `Arc`
+        // (and the duplicate bytes it owns) is dropped.
+        let candidate = Arc::new(summary);
+        match self.summaries.entry(InternedBytes(Arc::clone(&candidate))) {
+            Entry::Occupied(mut slot) => {
+                slot.get_mut().holders += 1;
+                Arc::clone(&slot.get().shared)
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Slot {
+                    shared: Arc::clone(&candidate),
+                    holders: 1,
+                });
+                candidate
+            }
+        }
     }
 
     /// Drop one holder reference on `summary`'s bytes, removing the table entry
     /// when it was the last.
+    ///
+    /// This hashes the bytes again. Storing each record's hash to skip that
+    /// would need a lookup by precomputed hash, which std's `HashMap` does not
+    /// offer; the same-bytes early returns in [`Self::set_summary`] and
+    /// [`Self::insert`] already keep the steady state (an in-sync neighbour
+    /// resending identical bytes) from reaching here.
     fn release(&mut self, summary: &StateSummary<'static>) {
+        #[cfg(test)]
+        {
+            self.table_ops += 1;
+        }
         let bytes: &[u8] = summary.as_ref();
         match self.summaries.get_mut(bytes) {
             Some(slot) if slot.holders > 1 => slot.holders -= 1,
             Some(_) => {
                 self.summaries.remove(bytes);
             }
-            None => debug_assert!(false, "released a summary the table does not hold"),
+            None => {
+                // Unreachable while every summary write goes through this
+                // type. Logged so an accounting bug is visible in release
+                // builds, where the debug_assert is compiled out.
+                tracing::warn!(
+                    summary_len = bytes.len(),
+                    "neighbour summary table: released a summary it does not hold"
+                );
+                debug_assert!(false, "released a summary the table does not hold");
+            }
         }
+    }
+
+    /// Whether `record` already holds exactly `bytes`. Compares length first,
+    /// so a changed summary of a different size costs no byte comparison.
+    fn holds_same_bytes(record: Option<&PeerInterest>, bytes: &[u8]) -> bool {
+        record
+            .and_then(|r| r.summary.as_deref())
+            .is_some_and(|held| {
+                let held: &[u8] = held.as_ref();
+                held.len() == bytes.len() && held == bytes
+            })
     }
 
     /// Mutable access to a record's non-summary fields.
@@ -214,11 +257,21 @@ impl ContractPeers {
         is_upstream: bool,
         now: Instant,
     ) -> &mut PeerInterest {
-        let shared = summary.map(|s| self.acquire(s));
+        // Re-registering with the bytes the record already holds keeps its
+        // shared allocation and holder count as they are: no hashing, no
+        // acquire/release.
+        let reuse = summary
+            .as_ref()
+            .is_some_and(|s| Self::holds_same_bytes(self.peers.get(&peer), s.as_ref()));
+        let shared = if reuse {
+            self.peers.get(&peer).and_then(|p| p.summary.clone())
+        } else {
+            summary.map(|s| self.acquire(s))
+        };
         let previous = self
             .peers
             .insert(peer.clone(), PeerInterest::new(shared, is_upstream, now));
-        if let Some(old) = previous.as_ref().and_then(|p| p.summary.as_deref()) {
+        if !reuse && let Some(old) = previous.as_ref().and_then(|p| p.summary.as_deref()) {
             self.release(old);
         }
         self.peers
@@ -244,8 +297,12 @@ impl ContractPeers {
         summary: StateSummary<'static>,
         now: Instant,
     ) -> Option<bool> {
-        if !self.peers.contains_key(peer) {
-            return None;
+        let record = self.peers.get_mut(peer)?;
+        // Steady state: an in-sync neighbour resends the bytes we hold. Only
+        // the TTL changes; the table and the stored `Arc` are left alone.
+        if Self::holds_same_bytes(Some(&*record), summary.as_ref()) {
+            record.refresh(now);
+            return Some(true);
         }
         // Acquire before releasing, so replacing a summary with identical
         // bytes never drops the table entry in between.
@@ -289,10 +346,12 @@ impl ContractPeers {
     }
 
     /// Bytes of summary data stored for this contract, counting each distinct
-    /// summary once.
-    #[cfg(test)]
-    pub(super) fn held_summary_bytes(&self) -> usize {
-        self.summaries.keys().map(|k| k.0.as_ref().len()).sum()
+    /// summary once. See [`super::InterestManager::distinct_summary_bytes_for`].
+    pub(super) fn held_summary_bytes(&self) -> u64 {
+        self.summaries
+            .values()
+            .map(|slot| slot.shared.as_ref().as_ref().len() as u64)
+            .sum()
     }
 
     /// Panics unless the intern table matches the records exactly: every
@@ -390,6 +449,47 @@ mod tests {
         records.insert(a.clone(), Some(summary(&[3])), false, now);
         records.insert(b.clone(), None, false, now);
         assert_eq!(records.distinct_summaries(), 1);
+        records.assert_consistent();
+    }
+
+    #[test]
+    fn resending_the_held_bytes_touches_neither_table_nor_arc() {
+        let now = Instant::now();
+        let later = now + std::time::Duration::from_secs(5);
+        let mut records = ContractPeers::default();
+        let (a, b) = (peer(), peer());
+        records.insert(a.clone(), Some(summary(&[1; 32])), false, now);
+        records.insert(b.clone(), Some(summary(&[1; 32])), false, now);
+        let before = shared(&records, &a);
+        let ops = records.table_ops;
+
+        // set_summary with the bytes already held: TTL only.
+        assert_eq!(
+            records.set_summary(&a, summary(&[1; 32]), later),
+            Some(true)
+        );
+        assert_eq!(records.table_ops, ops, "no acquire/release for same bytes");
+        assert!(Arc::ptr_eq(&before, &shared(&records, &a)));
+        assert_eq!(records.peers[&a].last_refreshed, later);
+
+        // Re-inserting over a record with the same bytes keeps its allocation.
+        records.insert(b.clone(), Some(summary(&[1; 32])), true, later);
+        assert_eq!(records.table_ops, ops, "no acquire/release for same bytes");
+        assert!(Arc::ptr_eq(&before, &shared(&records, &b)));
+        assert!(
+            records.peers[&b].is_upstream,
+            "the record itself is replaced"
+        );
+        assert_eq!(records.distinct_summaries(), 1);
+        records.assert_consistent();
+
+        // Same length, different bytes: not taken as equal.
+        assert_eq!(
+            records.set_summary(&a, summary(&[2; 32]), later),
+            Some(true)
+        );
+        assert_ne!(records.table_ops, ops);
+        assert_eq!(records.distinct_summaries(), 2);
         records.assert_consistent();
     }
 
