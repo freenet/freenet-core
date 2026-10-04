@@ -810,6 +810,22 @@ impl IsotonicEstimator {
         self.fit_policy
     }
 
+    /// Give `peer` a trusted per-peer adjustment of `value` (past the
+    /// sample-size bar `estimate_retrieval_time` applies), so a router test can
+    /// hold the estimator in a state real traffic reaches only after a long,
+    /// specific history. The next refit replaces it. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_peer_adjustment_for_test(&mut self, peer: PeerKeyLocation, value: f64) {
+        self.peer_adjustments.insert(
+            peer,
+            Adjustment {
+                smoothed: value,
+                effective_count: 2.0 * MIN_POINTS_FOR_REGRESSION as f64,
+                alpha: EWMA_ALPHA,
+            },
+        );
+    }
+
     /// The raw events in the rolling window, oldest first. Test-only.
     #[cfg(test)]
     pub(crate) fn raw_events_for_test(&self) -> impl Iterator<Item = &IsotonicEvent> {

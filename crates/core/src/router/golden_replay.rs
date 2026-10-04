@@ -51,6 +51,12 @@
 //! every other decision must still match. So the floor cannot reach any
 //! decision beyond the listed ones without this test failing.
 //!
+//! The floor is a lower bound on every isotonic estimate, so it also lifts a
+//! positive estimate below it. That added no decision to the list: in these
+//! scenarios a positive estimate below the floor occurs only while the
+//! hierarchical transfer stage is warm, where routing does not read the
+//! isotonic speed.
+//!
 //! The window is computed without looking at the decision, so a few early
 //! distance-only decisions (the first 50 events, before prediction starts)
 //! fall in it and are skipped too, although nothing in them can differ.
