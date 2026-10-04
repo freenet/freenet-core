@@ -175,7 +175,10 @@ pub(crate) fn neighbour_summary_limit(
         SummaryPopulationSource::Delivery | SummaryPopulationSource::DigestAgreement => {
             crate::wasm_runtime::MAX_STATE_SIZE
         }
-        _ => match own_summary_len {
+        SummaryPopulationSource::InterestSummary
+        | SummaryPopulationSource::InboundBroadcast
+        | SummaryPopulationSource::ResyncResponse
+        | SummaryPopulationSource::Unknown => match own_summary_len {
             Some(own) => own
                 .saturating_mul(RELATIVE_SUMMARY_FACTOR)
                 .saturating_add(RELATIVE_SUMMARY_SLACK),
@@ -6186,7 +6189,10 @@ mod tests {
             StateSummary::from(vec![200u8; 50_000])
         ));
 
-        let share = 1_000_000;
+        // 920 KB sits between 900 KB and 950 KB, so the result depends on the
+        // shared 50 KB summary on contract 0 NOT being counted against the
+        // flooder: counting it would leave 950 KB and drop a seventh summary.
+        let share = 920_000;
         let trim = manager.enforce_peer_summary_share(share);
         // Unshared flooder bytes: 200 KB + ... + 1000 KB = 5.4 MB. Dropping
         // the 1000, 900, ..., 600 KB summaries leaves 200+300+400+500 = 1.4 MB,

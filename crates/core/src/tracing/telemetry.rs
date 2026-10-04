@@ -3649,12 +3649,13 @@ mod tests {
         // Raised from 14_336 alongside the busy budget, same 40 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
         // measured 15195; no fleet value approaches it, so it constrains
-        // schema shape rather than real bytes. #5647 added 6 counters (the
-        // `rejected_oversized` population outcome across the 6 sources), 6 x
-        // 21 bytes at u64::MAX = 126: measured 15321, still within this limit.
+        // schema shape rather than real bytes. #5647 added 7 counters (the
+        // `rejected_oversized` population outcome across the 6 sources, and
+        // the `over_size_bound` entry in `current`), 7 x 21 bytes at u64::MAX
+        // = 147: measured 15342, still within this limit.
         const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
-        // Raised from 2_048 by #5647 for the same 6 new counters, about 2 bytes
-        // each in an all-zero block (6 digits plus 6 commas): measured 2055.
+        // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
+        // each in an all-zero block (a digit and a comma): measured 2057.
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_064;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
@@ -3682,8 +3683,8 @@ mod tests {
         // two blocks merged onto this soak branch — measured 15267. This
         // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
         // digits); no fleet value approaches it, so it constrains schema shape
-        // rather than real bytes. Raised by #5647 for the same 6 counters as
-        // MAX_WORST_CASE_JSON_BYTES (126 bytes at u64::MAX): measured 15393.
+        // rather than real bytes. Raised by #5647 for the same 7 counters as
+        // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
         const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_424;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
