@@ -402,8 +402,9 @@ pub(crate) struct FailureForecasts {
     pub log_response_time_hierarchical: Option<f64>,
     /// `ln(bytes/s)` of the isotonic transfer speed a transfer stage without a
     /// hierarchical curve falls back to, as routing uses it: FLOORED at
-    /// `DEGENERATE_SPEED_FLOOR_BPS` (1 B/s), so it is never below `ln(1) = 0`,
-    /// and a recorded 0 means the estimator itself said zero or nearly so.
+    /// `DEGENERATE_SPEED_FLOOR_BPS` (1e-6 B/s), so it is never below
+    /// `ln(1e-6)` (about -13.8), and that value means the estimator itself
+    /// said zero or nearly so.
     /// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141)
     /// in two ways: earlier builds recorded the Renegade blend here (see
     /// `log_response_time_legacy`), and recorded the speed unfloored, with no

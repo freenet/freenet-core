@@ -2599,7 +2599,7 @@ impl Router {
     /// `FREENET_ROUTING_FALLBACK_ISOTONIC` (off by default) sends every stage
     /// down that fallback path.
     ///
-    /// The isotonic transfer speed is floored at 1 B/s, so a degenerate (zero
+    /// The isotonic transfer speed is floored at 1e-6 B/s, so a degenerate (zero
     /// or near-zero) one is not priced as an unroutable transfer; the soaked
     /// build did not floor it (see `DEGENERATE_SPEED_FLOOR_BPS`), which is the
     /// second, and narrower, difference from it.
@@ -3391,13 +3391,27 @@ struct IsotonicTimingForecast {
 /// transfers ran slower than the curve can be driven to zero (the estimator
 /// clamps there), and the curve itself extrapolates to zero beyond its data;
 /// routing then priced that peer's transfer at the `f64::MAX / 2` sentinel. The
-/// floor keeps the price finite, so such a peer still sorts last but is
-/// ordered among its peers by its other costs, and no estimate is ever zero.
+/// floor keeps the price finite, so several such peers are ordered among
+/// themselves by their other costs, and no estimate is ever zero.
+///
+/// It is TINY on purpose, so that such a peer still sorts last, as it did at
+/// the sentinel. Its transfer term is `mean_transfer_size / 1e-6`, at least
+/// 1e6 s (the mean is of positive payload sizes over a 100-byte seed, so at
+/// least 1 byte; 1e8 s at the seed). A peer that works, with a response time
+/// within `OPERATION_TTL` (60 s; a slower one is a timeout, i.e. a failure)
+/// and a speed of at least 1 B/s, costs at most `t * (1 + 3f) + mean / speed`
+/// <= 240 s + mean, far below that for any mean. (A 1 B/s floor did not hold
+/// this: just after a restart, mean near the seed, a fast and reliable
+/// degenerate peer cost ~133 s and outranked a slow, unreliable working one at
+/// ~148 s. Pinned by `a_degenerate_transfer_speed_sorts_after_every_working_peer`.)
+/// The costs stay finite and well inside f64: about 1e12 s for a 1 MB mean,
+/// resolved to about 1e-4 s, so the other costs still order degenerate peers.
 ///
 /// It is ONE absolute value, the same for every candidate, and a lower bound
 /// on every estimate (`max(raw, floor)`). Both are needed for routing to
 /// preserve the order of the raw estimates, so that a peer the estimator
-/// learned to be slower never routes faster than one it learned to be faster:
+/// learned to be slower is never strictly faster at the transfer term than
+/// one it learned to be faster (estimates below the floor tie there):
 ///   - Replacing only a zero estimate left a peer driven to a tiny positive
 ///     speed priced near-unroutable while a worse peer, clamped to zero, was
 ///     lifted above it.
@@ -3411,9 +3425,9 @@ struct IsotonicTimingForecast {
 /// and extrapolates toward zero beyond it, so on the production-like golden
 /// replay a tenth of the smallest fitted value was 11.7 kB/s while candidates
 /// sitting exactly on the curve were estimated at 0.3 to 9 kB/s. That floor
-/// tied them all and moved four compared decisions; 1 B/s lifts only
+/// tied them all and moved four compared decisions; 1e-6 B/s lifts only
 /// estimates that are zero for practical purposes and moves none.
-const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1.0;
+const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1e-6;
 
 /// Recent forecast/outcome pairs kept per stage for the accuracy panel.
 const RECENT_PAIRS: usize = 200;
@@ -4864,10 +4878,10 @@ mod tests {
         estimator
     }
 
-    /// The isotonic transfer speed routing uses is floored at 1 B/s, whatever
-    /// the curve, and the floor is a LOWER BOUND on every estimate, not a
-    /// replacement for a zero one: a peer driven to a tiny positive speed is
-    /// lifted exactly like one clamped to zero, and every estimate above the
+    /// The isotonic transfer speed routing uses is floored at 1e-6 B/s,
+    /// whatever the curve, and the floor is a LOWER BOUND on every estimate,
+    /// not a replacement for a zero one: a peer driven to a tiny positive speed
+    /// is lifted exactly like one clamped to zero, and every estimate above the
     /// floor is kept as it is.
     #[test]
     fn a_degenerate_isotonic_transfer_speed_is_floored() {
@@ -4885,24 +4899,24 @@ mod tests {
                 curve,
                 &[
                     (zero.clone(), -2000.0),
-                    (tiny.clone(), 0.5),
-                    (slow.clone(), 2.0),
+                    (tiny.clone(), 1e-9),
+                    (slow.clone(), 0.5),
                     (fast.clone(), 1500.0),
                 ],
             );
             assert_eq!(
                 speed(&router, &zero),
-                1.0,
+                1e-6,
                 "a zero estimate is lifted ({curve})"
             );
             assert_eq!(
                 speed(&router, &tiny),
-                1.0,
+                1e-6,
                 "a tiny positive one too ({curve})"
             );
             assert_eq!(
                 speed(&router, &slow),
-                2.0,
+                0.5,
                 "one above the floor is kept ({curve})"
             );
             assert_eq!(speed(&router, &fast), 1500.0);
@@ -4992,7 +5006,7 @@ mod tests {
     fn a_floored_transfer_speed_never_ranks_a_slower_peer_above_a_faster_one() {
         let _seed = GlobalRng::seed_guard(0x4485_F101);
         let _routing = force_isotonic_fallback(true);
-        let learned: Vec<(PeerKeyLocation, f64)> = [-500.0, 0.01, 50.0, 150.0, 500.0, 2000.0]
+        let learned: Vec<(PeerKeyLocation, f64)> = [-500.0, 1e-9, 50.0, 150.0, 500.0, 2000.0]
             .into_iter()
             .map(|speed| (PeerKeyLocation::random(), speed))
             .collect();
@@ -5059,6 +5073,94 @@ mod tests {
         let router = router_ranking_on_transfer_speed(transfer);
         let lifted = assert_transfer_ranking_is_monotone(&router, &[near, far], target);
         assert!(lifted >= 1, "the floor must be in play: {lifted} lifted");
+    }
+
+    /// A peer whose isotonic transfer speed is degenerate (0) sorts after every
+    /// healthy peer, whatever their response times and failure probabilities,
+    /// as it did when the reference build priced it at the sentinel. The
+    /// scenario: a node just restarted on a network of small states, so the
+    /// mean transfer size is near its 100-byte seed. With a 1 B/s floor the
+    /// degenerate peer's transfer term was only ~133 s, and a fast, reliable
+    /// degenerate peer outranked a slow, unreliable but working one (148 s).
+    /// Two degenerate peers are still ordered by their other costs.
+    #[test]
+    fn a_degenerate_transfer_speed_sorts_after_every_working_peer() {
+        let _seed = GlobalRng::seed_guard(0x4485_F103);
+        let _routing = force_isotonic_fallback(true);
+        let [degenerate, healthy_but_slow, degenerate_fast] =
+            std::array::from_fn(|_| PeerKeyLocation::random());
+        let mut router = router_ranking_on_transfer_speed(transfer_estimator_with(
+            1000.0,
+            &[
+                (degenerate.clone(), -1000.0),
+                (healthy_but_slow.clone(), 1000.0),
+                (degenerate_fast.clone(), -1000.0),
+            ],
+        ));
+        // Failure: a flat 0 curve plus an additive per-peer offset.
+        for (peer, failure) in [
+            (&degenerate, 0.05),
+            (&healthy_but_slow, 0.9),
+            (&degenerate_fast, 0.0),
+        ] {
+            router
+                .failure_estimator
+                .set_peer_adjustment_for_test(peer.clone(), failure);
+        }
+        // Response time: a flat 100 ms curve times a per-peer factor.
+        for (peer, seconds) in [
+            (&degenerate, 0.2),
+            (&healthy_but_slow, 40.0),
+            (&degenerate_fast, 0.1),
+        ] {
+            router
+                .response_start_time_estimator
+                .set_peer_adjustment_for_test(peer.clone(), (seconds / 0.1f64).ln());
+        }
+        // Five ~200-byte transfers after the 100-byte seed.
+        for _ in 0..5 {
+            router.mean_transfer_size.add(200.0);
+        }
+        let target = Location::new(0.3);
+        let cost = |router: &Router, peer: &PeerKeyLocation| {
+            router
+                .predict_routing_outcome(peer, target)
+                .expect("predicts")
+                .expected_total_time
+        };
+        for peer in [&degenerate, &healthy_but_slow, &degenerate_fast] {
+            assert!(cost(&router, peer).is_finite(), "{}", cost(&router, peer));
+        }
+        let candidates = [
+            degenerate.clone(),
+            healthy_but_slow.clone(),
+            degenerate_fast.clone(),
+        ];
+        let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
+        assert_eq!(
+            ranked,
+            [&healthy_but_slow, &degenerate_fast, &degenerate],
+            "costs: healthy-but-slow {}, degenerate {}, degenerate-but-fast {}",
+            cost(&router, &healthy_but_slow),
+            cost(&router, &degenerate),
+            cost(&router, &degenerate_fast)
+        );
+
+        // At a 1 MB mean the degenerate costs are ~1e12 s: still finite, and
+        // still resolved finely enough to order the two degenerate peers.
+        router
+            .mean_transfer_size
+            .add_with_count(1e6 * 1e6, 1_000_000);
+        let costs =
+            [&degenerate, &healthy_but_slow, &degenerate_fast].map(|peer| cost(&router, peer));
+        assert!(costs.iter().all(|c| c.is_finite()), "{costs:?}");
+        assert!(costs[0] > 1e11, "{costs:?}");
+        let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
+        assert_eq!(
+            ranked,
+            [&healthy_but_slow, &degenerate_fast, &degenerate],
+            "{costs:?}"
+        );
     }
 
     /// Whether any candidate in a replayed decision prices its transfer as
@@ -5515,11 +5617,12 @@ mod tests {
         hierarchical_transfer_mse: f64,
         /// Events both transfer errors were scored on.
         transfer_scored: usize,
-        /// Events where the isotonic fallback had no transfer-speed estimate,
-        /// left out of BOTH transfer errors. Leaving them out flatters the
-        /// fallback, which is the conservative direction for this gate. (A
-        /// speed the additive per-peer EWMA drives to zero no longer counts
-        /// here: routing floors it, and so does this comparison.)
+        /// Events where the isotonic fallback had no transfer-speed estimate, or
+        /// only a degenerate one that `DEGENERATE_SPEED_FLOOR_BPS` lifted, left
+        /// out of BOTH transfer errors. Leaving them out flatters the fallback,
+        /// which is the conservative direction for this gate. Scoring the
+        /// floored speed instead would price such an event at ~5e9 s and pass
+        /// the gate on that alone.
         isotonic_speed_missing: usize,
     }
 
@@ -5576,7 +5679,12 @@ mod tests {
                 acc[0] += (isotonic_time - expected_time).powi(2);
                 acc[1] += (prediction.time_to_response_start - expected_time).powi(2);
                 scored += 1;
-                match isotonic.transfer_speed_bps {
+                // A floored speed is a degenerate estimate, not a forecast.
+                let degenerate = router
+                    .transfer_rate_estimator
+                    .estimate_retrieval_time(&peers[p], contract)
+                    .is_ok_and(|raw| raw < DEGENERATE_SPEED_FLOOR_BPS);
+                match isotonic.transfer_speed_bps.filter(|_| !degenerate) {
                     Some(isotonic_speed) => {
                         acc[2] += (BYTES / isotonic_speed - expected_transfer).powi(2);
                         acc[3] += (BYTES / prediction.xfer_speed.bytes_per_second
@@ -5640,7 +5748,7 @@ mod tests {
         eprintln!(
             "#4485 timing in seconds: response-time mse {ht:.6} vs isotonic {it:.6} (ratio {:.3}); \
              transfer-time mse {hx:.6} vs isotonic {ix:.6} (ratio {:.3}) over {transfer_scored} \
-             events, {missing} more where the isotonic fallback had no speed estimate",
+             events, {missing} more where the isotonic fallback had no or a degenerate speed",
             ht / it,
             hx / ix
         );

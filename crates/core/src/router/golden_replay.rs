@@ -69,8 +69,9 @@
 //! (`a_degenerate_isotonic_transfer_speed_is_floored` and the
 //! `a_floored_transfer_speed_*` ranking tests).
 //!
-//! The floor is 1 B/s, a lower bound on every isotonic estimate, so it would
-//! also lift a positive estimate below 1 B/s; none occurs in these scenarios.
+//! The floor is 1e-6 B/s, a lower bound on every isotonic estimate, so it
+//! would also lift a positive estimate below that; none occurs in these
+//! scenarios.
 //! (An earlier floor relative to the distance curve could reorder candidates
 //! across distances; see `DEGENERATE_SPEED_FLOOR_BPS` in `router.rs`.)
 //!

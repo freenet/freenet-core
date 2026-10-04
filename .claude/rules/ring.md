@@ -242,7 +242,8 @@ WHEN touching the router:
         its isotonic fallback. Pinned by
         a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
     (2) the isotonic transfer-speed estimate routing uses is floored at
-        DEGENERATE_SPEED_FLOOR_BPS (1 B/s), a lower bound on EVERY estimate
+        DEGENERATE_SPEED_FLOOR_BPS (1e-6 B/s, tiny so a floored peer still sorts
+        after every working one), a lower bound on EVERY estimate
         (`raw.max(floor)`), where the reference build priced a zero estimate
         at the f64::MAX/2 sentinel. The floor must stay ONE value for every
         candidate: a floor relative to the curve at each candidate's own
