@@ -654,6 +654,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_resident_overhead_evicted_charged_bytes_total: Option<u64>,
     pub interest_resident_bytes_total: Option<u64>,
     pub interest_summary_bound_trims_total: Option<u64>,
+    /// Distinct neighbour-summary bytes held node-wide, excluding our own
+    /// summaries (#5781). Capped at a quarter of
+    /// `hosting_resident_overhead_budget_bytes` by write-time refusal.
+    pub interest_neighbour_summary_bytes: Option<u64>,
     pub interest_summary_bound_trimmed_bytes_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
@@ -3632,6 +3636,7 @@ impl Router {
             hosting_resident_overhead_evicted_charged_bytes_total: None,
             interest_resident_bytes_total: None,
             interest_summary_bound_trims_total: None,
+            interest_neighbour_summary_bytes: None,
             interest_summary_bound_trimmed_bytes_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,

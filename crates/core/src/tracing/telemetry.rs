@@ -3055,6 +3055,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.interest_resident_bytes_total),
                 );
                 obj.insert(
+                    "interest_neighbour_summary_bytes".to_string(),
+                    serde_json::json!(snapshot.interest_neighbour_summary_bytes),
+                );
+                obj.insert(
                     "interest_summary_bound_trims_total".to_string(),
                     serde_json::json!(snapshot.interest_summary_bound_trims_total),
                 );
@@ -3940,6 +3944,7 @@ mod tests {
         info.hosting_resident_overhead_evicted_charged_bytes_total = Some(307);
         info.interest_resident_bytes_total = Some(311);
         info.interest_summary_bound_trims_total = Some(313);
+        info.interest_neighbour_summary_bytes = Some(331);
         info.interest_summary_bound_trimmed_bytes_total = Some(317);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
@@ -3949,6 +3954,7 @@ mod tests {
             ("hosting_resident_overhead_evicted_charged_bytes_total", 307),
             ("interest_resident_bytes_total", 311),
             ("interest_summary_bound_trims_total", 313),
+            ("interest_neighbour_summary_bytes", 331),
             ("interest_summary_bound_trimmed_bytes_total", 317),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");

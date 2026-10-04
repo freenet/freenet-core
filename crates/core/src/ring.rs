@@ -1003,6 +1003,7 @@ impl Ring {
         // `InterestManager` Arc directly creates no cycle: it references
         // neither the ring nor the hosting manager.
         let interest = op_manager.interest_manager.clone();
+        interest.set_neighbour_summary_budget(self.neighbour_summary_budget());
         self.hosting_manager
             .set_interest_bytes_provider(Arc::new(move |key| interest.resident_bytes_for(key)));
     }
@@ -2115,8 +2116,10 @@ impl Ring {
             snapshot.interest_resident_bytes_total = ring
                 .upgrade_op_manager()
                 .map(|op| op.interest_manager.total_resident_bytes());
-            // Neighbour-summary bound trims (#5781).
+            // Neighbour-summary bound trims and node-wide bytes (#5781).
             if let Some(op) = ring.upgrade_op_manager() {
+                snapshot.interest_neighbour_summary_bytes =
+                    Some(op.interest_manager.neighbour_summary_bytes());
                 let (trims, bytes) = op.interest_manager.summary_bound_trim_totals();
                 snapshot.interest_summary_bound_trims_total = Some(trims);
                 snapshot.interest_summary_bound_trimmed_bytes_total = Some(bytes);
@@ -5774,6 +5777,14 @@ impl Ring {
     /// subscribers is evicted LAST (shed only when nothing with fewer
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
+    /// The node-wide budget for distinct neighbour-summary bytes (#5781): a
+    /// quarter of the hosting resident budget, enforced when a summary is
+    /// written so neighbours cannot force eviction through summaries.
+    fn neighbour_summary_budget(&self) -> u64 {
+        self.hosting_manager.resident_overhead_budget_bytes()
+            / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+    }
+
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
         // Neighbour-summary bounds (#5781), BEFORE the hosting sweep re-reads
         // the interest bytes it charges: each hosted contract's distinct
@@ -5785,6 +5796,11 @@ impl Ring {
         // rather than on the interest manager's own timer, means the cache
         // never charges bytes beyond them.
         if let Some(op_manager) = self.upgrade_op_manager() {
+            // The node-wide neighbour-summary budget follows the resident
+            // budget, which the sweep task recomputes each tick.
+            op_manager
+                .interest_manager
+                .set_neighbour_summary_budget(self.neighbour_summary_budget());
             let share = self.hosting_manager.resident_overhead_budget_bytes()
                 / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR;
             op_manager
