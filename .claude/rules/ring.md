@@ -219,15 +219,19 @@ exists because a failure on a contract nobody can serve was learned as evidence
 about the peer that was asked, which raised that peer's forecasts for every
 other contract (#5700, #5702). It is on unconditionally; there is no flag for it.
 
-The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in three roles:
-  - the 50-event gate between distance-only and prediction-based routing, and
-    below it the "prefer untried peers" order (the per-peer EWMA map)
+The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in four routing roles
+(router.rs) plus two others:
+  - the 50-event gate between distance-only and prediction-based routing
+    (has_sufficient_routing_events reads the failure estimator's window)
+  - below the gate, the "prefer untried peers" order: a peer with an entry in
+    the failure estimator's per-peer EWMA map sorts after one without
   - the fallback for a TIMING stage without a hierarchical curve yet (timing
     stages need 30 samples; the failure stage is warm long before the gate
-    opens). A peer the isotonic failure estimate rejects (no location) gets
-    no prediction and sorts last.
-  - the dashboard's distance charts; and ConnectForwardEstimator (CONNECT)
-    is an IsotonicEstimator of its own
+    opens), with the transfer-speed floor below
+  - a peer the isotonic failure estimate rejects (no location) gets no
+    prediction and sorts after every peer that has one
+  - not routing: the dashboard's distance charts; and ConnectForwardEstimator
+    (CONNECT) is an IsotonicEstimator of its own
 Do not remove them without replacing every role.
 
 WHEN touching the router:
@@ -254,8 +258,12 @@ WHEN touching the router:
         a_degenerate_isotonic_transfer_speed_is_floored and the
         a_floored_transfer_speed_* ranking tests; golden_replay skips the
         decisions it changes (golden/degenerate.txt).
-    Both act only while a timing stage has no hierarchical curve, which is
-    the window golden_replay does NOT compare. That window is not a startup
+    Both act only while a timing stage has no hierarchical curve (fewer than
+    30 samples), but they reach golden_replay differently. (1) acts only at
+    10-29 samples, the window golden_replay does NOT compare. (2) acts from
+    the 5th transfer, when the isotonic transfer estimate first exists, so at
+    5-9 transfers it acts INSIDE compared decisions; that is why
+    golden/degenerate.txt exists. That cold period is not a startup
     curiosity: the router is rebuilt empty on every restart, and timed
     samples are about 4% of route events (payload transfers about 2%), so it
     recurs after every restart and lasts a long time. A confirmation soak
