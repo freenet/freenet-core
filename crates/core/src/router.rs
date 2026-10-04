@@ -1813,7 +1813,9 @@ impl Router {
                 .cloned()
                 .collect();
             discarded_unlocated = (history.len() - located.len()) as u64;
-            tracing::debug!(
+            // Once per construction, so bounded; WARN because, as in
+            // `add_event_recording`, this should never happen.
+            tracing::warn!(
                 skipped = discarded_unlocated,
                 "route history events about peers with no known location; not learned"
             );
@@ -2088,10 +2090,25 @@ impl Router {
         // a peer that cannot be placed on the ring says nothing about distance.
         if event.peer.location().is_none() {
             self.route_events_discarded_unlocated += 1;
-            tracing::debug!(
-                peer = ?event.peer,
-                "route event about a peer with no known location; not recorded"
-            );
+            let discarded_total = self.route_events_discarded_unlocated;
+            // A should-be-zero invariant, so it must reach a release log, but a
+            // producer that breaks it may do so on every event: warn at
+            // power-of-two totals (1, 2, 4, 8, ...), as `note_dropped_event_log`
+            // does, and leave the rest at debug.
+            if discarded_total.is_power_of_two() {
+                tracing::warn!(
+                    peer = ?event.peer,
+                    discarded_total,
+                    "route event about a peer with no known location; not learned. A \
+                     route-event producer broke the invariant that routed peers are located"
+                );
+            } else {
+                tracing::debug!(
+                    peer = ?event.peer,
+                    discarded_total,
+                    "route event about a peer with no known location; not recorded"
+                );
+            }
             return;
         }
         let was_below_threshold = !self.has_sufficient_routing_events();
