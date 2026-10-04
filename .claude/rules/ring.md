@@ -228,13 +228,14 @@ The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in three roles:
 Do not remove them without replacing every role.
 
 WHEN touching the router:
-  → router/golden_replay.rs pins routing decisions bit for bit. Keep it
-    green. Regenerate its golden files ONLY for a change you can explain
-    number by number, never to make it pass; record the reason in the commit.
-  → The one known divergence from the build soaked with
-    FREENET_ROUTING_HIERARCHICAL=1 (origin/main d9fa29522): a timing stage
-    holding 10-29 samples no longer blends Renegade into its isotonic
-    fallback. Pinned by
+  → router/golden_replay.rs pins routing decisions bit for bit to the last
+    build that routed with the legacy stack still present (origin/main
+    46bf2002f, flag on; first generated on the soaked d9fa29522 and
+    regenerated once for #5702, see its module doc). Keep it green.
+    Regenerate its golden files ONLY on a shipped or soaked build and for a
+    change you can attribute number by number, never to make it pass.
+  → The one known divergence from that build: a timing stage holding 10-29
+    samples no longer blends Renegade into its isotonic fallback. Pinned by
     a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
   → Routing-behaviour guards cover BOTH paths through Training: History (a
     history-built router never feeds the hierarchical estimator, so it routes

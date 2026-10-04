@@ -1,13 +1,24 @@
-//! Golden replay of routing decisions against the soaked build (#4485).
+//! Golden replay of routing decisions against the reference build (#4485).
 //!
 //! The legacy prediction stack (Renegade, the fixed blend, the residual
 //! correction) was removed after the hierarchical estimator had been soaked with
-//! `FREENET_ROUTING_HIERARCHICAL=1` on a production gateway. That evidence
-//! carries over to this build only if it makes the same routing decisions, so
-//! this test replays fixed route-event sequences and compares every decision
-//! with `golden/<scenario>.txt`. Those files were generated on origin/main
-//! `d9fa29522` with the hierarchical flag forced on and the residual correction
-//! forced off, which is the soak's configuration.
+//! `FREENET_ROUTING_HIERARCHICAL=1` on a production gateway and then shipped as
+//! the default (#5708). That evidence carries over to this build only if it
+//! makes the same routing decisions, so this test replays fixed route-event
+//! sequences and compares every decision with `golden/<scenario>.txt`.
+//!
+//! Those files were generated on origin/main `46bf2002f` (release 0.2.141,
+//! which routes on the hierarchical estimator by default) with this harness,
+//! the hierarchical flag forced on and the residual correction forced off,
+//! which is the soak's configuration. They were first generated on the soaked
+//! build itself, origin/main `d9fa29522`, and regenerated once, for #5702's
+//! changes to the failure stage (a shorter forgetting-horizon menu, the
+//! contract term, and ranking by the value above the `[0, 1]` bound). That
+//! regeneration was checked, not assumed: on `ce5540361`, the commit before
+//! #5702, the harness reproduces the `d9fa29522` files exactly, and on
+//! `829550d41`, #5702's merge, it reproduces the `46bf2002f` files exactly. On
+//! the compared decisions only failure probabilities and the costs built from
+//! them moved; no time-to-response or transfer-speed estimate changed.
 //!
 //! Each line compared covers the full ranked candidate list: which peer sits
 //! at each position, its distance, and the bits of every estimate the router
@@ -17,14 +28,14 @@
 //!
 //! # The one window that is NOT compared
 //!
-//! On the soaked build, a timing stage the hierarchical estimator could not yet
-//! estimate (fewer than 30 samples) fell back to the legacy stack, which
+//! On the reference build, a timing stage the hierarchical estimator could not
+//! yet estimate (fewer than 30 samples) fell back to the legacy stack, which
 //! blended Renegade in once Renegade's own stage held 10 samples. This build
 //! falls back to the same isotonic estimate without the blend. So while either
-//! timing stage holds 10 to 29 samples, decisions can legitimately differ. The
-//! soaked build's output there also depended on the host wall clock (Renegade's
-//! time feature), so it could not be pinned anyway. Those decisions are written
-//! as `W` and skipped. Which decisions fall in the window is computed by this
+//! timing stage holds 10 to 29 samples, decisions can legitimately differ. (On
+//! the soaked build `d9fa29522` the output there also depended on the host wall
+//! clock, through Renegade's time feature; #5755 moved that onto the injected
+//! clock before `46bf2002f`.) Those decisions are written as `W` and skipped. Which decisions fall in the window is computed by this
 //! harness from the event stream, identically on both builds, so the window
 //! cannot widen without the next decision failing.
 //! `a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone` in
@@ -32,10 +43,10 @@
 //!
 //! # The second, narrower difference
 //!
-//! The soaked build priced a candidate whose isotonic transfer-speed estimate
-//! was zero (the additive per-peer EWMA driven to the clamp) at an unroutable
-//! transfer cost. This build floors that estimate. The decisions where the
-//! soaked build did this OUTSIDE the cold window are listed in
+//! The reference build priced a candidate whose isotonic transfer-speed
+//! estimate was zero (the additive per-peer EWMA driven to the clamp) at an
+//! unroutable transfer cost. This build floors that estimate. The decisions
+//! where the reference build did this OUTSIDE the cold window are listed in
 //! `golden/degenerate.txt`, derived from its decision trace, and skipped here;
 //! every other decision must still match. So the floor cannot reach any
 //! decision beyond the listed ones without this test failing.
@@ -48,7 +59,10 @@
 //!
 //! Set `FREENET_ROUTER_GOLDEN_WRITE=1` to rewrite the golden files instead of
 //! comparing against them. Only ever do that on a build whose routing has itself
-//! been soaked. Regenerating to make this test pass defeats its only purpose.
+//! shipped or been soaked, with this file installed and `soaked_configuration`
+//! swapped for that build's switches, and only for a change you can attribute
+//! number by number (as above). Regenerating to make this test pass defeats its
+//! only purpose.
 //! Set `FREENET_ROUTER_GOLDEN_TRACE=<dir>` to also write every decision's full
 //! values, window included, as JSON lines, for comparing two builds offline.
 
@@ -81,7 +95,7 @@ const HIERARCHICAL_MIN_SAMPLES: usize = 30;
 
 /// The soak's configuration, held for the duration of a replay.
 ///
-/// On the soaked build this was the only line of the file that differed:
+/// On the reference builds this was the only line of the file that differed:
 ///
 /// ```ignore
 /// fn soaked_configuration() -> (HierarchicalOverrideGuard, CorrectionOverrideGuard) {
@@ -506,7 +520,7 @@ fn check(scenario: &Scenario, coverage: Coverage) {
         std::fs::create_dir_all(GOLDEN_DIR).expect("create golden dir");
         let mut body = format!(
             "# Golden routing decisions for scenario `{}` (see router/golden_replay.rs).\n\
-             # Generated on the soaked build; `W` marks cold-window decisions, not compared.\n",
+             # Generated on the reference build; `W` marks cold-window decisions, not compared.\n",
             scenario.name
         );
         for line in &lines {
