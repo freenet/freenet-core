@@ -1625,11 +1625,32 @@ fn routing_flag_warnings(
     warnings
 }
 
-/// Warn, once per process, about the routing switches: see
-/// [`routing_flag_warnings`].
+/// The INFO line stating which estimator routes, logged once per process when
+/// the first `Router` is built.
+///
+/// The soak's crossover verification greps a node's log for these strings to
+/// confirm its mode, as it did on releases that had the
+/// `FREENET_ROUTING_HIERARCHICAL` switch: `estimator: enabled (default)` and
+/// `estimator: disabled via`. Grep one of those, not the bare prefix
+/// `hierarchical routing estimator: `, which the peer-table saturation notice
+/// in `hierarchical.rs` shares. Pinned by
+/// `the_routing_mode_line_names_the_estimator_that_routes`; change them
+/// together.
+fn routing_mode_line(isotonic_fallback: bool) -> &'static str {
+    if isotonic_fallback {
+        "hierarchical routing estimator: disabled via FREENET_ROUTING_FALLBACK_ISOTONIC \
+         (routing on the emergency isotonic fallback)"
+    } else {
+        "hierarchical routing estimator: enabled (default)"
+    }
+}
+
+/// Once per process, log which estimator routes ([`routing_mode_line`]) and
+/// warn about the routing switches ([`routing_flag_warnings`]).
 fn warn_about_routing_flags() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
+        tracing::info!("{}", routing_mode_line(isotonic_fallback_enabled()));
         for (variable, message) in routing_flag_warnings(|name| std::env::var_os(name)) {
             tracing::warn!(variable, "{message}");
         }
@@ -4543,6 +4564,23 @@ mod tests {
     #[test]
     fn the_isotonic_fallback_switch_reads_its_documented_variable() {
         assert_eq!(ISOTONIC_FALLBACK_ENV, "FREENET_ROUTING_FALLBACK_ISOTONIC");
+    }
+
+    /// The startup line operators and the soak's crossover check grep for a
+    /// node's routing mode.
+    #[test]
+    fn the_routing_mode_line_names_the_estimator_that_routes() {
+        assert_eq!(
+            routing_mode_line(false),
+            "hierarchical routing estimator: enabled (default)"
+        );
+        let fallback = routing_mode_line(true);
+        assert!(
+            fallback.starts_with(
+                "hierarchical routing estimator: disabled via FREENET_ROUTING_FALLBACK_ISOTONIC"
+            ),
+            "{fallback}"
+        );
     }
 
     /// Which routing switches produce a startup warning, and what it says.
