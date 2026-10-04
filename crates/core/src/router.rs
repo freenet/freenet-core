@@ -1353,6 +1353,15 @@ pub(crate) struct Router {
     #[cfg(test)]
     #[serde(skip)]
     predictions_by_model: [std::sync::atomic::AtomicU64; 2],
+    /// Test-only: route events this router learned, by what
+    /// `isotonic_fallback_enabled()` returned on the thread that learned them,
+    /// `[switch off, switch on]`. Like `predictions_by_model` it is router
+    /// state, so it says which setting the nodes' own threads saw; unlike it,
+    /// it counts from the first event rather than from the 50-event gate, so a
+    /// short simulation fills it (`sim_e2e_tests`).
+    #[cfg(test)]
+    #[serde(skip)]
+    events_by_fallback_switch: [u64; 2],
 }
 
 /// Cumulative success / failure counts of the route events this router has
@@ -1406,6 +1415,8 @@ impl Clone for Router {
             recorded_sources: self.recorded_sources.clone(),
             #[cfg(test)]
             predictions_by_model: Default::default(),
+            #[cfg(test)]
+            events_by_fallback_switch: [0; 2],
         }
     }
 }
@@ -1907,6 +1918,8 @@ impl Router {
             recorded_sources: Vec::new(),
             #[cfg(test)]
             predictions_by_model: Default::default(),
+            #[cfg(test)]
+            events_by_fallback_switch: [0; 2],
         }
     }
 
@@ -1975,6 +1988,10 @@ impl Router {
         #[cfg(test)]
         self.recorded_sources
             .push((event.peer.socket_addr(), source));
+        #[cfg(test)]
+        {
+            self.events_by_fallback_switch[usize::from(isotonic_fallback_enabled())] += 1;
+        }
         match event.outcome {
             RouteOutcome::Failure => self.outcome_totals.failures += 1,
             RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => {
@@ -2140,10 +2157,8 @@ impl Router {
         self.outcome_totals
     }
 
-    /// Every `(peer address, result)` pair currently held in the failure
-    /// estimator's rolling window, in insertion order (`1.0` = failure,
-    /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
-    /// route event blamed.
+    /// `(peer address, source)` of every event this router learned. See
+    /// `recorded_sources`.
     #[cfg(test)]
     pub(crate) fn recorded_sources_for_test(
         &self,
@@ -2162,6 +2177,21 @@ impl Router {
         )
     }
 
+    /// Route events learned with the isotonic fallback switch `(off, on)`, as
+    /// the learning thread saw it. See `events_by_fallback_switch`.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "simulation_tests"), allow(dead_code))]
+    pub(crate) fn events_by_fallback_switch_for_test(&self) -> (u64, u64) {
+        (
+            self.events_by_fallback_switch[0],
+            self.events_by_fallback_switch[1],
+        )
+    }
+
+    /// Every `(peer address, result)` pair currently held in the failure
+    /// estimator's rolling window, in insertion order (`1.0` = failure,
+    /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
+    /// route event blamed.
     #[cfg(test)]
     pub(crate) fn failure_window_for_test(&self) -> Vec<(Option<std::net::SocketAddr>, f64)> {
         self.failure_estimator
