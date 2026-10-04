@@ -1366,10 +1366,11 @@ pub(crate) struct Router {
     #[cfg(test)]
     #[serde(skip)]
     recorded_sources: Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)>,
-    /// Test-only: predictions made by this router, `[isotonic fallback,
-    /// hierarchical]`. Router state rather than a thread-local, so a
-    /// simulation can tell which path its nodes ACTUALLY routed on, whatever
-    /// thread ran them (`sim_e2e_tests`).
+    /// Test-only: predictions made by this router on the model routing acts
+    /// on, `[isotonic fallback, hierarchical]`; the other model's predictions
+    /// for the candidate log are not counted. Router state rather than a
+    /// thread-local, so a simulation can tell which path its nodes ACTUALLY
+    /// routed on, whatever thread ran them (`sim_e2e_tests`).
     #[cfg(test)]
     #[serde(skip)]
     predictions_by_model: [std::sync::atomic::AtomicU64; 2],
@@ -2647,9 +2648,14 @@ impl Router {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
         }
+        // Only the model routing acts on: the candidate log also computes the
+        // other one for every candidate, and counting that would read as
+        // routing on both.
         #[cfg(test)]
-        self.predictions_by_model[usize::from(use_hierarchical)]
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if use_hierarchical != isotonic_fallback_enabled() {
+            self.predictions_by_model[usize::from(use_hierarchical)]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Required even though routing acts on the hierarchical failure
         // estimate once it exists: a peer the isotonic estimator cannot estimate
@@ -5169,6 +5175,52 @@ mod tests {
             [&healthy_but_slow, &degenerate_fast, &degenerate],
             "{costs:?}"
         );
+    }
+
+    /// `predictions_by_model` counts the model routing ACTS on, even when the
+    /// candidate log also computes the other model for every candidate. The
+    /// sim A/B's exclusivity checks rely on it: counting both would make each
+    /// arm look as if it had routed on the other once a recorder is on.
+    #[test]
+    fn predictions_by_model_counts_only_the_acting_model_under_capture() {
+        let _seed = GlobalRng::seed_guard(0x4485_C0C7);
+        for fallback in [false, true] {
+            let _routing = force_isotonic_fallback(fallback);
+            let mut router = Router::new(&[]);
+            add_relay_recorded_successes(&mut router, 60);
+            let candidates: Vec<PeerKeyLocation> =
+                (0..5).map(|_| PeerKeyLocation::random()).collect();
+            let (_, decision, captured) = router.select_k_best_peers_capturing(
+                candidates.iter(),
+                Location::new(0.3),
+                candidates.len(),
+                true,
+            );
+            assert!(matches!(
+                decision.strategy,
+                RoutingStrategy::PredictionBased | RoutingStrategy::PredictionFallback
+            ));
+            let captured = captured.expect("a prediction-based decision is captured");
+            assert!(
+                captured
+                    .candidates
+                    .iter()
+                    .any(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+                "the capture must have computed both models, or this is vacuous"
+            );
+            let (isotonic, hierarchical) = router.predictions_by_model_for_test();
+            if fallback {
+                assert!(
+                    isotonic > 0 && hierarchical == 0,
+                    "{isotonic}/{hierarchical}"
+                );
+            } else {
+                assert!(
+                    hierarchical > 0 && isotonic == 0,
+                    "{isotonic}/{hierarchical}"
+                );
+            }
+        }
     }
 
     /// Whether any candidate in a replayed decision prices its transfer as
