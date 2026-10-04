@@ -2,7 +2,7 @@ use super::assets::{CSS, JS, PEER_CSS};
 use super::cards::format_bytes;
 use super::estimator::{
     PeerLine, build_accuracy_panel, build_estimator_chart_or_placeholder, failure_chart_y_max,
-    fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+    fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
 };
 use super::*;
 use crate::router::{AdjustmentMode, Breakdown};
@@ -1006,7 +1006,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 </div>"#,
                 fp = fmt_prediction_prob(pred.failure_probability),
                 rt = fmt_prediction_time(pred.time_to_response_start),
-                ett = fmt_prediction_time(pred.expected_total_time),
+                ett = fmt_expected_total_time(pred.expected_total_time, pred.transfer_speed_bps),
                 ts = fmt_prediction_speed(pred.transfer_speed_bps),
             )
         } else {

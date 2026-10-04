@@ -3441,7 +3441,7 @@ struct IsotonicTimingForecast {
 /// sitting exactly on the curve were estimated at 0.3 to 9 kB/s. That floor
 /// tied them all and moved four compared decisions; 1e-6 B/s lifts only
 /// estimates that are zero for practical purposes and moves none.
-const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1e-6;
+pub(crate) const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1e-6;
 
 /// Recent forecast/outcome pairs kept per stage for the accuracy panel.
 const RECENT_PAIRS: usize = 200;

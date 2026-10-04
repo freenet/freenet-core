@@ -451,8 +451,13 @@ pub fn build_estimator_chart(
     svg
 }
 
-/// Sentinel values (f64::MAX / 2.0 ~ 9e307) indicate insufficient transfer data.
-/// Cap at ~31 years in seconds -- anything above is clearly not a real prediction.
+/// Cap at ~31 years in seconds: anything above is clearly not a real
+/// prediction. The router's `f64::MAX / 2` transfer sentinel is still guarded
+/// against here, but it no longer prices a degenerate isotonic transfer speed:
+/// that speed is floored at `DEGENERATE_SPEED_FLOOR_BPS`, which gives a cost of
+/// `mean transfer size x 1e6` seconds, BELOW this limit for a mean under 1 kB
+/// (just after a restart). Render a cost beside its speed with
+/// [`fmt_expected_total_time`], which recognises that case.
 const REASONABLE_TIME_LIMIT: f64 = 1.0e9;
 
 pub fn fmt_prediction_time(v: f64) -> String {
@@ -463,9 +468,31 @@ pub fn fmt_prediction_time(v: f64) -> String {
     }
 }
 
+/// Whether a transfer speed is the router's floor under a degenerate isotonic
+/// estimate rather than a measurement: such a peer sorts after every working
+/// one, and its speed and cost are placeholders.
+fn is_floored_speed(v: f64) -> bool {
+    v.is_finite() && v > 0.0 && v <= crate::router::DEGENERATE_SPEED_FLOOR_BPS
+}
+
+/// A routing cost, or "not routable" when it was built on a floored transfer
+/// speed (see [`is_floored_speed`]), whose cost is a placeholder that can read
+/// like a real number of seconds.
+pub fn fmt_expected_total_time(total: f64, transfer_speed_bps: f64) -> String {
+    if is_floored_speed(transfer_speed_bps) {
+        "N/A (transfer speed degenerate: ranked last)".to_string()
+    } else {
+        fmt_prediction_time(total)
+    }
+}
+
 pub fn fmt_prediction_speed(v: f64) -> String {
-    if v.is_finite() && v > 0.0 {
+    if is_floored_speed(v) {
+        "N/A (degenerate estimate)".to_string()
+    } else if v.is_finite() && v >= 10.0 {
         format!("{v:.0} B/s")
+    } else if v.is_finite() && v > 0.0 {
+        format!("{v:.2} B/s")
     } else {
         "N/A".to_string()
     }

@@ -227,7 +227,8 @@ mod tests {
     use super::estimator::{
         PeerLine, RegKind, build_accuracy_panel, build_estimator_chart,
         build_estimator_chart_or_placeholder, build_regression_chart, build_reliability_chart,
-        failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+        failure_chart_y_max, fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed,
+        fmt_prediction_time,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -1413,6 +1414,25 @@ mod tests {
         assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
         assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
         assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+        assert_eq!(fmt_prediction_speed(0.5), "0.50 B/s");
+    }
+
+    /// A peer whose isotonic transfer speed is floored has a placeholder speed
+    /// and cost. The cost (`mean x 1e6` s) is below `REASONABLE_TIME_LIMIT`
+    /// for a mean under 1 kB, so without this it rendered as a real time
+    /// ("100000000.000s") and the speed as "0 B/s".
+    #[test]
+    fn a_floored_transfer_speed_renders_as_not_routable() {
+        let floor = crate::router::DEGENERATE_SPEED_FLOOR_BPS;
+        assert_eq!(fmt_prediction_speed(floor), "N/A (degenerate estimate)");
+        let cost = 100.0 / floor;
+        assert!(cost < 1.0e9, "the case this guards: {cost} reads as a time");
+        assert_eq!(
+            fmt_expected_total_time(cost, floor),
+            "N/A (transfer speed degenerate: ranked last)"
+        );
+        assert_eq!(fmt_expected_total_time(1.5, 1024.0), "1.500s");
+        assert_eq!(fmt_expected_total_time(f64::MAX / 2.0, 1024.0), "N/A");
     }
 
     /// Regression: with no data the helper must still emit a titled
