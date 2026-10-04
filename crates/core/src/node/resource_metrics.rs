@@ -21,15 +21,18 @@ use crate::transport::TRANSPORT_METRICS;
 /// A point-in-time sample of the node's own resource utilization.
 ///
 /// Every field is best-effort: the memory / CPU fields are `Option` because
-/// their `/proc` sources are Linux-only and can fail to parse; the bandwidth
-/// counters are always available from the in-process transport metrics.
+/// their sources are platform-specific and can fail (CPU time is Linux-only;
+/// RSS and the memory limit are read on Linux, macOS and Windows); the
+/// bandwidth counters are always available from the in-process transport
+/// metrics.
 ///
 /// Serialized to JSON for the telemetry stream (`resource_utilization` event).
 /// It is NOT a wire-protocol type and must not be embedded in one.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct ResourceUtilization {
     /// Resident set size (bytes): the node process's current physical-memory
-    /// footprint. `None` off Linux or if `/proc/self/statm` is unreadable.
+    /// footprint, from `wasm_runtime::read_own_rss_bytes` (Linux, macOS,
+    /// Windows). `None` on other platforms or if the read fails.
     pub memory_rss_bytes: Option<u64>,
     /// Memory ceiling the node may use (bytes): `min(host RAM, cgroup limit)`.
     /// This is the SAME source that sizes the module cache and (piece A2) the
@@ -59,7 +62,7 @@ impl ResourceUtilization {
 
 /// Sample the node's current resource utilization from cheap local sources.
 ///
-/// Reads `/proc/self/statm` (RSS), `/proc/self/stat` (CPU time),
+/// Reads RSS via [`crate::wasm_runtime::read_own_rss_bytes`], `/proc/self/stat` (CPU time),
 /// [`crate::wasm_runtime::read_total_ram_bytes`] (memory ceiling) and the
 /// in-process [`TRANSPORT_METRICS`] cumulative byte counters. Never blocks on
 /// the network and never panics.
@@ -73,27 +76,13 @@ pub(crate) fn sample() -> ResourceUtilization {
     }
 }
 
-/// Returns the process RSS (Resident Set Size) in bytes by reading
-/// `/proc/self/statm`. Returns `None` on non-Linux platforms or if the read
-/// fails.
+/// Returns the process RSS (Resident Set Size) in bytes on Linux, macOS and
+/// Windows, via the shared reader `wasm_runtime::read_own_rss_bytes`. `None`
+/// on other platforms or if the read fails. Before #5647 this was a
+/// Linux-only `/proc/self/statm` reader duplicating that one, so macOS and
+/// Windows nodes reported no RSS at all.
 pub(crate) fn rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        // SAFETY: `sysconf(_SC_PAGESIZE)` is a POSIX-defined, signal-safe call
-        // that reads a system constant and has no preconditions.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size > 0 {
-            Some(rss_pages * page_size as u64)
-        } else {
-            None
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    crate::wasm_runtime::read_own_rss_bytes().map(|b| b as u64)
 }
 
 /// Returns cumulative process CPU time (user + system) in seconds by reading

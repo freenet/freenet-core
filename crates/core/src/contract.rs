@@ -7,10 +7,16 @@ use std::sync::Arc;
 use either::Either;
 use freenet_stdlib::prelude::*;
 
+#[cfg(test)]
+mod capability_loop_tests;
 pub(crate) mod delegate_app_registry;
+pub(crate) mod delegate_capabilities;
 mod delegate_park;
+mod delegate_restore;
 mod executor;
 mod fair_queue;
+#[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
+mod wakeup_wasm_tests;
 pub(crate) use fair_queue::Priority;
 /// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
 /// than widening `fair_queue` itself, which is otherwise private to this
@@ -22,11 +28,12 @@ mod state_size_metrics;
 pub mod storages;
 pub(crate) mod user_input;
 
+#[cfg(test)]
+pub(crate) use executor::declared_cache_ceiling;
 pub(crate) use executor::{
     ContractExecutor, ExecutorTransactionStream, ExportBusy, MAX_CREATED_DELEGATES_PER_NODE,
     MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL,
-    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, declared_cache_ceiling,
-    mock_runtime::MockRuntime,
+    SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, mock_runtime::MockRuntime,
 };
 
 // Re-export CRDT emulation functions for testing
@@ -805,7 +812,7 @@ fn contract_op_response_msg(
 /// process. In the in-process multi-node harness that means every node ever
 /// built. A hold that cannot upgrade has nothing left to release, because the
 /// `InterestManager` it would decrement went with the `OpManager`.
-fn delegate_interest_release_closure(
+pub(crate) fn delegate_interest_release_closure(
     op_manager: &std::sync::Arc<crate::node::OpManager>,
 ) -> crate::wasm_runtime::delegate_interest::InterestRelease {
     let weak = std::sync::Arc::downgrade(op_manager);
@@ -952,7 +959,14 @@ where
         // subscription's hold has to be given back — `subscribe` does that
         // itself (see `SubscribeOutcome::RegisteredEvicting`), because a caller
         // that ignores the outcome compiles fine and two of the three do.
-        crate::wasm_runtime::delegate_subscriptions::subscribe(pending.contract_id, delegate_key);
+        let durable_store = contract_handler.executor().delegate_subscription_store();
+        crate::wasm_runtime::delegate_subscriptions::subscribe(
+            pending.contract_id,
+            delegate_key,
+            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                durable_store.as_ref(),
+            ),
+        );
         // RECORD THE OBLIGATION THIS SUBSCRIBE JUST INCURRED (#5542).
         //
         // `run_executor_subscribe` ended in
@@ -1011,13 +1025,19 @@ where
                 // WEAK, so an outstanding hold never keeps a shut-down node's
                 // `OpManager` alive. A hold that cannot upgrade has nothing
                 // left to release.
-                crate::wasm_runtime::delegate_interest::record(
+                if !crate::wasm_runtime::delegate_interest::record(
                     pending.contract_id,
                     delegate_key.clone(),
                     key,
                     delegate_interest_release_closure(&op_manager),
                     op_manager.node_identity,
-                );
+                ) {
+                    // This node already held the pair's obligation (the
+                    // boot-time restore recorded it while this subscribe was
+                    // in flight, #5493), so the refcount this subscribe took
+                    // is unaccounted for. Give it back rather than leak it.
+                    op_manager.interest_manager.remove_local_client(&key);
+                }
             }
             None => {
                 // No `OpManager` means no `run_executor_subscribe` ran, so no
@@ -1206,6 +1226,11 @@ struct ParkingCtx<'a> {
     /// new continuation, and if it completes the caller reads what is left here
     /// and answers the client. A fresh run passes `&mut None`.
     carried_responder: &'a mut Option<StashedResponder>,
+    /// Whether this run's loop time is charged to the NODE duty bucket too:
+    /// lifecycle and wake-up runs, not notification or client runs. Carried
+    /// into the continuation so a resumed leg is charged like the first one
+    /// (see `handle_delegate_resume`).
+    node_wide_duty: bool,
 }
 
 /// State carried into a delegate run that is continuing an earlier one.
@@ -1426,17 +1451,23 @@ where
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
                 // migration probes when old delegate WASM isn't on this node.
-                // A missing-delegate probe stays a benign empty response
-                // rather than a client-visible error; only genuine execution
-                // failures propagate as Err below (#5263 — previously EVERY
-                // failure here, including real ones, silently became an
-                // empty successful DelegateResponse to the client).
+                //
+                // The LOG is downgraded, the ANSWER is not (#5727): the client
+                // gets the typed `DelegateError::Missing`, exactly what
+                // `freenet local` answers. This used to return
+                // `Completed(accumulated_messages)` — an empty successful
+                // `DelegateResponse` — so a migration walk could not tell "not
+                // registered here" from "registered and said nothing", and a
+                // rehearsal on `freenet local` did not show what network users
+                // hit (freenet/harvest#150). `Failed` carries the typed error
+                // to the client; `client_events` keeps it typed rather than
+                // flattening it to an `OperationError` string.
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
                         "Delegate not found in store (expected for migration probes)"
                     );
-                    return DelegateRunOutcome::Completed(accumulated_messages);
+                    return DelegateRunOutcome::Failed(err);
                 }
                 tracing::error!(
                     delegate_key = %delegate_key,
@@ -1516,6 +1547,36 @@ where
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
+
+        // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
+        // opted into capabilities (a manifest, registered by an app that holds
+        // the Background grant; every other delegate, including an ungranted
+        // manifest delegate, is untouched as before this budget existed), a
+        // run no client asked for —
+        // a contract notification or a lifecycle event — is admitted per
+        // operation (local or network) against per-delegate and node-wide
+        // per-minute allowances, plus a per-(delegate, contract) write bound
+        // that caps the #5558 self-notification loop. Refused operations are
+        // answered at once with a refusal the delegate can see (GET has no
+        // error channel, so it reads as "not found"), and counted.
+        if is_unprompted_run(inter_delegate)
+            && !(get_requests.is_empty()
+                && put_requests.is_empty()
+                && update_requests.is_empty()
+                && subscribe_requests.is_empty())
+            && let Some(caps) = contract_handler.executor().delegate_capabilities()
+            && caps.is_budgeted(delegate_key)
+        {
+            admit_unprompted_ops(
+                &caps,
+                delegate_key,
+                &mut get_requests,
+                &mut put_requests,
+                &mut update_requests,
+                &mut subscribe_requests,
+                &mut inbound_responses,
+            );
+        }
         // Delegate PUT/UPDATEs whose contract asked for related contracts this
         // node does not hold. Their network fetch is off-loaded with the rest of
         // this iteration's slow work rather than awaited here (#5544 stall 1).
@@ -2156,13 +2217,18 @@ where
                                         )
                                         .await;
                                     }
-                                    crate::wasm_runtime::delegate_interest::record(
+                                    if !crate::wasm_runtime::delegate_interest::record(
                                         contract_id,
                                         delegate_key.clone(),
                                         full_key,
                                         delegate_interest_release_closure(&op_manager),
                                         op_manager.node_identity,
-                                    );
+                                    ) {
+                                        // Already held (boot-time restore won
+                                        // the race across the await above,
+                                        // #5493): return the extra refcount.
+                                        op_manager.interest_manager.remove_local_client(&full_key);
+                                    }
                                     true
                                 }
                                 // No `OpManager` means no eviction pressure worth
@@ -2176,9 +2242,14 @@ where
                             interest_registered,
                             "Delegate subscribed to a contract this node already holds"
                         );
+                        let durable_store =
+                            contract_handler.executor().delegate_subscription_store();
                         crate::wasm_runtime::delegate_subscriptions::subscribe(
                             contract_id,
                             delegate_key,
+                            crate::wasm_runtime::delegate_subscriptions::Durability::from_store(
+                                durable_store.as_ref(),
+                            ),
                         );
                         Ok(())
                     } else if parking.is_some()
@@ -2538,6 +2609,7 @@ where
                     // is itself a resume that is parking again.
                     responder: ctx.carried_responder.take(),
                     delivery: ctx.delivery,
+                    node_wide_duty: ctx.node_wide_duty,
                 };
                 // Charge what the OFF-LOOP TASK will retain, not just what the
                 // continuation points at: the prompts and the deferred upserts
@@ -2912,6 +2984,20 @@ where
     let mut delegate_rx = contract_handler.executor().take_delegate_notification_rx();
     let mut fair_queue = fair_queue::FairEventQueue::new();
 
+    // Lifecycle events for delegates that asked for them and whose app holds
+    // the Background grant (`delegate_capabilities`). Producers `try_send`
+    // into the bounded channel; the loop moves them into a due-time schedule
+    // and runs a few per iteration.
+    let capabilities = contract_handler.executor().delegate_capabilities();
+    let mut lifecycle_rx = capabilities
+        .as_ref()
+        .and_then(|caps| caps.take_lifecycle_rx());
+    let mut lifecycle_schedule = delegate_capabilities::LifecycleSchedule::default();
+    if let Some(caps) = &capabilities {
+        refresh_capability_manifests(contract_handler.executor(), caps);
+        seed_node_started(caps, &mut lifecycle_schedule);
+    }
+
     // Resume channel for PUT/UPDATE operations whose related-contract fetch was
     // off-loaded from this serial loop (#4391). Off-loop waiter tasks send the
     // fetched states back here; the loop re-runs the upsert ON the loop so WASM
@@ -3124,6 +3210,43 @@ where
             }
         }
 
+        // Lifecycle runs: move newly queued ones into the schedule, then run
+        // the due ones, a bounded number per iteration so they cannot starve
+        // client work. A run that cannot start yet re-schedules itself in the
+        // future, so a due deadline never stays in the past (no spin).
+        if let Some(rx) = lifecycle_rx.as_mut() {
+            let now = lifecycle_now(capabilities.as_deref());
+            for _ in 0..delegate_capabilities::LIFECYCLE_QUEUE_CAPACITY {
+                match rx.try_recv() {
+                    Ok(run) => {
+                        schedule_queued_run(
+                            capabilities.as_deref(),
+                            &mut lifecycle_schedule,
+                            now,
+                            run,
+                        );
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        for _ in 0..delegate_capabilities::MAX_LIFECYCLE_RUNS_PER_ITERATION {
+            let Some((run, attempts)) =
+                lifecycle_schedule.pop_due(lifecycle_now(capabilities.as_deref()))
+            else {
+                break;
+            };
+            run_lifecycle(
+                &mut contract_handler,
+                &mut park_ctx,
+                &prompter,
+                &mut lifecycle_schedule,
+                run,
+                attempts,
+            )
+            .await;
+        }
+
         // Drain delegate notifications (non-blocking, bounded) even when the fair queue
         // has work. This prevents delegate starvation under sustained contract load.
         // We drain up to MAX_DELEGATE_DRAIN_BATCH to handle bursts (e.g., a contract
@@ -3210,6 +3333,7 @@ where
         // `pending()` when nothing is parked, so an idle node with no parks
         // still blocks indefinitely rather than spinning on a timer.
         let park_deadline = park_ctx.next_sweep_deadline();
+        let lifecycle_deadline = lifecycle_schedule.next_deadline();
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
@@ -3255,7 +3379,213 @@ where
                 )
                 .await;
             }
+            // A newly queued lifecycle run, or a scheduled one falling due.
+            // Wake only: both are handled at the top of the next iteration.
+            Some(run) = async {
+                match lifecycle_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                schedule_queued_run(
+                    capabilities.as_deref(),
+                    &mut lifecycle_schedule,
+                    lifecycle_now(capabilities.as_deref()),
+                    run,
+                );
+            }
+            () = async {
+                match lifecycle_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
         }
+    }
+}
+
+/// The clock the lifecycle schedule runs on: the capabilities' time source,
+/// which is what `run_lifecycle` uses for retry deadlines.
+fn lifecycle_now(
+    caps: Option<&delegate_capabilities::DelegateCapabilities>,
+) -> tokio::time::Instant {
+    caps.map_or_else(tokio::time::Instant::now, |c| c.now())
+}
+
+/// Put a run that arrived on the capability queue into the schedule: a
+/// lifecycle event is due now, a freshly armed wake-up after
+/// [`delegate_capabilities::first_wakeup_delay`]. A duplicate of a waiting run
+/// is dropped (see `LifecycleSchedule::push`), and counted; for a wake-up that
+/// is the normal case (every registration re-arms, and the chain already
+/// running is kept as it is).
+fn schedule_queued_run(
+    caps: Option<&delegate_capabilities::DelegateCapabilities>,
+    schedule: &mut delegate_capabilities::LifecycleSchedule,
+    now: tokio::time::Instant,
+    run: delegate_capabilities::LifecycleRun,
+) {
+    use std::sync::atomic::Ordering;
+    let is_wakeup = matches!(run.event, delegate_capabilities::RunEvent::Wakeup { .. });
+    let due = match &run.event {
+        delegate_capabilities::RunEvent::Lifecycle(_) => now,
+        delegate_capabilities::RunEvent::Wakeup { every, .. } => {
+            now + delegate_capabilities::first_wakeup_delay(*every)
+        }
+    };
+    // Already scheduled (every registration re-arms a wake-up): skip the cap
+    // check, and above all its sweep, for the routine case. A duplicate
+    // lifecycle run still goes to `push`, which restarts the waiting run's
+    // attempt count.
+    if is_wakeup && schedule.contains(&run.key, &run.event.kind()) {
+        if let Some(caps) = caps {
+            caps.stats
+                .wakeups_already_armed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if is_wakeup && schedule.wakeup_count() >= delegate_capabilities::MAX_SCHEDULED_WAKEUPS {
+        // Entries of delegates unregistered since they were armed linger
+        // until due; sweep them before refusing anything. Kept: everything
+        // still eligible, and anything whose eligibility cannot be read now.
+        if let Some(caps) = caps {
+            schedule.retain_wakeups(|key, tag| {
+                caps.wakeup_check(key, tag) != delegate_capabilities::WakeupCheck::Ineligible
+            });
+        }
+        if schedule.wakeup_count() >= delegate_capabilities::MAX_SCHEDULED_WAKEUPS {
+            if let Some(caps) = caps {
+                caps.stats
+                    .wakeups_schedule_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(delegate = %run.key, "Wake-up schedule full; not arming this wake-up");
+            return;
+        }
+    }
+    if !schedule.push(due, run, 0)
+        && let Some(caps) = caps
+    {
+        let counter = if is_wakeup {
+            &caps.stats.wakeups_already_armed
+        } else {
+            &caps.stats.lifecycle_deduplicated
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Re-read the manifest of every granted delegate from its stored code, so a
+/// record written by an older node (which dropped manifest fields it did not
+/// know, such as `wakeups`) reflects what the delegate actually declares. Runs
+/// once, before [`seed_node_started`], so wake-ups declared by a delegate
+/// registered under an older release are armed on the first start of this
+/// one without its app having to register it again.
+///
+/// Bounded by the granted records (at most `MAX_CAPABILITY_RECORDS`), and
+/// only reads code this node already stores. A delegate whose code cannot be
+/// loaded keeps its record unchanged.
+fn refresh_capability_manifests<E: ContractExecutor>(
+    executor: &E,
+    caps: &delegate_capabilities::DelegateCapabilities,
+) {
+    let mut refreshed = 0usize;
+    for key in caps.granted_record_keys() {
+        let Some(code) = executor.delegate_code(&key) else {
+            continue;
+        };
+        if let Some(manifest) = delegate_capabilities::read_manifest(&key, &code)
+            && caps.refresh_manifest(&key, manifest)
+        {
+            refreshed += 1;
+        }
+    }
+    if refreshed > 0 {
+        tracing::info!(
+            delegates = refreshed,
+            "Refreshed background delegates' manifests from their stored code"
+        );
+    }
+}
+
+/// Schedule `NodeStarted` for every delegate that asked for it and whose app
+/// holds the Background grant, spread over [`delegate_capabilities::
+/// NODE_STARTED_SMEAR`] after a short start-up delay. Also arms every declared
+/// wake-up of those delegates (first fire per
+/// [`delegate_capabilities::first_wakeup_delay`]): wake-ups are re-armed at
+/// each start rather than persisted.
+///
+/// Runs when the loop starts, which is after `NetworkContractHandler::build`
+/// returned: the durable delegate-subscription REGISTRY is restored by then
+/// (#5728), but its network re-establishment is paced in the background and
+/// may still be running when NodeStarted arrives. A handler that
+/// re-subscribes can race it; that race is handled by the restore
+/// (`delegate_restore`), and the re-subscribe goes through the unprompted-run
+/// budget like any other.
+///
+/// Also re-queues `Installed` for granted delegates still owed it (an earlier
+/// delivery was dropped). It is scheduled first, so it normally runs before
+/// NodeStarted; if it is deferred (delegate parked, duty spent) NodeStarted
+/// can still arrive first.
+fn seed_node_started(
+    caps: &delegate_capabilities::DelegateCapabilities,
+    schedule: &mut delegate_capabilities::LifecycleSchedule,
+) {
+    for key in caps.installed_pending_targets() {
+        schedule.push(
+            caps.now() + delegate_capabilities::NODE_STARTED_MIN_DELAY,
+            delegate_capabilities::LifecycleRun {
+                key,
+                event: LifecycleEvent::Installed.into(),
+            },
+            0,
+        );
+    }
+    let wakeups = caps.wakeup_start_targets();
+    if !wakeups.is_empty() {
+        tracing::info!(
+            wakeups = wakeups.len(),
+            "Arming background delegates' wake-ups"
+        );
+    }
+    for (key, tag, every) in wakeups {
+        schedule.push(
+            caps.now() + delegate_capabilities::first_wakeup_delay(every),
+            delegate_capabilities::LifecycleRun {
+                key,
+                event: delegate_capabilities::RunEvent::Wakeup { tag, every },
+            },
+            0,
+        );
+    }
+    let targets = caps.node_started_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let now = caps.now();
+    let smear_ms = delegate_capabilities::NODE_STARTED_SMEAR.as_millis() as u64;
+    tracing::info!(
+        delegates = targets.len(),
+        "Scheduling NodeStarted for background delegates"
+    );
+    for key in targets {
+        let offset = std::time::Duration::from_millis(
+            crate::config::GlobalRng::random_u64() % smear_ms.max(1),
+        );
+        schedule.push(
+            now + delegate_capabilities::NODE_STARTED_MIN_DELAY + offset,
+            delegate_capabilities::LifecycleRun {
+                key,
+                // This node does not record when it last ran yet; `None`
+                // means "unknown", which the delegate must treat as "maybe
+                // missed anything".
+                event: LifecycleEvent::NodeStarted {
+                    down_since_ms: None,
+                }
+                .into(),
+            },
+            0,
+        );
     }
 }
 
@@ -4032,6 +4362,14 @@ async fn handle_delegate_notification<CH, P>(
     // A notification-driven run has no client responder to carry; the slot
     // exists only to satisfy the shared `ParkingCtx` shape.
     let mut no_responder = None;
+    // Charged to the delegate's duty budget, so a delegate that spends its
+    // loop time on notifications waits longer for its lifecycle runs. Not
+    // ENFORCED here: deferring notifications is a separate change.
+    let duty_clock = contract_handler
+        .executor()
+        .delegate_capabilities()
+        .filter(|caps| caps.is_budgeted(&delegate_key))
+        .map(|caps| (caps.now(), caps));
     let outcome = handle_delegate_with_contract_requests(
         contract_handler,
         req,
@@ -4059,11 +4397,19 @@ async fn handle_delegate_notification<CH, P>(
             // No client behind a notification-driven run; residual messages fan
             // out to registered apps instead.
             delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: false,
             carried_responder: &mut no_responder,
         }),
         RunSeed::default(),
     )
     .await;
+    if let Some((started, caps)) = duty_clock {
+        caps.charge_duty(
+            &delegate_key,
+            caps.now().saturating_duration_since(started),
+            false,
+        );
+    }
 
     match outcome {
         // Notification-driven run: no client responder to stash. The residual
@@ -4151,6 +4497,510 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
     }
 }
 
+/// Whether a delegate run was started by the node rather than by a client.
+///
+/// Notification runs, queued notification runs and lifecycle runs are the
+/// callers that pass `InterDelegateDispatch::Suppressed`, and every one of
+/// them is unprompted; client-driven runs pass `Allowed`. The continuation of
+/// a parked run carries the value across the park, so a resumed run is
+/// classified like the run it continues. Pinned by
+/// `unprompted_runs_are_exactly_the_suppressed_ones`.
+fn is_unprompted_run(inter_delegate: InterDelegateDispatch) -> bool {
+    inter_delegate == InterDelegateDispatch::Suppressed
+}
+
+/// Apply the unprompted-run budget to one iteration's network operations,
+/// answering refused ones in `inbound_responses`.
+fn admit_unprompted_ops(
+    caps: &delegate_capabilities::DelegateCapabilities,
+    delegate_key: &DelegateKey,
+    gets: &mut Vec<GetContractRequest>,
+    puts: &mut Vec<PutContractRequest>,
+    updates: &mut Vec<UpdateContractRequest>,
+    subscribes: &mut Vec<SubscribeContractRequest>,
+    inbound_responses: &mut Vec<InboundDelegateMsg<'static>>,
+) {
+    gets.retain(|req| match caps.admit_op(delegate_key, None) {
+        Ok(()) => true,
+        Err(_) => {
+            inbound_responses.push(InboundDelegateMsg::GetContractResponse(
+                GetContractResponse {
+                    contract_id: req.contract_id,
+                    state: None,
+                    context: req.context.clone(),
+                },
+            ));
+            false
+        }
+    });
+    puts.retain(|req| {
+        let contract_id = *req.contract.key().id();
+        match caps.admit_op(delegate_key, Some(&contract_id)) {
+            Ok(()) => true,
+            Err(refusal) => {
+                inbound_responses.push(InboundDelegateMsg::PutContractResponse(
+                    PutContractResponse {
+                        contract_id,
+                        result: Err(refusal.message().to_string()),
+                        context: req.context.clone(),
+                    },
+                ));
+                false
+            }
+        }
+    });
+    updates.retain(
+        |req| match caps.admit_op(delegate_key, Some(&req.contract_id)) {
+            Ok(()) => true,
+            Err(refusal) => {
+                inbound_responses.push(InboundDelegateMsg::UpdateContractResponse(
+                    UpdateContractResponse {
+                        contract_id: req.contract_id,
+                        result: Err(refusal.message().to_string()),
+                        context: req.context.clone(),
+                    },
+                ));
+                false
+            }
+        },
+    );
+    subscribes.retain(|req| match caps.admit_op(delegate_key, None) {
+        Ok(()) => true,
+        Err(refusal) => {
+            inbound_responses.push(InboundDelegateMsg::SubscribeContractResponse(
+                SubscribeContractResponse {
+                    contract_id: req.contract_id,
+                    result: Err(refusal.message().to_string()),
+                    context: req.context.clone(),
+                },
+            ));
+            false
+        }
+    });
+}
+
+/// Inbound messages only the node may deliver. A client's `ApplicationMessages`
+/// carrying one is refused: a page must not be able to tell a delegate it was
+/// installed, that the node started, or that a wake-up fired. Those messages
+/// open work the delegate would otherwise only do with the user's Background
+/// grant, and the delegate cannot tell a forged one from a real one, because
+/// neither carries an origin.
+fn carries_host_only_inbound(req: &DelegateRequest<'_>) -> bool {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match req {
+        DelegateRequest::ApplicationMessages { inbound, .. } => inbound.iter().any(|msg| {
+            matches!(
+                msg,
+                InboundDelegateMsg::Lifecycle(_) | InboundDelegateMsg::WakeupFired { .. }
+            )
+        }),
+        // Registration requests carry no inbound messages. The wildcard is for
+        // `#[non_exhaustive]`.
+        _ => false,
+    }
+}
+
+/// Capability work owed once a (un)registration has SUCCEEDED. Built before
+/// the run, because the request is consumed by it.
+enum CapabilityHook {
+    Registered {
+        key: DelegateKey,
+        manifest: DelegateManifest,
+        params: Vec<u8>,
+        app: Option<delegate_capabilities::AppIdentity>,
+    },
+    Unregistered {
+        key: DelegateKey,
+        app: Option<delegate_capabilities::AppIdentity>,
+    },
+}
+
+fn capability_hook(
+    capabilities_enabled: bool,
+    req: &DelegateRequest<'_>,
+    origin_contract: Option<&ContractInstanceId>,
+    connection_scope: crate::client_events::ConnectionScope,
+) -> Option<CapabilityHook> {
+    if !capabilities_enabled {
+        return None;
+    }
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match req {
+        DelegateRequest::RegisterDelegate { delegate, .. } => {
+            let key = delegate.key().clone();
+            // No manifest (every delegate built before manifests): nothing to do.
+            let manifest = delegate_capabilities::read_manifest(&key, delegate.code().data())?;
+            let params = match delegate {
+                DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => {
+                    d.params().as_ref().to_vec()
+                }
+                // `#[non_exhaustive]`; registration refuses unknown versions.
+                _ => return None,
+            };
+            // The same gate the executor applies before recording the
+            // registration origin (GHSA-824h-7x5x-wfmf): only a LOCAL
+            // connection's app claim binds the delegate to an app. A remote
+            // caller can mint a token for any contract id.
+            let app = if connection_scope.is_local() {
+                origin_contract.map(|id| delegate_capabilities::AppIdentity::WebApp(*id))
+            } else {
+                None
+            };
+            Some(CapabilityHook::Registered {
+                key,
+                manifest,
+                params,
+                app,
+            })
+        }
+        // Only a local connection may drop the record: a remote caller could
+        // otherwise unregister a delegate to reset its Installed flag and its
+        // app bindings (UnregisterDelegate itself is not gated, pre-existing).
+        DelegateRequest::UnregisterDelegate(key) if connection_scope.is_local() => {
+            Some(CapabilityHook::Unregistered {
+                key: key.clone(),
+                app: origin_contract.map(|id| delegate_capabilities::AppIdentity::WebApp(*id)),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn finish_capability_hook<CH, P>(
+    contract_handler: &mut CH,
+    prompter: &std::sync::Arc<P>,
+    hook: CapabilityHook,
+) where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let Some(caps) = contract_handler.executor().delegate_capabilities() else {
+        return;
+    };
+    match hook {
+        CapabilityHook::Registered {
+            key,
+            manifest,
+            params,
+            app,
+        } => {
+            if let Some(prompt) = caps.on_registered_manifest(&key, manifest, &params, app) {
+                spawn_capability_prompt(prompter, caps, prompt);
+            }
+        }
+        CapabilityHook::Unregistered { key, app } => caps.on_unregistered(&key, app),
+    }
+}
+
+/// Ask the user for a capability grant OFF the loop: a prompt waits up to
+/// `USER_INPUT_TIMEOUT` for a human, and the loop must keep serving everyone
+/// else meanwhile (#5544). The answer is written straight to the grant store;
+/// an Allow queues `Installed` through the lifecycle channel.
+fn spawn_capability_prompt<P>(
+    prompter: &std::sync::Arc<P>,
+    caps: std::sync::Arc<delegate_capabilities::DelegateCapabilities>,
+    prompt: delegate_capabilities::CapabilityPrompt,
+) where
+    P: UserInputPrompter + 'static,
+{
+    /// Releases the app's in-flight prompt slot however the task ends, so a
+    /// panicking or dropped prompt cannot suppress every later prompt for that
+    /// app until restart.
+    ///
+    /// Holds the capabilities WEAKLY: they own a redb handle, and a prompt
+    /// can wait a minute for a human, so a strong reference would keep the
+    /// database locked past a node shutdown. If the node is gone by the time
+    /// the answer arrives, there is nothing to record it in.
+    struct Unanswered {
+        caps: std::sync::Weak<delegate_capabilities::DelegateCapabilities>,
+        prompt: Option<delegate_capabilities::CapabilityPrompt>,
+    }
+    impl Drop for Unanswered {
+        fn drop(&mut self) {
+            if let Some(prompt) = self.prompt.take()
+                && let Some(caps) = self.caps.upgrade()
+            {
+                caps.prompt_unanswered(&prompt);
+            }
+        }
+    }
+
+    let prompter = prompter.clone();
+    // Short-lived (bounded by USER_INPUT_TIMEOUT), so fire-and-forget.
+    drop(GlobalExecutor::spawn(async move {
+        let mut guard = Unanswered {
+            caps: std::sync::Arc::downgrade(&caps),
+            prompt: Some(prompt),
+        };
+        drop(caps);
+        let Some(prompt) = guard.prompt.clone() else {
+            return;
+        };
+        let answer = prompter
+            .prompt_capability(
+                prompt.message(),
+                delegate_capabilities::CapabilityPrompt::labels(),
+                &prompt.delegate.to_string(),
+                CallerIdentity::WebApp(prompt.app.display()),
+            )
+            .await;
+        if let Some(index) = answer
+            && let Some(caps) = guard.caps.upgrade()
+        {
+            guard.prompt = None;
+            caps.record_answer(
+                &prompt,
+                index == delegate_capabilities::CapabilityPrompt::ALLOW_INDEX,
+            );
+        }
+        // No answer: the guard drops and stores nothing, so the next
+        // registration asks again.
+    }));
+}
+
+/// What happened to one lifecycle run pulled off the schedule.
+#[derive(Debug, PartialEq, Eq)]
+enum LifecycleOutcome {
+    /// Handed to the delegate.
+    Ran,
+    /// Not due for delivery (no grant, kind not listed, already delivered).
+    Skipped,
+    /// Could not start yet; re-queued.
+    Deferred,
+    /// Gave up after `LIFECYCLE_MAX_ATTEMPTS`.
+    Dropped,
+}
+
+/// Deliver one lifecycle event or wake-up, on the loop.
+///
+/// Runs like a notification run: no origin, no client, `Local` scope with the
+/// inter-delegate hop SUPPRESSED (the node, not a caller, chose to run it, so
+/// there is no caller scope to forward), residual `ApplicationMessage`s fanned
+/// out to registered apps. Unlike a notification run it gets the delegate's
+/// REGISTERED parameters, and it is admitted by the duty budget: the same one
+/// for both kinds.
+///
+/// The grant and the manifest are checked again here rather than trusted from
+/// the time the run was queued, so a revocation in between takes effect.
+///
+/// A wake-up re-schedules its next fire whatever happens to this one (run,
+/// failed, delegate missing, or skipped after [`delegate_capabilities::
+/// WAKEUP_MAX_DEFERRALS`] deferrals), so a periodic schedule is never lost to
+/// one bad fire; it ends only when the delegate is no longer eligible.
+async fn run_lifecycle<CH, P>(
+    contract_handler: &mut CH,
+    park: &mut delegate_park::DelegateParkCtx,
+    prompter: &std::sync::Arc<P>,
+    schedule: &mut delegate_capabilities::LifecycleSchedule,
+    run: delegate_capabilities::LifecycleRun,
+    attempts: u32,
+) -> LifecycleOutcome
+where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    use delegate_capabilities::RunEvent;
+    use std::sync::atomic::Ordering;
+    let Some(caps) = contract_handler.executor().delegate_capabilities() else {
+        return LifecycleOutcome::Skipped;
+    };
+    let key = run.key.clone();
+    // `every` is `Some` for a wake-up: its CURRENT interval, from the record.
+    let (params, inbound, every) = match &run.event {
+        RunEvent::Lifecycle(event) => {
+            let Some(params) = caps.delivery_params(&key, event.kind()) else {
+                caps.stats
+                    .lifecycle_dropped_not_granted
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event not delivered: not granted or not requested");
+                return LifecycleOutcome::Skipped;
+            };
+            (params, InboundDelegateMsg::Lifecycle(event.clone()), None)
+        }
+        RunEvent::Wakeup {
+            tag,
+            every: armed_every,
+        } => match caps.wakeup_check(&key, tag) {
+            delegate_capabilities::WakeupCheck::Deliver { params, every } => (
+                params,
+                InboundDelegateMsg::WakeupFired { tag: tag.clone() },
+                Some(every),
+            ),
+            delegate_capabilities::WakeupCheck::Ineligible => {
+                // Revoked, no longer declared, or the record is gone: the
+                // chain ends here. A grant, a registration or the next node
+                // start re-arms it if the delegate becomes eligible again.
+                caps.stats.wakeups_stopped.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(delegate = %key, event = ?run.event, "Wake-up schedule ended: not granted, no longer declared, or the delegate's record is gone");
+                return LifecycleOutcome::Skipped;
+            }
+            delegate_capabilities::WakeupCheck::Unknown => {
+                // A storage error, not an answer: skip this fire and keep the
+                // schedule, or one transient failure would stop the
+                // delegate's wake-ups until the node restarts.
+                caps.stats
+                    .wakeups_storage_error
+                    .fetch_add(1, Ordering::Relaxed);
+                schedule.push(
+                    caps.now() + delegate_capabilities::next_wakeup_delay(*armed_every),
+                    run.clone(),
+                    0,
+                );
+                return LifecycleOutcome::Deferred;
+            }
+        },
+    };
+    // The next fire of a wake-up, `delay` from now.
+    let rearm = |schedule: &mut delegate_capabilities::LifecycleSchedule,
+                 every: std::time::Duration| {
+        if let RunEvent::Wakeup { tag, .. } = &run.event {
+            schedule.push(
+                caps.now() + delegate_capabilities::next_wakeup_delay(every),
+                delegate_capabilities::LifecycleRun {
+                    key: key.clone(),
+                    event: RunEvent::Wakeup {
+                        tag: tag.clone(),
+                        every,
+                    },
+                },
+                0,
+            );
+        }
+    };
+
+    // Per-delegate exclusion (#5544): never re-enter a parked delegate. And
+    // the duty budget: a delegate that has spent its loop time waits.
+    let parked = park.is_parked(&key);
+    if parked || !caps.duty_available(&key) {
+        if let Some(every) = every {
+            caps.stats.wakeups_deferred.fetch_add(1, Ordering::Relaxed);
+            if attempts >= delegate_capabilities::WAKEUP_MAX_DEFERRALS {
+                // Skip this one fire; the schedule goes on.
+                caps.stats.wakeups_skipped.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    delegate = %key,
+                    event = ?run.event,
+                    parked,
+                    "Skipping a wake-up that could not start; the next one is scheduled"
+                );
+                rearm(schedule, every);
+                return LifecycleOutcome::Deferred;
+            }
+            schedule.push(
+                caps.now() + delegate_capabilities::LIFECYCLE_RETRY_DELAY,
+                run.clone(),
+                attempts + 1,
+            );
+            return LifecycleOutcome::Deferred;
+        }
+        let counter = if parked {
+            &caps.stats.lifecycle_deferred_parked
+        } else {
+            &caps.stats.lifecycle_deferred_duty
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if attempts + 1 >= delegate_capabilities::LIFECYCLE_MAX_ATTEMPTS {
+            caps.stats
+                .lifecycle_dropped_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                delegate = %key,
+                event = ?run.event,
+                parked,
+                "Dropping a lifecycle event that could not start after repeated attempts"
+            );
+            return LifecycleOutcome::Dropped;
+        }
+        schedule.push(
+            caps.now() + delegate_capabilities::LIFECYCLE_RETRY_DELAY,
+            run.clone(),
+            attempts + 1,
+        );
+        return LifecycleOutcome::Deferred;
+    }
+
+    if run.event == RunEvent::Lifecycle(LifecycleEvent::Installed) {
+        // Marked before the run: a delegate that brings the node down in its
+        // Installed handler must not get it again on every start.
+        caps.mark_installed_delivered(&key);
+    }
+
+    let req = DelegateRequest::ApplicationMessages {
+        key: key.clone(),
+        params: Parameters::from(params),
+        inbound: vec![inbound],
+    };
+    let started = caps.now();
+    let mut no_responder = None;
+    let outcome = handle_delegate_with_contract_requests(
+        contract_handler,
+        req,
+        None,
+        crate::client_events::ConnectionScope::Local,
+        // Unprompted run: see `is_unprompted_run`.
+        InterDelegateDispatch::Suppressed,
+        None,
+        &key,
+        prompter,
+        Some(ParkingCtx {
+            park,
+            delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: true,
+            carried_responder: &mut no_responder,
+        }),
+        RunSeed::default(),
+    )
+    .await;
+    caps.charge_duty(&key, caps.now().saturating_duration_since(started), true);
+    if let Some(every) = every {
+        rearm(schedule, every);
+    }
+
+    let (delivered, failed) = if every.is_some() {
+        (&caps.stats.wakeups_delivered, &caps.stats.wakeups_failed)
+    } else {
+        (
+            &caps.stats.lifecycle_delivered,
+            &caps.stats.lifecycle_failed,
+        )
+    };
+    match outcome {
+        DelegateRunOutcome::Failed(err) if err.is_missing_delegate() => {
+            // Usually unregistered since (by the CLI, another connection, or
+            // a remote client). Counted apart from real failures, and the
+            // record is KEPT: "missing" also covers a module that failed to
+            // load from disk, and dropping a granted record on a transient
+            // read error would re-deliver Installed after the app's next
+            // registration. The record goes when its app unregisters it.
+            caps.stats
+                .lifecycle_skipped_missing
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(delegate = %key, event = ?run.event, "Lifecycle event for a delegate this node could not load; skipped");
+        }
+        DelegateRunOutcome::Failed(err) => {
+            let n = failed.fetch_add(1, Ordering::Relaxed);
+            // A wake-up that fails fails every period: log the first and
+            // every 100th, so it is visible without flooding the log.
+            if every.is_none() || n % 100 == 0 {
+                tracing::info!(delegate = %key, event = ?run.event, error = %err, total = n + 1, "Lifecycle run failed");
+            }
+        }
+        DelegateRunOutcome::Parked => {
+            delivered.fetch_add(1, Ordering::Relaxed);
+        }
+        DelegateRunOutcome::Completed(outbound) => {
+            delivered.fetch_add(1, Ordering::Relaxed);
+            if every.is_some() {
+                tracing::debug!(delegate = %key, event = ?run.event, "Delivered wake-up to delegate");
+            } else {
+                tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
+            }
+            route_notification_outbound(&key, outbound);
+        }
+    }
+    LifecycleOutcome::Ran
+}
+
 /// Run one client-driven delegate request, honouring per-delegate exclusion.
 ///
 /// Shared by the `ContractHandlerEvent::DelegateRequest` arm and by the drain
@@ -4171,6 +5021,41 @@ async fn dispatch_delegate_request<CH, P>(
     P: UserInputPrompter + 'static,
 {
     let delegate_key = req.key().clone();
+
+    // Refused before exclusion or queueing: a forged host-only message must
+    // not even wait behind a park to be refused later.
+    if carries_host_only_inbound(&req) {
+        if let Some(caps) = contract_handler.executor().delegate_capabilities() {
+            caps.stats
+                .forged_lifecycle_refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        tracing::warn!(
+            delegate_key = %delegate_key,
+            "Refused a client delegate request carrying a host-only inbound message \
+             (Lifecycle or WakeupFired); only the node delivers those"
+        );
+        send_delegate_response(
+            contract_handler,
+            id,
+            &delegate_key,
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "lifecycle and wake-up messages are delivered by the node and cannot be sent by a client"
+            ))),
+        )
+        .await;
+        return;
+    }
+
+    let hook = capability_hook(
+        contract_handler
+            .executor()
+            .delegate_capabilities()
+            .is_some(),
+        &req,
+        origin_contract.as_ref(),
+        connection_scope,
+    );
 
     // INVARIANT this function is the chokepoint for, load-bearing for TWO
     // separate changes and enforced by nothing but the shape of the call graph:
@@ -4222,7 +5107,12 @@ async fn dispatch_delegate_request<CH, P>(
         )
         .await;
         let response = match outcome {
-            DelegateRunOutcome::Completed(msgs) => Ok(msgs),
+            DelegateRunOutcome::Completed(msgs) => {
+                if let Some(hook) = hook {
+                    finish_capability_hook(contract_handler, prompter, hook);
+                }
+                Ok(msgs)
+            }
             // #5263: a genuine execution failure must reach the client as
             // `Err`, not as an empty successful response.
             DelegateRunOutcome::Failed(err) => Err(err),
@@ -4307,6 +5197,7 @@ async fn dispatch_delegate_request<CH, P>(
         Some(ParkingCtx {
             park: &mut *park,
             delivery: delegate_park::Delivery::Client,
+            node_wide_duty: false,
             carried_responder: &mut carried_responder,
         }),
         RunSeed::default(),
@@ -4322,6 +5213,9 @@ async fn dispatch_delegate_request<CH, P>(
             park.attach_responder(&delegate_key, responder);
         }
         DelegateRunOutcome::Completed(response) => {
+            if let Some(hook) = hook {
+                finish_capability_hook(contract_handler, prompter, hook);
+            }
             send_delegate_response(contract_handler, id, &delegate_key, Ok(response)).await;
         }
         // #5263 propagation, carried through parking.
@@ -4469,7 +5363,18 @@ where
         inbound_so_far,
         responder,
         delivery,
+        node_wide_duty,
     } = continuation;
+    // The resumed leg is loop time like the first one: charge it to the same
+    // duty buckets (#5748). Without this a background run that parks (every
+    // off-loop contract fetch or network op does, not only prompts) spends
+    // its resumed leg free, every time, and the "1% of loop time" bound does
+    // not hold for exactly the delegates the budget exists for.
+    let leg_clock = is_unprompted_run(inter_delegate)
+        .then(|| contract_handler.executor().delegate_capabilities())
+        .flatten()
+        .filter(|caps| caps.is_budgeted(&delegate_key))
+        .map(|caps| (caps.now(), caps));
 
     let mut all_inbound = inbound_so_far;
     // Re-run any deferred upserts ON the loop (WASM stays serial; only the
@@ -4551,6 +5456,7 @@ where
                 park: &mut *park,
                 delivery,
                 carried_responder: &mut carried_responder,
+                node_wide_duty,
             }),
             // SEED, not append-afterwards (#5544 B3). What the delegate emitted
             // before the earlier park has to be inside the run, so that if this
@@ -4565,6 +5471,13 @@ where
         )
         .await
     };
+    if let Some((started, caps)) = leg_clock {
+        caps.charge_duty(
+            &delegate_key,
+            caps.now().saturating_duration_since(started),
+            node_wide_duty,
+        );
+    }
 
     match outcome {
         DelegateRunOutcome::Parked => {
@@ -4694,6 +5607,11 @@ async fn run_queued_notification<CH, P>(
     }
 
     let mut no_responder = None;
+    let duty_clock = contract_handler
+        .executor()
+        .delegate_capabilities()
+        .filter(|caps| caps.is_budgeted(delegate_key))
+        .map(|caps| (caps.now(), caps));
     let outcome = handle_delegate_with_contract_requests(
         contract_handler,
         req,
@@ -4706,11 +5624,19 @@ async fn run_queued_notification<CH, P>(
         park.map(|park| ParkingCtx {
             park,
             delivery: delegate_park::Delivery::Apps,
+            node_wide_duty: false,
             carried_responder: &mut no_responder,
         }),
         RunSeed::default(),
     )
     .await;
+    if let Some((started, caps)) = duty_clock {
+        caps.charge_duty(
+            delegate_key,
+            caps.now().saturating_duration_since(started),
+            false,
+        );
+    }
 
     match outcome {
         DelegateRunOutcome::Parked => {}
@@ -5823,6 +6749,9 @@ mod tests {
             "dispatch_delegate_request",
             "handle_delegate_resume",
             "run_queued_notification",
+            // Lifecycle events (`delegate_capabilities`): called from the
+            // lifecycle block at the top of `contract_handling`'s loop.
+            "run_lifecycle",
         ];
         let mut callers: Vec<&str> = code
             .match_indices(&format!("{chokepoint}("))
@@ -8160,10 +9089,10 @@ mod hol_4391_tests {
     /// `DelegateResponse(Err(_))`, not a fake empty successful response.
     ///
     /// `MockWasmRuntime::execute_delegate_request` unconditionally returns a
-    /// generic `ExecutorError::other(...)` for any delegate request — not the
-    /// `is_missing_delegate()` case, which stays a benign empty response for
-    /// legacy migration probes (see `handle_delegate_with_contract_requests`)
-    /// — so no delegate needs to be registered to exercise the genuine
+    /// generic `ExecutorError::other(...)` for an unscripted delegate request
+    /// — not the `is_missing_delegate()` case, which is pinned separately by
+    /// `delegate_request_to_unregistered_delegate_surfaces_missing_5727` — so
+    /// no delegate needs to be registered to exercise the genuine
     /// execution-failure branch this test targets.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delegate_request_surfaces_execution_failure_5263() {
@@ -8211,6 +9140,103 @@ mod hol_4391_tests {
             }
             other => panic!("expected DelegateResponse, got {other}"),
         }
+    }
+
+    /// Regression for #5727: a network-mode node answering a request to a
+    /// delegate it never registered must send the typed
+    /// `DelegateError::Missing(key)`, the same answer `freenet local` gives —
+    /// not an empty successful `DelegateResponse`.
+    ///
+    /// The empty answer is what a registered delegate that emits nothing also
+    /// returns, so a migration walk could not tell "not here" from "here and
+    /// silent" (freenet/harvest#150: a rehearsal on `freenet local` saw
+    /// `Missing`, while every network node answered empty).
+    ///
+    /// The script holds a run that WOULD succeed, so if the missing arm were
+    /// bypassed the delegate would answer `Ok` rather than fail for an
+    /// unrelated reason. The assertion is on the typed variant and its key,
+    /// not merely `is_err()`, because an unscripted mock request also errors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_request_to_unregistered_delegate_surfaces_missing_5727() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, None, "del_missing_5727").await;
+
+        let delegate_key = DelegateKey::new([27u8; 32], CodeHash::new([57u8; 32]));
+        handler
+            .runtime_mut()
+            .unregistered_delegates
+            .lock()
+            .unwrap()
+            .insert(delegate_key.clone());
+        handler
+            .runtime_mut()
+            .delegate_script
+            .lock()
+            .unwrap()
+            .push_back(ScriptedRun::from(vec![]));
+
+        let event = ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: Parameters::from(vec![]),
+                inbound: vec![],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &std::sync::Arc::new(user_input::AutoApprovePrompter),
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                let err = result.expect_err(
+                    "a request to a never-registered delegate must answer with an \
+                     ERROR, not an empty success that reads as a registered delegate \
+                     with nothing to say (#5727)",
+                );
+                assert!(
+                    err.is_missing_delegate(),
+                    "the error must be the typed DelegateError::Missing that local \
+                     mode sends, got: {err}"
+                );
+                match err.unwrap_request() {
+                    freenet_stdlib::client_api::RequestError::DelegateError(
+                        freenet_stdlib::client_api::DelegateError::Missing(k),
+                    ) => assert_eq!(k, delegate_key, "Missing must name the requested key"),
+                    other => panic!("expected DelegateError::Missing, got {other}"),
+                }
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
+        }
+        assert!(
+            handler
+                .runtime_mut()
+                .delegate_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "an unregistered delegate must not have been entered"
+        );
     }
 
     /// The executor loop's half of the same guarantee as
@@ -8598,8 +9624,14 @@ mod hol_4391_tests {
         let bad_id = ContractInstanceId::new([23u8; 32]);
         // Global registry: use ids unique to this test so it does not race the
         // rest of the suite.
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let (mut handler, _send) = build_handler(vec![]).await;
         let _ = apply_resolved_contract_op(
@@ -8638,8 +9670,14 @@ mod hol_4391_tests {
             "a FAILED subscribe must not install a hook: it would advertise a \
              delivery path that was never established"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&ok_id);
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&bad_id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &ok_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &bad_id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
@@ -8801,7 +9839,10 @@ mod hol_4391_tests {
                 .into(),
             );
         }
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         let handle = GlobalExecutor::spawn(contract_handling(
             handler,
@@ -8846,7 +9887,10 @@ mod hol_4391_tests {
         );
 
         handle.abort();
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one
@@ -8908,7 +9952,10 @@ mod hol_4391_tests {
                 )]
                 .into(),
             );
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
 
         let handle = GlobalExecutor::spawn(contract_handling(
@@ -8979,7 +10026,10 @@ mod hol_4391_tests {
 
         handle.abort();
         for key in [banned_key, allowed_key] {
-            crate::wasm_runtime::delegate_subscriptions::remove_contract(key.id());
+            crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                key.id(),
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
         }
     }
 
@@ -9356,7 +10406,10 @@ mod hol_4391_tests {
         // The key `add_local_client` was called with: the FULL key, carrying the
         // real code hash, because the subscribe op knew it.
         let full_key = ContractKey::from_id_and_code(id, CodeHash::new([33u8; 32]));
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
 
         // Stand in for what `run_executor_subscribe` did before returning Ok.
         assert!(
@@ -9392,7 +10445,10 @@ mod hol_4391_tests {
              subscription is dropped, even though the contract body never \
              landed and the full `ContractKey` could not be resolved (#5542)"
         );
-        crate::wasm_runtime::delegate_subscriptions::remove_contract(&id);
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            &id,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
     }
 
     /// #5542. A delegate SUBSCRIBE that cannot reach the network must still get
@@ -9998,6 +11054,7 @@ mod hol_4391_tests {
             inbound_so_far: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
+            node_wide_duty: false,
         }
     }
 

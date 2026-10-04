@@ -4,19 +4,9 @@
 
 ### BEFORE writing any new code in this crate
 
-```
-Does this code need current time?
-  → DO NOT use: std::time::Instant::now(), tokio::time::sleep()
-  → USE: TimeSource trait from src/simulation/
-
-Does this code need randomness?
-  → DO NOT use: rand::random(), rand::thread_rng()
-  → USE: GlobalRng from src/config.rs
-
-Is this network code for tests?
-  → DO NOT use: tokio::net::UdpSocket
-  → USE: SimulationSocket from src/transport/in_memory_socket.rs
-```
+DST requirements (TimeSource for time, GlobalRng for randomness,
+SimulationSocket for test networking) are canonical in
+`.claude/rules/testing.md` — see "When writing new code in `crates/core/`".
 
 ### WHEN adding a test
 

@@ -321,7 +321,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -330,6 +330,17 @@ jobs:
       # is broken" looking identical.
       - name: Self-test PR backlog sweep
         run: bash scripts/pr-backlog-sweep_test.sh
+      # The Nix deployment path's supervisor. `nix build .#freenet-node` only
+      # LINTS that script (writeShellApplication runs shellcheck at build time)
+      # and costs a full dependency-graph compile; this RUNS it against a fake
+      # `freenet` in about a second, and asserts the exit-code contract in both
+      # directions — the updater runs on exit 42 and on a crash, and does NOT
+      # run on 0, 43, or a signal-shaped status. Auto-update is the whole reason
+      # the Nix node exists, so it is checked in the always-on job rather than
+      # in the path-filtered nix.yml.
+      - name: Self-test the Nix node supervisor
+        run: bash scripts/nix-node-wrapper_test.sh
+
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -998,7 +1009,9 @@ jobs:
   macos_unit:
     name: macOS Service Unit
     runs-on: macos-latest
-    timeout-minutes: 30
+    # 45, not 30: the freenet:// LaunchServices e2e rebuilds the freenet crate
+    # (auto-update off) and waits for the app to launch and handle links.
+    timeout-minutes: 45
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
@@ -1051,7 +1064,26 @@ jobs:
         run: cargo build --locked -p freenet --bin freenet
 
       - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
+
+      # freenet:// scheme handler (#5726) against the real binary.
+      - name: Test freenet:// handler binary
+        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
+
+      # And through LaunchServices: build an unsigned Freenet.app with the real
+      # package-macos.sh, register it, click links with `open`, and check the
+      # menu-bar wrapper handled them, including the instance launchd starts at
+      # login. The app starts a real node, so this rebuilds the binary with
+      # FREENET_GIT_IS_DIRTY=1 (auto-update off; only the freenet crate
+      # recompiles): otherwise a release newer than this branch would make
+      # the node exit 42 and the DMG-swap updater replace the test bundle
+      # mid-run. Last step on purpose, since it changes target/debug/freenet.
+      - name: freenet:// end to end through LaunchServices
+        env:
+          FREENET_GIT_IS_DIRTY: "1"
+        run: |
+          cargo build --locked -p freenet --bin freenet
+          scripts/macos-url-scheme-e2e.sh target/debug/freenet
 
   # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
   # single-instance guard, process classification, etc). `windows_check` above
@@ -1110,7 +1142,56 @@ jobs:
         run: cargo build --locked -p freenet --bin freenet
 
       - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
+
+      # freenet:// scheme handler (#5726). Includes the argument-injection
+      # test: the command line registered in HKCU, with hostile links
+      # substituted for %1 and launched raw, so the real Windows argv parser
+      # splits it.
+      - name: Test freenet:// handler binary
+        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
+
+      # And through real protocol activation: Start-Process hands the link to
+      # Windows, which looks up HKCU\Software\Classes\freenet and runs the
+      # handler. No node runs here, so the handler writes its "not running"
+      # page, which proves it ran. The page must not carry the link.
+      - name: freenet:// end to end through Windows protocol activation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'target\debug\freenet.exe').Path
+          $river = 'raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv'
+          & $exe service url-handler register
+          if ($LASTEXITCODE -ne 0) { throw "register exited $LASTEXITCODE" }
+          $cmd = (Get-ItemProperty 'HKCU:\Software\Classes\freenet\shell\open\command').'(default)'
+          $expected = '"' + $exe + '" open -- "%1"'
+          if ($cmd -ne $expected) { throw "registered '$cmd', expected '$expected'" }
+          if ((Get-ItemProperty 'HKCU:\Software\Classes\freenet').'URL Protocol' -ne '') { throw 'URL Protocol value missing' }
+          $pages = Join-Path $env:LOCALAPPDATA 'The Freenet Project Inc\Freenet\cache\open-link'
+          $env:FREENET_OPEN_DRY_RUN = '1'
+          # The handler writes one open-link-*.html per link (stale ones are
+          # swept later, so it is still there to read).
+          function Invoke-Link([string]$link) {
+            Remove-Item (Join-Path $pages 'open-link-*.html') -ErrorAction SilentlyContinue
+            Start-Process $link
+            $page = $null
+            for ($i = 0; $i -lt 60 -and -not $page; $i++) {
+              Start-Sleep -Milliseconds 500
+              $page = Get-ChildItem (Join-Path $pages 'open-link-*.html') -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+            if (-not $page) { throw "the handler never ran for $link" }
+            return Get-Content -Raw $page.FullName
+          }
+          $html = Invoke-Link "freenet://$river/?a=1#secret=TOKEN"
+          if (-not $html.Contains("Freenet isn't running") -or -not $html.Contains('port 7509')) { throw "unexpected page: $html" }
+          if ($html.Contains($river) -or $html.Contains('TOKEN')) { throw "the page carries the link: $html" }
+          Write-Host 'ok - a valid link reached the handler through protocol activation'
+          $html = Invoke-Link "freenet://$river/%2e%2e/other/"
+          if (-not $html.Contains("isn't valid") -or $html.Contains('127.0.0.1')) { throw "traversal link not refused: $html" }
+          Write-Host 'ok - a traversal link was refused'
+          & $exe service url-handler unregister
+          if (Test-Path 'HKCU:\Software\Classes\freenet') { throw 'still registered after unregister' }
+          Write-Host 'ok - unregister removed the key'
 
   test_simulation:
     name: Simulation

@@ -47,6 +47,54 @@ A module importing a removed name fails to instantiate; pinned by
 removed_delegate_contract_imports_are_refused_at_instantiation.
 ```
 
+### Delegate manifests, lifecycle events and capability grants
+
+```
+A delegate built against an older stdlib cannot decode an InboundDelegateMsg
+variant added later: delivery fails with a decode error (pinned by
+a_delegate_without_a_manifest_cannot_decode_lifecycle). So:
+
+NEVER deliver a new inbound message kind to a delegate that did not ask for
+it. Ask = its embedded `freenet-manifest` section lists that kind
+(DelegateManifest::from_wasm, read at registration). Lifecycle (tag 10) is
+delivered only when the manifest lists the kind AND a bound app holds the
+user's Background grant; both are re-checked at delivery
+(contract::delegate_capabilities::delivery_params).
+
+A client may not send host-only inbound messages (Lifecycle, WakeupFired):
+dispatch_delegate_request refuses them before exclusion or queueing.
+
+Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
+connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
+"Freenet asks:") and raised off the contract loop. Unprompted runs
+(InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
+delegates without a manifest are untouched.
+
+Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
+declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at
+every fire (wakeup_check; a storage error skips that fire, never ends the schedule). Declared in the manifest ON PURPOSE: a host import
+fails instantiation on nodes without it, and a new OutboundDelegateMsg variant
+fails decoding of the whole outbound batch on older nodes; an unknown manifest
+field is ignored. DO NOT add a run-time request (import or outbound variant)
+without solving that. Bounds: effective_wakeups (60 s floor, 4 per delegate),
+one pending fire per (delegate, tag), and the SAME duty budget as lifecycle
+runs (one budget, not two). Not persisted: re-armed at node start after
+refresh_capability_manifests re-reads manifests from stored code (older nodes
+stored them without `wakeups`). A parked unprompted run is charged for its
+resumed legs too (handle_delegate_resume, #5748).
+
+Consent: wake-ups ride the existing Background grant (decided with the work's
+brief: "gate on the #5730 Background grant"); an app granted under the older
+card text gets periodic runs without a new prompt. Revoking stops them at the
+next fire.
+
+Old delegate versions: a re-keyed delegate's OLD key keeps its record, and so
+its wake-ups, while any app stays bound to it. Only an unregister by a bound
+app from a local connection removes a binding (the record goes with the last
+one); a CLI or remote unregister does not. An app that re-keys should
+unregister the old key from its own tab once its migration is done.
+```
+
 ### WASM Call Modes
 
 All three guest entry points share ONE body, `call_typed_blocking` in

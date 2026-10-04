@@ -258,6 +258,9 @@ struct RouteFailureCauseCounts {
     not_found: std::sync::atomic::AtomicU64,
     timeout: std::sync::atomic::AtomicU64,
     send_failure: std::sync::atomic::AtomicU64,
+    /// The subset of `timeout` recorded as the originator of the operation,
+    /// excluding labels recorded while relaying other nodes' operations.
+    originator_timeout: std::sync::atomic::AtomicU64,
 }
 
 /// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
@@ -995,6 +998,14 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+        // The hosting cache charges each hosted contract the neighbour-summary
+        // bytes the interest manager holds for it (#5647). Holding the
+        // `InterestManager` Arc directly creates no cycle: it references
+        // neither the ring nor the hosting manager.
+        let interest = op_manager.interest_manager.clone();
+        interest.set_neighbour_summary_budget(self.neighbour_summary_budget());
+        self.hosting_manager
+            .set_interest_bytes_provider(Arc::new(move |key| interest.resident_bytes_for(key)));
     }
 
     /// Shared per-node module-cache telemetry sink (#4440 / #4488). The
@@ -2094,11 +2105,25 @@ impl Ring {
             // `HostingCacheStats` field has no reader in this block.
             snapshot.hosting_resident_overhead_budget_bytes =
                 Some(hosting.resident_overhead_budget_bytes);
-            snapshot.hosting_estimated_resident_overhead_bytes =
-                Some(hosting.estimated_resident_overhead_bytes);
-            snapshot.hosting_contract_slot_budget = Some(hosting.contract_slot_budget);
+            snapshot.hosting_resident_overhead_bytes = Some(hosting.resident_overhead_bytes);
             snapshot.hosting_resident_overhead_evictions_total =
                 Some(hosting.resident_overhead_evictions_total);
+            snapshot.hosting_resident_overhead_evicted_charged_bytes_total =
+                Some(hosting.resident_overhead_evicted_charged_bytes_total);
+            // All neighbour-record bytes, hosted or not (#5647): compared with
+            // the hosted part of `hosting_resident_overhead_bytes`, the excess
+            // is what #5782's reconciliation has not yet freed.
+            snapshot.interest_resident_bytes_total = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.total_resident_bytes());
+            // Neighbour-summary bound trims and node-wide bytes (#5781).
+            if let Some(op) = ring.upgrade_op_manager() {
+                snapshot.interest_neighbour_summary_bytes =
+                    Some(op.interest_manager.neighbour_summary_bytes());
+                let (trims, bytes) = op.interest_manager.summary_bound_trim_totals();
+                snapshot.interest_summary_bound_trims_total = Some(trims);
+                snapshot.interest_summary_bound_trimmed_bytes_total = Some(bytes);
+            }
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -3472,6 +3497,18 @@ impl Ring {
                 return;
             }
 
+            // Resident-overhead budget (#5325, #5647): the share of the node's
+            // memory limit hosted contracts may hold in RAM. Recomputed every
+            // tick so a cgroup limit changed at runtime is picked up, and
+            // BEFORE the sweep below, so the neighbour-summary budget it
+            // installs and the eviction it runs both use the current value.
+            // Falls back to 1 GiB in the rare case the RAM read itself fails.
+            let total_ram = crate::ring::hosting::total_ram_or_fallback(
+                crate::wasm_runtime::read_total_ram_bytes(),
+            );
+            ring.hosting_manager
+                .recompute_resident_overhead_budget(total_ram);
+
             // Sweep expired entries from GET subscription cache
             let crate::ring::hosting::HostingSweepResult {
                 expired,
@@ -3559,7 +3596,12 @@ impl Ring {
                     "Cleaned up expired hosting subscription from local state"
                 );
                 if let Some(op_manager) = &op_manager {
-                    if op_manager.interest_manager.unregister_local_hosting(&key) {
+                    // A GET/PUT may have re-hosted it since the eviction decision
+                    // (#5780); unregistering then would leave a hosted contract
+                    // outside anti-entropy (until a restart; see #5784).
+                    if !ring.is_hosting_contract(&key)
+                        && op_manager.interest_manager.unregister_local_hosting(&key)
+                    {
                         removed_contracts.push(key);
                     }
                     crate::operations::reclaim_evicted_contract(
@@ -3581,6 +3623,54 @@ impl Ring {
                     removed_contracts,
                 )
                 .await;
+            }
+
+            // Interest-record reconciliation (#5780): drop neighbour records for
+            // contracts this node has neither hosted nor used for
+            // `RECONCILE_MIN_UNUSED_AGE`. Dropped records reach neighbours
+            // through the next interest heartbeat, which is a full replace. A
+            // stale local-hosting flag cleared here has its co-host
+            // advertisement retracted, as an eviction would; neighbours are told
+            // the interest ended only if it did (a delegate or local client can
+            // keep it). Advertisements are retracted every pass for every
+            // contract past the wait that is unhosted, unused and holds no
+            // lease of this node's own, including advertised contracts with no
+            // records left, so it does not matter how a lease or the records
+            // ended. A contract whose lease is live is left alone until the
+            // lease, which is not demand, lapses unrenewed.
+            if let Some(op_manager) = &op_manager {
+                let outcome = op_manager.interest_manager.reconcile_with_hosting(
+                    &op_manager.neighbor_hosting.advertised_contract_keys(),
+                    |key| ring.is_hosting_contract(key),
+                    |key| ring.contract_in_use(key),
+                    |key| ring.is_subscribed(key),
+                );
+                for key in &outcome.advertisements_to_retract {
+                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
+                }
+                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
+                    tracing::info!(
+                        hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
+                        contracts_dropped = outcome.contracts_dropped,
+                        records_dropped = outcome.records_dropped,
+                        "interest records reconciled with the hosted set"
+                    );
+                }
+                // Skip any contract that regained local interest since the pass,
+                // so this removal cannot follow a concurrent re-host's addition.
+                let interest_lost: Vec<ContractKey> = outcome
+                    .interest_lost
+                    .into_iter()
+                    .filter(|key| !op_manager.interest_manager.has_local_interest(key))
+                    .collect();
+                if !interest_lost.is_empty() {
+                    crate::operations::broadcast_change_interests(
+                        op_manager,
+                        Vec::new(),
+                        interest_lost,
+                    )
+                    .await;
+                }
             }
 
             // Retry pending reclamations queued by the two skip points
@@ -3654,33 +3744,6 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
-
-            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
-            // recomputed every tick so it tracks LIVE memory pressure rather than
-            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
-            // cgroup that gets tightened externally) re-derives a smaller budget
-            // on the next tick, and one that goes idle re-derives a larger one.
-            // All three reads are cheap (a `/proc` parse or a single syscall on
-            // every platform), so unlike the disk-usage walk above these run
-            // inline rather than on a blocking thread.
-            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
-            // that module) for the rare case the RAM read itself fails.
-            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
-                .map(|v| v as u64)
-                .unwrap_or(1024 * 1024 * 1024);
-            let pool_size = crate::config::runtime_pool_size().get();
-            let live_signals = match (
-                crate::wasm_runtime::read_own_rss_bytes(),
-                crate::wasm_runtime::read_available_memory_bytes(),
-            ) {
-                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
-                _ => None,
-            };
-            ring.hosting_manager.recompute_resident_overhead_budget(
-                total_ram,
-                pool_size,
-                live_signals,
-            );
         }
     }
 
@@ -3739,6 +3802,11 @@ impl Ring {
             // join/peer_ready progress signal (snapshot presence alone only
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
+            snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
+            snapshot.stale_advertisements = ring.stale_advertisement_count();
+            snapshot.reconcile_contracts_dropped = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -3882,9 +3950,9 @@ impl Ring {
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
-    /// Install the operator-configurable share of live host-wide surplus
-    /// memory the resident-overhead (count-derived) eviction budget may claim
-    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    /// Install the operator-configurable share of the node's memory limit
+    /// that hosted contracts may hold in RAM (`--hosting-mem-share`, #5333,
+    /// #5647). Called once at startup; the 60s sweep's recompute reads it.
     pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
         self.hosting_manager
             .configure_resident_overhead_mem_share(mem_share);
@@ -4063,36 +4131,79 @@ impl Ring {
     /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
+    /// `log_as` says whether this selection is a routing decision for the
+    /// routing dataset's candidate log.
     #[inline]
     pub fn closest_potentially_hosting(
         &self,
+        log_as: crate::router::dataset::DecisionLog,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
+        let log = self.candidate_log_for(log_as);
+        // The router read lock is held across candidate gathering and
+        // selection, as before candidate logging existed; it is released
+        // before the dataset write and the debug trace.
         let router = self.router.read();
         let target = Location::from(contract_key);
-        let (peer, decision) = self
-            .connection_manager
-            .routing_with_telemetry(target, None, skip_list, &router);
+        self.connection_manager
+            .routing_with(target, None, skip_list, move |candidates| {
+                let (selected, decision, capture) = router.select_k_best_peers_capturing(
+                    candidates.iter(),
+                    target,
+                    1,
+                    log.as_ref().is_some_and(|(log, _)| log.capture),
+                );
+                drop(router);
+                if let Some((log, op)) = log {
+                    log.record(
+                        op,
+                        target,
+                        &selected,
+                        matches!(
+                            decision.strategy,
+                            crate::router::RoutingStrategy::DistanceBased
+                        ),
+                        capture,
+                    );
+                }
+                let peer = selected.into_iter().next().cloned();
+                tracing::debug!(
+                    target_location = %target.as_f64(),
+                    strategy = ?decision.strategy,
+                    num_candidates = decision.candidates.len(),
+                    total_routing_events = decision.total_routing_events,
+                    selected = peer.is_some(),
+                    "routing_decision"
+                );
+                peer
+            })
+            .flatten()
+    }
 
-        if let Some(decision) = &decision {
-            tracing::debug!(
-                target_location = %target.as_f64(),
-                strategy = ?decision.strategy,
-                num_candidates = decision.candidates.len(),
-                total_routing_events = decision.total_routing_events,
-                selected = peer.is_some(),
-                "routing_decision"
-            );
+    /// The candidate log for a selection, and its op, when it is a routing
+    /// decision and logging is on. `Unlogged` consults nothing.
+    fn candidate_log_for(
+        &self,
+        log_as: crate::router::dataset::DecisionLog,
+    ) -> Option<(
+        crate::router::dataset::CandidateLog<'static>,
+        crate::node::network_status::OpType,
+    )> {
+        match log_as {
+            crate::router::dataset::DecisionLog::Joinable(op) => {
+                crate::router::dataset::candidate_log(|| self.time_source.now())
+                    .map(|log| (log, op))
+            }
+            crate::router::dataset::DecisionLog::Unlogged => None,
         }
-
-        peer
     }
 
     /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
     pub fn k_closest_potentially_hosting<K>(
         &self,
+        log_as: crate::router::dataset::DecisionLog,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
@@ -4210,13 +4321,28 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let (selected, decision) = self.router.read().select_k_best_peers_with_telemetry(
+        let log = self.candidate_log_for(log_as);
+        let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
             candidates.iter(),
             target_location,
             k,
+            log.as_ref().is_some_and(|(log, _)| log.capture),
         );
-        // `selected` borrows from `candidates`, not from the router guard, so
-        // the read lock is released here before the tracing/collect below.
+        // `selected` and `capture` borrow from `candidates`, not from the
+        // router guard, so the read lock is released at the end of the
+        // statement above, before the dataset write.
+        if let Some((log, op)) = log {
+            log.record(
+                op,
+                target_location,
+                &selected,
+                matches!(
+                    decision.strategy,
+                    crate::router::RoutingStrategy::DistanceBased
+                ),
+                capture,
+            );
+        }
 
         tracing::debug!(
             target_location = %target_location.as_f64(),
@@ -4293,11 +4419,6 @@ impl Ring {
     ///    broke the strict-determinism tests (`test_strict_determinism_*`,
     ///    `test_direct_runner_determinism`, `test_thundering_herd_connect_storm`).
     ///
-    /// CAVEAT: `Router::add_event` itself reaches `RoutingPredictor::record` →
-    /// `wall_clock_hours()` → `SystemTime::now()`, so this path is not strictly
-    /// TimeSource-clean either; the determinism tests pass because that
-    /// variance is far below what they compare.
-    ///
     /// `source` tags the event in the opt-in routing dataset (#5648): `Relay`
     /// for an outcome a relay hop observed about its downstream peer,
     /// `Originator` for one observed by the node that started the operation.
@@ -4336,6 +4457,13 @@ impl Ring {
             AttemptFailure::SendFailure => &self.route_failure_causes.send_failure,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cause == AttemptFailure::Timeout
+            && matches!(source, crate::router::dataset::RouteSource::Originator)
+        {
+            self.route_failure_causes
+                .originator_timeout
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if cause == AttemptFailure::Timeout {
             if let Some(addr) = event.peer.socket_addr() {
                 self.timeout_label_window.lock().record(addr);
@@ -4384,6 +4512,16 @@ impl Ring {
             self.route_failure_causes.timeout.load(Relaxed),
             self.route_failure_causes.send_failure.load(Relaxed),
         )
+    }
+
+    /// Timeout failure labels this node recorded as the originator of an
+    /// operation: the subset of [`Self::route_failure_cause_counts`]'s timeouts
+    /// that excludes labels recorded while relaying (#5660).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn originator_route_timeout_count(&self) -> u64 {
+        self.route_failure_causes
+            .originator_timeout
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ==================== Subscription Management (Lease-Based) ====================
@@ -4868,6 +5006,52 @@ impl Ring {
             .map(|op_manager| op_manager.interest_manager.active_demand_count())
     }
 
+    /// Number of contracts this node keeps neighbour records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Such records keep the contract indexed and advertised in the interest
+    /// heartbeat, so neighbours keep refreshing them; reconciliation removes
+    /// them. `None` if the `OpManager` is not attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn orphan_interest_contract_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .contracts_with_peer_records()
+                .into_iter()
+                .filter(|key| {
+                    !self.is_hosting_contract(key)
+                        && !self.contract_in_use(key)
+                        && !op_manager.interest_manager.has_local_interest(key)
+                })
+                .count()
+        })
+    }
+
+    /// Number of contracts this node still advertises to co-hosts although it
+    /// neither hosts nor uses them and holds no live lease toward them (#5782).
+    /// Such an advertisement keeps co-hosts sending updates for a copy this
+    /// node no longer holds. A live lease is excluded because the retraction
+    /// deliberately waits for it to lapse. `None` if the `OpManager` is not
+    /// attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stale_advertisement_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            let mut held: HashSet<ContractInstanceId> = self
+                .hosting_contract_keys()
+                .iter()
+                .chain(self.get_subscribed_contracts().iter())
+                .map(|key| *key.id())
+                .collect();
+            held.extend(self.hosting_manager.in_use_contract_ids());
+            op_manager
+                .neighbor_hosting
+                .advertised_contract_keys()
+                .iter()
+                .filter(|key| !held.contains(key.id()))
+                .count()
+        })
+    }
+
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.
     /// peers it subscribed THROUGH (its parent in the subscription tree). Reads
     /// the live `InterestManager`'s `is_upstream` edges.
@@ -5113,8 +5297,7 @@ impl Ring {
             disk_total_bytes,
             disk_budget_bytes,
             resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
-            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
-            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_bytes: stats.resident_overhead_bytes,
             resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
@@ -5581,6 +5764,18 @@ impl Ring {
         self.hosting_manager.has_recent_local_client_access(key)
     }
 
+    /// The node-wide budget for distinct neighbour-summary bytes (#5781): a
+    /// fixed quarter of the hosting resident budget, enforced when a summary
+    /// is written and trimmed to at each sweep. It does not shrink with the
+    /// rest of the resident charge: at capacity, neighbour summaries (at most
+    /// this quarter) count as hosting cost and can trigger the ordinary
+    /// demand-ordered eviction of the lowest-ranked contracts, rather than
+    /// being wiped to make room.
+    fn neighbour_summary_budget(&self) -> u64 {
+        self.hosting_manager.resident_overhead_budget_bytes()
+            / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
@@ -5591,6 +5786,27 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
+        // Neighbour-summary bounds (#5781), BEFORE the hosting sweep re-reads
+        // the interest bytes it charges: each hosted contract's distinct
+        // summaries are capped relative to our own summary (independent of
+        // who sent them), and no single neighbour may make this node hold more
+        // than 1/PEER_SUMMARY_SHARE_DIVISOR of the hosting budget in summaries
+        // only it sent. Neighbours therefore cannot inflate the resident axis
+        // past those bounds to get other contracts evicted. Running it here,
+        // rather than on the interest manager's own timer, means the cache
+        // never charges bytes beyond them.
+        if let Some(op_manager) = self.upgrade_op_manager() {
+            // The node-wide neighbour-summary budget follows the resident
+            // budget, which the sweep task recomputes each tick.
+            op_manager
+                .interest_manager
+                .set_neighbour_summary_budget(self.neighbour_summary_budget());
+            let share = self.hosting_manager.resident_overhead_budget_bytes()
+                / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR;
+            op_manager
+                .interest_manager
+                .enforce_summary_bounds(share, |key| self.is_hosting_contract(key));
+        }
         // Cost-aware eviction (#4861): feed the sweep the node's attributed
         // update-work cost so a zero-subscriber contract dominating CPU /
         // broadcast capacity is shed even while UNDER the byte budget (the
@@ -6875,6 +7091,11 @@ impl Ring {
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
+        snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
+        snapshot.stale_advertisements = self.stale_advertisement_count();
+        snapshot.reconcile_contracts_dropped = self
+            .upgrade_op_manager()
+            .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
@@ -7711,6 +7932,115 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// #5780: the periodic hosting sweep must run the interest-record
+    /// reconciliation, or evicted contracts keep their neighbours' records and
+    /// stay advertised. Requires the call on a code line (not a comment), so a
+    /// commented-out call fails this pin.
+    #[test]
+    fn sweep_reconciles_interest_records_with_the_hosted_set() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Code only, whitespace removed: layout-proof, and a commented-out
+        // line cannot satisfy it.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for needle in [
+            // the call, with the hosting facts in the right order
+            concat!(
+                "interest_manager.reconcile_with_hosting(",
+                "&op_manager.neighbor_hosting.advertised_contract_keys(),",
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
+                "|key|ring.is_subscribed(key),)"
+            ),
+            // every aged, unhosted, unused, lease-free contract has any
+            // standing advertisement retracted, every pass
+            concat!(
+                "forkeyin&outcome.advertisements_to_retract{crate::operations::",
+                "retract_advertisement_for_evicted_contract(op_manager,key);}"
+            ),
+            // neighbours are told only when interest actually ended, and still
+            // has not come back
+            concat!(
+                ".filter(|key|!op_manager.interest_manager.has_local_interest(key))",
+                ".collect();if!interest_lost.is_empty(){"
+            ),
+            concat!(
+                "crate::operations::broadcast_change_interests(op_manager,",
+                "Vec::new(),interest_lost,)"
+            ),
+            // the post-eviction unregister skips a re-hosted contract
+            concat!(
+                "if!ring.is_hosting_contract(&key)&&op_manager",
+                ".interest_manager.unregister_local_hosting(&key)"
+            ),
+        ] {
+            assert!(
+                code.contains(needle),
+                "sweep_get_subscription_cache must contain `{needle}` (#5780)"
+            );
+        }
+        // The retraction runs before the interest broadcast for the same pass.
+        let retract = code
+            .find("forkeyin&outcome.advertisements_to_retract{")
+            .expect("retraction loop");
+        let broadcast = code
+            .find("Vec::new(),interest_lost,)")
+            .expect("interest broadcast");
+        assert!(
+            retract < broadcast,
+            "retract before broadcasting lost interest"
+        );
+    }
+
+    /// #5647: the periodic hosting sweep must re-read the memory limit and
+    /// recompute the resident budget every tick, or a cgroup limit changed at
+    /// runtime is never picked up and the budget stays at its startup value.
+    /// Code only, whitespace removed, so a reflow cannot break it and a
+    /// commented-out call cannot satisfy it.
+    #[test]
+    fn sweep_recomputes_the_resident_budget_from_the_memory_limit() {
+        let body = extract_fn_body(
+            production_source(),
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Only the loop body runs every tick; a recompute before the loop
+        // would run once at startup.
+        let (_, loop_body) = body
+            .split_once("loop {")
+            .expect("sweep_get_subscription_cache must have its tick loop");
+        let code: String = loop_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = concat!(
+            "lettotal_ram=crate::ring::hosting::total_ram_or_fallback(",
+            "crate::wasm_runtime::read_total_ram_bytes(),);",
+            "ring.hosting_manager.recompute_resident_overhead_budget(total_ram);"
+        );
+        let recompute_at = code.find(needle).unwrap_or_else(|| {
+            panic!(
+                "sweep_get_subscription_cache must read the memory limit and recompute \
+                 the resident budget each tick (#5647)"
+            )
+        });
+        let sweep_at = code
+            .find("ring.sweep_expired_get_subscriptions()")
+            .expect("the tick must run the hosting sweep");
+        assert!(
+            recompute_at < sweep_at,
+            "the budget must be recomputed before the sweep uses it"
         );
     }
 
@@ -9521,6 +9851,300 @@ mod cost_pressure_seam_tests {
         )
     }
 
+    /// A real `OpManager` whose ring has been attached the production way
+    /// (`Ring::attach_op_manager`), for the #5647/#5781 wiring tests.
+    async fn attached_op_manager(id: &str) -> std::sync::Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    fn wiring_key(seed: u32) -> freenet_stdlib::prelude::ContractKey {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let mut id = [7u8; 32];
+        id[..4].copy_from_slice(&seed.to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new([8u8; 32]))
+    }
+
+    /// #5647: `attach_op_manager` must install the interest-bytes provider, so
+    /// the hosting cache charges each hosted contract the neighbour-summary
+    /// bytes the REAL interest manager holds for it. Goes through the
+    /// production sweep entry (`Ring::sweep_expired_hosting`). Without the
+    /// provider the cache counts only its fixed per-entry bytes and the
+    /// resident axis would silently stop seeing summaries, with every other
+    /// test still green.
+    #[tokio::test]
+    async fn attach_op_manager_wires_interest_bytes_into_the_hosting_cache() {
+        use freenet_stdlib::prelude::StateSummary;
+        let op_manager = attached_op_manager("interest-bytes-wiring-5647").await;
+        let key = wiring_key(0);
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+        let neighbour =
+            crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone());
+        assert!(op_manager.interest_manager.upsert_peer_summary(
+            &key,
+            &neighbour,
+            StateSummary::from(vec![0u8; 4096]),
+        ));
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let held = op_manager.interest_manager.resident_bytes_for(&key);
+        assert!(held > 4096);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES + held,
+            "the hosting cache must charge the summary bytes the interest manager holds"
+        );
+    }
+
+    fn wiring_peer() -> crate::ring::PeerKey {
+        crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone())
+    }
+
+    fn host_for_wiring(
+        op_manager: &crate::node::OpManager,
+        key: freenet_stdlib::prelude::ContractKey,
+    ) {
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+    }
+
+    /// #5781 review blocker, at the 64 MiB floor budget: identities acting
+    /// together, sending identical and distinct oversized summaries for 600
+    /// hosted contracts, cannot push the resident axis over budget, so they
+    /// cannot get any contract evicted. 600 contracts at the 128 KiB
+    /// per-contract cap would be 75 MiB; the node-wide budget (a quarter of
+    /// the resident budget, enforced at write time) is what keeps the total
+    /// under 64 MiB, and the counter never exceeds it.
+    #[tokio::test]
+    async fn colluding_peers_flooding_summaries_cannot_push_hosting_over_budget() {
+        use freenet_stdlib::prelude::StateSummary;
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-flood-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        // A 512 MiB limit at the default share: the 64 MiB floor budget.
+        hosting.configure_resident_overhead_mem_share(0.125);
+        let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
+        assert_eq!(budget, 64 * MIB);
+        let node_cap = budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR;
+        // What the sweep installs; installed here so the flood below is
+        // judged against the floor budget from the first write.
+        op_manager
+            .interest_manager
+            .set_neighbour_summary_budget(node_cap);
+
+        let im = &op_manager.interest_manager;
+        let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
+        let hosted = 600u32;
+        let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
+        for i in 0..hosted {
+            let key = wiring_key(i);
+            host_for_wiring(&op_manager, key);
+            for (n, peer) in colluders.iter().enumerate() {
+                // 1 MiB each, identical across identities: over the cap.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0u8; MIB as usize]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+                // Distinct per identity, each under the cap but together over it.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+                // Identical and exactly at the cap: stored once if it fits.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+            }
+        }
+        assert!(
+            im.neighbour_summary_bytes() > 0,
+            "the flood was partly admitted"
+        );
+        let mut with_summaries = 0;
+        for i in 0..hosted {
+            let held = im.distinct_summary_bytes_for(&wiring_key(i));
+            assert!(held <= cap as u64, "contract {i} holds {held} bytes");
+            if held > 0 {
+                with_summaries += 1;
+            }
+        }
+        assert!(with_summaries > 0 && with_summaries < hosted);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let stats = hosting.hosting_cache_stats();
+        assert!(
+            stats.resident_overhead_bytes <= budget,
+            "the colluders pushed the resident axis to {} bytes against a {budget} budget",
+            stats.resident_overhead_bytes
+        );
+        assert_eq!(
+            stats.contract_count,
+            u64::from(hosted),
+            "nothing was evicted"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+    }
+
+    /// #5781: `Ring::attach_op_manager` installs the node-wide summary budget
+    /// at once (a real value, never 0 or the unset `u64::MAX`), and every
+    /// sweep re-installs it from the current resident budget.
+    #[tokio::test]
+    async fn neighbour_summary_budget_is_installed_at_attach_and_each_sweep() {
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-budget-install-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        let at_attach = im.neighbour_summary_budget();
+        assert_eq!(
+            at_attach,
+            hosting.resident_overhead_budget_bytes()
+                / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+        );
+        assert!(at_attach > 0 && at_attach < u64::MAX);
+
+        hosting.configure_resident_overhead_mem_share(0.125);
+        assert_eq!(
+            hosting.recompute_resident_overhead_budget(512 * MIB),
+            64 * MIB
+        );
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(im.neighbour_summary_budget(), 16 * MIB);
+    }
+
+    /// #5781: on a node at capacity the summary budget stays a quarter of the
+    /// resident budget and the sweep keeps the neighbours' summaries; it does
+    /// not wipe them to clear the breach. Relieving the breach is left to the
+    /// ordinary demand-ordered eviction once it has lasted the sustained
+    /// window (covered by the hosting-cache eviction tests; this sweep runs
+    /// before that window, so nothing is evicted yet).
+    #[tokio::test]
+    async fn a_node_at_capacity_keeps_its_neighbour_summaries() {
+        use freenet_stdlib::prelude::StateSummary;
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-at-capacity-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        hosting.configure_resident_overhead_mem_share(0.125);
+        let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
+        assert_eq!(budget, 64 * MIB);
+        // Entries alone exceed the budget.
+        let hosted = (budget / crate::ring::hosting::HOSTED_ENTRY_BYTES) as u32 + 100;
+        for i in 0..hosted {
+            hosting.record_contract_access(
+                wiring_key(i),
+                10,
+                crate::ring::hosting::AccessType::Get,
+                crate::ring::hosting::HostingCause::Other,
+            );
+        }
+        for i in 0..50u32 {
+            let key = wiring_key(i);
+            im.register_local_hosting(&key);
+            assert!(im.upsert_peer_summary(
+                &key,
+                &wiring_peer(),
+                StateSummary::from(vec![i as u8; 10_000])
+            ));
+        }
+        let held = im.neighbour_summary_bytes();
+        assert_eq!(held, 50 * 10_000);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(
+            im.neighbour_summary_budget(),
+            budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR,
+            "the summary budget does not collapse at capacity"
+        );
+        assert_eq!(im.neighbour_summary_bytes(), held, "no summary was trimmed");
+        assert_eq!(im.summary_bound_trim_totals(), (0, 0));
+        let stats = hosting.hosting_cache_stats();
+        assert!(
+            stats.resident_overhead_bytes > budget,
+            "the node is over budget"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+    }
+
+    /// #5781 relative cap, end to end through the production sweep: a
+    /// neighbour's 100,000-byte summary fits the 128 KiB cap while our own
+    /// summary is unknown. Once a delivery records our own 1,000-byte summary
+    /// the cap is 69,536 bytes, and the next `Ring::sweep_expired_hosting`
+    /// drops the oversized summary before the hosting cache charges it.
+    #[tokio::test]
+    async fn relative_summary_cap_is_enforced_before_hosting_charges() {
+        use crate::ring::interest::SummaryPopulationSource;
+        use freenet_stdlib::prelude::StateSummary;
+        let op_manager = attached_op_manager("summary-relative-5781").await;
+        let key = wiring_key(0);
+        host_for_wiring(&op_manager, key);
+        let neighbour = wiring_peer();
+        let us_to = wiring_peer();
+        let im = &op_manager.interest_manager;
+
+        assert!(im.upsert_peer_summary(&key, &neighbour, StateSummary::from(vec![1u8; 100_000])));
+        im.upsert_peer_summary_from(
+            &key,
+            &us_to,
+            StateSummary::from(vec![2u8; 1_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 101_000);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert!(
+            im.get_peer_summary(&key, &neighbour).is_none(),
+            "the neighbour's summary is over 4 x ours + 64 KiB"
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 1_000);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES
+                + 2 * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES
+                + 1_000
+        );
+    }
+
     /// `Ring::add_connection`'s `bool` reports the READINESS-threshold
     /// crossing, not acceptance — it is `false` both when the ring rejects the
     /// connection and (far more often) when the connection is added while the
@@ -10292,6 +10916,10 @@ mod hosting_stats_mirror_source_tests {
     /// scrape below can only under-count (a declaration shape it cannot parse),
     /// and a floor set below the true count lets exactly that go unnoticed.
     /// Adding a field means bumping this deliberately AND mirroring the field.
+    // 19 since #5647: `contract_slot_budget` was removed (no per-contract
+    // constant to divide by), the estimated field was renamed
+    // `resident_overhead_bytes`, and `resident_overhead_evicted_charged_bytes_total`
+    // was added.
     const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
 
     fn production_source() -> &'static str {
@@ -10554,7 +11182,7 @@ mod hosting_stats_mirror_source_tests {
         );
         // A transposed assignment does NOT contain the expected statement.
         let transposed = "snapshot.hosting_resident_overhead_budget_bytes = \
-                          Some(hosting.estimated_resident_overhead_bytes);";
+                          Some(hosting.resident_overhead_bytes);";
         assert!(!transposed.contains(&e));
         // Neither does a bare read, nor a read into the wrong destination.
         assert!(!"let _ = hosting.resident_overhead_budget_bytes;".contains(&e));
@@ -10567,5 +11195,336 @@ mod hosting_stats_mirror_source_tests {
             expected_mirror("read_count_hist"),
             "host_reads: hosting.read_count_hist,"
         );
+    }
+}
+
+/// The ring's selection functions are where candidate logging is wired to the
+/// op that routed; the router- and writer-level tests cannot see a wrong op, a
+/// dropped `record` call or a probe that logs.
+#[cfg(test)]
+pub(crate) mod candidate_log_wiring_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    use crate::node::network_status::OpType;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+    use crate::ring::{Location, PeerKeyLocation};
+    use crate::router::dataset::{self, DecisionLog, RoutingDataset, UncapturedReason};
+    use crate::router::{RouteEvent, RouteOutcome};
+
+    pub(crate) fn recorder() -> (Arc<RoutingDataset>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let recorder = RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+        (Arc::new(recorder), dir, path)
+    }
+
+    /// Every line up to and including a sentinel written last, so an extra
+    /// trailing line cannot be missed by reading too early.
+    pub(crate) fn lines_through_sentinel(
+        recorder: &RoutingDataset,
+        path: &std::path::Path,
+    ) -> Vec<serde_json::Value> {
+        const SENTINEL_T_MS: u64 = 424_242;
+        recorder.record_peers(SENTINEL_T_MS, Vec::new());
+        dataset::lines_eventually(path, |lines| {
+            lines
+                .iter()
+                .any(|line| line["kind"] == "peers" && line["t_ms"] == SENTINEL_T_MS)
+        })
+    }
+
+    /// Enough routing history that decisions are prediction-based.
+    fn warm_router(ring: &super::Ring, peers: &[PeerKeyLocation], contract: Location) {
+        let mut router = ring.router.write();
+        for i in 0..120 {
+            router.add_event(RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location: contract,
+                outcome: if i % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+    }
+
+    fn selected_at(line: &serde_json::Value, position: usize) -> String {
+        line["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["selected_position"] == position)
+            .unwrap_or_else(|| panic!("no candidate at position {position}: {line}"))["peer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn contract_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([0u8; 32]))
+    }
+
+    #[tokio::test]
+    async fn ring_selections_log_only_routing_decisions_with_their_op() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-wiring", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        let contract = Location::from(&key);
+        warm_router(ring, &peers, contract);
+        let (recorder, _dir, path) = recorder();
+        let none: Vec<SocketAddr> = Vec::new();
+        let all: Vec<SocketAddr> = peers.iter().filter_map(|p| p.socket_addr()).collect();
+
+        let (subscribe, put, get) = {
+            let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+            // Probes and pre-selections log nothing.
+            assert_eq!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Unlogged,
+                    key.id(),
+                    none.as_slice(),
+                    2
+                )
+                .len(),
+                2
+            );
+            assert!(
+                ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice())
+                    .is_some()
+            );
+            // A selection of nobody routes nowhere and logs nothing.
+            assert!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Get),
+                    key.id(),
+                    all.as_slice(),
+                    1
+                )
+                .is_empty()
+            );
+            let subscribe = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Subscribe),
+                key.id(),
+                none.as_slice(),
+                2,
+            );
+            let put = ring
+                .closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Put),
+                    &key,
+                    none.as_slice(),
+                )
+                .unwrap();
+            let get = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            );
+            (subscribe, put, get)
+        };
+        let again = {
+            // Below rate 1 the test override never draws a capture: this GET
+            // decision is uncaptured. Tied costs are shuffled, so it may pick a
+            // different peer than the capture above; every peer is made a live
+            // GET capture first, so whichever it picks is closed.
+            for peer in &peers {
+                recorder.record_decision(live_capture(peer, OpType::Get, contract));
+            }
+            let _log = dataset::force_candidate_log(recorder.clone(), 0.5);
+            let again = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            );
+            assert_eq!(again.len(), 1);
+            dataset::record_bypass(
+                OpType::Subscribe,
+                contract,
+                &subscribe[0],
+                UncapturedReason::DirectedFirstHop,
+            );
+            again
+        };
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision",
+                "decision",
+                // The live GET captures of every peer.
+                "decision",
+                "decision",
+                "decision",
+                "decision",
+                "decision",
+                "decision_uncaptured",
+                "decision_uncaptured",
+                "peers"
+            ],
+            "{lines:?}"
+        );
+
+        let (sub_line, put_line, get_line) = (&lines[1], &lines[2], &lines[3]);
+        assert_eq!(sub_line["op"], "SUBSCRIBE");
+        assert_eq!(sub_line["contract_location"], contract.as_f64());
+        assert_eq!(sub_line["k"], 2);
+        assert_eq!(sub_line["candidates_considered"], peers.len());
+        assert_eq!(selected_at(sub_line, 0), dataset::peer_hash(&subscribe[0]));
+        assert_eq!(selected_at(sub_line, 1), dataset::peer_hash(&subscribe[1]));
+
+        assert_eq!(put_line["op"], "PUT");
+        assert_eq!(put_line["k"], 1);
+        assert_eq!(selected_at(put_line, 0), dataset::peer_hash(&put));
+
+        assert_eq!(get_line["op"], "GET");
+        assert_eq!(selected_at(get_line, 0), dataset::peer_hash(&get[0]));
+
+        let (superseded, bypass) = (&lines[9], &lines[10]);
+        assert_eq!(superseded["op"], "GET");
+        assert_eq!(superseded["reason"], "sampled_out");
+        assert_eq!(
+            superseded["selected"],
+            serde_json::json!([dataset::peer_hash(&again[0])])
+        );
+        assert_eq!(bypass["op"], "SUBSCRIBE");
+        assert_eq!(bypass["reason"], "directed_first_hop");
+        assert_eq!(
+            bypass["selected"],
+            serde_json::json!([dataset::peer_hash(&subscribe[0])])
+        );
+    }
+
+    /// A router with too little history ranks by distance; the ring must say
+    /// so rather than blame sampling.
+    #[tokio::test]
+    async fn a_cold_router_decision_is_logged_as_distance_based() {
+        let (op_manager, _rx, _peers, _guards) = op_manager_with_peers("candidate-cold", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        let contract = Location::from(&key);
+        let (recorder, _dir, path) = recorder();
+        let none: Vec<SocketAddr> = Vec::new();
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let chosen = ring
+            .closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice())
+            .unwrap();
+        // Make the selection a live capture, so the uncaptured line is written.
+        recorder.record_decision(live_capture(&chosen, OpType::Put, contract));
+        let again = ring
+            .closest_potentially_hosting(DecisionLog::Joinable(OpType::Put), &key, none.as_slice())
+            .unwrap();
+        assert_eq!(again, chosen);
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["start", "decision", "decision_uncaptured", "peers"],
+            "{lines:?}"
+        );
+        assert_eq!(lines[2]["reason"], "distance_based");
+        assert_eq!(lines[2]["op"], "PUT");
+    }
+
+    /// Pacing must run on the ring's injected clock: under a paused runtime
+    /// only that clock moves, so a capture refused as paced is allowed again
+    /// once virtual time passes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_pacing_reads_the_injected_clock() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-paced", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        // A 40 KB budget released over an hour: the burst is 2.5 KB, less
+        // than one captured decision.
+        let recorder = Arc::new(
+            RoutingDataset::open_with_decisions(
+                &path,
+                dataset::DEFAULT_MAX_BYTES,
+                40_000,
+                3_600_000,
+            )
+            .unwrap(),
+        );
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let none: Vec<SocketAddr> = Vec::new();
+        // Selecting every peer makes each call the same selection whatever
+        // order tied costs are shuffled into, so the second call's selections
+        // are live and its pacing is written as a line.
+        let get = || {
+            ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                peers.len(),
+            )
+        };
+        let kinds = |lines: &[serde_json::Value]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l["kind"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Each call's line is awaited before the next call, so the lines pin
+        // which call was captured and which was paced.
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| kinds(lines) == ["start", "decision"]);
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| {
+            kinds(lines) == ["start", "decision", "decision_uncaptured"]
+        });
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(get().len(), peers.len());
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        assert_eq!(
+            kinds(&lines),
+            [
+                "start",
+                "decision",
+                "decision_uncaptured",
+                "decision",
+                "peers"
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[2]["reason"], "paced", "the second call is paced");
+    }
+
+    /// A captured decision for `peer` alone, as a warm router would write it.
+    pub(crate) fn live_capture(
+        peer: &PeerKeyLocation,
+        op: OpType,
+        contract: Location,
+    ) -> dataset::DecisionRecord {
+        dataset::DecisionCapture {
+            contract_location: contract,
+            acting_model: dataset::RoutingModel::Legacy,
+            prediction_fallback: false,
+            k: 1,
+            candidates_available: 1,
+            prior_failure_events: 0,
+            candidates: vec![dataset::CapturedCandidate {
+                peer,
+                legacy: None,
+                hierarchical: None,
+                hierarchical_stages: dataset::HierarchicalStages::default(),
+                selected_position: Some(0),
+            }],
+        }
+        .into_record(op, 1)
     }
 }

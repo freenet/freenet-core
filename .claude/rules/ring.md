@@ -206,6 +206,16 @@ residual correction) was removed after the gateway soak.
 FREENET_ROUTING_HIERARCHICAL and FREENET_ROUTING_RESIDUAL_CORRECTION are
 ignored, with a warning at startup when set.
 
+The FAILURE stage chooses its forgetting horizon from a shorter menu
+(FAILURE_HORIZONS_HOURS) than the timing stages (LOG_HORIZONS_HOURS), so a
+failure burst is tracked faster, and it carries a CONTRACT-LEVEL TERM: a second
+hierarchy, contract > (contract, peer), whose effect is subtracted from what the
+peer levels learn (from OTHER peers only, so a peer's own failures never explain
+themselves away) and added back to a forecast (from all present peers). It
+exists because a failure on a contract nobody can serve was learned as evidence
+about the peer that was asked, which raised that peer's forecasts for every
+other contract (#5700, #5702). It is on unconditionally; there is no flag for it.
+
 The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in three roles:
   - the 50-event gate between distance-only and prediction-based routing, and
     below it the "prefer untried peers" order (the per-peer EWMA map)
@@ -218,13 +228,24 @@ The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in three roles:
 Do not remove them without replacing every role.
 
 WHEN touching the router:
-  → router/golden_replay.rs pins routing decisions to the build soaked with
-    FREENET_ROUTING_HIERARCHICAL=1 (origin/main d9fa29522). Keep it green.
-    Regenerate its golden files ONLY from a build whose routing has itself
-    been soaked, never to make it pass.
-  → The one known divergence from that build: a timing stage holding 10-29
-    samples no longer blends Renegade into its isotonic fallback. Pinned by
+  → router/golden_replay.rs pins routing decisions bit for bit. Keep it
+    green. Regenerate its golden files ONLY for a change you can explain
+    number by number, never to make it pass; record the reason in the commit.
+  → The one known divergence from the build soaked with
+    FREENET_ROUTING_HIERARCHICAL=1 (origin/main d9fa29522): a timing stage
+    holding 10-29 samples no longer blends Renegade into its isotonic
+    fallback. Pinned by
     a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
+  → Routing-behaviour guards cover BOTH paths through Training: History (a
+    history-built router never feeds the hierarchical estimator, so it routes
+    on the isotonic fallback) and WarmHierarchical (trained through add_event
+    with a frozen clock; asserts every FAILURE probability, and every timing
+    estimate the estimator supplies, came from the hierarchical estimate). Its
+    timing stages warm only after 30 timed successes, so a guard whose
+    property depends on timing must train that many and call
+    assert_hierarchical_timing_decides. Where both paths agree bit for bit
+    (all-success data), add a FALLBACK_STAGE_EVALUATIONS delta check. Give a
+    new guard both modes.
   → The hierarchical estimator's time comes from the router's injected
     TimeSource, never the host wall clock. Ring wires ring.time_source, an
     InstantTimeSrc reading tokio's clock: it advances under a paused tokio
@@ -235,6 +256,62 @@ WHEN touching the router:
   → The dashboard's per-peer breakdown (HierarchicalRouting::explain) must
     reproduce the routing estimate bit for bit; pinned by
     explanation_reproduces_the_estimate_routing_acts_on
+  → PAIRED VALUES, failure probability: the estimator returns TWO failure
+    numbers per candidate and they are not interchangeable.
+    failure_probability is clamped to [0, 1] and is what is REPORTED and
+    RECORDED (RoutingPrediction, the dataset, telemetry, the dashboard);
+    failure_ranking (hierarchical::ranking_failure_probability) is what the
+    cost formula RANKS BY, and it keeps the order of the forecasts above 1 so
+    that several peers clamped at 1 are not tied. They differ only above 1,
+    and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
+    the ranking value is pinned at 0 deliberately: carrying the downward
+    overshoot made the no-timing cost branch (failure * 3.0) negative for the
+    healthiest peers, which the dashboard prints as "N/A". Consequences to
+    keep in mind: an offline tool CANNOT reproduce the router's order among
+    candidates that all clamp, because the unbounded value is recorded
+    nowhere; and recomputing expected_total_time from the recorded
+    failure_probability reproduces it only to within the slope.
+  → Do NOT write that a contract-level change "cannot change which peer is
+    picked". A quantity common to every candidate cannot reorder the
+    candidates' failure PROBABILITIES, but routing ranks by
+    `t + transfer + 3*t*p`, so a common change of `d` moves candidate i's cost
+    by `3*t_i*d`, which differs across candidates whose response times differ.
+    See hierarchical.rs, "Contract term", and
+    a_shared_contract_effect_reweights_peers_that_differ_in_response_time.
+  → The contract term must export enough to tell "it worked and helped
+    nothing" from "it never activated". _contract_estimable_refits is NECESSARY
+    and not sufficient for that: the effect is also refused per query below the
+    present-peer bar, and on the recorded soak most failures are on contracts
+    that never reach it, so a node estimable at every refit that moves no
+    forecast would read as active. The counters that answer the question are
+    _contract_effects_applied and _contract_forecast_offsets; read
+    _contract_tau2 beside _contract_qualifying_contracts, because a value
+    resting on two contracts is otherwise indistinguishable from one resting on
+    eighty, and beside _contract_den_below_two_refits, which counts the refits
+    on which fewer than two contracts qualified so the term was off despite
+    counting as estimable. Know what _contract_effects_applied does NOT cover:
+    it counts the LIVE learn path only, and only where the explaining bound
+    left a non-zero adjustment, so it is not a total of every residual the term
+    has moved (the per-refit re-adjustment of the whole window is counted
+    nowhere). Do NOT quote _contract_estimable_refits on its own as the term's
+    activity: on the recorded streams 595 of 796 refits were estimable but the
+    term could act on only 285 of them (158 with fewer than two qualifying
+    contracts, a further 152 with tau2_contract computing to exactly zero), so
+    the estimable count reads as "working everywhere" and overstates by 2x.
+    A related property of the estimator, measured 2026-09-18: a contract whose
+    peers DISAGREE sharply contributes its spread to tau2_peer rather than
+    tau2_contract, so the term is silent on it unless other contracts supply
+    the between-contract variance. That is a different gate from the
+    present-peer bar and compounds with it. All of these reach the snapshot
+    and the peer-detail dashboard; the OTLP body carries the ones a fleet-wide
+    question needs (_effects_applied, _forecast_offsets, _estimable_refits,
+    _qualifying_contracts, _floor_bound_refits, _contracts, _tau2) and NOT the
+    saturation gauges or _den_below_two_refits, which are dashboard-only by
+    choice and listed as such on the telemetry pin (telemetry.rs is
+    hand-mirrored: a new RouterSnapshotInfo field is invisible to the collector
+    unless added there). Do not add a mechanism whose activation nothing
+    reports, and do not mistake "the mechanism could act" for "the mechanism
+    acted".
 
 EMERGENCY FALLBACK: FREENET_ROUTING_FALLBACK_ISOTONIC=1 (default off, fail-safe
 parse) routes EVERY stage on the isotonic estimate with the per-peer EWMA, the
@@ -244,13 +321,30 @@ WARN at startup when set; slated for removal once hierarchical is proven.
 Pinned by the_isotonic_fallback_switch_routes_every_stage_on_the_isotonic_estimate;
 golden_replay runs with it unset. FREENET_ROUTING_LEGACY_LABELS (#5653) still
 restores the pre-#5657 failure labels, a label switch, not an estimator one.
+The routing dataset's candidate log (FREENET_ROUTING_DATASET_CANDIDATES) records
+the isotonic fallback as its `legacy` model; use a rate of 0.01 or less until
+its capture cost is re-measured without Renegade (router/dataset.rs "Cost").
 
 HOW THE PROMOTION WAS DECIDED (the method to reuse for a future estimator),
 both parts on data collected after #5653 (failure labels) was deployed:
-  (a) OFFLINE CALIBRATION on the routing dataset (FREENET_ROUTING_DATASET):
-      prequential failure Brier score and seconds error for both models on
-      the same events. Calibration only: the dataset records the chosen peer
-      and its outcome, with no candidate sets, so it cannot measure ranking.
+  (a) OFFLINE, on the routing dataset (FREENET_ROUTING_DATASET), gated by
+      /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17, approved by
+      Ian), which superseded a Brier-first gate: M1 within-contract RANKING
+      (delta C-index, non-inferiority margin -0.05; it cannot resolve on the
+      recorded data at that margin, so it was REPORTED), M2 dead-contract
+      POLLUTION (excess forecast on successes of recently storm-tainted peers),
+      and M3 failure Brier only as a non-inferiority check (CI upper bound at
+      most 1.10). The Brier-first gate weighted contract-level calibration on
+      failed relayed GETs heavily, which affects candidate ORDERING only
+      indirectly. Two blind spots to keep in view: the gate scores the
+      recorded CLAMPED forecast, so it cannot see the ranking value above, and
+      M2 scores only forecasts too high on successes, so an over-correction
+      reads as an improvement. Route lines record only the chosen peer;
+      FREENET_ROUTING_DATASET_CANDIDATES adds a `decision` line per routing
+      decision for ranking comparisons over the candidates the ACTING model
+      chose among (no exploration, so an unselected peer's outcome is
+      unobserved; the by-value join is biased in the two directions the
+      router/dataset.rs module doc "Joining" names).
   (b) ON-FIELD CROSSOVER between the two nova gateways, swapping which one
       runs the candidate halfway through the window, compared WITHIN each
       gateway (GET success rate, latency, chosen-peer failure rate). The

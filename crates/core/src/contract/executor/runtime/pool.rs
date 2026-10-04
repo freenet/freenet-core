@@ -198,6 +198,16 @@ pub struct RuntimePool {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Manifests, consent-once grants and the unprompted-run budget for this
+    /// node's delegates (`contract::delegate_capabilities`). Per node, never
+    /// a process global: simulation tests run many nodes in one process.
+    ///
+    /// `None` in hosted mode: there every client can present any app's token
+    /// from what the node sees as a local connection, and runs have no
+    /// per-user secret namespace, so neither app identity nor a node-wide
+    /// grant means anything there.
+    delegate_capabilities:
+        Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
     /// Sender for delegate notifications (cloned into each executor and replacements).
     delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
@@ -599,7 +609,27 @@ impl RuntimePool {
             None
         };
 
+        #[cfg(feature = "redb")]
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(shared_state_store.inner().clone());
+        #[cfg(not(feature = "redb"))]
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
+        let delegate_capabilities = if config.ws_api.hosted_mode {
+            tracing::info!("Hosted mode: delegate capabilities (background runs) are disabled");
+            None
+        } else {
+            let caps = crate::contract::delegate_capabilities::DelegateCapabilities::new(
+                capability_storage,
+            );
+            op_manager.set_delegate_capabilities(&caps);
+            Some(caps)
+        };
+
         Ok(Self {
+            delegate_capabilities,
             runtimes,
             available: Semaphore::new(pool_size_usize),
             config,
@@ -850,6 +880,16 @@ impl RuntimePool {
         self.log_health_if_degraded();
     }
 
+    /// Replace the pool's capability state, so a test can drive the real
+    /// handler with a clock it controls (wake-up intervals are minutes).
+    #[cfg(test)]
+    pub(crate) fn set_delegate_capabilities_for_test(
+        &mut self,
+        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        self.delegate_capabilities = Some(caps);
+    }
+
     /// Get a reference to the shared state store.
     /// Used for hosting metadata persistence operations during startup.
     pub fn state_store(&self) -> &StateStore<Storage> {
@@ -894,6 +934,25 @@ impl ContractExecutor for RuntimePool {
 
     fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
         Some(self.op_manager.clone())
+    }
+
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities.clone()
+    }
+
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        // The delegate index and code cache are shared by every executor in
+        // the pool, so any one that is not checked out can answer.
+        self.runtimes
+            .iter()
+            .flatten()
+            .find_map(|executor| executor.runtime.delegate_code(key))
+    }
+
+    fn delegate_subscription_store(&self) -> Option<Storage> {
+        Some(self.shared_state_store.inner().clone())
     }
 
     async fn fetch_contract(
@@ -1681,6 +1740,77 @@ mod tests {
         let wrapped = WrappedContract::new(Arc::new(code), params);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
         (container, key)
+    }
+
+    /// The start-up manifest refresh (`refresh_capability_manifests`) reads a
+    /// delegate's code through `RuntimePool::delegate_code`. Through the real
+    /// pool and store: a registered delegate's exact module comes back, and an
+    /// unknown key gives `None`.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn delegate_code_returns_the_stored_module() {
+        use crate::wasm_runtime::DelegateRuntimeInterface;
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+
+        let config_args = ConfigArgs {
+            id: Some("pool-delegate-code".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let mut pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(2).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        let code = crate::wasm_runtime::tests::get_test_module("test_delegate_lifecycle")
+            .expect("build the fixture delegate");
+        let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &code.clone().into(),
+            &b"params".to_vec().into(),
+        ))));
+        let key = delegate.key().clone();
+        pool.runtimes[0]
+            .as_mut()
+            .expect("pool executor present")
+            .runtime
+            .register_delegate(
+                delegate,
+                XChaCha20Poly1305::new(&[0u8; 32].into()),
+                [0u8; 24].into(),
+            )
+            .expect("register the delegate");
+
+        assert_eq!(pool.delegate_code(&key), Some(code));
+        assert_eq!(
+            pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
+            None
+        );
     }
 
     /// End-to-end proof that evicting an advertised contract through the real

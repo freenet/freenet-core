@@ -3228,6 +3228,7 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
         crate::wasm_runtime::delegate_subscriptions::subscribe(
             subscribe_req.contract_id,
             &delegate_key,
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
         );
         Ok(())
     } else {
@@ -3357,7 +3358,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     }
 
     // --- Step 5: Cleanup on delegate unregister ---
-    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+        &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
 
     // Verify cleanup
     assert!(
@@ -3454,6 +3458,7 @@ async fn test_notification_application_message_routed_to_registered_app()
     crate::wasm_runtime::delegate_subscriptions::subscribe(
         subscribe_req.contract_id,
         &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
     );
     // Feed the subscribe response back so the delegate finishes subscribing.
     let _ = runtime.inbound_app_message(
@@ -3557,7 +3562,10 @@ async fn test_notification_application_message_routed_to_registered_app()
         "after disconnect no app should remain registered"
     );
 
-    crate::wasm_runtime::delegate_subscriptions::remove_delegate(&delegate_key);
+    crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+        &delegate_key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
     std::mem::drop(temp_dir);
     Ok(())
 }
@@ -3593,8 +3601,16 @@ async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std:
     // Simulate delegate subscriptions
     let delegate_key_a = DelegateKey::new([1u8; 32], CodeHash::new([10u8; 32]));
     let delegate_key_b = DelegateKey::new([2u8; 32], CodeHash::new([20u8; 32]));
-    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_a);
-    crate::wasm_runtime::delegate_subscriptions::subscribe(contract_instance_id, &delegate_key_b);
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        contract_instance_id,
+        &delegate_key_a,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        contract_instance_id,
+        &delegate_key_b,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
 
     // Verify subscriptions exist
     assert_eq!(
@@ -4908,5 +4924,77 @@ async fn unsubscribe_contract_request_fails_the_run_rather_than_being_dropped()
         );
     }
 
+    Ok(())
+}
+
+/// Declares `manifest(lifecycle = [Installed, NodeStarted], capabilities =
+/// [Background])` and answers each lifecycle event with
+/// `"<event>:<parameters>"`.
+const TEST_DELEGATE_LIFECYCLE: &str = "test_delegate_lifecycle";
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn app_payloads(outbound: &[OutboundDelegateMsg]) -> Vec<Vec<u8>> {
+    outbound
+        .iter()
+        .filter_map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(msg) => Some(msg.payload.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The manifest survives a real build of a real delegate and is what the node
+/// reads at registration, and a delegate built against stdlib 0.12 decodes
+/// `InboundDelegateMsg::Lifecycle` (tag 10).
+#[tokio::test]
+async fn a_manifest_delegate_decodes_lifecycle_events() -> Result<(), Box<dyn std::error::Error>> {
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_LIFECYCLE).await?;
+
+    let manifest = DelegateManifest::from_wasm(delegate.code().data())?
+        .expect("the #[delegate(manifest(..))] section must be in the built module");
+    assert!(manifest.wants_lifecycle(LifecycleKind::Installed));
+    assert!(manifest.wants_lifecycle(LifecycleKind::NodeStarted));
+    assert!(manifest.wants_capability(Capability::Background));
+
+    for (event, expected) in [
+        (LifecycleEvent::Installed, b"installed:".to_vec()),
+        (
+            LifecycleEvent::NodeStarted {
+                down_since_ms: Some(1_700_000_000_000),
+            },
+            b"node_started:".to_vec(),
+        ),
+    ] {
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::Lifecycle(event)],
+        )?;
+        assert_eq!(app_payloads(&outbound), vec![expected]);
+    }
+    Ok(())
+}
+
+/// Why delivery is gated on the manifest: a delegate built against an older
+/// stdlib (this fixture pins 0.3.x) cannot decode tag 10 at all, and has no
+/// manifest the node could mistake for an opt-in.
+#[tokio::test]
+async fn a_delegate_without_a_manifest_cannot_decode_lifecycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (delegate, mut runtime, _temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    assert_eq!(DelegateManifest::from_wasm(delegate.code().data())?, None);
+    let result = runtime.inbound_app_message(
+        delegate.key(),
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::Lifecycle(LifecycleEvent::Installed)],
+    );
+    assert!(
+        result.is_err(),
+        "an old delegate must fail to decode a Lifecycle message, got {result:?}"
+    );
     Ok(())
 }

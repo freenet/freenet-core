@@ -31,11 +31,10 @@ mod wasmtime_engine;
 /// Retired-instance bytes ONE wasmtime Store may hold before it is refreshed, for
 /// a host with `total_ram` bytes and `pool_size` executors. Re-exported because
 /// there is one Store per executor, so it is a per-worker term in the node's
-/// aggregate memory commitment — consulted by both
-/// `contract::executor::declared_cache_ceiling` (production) and
-/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe` (the
-/// test that verifies it stays safe).
-#[cfg(feature = "wasmtime-backend")]
+/// aggregate memory commitment — consulted by
+/// `contract::executor::declared_cache_ceiling`, which is test-only since #5647
+/// (it feeds `cache_byte_budgets_are_aggregate_safe`).
+#[cfg(all(feature = "wasmtime-backend", test))]
 pub(crate) use wasmtime_engine::store_arena_budget_for;
 
 use super::ContractError;

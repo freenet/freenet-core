@@ -8,6 +8,14 @@ mod recoverability;
 mod skill;
 mod util;
 
+/// Simulation coverage for the hierarchical estimator (#4485), gated on
+/// `simulation_tests` like the other in-crate simulation cases. The module name
+/// is load-bearing: CI's simulation job selects in-crate simulation tests with
+/// `-E 'kind(test) | (kind(lib) & test(sim_e2e_tests))'`, so a differently-named
+/// module would compile and never run (#4301).
+#[cfg(all(test, feature = "simulation_tests"))]
+mod sim_e2e_tests;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -196,7 +204,11 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// and post-#5117 series separately. Still an undercount either way: the
     /// removal is only honoured within `INTEREST_TTL` and lives in a bounded LRU.
     pub recreated: [u64; InterestRemovalCause::COUNT],
-    /// Summary-population outcomes by source then outcome.
+    /// Summary-population outcomes by source then outcome. Each row grew from
+    /// 4 to 5 entries in #5647 (`rejected_oversized`, appended last) while the
+    /// schema stayed `v: 1`: positions of existing outcomes are unchanged, so a
+    /// reader indexes by `SummaryPopulationOutcome::ALL` order and treats a
+    /// shorter row as coming from an older node.
     pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
     /// Missing-pair history and active-attempt correlation overflows.
     pub corr_ovf: [u64; 2],
@@ -588,44 +600,64 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
-    /// Resident-overhead pressure axis (#5325), populated by `Ring` from the
-    /// `HostingManager` on the snapshot cadence. This is the SECOND, independent
-    /// eviction pressure: `hosting_budget_bytes` / `hosting_current_bytes` above
-    /// bound contract STATE bytes only, while this axis bounds the per-contract
-    /// resident bookkeeping that scales with hosted-contract COUNT, and either
-    /// can trigger a sweep on its own. Without these four, a node evicting
-    /// purely under slot pressure looks idle in telemetry — its state-byte
-    /// occupancy can sit at 13% while `hosting_resident_overhead_evictions_total`
-    /// climbs, which is exactly the confusion the fleet audit hit.
+    /// Resident-overhead pressure axis (#5325, #5647), populated by `Ring` from
+    /// the `HostingManager` on the snapshot cadence. This is the SECOND,
+    /// independent eviction pressure: `hosting_budget_bytes` /
+    /// `hosting_current_bytes` above bound contract STATE bytes (on disk), while
+    /// this axis bounds the memory hosted contracts hold in RAM, and either can
+    /// trigger a sweep on its own.
     ///
-    /// `hosting_resident_overhead_budget_bytes` is the RAM-scaled ceiling;
-    /// `hosting_estimated_resident_overhead_bytes` is `contract_count *
-    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Treat that pair as a
-    /// contract-COUNT ceiling wearing memory units, NOT as measured RAM: the
-    /// "used" side is a count multiplied by a flat estimate, so a collector that
-    /// renders it as memory will mislead (the node's own dashboard renders
-    /// `hosting_contract_slot_budget` — the same budget expressed as the slot
-    /// count it really bounds — for that reason).
+    /// `hosting_resident_overhead_budget_bytes` is `--hosting-mem-share` of the
+    /// node's memory limit. `hosting_resident_overhead_bytes` is COUNTED, not
+    /// estimated: the neighbour-summary bytes the interest manager holds for the
+    /// hosted contracts plus a fixed per-entry charge, as of the last sweep. Both
+    /// are bytes, so `used / budget` is a utilization ratio; the budget moves
+    /// only if the memory limit does. Compare `hosting_resident_overhead_bytes`
+    /// with the process's `memory_rss_bytes` (resource_utilization) to see how
+    /// much of RSS hosting accounts for.
+    ///
     /// `hosting_resident_overhead_evictions_total` is a monotonic counter the
-    /// collector differences to get a slot-pressure eviction rate; it may overlap
+    /// collector differences to get this axis's eviction rate; it may overlap
     /// with `hosting_budget_evictions_total`. `None` until the ring is built.
-    /// Per-node aggregate scalars.
     ///
-    /// The budget is ALSO a moving target, which matters more to a collector than
-    /// to this node. `ring::hosting::cache::resident_overhead_budget_for` derives
-    /// it as a structural RESIDUAL (total RAM, less the baseline reservation, less
-    /// every declared cache ceiling, less the state-byte budget) and then mins it
-    /// against live memory signals, recomputed every 60s sweep — a known
-    /// limitation, #5334, deferred pending exactly this telemetry. So
-    /// `estimated / budget` graphed as a utilization ratio has a NON-STATIONARY
-    /// DENOMINATOR that moves with unrelated system memory pressure: a rise in
-    /// that ratio does not by itself mean the node took on more contracts. Graph
-    /// the numerator and denominator separately before reading a trend into the
-    /// ratio.
+    /// `hosting_resident_overhead_evicted_charged_bytes_total` is a monotonic
+    /// sum of the bytes CHARGED to each contract this axis evicted, as of the
+    /// sweep before its eviction (#5647). It is what the accounting stopped
+    /// counting, not a measurement of memory released: the neighbour-record
+    /// part is freed a few minutes later, when #5782's reconciliation drops
+    /// the records of a contract that is neither hosted nor in use, and a
+    /// summary that arrived since the last sweep was never charged.
+    ///
+    /// `interest_summary_bound_trims_total` and
+    /// `interest_summary_bound_trimmed_bytes_total` count the neighbour
+    /// summaries dropped (and the distinct bytes freed) by the two summary
+    /// bounds (#5781): a hosted contract over its cap relative to our own
+    /// summary, or one peer holding more than its share of summary bytes only
+    /// it had sent. Nonzero means neighbours are sending far more summary
+    /// data than our own summaries justify.
+    ///
+    /// `interest_resident_bytes_total` is the bytes held for neighbour interest
+    /// records across EVERY contract, hosted or not, counted the same way as
+    /// the per-contract figure inside `hosting_resident_overhead_bytes` (#5647).
+    /// The excess over the hosted part is what the node holds for contracts it
+    /// does not host; #5782's reconciliation should keep it small, so a
+    /// growing excess means records are outliving the hosting they serve.
+    ///
+    /// Before #5647 the second field was `hosting_estimated_resident_overhead_bytes`
+    /// (`contract_count` times a flat 1 MiB) and a `hosting_contract_slot_budget`
+    /// was exported beside it. Both are gone; series from before and after do
+    /// not compare.
     pub hosting_resident_overhead_budget_bytes: Option<u64>,
-    pub hosting_estimated_resident_overhead_bytes: Option<u64>,
-    pub hosting_contract_slot_budget: Option<u64>,
+    pub hosting_resident_overhead_bytes: Option<u64>,
     pub hosting_resident_overhead_evictions_total: Option<u64>,
+    pub hosting_resident_overhead_evicted_charged_bytes_total: Option<u64>,
+    pub interest_resident_bytes_total: Option<u64>,
+    pub interest_summary_bound_trims_total: Option<u64>,
+    /// Distinct neighbour-summary bytes held node-wide, excluding our own
+    /// summaries (#5781). Capped at a quarter of
+    /// `hosting_resident_overhead_budget_bytes` by write-time refusal.
+    pub interest_neighbour_summary_bytes: Option<u64>,
+    pub interest_summary_bound_trimmed_bytes_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -1053,6 +1085,69 @@ pub(crate) struct RouterSnapshotInfo {
     /// Per-stage peer-table capacity, derived from `max_connections`.
     #[serde(default)]
     pub hierarchical_peer_capacity: usize,
+    /// Contracts held by the failure stage's contract term (#4485, #5700).
+    #[serde(default)]
+    pub hierarchical_contracts: usize,
+    /// Contracts evicted from that table, least-recently-used in batches.
+    #[serde(default)]
+    pub hierarchical_contract_evictions: u64,
+    /// Residuals the contract table did not record LIVE, because every entry
+    /// of their contract already held a larger decayed weight. The events
+    /// still train the curve and the peer levels.
+    #[serde(default)]
+    pub hierarchical_contract_residuals_refused: u64,
+    /// `(contract, peer)` pairs the LAST refit dropped for being outside a
+    /// contract's heaviest eight. A GAUGE, not a total: a persistently
+    /// over-full contract contributes the same drops at every refit, so a
+    /// cumulative count would read about 100x the distinct pairs ever dropped.
+    #[serde(default)]
+    pub hierarchical_contract_pairs_refused_last_refit: u64,
+    /// Live contract entries displaced by a heavier newcomer, whose
+    /// accumulated moments were discarded. Counted rather than merged,
+    /// because merging would attribute one peer's residuals to another.
+    #[serde(default)]
+    pub hierarchical_contract_entries_displaced: u64,
+    /// Refits after which the contract term's variance components were
+    /// estimable. NECESSARY for the term to do anything and not sufficient:
+    /// `effect` also returns nothing per query below the present-peer bar, and
+    /// on the recorded soak most failures are on contracts that never reach
+    /// it. The two counters below are what say whether anything moved.
+    #[serde(default)]
+    pub hierarchical_contract_estimable_refits: u64,
+    /// Learned residuals actually adjusted by a contract effect.
+    #[serde(default)]
+    pub hierarchical_contract_effects_applied: u64,
+    /// Scored forecasts that actually carried a contract offset.
+    #[serde(default)]
+    pub hierarchical_contract_forecast_offsets: u64,
+    /// Estimable refits at which the Bernoulli evidence floor was the binding
+    /// value for the contract term's `sigma2`, rather than the measured
+    /// within-cell variance. On the recorded gateway streams the floor bound
+    /// on every estimable refit, because cells there are mostly unanimous and
+    /// mostly tiny; this counter is how a reader sees whether that still holds
+    /// on their traffic.
+    #[serde(default)]
+    pub hierarchical_contract_floor_bound_refits: u64,
+    /// Estimable refits on which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced NOTHING although the
+    /// refit counted as estimable. Read alongside
+    /// `hierarchical_contract_estimable_refits`: their difference is the
+    /// refits on which the term could act at all.
+    #[serde(default)]
+    pub hierarchical_contract_den_below_two_refits: u64,
+    /// Contracts that qualified for `tau2_contract` at the last refit, and
+    /// present entries that informed the components. `tau2_contract` requires
+    /// at least two, so this is also how the term's WARM-UP silence is
+    /// observed: a freshly started node has one qualifying contract for its
+    /// first several thousand events and the term is off until it has two.
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_contracts: u64,
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_entries: u64,
+    /// Between-contract variance at the last refit; `None` when the components
+    /// are not estimable. The term produces no effect while it is absent or 0.
+    #[serde(default)]
+    pub hierarchical_contract_tau2: Option<f64>,
     /// Timed successes whose response time was floored to 1 ms before the log.
     #[serde(default)]
     pub hierarchical_floored_response_times: u64,
@@ -1251,6 +1346,13 @@ pub(crate) struct Router {
     #[cfg(test)]
     #[serde(skip)]
     recorded_sources: Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)>,
+    /// Test-only: predictions made by this router, `[isotonic fallback,
+    /// hierarchical]`. Router state rather than a thread-local, so a
+    /// simulation can tell which path its nodes ACTUALLY routed on, whatever
+    /// thread ran them (`sim_e2e_tests`).
+    #[cfg(test)]
+    #[serde(skip)]
+    predictions_by_model: [std::sync::atomic::AtomicU64; 2],
 }
 
 /// Cumulative success / failure counts of the route events this router has
@@ -1302,6 +1404,8 @@ impl Clone for Router {
             outcome_totals: self.outcome_totals,
             #[cfg(test)]
             recorded_sources: self.recorded_sources.clone(),
+            #[cfg(test)]
+            predictions_by_model: Default::default(),
         }
     }
 }
@@ -1391,6 +1495,15 @@ fn isotonic_fallback_enabled() -> bool {
 #[cfg(test)]
 thread_local! {
     static TEST_ISOTONIC_FALLBACK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+// Test-only count of predictions in which at least one stage that the isotonic
+// estimator could estimate was decided by the isotonic fallback rather than the
+// hierarchical estimator, so a guard trained warm can assert that no stage fell
+// back (two estimators that agree bit for bit cannot be told apart otherwise).
+#[cfg(test)]
+thread_local! {
+    static FALLBACK_STAGE_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Force the isotonic fallback on or off for the duration of a test.
@@ -1792,6 +1905,8 @@ impl Router {
             outcome_totals: RouteOutcomeTotals::default(),
             #[cfg(test)]
             recorded_sources: Vec::new(),
+            #[cfg(test)]
+            predictions_by_model: Default::default(),
         }
     }
 
@@ -2034,6 +2149,17 @@ impl Router {
         &self,
     ) -> Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)> {
         self.recorded_sources.clone()
+    }
+
+    /// Predictions this router has made, `(isotonic fallback, hierarchical)`.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "simulation_tests"), allow(dead_code))]
+    pub(crate) fn predictions_by_model_for_test(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.predictions_by_model[0].load(Relaxed),
+            self.predictions_by_model[1].load(Relaxed),
+        )
     }
 
     #[cfg(test)]
@@ -2339,9 +2465,35 @@ impl Router {
         target_location: Location,
         estimator_hours: f64,
     ) -> Result<RoutingPrediction, RoutingError> {
+        self.predict_with_model(
+            peer,
+            target_location,
+            estimator_hours,
+            !isotonic_fallback_enabled(),
+        )
+        .map(|(prediction, _)| prediction)
+    }
+
+    /// The prediction routing would act on with the hierarchical estimator in
+    /// or out of routing (`use_hierarchical`), whatever
+    /// `FREENET_ROUTING_FALLBACK_ISOTONIC` is actually set to, and which stages
+    /// the hierarchical estimator supplied itself. With `use_hierarchical`
+    /// false every stage takes the isotonic fallback, which is what the
+    /// emergency switch routes on. Routing passes the switch; the candidate log
+    /// (`dataset`) also asks for the other model.
+    fn predict_with_model(
+        &self,
+        peer: &PeerKeyLocation,
+        target_location: Location,
+        estimator_hours: f64,
+        use_hierarchical: bool,
+    ) -> Result<(RoutingPrediction, dataset::HierarchicalStages), RoutingError> {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
         }
+        #[cfg(test)]
+        self.predictions_by_model[usize::from(use_hierarchical)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Required even though routing acts on the hierarchical failure
         // estimate once it exists: a peer the isotonic estimator cannot estimate
@@ -2369,14 +2521,15 @@ impl Router {
             .map(|loc| target_location.distance(loc).as_f64())
             .unwrap_or(0.5);
 
-        // The emergency fallback routes every stage on the isotonic estimate,
-        // which is exactly what a stage without a hierarchical curve uses. See
-        // `isotonic_fallback_enabled`.
-        let hierarchical = if isotonic_fallback_enabled() {
-            hierarchical::Estimate::default()
-        } else {
+        // Without the hierarchical estimator (the emergency fallback, or the
+        // candidate log asking for the other model) every stage takes the
+        // isotonic estimate, which is exactly what a stage without a
+        // hierarchical curve uses. See `isotonic_fallback_enabled`.
+        let hierarchical = if use_hierarchical {
             self.hierarchical
                 .estimate(peer, target_location, distance, estimator_hours)
+        } else {
+            hierarchical::Estimate::default()
         };
         let hierarchical_failure = hierarchical
             .failure_probability
@@ -2389,11 +2542,30 @@ impl Router {
             .transfer_speed_bps
             .filter(|v| v.is_finite() && *v > 0.0);
 
+        #[cfg(test)]
+        if hierarchical_failure.is_none()
+            || (hierarchical_time.is_none() && time_estimate.is_some())
+            || (hierarchical_speed.is_none() && transfer_estimate.is_some())
+        {
+            FALLBACK_STAGE_EVALUATIONS.with(|count| count.set(count.get() + 1));
+        }
+
         let failure_cost_multiplier = 3.0;
         // Clamp the fallback before using it in cost formulas — the per-peer
         // EWMA adjustment can push the raw estimate slightly outside [0, 1].
         let failure_estimate =
             hierarchical_failure.unwrap_or_else(|| failure_estimate.clamp(0.0, 1.0));
+        // The failure value the cost formula ranks by. For the hierarchical
+        // estimator it keeps the order of the forecasts BEFORE the [0, 1] bound,
+        // so peers whose forecasts all clamp at 1 are not tied (see
+        // `hierarchical::ranking_failure_probability`); it differs from the
+        // reported probability only ABOVE that bound, and then by at most 1e-6
+        // per unit of overshoot, so it is never negative and cannot make this
+        // cost negative. The isotonic fallback ranks by its own probability.
+        let failure_for_cost = match hierarchical_failure {
+            Some(probability) => hierarchical.failure_ranking.unwrap_or(probability),
+            None => failure_estimate,
+        };
         let time_to_response_start = hierarchical_time.or(time_estimate).unwrap_or(0.0);
         let xfer_speed = hierarchical_speed.or(transfer_estimate).unwrap_or(0.0);
 
@@ -2411,19 +2583,27 @@ impl Router {
             };
             time_to_response_start
                 + transfer_time
-                + (time_to_response_start * failure_estimate * failure_cost_multiplier)
+                + (time_to_response_start * failure_for_cost * failure_cost_multiplier)
         } else {
-            failure_estimate * failure_cost_multiplier
+            failure_for_cost * failure_cost_multiplier
         };
 
-        Ok(RoutingPrediction {
-            failure_probability: failure_estimate,
-            xfer_speed: TransferSpeed {
-                bytes_per_second: xfer_speed,
+        let stages = dataset::HierarchicalStages {
+            failure: hierarchical_failure.is_some(),
+            response_time: hierarchical_time.is_some(),
+            transfer_speed: hierarchical_speed.is_some(),
+        };
+        Ok((
+            RoutingPrediction {
+                failure_probability: failure_estimate,
+                xfer_speed: TransferSpeed {
+                    bytes_per_second: xfer_speed,
+                },
+                time_to_response_start,
+                expected_total_time,
             },
-            time_to_response_start,
-            expected_total_time,
-        })
+            stages,
+        ))
     }
 
     /// Like `select_k_best_peers` but also returns a `RoutingDecisionInfo` for telemetry.
@@ -2433,6 +2613,32 @@ impl Router {
         target_location: Location,
         k: usize,
     ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
+        let (selected, decision, _) =
+            self.select_k_best_peers_capturing(peers, target_location, k, false);
+        (selected, decision)
+    }
+
+    /// [`Self::select_k_best_peers_with_telemetry`], and with `capture` also the
+    /// candidate set for the routing dataset's `decision` line: every scored
+    /// candidate with BOTH models' predictions, taken from the decision as it
+    /// is made. `None` without `capture`, and for a distance-based decision.
+    ///
+    /// Capturing costs one extra prediction per candidate (the model that is
+    /// not routing) under the caller's router READ lock; see the cost notes in
+    /// [`dataset`]'s "Candidate sets". Without `capture` the path is the plain
+    /// routing decision. Building and sending the record is left to the
+    /// caller, after the lock is released.
+    pub(crate) fn select_k_best_peers_capturing<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+        capture: bool,
+    ) -> (
+        Vec<&'a PeerKeyLocation>,
+        RoutingDecisionInfo,
+        Option<dataset::DecisionCapture<'a>>,
+    ) {
         let total_routing_events = self.failure_estimator.len();
 
         if k == 0 {
@@ -2444,6 +2650,7 @@ impl Router {
                     candidates: Vec::new(),
                     total_routing_events,
                 },
+                None,
             );
         }
 
@@ -2491,11 +2698,20 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, None)
         } else {
             let (closest, candidates_available) =
                 self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
+            // The model routing acts on: the hierarchical estimator, unless the
+            // emergency isotonic fallback is switched on. The candidate log's
+            // "legacy" model is the isotonic fallback (#4485).
+            let acting_hierarchical = !isotonic_fallback_enabled();
+            let mut captured: Vec<dataset::CapturedCandidate<'a>> = if capture {
+                Vec::with_capacity(closest.len())
+            } else {
+                Vec::new()
+            };
 
             // `closest` is distance-sorted, so the enumerate index IS the
             // distance rank. Carrying it through the re-sort is how the rank
@@ -2511,20 +2727,64 @@ impl Router {
                             .location()
                             .map(|loc| target_location.distance(loc).as_f64())
                             .unwrap_or(0.5);
-                        match self.predict_routing_outcome(peer, target_location) {
-                            Ok(pred) => (distance_rank, *peer, distance, Some(pred)),
-                            Err(_) => {
-                                fallback_count += 1;
-                                (distance_rank, *peer, distance, None)
-                            }
+                        let prediction = if capture {
+                            // Both models on one clock reading; the acting one
+                            // is exactly what routing sorts below.
+                            let estimator_hours = self.estimator_clock.hours();
+                            let acting = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    estimator_hours,
+                                    acting_hierarchical,
+                                )
+                                .ok();
+                            let other = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    estimator_hours,
+                                    !acting_hierarchical,
+                                )
+                                .ok();
+                            let (legacy, hierarchical) = if acting_hierarchical {
+                                (other, acting)
+                            } else {
+                                (acting, other)
+                            };
+                            let estimate =
+                                |p: &(RoutingPrediction, dataset::HierarchicalStages)| {
+                                    dataset::ModelEstimate {
+                                        failure_probability: p.0.failure_probability,
+                                        time_to_response_start_s: p.0.time_to_response_start,
+                                        transfer_speed_bps: p.0.xfer_speed.bytes_per_second,
+                                        expected_total_time: p.0.expected_total_time,
+                                    }
+                                };
+                            captured.push(dataset::CapturedCandidate {
+                                peer,
+                                legacy: legacy.as_ref().map(estimate),
+                                hierarchical: hierarchical.as_ref().map(estimate),
+                                hierarchical_stages: hierarchical
+                                    .map(|(_, stages)| stages)
+                                    .unwrap_or_default(),
+                                selected_position: None,
+                            });
+                            acting.map(|(prediction, _)| prediction)
+                        } else {
+                            self.predict_routing_outcome(peer, target_location).ok()
+                        };
+                        if prediction.is_none() {
+                            fallback_count += 1;
                         }
+                        (distance_rank, *peer, distance, prediction)
                     })
                     .collect();
 
             // Sort: peers with predictions by expected_total_time, others at the end
             scored.sort_by(|a, b| {
-                let time_a = a.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                let time_b = b.3.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_a = dataset::cost_order_key(a.3.map(|p| p.expected_total_time));
+                let time_b = dataset::cost_order_key(b.3.map(|p| p.expected_total_time));
                 time_a.total_cmp(&time_b)
             });
 
@@ -2553,6 +2813,28 @@ impl Router {
                 .collect();
 
             scored.truncate(k);
+            // The selection, marked on the capture by the distance rank each
+            // returned peer carried through the sort: from the decision itself.
+            let capture = capture.then(|| {
+                for (position, (distance_rank, _, _, _)) in scored.iter().enumerate() {
+                    if let Some(candidate) = captured.get_mut(*distance_rank) {
+                        candidate.selected_position = Some(position);
+                    }
+                }
+                dataset::DecisionCapture {
+                    contract_location: target_location,
+                    acting_model: if acting_hierarchical {
+                        dataset::RoutingModel::Hierarchical
+                    } else {
+                        dataset::RoutingModel::Legacy
+                    },
+                    prediction_fallback: fallback_count > 0,
+                    k,
+                    candidates_available,
+                    prior_failure_events: total_routing_events,
+                    candidates: captured,
+                }
+            });
             let selected: Vec<&'a PeerKeyLocation> =
                 scored.into_iter().map(|(_, peer, _, _)| peer).collect();
 
@@ -2562,7 +2844,7 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, capture)
         }
     }
 
@@ -2681,9 +2963,13 @@ impl Router {
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
             hosting_resident_overhead_budget_bytes: None,
-            hosting_estimated_resident_overhead_bytes: None,
-            hosting_contract_slot_budget: None,
+            hosting_resident_overhead_bytes: None,
             hosting_resident_overhead_evictions_total: None,
+            hosting_resident_overhead_evicted_charged_bytes_total: None,
+            interest_resident_bytes_total: None,
+            interest_summary_bound_trims_total: None,
+            interest_neighbour_summary_bytes: None,
+            interest_summary_bound_trimmed_bytes_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,
@@ -2842,6 +3128,22 @@ impl Router {
             hierarchical_transfer_speed_active: hierarchical[2].active,
             hierarchical_peer_evictions: self.hierarchical.total_evictions(),
             hierarchical_peer_capacity: hierarchical[0].peer_capacity,
+            hierarchical_contracts: hierarchical[0].contracts,
+            hierarchical_contract_evictions: hierarchical[0].contract_evictions,
+            hierarchical_contract_residuals_refused: hierarchical[0].contract_residuals_refused,
+            hierarchical_contract_pairs_refused_last_refit: hierarchical[0]
+                .contract_pairs_refused_last_refit,
+            hierarchical_contract_entries_displaced: hierarchical[0].contract_entries_displaced,
+            hierarchical_contract_estimable_refits: hierarchical[0].contract_estimable_refits,
+            hierarchical_contract_effects_applied: hierarchical[0].contract_effects_applied,
+            hierarchical_contract_forecast_offsets: hierarchical[0].contract_forecast_offsets,
+            hierarchical_contract_floor_bound_refits: hierarchical[0].contract_floor_bound_refits,
+            hierarchical_contract_den_below_two_refits: hierarchical[0]
+                .contract_den_below_two_refits,
+            hierarchical_contract_qualifying_contracts: hierarchical[0]
+                .contract_qualifying_contracts,
+            hierarchical_contract_qualifying_entries: hierarchical[0].contract_qualifying_entries,
+            hierarchical_contract_tau2: hierarchical[0].contract_tau2,
             hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
             hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
             response_time_rmse_secs_isotonic: self.response_time_error.rmse().map(|(i, _)| i),
@@ -3245,7 +3547,11 @@ mod tests {
         let path = dir.path().join("routing.jsonl");
         let recorder = dataset::RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
 
-        let mut router = Router::new(&[]);
+        // A frozen clock, so the forecast taken below and the one `add_event`
+        // records read the same instant.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
         // A key of its own: `PeerKeyLocation::random()` reuses one key per
         // thread, which would make the peer-hash assertion below vacuous.
         let peer = PeerKeyLocation::new(
@@ -3568,6 +3874,7 @@ mod tests {
                 failure: Some(0.1),
                 estimate: hierarchical::Estimate {
                     failure_probability: Some(0.1),
+                    failure_ranking: Some(0.1),
                     time_to_response_start_secs: Some(0.2),
                     transfer_speed_bps: None,
                 },
@@ -3800,6 +4107,164 @@ mod tests {
             });
         }
         (targeted_peer, targeted_contract)
+    }
+
+    /// How a routing-behaviour test trains its router.
+    ///
+    /// `Router::new(&history)` never feeds the hierarchical estimator (see its
+    /// "Not replayed from `history`" comment), so a history-built router keeps
+    /// a COLD estimator and routes entirely on the isotonic fallback. A warm
+    /// node routes on the hierarchical estimator instead, so each behavioural
+    /// guard runs in both modes:
+    ///
+    /// - `History` covers the cold-start fallback. That is also what a node
+    ///   with `FREENET_ROUTING_FALLBACK_ISOTONIC` set runs, but only by
+    ///   equivalence: today a never-fed estimator supplies no stage, so
+    ///   prediction takes the isotonic path for every stage. If a cold
+    ///   estimator ever supplies something (a warm-start prior, a seeded root
+    ///   curve), `History` stops covering the emergency fallback.
+    /// - `WarmHierarchical` covers the estimator the fleet routes with. Its
+    ///   precondition always pins the FAILURE stage. The timing stages warm only
+    ///   after 30 timed successes (`MIN_CURVE_POINTS_LOG`; the speed stage
+    ///   counts only those with a non-zero payload), so a guard trained on
+    ///   fewer still ranks on ISOTONIC timing; only the twins that train that
+    ///   many (realistic traffic, the transition's phase 3, #4230 steady state)
+    ///   have their timing pinned to the hierarchical estimator too.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Training {
+        History,
+        WarmHierarchical,
+    }
+
+    impl Training {
+        fn train(self, events: &[RouteEvent]) -> Router {
+            match self {
+                Training::History => Router::new(events),
+                Training::WarmHierarchical => warm_hierarchical_router(events),
+            }
+        }
+
+        /// Hold for the whole test: keeps the emergency isotonic fallback off
+        /// in the warm mode, whatever the environment says (the cold mode keeps
+        /// the test's original, unforced behaviour).
+        fn guard(self) -> Option<IsotonicFallbackGuard> {
+            (self == Training::WarmHierarchical).then(|| force_isotonic_fallback(false))
+        }
+
+        /// The warm mode's precondition: every failure probability the decision
+        /// ranks on, and every timing estimate the hierarchical estimator
+        /// supplies, came from the hierarchical estimate. See
+        /// [`assert_hierarchical_failure_decides`].
+        fn check_decides(self, router: &Router, peers: &[PeerKeyLocation], target: Location) {
+            if self == Training::WarmHierarchical {
+                assert_hierarchical_failure_decides(router, peers, target);
+            }
+        }
+    }
+
+    /// A router trained through `add_event` — production's path, on which the
+    /// hierarchical estimator learns every event. The clock is a
+    /// frozen mock, so a prediction and a direct `estimate` read the same
+    /// instant and can be compared exactly.
+    ///
+    /// The price: every event lands at one estimator instant, so the online
+    /// horizon choice and forgetting a real node's time-spread events go
+    /// through are degenerate in the twins. Those are covered by the router
+    /// tests that advance a `SharedMockTimeSource` by hand, not here.
+    fn warm_hierarchical_router(events: &[RouteEvent]) -> Router {
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        for event in events {
+            router.add_event(event.clone());
+        }
+        router
+    }
+
+    /// Precondition for a warm-hierarchical guard: for every candidate, the
+    /// failure probability the router acts on IS the hierarchical estimate,
+    /// and so is each timing estimate (response time, transfer speed) whenever
+    /// the hierarchical estimator supplies one. So a guard cannot pass on the
+    /// isotonic fallback for any stage the estimator has warmed. A timing stage it
+    /// has NOT warmed (below 30 timed successes) is legitimately isotonic and is not
+    /// checked; a guard whose property depends on timing must also call
+    /// [`assert_hierarchical_timing_decides`].
+    ///
+    /// Two stacks that happen to agree bit for bit (all-success data: both
+    /// read 0.0) cannot be told apart by equality; such a guard needs the
+    /// `FALLBACK_STAGE_EVALUATIONS` check as well (see the transition twin).
+    fn assert_hierarchical_failure_decides(
+        router: &Router,
+        peers: &[PeerKeyLocation],
+        target: Location,
+    ) {
+        assert!(
+            !isotonic_fallback_enabled(),
+            "call with the emergency isotonic fallback off"
+        );
+        let hours = router.estimator_clock.hours();
+        for peer in peers {
+            let distance = peer
+                .location()
+                .map(|loc| target.distance(loc).as_f64())
+                .unwrap_or(0.5);
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
+            let acted_on = router
+                .predict_routing_outcome(peer, target)
+                .expect("a warm router predicts");
+            assert_eq!(
+                estimate.failure_probability.map(|p| p.clamp(0.0, 1.0)),
+                Some(acted_on.failure_probability),
+                "the failure probability for {peer:?} must come from the (warm) \
+                 hierarchical estimator, not the isotonic fallback"
+            );
+            if let Some(seconds) = estimate
+                .time_to_response_start_secs
+                .filter(|t| t.is_finite() && *t >= 0.0)
+            {
+                assert_eq!(
+                    acted_on.time_to_response_start, seconds,
+                    "the response time for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
+            if let Some(speed) = estimate
+                .transfer_speed_bps
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                assert_eq!(
+                    acted_on.xfer_speed.bytes_per_second, speed,
+                    "the transfer speed for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
+        }
+    }
+
+    /// The stricter precondition for a guard whose property depends on timing:
+    /// both hierarchical timing stages must be WARM for every candidate (so
+    /// [`assert_hierarchical_failure_decides`] compared them), not merely
+    /// consistent when present. Otherwise the guard's timing is isotonic.
+    fn assert_hierarchical_timing_decides(
+        router: &Router,
+        peers: &[PeerKeyLocation],
+        target: Location,
+    ) {
+        let hours = router.estimator_clock.hours();
+        for peer in peers {
+            let distance = peer
+                .location()
+                .map(|loc| target.distance(loc).as_f64())
+                .unwrap_or(0.5);
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
+            assert!(
+                estimate.time_to_response_start_secs.is_some()
+                    && estimate.transfer_speed_bps.is_some(),
+                "both hierarchical timing stages must be warm for {peer:?} (train at \
+                 least 30 timed successes); got {estimate:?}"
+            );
+        }
+        assert_hierarchical_failure_decides(router, peers, target);
     }
 
     /// Once warm, all three stages come from the hierarchical estimator, in the
@@ -4187,6 +4652,160 @@ mod tests {
             router.hierarchical.diagnostics()[0].window_events,
             201,
             "a stopped recorder must not stop routing from learning"
+        );
+    }
+
+    /// The contract term's counters reach the snapshot the dashboard, the
+    /// tracing event and the OTLP body read, and they MOVE on real traffic.
+    ///
+    /// Finding 10 of the 2026-09-17 round-1 review, and its round-2 follow-up:
+    /// the first version of this test snapshotted a fresh `Router::new(&[])`,
+    /// so three of its six assertions were `0 == 0` and would have passed for
+    /// a hard-coded zero or a transposed field. It now drives traffic that
+    /// saturates every counter and asserts each is non-zero THROUGH the
+    /// snapshot, in the shape of the sibling test below.
+    #[test]
+    fn contract_term_counters_reach_the_snapshot() {
+        use crate::node::network_status::OpType;
+
+        let _guard = crate::config::GlobalRng::seed_guard(0x4485_5417);
+        // Cold: absent rather than wrong, and every field still agrees with
+        // the stage's own diagnostic.
+        let cold = Router::new(&[]);
+        let snapshot = cold.snapshot();
+        assert_eq!(snapshot.hierarchical_contracts, 0);
+        assert_eq!(snapshot.hierarchical_contract_estimable_refits, 0);
+        assert_eq!(snapshot.hierarchical_contract_effects_applied, 0);
+        assert_eq!(snapshot.hierarchical_contract_tau2, None);
+
+        // Warm: a small contract pool with more peers per contract than the
+        // eight entries a contract keeps, so displacement, live refusal and
+        // refit dropping all occur, and a dead contract so the term activates.
+        let mut router = Router::new(&[]).with_max_connections(16);
+        let peers: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        let contracts: Vec<Location> = (0..6).map(|i| Location::new(i as f64 / 6.0)).collect();
+        let dead = Location::new(0.37);
+        for index in 0..3_000 {
+            let (peer, contract, outcome) = if index % 3 == 0 {
+                (&peers[index % peers.len()], dead, RouteOutcome::Failure)
+            } else {
+                (
+                    &peers[index % peers.len()],
+                    contracts[index % contracts.len()],
+                    if index % 7 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                )
+            };
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome,
+                op_type: Some(OpType::Get),
+            });
+        }
+        let snapshot = router.snapshot();
+        let diagnostics = router.hierarchical.diagnostics()[0];
+
+        // Each field must be NON-ZERO through the snapshot, so a hard-coded
+        // zero or a field that is never populated fails here, and must equal
+        // the stage's own diagnostic, so a transposition fails too.
+        for (name, from_snapshot, from_stage) in [
+            (
+                "contracts",
+                snapshot.hierarchical_contracts as u64,
+                diagnostics.contracts as u64,
+            ),
+            (
+                "residuals_refused",
+                snapshot.hierarchical_contract_residuals_refused,
+                diagnostics.contract_residuals_refused,
+            ),
+            (
+                "entries_displaced",
+                snapshot.hierarchical_contract_entries_displaced,
+                diagnostics.contract_entries_displaced,
+            ),
+            (
+                "estimable_refits",
+                snapshot.hierarchical_contract_estimable_refits,
+                diagnostics.contract_estimable_refits,
+            ),
+            (
+                "effects_applied",
+                snapshot.hierarchical_contract_effects_applied,
+                diagnostics.contract_effects_applied,
+            ),
+            (
+                "forecast_offsets",
+                snapshot.hierarchical_contract_forecast_offsets,
+                diagnostics.contract_forecast_offsets,
+            ),
+            (
+                "qualifying_contracts",
+                snapshot.hierarchical_contract_qualifying_contracts,
+                diagnostics.contract_qualifying_contracts,
+            ),
+            (
+                "qualifying_entries",
+                snapshot.hierarchical_contract_qualifying_entries,
+                diagnostics.contract_qualifying_entries,
+            ),
+            // I3 of the 2026-09-18 round-3 testing review: this field was
+            // wired to the snapshot and to the OTLP body but was absent from
+            // this loop, so hard-coding it to zero, or reading it from the
+            // wrong stage, survived. The telemetry test only checks the JSON
+            // key against a hand-set value.
+            (
+                "floor_bound_refits",
+                snapshot.hierarchical_contract_floor_bound_refits,
+                diagnostics.contract_floor_bound_refits,
+            ),
+        ] {
+            assert!(
+                from_snapshot > 0,
+                "hierarchical_contract_{name} must be non-zero on this traffic, \
+                 or the assertion cannot tell a wired field from an unwired one"
+            );
+            assert_eq!(
+                from_snapshot, from_stage,
+                "hierarchical_contract_{name} must be the failure stage's own value"
+            );
+        }
+        assert_eq!(
+            snapshot.hierarchical_contract_pairs_refused_last_refit,
+            diagnostics.contract_pairs_refused_last_refit,
+            "the refit gauge must be the failure stage's own value"
+        );
+        // Equality only, deliberately: a stream whose contracts all qualify
+        // from the first refit has a legitimate zero here, so asserting
+        // non-zero would make this test depend on the warm-up shape of its own
+        // traffic. The transposition is what this pins.
+        assert_eq!(
+            snapshot.hierarchical_contract_den_below_two_refits,
+            diagnostics.contract_den_below_two_refits,
+            "the den-gate count must be the failure stage's own value"
+        );
+        assert!(
+            snapshot.hierarchical_contract_den_below_two_refits
+                <= snapshot.hierarchical_contract_estimable_refits,
+            "the den gate is evaluated only on estimable refits, so its count \
+             cannot exceed them: {} against {}",
+            snapshot.hierarchical_contract_den_below_two_refits,
+            snapshot.hierarchical_contract_estimable_refits
+        );
+        assert!(
+            snapshot
+                .hierarchical_contract_tau2
+                .is_some_and(|tau2| tau2 > 0.0),
+            "between-contract variance must be estimated: {:?}",
+            snapshot.hierarchical_contract_tau2
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_tau2,
+            diagnostics.contract_tau2
         );
     }
 
@@ -4789,6 +5408,356 @@ mod tests {
         );
     }
 
+    /// The routing dataset's candidate log must be the candidate set the router
+    /// actually scored and the selection it actually made, taken from the
+    /// decision itself — not a list re-derived afterwards from the peers it was
+    /// offered (the "metric re-derived at the call site" trap).
+    #[test]
+    fn decision_capture_is_the_candidate_set_the_router_scored() {
+        // A frozen clock, so the two passes below read the same instant and the
+        // logged model can be compared with the acting one bit for bit (#5754).
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        // 40 peers against the default 25-peer window, each with its own key
+        // (`PeerKeyLocation::random()` shares one) and a distinct location.
+        let peers: Vec<PeerKeyLocation> =
+            (0..40u32).map(|i| peer_in_subnet(i * 1543 + 7)).collect();
+        let contract = Location::new(0.5);
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    // Reliability unrelated to distance, so cost order is not
+                    // distance order.
+                    outcome: if (index * 7 + round) % 5 < index % 4 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 13 * index as u64),
+                            payload_size: 5000,
+                            payload_transfer_time: Duration::from_millis(50),
+                        }
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+
+        let mut distance_order: Vec<&PeerKeyLocation> = peers.iter().collect();
+        distance_order.sort_by_key(|peer| contract.distance(peer.location().unwrap()));
+        let window = router.consider_n_closest_peers;
+        assert!(peers.len() > window, "the window must discard some peers");
+
+        // Each model's estimates from the pass where it acted, to compare with
+        // the pass where it was only logged.
+        let mut acted: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        let mut logged: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        // The candidate log's "legacy" model is the isotonic fallback (#4485),
+        // which routes when `FREENET_ROUTING_FALLBACK_ISOTONIC` is set.
+        for acting_hierarchical in [false, true] {
+            let _flag = force_isotonic_fallback(!acting_hierarchical);
+            let k = 3;
+            let (selected, decision, capture) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, true);
+            let capture = capture.expect("a prediction-based decision is captured");
+            assert_eq!(capture.k, k);
+            assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+            assert!(!capture.prediction_fallback);
+            assert!(matches!(
+                decision.strategy,
+                RoutingStrategy::PredictionBased
+            ));
+            assert!(
+                capture.candidates.iter().all(|c| c.hierarchical_stages
+                    == dataset::HierarchicalStages {
+                        failure: true,
+                        response_time: true,
+                        transfer_speed: true,
+                    }),
+                "every stage is warm for every peer here"
+            );
+            let legacy: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.legacy.unwrap())
+                .collect();
+            let hierarchical: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.hierarchical.unwrap())
+                .collect();
+            acted.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    hierarchical.clone()
+                } else {
+                    legacy.clone()
+                },
+            ));
+            logged.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    legacy
+                } else {
+                    hierarchical
+                },
+            ));
+            let (uncaptured, _, none) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, false);
+            assert!(none.is_none(), "nothing is captured when not asked");
+            assert_eq!(
+                selected, uncaptured,
+                "capturing must not change the selection"
+            );
+
+            assert_eq!(
+                capture.acting_model,
+                if acting_hierarchical {
+                    dataset::RoutingModel::Hierarchical
+                } else {
+                    dataset::RoutingModel::Legacy
+                }
+            );
+            assert_eq!(capture.candidates_available, peers.len());
+            assert_eq!(capture.candidates.len(), decision.candidates.len());
+            let captured_peers: Vec<&PeerKeyLocation> =
+                capture.candidates.iter().map(|c| c.peer).collect();
+            assert_eq!(
+                captured_peers,
+                distance_order[..window],
+                "the scored window, in distance order"
+            );
+            // The selection as the router returned it, position by position.
+            for (position, peer) in selected.iter().enumerate() {
+                let marked: Vec<&PeerKeyLocation> = capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position == Some(position))
+                    .map(|c| c.peer)
+                    .collect();
+                assert_eq!(marked, vec![*peer], "selected position {position}");
+            }
+            assert_eq!(
+                capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position.is_some())
+                    .count(),
+                k
+            );
+            assert!(
+                capture
+                    .candidates
+                    .iter()
+                    .all(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+                "both models predict every candidate"
+            );
+
+            let record = capture.into_record(OpType::Get, 1);
+            assert_eq!(record.op, "GET");
+            assert_eq!(record.candidates_omitted, 0);
+            // The acting model's estimates are the ones the router sorted: its
+            // j-th ranked candidate carries exactly the decision's j-th cost.
+            for candidate in &record.candidates {
+                let (rank, estimate) = if acting_hierarchical {
+                    (candidate.rank_hierarchical, candidate.hierarchical)
+                } else {
+                    (candidate.rank_legacy, candidate.legacy)
+                };
+                let routed = decision.candidates[rank]
+                    .prediction
+                    .as_ref()
+                    .expect("prediction-based");
+                let estimate = estimate.unwrap();
+                assert_eq!(
+                    estimate.expected_total_time.to_bits(),
+                    routed.expected_total_time.to_bits()
+                );
+                assert_eq!(
+                    estimate.failure_probability.to_bits(),
+                    routed.failure_probability.to_bits()
+                );
+                assert_eq!(candidate.selected_position.is_some(), rank < k);
+            }
+            let chosen_acting = if acting_hierarchical {
+                record.chosen_rank_hierarchical
+            } else {
+                record.chosen_rank_legacy
+            };
+            assert_eq!(chosen_acting, Some(0));
+            assert!(
+                record
+                    .candidates
+                    .iter()
+                    .any(|c| c.rank_legacy != c.rank_hierarchical),
+                "the two models must disagree somewhere, or which model is which is untested"
+            );
+        }
+
+        // The model that was only logged must carry what it would route on when
+        // it acts: the isotonic fallback logged in the hierarchical pass matches
+        // the isotonic fallback acting in its own pass, and the other way round. Bit-equal: both passes
+        // read the same frozen clock, so any difference is a real divergence
+        // between what is logged and what would be acted on.
+        for (logged_in_hierarchical_pass, logged_estimates) in &logged {
+            let (_, acting_estimates) = acted
+                .iter()
+                .find(|(pass, _)| pass != logged_in_hierarchical_pass)
+                .unwrap();
+            for (logged, acting) in logged_estimates.iter().zip(acting_estimates) {
+                for (field, a, b) in [
+                    (
+                        "failure",
+                        logged.failure_probability,
+                        acting.failure_probability,
+                    ),
+                    (
+                        "time",
+                        logged.time_to_response_start_s,
+                        acting.time_to_response_start_s,
+                    ),
+                    (
+                        "speed",
+                        logged.transfer_speed_bps,
+                        acting.transfer_speed_bps,
+                    ),
+                    (
+                        "cost",
+                        logged.expected_total_time,
+                        acting.expected_total_time,
+                    ),
+                ] {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{field}: logged {a} vs acting {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cold stages and candidates neither model can predict are recorded as
+    /// such, from the decision.
+    #[test]
+    fn decision_capture_records_cold_stages_and_unpredictable_candidates() {
+        let mut router = Router::new(&[]);
+        let peers: Vec<PeerKeyLocation> =
+            (0..10u32).map(|i| peer_in_subnet(i * 977 + 11)).collect();
+        let contract = Location::new(0.5);
+        // Untimed outcomes only, so no timing stage has any data.
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    outcome: if (index + round) % 3 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        // Acting on the isotonic fallback, so the hierarchical model is the
+        // logged one.
+        let _flag = force_isotonic_fallback(true);
+        // No location, so no failure estimate: the router ranks it last.
+        let unknown = PeerKeyLocation::with_unknown_addr(
+            crate::transport::TransportKeypair::new().public().clone(),
+        );
+        let mut offered = peers.clone();
+        offered.push(unknown.clone());
+
+        let (_, decision, capture) =
+            router.select_k_best_peers_capturing(offered.iter(), contract, 2, true);
+        let capture = capture.expect("prediction-based with some fallback");
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionFallback
+        ));
+        assert!(capture.prediction_fallback);
+        assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+
+        let blind = capture
+            .candidates
+            .iter()
+            .find(|c| c.peer == &unknown)
+            .expect("in the window");
+        assert!(blind.legacy.is_none() && blind.hierarchical.is_none());
+        assert_eq!(
+            blind.hierarchical_stages,
+            dataset::HierarchicalStages::default()
+        );
+        assert!(blind.selected_position.is_none());
+
+        for candidate in capture.candidates.iter().filter(|c| c.peer != &unknown) {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages {
+                    failure: true,
+                    response_time: false,
+                    transfer_speed: false,
+                },
+                "failure is learned, timing is cold"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            // A cold stage is the isotonic fallback, not a hierarchical number.
+            assert_eq!(
+                hierarchical.time_to_response_start_s,
+                legacy.time_to_response_start_s
+            );
+            assert_eq!(hierarchical.transfer_speed_bps, legacy.transfer_speed_bps);
+        }
+        let record = capture.into_record(OpType::Get, 1);
+        let blind = record
+            .candidates
+            .iter()
+            .find(|c| c.peer == dataset::peer_hash(&unknown))
+            .unwrap();
+        assert_eq!(blind.distance, None);
+        assert_eq!(blind.rank_legacy, record.candidates.len() - 1);
+
+        // A router whose hierarchical estimator never learned anything (built
+        // from history, which does not feed it): every hierarchical stage is
+        // cold, so its logged estimate is the isotonic one throughout and says
+        // so.
+        let history: Vec<RouteEvent> = (0..12)
+            .flat_map(|round| {
+                peers
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, peer)| RouteEvent {
+                        peer: peer.clone(),
+                        contract_location: contract,
+                        outcome: if (index + round) % 3 == 0 {
+                            RouteOutcome::Failure
+                        } else {
+                            RouteOutcome::SuccessUntimed
+                        },
+                        op_type: Some(OpType::Get),
+                    })
+            })
+            .collect();
+        let unlearned = Router::new(&history);
+        let (_, _, capture) =
+            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true);
+        for candidate in capture.expect("prediction-based").candidates {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages::default(),
+                "nothing learned, nothing supplied"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            assert_eq!(hierarchical.failure_probability, legacy.failure_probability);
+        }
+    }
+
     #[test]
     fn estimators_use_intended_adjustment_modes() {
         // Pin the per-estimator adjustment modes so a future change can't silently
@@ -5108,6 +6077,12 @@ mod tests {
     // distant peer that happens to have slightly better per-peer EWMA history
     // than the closest peer?
     //
+    // Since #4485 the same question applies to the hierarchical estimator,
+    // which routes (distance enters through its EB-shrunk prior curve;
+    // per-peer and per-(peer, band) cells play the EWMA's role), so the guards
+    // below also run in `Training::WarmHierarchical`. The paragraph after this
+    // one describes the isotonic fallback.
+    //
     // The predictor's scoring (`predict_routing_outcome`) has no direct
     // distance term; distance enters only via the distance curves (the global
     // isotonic regression in `isotonic_estimator.rs`, and since #4485 the
@@ -5150,8 +6125,8 @@ mod tests {
         PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
     }
 
-    /// Train a `Router` on a synthetic history whose global shape matches what
-    /// the production isotonic regression learns — a distance->failure gradient
+    /// Build a synthetic history whose global shape matches what both routing
+    /// estimators learn in production — a distance->failure gradient
     /// (closer peers succeed more, farther peers fail more) — but with each peer
     /// *also* carrying an individual reliability bias that is INDEPENDENT of its
     /// distance. The per-peer bias is what populates mature, divergent per-peer
@@ -5212,6 +6187,56 @@ mod tests {
         events
     }
 
+    /// `history` with every success TIMED, so the hierarchical timing stages
+    /// (30-point floor) warm and a ranking uses all three stages — but with
+    /// timing that carries NO locality and NO per-peer signal: it varies only
+    /// with the event's position in the history.
+    ///
+    /// Timing that rose with distance was a perfect "route to the closest
+    /// peer" term on its own, so a locality guard trained on it passed whatever
+    /// the failure stage did (measured: an inverted hierarchical failure
+    /// estimate left the #4230 steady twin green). Per-peer timing would add
+    /// exactly the per-peer-history-versus-locality competition #4230 guards,
+    /// from a source the test does not control. Deterministic: draws no RNG.
+    ///
+    /// The jitter has a second job: it keeps the values varied, so the
+    /// log-curve fit is well-conditioned rather than fitted to one repeated
+    /// value.
+    ///
+    /// "No per-peer signal" holds only while the caller's history is
+    /// ROUND-MAJOR (each round touches every peer once) AND its peer count is
+    /// not a multiple of the 7-event cycle; otherwise a peer's jitter is a
+    /// fixed offset.
+    ///
+    /// Those two conditions are guarded ASYMMETRICALLY, and a new caller has
+    /// to know it: each caller asserts its own peer count (the #4230
+    /// steady-state twin does), while the ROUND-MAJOR half rests on this
+    /// paragraph alone. A history batched per peer would hand every peer a
+    /// fixed offset with nothing failing.
+    fn with_uninformative_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
+        history
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let jitter = (index % 7) as f64;
+                let outcome = match event.outcome.clone() {
+                    RouteOutcome::SuccessUntimed => RouteOutcome::Success {
+                        time_to_response_start: Duration::from_secs_f64(0.05 + 0.002 * jitter),
+                        payload_size: 2000,
+                        payload_transfer_time: Duration::from_secs_f64(0.010 + 0.001 * jitter),
+                    },
+                    RouteOutcome::Success { .. } | RouteOutcome::Failure => event.outcome.clone(),
+                };
+                RouteEvent {
+                    peer: event.peer.clone(),
+                    contract_location: event.contract_location,
+                    outcome,
+                    op_type: event.op_type,
+                }
+            })
+            .collect()
+    }
+
     /// Measure routing convergence at a given candidate window over many random
     /// targets, against a fixed trained router and peer pool.
     ///
@@ -5237,13 +6262,19 @@ mod tests {
         pool: &[PeerKeyLocation],
         window: usize,
         trials: usize,
+        training: Training,
     ) -> (f64, f64) {
-        let router = Router::new(history).considering_n_closest_peers(window as u32);
+        let router = training
+            .train(history)
+            .considering_n_closest_peers(window as u32);
         assert!(
             router.has_sufficient_routing_events(),
             "trained router below prediction threshold ({} events)",
             router.failure_estimator.len()
         );
+        // A fixed probe target (no RNG draw, so the History mode's target
+        // sequence is exactly what it always was).
+        training.check_decides(&router, pool, Location::new(0.37));
         let mut percentiles: Vec<f64> = Vec::with_capacity(trials);
         for _ in 0..trials {
             let target = Location::random();
@@ -5287,6 +6318,24 @@ mod tests {
     /// Deterministic.
     #[test]
     fn routing_convergence_preserved_at_window_25_4230() {
+        convergence_at_window_25_case(Training::History);
+    }
+
+    /// [`routing_convergence_preserved_at_window_25_4230`] on the warm
+    /// hierarchical estimator, with the same bounds: the property #4230 pins
+    /// must hold for the estimator the fleet routes with, not only for the
+    /// isotonic fallback. The warm mode trains the same history with every
+    /// success timed ([`with_uninformative_timing`]: no distance or per-peer
+    /// signal) so ALL THREE hierarchical stages are warm and ranking uses the
+    /// full shipping formula, while the property still rests on the failure
+    /// stage: an inverted hierarchical failure estimate must turn it red.
+    #[test]
+    fn routing_convergence_preserved_at_window_25_4230_warm_hierarchical() {
+        convergence_at_window_25_case(Training::WarmHierarchical);
+    }
+
+    fn convergence_at_window_25_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_C0DE);
 
         // Pin the shipped window so a silent default change surfaces here too
@@ -5311,6 +6360,24 @@ mod tests {
             .map(|p| p.location().unwrap().as_f64().to_bits())
             .collect();
         assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
+        // `with_uninformative_timing` cycles its jitter every 7 events and
+        // `gradient_history` is round-major (each round touches every peer
+        // once), so a peer's jitter walks the cycle across rounds and per-peer
+        // means differ only by the partial final cycle — at 40 peers x 12
+        // rounds, 2.67 to 3.33 jitter units, about 1.3 ms on a 50 ms base.
+        // (They are exactly equal only when the round count is a multiple of
+        // 7.) If the pool size were a multiple of 7,
+        // the jitter would collapse to a FIXED per-peer offset: a per-peer
+        // timing signal, which is exactly the per-peer-history-versus-locality
+        // regime #4230 guards, injected by the test itself and invisible to
+        // every assertion below.
+        assert_ne!(
+            pool.len() % 7,
+            0,
+            "pool size {} is a multiple of with_uninformative_timing's 7-event \
+             jitter cycle, so its timing would become a fixed per-peer offset",
+            pool.len()
+        );
 
         let history = gradient_history(&pool, 12, 0.35); // 40 * 12 = 480 events
 
@@ -5348,11 +6415,27 @@ mod tests {
             adj_max - adj_min
         );
 
-        let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400);
+        // The History mode keeps the original untimed input. The warm mode
+        // times every success (with no distance signal, so the ranking stays
+        // failure-driven) so the hierarchical timing stages warm too, and
+        // proves they did before measuring.
+        let measured = match training {
+            Training::History => history.clone(),
+            Training::WarmHierarchical => {
+                let timed = with_uninformative_timing(&history);
+                assert_hierarchical_timing_decides(
+                    &warm_hierarchical_router(&timed),
+                    &pool,
+                    Location::new(0.37),
+                );
+                timed
+            }
+        };
+        let (mean_pct, p90_pct) = measure_convergence(&measured, &pool, 25, 400, training);
 
         assert!(
             mean_pct < 0.18,
-            "issue #4230 regression: at window=25 the chosen next hop's mean \
+            "issue #4230 regression ({training:?}): at window=25 the chosen next hop's mean \
              rank-percentile is {mean_pct:.3} — the predictor is drifting away \
              from the closest tail (0.5 = median = no progress), so per-peer \
              history is overriding geographic locality and small-world routing \
@@ -5360,7 +6443,7 @@ mod tests {
         );
         assert!(
             p90_pct < 0.40,
-            "issue #4230 regression: at window=25 the 90th-percentile chosen-hop \
+            "issue #4230 regression ({training:?}): at window=25 the 90th-percentile chosen-hop \
              rank-percentile is {p90_pct:.3} — the routing tail has degraded; \
              too many hops are landing far from the target"
         );
@@ -5392,6 +6475,21 @@ mod tests {
     /// locality) plus the bounded 5->25 increase.
     #[test]
     fn routing_convergence_window_sweep_does_not_degrade_4230() {
+        convergence_window_sweep_case(Training::History);
+    }
+
+    /// [`routing_convergence_window_sweep_does_not_degrade_4230`] on the warm
+    /// hierarchical estimator, with the same bounds. FAILURE-ONLY in both
+    /// modes: `gradient_history` has no timed events, so no timing estimate
+    /// exists in either stack and the ranking is the failure term alone. The
+    /// timed, all-stages ranking is covered by the steady-state twin.
+    #[test]
+    fn routing_convergence_window_sweep_does_not_degrade_4230_warm_hierarchical() {
+        convergence_window_sweep_case(Training::WarmHierarchical);
+    }
+
+    fn convergence_window_sweep_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_5EED);
 
         // 40 peers x 12 rounds = 480 events: mature per-peer EWMA within the
@@ -5412,7 +6510,8 @@ mod tests {
             // (window, mean_pct, p90_pct) for each swept window.
             let mut results: Vec<(usize, f64, f64)> = Vec::new();
             for &window in &[5usize, 10, 25, 40] {
-                let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
+                let (mean_pct, p90_pct) =
+                    measure_convergence(&history, &pool, window, 300, training);
                 results.push((window, mean_pct, p90_pct));
             }
 
@@ -5423,13 +6522,13 @@ mod tests {
             for &(window, mean_pct, p90_pct) in &results {
                 assert!(
                     mean_pct < 0.20,
-                    "issue #4230: at window={window} bias_mag={bias_mag} mean \
+                    "issue #4230 ({training:?}): at window={window} bias_mag={bias_mag} mean \
                      chosen-hop rank-percentile {mean_pct:.3} drifted toward the \
                      median — routing convergence degraded by candidate-window size"
                 );
                 assert!(
                     p90_pct < 0.42,
-                    "issue #4230: at window={window} bias_mag={bias_mag} p90 \
+                    "issue #4230 ({training:?}): at window={window} bias_mag={bias_mag} p90 \
                      chosen-hop rank-percentile {p90_pct:.3} is too high — the \
                      routing tail degraded"
                 );
@@ -5444,7 +6543,7 @@ mod tests {
             let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
             assert!(
                 m25 < 0.20 && m25 - m5 < 0.15,
-                "issue #4230: at bias_mag={bias_mag} widening the candidate \
+                "issue #4230 ({training:?}): at bias_mag={bias_mag} widening the candidate \
                  window from 5 to 25 raised the mean chosen-hop rank-percentile \
                  from {m5:.3} to {m25:.3} — the widening pushed routing \
                  materially toward the median and may need a soft distance bias \
@@ -5618,6 +6717,17 @@ mod tests {
     /// distances. Verify select_peer prefers peer A.
     #[test]
     fn test_failure_avoidance() {
+        failure_avoidance_case(Training::History);
+    }
+
+    /// [`test_failure_avoidance`] on the warm hierarchical estimator.
+    #[test]
+    fn test_failure_avoidance_warm_hierarchical() {
+        failure_avoidance_case(Training::WarmHierarchical);
+    }
+
+    fn failure_avoidance_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let peer_a = PeerKeyLocation::random();
         let peer_b = PeerKeyLocation::random();
@@ -5650,17 +6760,19 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
 
         // With 80 total events in failure_estimator (>= 50 threshold),
         // the router should use predictions and prefer peer A
         let peers = vec![peer_a.clone(), peer_b.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let selected = router.select_peer(&peers, contract_location);
         assert!(selected.is_some());
         assert_eq!(
             *selected.unwrap(),
             peer_a,
-            "Router should prefer peer A (all successes) over peer B (all failures)"
+            "Router should prefer peer A (all successes) over peer B (all failures) \
+             ({training:?})"
         );
     }
 
@@ -5878,6 +6990,18 @@ mod tests {
     /// the router should use failure probability to prefer low-failure peers.
     #[test]
     fn test_failure_only_differentiates_peers() {
+        failure_only_differentiates_peers_case(Training::History);
+    }
+
+    /// [`test_failure_only_differentiates_peers`] on the warm hierarchical
+    /// estimator.
+    #[test]
+    fn test_failure_only_differentiates_peers_warm_hierarchical() {
+        failure_only_differentiates_peers_case(Training::WarmHierarchical);
+    }
+
+    fn failure_only_differentiates_peers_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let good_peer = PeerKeyLocation::random();
         let bad_peer = PeerKeyLocation::random();
@@ -5905,13 +7029,14 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
         assert_eq!(router.response_start_time_estimator.len(), 0);
         assert_eq!(router.transfer_rate_estimator.len(), 0);
 
         // Router should prefer the good peer via failure-probability prediction
         let peers = vec![good_peer.clone(), bad_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
 
@@ -6055,50 +7180,74 @@ mod tests {
     }
 
     /// Verify ContractOpFailure increments failure_estimator with value 1.0,
-    /// and that after enough failures the router predicts higher failure probability.
+    /// and that after enough failures the router predicts higher failure
+    /// probability. The prediction is checked on BOTH paths: it comes from the
+    /// hierarchical estimator by default (#4485), and from the isotonic
+    /// estimator only under the emergency `FREENET_ROUTING_FALLBACK_ISOTONIC`.
     #[test]
     fn test_failure_outcome_feeds_failure_estimator_with_value_one() {
-        let peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
+        for hierarchical in [false, true] {
+            let _mode = force_isotonic_fallback(!hierarchical);
+            let peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
 
-        let mut router = Router::new(&[]);
+            let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+                crate::util::time_source::SharedMockTimeSource::new(),
+            ));
 
-        // Add a failure event
-        router.add_event(RouteEvent {
-            peer: peer.clone(),
-            contract_location,
-            outcome: RouteOutcome::Failure,
-            op_type: None,
-        });
-        assert_eq!(
-            router.failure_estimator.len(),
-            1,
-            "Failure should be recorded in failure_estimator"
-        );
-
-        // Add enough failures to cross threshold and check prediction
-        for _ in 0..59 {
+            // Add a failure event
             router.add_event(RouteEvent {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
                 op_type: None,
             });
-        }
-        assert_eq!(router.failure_estimator.len(), 60);
-        assert!(router.has_sufficient_routing_events());
+            assert_eq!(
+                router.failure_estimator.len(),
+                1,
+                "Failure should be recorded in failure_estimator"
+            );
 
-        // Prediction should show high failure probability
-        let peers = vec![peer.clone()];
-        let (selected, decision) =
-            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
-        assert!(!selected.is_empty());
-        let pred = decision.candidates[0].prediction.as_ref().unwrap();
-        assert!(
-            pred.failure_probability > 0.5,
-            "After 60 failures, failure probability should be high, got {}",
-            pred.failure_probability
-        );
+            // Add enough failures to cross threshold and check prediction
+            for _ in 0..59 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+            assert_eq!(router.failure_estimator.len(), 60);
+            assert!(router.has_sufficient_routing_events());
+
+            // Prediction should show high failure probability
+            let peers = vec![peer.clone()];
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+            let fallback_evaluations =
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before;
+            if hierarchical {
+                assert_hierarchical_failure_decides(&router, &peers, contract_location);
+                assert_eq!(
+                    fallback_evaluations, 0,
+                    "a warm estimator with no timing data must not fall back to the isotonic estimate"
+                );
+            } else {
+                assert!(
+                    fallback_evaluations >= 1,
+                    "on the isotonic fallback the prediction must come from the isotonic estimate"
+                );
+            }
+            assert!(!selected.is_empty());
+            let pred = decision.candidates[0].prediction.as_ref().unwrap();
+            assert!(
+                pred.failure_probability > 0.5,
+                "After 60 failures, failure probability should be high, got {} \
+                 (hierarchical: {hierarchical})",
+                pred.failure_probability
+            );
+        }
     }
 
     /// Verify existing Success path (with timing) still feeds all 3 estimators.
@@ -6143,6 +7292,31 @@ mod tests {
     /// predictions with real timing values.
     #[test]
     fn test_transition_from_failure_only_to_full_predictions() {
+        transition_from_failure_only_case(Training::History);
+    }
+
+    /// [`test_transition_from_failure_only_to_full_predictions`] on the warm
+    /// hierarchical estimator, through three states a node passes through:
+    ///
+    /// 1. Failure-only (all-success, untimed). Both estimators read 0.0 failure
+    ///    here, so the precondition's equality cannot tell them apart; the
+    ///    warm mode instead asserts NO stage fell back to the isotonic
+    ///    estimate, which with no timing data holds only when a hierarchical
+    ///    failure estimate is PRESENT. It cannot tell which
+    ///    value that arm then uses: returning the raw isotonic estimate there
+    ///    would also read 0.0 and pass. That residual is equality-blind.
+    /// 2. Five timed successes: below the hierarchical timing stages' 30-point
+    ///    floor, so timing comes from the isotonic fallback while failure stays
+    ///    hierarchical — the mixed state of a node's first timed GETs.
+    /// 3. (Warm only) 30 more timed successes: every stage hierarchical, no
+    ///    legacy stage evaluated, timing pinned to the hierarchical estimate.
+    #[test]
+    fn test_transition_from_failure_only_to_full_predictions_warm_hierarchical() {
+        transition_from_failure_only_case(Training::WarmHierarchical);
+    }
+
+    fn transition_from_failure_only_case(training: Training) {
+        let _mode = training.guard();
         let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
         let contract_location = Location::random();
 
@@ -6156,8 +7330,18 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
+        training.check_decides(&router, &peers, contract_location);
+        let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
         let (_, decision) = router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        if training == Training::WarmHierarchical {
+            assert_eq!(
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before,
+                0,
+                "phase 1 has no timing data, so a stage falls back only if the \
+                 hierarchical failure estimate is missing or ignored"
+            );
+        }
         // Failure-only: timing fields should be 0.0
         let pred = decision.candidates[0].prediction.as_ref().unwrap();
         assert_eq!(pred.time_to_response_start, 0.0);
@@ -6177,8 +7361,9 @@ mod tests {
             });
         }
 
-        let router2 = Router::new(&events);
+        let router2 = training.train(&events);
         assert!(router2.response_start_time_estimator.len() >= 5);
+        training.check_decides(&router2, &peers, contract_location);
         let (_, decision2) =
             router2.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
         // Full prediction: timing fields should have real values
@@ -6191,6 +7376,41 @@ mod tests {
             pred2.transfer_speed_bps > 0.0,
             "Should have real transfer speed after transition"
         );
+
+        if training == Training::WarmHierarchical {
+            // Phase 3: past the hierarchical timing stages' 30-point floor
+            // (5 + 30 timed successes), so every stage is hierarchical and no
+            // stage may fall back to the isotonic estimate.
+            for round in 0..6u64 {
+                for peer in &peers {
+                    events.push(RouteEvent {
+                        peer: peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 5 * round),
+                            payload_size: 1000,
+                            payload_transfer_time: Duration::from_millis(8 + round),
+                        },
+                        op_type: None,
+                    });
+                }
+            }
+            let router3 = training.train(&events);
+            assert_hierarchical_timing_decides(&router3, &peers, contract_location);
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (_, decision3) =
+                router3.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+            assert_eq!(
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before,
+                0,
+                "phase 3: with every stage warm, no stage may fall back to the isotonic estimate"
+            );
+            let pred3 = decision3.candidates[0].prediction.as_ref().unwrap();
+            assert!(
+                pred3.time_to_response_start > 0.0 && pred3.transfer_speed_bps > 0.0,
+                "phase 3 must carry real hierarchical timing, got {pred3:?}"
+            );
+        }
     }
 
     /// Simulate realistic post-#3137 traffic: a mix of timed GET successes, untimed
@@ -6199,9 +7419,29 @@ mod tests {
     /// low-failure, low-latency peers.
     #[test]
     fn test_realistic_mixed_traffic_routing() {
+        realistic_mixed_traffic_case(Training::History);
+    }
+
+    /// [`test_realistic_mixed_traffic_routing`] on the warm hierarchical
+    /// estimator. The warm mode triples the timed GET successes (39, past the
+    /// 30-point floor) so BOTH timing stages are hierarchical as well and the
+    /// ranking runs entirely on the hierarchical estimate, which the timing
+    /// precondition proves. The failure ordering is unchanged (close ~4%, mid
+    /// ~21%, far 75%); the History mode keeps the original 13 timed events.
+    /// So under realistic traffic this twin covers only fully-warm timing; the
+    /// mixed state (warm failure, sparse isotonic timing) is covered by the
+    /// transition twin's phase 2, with uniform timing.
+    #[test]
+    fn test_realistic_mixed_traffic_routing_warm_hierarchical() {
+        realistic_mixed_traffic_case(Training::WarmHierarchical);
+    }
+
+    fn realistic_mixed_traffic_case(training: Training) {
+        let _mode = training.guard();
         // Seed RNG so peer ring distances are deterministic; without this the
-        // isotonic regression's ascending monotonicity constraint can conflict
-        // with the failure-rate ordering when random distances are adversarial.
+        // (history mode's) isotonic regression's ascending monotonicity
+        // constraint can conflict with the failure-rate ordering when random
+        // distances are adversarial.
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let contract_location = Location::random();
         let close_peer = PeerKeyLocation::random();
@@ -6210,9 +7450,17 @@ mod tests {
 
         let mut events = Vec::new();
 
+        // Timed-success multiplier: 1 in the History mode (the original
+        // input), 3 in the warm mode so the hierarchical timing stages warm.
+        let timed_rounds: usize = if training == Training::WarmHierarchical {
+            3
+        } else {
+            1
+        };
+
         // close_peer: 10 timed GET successes + 15 untimed PUT/SUB successes, 2 failures
         // → ~7% failure rate, good timing data
-        for _ in 0..10 {
+        for _ in 0..10 * timed_rounds {
             events.push(RouteEvent {
                 peer: close_peer.clone(),
                 contract_location,
@@ -6243,7 +7491,7 @@ mod tests {
 
         // mid_peer: 3 timed GET successes + 10 untimed successes, 5 failures
         // → ~28% failure rate, sparse timing data
-        for _ in 0..3 {
+        for _ in 0..3 * timed_rounds {
             events.push(RouteEvent {
                 peer: mid_peer.clone(),
                 contract_location,
@@ -6291,18 +7539,24 @@ mod tests {
             });
         }
 
-        // Total: 27 + 18 + 20 = 65 events > 50 threshold
-        let router = Router::new(&events);
+        // Total: 27 + 18 + 20 = 65 events > 50 threshold (History mode; the warm
+        // mode adds 26 timed successes)
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
 
-        // failure_estimator should have all 65 events
-        assert_eq!(router.failure_estimator.len(), 65);
-        // timing estimators only have the timed GET successes: 10 + 3 = 13
-        assert_eq!(router.response_start_time_estimator.len(), 13);
-        assert_eq!(router.transfer_rate_estimator.len(), 13);
+        let timed = 13 * timed_rounds;
+        // failure_estimator should have every event (65 in the History mode)
+        assert_eq!(router.failure_estimator.len(), 52 + timed);
+        // timing estimators only have the timed GET successes: 10 + 3 = 13 (x3 warm)
+        assert_eq!(router.response_start_time_estimator.len(), timed);
+        assert_eq!(router.transfer_rate_estimator.len(), timed);
 
         // Router should use prediction-based routing and prefer close_peer
         let peers = vec![close_peer.clone(), mid_peer.clone(), far_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
+        if training == Training::WarmHierarchical {
+            assert_hierarchical_timing_decides(&router, &peers, contract_location);
+        }
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
 
@@ -6385,6 +7639,18 @@ mod tests {
     /// that primarily handles PUT/SUBSCRIBE/UPDATE traffic.
     #[test]
     fn test_untimed_only_network_peer_ranking() {
+        untimed_only_network_case(Training::History);
+    }
+
+    /// [`test_untimed_only_network_peer_ranking`] on the warm hierarchical
+    /// estimator.
+    #[test]
+    fn test_untimed_only_network_peer_ranking_warm_hierarchical() {
+        untimed_only_network_case(Training::WarmHierarchical);
+    }
+
+    fn untimed_only_network_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let reliable_peer = PeerKeyLocation::random();
         let flaky_peer = PeerKeyLocation::random();
@@ -6420,7 +7686,7 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
         // No timing data at all
         assert_eq!(router.response_start_time_estimator.len(), 0);
@@ -6428,6 +7694,7 @@ mod tests {
 
         // Router should still make predictions and prefer the reliable peer
         let peers = vec![reliable_peer.clone(), flaky_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
 
@@ -6449,65 +7716,102 @@ mod tests {
     }
 
     /// When the router receives SuccessUntimed events at one contract location
-    /// and Failure events at a different contract location through the same peer,
-    /// the failure estimator should track these as distinct (distance, result)
-    /// data points. This validates the isotonic model learns location-dependent
-    /// failure patterns using untimed success data from PUT/SUBSCRIBE/UPDATE.
+    /// and Failure events at a different contract location through the same
+    /// peer, its prediction must separate them, using untimed success data from
+    /// PUT/SUBSCRIBE/UPDATE. Checked on BOTH paths: the hierarchical estimator
+    /// (what routes since #4485, which separates them through its per-peer,
+    /// per-band cells) and the isotonic model (reached only under the
+    /// emergency `FREENET_ROUTING_FALLBACK_ISOTONIC`).
     #[test]
     fn test_location_dependent_failure_patterns() {
-        let peer = PeerKeyLocation::random();
-        let near_contract = Location::new(0.01); // very close distance (close to 0)
-        let far_contract = Location::new(0.49); // maximum distance on the ring
+        for hierarchical in [false, true] {
+            let _mode = force_isotonic_fallback(!hierarchical);
+            let peer = PeerKeyLocation::random();
+            let near_contract = Location::new(0.01); // very close distance (close to 0)
+            let far_contract = Location::new(0.49); // maximum distance on the ring
 
-        let mut router = Router::new(&[]);
+            let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+                crate::util::time_source::SharedMockTimeSource::new(),
+            ));
 
-        // Peer succeeds for nearby contracts (small distance)
-        for _ in 0..30 {
-            router.add_event(RouteEvent {
-                peer: peer.clone(),
-                contract_location: near_contract,
-                outcome: RouteOutcome::SuccessUntimed,
-                op_type: None,
-            });
+            // Peer succeeds for nearby contracts (small distance)
+            for _ in 0..30 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: near_contract,
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: None,
+                });
+            }
+
+            // Peer fails for distant contracts (large distance)
+            for _ in 0..25 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: far_contract,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+
+            assert!(router.has_sufficient_routing_events());
+            assert_eq!(router.failure_estimator.len(), 55);
+
+            // The router should give different failure predictions for near vs
+            // far contracts through this peer
+            let peers = vec![peer.clone()];
+
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (_, near_decision) =
+                router.select_k_best_peers_with_telemetry(&peers, near_contract, 1);
+            let (_, far_decision) =
+                router.select_k_best_peers_with_telemetry(&peers, far_contract, 1);
+            let fallback_evaluations =
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before;
+            if hierarchical {
+                for contract in [near_contract, far_contract] {
+                    assert_hierarchical_failure_decides(&router, &peers, contract);
+                }
+                assert_eq!(
+                    fallback_evaluations, 0,
+                    "a warm estimator with no timing data must not fall back to the isotonic estimate"
+                );
+            } else {
+                assert!(
+                    fallback_evaluations >= 2,
+                    "on the isotonic fallback both predictions must come from the isotonic estimate"
+                );
+            }
+
+            let near_pred = near_decision.candidates[0]
+                .prediction
+                .as_ref()
+                .expect("should have prediction for near contract");
+            let far_pred = far_decision.candidates[0]
+                .prediction
+                .as_ref()
+                .expect("should have prediction for far contract");
+
+            // Near contract should have lower failure probability than far
+            // contract. The isotonic fit only guarantees `<=`; the
+            // hierarchical estimator's (peer, band) cells see the two bands
+            // separately, so it must separate them strictly.
+            if hierarchical {
+                assert!(
+                    near_pred.failure_probability < far_pred.failure_probability,
+                    "hierarchical: near contract failure prob ({}) must be < far ({})",
+                    near_pred.failure_probability,
+                    far_pred.failure_probability
+                );
+            } else {
+                assert!(
+                    near_pred.failure_probability <= far_pred.failure_probability,
+                    "isotonic: near contract failure prob ({}) should be <= far ({})",
+                    near_pred.failure_probability,
+                    far_pred.failure_probability
+                );
+            }
         }
-
-        // Peer fails for distant contracts (large distance)
-        for _ in 0..25 {
-            router.add_event(RouteEvent {
-                peer: peer.clone(),
-                contract_location: far_contract,
-                outcome: RouteOutcome::Failure,
-                op_type: None,
-            });
-        }
-
-        assert!(router.has_sufficient_routing_events());
-        assert_eq!(router.failure_estimator.len(), 55);
-
-        // The isotonic model should give different failure predictions
-        // for near vs far contracts through this peer
-        let peers = vec![peer.clone()];
-
-        let (_, near_decision) =
-            router.select_k_best_peers_with_telemetry(&peers, near_contract, 1);
-        let (_, far_decision) = router.select_k_best_peers_with_telemetry(&peers, far_contract, 1);
-
-        let near_pred = near_decision.candidates[0]
-            .prediction
-            .as_ref()
-            .expect("should have prediction for near contract");
-        let far_pred = far_decision.candidates[0]
-            .prediction
-            .as_ref()
-            .expect("should have prediction for far contract");
-
-        // Near contract should have lower failure probability than far contract
-        assert!(
-            near_pred.failure_probability <= far_pred.failure_probability,
-            "Near contract failure prob ({}) should be <= far contract failure prob ({})",
-            near_pred.failure_probability,
-            far_pred.failure_probability
-        );
     }
 
     /// Verify that a single peer's SuccessUntimed events correctly produce a 0.0
@@ -6567,6 +7871,165 @@ mod tests {
             ]
         }
 
+        // Each property runs in both `Training` modes: from history (the
+        // isotonic fallback) and warm hierarchical (what the fleet routes with).
+
+        fn predictions_never_nan_case(
+            outcomes: Vec<RouteOutcome>,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+            let contract_location = Location::random();
+
+            let events: Vec<RouteEvent> = outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(i, outcome)| RouteEvent {
+                    peer: peers[i % peers.len()].clone(),
+                    contract_location,
+                    outcome,
+                    op_type: None,
+                })
+                .collect();
+
+            let router = training.train(&events);
+
+            // Router should have enough events for prediction
+            prop_assert!(router.has_sufficient_routing_events());
+            training.check_decides(&router, &peers, contract_location);
+
+            // Predictions must not produce NaN
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+            prop_assert!(!selected.is_empty());
+            for candidate in &decision.candidates {
+                if let Some(pred) = &candidate.prediction {
+                    prop_assert!(
+                        !pred.failure_probability.is_nan(),
+                        "failure_probability is NaN"
+                    );
+                    prop_assert!(
+                        !pred.expected_total_time.is_nan(),
+                        "expected_total_time is NaN"
+                    );
+                    prop_assert!(
+                        !pred.time_to_response_start.is_nan(),
+                        "time_to_response_start is NaN"
+                    );
+                    prop_assert!(
+                        !pred.transfer_speed_bps.is_nan(),
+                        "transfer_speed_bps is NaN"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn failure_data_increases_failure_prediction_case(
+            n_good: usize,
+            n_bad: usize,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let good_peer = PeerKeyLocation::random();
+            let bad_peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
+
+            let mut events = Vec::new();
+
+            // Good peer: all successes (untimed for simplicity)
+            for _ in 0..n_good {
+                events.push(RouteEvent {
+                    peer: good_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: None,
+                });
+            }
+
+            // Bad peer: all failures
+            for _ in 0..n_bad {
+                events.push(RouteEvent {
+                    peer: bad_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+
+            let router = training.train(&events);
+            prop_assert!(router.has_sufficient_routing_events());
+
+            let peers = vec![good_peer.clone(), bad_peer.clone()];
+            training.check_decides(&router, &peers, contract_location);
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
+
+            let all_have_predictions = decision.candidates.iter().all(|c| c.prediction.is_some());
+
+            // With enough data, predictions should exist for both
+            if all_have_predictions && selected.len() == 2 {
+                // The first selected peer (lowest expected_total_time) should
+                // be the good peer since failures increase cost via the
+                // failure_cost_multiplier in predict_routing_outcome
+                prop_assert!(
+                    *selected[0] == good_peer,
+                    "Good peer (all successes) should be ranked first ({:?})",
+                    training
+                );
+            }
+            Ok(())
+        }
+
+        fn failure_probability_bounded_case(
+            outcomes: Vec<RouteOutcome>,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let peers: Vec<PeerKeyLocation> = (0..3).map(|_| PeerKeyLocation::random()).collect();
+            let contract_location = Location::random();
+
+            let events: Vec<RouteEvent> = outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(i, outcome)| RouteEvent {
+                    peer: peers[i % peers.len()].clone(),
+                    contract_location,
+                    outcome,
+                    op_type: None,
+                })
+                .collect();
+
+            let router = training.train(&events);
+            if !router.has_sufficient_routing_events() {
+                return Ok(());
+            }
+            training.check_decides(&router, &peers, contract_location);
+
+            let (_, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+            for candidate in &decision.candidates {
+                if let Some(pred) = &candidate.prediction {
+                    // Allow small float tolerance around [0, 1]
+                    prop_assert!(
+                        pred.failure_probability >= 0.0 && pred.failure_probability <= 1.0,
+                        "failure_probability {} out of [0, 1] range",
+                        pred.failure_probability
+                    );
+                }
+            }
+            Ok(())
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -6577,52 +8040,17 @@ mod tests {
                 outcomes in proptest::collection::vec(arb_route_outcome(), 60..200),
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let peers: Vec<PeerKeyLocation> =
-                    (0..5).map(|_| PeerKeyLocation::random()).collect();
-                let contract_location = Location::random();
+                predictions_never_nan_case(outcomes, seed, Training::History)?;
+            }
 
-                let events: Vec<RouteEvent> = outcomes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, outcome)| RouteEvent {
-                        peer: peers[i % peers.len()].clone(),
-                        contract_location,
-                        outcome,
-                        op_type: None,
-                    })
-                    .collect();
-
-                let router = Router::new(&events);
-
-                // Router should have enough events for prediction
-                prop_assert!(router.has_sufficient_routing_events());
-
-                // Predictions must not produce NaN
-                let (selected, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
-
-                prop_assert!(!selected.is_empty());
-                for candidate in &decision.candidates {
-                    if let Some(pred) = &candidate.prediction {
-                        prop_assert!(
-                            !pred.failure_probability.is_nan(),
-                            "failure_probability is NaN"
-                        );
-                        prop_assert!(
-                            !pred.expected_total_time.is_nan(),
-                            "expected_total_time is NaN"
-                        );
-                        prop_assert!(
-                            !pred.time_to_response_start.is_nan(),
-                            "time_to_response_start is NaN"
-                        );
-                        prop_assert!(
-                            !pred.transfer_speed_bps.is_nan(),
-                            "transfer_speed_bps is NaN"
-                        );
-                    }
-                }
+            /// [`predictions_never_nan_or_panic`] on the warm hierarchical
+            /// estimator.
+            #[test]
+            fn predictions_never_nan_or_panic_warm_hierarchical(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..200),
+                seed in 0u64..u64::MAX,
+            ) {
+                predictions_never_nan_case(outcomes, seed, Training::WarmHierarchical)?;
             }
 
             /// Property: after enough failure data for a peer, the router predicts
@@ -6634,53 +8062,28 @@ mod tests {
                 n_bad in 30usize..60,
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let good_peer = PeerKeyLocation::random();
-                let bad_peer = PeerKeyLocation::random();
-                let contract_location = Location::random();
+                failure_data_increases_failure_prediction_case(
+                    n_good,
+                    n_bad,
+                    seed,
+                    Training::History,
+                )?;
+            }
 
-                let mut events = Vec::new();
-
-                // Good peer: all successes (untimed for simplicity)
-                for _ in 0..n_good {
-                    events.push(RouteEvent {
-                        peer: good_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::SuccessUntimed,
-                        op_type: None,
-                    });
-                }
-
-                // Bad peer: all failures
-                for _ in 0..n_bad {
-                    events.push(RouteEvent {
-                        peer: bad_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::Failure,
-                        op_type: None,
-                    });
-                }
-
-                let router = Router::new(&events);
-                prop_assert!(router.has_sufficient_routing_events());
-
-                let peers = vec![good_peer.clone(), bad_peer.clone()];
-                let (selected, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
-
-                let all_have_predictions = decision.candidates.iter()
-                    .all(|c| c.prediction.is_some());
-
-                // With enough data, predictions should exist for both
-                if all_have_predictions && selected.len() == 2 {
-                    // The first selected peer (lowest expected_total_time) should
-                    // be the good peer since failures increase cost via the
-                    // failure_cost_multiplier in predict_routing_outcome
-                    prop_assert!(
-                        *selected[0] == good_peer,
-                        "Good peer (all successes) should be ranked first"
-                    );
-                }
+            /// [`failure_data_increases_failure_prediction`] on the warm
+            /// hierarchical estimator.
+            #[test]
+            fn failure_data_increases_failure_prediction_warm_hierarchical(
+                n_good in 30usize..60,
+                n_bad in 30usize..60,
+                seed in 0u64..u64::MAX,
+            ) {
+                failure_data_increases_failure_prediction_case(
+                    n_good,
+                    n_bad,
+                    seed,
+                    Training::WarmHierarchical,
+                )?;
             }
 
             /// Property: add_event is consistent with batch construction.
@@ -6764,41 +8167,17 @@ mod tests {
                 outcomes in proptest::collection::vec(arb_route_outcome(), 60..150),
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let peers: Vec<PeerKeyLocation> =
-                    (0..3).map(|_| PeerKeyLocation::random()).collect();
-                let contract_location = Location::random();
+                failure_probability_bounded_case(outcomes, seed, Training::History)?;
+            }
 
-                let events: Vec<RouteEvent> = outcomes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, outcome)| RouteEvent {
-                        peer: peers[i % peers.len()].clone(),
-                        contract_location,
-                        outcome,
-                        op_type: None,
-                    })
-                    .collect();
-
-                let router = Router::new(&events);
-                if !router.has_sufficient_routing_events() {
-                    return Ok(());
-                }
-
-                let (_, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
-
-                for candidate in &decision.candidates {
-                    if let Some(pred) = &candidate.prediction {
-                        // Allow small float tolerance around [0, 1]
-                        prop_assert!(
-                            pred.failure_probability >= 0.0
-                                && pred.failure_probability <= 1.0,
-                            "failure_probability {} out of [0, 1] range",
-                            pred.failure_probability
-                        );
-                    }
-                }
+            /// [`failure_probability_bounded`] on the warm hierarchical
+            /// estimator.
+            #[test]
+            fn failure_probability_bounded_warm_hierarchical(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..150),
+                seed in 0u64..u64::MAX,
+            ) {
+                failure_probability_bounded_case(outcomes, seed, Training::WarmHierarchical)?;
             }
         }
     }
@@ -6807,6 +8186,22 @@ mod tests {
     /// in the estimator, preferring untried peers.
     #[test]
     fn test_distance_fallback_deprioritizes_failed_peers() {
+        distance_fallback_deprioritizes_failed_peers_case(Training::History);
+    }
+
+    /// [`test_distance_fallback_deprioritizes_failed_peers`] with the
+    /// hierarchical estimator WARM: below the prediction threshold the
+    /// fallback consults only the isotonic `peer_adjustments`, so a warm
+    /// estimator must not change what it picks. The sibling
+    /// `test_distance_fallback_k_greater_than_untried_count` exercises the same
+    /// branch, so it has no twin.
+    #[test]
+    fn test_distance_fallback_deprioritizes_failed_peers_warm_hierarchical() {
+        distance_fallback_deprioritizes_failed_peers_case(Training::WarmHierarchical);
+    }
+
+    fn distance_fallback_deprioritizes_failed_peers_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
 
         // Create a "failed" peer that is very close to the target
@@ -6827,11 +8222,24 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(
             !router.has_sufficient_routing_events(),
             "Should still be in distance-based fallback mode"
         );
+        if training == Training::WarmHierarchical {
+            // Warm: the failure stage has a curve and an estimate for the
+            // failed peer (at distance 0 from its own location), so the
+            // fallback below runs with the estimator ready to be consulted.
+            assert!(
+                router
+                    .hierarchical
+                    .estimate(&failed_peer, target, 0.0, router.estimator_clock.hours())
+                    .failure_probability
+                    .is_some(),
+                "the hierarchical failure stage must be warm for this twin to mean anything"
+            );
+        }
         assert!(
             router
                 .failure_estimator
@@ -7107,6 +8515,18 @@ mod tests {
     /// `expected_total_time`, even when transfer speed is zero.
     #[test]
     fn predict_routing_outcome_no_nan_with_zero_transfer_speed() {
+        zero_transfer_speed_case(Training::History);
+    }
+
+    /// [`predict_routing_outcome_no_nan_with_zero_transfer_speed`] on the warm
+    /// hierarchical estimator.
+    #[test]
+    fn predict_routing_outcome_no_nan_with_zero_transfer_speed_warm_hierarchical() {
+        zero_transfer_speed_case(Training::WarmHierarchical);
+    }
+
+    fn zero_transfer_speed_case(training: Training) {
+        let _mode = training.guard();
         let peer = PeerKeyLocation::random();
         let contract_location = Location::random();
 
@@ -7131,7 +8551,8 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
+        training.check_decides(&router, std::slice::from_ref(&peer), contract_location);
 
         // Not enough data (Err) is acceptable; only the Ok path is asserted.
         if let Ok(pred) = router.predict_routing_outcome(&peer, contract_location) {

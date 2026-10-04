@@ -672,6 +672,11 @@ boot_count_for() {
     (
         curl() { :; }
         tar()  { :; }
+        # The #5715 latest-release wait runs before the first boot. With `curl`
+        # a no-op it would never see an answer, so answer it: the boot count is
+        # the subject here, not the wait.
+        CANARY_LATEST_CONFIRMATIONS=1
+        resolve_expected_latest() { printf '0.2.122'; }
         cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
     )
     grep -c x "$counter" 2>/dev/null || echo 0

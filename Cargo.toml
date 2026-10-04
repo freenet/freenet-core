@@ -63,7 +63,7 @@ moka = { version = "0.12", features = ["sync"] }
 
 # File I/O
 directories = "6"
-dirs = "6"
+dirs = "7"
 filetime = "0.2"
 flate2 = "1"
 notify = "8"
@@ -143,7 +143,7 @@ wasmtime = { version = "47", default-features = false, features = [
 # which is stable across these versions, and each runs immediately before a
 # real wasmtime validation that has the final say — but do not restate the
 # single-copy claim without re-checking `cargo tree -d -p wasmparser`.
-wasmparser = "0.257"
+wasmparser = "0.258"
 # Test-only WAT assembler, so a fixture module can state its imports in text
 # rather than as hand-encoded LEB128. Already in the lock file: wasmtime's
 # "wat" feature above pulls the same crate, so this adds no new build.
@@ -156,7 +156,7 @@ freenet-test-network = "0.1.24"
 httptest = "0.16"
 proptest = "1"
 regex = "1"
-rstest = "0.26"
+rstest = "0.27"
 serial_test = "4"
 statrs = "0.19"
 test-log = "0.2"
@@ -185,6 +185,16 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
+# 0.12.0 adds delegate manifests (a `freenet-manifest` WASM custom section,
+# read with `DelegateManifest::from_wasm`) and `InboundDelegateMsg::Lifecycle`
+# at tag 10 (stdlib #136). Core delivers `Lifecycle` ONLY to a delegate whose
+# manifest lists that kind and whose app holds the Background grant
+# (`contract::delegate_capabilities`), and refuses it (and `WakeupFired`) in a
+# client's `ApplicationMessages`.
+#
+# 0.11.0 removed seven delegate host imports no released core provided; core
+# never registered them, so nothing here changes.
+#
 # 0.10.0 adds three delegate wire variants, all APPENDED so existing tags are
 # unchanged (stdlib #98/#82). Core matches them explicitly rather than sweeping
 # them into a wildcard, but implements none of them yet:
@@ -229,7 +239,7 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Exposure is FBS-only: `client_events/websocket.rs` falls back to
 # Flatbuffers when no encoding is specified, and every first-party client
 # (fdev, riverctl, River UI, the test harness) explicitly pins native.
-freenet-stdlib = "0.10.0"
+freenet-stdlib = "0.12.1"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

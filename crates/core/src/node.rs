@@ -4568,20 +4568,36 @@ async fn handle_interest_sync_message(
                         // production and sim-only converged skips, both fixed in
                         // #5055). Pinned by
                         // `summaries_arm_writes_summary_outside_staleness_branch_pin`.
+                        //
+                        // Bounded against OUR summary of the same contract
+                        // when we have it (#5647, #5781): a peer's summary far
+                        // larger than ours is not stored, because its bytes are
+                        // charged to the hosting budget.
                         match their_summary {
                             Some(theirs) => {
-                                op_manager.interest_manager.upsert_peer_summary_from(
+                                op_manager.interest_manager.upsert_peer_summary_bounded(
                                     &contract,
                                     &pk,
                                     theirs,
                                     crate::ring::interest::SummaryPopulationSource::InterestSummary,
+                                    our_summary.as_ref(),
                                 );
                             }
-                            None => op_manager.interest_manager.clear_peer_summary(
-                                &contract,
-                                &pk,
-                                crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
-                            ),
+                            None => {
+                                // Our summary, when we computed it, sizes the
+                                // contract's summary cap even if this peer sent
+                                // none (#5781).
+                                if let Some(ours) = our_summary.as_ref() {
+                                    op_manager
+                                        .interest_manager
+                                        .note_own_summary(&contract, ours);
+                                }
+                                op_manager.interest_manager.clear_peer_summary(
+                                    &contract,
+                                    &pk,
+                                    crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
+                                )
+                            }
                         }
 
                         if is_stale && !stale_contracts.contains(&contract) {
@@ -6456,9 +6472,14 @@ mod tests {
                 .expect("end of handler region not found");
         let body: String = src[handler_start..handler_end].split_whitespace().collect();
         assert!(
-            body.contains("upsert_peer_summary_from(&contract,&pk,theirs,"),
+            body.contains("upsert_peer_summary_bounded(&contract,&pk,theirs,"),
             "Summaries arm must upsert a Some(summary) report (seeds untracked \
              co-hosts, #4952)"
+        );
+        assert!(
+            body.contains("ifletSome(ours)=our_summary.as_ref(){op_manager.interest_manager.note_own_summary(&contract,ours);}"),
+            "a Summaries entry without the peer's summary must still record our own \
+             summary when we computed it (#5781)"
         );
         assert!(
             !body.contains("update_peer_summary(&contract,&pk,Some"),
@@ -6683,7 +6704,7 @@ mod tests {
 
         // Both writes must be present — they are the only thing refreshing the
         // TTL on this path.
-        let upsert_at = summaries_arm.find("upsert_peer_summary_from(").expect(
+        let upsert_at = summaries_arm.find("upsert_peer_summary_bounded(").expect(
             "the Summaries arm must cache the peer's reported summary via \
              upsert_peer_summary — that write is also what refreshes the peer's \
              interest TTL here (#4952, #3046)",
@@ -6719,7 +6740,8 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            !stripped.contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary_from("),
+            !stripped
+                .contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary_bounded("),
             "the summary write must not be gated on is_stale — see above"
         );
     }
@@ -12162,7 +12184,7 @@ mod tests {
                         h.op_manager
                             .interest_manager
                             .get_peer_interest(&keys[0], &pk)
-                            .and_then(|i| i.summary)
+                            .and_then(|i| i.summary().cloned())
                             .map(|s| s.as_ref().to_vec()),
                         Some(theirs.clone()),
                         "{label}: a costed entry must be compared and its bytes \
@@ -12182,7 +12204,7 @@ mod tests {
                     h.op_manager
                         .interest_manager
                         .get_peer_interest(&keys[127], &pk)
-                        .and_then(|i| i.summary),
+                        .and_then(|i| i.summary().cloned()),
                     None,
                     "{label}: a free entry still carries its repair — it clears \
                      our cached belief that the peer holds state. Not charging \

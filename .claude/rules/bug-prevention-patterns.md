@@ -774,3 +774,110 @@ grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegat
 # reachable from the driver.
 grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/
 ```
+
+
+## A mirror of hosting state cleaned up only when the mirror changes
+
+**State that mirrors another structure's membership must be reconciled against
+that structure on a timer, not only cleaned up at the moment the mirror
+changes.** `InterestManager` mirrors the hosting cache (`LocalInterest.hosting`,
+and the neighbour records in `interested_peers` that ride on it), and
+several paths write the mirror without consulting the source: the `Interests`
+heartbeat handler, `upsert_peer_summary_from`, a subscribe finaliser. A cleanup
+run at the instant local interest ends can be undone by a registration already
+in flight, and nothing ever runs it again.
+
+#5780: eviction cleared `LocalInterest.hosting` but left `interested_peers`.
+The records kept the contract in `contract_hash_index`, so the heartbeat kept
+advertising it, so neighbours kept refreshing the records. Evicting a contract
+freed almost none of its memory. #5779's first fix dropped the records at the
+moment interest ended (edge-triggered) and review found it raced every
+unchecked writer.
+
+### Fix shape (#5782)
+
+- **Level-triggered reconciliation** on the existing hosting sweep
+  (`InterestManager::reconcile_with_hosting`), acting only on a state that has
+  held for `RECONCILE_MIN_UNUSED_AGE`.
+- **Measure the wait in elapsed time, never in passes.** The sweep's
+  `tokio::time::interval` uses `MissedTickBehavior::Burst` (the tokio default;
+  the sweep does not set it), so after a stall two passes can run milliseconds
+  apart.
+- **Restart the wait on every change to the mirror**, not only when a pass
+  observes the source: a re-host and re-eviction between two passes is
+  invisible to the passes. A pass treats a restart as a stop signal: its
+  record removal re-checks, under the record's shard guard, that the wait
+  entry it started from is unchanged, so a subscribe refreshing an upstream
+  record mid-pass keeps it. The one write that must NOT restart the wait is
+  the pass's own stale-flag clear (`clear_local_hosting_flag`); going
+  through `unregister_local_hosting` there would stop the pass dropping the
+  records it just made eligible.
+- **Re-check the source immediately before each destructive step**, and say in
+  the doc comment that the checks are not atomic and what restores state when
+  a registration lands just after a drop.
+- **When a pass works through a bounded window, resume from a KEY, not an
+  offset.** An offset into unordered map iteration loses coverage under churn.
+- **Do not add a repair that writes the mirror from a probe that can be
+  inconclusive.** `contract_state_present` (and the async variant on SQLite
+  errors) answers "present" when it cannot tell; a repair keyed on it
+  registers and advertises stateless phantoms (#4610 shape). #5782 removed
+  such a repair rather than gate it; the residual is #5784.
+- **A node's own subscription lease is not demand.** It exists to receive
+  updates for a hosted copy, so it follows hosting and never justifies it.
+  Demand is a local client or a downstream subscriber. When the copy is gone
+  and there is no demand, do not count the lease as use and do not keep the
+  copy for it: the lease is renewed only for demand, so it lapses within one
+  lease period. The advertisement retraction refuses while a lease is live (a
+  subscribe installs it before the body arrives, so a live lease may mean a
+  host is forming), so something must retract after the lease ends. A
+  lease ends several ways (expiry, an upstream unsubscribe on collapse,
+  eviction), so reconcile against the advertised set itself: the sweep
+  examines every advertised contract, not only those with interest records
+  (up to `MAX_RECONCILE_KEYS_PER_PASS` per pass, resuming where it stopped),
+  and retracts each that is unhosted, unused and lease-free past the wait.
+  A contract tracked only by its records goes untracked once they are
+  dropped, and a retraction refused earlier is then never retried. Do not
+  retract only at the moment a flag is cleared or a lease expires: other
+  paths end the same state and nothing comes back to retry.
+
+The two paths that form a CACHE host (the GET cache path and the PUT relay
+store) go through `operations::complete_host_formation` (announce, migration
+nudge, register local hosting, interest change). The caller checks
+`is_hosting_contract` before it, and the helper checks again after the
+announce await and registers nothing if the contract was evicted meanwhile.
+Its retraction there is usually a no-op (the eviction already removed the
+advertisement entry), and every hosting retraction is best-effort: a dropped
+one is healed when a co-host re-requests our hosted set on the interest
+heartbeat. Neither check is atomic with eviction: a flag set just before an
+eviction is cleared and its advertisement retracted by reconciliation, within
+`RECONCILE_MIN_UNUSED_AGE` plus one sweep interval, since registering restarts
+the wait. The window is bounded, not closed. A re-host from state already on
+disk also requires the contract code on disk, because a partial reclamation
+can delete the code and leave the state. This is the "manually-inlined side
+effects" row applied to hosting. The subscribe finalisers in `subscribe.rs`
+announce on their own: they register demand (`add_local_client`, a downstream
+subscriber) rather than cache hosting, so they are not cache host formation.
+
+### Audit
+
+```bash
+# Production callers of the local-hosting mirror. Comment lines dropped; the
+# test modules of interest.rs, node.rs and operations/, and the simulation
+# harness node/testing_impl/in_memory.rs, also match, so read the file
+# position of each hit. Expected: the GET/PUT eviction loops and the sweep
+# (guarded unregister), complete_host_formation, reconcile_with_hosting (its
+# flag-clear restore; the clear itself is `clear_local_hosting_flag(`), and
+# startup rehydration in node/op_state_manager.rs, which registers from
+# `contract_state_present` and so inherits the inconclusive-probe caveat above.
+grep -rn "register_local_hosting(\|unregister_local_hosting(" crates/core/src --include=*.rs | grep -v ':\s*//'
+# Announce call sites. Outside `complete_host_formation` itself, expect only the
+# two subscribe finalisers in subscribe.rs (demand, not cache hosting); the
+# remaining hits are needle strings in pin tests and doc comments. A new
+# cache-hosting path must use the helper.
+grep -rn "announce_contract_hosted(" crates/core/src/operations* | grep -v "fn announce_contract_hosted\|:\s*//"
+```
+
+Simulation guard: `test_evicted_contracts_keep_no_interest_records` asserts
+that no peer keeps records for a contract it neither hosts nor uses, and that
+reconciliation actually dropped some, so a run in which no records formed
+cannot pass.

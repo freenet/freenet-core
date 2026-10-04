@@ -132,18 +132,30 @@ static DELEGATE_INTEREST_HOLDS: std::sync::LazyLock<
 /// guarantee were ever broken, holding one obligation for two increments leaks
 /// — which is the safe direction, since the alternative is releasing interest
 /// that was never taken.
+///
+/// Returns `true` if this call recorded a NEW obligation, `false` if this node
+/// already held one for the pair. Since #5493 a `false` is reachable: the
+/// boot-time restore (`contract::delegate_restore`) takes and records a
+/// refcount off-loop, and a live re-subscribe from the delegate can take its
+/// own in the same window. A caller that sees `false` holds a refcount no hold
+/// accounts for and must give it back, or it leaks.
 pub(crate) fn record(
     contract: ContractInstanceId,
     delegate: DelegateKey,
     key: ContractKey,
     release: InterestRelease,
     node: NodeIdentity,
-) {
-    DELEGATE_INTEREST_HOLDS
+) -> bool {
+    let mut holds = DELEGATE_INTEREST_HOLDS
         .entry((contract, delegate))
-        .or_default()
-        .entry(node)
-        .or_insert(Hold { key, release });
+        .or_default();
+    match holds.entry(node) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(Hold { key, release });
+            true
+        }
+    }
 }
 
 /// Whether THIS node already holds an interest obligation for

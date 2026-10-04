@@ -255,6 +255,10 @@ impl ContractExecutor for Executor<Runtime> {
         self.op_manager.clone()
     }
 
+    fn delegate_subscription_store(&self) -> Option<crate::contract::storages::Storage> {
+        Some(self.state_store.inner().clone())
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,

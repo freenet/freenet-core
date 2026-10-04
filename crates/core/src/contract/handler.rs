@@ -120,7 +120,7 @@ impl ContractHandler for NetworkContractHandler {
             config.hosting_disk_pct,
             config.max_hosting_disk,
         );
-        // Resident-overhead (count-derived) budget's live-surplus share (#5333).
+        // Share of the memory limit hosted contracts may hold in RAM (#5647).
         op_manager
             .ring
             .configure_resident_overhead_mem_share(config.hosting_mem_share);
@@ -160,10 +160,9 @@ impl ContractHandler for NetworkContractHandler {
         // Populate neighbor hosting from hosted contracts so HostingStateResponse
         // reports our full contract set when ring connections establish.
         let hosted_keys = op_manager.ring.hosting_contract_keys();
-        let hosted_ids = hosted_keys.iter().map(|k| *k.id());
         op_manager
             .neighbor_hosting
-            .initialize_from_hosting_cache(hosted_ids);
+            .initialize_from_hosting_cache(hosted_keys.into_iter());
 
         // #4780: also rehydrate InterestManager local-hosting for every restored
         // hosted contract, so a client GET for a cached contract serves LOCALLY
@@ -181,6 +180,16 @@ impl ContractHandler for NetworkContractHandler {
         // copies with no freshening path and re-introduce the #3698 stale-serve
         // bug. See .claude/rules/hosting-invariants.md (invariant 1).
         op_manager.rehydrate_local_hosting_interest();
+
+        // Restore persisted delegate subscriptions (#5493). AFTER the hosting
+        // cache and interest rehydration above, so a restored subscribe that
+        // hits a locally hosted contract sees it as local; BEFORE this
+        // function returns, which is before the event loop exists, so no
+        // delegate can run while its subscriptions are still missing. The
+        // registry half is synchronous; the network half is paced in the
+        // background (`delegate_restore`). Inert when nothing was persisted.
+        let restored = crate::wasm_runtime::delegate_subscriptions::restore_from_storage(&storage);
+        super::delegate_restore::spawn_reestablish(op_manager.clone(), restored);
 
         Ok(Self { executor, channel })
     }

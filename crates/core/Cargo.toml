@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.135"
+version = "0.2.141"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -37,7 +37,7 @@ aes-gcm = { workspace = true }
 # (P3 of #4381). `zeroize` wipes the derived output buffer; we use the low-level
 # `Argon2::hash_password_into` API (not the PHC-string `password_hash` path) so
 # the feature set is minimal.
-argon2 = { version = "0.5", features = ["zeroize"] }
+argon2 = { version = "0.6", features = ["zeroize"] }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
@@ -206,7 +206,7 @@ tao = { workspace = true }
 # had not actually been confirmed by (the job was still pending). `libc`
 # has every symbol needed, including the `_COUNT` size constants that avoid
 # hand-rolled `size_of` arithmetic — see `wasm_runtime::module_cache`'s
-# `read_macos_available_bytes`/`read_macos_own_rss_bytes`.
+# `read_macos_own_rss_bytes`.
 
 [dev-dependencies]
 arbitrary = { workspace = true }
@@ -218,7 +218,7 @@ freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
 # Test-only: proves the collector can verify XEdDSA tokens with a stock
 # ed25519 library after Montgomery->Edwards conversion (4.1.3 = xeddsa's).
-curve25519-dalek = "4.1.3"
+curve25519-dalek = "5.0.0"
 # Test-only: `InMemoryMetricExporter`, so the OTel instrument callbacks can be
 # collected and asserted on without a collector. Dev-only on purpose — the
 # `testing` feature must not reach the shipped binary.

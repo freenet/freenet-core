@@ -361,7 +361,7 @@ impl ExecutorError {
         }
     }
 
-    fn request(error: impl Into<RequestError>) -> Self {
+    pub(crate) fn request(error: impl Into<RequestError>) -> Self {
         Self {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
@@ -729,6 +729,12 @@ impl ExecutorError {
     /// Returns true if the error is due to a missing delegate (not found in store).
     /// This is expected during legacy migration probes and should be logged at
     /// warn level rather than error.
+    ///
+    /// It also decides what the CLIENT sees (#5727): the executor loop returns it
+    /// as a failure, and `client_events::missing_delegate_client_error` keeps it
+    /// as the typed `DelegateError::Missing` rather than an `OperationError`
+    /// string, which in turn lets the websocket `DelegateRateLimiter` back off
+    /// repeated requests for the same missing key.
     pub fn is_missing_delegate(&self) -> bool {
         matches!(
             &self.inner,
@@ -1134,6 +1140,34 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn op_manager_handle(&self) -> Option<Arc<OpManager>> {
         None
     }
+
+    /// This node's delegate capability state (manifests, grants, lifecycle
+    /// queue, unprompted-run budget), if the executor has one. `None` for
+    /// executors that do not implement capabilities: lifecycle events are
+    /// then never delivered and unprompted runs are not budgeted, which is
+    /// exactly the behaviour before capabilities existed.
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
+
+    /// The raw WASM of a delegate this node stores, if it has it. Used at
+    /// start-up to re-read manifests (`refresh_capability_manifests`); `None`
+    /// for executors without a delegate store.
+    fn delegate_code(&self, _key: &DelegateKey) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The node's durable store, for mirroring delegate subscriptions to disk
+    /// so they survive a restart (#5493).
+    ///
+    /// `None` for mock/test executors with no durable store; their delegate
+    /// subscriptions are in-memory only, which is the behaviour before
+    /// durability existed.
+    fn delegate_subscription_store(&self) -> Option<crate::contract::storages::Storage> {
+        None
+    }
 }
 
 /// Tracks contracts that have undergone corrupted-state recovery.
@@ -1360,15 +1394,11 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
 /// safety on a >32 GiB host is guarded separately by
 /// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
 ///
-/// Promoted from a `#[cfg(test)]`-only helper (originally written purely to
-/// verify [`cache_byte_budgets_are_aggregate_safe`] below) to a real
-/// production function (#5333 review): the resident-overhead hosting budget
-/// (`ring::hosting::cache::resident_overhead_budget_for`) needs the SAME
-/// real figure — what every OTHER memory consumer has already declared — to
-/// derive its own budget as a residual rather than an independently-clamped
-/// guess. Using this one function in both places means the aggregate-safety
-/// test now checks the ACTUAL formula the resident-overhead budget composes
-/// against, not a second, potentially-drifting re-derivation of it.
+/// Test-only again since #5647. #5333 promoted it to production so the
+/// resident-overhead hosting budget could be derived as a residual of it; that
+/// budget is now its own share of the memory limit, so this sum is used only
+/// by the aggregate-safety tests, which keep every declared cache in one place.
+#[cfg(test)]
 pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
     // PER-EXECUTOR — multiplied by the pool.
     let summary = summary_budget_for(memory_limit, pool_size);

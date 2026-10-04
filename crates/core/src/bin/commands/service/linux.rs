@@ -317,6 +317,10 @@ fn install_user_service(no_linger: bool) -> Result<()> {
     }
     println!("Logs will be written to: {}", log_dir.display());
 
+    // A user service implies a desktop user; register freenet:// links.
+    // (A --system service is a headless server, so it does not.)
+    super::super::url_handler::register_for_install();
+
     Ok(())
 }
 
@@ -879,9 +883,16 @@ pub fn stop_and_remove_service(system: bool) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 pub(super) fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    // Decided before removal: afterwards the user unit is gone, and the
+    // auto-detection would see only a system unit, if any.
+    let user_mode = !use_system_mode(system);
     stop_and_remove_service(system)?;
 
     println!("Freenet service uninstalled.");
+
+    if user_mode {
+        super::super::url_handler::unregister_for_uninstall();
+    }
 
     if super::purge::should_purge(purge, keep_data)? {
         let system_mode = use_system_mode(system);

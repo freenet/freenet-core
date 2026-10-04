@@ -229,6 +229,17 @@ pub(crate) struct OpManager {
     ///
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    /// This node's delegate capability state, set once by the executor pool
+    /// when it is built, so the HTTP server can answer "Apps and permissions"
+    /// requests. `None` until then (and on executors without capabilities).
+    ///
+    /// WEAK: the pool owns it. `DelegateCapabilities` holds a redb handle, and
+    /// the `OpManager` outlives the node's run loop, so a strong reference
+    /// here would keep the database file locked after shutdown and break an
+    /// in-process restart (`test_in_process_restart_releases_redb_lock`).
+    delegate_capabilities: Arc<
+        OnceLock<std::sync::Weak<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    >,
     /// Registry for handling race conditions between stream fragments and metadata messages.
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
@@ -368,6 +379,7 @@ impl Clone for OpManager {
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
+            delegate_capabilities: self.delegate_capabilities.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
             attempt_hop_registry: self.attempt_hop_registry.clone(),
@@ -591,6 +603,7 @@ impl OpManager {
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
             request_router,
+            delegate_capabilities: Arc::new(OnceLock::new()),
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
             attempt_hop_registry: Arc::new(
@@ -788,6 +801,28 @@ impl OpManager {
     /// without holding an `Arc<OpManager>` across the drain wait.
     pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
         self.inflight_client_ops.clone()
+    }
+
+    /// Set once by the executor pool; later calls are ignored.
+    pub(crate) fn set_delegate_capabilities(
+        &self,
+        caps: &Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        if self
+            .delegate_capabilities
+            .set(Arc::downgrade(caps))
+            .is_err()
+        {
+            tracing::debug!("delegate capabilities already set; ignoring repeat wiring");
+        }
+    }
+
+    pub(crate) fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities
+            .get()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.

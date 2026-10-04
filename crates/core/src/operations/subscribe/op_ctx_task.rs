@@ -540,6 +540,9 @@ pub(crate) async fn run_executor_subscribe(
         instance_id,
         /* is_renewal */ false,
         /* first_hop */ None,
+        // A pre-check: the network case re-selects in the inner driver, which
+        // is the decision that routes.
+        crate::router::dataset::DecisionLog::Unlogged,
     )
     .await
     {
@@ -697,8 +700,17 @@ async fn drive_client_subscribe_inner(
     // resolving, leaving this peer subscribed-but-bodyless. `None` for ordinary
     // (non-directed) subscribes, which keep the greedy fetch.
     let directed_holder = first_hop.clone();
-    let initial =
-        prepare_initial_request(op_manager, client_tx, instance_id, is_renewal, first_hop).await?;
+    let initial = prepare_initial_request(
+        op_manager,
+        client_tx,
+        instance_id,
+        is_renewal,
+        first_hop,
+        crate::router::dataset::DecisionLog::Joinable(
+            crate::node::network_status::OpType::Subscribe,
+        ),
+    )
+    .await?;
 
     let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
         InitialRequest::LocallyComplete { key } => {
@@ -1257,9 +1269,14 @@ async fn advance_to_next_peer(
         retries,
         attempts_at_hop,
         |instance_id, visited| {
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(instance_id, visited, MAX_BREADTH)
+            op_manager.ring.k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Joinable(
+                    crate::node::network_status::OpType::Subscribe,
+                ),
+                instance_id,
+                visited,
+                MAX_BREADTH,
+            )
         },
     )
 }
@@ -1822,10 +1839,14 @@ async fn drive_relay_subscribe(
     new_visited.mark_visited(own_addr);
     new_visited.mark_visited(upstream_addr);
 
-    let mut candidates =
-        op_manager
-            .ring
-            .k_closest_potentially_hosting(&instance_id, &new_visited, MAX_BREADTH);
+    let mut candidates = op_manager.ring.k_closest_potentially_hosting(
+        crate::router::dataset::DecisionLog::Joinable(
+            crate::node::network_status::OpType::Subscribe,
+        ),
+        &instance_id,
+        &new_visited,
+        MAX_BREADTH,
+    );
 
     if candidates.is_empty() {
         // True no-candidate terminus: every connection is already in the
@@ -1963,6 +1984,12 @@ async fn drive_relay_subscribe(
                         target = %consult_addr,
                         "SUBSCRIBE relay: consulting advertised host off routing path after \
                          downstream NotFound"
+                    );
+                    crate::router::dataset::record_bypass(
+                        crate::node::network_status::OpType::Subscribe,
+                        crate::ring::Location::from(&instance_id),
+                        &consult_hop,
+                        crate::router::dataset::UncapturedReason::TerminalConsult,
                     );
                     let consult_outcome = relay_subscribe_forward_once(
                         op_manager,
@@ -4224,7 +4251,12 @@ mod route_attempt_driver_tests {
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let greedy = op_manager
             .ring
-            .k_closest_potentially_hosting(&instance_id, [own, upstream].as_slice(), 1)
+            .k_closest_potentially_hosting(
+                crate::router::dataset::DecisionLog::Unlogged,
+                &instance_id,
+                [own, upstream].as_slice(),
+                1,
+            )
             .into_iter()
             .next()
             .expect("a greedy candidate");
@@ -4241,8 +4273,14 @@ mod route_attempt_driver_tests {
                 is_response: true,
             },
         );
+        // The consulted host becomes a live capture once the relay's own
+        // selection (which lists it as an alternative, and so closes any
+        // earlier capture of it) is logged: the consult must then close it.
+        let (recorder, _dir, path) = crate::ring::candidate_log_wiring_tests::recorder();
+        let _log = crate::router::dataset::force_candidate_log(recorder.clone(), 1.0);
         let targets = Arc::new(Mutex::new(Vec::new()));
         let seen = targets.clone();
+        let (live_recorder, live_host) = (recorder.clone(), host.clone());
         serve_attempts(
             op_manager.clone(),
             rx,
@@ -4257,6 +4295,13 @@ mod route_attempt_driver_tests {
                 let mut seen = seen.lock();
                 seen.push(target);
                 let answer = if seen.len() == 1 {
+                    live_recorder.record_decision(
+                        crate::ring::candidate_log_wiring_tests::live_capture(
+                            &live_host,
+                            crate::node::network_status::OpType::Subscribe,
+                            crate::ring::Location::from(&instance_id),
+                        ),
+                    );
                     Answer::Reply(not_found(msg, instance_id))
                 } else {
                     Answer::Reply(subscribed(msg, instance_id))
@@ -4282,6 +4327,18 @@ mod route_attempt_driver_tests {
         );
         let failures = failed_addrs(&op_manager);
         assert!(failures.is_empty(), "{label}: {failures:?}");
+        let lines =
+            crate::ring::candidate_log_wiring_tests::lines_through_sentinel(&recorder, &path);
+        let consults: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["reason"] == "terminal_consult")
+            .collect();
+        assert_eq!(consults.len(), 1, "{lines:?}");
+        assert_eq!(consults[0]["op"], "SUBSCRIBE");
+        assert_eq!(
+            consults[0]["selected"],
+            serde_json::json!([crate::router::dataset::peer_hash(&host)])
+        );
     }
 
     fn subscribed(msg: &NetMessage, instance_id: ContractInstanceId) -> NetMessage {

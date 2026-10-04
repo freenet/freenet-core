@@ -2740,6 +2740,50 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "network_efficiency_v1".to_string(),
                     serde_json::json!(snapshot.network_efficiency_v1),
                 );
+                // Contract-term activation counters (#4485, #5700). PLAN-v2's
+                // live safety watch has to tell "the term is working" from
+                // "the term never activated" on a deployed gateway, and the
+                // estimable-refit count alone cannot: the effect is also
+                // refused per query below the present-peer bar. So the two
+                // APPLIED counts are mirrored beside it, with the
+                // between-contract variance and the number of contracts it
+                // rests on (it has no minimum group count). Same hand-mirroring
+                // footgun as everything else in this block: a new
+                // `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_contract_term_activation`.
+                for (name, value) in [
+                    (
+                        "hierarchical_contract_effects_applied",
+                        snapshot.hierarchical_contract_effects_applied,
+                    ),
+                    (
+                        "hierarchical_contract_forecast_offsets",
+                        snapshot.hierarchical_contract_forecast_offsets,
+                    ),
+                    (
+                        "hierarchical_contract_estimable_refits",
+                        snapshot.hierarchical_contract_estimable_refits,
+                    ),
+                    (
+                        "hierarchical_contract_qualifying_contracts",
+                        snapshot.hierarchical_contract_qualifying_contracts,
+                    ),
+                    (
+                        "hierarchical_contract_floor_bound_refits",
+                        snapshot.hierarchical_contract_floor_bound_refits,
+                    ),
+                    (
+                        "hierarchical_contracts",
+                        snapshot.hierarchical_contracts as u64,
+                    ),
+                ] {
+                    obj.insert(name.to_string(), serde_json::json!(value));
+                }
+                obj.insert(
+                    "hierarchical_contract_tau2".to_string(),
+                    serde_json::json!(snapshot.hierarchical_contract_tau2),
+                );
                 // Contract-exec WASM counters: the cache-hit / WASM-miss split
                 // that makes a summarize or delta rate interpretable at all.
                 // Same hand-mirroring footgun as everything else in this block —
@@ -2983,28 +3027,44 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_budget_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_budget_evictions_total),
                 );
-                // Resident-overhead pressure axis (#5325) — the SECOND, independent
-                // eviction pressure alongside the state-byte budget above. Same
+                // Resident-overhead pressure axis (#5325, #5647) — the SECOND,
+                // independent eviction pressure alongside the state-byte budget
+                // above: the memory hosted contracts hold in RAM, counted. Same
                 // hand-mirrored footgun; pinned by
-                // `router_snapshot_json_includes_resident_overhead_gauges`. Note the
-                // budget/estimate pair is a contract-COUNT ceiling in memory units,
-                // not measured RAM (see the `RouterSnapshotInfo` doc), which is why
-                // `hosting_contract_slot_budget` travels with it.
+                // `router_snapshot_json_includes_resident_overhead_gauges`.
                 obj.insert(
                     "hosting_resident_overhead_budget_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_resident_overhead_budget_bytes),
                 );
                 obj.insert(
-                    "hosting_estimated_resident_overhead_bytes".to_string(),
-                    serde_json::json!(snapshot.hosting_estimated_resident_overhead_bytes),
-                );
-                obj.insert(
-                    "hosting_contract_slot_budget".to_string(),
-                    serde_json::json!(snapshot.hosting_contract_slot_budget),
+                    "hosting_resident_overhead_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_resident_overhead_bytes),
                 );
                 obj.insert(
                     "hosting_resident_overhead_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_resident_overhead_evictions_total),
+                );
+                obj.insert(
+                    "hosting_resident_overhead_evicted_charged_bytes_total".to_string(),
+                    serde_json::json!(
+                        snapshot.hosting_resident_overhead_evicted_charged_bytes_total
+                    ),
+                );
+                obj.insert(
+                    "interest_resident_bytes_total".to_string(),
+                    serde_json::json!(snapshot.interest_resident_bytes_total),
+                );
+                obj.insert(
+                    "interest_neighbour_summary_bytes".to_string(),
+                    serde_json::json!(snapshot.interest_neighbour_summary_bytes),
+                );
+                obj.insert(
+                    "interest_summary_bound_trims_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_bound_trims_total),
+                );
+                obj.insert(
+                    "interest_summary_bound_trimmed_bytes_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_bound_trimmed_bytes_total),
                 );
                 // Demand-ordered eviction gauges (#4642 A3). Same
                 // hand-mirrored footgun as the A2 gauges above: a new
@@ -3593,9 +3653,14 @@ mod tests {
         // Raised from 14_336 alongside the busy budget, same 40 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
         // measured 15195; no fleet value approaches it, so it constrains
-        // schema shape rather than real bytes.
+        // schema shape rather than real bytes. #5647 added 7 counters (the
+        // `rejected_oversized` population outcome across the 6 sources, and
+        // the `over_size_bound` entry in `current`), 7 x 21 bytes at u64::MAX
+        // = 147: measured 15342, still within this limit.
         const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
-        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
+        // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
+        // each in an all-zero block (a digit and a comma): measured 2057.
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_064;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
         // arithmetic, not to forbid growth, so here it is:
@@ -3622,8 +3687,9 @@ mod tests {
         // two blocks merged onto this soak branch — measured 15267. This
         // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
         // digits); no fleet value approaches it, so it constrains schema shape
-        // rather than real bytes.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_360;
+        // rather than real bytes. Raised by #5647 for the same 7 counters as
+        // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_424;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3638,10 +3704,10 @@ mod tests {
             reg_new_k: [value; 7],
             reg_new_m: [value; 7],
             reg_cap: [value; 7],
-            removed: [value; 7],
-            current: [value; 5],
-            recreated: [value; 7],
-            populated: [[value; 4]; 6],
+            removed: [value; crate::ring::interest::InterestRemovalCause::COUNT],
+            current: [value; crate::ring::interest::SummaryMissingReason::COUNT + 1],
+            recreated: [value; crate::ring::interest::InterestRemovalCause::COUNT],
+            populated: [[value; crate::ring::interest::SummaryPopulationOutcome::COUNT]; 6],
             corr_ovf: [value; 2],
             queue: [value; 15],
             recv_n: [[value; 9]; 4],
@@ -3865,7 +3931,7 @@ mod tests {
     /// pinned by `ring::hosting_stats_mirror_source_tests`. The axis shipped
     /// computed-and-rendered-but-unexported, so a fleet audit could see a node's
     /// state-byte occupancy sitting at 13% with no way to tell it was
-    /// nevertheless evicting under slot pressure.
+    /// nevertheless evicting under resident-overhead pressure.
     #[test]
     fn router_snapshot_json_includes_resident_overhead_gauges() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -3873,15 +3939,23 @@ mod tests {
         let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
             .expect("construct RouterSnapshotInfo for test");
         info.hosting_resident_overhead_budget_bytes = Some(277);
-        info.hosting_estimated_resident_overhead_bytes = Some(281);
-        info.hosting_contract_slot_budget = Some(283);
+        info.hosting_resident_overhead_bytes = Some(281);
         info.hosting_resident_overhead_evictions_total = Some(293);
+        info.hosting_resident_overhead_evicted_charged_bytes_total = Some(307);
+        info.interest_resident_bytes_total = Some(311);
+        info.interest_summary_bound_trims_total = Some(313);
+        info.interest_neighbour_summary_bytes = Some(331);
+        info.interest_summary_bound_trimmed_bytes_total = Some(317);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_resident_overhead_budget_bytes", 277),
-            ("hosting_estimated_resident_overhead_bytes", 281),
-            ("hosting_contract_slot_budget", 283),
+            ("hosting_resident_overhead_bytes", 281),
             ("hosting_resident_overhead_evictions_total", 293),
+            ("hosting_resident_overhead_evicted_charged_bytes_total", 307),
+            ("interest_resident_bytes_total", 311),
+            ("interest_summary_bound_trims_total", 313),
+            ("interest_neighbour_summary_bytes", 331),
+            ("interest_summary_bound_trimmed_bytes_total", 317),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -4444,6 +4518,57 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// The contract term's activation counters must reach the OTLP body, or
+    /// the live safety watch cannot tell a term that worked from one that
+    /// never activated. Distinct values per field, so mirroring one field's
+    /// value under another field's key fails too.
+    ///
+    /// This covers the counters the COLLECTOR needs, which is NOT the whole
+    /// set the snapshot carries: `_residuals_refused`,
+    /// `_pairs_refused_last_refit`, `_entries_displaced` and
+    /// `_den_below_two_refits` are dashboard-only by choice. The first three
+    /// describe table SATURATION, which is read while looking at one node's
+    /// peer-detail page rather than aggregated across the fleet, and the
+    /// fourth is derivable from the two that are exported here
+    /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
+    /// question ever needs one of them, add it to the mirrored block above and
+    /// to this list together.
+    #[test]
+    fn router_snapshot_json_includes_contract_term_activation() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hierarchical_contract_effects_applied = 201;
+        info.hierarchical_contract_forecast_offsets = 202;
+        info.hierarchical_contract_estimable_refits = 203;
+        info.hierarchical_contract_qualifying_contracts = 204;
+        info.hierarchical_contract_floor_bound_refits = 206;
+        info.hierarchical_contracts = 205;
+        info.hierarchical_contract_tau2 = Some(0.25);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hierarchical_contract_effects_applied", 201),
+            ("hierarchical_contract_forecast_offsets", 202),
+            ("hierarchical_contract_estimable_refits", 203),
+            ("hierarchical_contract_qualifying_contracts", 204),
+            ("hierarchical_contract_floor_bound_refits", 206),
+            ("hierarchical_contracts", 205),
+        ] {
+            assert_eq!(
+                json.get(key).and_then(|v| v.as_u64()),
+                Some(want),
+                "{key} must reach the OTLP body"
+            );
+        }
+        assert_eq!(
+            json.get("hierarchical_contract_tau2")
+                .and_then(|v| v.as_f64()),
+            Some(0.25),
+            "hierarchical_contract_tau2 must reach the OTLP body"
+        );
     }
 
     /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.

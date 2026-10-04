@@ -274,6 +274,71 @@ pub(crate) fn reject_if_contract_banned_on(
     Ok(())
 }
 
+/// Side effects of a contract becoming hosted with its state held locally
+/// (#5780): advertise it to neighbours (so it receives live UPDATE fan-out),
+/// nudge placement, register local hosting (so it joins anti-entropy,
+/// hosting-invariants invariant 1), and send one interest change carrying it
+/// together with any `removed` contracts from the same event.
+///
+/// One helper so every path that forms a host runs the whole sequence: the GET
+/// cache path and the PUT relay store both call it. A path that registered
+/// without announcing left a re-hosted copy unadvertised after its eviction had
+/// retracted the advertisement; one that announced without checking the
+/// contract was still hosted left an advertisement and a hosting flag for a
+/// contract it no longer held.
+///
+/// Callers check `is_hosting_contract` first, and the helper checks again after
+/// the announce, which can wait up to 30s: if the contract was evicted in that
+/// window nothing is registered, so no local-hosting flag or `added` interest
+/// outlives the eviction. The retraction issued then is often a no-op, since
+/// the eviction already removed the advertisement entry; like every hosting
+/// retraction it is best-effort, and a dropped one is healed when a co-host
+/// re-requests our hosted set on the interest heartbeat (~5 min). Neither check
+/// is atomic with eviction: a flag set just before an eviction is cleared and
+/// retracted by the hosting sweep's reconciliation, within
+/// `RECONCILE_MIN_UNUSED_AGE` plus one sweep interval.
+pub(crate) async fn complete_host_formation(
+    op_manager: &OpManager,
+    key: ContractKey,
+    removed: Vec<ContractKey>,
+) {
+    announce_contract_hosted(op_manager, &key).await;
+    // The announce can wait up to 30s; an evicted contract re-hosted or
+    // re-subscribed meanwhile must not be sent as removed after its own
+    // addition went out.
+    let removed: Vec<ContractKey> = removed
+        .into_iter()
+        .filter(|k| {
+            !op_manager.ring.is_hosting_contract(k)
+                && !op_manager.interest_manager.has_local_interest(k)
+        })
+        .collect();
+    if !op_manager.ring.is_hosting_contract(&key) {
+        retract_advertisement_for_evicted_contract(op_manager, &key);
+        if !removed.is_empty() {
+            broadcast_change_interests(op_manager, Vec::new(), removed).await;
+        }
+        return;
+    }
+    // Directed-subscribe placement (#4404): best-effort nudge the node to
+    // consider migrating this freshly-hosted contract toward a closer
+    // neighbor. Dropped silently if the event channel is full; the next
+    // hosting/peer event re-triggers consideration.
+    if let Err(err) = op_manager
+        .try_notify_node_event(crate::message::NodeEvent::ConsiderContractMigration { key })
+    {
+        tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped");
+    }
+    let added = if op_manager.interest_manager.register_local_hosting(&key) {
+        vec![key]
+    } else {
+        Vec::new()
+    };
+    if !added.is_empty() || !removed.is_empty() {
+        broadcast_change_interests(op_manager, added, removed).await;
+    }
+}
+
 /// Announces to neighbors that we're hosting a contract.
 /// This broadcasts to all connected peers so they know to forward UPDATEs to us.
 pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &ContractKey) {
@@ -384,9 +449,15 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// - `is_hosting_contract` — a GET/PUT re-hosted it into the hosting cache.
 /// - `contract_in_use` — a client or downstream subscriber re-registered.
 ///   (These two match guards 1 and 2 in `RuntimePool::remove_contract`.)
-/// - `is_subscribed` — we hold a live upstream subscription lease, so we are
-///   wired into the contract's update mesh and therefore a host under invariant
-///   1, even with no cache entry and no subscriber of our own yet.
+/// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
+///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
+///   installs it before the body fetch and the announce, so a live lease may
+///   mean a host is forming. A lease left on a contract with no host and no
+///   demand is not renewed, so it lapses within one lease period (#5782). The
+///   hosting sweep's reconciliation calls this retraction every pass for each
+///   advertised or tracked contract that has been unhosted and unused for
+///   `RECONCILE_MIN_UNUSED_AGE` and is lease-free, so the advertisement goes
+///   on the first such pass after the lease ends, however it ended.
 ///
 /// The lease check is what makes the ordering guarantee below hold for the
 /// SUBSCRIBE path, whose announce is gated on the body being present ON DISK
@@ -1332,6 +1403,73 @@ mod sub_op_subscribe_pin_tests {
     }
 }
 
+/// Behaviour of `retract_advertisement_for_evicted_contract` against a real
+/// `OpManager` (#5782): the hosting sweep calls it every pass for unhosted,
+/// unused contracts, and it must leave the advertisement while this node's own
+/// lease is live and retract it once the lease has ended.
+#[cfg(test)]
+mod retraction_lease_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    async fn op_manager(id: &str) -> Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    #[tokio::test]
+    async fn retraction_waits_for_an_own_lease_to_end() {
+        let op_manager = op_manager("retraction-lease-5782").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        op_manager.neighbor_hosting.on_contract_hosted(&key);
+        op_manager.ring.subscribe(key);
+
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "a live lease keeps the advertisement"
+        );
+
+        op_manager.ring.unsubscribe(&key);
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "once the lease has ended the advertisement is retracted"
+        );
+    }
+}
+
 #[cfg(test)]
 mod reclaim_retraction_pin_tests {
     //! Pin tests for the hosting-advertisement retraction wiring (#4642 spec
@@ -1760,5 +1898,542 @@ mod terminal_consult_tests {
         assert_eq!(GlobalTestMetrics::terminal_consult_resolved_found(), 1);
         assert_eq!(GlobalTestMetrics::terminal_consult_still_not_found(), 1);
         GlobalTestMetrics::reset();
+    }
+}
+
+/// Source pins for the routing dataset's call-site classification (#4485).
+///
+/// Which ring selections are routing decisions (`DecisionLog::Joinable`), which
+/// are not (`Unlogged`), and which routes bypass ring selection
+/// (`record_bypass`) decide whether a replay can join an outcome to the decision
+/// that produced it. A wrong classification fails nothing at runtime: outcomes
+/// silently join the wrong decision, and `Unlogged` is not a safe default (a
+/// routing decision wrongly left unlogged lets its outcome join an older
+/// capture). The GET sites also have a behavioural test
+/// (`get::op_ctx_task::candidate_log_call_site_tests`).
+///
+/// The pins read code only: comments, string and char literal contents, and
+/// `#[cfg(test)]` modules are removed first, and identifiers are matched by
+/// suffix so an imported short path counts the same as a full one. Every
+/// selection call in a file must be in the table, with its log argument
+/// classified.
+#[cfg(test)]
+mod routing_dataset_call_site_pins {
+    const GET: &str = include_str!("operations/get/op_ctx_task.rs");
+    const PUT: &str = include_str!("operations/put/op_ctx_task.rs");
+    const SUBSCRIBE_DRIVER: &str = include_str!("operations/subscribe/op_ctx_task.rs");
+    const SUBSCRIBE: &str = include_str!("operations/subscribe.rs");
+    const UPDATE: &str = include_str!("operations/update/op_ctx_task.rs");
+
+    const SELECTION: &str = "closest_potentially_hosting(";
+    const JOINABLE: &str = "DecisionLog::Joinable(";
+    const UNLOGGED: &str = "DecisionLog::Unlogged";
+    const BYPASS: &str = "record_bypass(";
+
+    /// Code with comments removed and string / char literal contents emptied,
+    /// newlines kept. Raw strings (with or without a `b`/`c` prefix), escapes
+    /// including `'\''`, non-ASCII char literals, nested block comments and
+    /// lifetimes are handled. Fails CLOSED: an unterminated comment or literal
+    /// panics rather than silently masking the rest of the file.
+    fn mask(src: &str) -> String {
+        let b = src.as_bytes();
+        let ident = |at: usize| at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 0;
+                loop {
+                    assert!(i < b.len(), "pin lexer: unterminated block comment");
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if !ident(i)
+                && (c == b'r' || ((c == b'b' || c == b'c') && b.get(i + 1) == Some(&b'r')))
+                && {
+                    let r = if c == b'r' { i } else { i + 1 };
+                    let mut j = r + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    b.get(j) == Some(&b'"')
+                }
+            {
+                let r = if c == b'r' { i } else { i + 1 };
+                let mut j = r + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                j += 1;
+                loop {
+                    assert!(j < b.len(), "pin lexer: unterminated raw string");
+                    if b[j] == b'"'
+                        && b[j + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|x| **x == b'#')
+                            .count()
+                            == hashes
+                    {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j;
+            } else if c == b'"' {
+                let mut j = i + 1;
+                loop {
+                    assert!(j < b.len(), "pin lexer: unterminated string");
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'"' {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                out.push_str("\"\"");
+                i = j + 1;
+            } else if c == b'\'' {
+                if b.get(i + 1) == Some(&b'\\') {
+                    // An escape: skip the escaped byte (which may itself be a
+                    // quote), then up to the closing quote (for `\u{..}`).
+                    let mut j = i + 3;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    assert!(j < b.len(), "pin lexer: unterminated char literal");
+                    out.push_str("' '");
+                    i = j + 1;
+                } else {
+                    // One (possibly multi-byte) char then a quote is a char
+                    // literal; anything else is a lifetime.
+                    let width = match b.get(i + 1) {
+                        Some(lead) if *lead >= 0xF0 => 4,
+                        Some(lead) if *lead >= 0xE0 => 3,
+                        Some(lead) if *lead >= 0xC0 => 2,
+                        _ => 1,
+                    };
+                    if b.get(i + 1 + width) == Some(&b'\'') {
+                        out.push_str("' '");
+                        i += 2 + width;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                    }
+                }
+            } else {
+                // Copy whole UTF-8 characters.
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// The index of the brace closing the one opened at `open`.
+    fn matching_brace(code: &str, open: usize) -> usize {
+        let mut depth = 0;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// Masked production code: `#[cfg(test)] mod name;` and
+    /// `#[cfg(test)] mod name { .. }` removed wherever they appear. Other
+    /// `#[cfg(test)]` forms (a test-only `fn`, `#[cfg(any(test, ..))]`, an
+    /// attribute between `#[cfg(test)]` and `mod`) stay counted as production:
+    /// a site there makes a pin fail by over-counting, never pass vacuously.
+    /// Unbalanced braces panic, so a lexer gap fails closed.
+    fn production(src: &str) -> String {
+        let mut code = mask(src);
+        assert_eq!(
+            code.matches('{').count(),
+            code.matches('}').count(),
+            "pin lexer: unbalanced braces after masking"
+        );
+        while let Some(at) = code.find("#[cfg(test)]") {
+            let rest = &code[at..];
+            let item = rest["#[cfg(test)]".len()..].trim_start();
+            let item_at = code.len() - item.len();
+            let end = if item.starts_with("mod ") || item.starts_with("pub(crate) mod ") {
+                let semi = item.find(';');
+                let brace = item.find('{');
+                match (semi, brace) {
+                    (Some(semi), Some(brace)) if semi < brace => item_at + semi + 1,
+                    (Some(semi), None) => item_at + semi + 1,
+                    (_, Some(brace)) => matching_brace(&code, item_at + brace) + 1,
+                    (None, None) => panic!("malformed test module"),
+                }
+            } else {
+                // Some other test-only item: remove just the attribute.
+                at + "#[cfg(test)]".len()
+            };
+            code.replace_range(at..end, "");
+        }
+        code
+    }
+
+    /// Whitespace removed, rustfmt's trailing commas dropped, and a turbofish
+    /// on a selection call removed, so `k_closest_potentially_hosting::<K>(`
+    /// counts like any other call.
+    fn squash(code: &str) -> String {
+        let mut code = code
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
+        let turbofish = "closest_potentially_hosting::<";
+        while let Some(at) = code.find(turbofish) {
+            let open = at + turbofish.len() - 1;
+            let mut depth = 0;
+            let close = code[open..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '<' => depth += 1,
+                        '>' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(open + i)
+                })
+                .expect("pin lexer: unterminated turbofish");
+            code.replace_range(open - 2..=close, "");
+        }
+        code
+    }
+
+    /// The body of the one production function called `name`.
+    fn fn_body(production: &str, name: &str) -> String {
+        let signatures: Vec<usize> = production
+            .match_indices(&format!("fn {name}"))
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                let before_ok = at == 0 || !production.as_bytes()[at - 1].is_ascii_alphanumeric();
+                let next = production[at + 3 + name.len()..].chars().next();
+                before_ok && matches!(next, Some('(') | Some('<'))
+            })
+            .collect();
+        assert_eq!(signatures.len(), 1, "exactly one production `fn {name}`");
+        let open = signatures[0] + production[signatures[0]..].find('{').unwrap();
+        squash(&production[open..=matching_brace(production, open)])
+    }
+
+    /// `Joinable(..)` arguments naming `op`.
+    fn joinable_for(code: &str, op: &str) -> usize {
+        code.match_indices(JOINABLE)
+            .filter(|(at, _)| {
+                let argument = &code[at + JOINABLE.len()..];
+                let argument = &argument[..argument.find(')').unwrap_or(argument.len())];
+                argument.ends_with(&format!("OpType::{op}"))
+            })
+            .count()
+    }
+
+    struct Site {
+        name: &'static str,
+        selections: usize,
+        joinable: usize,
+        unlogged: usize,
+        bypasses: &'static [&'static str],
+    }
+
+    const fn site(
+        name: &'static str,
+        selections: usize,
+        joinable: usize,
+        unlogged: usize,
+        bypasses: &'static [&'static str],
+    ) -> Site {
+        Site {
+            name,
+            selections,
+            joinable,
+            unlogged,
+            bypasses,
+        }
+    }
+
+    fn check(file: &str, src: &str, op: &str, sites: &[Site]) {
+        let production = production(src);
+        for site in sites {
+            let body = fn_body(&production, site.name);
+            let context = format!("{file}::{}", site.name);
+            assert_eq!(
+                body.matches(SELECTION).count(),
+                site.selections,
+                "{context}: selections"
+            );
+            assert_eq!(
+                joinable_for(&body, op),
+                site.joinable,
+                "{context}: Joinable({op})"
+            );
+            assert_eq!(
+                body.matches(JOINABLE).count(),
+                site.joinable,
+                "{context}: Joinable of another op"
+            );
+            assert_eq!(
+                body.matches(UNLOGGED).count(),
+                site.unlogged,
+                "{context}: Unlogged"
+            );
+            assert_eq!(
+                body.matches(BYPASS).count(),
+                site.bypasses.len(),
+                "{context}: bypass lines"
+            );
+            for reason in site.bypasses {
+                assert!(
+                    body.contains(&format!("UncapturedReason::{reason})")),
+                    "{context}: bypass reason {reason}"
+                );
+            }
+        }
+        let whole = squash(&production);
+        let total = |f: fn(&Site) -> usize| sites.iter().map(f).sum::<usize>();
+        assert_eq!(
+            whole.matches(SELECTION).count(),
+            total(|s| s.selections),
+            "{file}: a selection call outside the table"
+        );
+        assert_eq!(
+            whole.matches(JOINABLE).count(),
+            total(|s| s.joinable),
+            "{file}: a Joinable outside the table"
+        );
+        assert_eq!(
+            whole.matches(UNLOGGED).count(),
+            total(|s| s.unlogged),
+            "{file}: an Unlogged outside the table"
+        );
+        assert_eq!(
+            whole.matches(BYPASS).count(),
+            total(|s| s.bypasses.len()),
+            "{file}: a bypass outside the table"
+        );
+        // Every selection call states how it logs, as its first argument.
+        for (at, _) in whole.match_indices(SELECTION) {
+            let argument = &whole[at + SELECTION.len()..];
+            let argument = &argument[..argument.find(',').unwrap_or(argument.len())];
+            assert!(
+                argument.contains(JOINABLE) || argument.ends_with(UNLOGGED) || argument == "log_as",
+                "{file}: selection with unclassified log argument `{argument}`"
+            );
+        }
+    }
+
+    #[test]
+    fn get_sites_are_classified() {
+        check(
+            "get",
+            GET,
+            "Get",
+            &[
+                site("drive_client_get_inner", 1, 0, 1, &[]),
+                site("fallback_target", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("first_hop_candidate", 1, 0, 1, &[]),
+                site(
+                    "relay_advance_to_next_peer",
+                    1,
+                    1,
+                    0,
+                    &["PinnedFirstHop", "BootstrapGateway"],
+                ),
+                site("drive_relay_get_inner", 0, 0, 0, &["TerminalConsult"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn put_sites_are_classified() {
+        check(
+            "put",
+            PUT,
+            "Put",
+            &[
+                site("drive_client_put_inner", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_relay_put", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_put_streaming", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_probe", 1, 0, 1, &[]),
+                site("drive_relay_probe_reconcile", 1, 0, 1, &[]),
+            ],
+        );
+    }
+
+    #[test]
+    fn subscribe_sites_are_classified() {
+        check(
+            "subscribe driver",
+            SUBSCRIBE_DRIVER,
+            "Subscribe",
+            &[
+                // The pre-check's `Unlogged` is its argument to
+                // `prepare_initial_request`.
+                site("run_executor_subscribe", 0, 0, 1, &[]),
+                site("drive_client_subscribe_inner", 0, 1, 0, &[]),
+                site("advance_to_next_peer", 1, 1, 0, &[]),
+                site("drive_relay_subscribe", 1, 1, 0, &["TerminalConsult"]),
+            ],
+        );
+        check(
+            "subscribe",
+            SUBSCRIBE,
+            "Subscribe",
+            &[site(
+                "prepare_initial_request",
+                1,
+                0,
+                // The three bypass guards compare against `Unlogged`.
+                3,
+                &[
+                    "DirectedFirstHop",
+                    "AnyConnectionFallback",
+                    "BootstrapGateway",
+                ],
+            )],
+        );
+        let body = fn_body(&production(SUBSCRIBE), "prepare_initial_request");
+        assert!(body.contains(&format!("{SELECTION}log_as,")));
+        assert_eq!(
+            body.matches(&format!(
+                "iflog_as!=crate::router::dataset::{UNLOGGED}{{crate::router::dataset::{BYPASS}"
+            ))
+            .count(),
+            3,
+            "every bypass is skipped for a pre-check"
+        );
+    }
+
+    #[test]
+    fn update_sites_are_never_logged() {
+        check(
+            "update",
+            UPDATE,
+            "Update",
+            &[
+                site("drive_client_update", 1, 0, 1, &[]),
+                site("drive_relay_request_update", 2, 0, 2, &[]),
+            ],
+        );
+    }
+
+    /// The masking the pins rely on: comments, literals and test modules do
+    /// not count, and production code after a `mod tests;` does.
+    #[test]
+    fn the_pins_read_code_only() {
+        let src = r#"
+fn a() {
+    // x.closest_potentially_hosting(DecisionLog::Unlogged, k)
+    /* x.closest_potentially_hosting(DecisionLog::Unlogged, k) /* nested */ */
+    let s = "closest_potentially_hosting(";
+    let c = '{';
+    y.closest_potentially_hosting(DecisionLog::Joinable(OpType::Get), k); // record_bypass(
+}
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod more {
+    fn b() { z.closest_potentially_hosting(DecisionLog::Unlogged, k); }
+}
+fn c<'a>(x: &'a str) { record_bypass(o, l, p, UncapturedReason::TerminalConsult); }
+"#;
+        let code = squash(&production(src));
+        assert_eq!(code.matches(SELECTION).count(), 1);
+        assert_eq!(code.matches(UNLOGGED).count(), 0);
+        assert_eq!(joinable_for(&code, "Get"), 1);
+        assert_eq!(
+            code.matches(BYPASS).count(),
+            1,
+            "code after `mod tests;` is production"
+        );
+        assert_eq!(fn_body(&production(src), "c").matches(BYPASS).count(), 1);
+    }
+
+    /// Literals that once mis-lexed, each followed by a brace and a site that
+    /// must still count; and a turbofish call.
+    #[test]
+    fn the_pin_lexer_handles_awkward_literals_and_turbofish() {
+        let src = r##"
+fn a() {
+    let q = ['\'','{'];
+    let arrow = ['→','{'];
+    let esc = '\u{7d}';
+    let raw = br"\";
+    let craw = cr#"\"#;
+    let brace = "}";
+    x.k_closest_potentially_hosting::<ContractInstanceId>(DecisionLog::Unlogged, k, s, 1);
+}
+"##;
+        let code = production(src);
+        assert_eq!(fn_body(&code, "a").matches(SELECTION).count(), 1);
+        assert_eq!(squash(&code).matches(UNLOGGED).count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_string() {
+        let _ = mask("fn a() { let s = \"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated raw string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_raw_string() {
+        let _ = mask("fn a() { let s = br#\"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated block comment")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_block_comment() {
+        let _ = mask("fn a() { /* never closed /* nested */ }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated char literal")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_char_literal() {
+        let _ = mask("fn a() { let c = '\\n; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unbalanced braces")]
+    fn the_pin_lexer_fails_closed_on_unbalanced_braces() {
+        let _ = production("fn a() { if x { }");
     }
 }

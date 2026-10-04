@@ -2500,6 +2500,7 @@ impl ConnectionManager {
     }
 
     /// Route an op to the most optimal target, returning telemetry about the decision.
+    #[cfg(test)]
     pub fn routing_with_telemetry(
         &self,
         target: Location,
@@ -2510,16 +2511,31 @@ impl ConnectionManager {
         Option<PeerKeyLocation>,
         Option<crate::router::RoutingDecisionInfo>,
     ) {
+        self.routing_with(target, requesting, skip_list, |candidates| {
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(candidates.iter(), target, 1);
+            (selected.into_iter().next().cloned(), Some(decision))
+        })
+        .unwrap_or((None, None))
+    }
+
+    /// The readiness-gated routing candidates for `target`, handed to `select`
+    /// unless there are none. The single candidate-gathering path for
+    /// ring-selected routing: `Ring::closest_potentially_hosting` selects (and
+    /// records the decision) inside `select`, and the routing unit tests reach
+    /// the same code through `routing_with_telemetry`.
+    pub fn routing_with<R>(
+        &self,
+        target: Location,
+        requesting: Option<SocketAddr>,
+        skip_list: impl Contains<SocketAddr>,
+        select: impl FnOnce(&[PeerKeyLocation]) -> R,
+    ) -> Option<R> {
         let candidates = self.routing_candidates(target, requesting, skip_list, true);
-
         if candidates.is_empty() {
-            return (None, None);
+            return None;
         }
-
-        let (selected, decision) =
-            router.select_k_best_peers_with_telemetry(candidates.iter(), target, 1);
-        let peer = selected.into_iter().next().cloned();
-        (peer, Some(decision))
+        Some(select(&candidates))
     }
 
     /// Gather routing candidates after applying skip/transient filters.

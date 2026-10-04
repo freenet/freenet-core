@@ -138,6 +138,12 @@ pub enum ServiceCommand {
     },
     /// Generate and upload a diagnostic report for debugging
     Report(ReportCommand),
+    /// Register or remove the freenet:// link handler.
+    ///
+    /// `freenet service install` registers it and `freenet service uninstall`
+    /// removes it, so this is only needed for installs without the service.
+    #[command(subcommand)]
+    UrlHandler(super::url_handler::UrlHandlerCommand),
     /// Internal: process wrapper that manages the freenet node lifecycle.
     /// Handles auto-update (exit code 42), crash backoff, log capture,
     /// and on Windows shows a system tray icon.
@@ -172,6 +178,7 @@ impl ServiceCommand {
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
             }
+            ServiceCommand::UrlHandler(cmd) => cmd.run(),
             ServiceCommand::RunWrapper => run_wrapper(version),
         }
     }
@@ -197,6 +204,11 @@ const WRAPPER_MAX_BACKOFF_SECS: u64 = 300;
 const WRAPPER_MAX_PORT_CONFLICT_KILLS: u32 = 3;
 /// Maximum consecutive failures before the wrapper gives up.
 const WRAPPER_MAX_CONSECUTIVE_FAILURES: u32 = 50;
+/// A child that ran at least this long before exiting was healthy, so its exit
+/// starts a fresh count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES`. Same value as
+/// the macOS launchd script's `MIN_HEALTHY_RUNTIME`, which resets its count the
+/// same way.
+const WRAPPER_MIN_HEALTHY_RUNTIME_SECS: u64 = 300;
 
 /// Dashboard URL served by the local freenet node.
 #[allow(dead_code)] // Used on Windows/macOS (tray + wrapper loop)
@@ -208,6 +220,15 @@ pub(crate) const DASHBOARD_URL: &str = "http://127.0.0.1:7509/";
 /// assert their consistency on Linux CI.
 #[allow(dead_code)]
 const DASHBOARD_ADDR: &str = "127.0.0.1:7509";
+
+/// Append a line to the wrapper's own log (the wrapper process has no
+/// tracing subscriber, so `tracing` output from it goes nowhere).
+#[cfg(target_os = "macos")]
+pub(crate) fn log_to_wrapper_log(message: &str) {
+    if let Some(dir) = freenet::tracing::tracer::get_log_dir() {
+        wrapper::log_wrapper_event(&dir, message);
+    }
+}
 
 /// Open a URL in the default browser (platform-specific).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2998,6 +3019,103 @@ echo "RC=$?"
         let action = next_wrapper_action(&mut state, 42, false, Some(false));
         assert_eq!(action, WrapperAction::BackoffAndRelaunch { secs: 20 });
         assert_eq!(state.backoff_secs, 40);
+    }
+
+    #[test]
+    fn a_long_healthy_run_clears_the_failure_streak() {
+        // A node that runs for a day and then fails one update (a #3934
+        // lockout retry) must not creep toward the give-up limit: before this,
+        // 50 such days stopped the node for good.
+        let mut state = WrapperState::new();
+        state.consecutive_failures = WRAPPER_MAX_CONSECUTIVE_FAILURES - 1;
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS);
+        assert_eq!(state.consecutive_failures, 0);
+        next_wrapper_action(&mut state, 42, false, Some(false));
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn a_long_healthy_run_resets_backoff_but_keeps_the_stuck_streak() {
+        // The same failure after every healthy run is still "stuck" (a node
+        // that cannot leave an old version), so the streak must survive.
+        let mut state = WrapperState::new();
+        for _ in 0..4 {
+            next_wrapper_action(&mut state, 42, false, Some(false));
+        }
+        let streak = state.identical_failure_streak;
+        assert!(state.backoff_secs > WRAPPER_INITIAL_BACKOFF_SECS);
+        assert!(streak > 0);
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS);
+        assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
+        assert_eq!(state.identical_failure_streak, streak);
+    }
+
+    /// The healthy-run reset only works if the loop measures the child's own
+    /// runtime as it exits (before the post-exit update, which can take
+    /// minutes) and applies it before the state machine counts the failure.
+    /// Swapping either order brings back the give-up it exists to prevent.
+    #[test]
+    fn wrapper_loop_measures_child_runtime_before_updating_and_applies_it_first() {
+        // Scoped to run_wrapper_loop's own body (brace-matched), so moving
+        // these statements into another function fails instead of passing on
+        // their file-wide order.
+        let src = include_str!("service/wrapper.rs");
+        assert_eq!(
+            src.matches("fn run_wrapper_loop(").count(),
+            1,
+            "the slice below takes the first match, so a second one would hide code"
+        );
+        let sig = src
+            .find("fn run_wrapper_loop(")
+            .expect("run_wrapper_loop not found");
+        let open = sig + src[sig..].find('{').expect("run_wrapper_loop has no body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let wrapper = &src[open..close.expect("run_wrapper_loop braces never balance")];
+        let pos = |needle: &str| {
+            wrapper
+                .find(needle)
+                .unwrap_or_else(|| panic!("run_wrapper_loop must contain `{needle}`"))
+        };
+        let measured = pos("let child_runtime_secs = child_started.elapsed().as_secs();");
+        let noted = pos("note_child_runtime(&mut state, child_runtime_secs);");
+        let sentinel = pos("if exit_code == SENTINEL_RESTART {");
+        let update = pos("spawn_update_command(&exe_path, Some(exit_code))");
+        let decided = pos("next_wrapper_action(&mut state, exit_code, is_port_conflict");
+        assert!(
+            measured < update,
+            "measure the child's runtime before the post-exit update runs"
+        );
+        assert!(
+            noted < sentinel,
+            "apply the healthy-run reset before the tray Restart/Stop sentinels continue"
+        );
+        assert!(
+            noted < decided,
+            "apply the healthy-run reset before next_wrapper_action counts the failure"
+        );
+    }
+
+    #[test]
+    fn a_short_run_keeps_the_failure_streak() {
+        // A tight crash loop must still reach the give-up limit.
+        let mut state = WrapperState::new();
+        state.consecutive_failures = 7;
+        note_child_runtime(&mut state, WRAPPER_MIN_HEALTHY_RUNTIME_SECS - 1);
+        assert_eq!(state.consecutive_failures, 7);
     }
 
     #[test]

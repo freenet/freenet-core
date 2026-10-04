@@ -330,6 +330,31 @@ pub struct NetworkStatus {
     pub gateway_addresses: HashSet<SocketAddr>,
     /// Active peer connections.
     pub connected_peers: Vec<ConnectedPeer>,
+    /// When the current spell without any peer-to-peer connection began, as
+    /// far as the gateway-only warning is concerned. Set when the node first
+    /// becomes gateway-only (connected, every connection a gateway); cleared
+    /// when it gains a peer-to-peer connection.
+    ///
+    /// Maintained by [`NetworkStatus::refresh_gateway_only_since`], which
+    /// every mutation of `connected_peers` must call. Kept as its own
+    /// timestamp because no property of the current connections can stand in
+    /// for it: the age of the oldest connection is too old when a long-lived
+    /// gateway link outlives the last peer, and too young when a gateway link
+    /// is re-established.
+    ///
+    /// It SURVIVES a drop to zero connections, because a real reconnect is a
+    /// disconnect followed by a connect: clearing it there would let a
+    /// firewalled node whose one gateway link flaps stay "still joining"
+    /// forever. It is restarted only if the node then stays disconnected for
+    /// longer than the grace itself (see [`Self::gateway_only_outage_since`]),
+    /// so a node that has been offline for a long stretch is treated as
+    /// joining afresh. (Time spent suspended does not count: `Instant` is a
+    /// monotonic clock that stops during sleep, so what is measured is the
+    /// disconnected time while awake.)
+    pub gateway_only_since: Option<Instant>,
+    /// When the node dropped to zero connections while
+    /// [`Self::gateway_only_since`] was set. `None` while connected.
+    pub gateway_only_outage_since: Option<Instant>,
     /// Freenet version string.
     pub version: String,
     /// This node's ring location.
@@ -938,6 +963,8 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         started_at: Instant::now(),
         gateway_addresses: gateway_addrs,
         connected_peers: Vec::new(),
+        gateway_only_since: None,
+        gateway_only_outage_since: None,
         version,
         own_location: None,
         external_address: None,
@@ -1006,6 +1033,33 @@ pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
     }
 }
 
+impl NetworkStatus {
+    /// Bring [`Self::gateway_only_since`] in line with `connected_peers`.
+    /// Call after every change to that list.
+    fn refresh_gateway_only_since(&mut self, now: Instant) {
+        if self.connected_peers.iter().any(|p| !p.is_gateway) {
+            // A peer-to-peer connection: not gateway-only, nothing to time.
+            self.gateway_only_since = None;
+            self.gateway_only_outage_since = None;
+        } else if self.connected_peers.is_empty() {
+            // Disconnected. Keep the anchor and note when the outage began.
+            if self.gateway_only_since.is_some() && self.gateway_only_outage_since.is_none() {
+                self.gateway_only_outage_since = Some(now);
+            }
+        } else {
+            // Gateway-only. A long outage in between starts the grace over; a
+            // short one (a reconnect) does not.
+            let long_outage = self.gateway_only_outage_since.is_some_and(|since| {
+                now.saturating_duration_since(since).as_secs() >= GATEWAY_ONLY_GRACE_SECS
+            });
+            if self.gateway_only_since.is_none() || long_outage {
+                self.gateway_only_since = Some(now);
+            }
+            self.gateway_only_outage_since = None;
+        }
+    }
+}
+
 /// Record a successful peer connection.
 pub fn record_peer_connected(
     addr: SocketAddr,
@@ -1024,6 +1078,7 @@ pub fn record_peer_connected(
                 connected_since: Instant::now(),
                 peer_key_location,
             });
+            s.refresh_gateway_only_since(Instant::now());
             s.gateway_failures.clear();
         }
     }
@@ -1034,6 +1089,7 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
     // Free the per-peer metrics slot so the bounded table doesn't accumulate
@@ -1775,8 +1831,14 @@ pub struct NetworkStatusSnapshot {
     pub contracts: Vec<ContractSnapshot>,
     pub op_stats: OpStatsSnapshot,
     pub nat_stats: NatStatsSnapshot,
-    /// True if all connections are to gateways (no peer-to-peer connections).
-    pub gateway_only: bool,
+    /// True if every connection is to a gateway (no peer-to-peer connections)
+    /// AND that has held for longer than [`GATEWAY_ONLY_GRACE_SECS`].
+    ///
+    /// The raw "all my peers are gateways" fact is deliberately not exposed:
+    /// it is true of every node for a while after it joins, since a node's
+    /// first connection is always a gateway, and rendering it as a warning
+    /// told every new user their firewall was at fault.
+    pub gateway_only_persisting: bool,
     /// Cumulative bytes uploaded (lifetime, never reset).
     pub bytes_uploaded: u64,
     /// Cumulative bytes downloaded (lifetime, never reset).
@@ -1990,9 +2052,11 @@ pub struct NetworkNorms {
 pub enum HealthLevel {
     /// Node has peer-to-peer connections and things are working.
     Healthy,
-    /// Connected but degraded (gateway-only, or all NAT attempts failing).
+    /// Connected but degraded: still gateway-only after the joining grace
+    /// period, or every NAT attempt failing over a meaningful sample.
     Degraded,
-    /// Still trying to establish connections.
+    /// Still joining: no connections yet, or connected only to gateways and
+    /// still within [`GATEWAY_ONLY_GRACE_SECS`].
     Connecting,
     /// No connections after extended time, or version mismatch.
     Trouble,
@@ -2097,28 +2161,17 @@ pub struct HostingSnapshot {
     /// real value — so the panel can distinguish "not yet computed" from a
     /// genuine (if enormous) budget.
     pub disk_budget_bytes: Option<u64>,
-    /// Configured resident-overhead budget (bytes, #5325): the RAM-scaled
-    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, a
-    /// pressure axis independent of `budget_bytes`/`used_bytes` (which cover
-    /// contract STATE bytes only, not the per-contract resident bookkeeping
-    /// overhead that scales with count). See
+    /// Resident-overhead budget (bytes, #5325/#5647): the memory hosted
+    /// contracts may hold in RAM, `--hosting-mem-share` of the node's memory
+    /// limit. A pressure axis independent of `budget_bytes`/`used_bytes`,
+    /// which cover contract STATE bytes on disk. See
     /// `.claude/rules/hosting-invariants.md` invariant 3.
     pub resident_overhead_budget_bytes: u64,
-    /// Current estimated resident-overhead bytes (#5325): `contract_count *
-    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Compare against
-    /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
-    /// against `budget_bytes`.
-    pub estimated_resident_overhead_bytes: u64,
-    /// The resident-overhead budget expressed as the contract COUNT it really
-    /// bounds (`resident_overhead_budget_bytes / 1 MiB-per-contract`).
-    ///
-    /// The dashboard renders this rather than the byte pair, because the byte
-    /// pair is not a memory measurement: the "used" side is
-    /// `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, so printing
-    /// it in MB reads to an operator as measured RAM when it is really a
-    /// contract-count ceiling. Derived in `HostingCache::contract_slot_budget`
-    /// so the per-contract constant keeps exactly one reader.
-    pub contract_slot_budget: u64,
+    /// Bytes hosted contracts currently hold in RAM (#5647): neighbour
+    /// summaries plus a fixed per-entry charge, counted from what is stored.
+    /// Compare against `resident_overhead_budget_bytes` the same way
+    /// `used_bytes` is compared against `budget_bytes`.
+    pub resident_overhead_bytes: u64,
     /// Monotonic count of evictions where resident-overhead pressure was
     /// active at decision time (#5325); may overlap with
     /// `budget_evictions_total`.
@@ -2204,11 +2257,58 @@ pub struct NatStatsSnapshot {
     pub recent_successes: u32,
 }
 
+/// NAT traversal attempts needed before "every one failed" is read as a
+/// blocked port.
+///
+/// Individual hole-punch attempts fail routinely on a healthy node (the
+/// failure list on the same page labels them "normal"), so a node whose first
+/// attempt or two happened to fail used to be told, in red, "0/1 successful —
+/// Port may be blocked". Below this the counts are shown without a verdict.
+pub const NAT_MIN_ATTEMPTS_FOR_VERDICT: u32 = 5;
+
+/// How long a node may be connected only to gateways before the dashboard
+/// treats it as a reachability problem rather than a node still joining.
+///
+/// Every node is gateway-only from its first connection until its first
+/// peer-to-peer one, and with no grace the dashboard greeted every fresh start
+/// with an amber banner and "Firewall likely blocking incoming connections".
+/// The same applies to a node that loses its last peer: it gets this long to
+/// find another before being told its firewall is at fault.
+///
+/// Two minutes is a judgement, not a measurement. It is long enough that a
+/// node joining normally is not warned, and short enough that a genuinely
+/// unreachable node is told within one look at the page. Measuring the real
+/// time-to-first-peer distribution is tracked in #5770.
+pub const GATEWAY_ONLY_GRACE_SECS: u64 = 120;
+
+impl NatStatsSnapshot {
+    /// Every NAT traversal attempt has failed, over enough attempts for that
+    /// to mean something. The one place this judgement is made: the health
+    /// level, the status card, the favicon and the tab title all read it.
+    pub fn looks_blocked(&self) -> bool {
+        self.attempts >= NAT_MIN_ATTEMPTS_FOR_VERDICT && self.successes == 0
+    }
+}
+
+/// Whether a node that became gateway-only at `since` has been that way long
+/// enough, as of `now`, to warn about.
+fn gateway_only_is_persisting(since: Option<Instant>, now: Instant) -> bool {
+    since.is_some_and(|since| {
+        now.saturating_duration_since(since).as_secs() >= GATEWAY_ONLY_GRACE_SECS
+    })
+}
+
 /// Get a snapshot of the current network status for the dashboard.
 pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
+    snapshot_at(Instant::now())
+}
+
+/// [`get_snapshot`] as of `now`. Split out so a test can ask what the
+/// dashboard shows some time from now without sleeping or constructing an
+/// `Instant` in the past (which can underflow on a freshly booted machine).
+fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     let status = NETWORK_STATUS.get()?;
     let s = status.read().ok()?;
-    let now = Instant::now();
 
     let failures = s
         .gateway_failures
@@ -2231,6 +2331,16 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                         "<strong>NAT traversal failed</strong>: Could not connect to this \
                          peer. This is normal — not all NAT traversal attempts succeed."
                             .to_string()
+                    } else if !s.connected_peers.is_empty() {
+                        // Connected, but only to gateways. "Can't reach
+                        // gateway" would be false here, and one failed attempt
+                        // is not yet evidence of a blocked port.
+                        format!(
+                            "<strong>NAT traversal failed</strong>: Could not connect to \
+                             this peer. If no peer connections succeed, check that UDP \
+                             port <code>{}</code> is open in your firewall.",
+                            s.listening_port
+                        )
                     } else {
                         format!(
                             "<strong>NAT traversal failed</strong>: Can't reach gateway. \
@@ -2265,7 +2375,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                 address: p.address,
                 is_gateway: p.is_gateway,
                 location: p.location,
-                connected_secs: now.duration_since(p.connected_since).as_secs(),
+                connected_secs: now.saturating_duration_since(p.connected_since).as_secs(),
                 peer_key_location: p.peer_key_location.clone(),
                 bytes_sent: sent,
                 bytes_received: recv,
@@ -2275,6 +2385,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
 
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
+    let gateway_only_persisting =
+        gateway_only && gateway_only_is_persisting(s.gateway_only_since, now);
 
     // Read subscribed contracts from the registered provider, which in
     // production points at the canonical lease map in `HostingManager`.
@@ -2313,19 +2425,29 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         })
         .unwrap_or_default();
 
-    let elapsed_secs = s.started_at.elapsed().as_secs();
+    let elapsed_secs = now.saturating_duration_since(s.started_at).as_secs();
     let has_version_mismatch = s
         .gateway_failures
         .iter()
         .any(|f| matches!(f.reason, FailureReason::VersionMismatch { .. }));
-    let nat_all_failing = s.nat_stats.attempts > 0 && s.nat_stats.successes == 0;
+    let nat_stats = NatStatsSnapshot {
+        attempts: s.nat_stats.attempts,
+        successes: s.nat_stats.successes,
+        recent_attempts: s.nat_stats.recent_attempts(),
+        recent_successes: s.nat_stats.recent_successes(),
+    };
 
     let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
-    } else if gateway_only || nat_all_failing {
+    } else if gateway_only_persisting || nat_stats.looks_blocked() {
         HealthLevel::Degraded
+    } else if gateway_only {
+        // Connected to a gateway and nothing else yet, within the grace: the
+        // node is still joining. Not a problem, but not "connected to N
+        // peers" either, since it has no peer-to-peer connection.
+        HealthLevel::Connecting
     } else {
         HealthLevel::Healthy
     };
@@ -2359,13 +2481,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             subscribes: s.op_stats.subscribes,
             updates_received: s.op_stats.updates_received,
         },
-        nat_stats: NatStatsSnapshot {
-            attempts: s.nat_stats.attempts,
-            successes: s.nat_stats.successes,
-            recent_attempts: s.nat_stats.recent_attempts(),
-            recent_successes: s.nat_stats.recent_successes(),
-        },
-        gateway_only,
+        nat_stats,
+        gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
         health,
@@ -2825,9 +2942,14 @@ mod tests {
                 connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        // Read past the joining grace, where gateway-only counts as persisting.
+        let later = Instant::now() + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
+        let snap = snapshot_at(later).unwrap();
+        assert!(snap.gateway_only_persisting);
 
         // Not gateway-only: add a non-gateway peer
         {
@@ -2839,22 +2961,27 @@ mod tests {
                 connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(!snap.gateway_only);
+        let snap = snapshot_at(later).unwrap();
+        assert!(!snap.gateway_only_persisting);
 
         // Back to gateway-only: remove non-gateway peer
         {
             let mut s = status.write().unwrap();
             s.connected_peers.retain(|p| p.address != peer_addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        // Gateway-only again, but only just: the grace restarts.
+        assert!(!get_snapshot().unwrap().gateway_only_persisting);
+        let snap = snapshot_at(later).unwrap();
+        assert!(snap.gateway_only_persisting);
 
         // Cleanup
         {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
 
@@ -2966,6 +3093,261 @@ mod tests {
         clear_subscription_provider();
     }
 
+    /// A node that has just connected to its first gateway is joining, not
+    /// degraded. Only once that state has outlasted the grace period is it a
+    /// reachability problem.
+    #[test]
+    fn gateway_only_is_degraded_only_after_the_joining_grace() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 12345);
+        init(31346, HashSet::new(), "0.1.148".to_string());
+        {
+            let mut s = NETWORK_STATUS.get().unwrap().write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+        }
+        let just_short = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS - 1);
+        let past_grace = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
+
+        // Freshly connected to a gateway: joining, not a problem.
+        let before_join = Instant::now();
+        record_peer_connected(gw_addr, None, None);
+        let joined = Instant::now();
+        let snap = get_snapshot().unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        let snap = snapshot_at(before_join + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
+
+        // Still gateway-only past the grace period: now it is a problem.
+        let snap = snapshot_at(joined + past_grace).unwrap();
+        assert!(snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Degraded);
+
+        // Recording the gateway connection again must NOT restart the grace.
+        // This happens in production without a disconnect in between (the
+        // connection is recorded when the transport inserts it and again when
+        // it is promoted into the ring), and the anchor is when the node
+        // became gateway-only, not the age of any one connection record.
+        // Asked at exactly the grace after `joined`, which is only satisfied
+        // if the anchor is still at or before `joined`: an anchor moved to the
+        // reconnect would be a moment short.
+        record_peer_connected(gw_addr, None, None);
+        assert!(
+            snapshot_at(joined + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS))
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        // A peer-to-peer connection clears it...
+        record_peer_connected(peer_addr, None, None);
+        let snap = snapshot_at(joined + past_grace).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Healthy);
+
+        // ...and losing that peer starts a NEW grace, even though the gateway
+        // connection is by now long-lived. A node gets time to find another
+        // peer before it is told its firewall is at fault.
+        let before_loss = Instant::now();
+        record_peer_disconnected(peer_addr);
+        let lost_peer = Instant::now();
+        let snap = snapshot_at(before_loss + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        assert!(
+            snapshot_at(lost_peer + past_grace)
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        record_peer_disconnected(gw_addr);
+        assert!(
+            !snapshot_at(lost_peer + past_grace)
+                .unwrap()
+                .gateway_only_persisting,
+            "with no connections the node is not gateway-only, whatever the anchor says"
+        );
+    }
+
+    /// A real reconnect is a disconnect followed by a connect. It must not
+    /// restart the grace, or a firewalled node whose one gateway link flaps
+    /// would be "still joining" forever; but an outage longer than the grace
+    /// is a fresh start, so a node back from a long time offline is not warned
+    /// at once.
+    #[test]
+    fn gateway_only_grace_survives_a_reconnect_but_not_a_long_outage() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        init(31348, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        // Drive the state machine at chosen instants. `record_peer_*` stamp
+        // `Instant::now()`, so the list is edited directly and the refresh is
+        // called with the time under test.
+        let set_gateway_connected = |connected: bool, at: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            if connected {
+                s.connected_peers.push(ConnectedPeer {
+                    address: gw_addr,
+                    is_gateway: true,
+                    location: None,
+                    connected_since: at,
+                    peer_key_location: None,
+                });
+            }
+            s.refresh_gateway_only_since(at);
+        };
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+        }
+        let persisting = |at: Instant| snapshot_at(at).unwrap().gateway_only_persisting;
+
+        // Gateway link flaps every 50s: up at 0, down at 50, up at 60, down at
+        // 110, up at 115. No single connection lives long enough to reach the
+        // grace, but the node has had no peer since t0.
+        set_gateway_connected(true, t0);
+        set_gateway_connected(false, t0 + secs(50));
+        set_gateway_connected(true, t0 + secs(60));
+        set_gateway_connected(false, t0 + secs(110));
+        set_gateway_connected(true, t0 + secs(115));
+        assert!(!persisting(t0 + secs(GATEWAY_ONLY_GRACE_SECS - 1)));
+        assert!(
+            persisting(t0 + secs(GATEWAY_ONLY_GRACE_SECS)),
+            "a flapping gateway link must not keep restarting the grace"
+        );
+
+        // Now the node goes dark for longer than the grace, then reconnects.
+        // That is a fresh join: the grace starts over from the reconnect.
+        let down = t0 + secs(200);
+        set_gateway_connected(false, down);
+        let back = down + secs(GATEWAY_ONLY_GRACE_SECS + 30);
+        set_gateway_connected(true, back);
+        assert!(
+            !persisting(back + secs(GATEWAY_ONLY_GRACE_SECS - 1)),
+            "after a long outage the node gets the joining grace again"
+        );
+        assert!(persisting(back + secs(GATEWAY_ONLY_GRACE_SECS)));
+
+        // The outage boundary: exactly the grace counts as long, one second
+        // less does not.
+        let reset_to_gateway_only_at = |at: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            drop(s);
+            set_gateway_connected(true, at);
+        };
+        let t1 = back + secs(1_000);
+        reset_to_gateway_only_at(t1);
+        set_gateway_connected(false, t1 + secs(10));
+        set_gateway_connected(true, t1 + secs(10 + GATEWAY_ONLY_GRACE_SECS - 1));
+        assert!(
+            persisting(t1 + secs(GATEWAY_ONLY_GRACE_SECS)),
+            "an outage one second short of the grace is a reconnect, not a fresh start"
+        );
+        let t2 = t1 + secs(1_000);
+        reset_to_gateway_only_at(t2);
+        set_gateway_connected(false, t2 + secs(10));
+        let back2 = t2 + secs(10 + GATEWAY_ONLY_GRACE_SECS);
+        set_gateway_connected(true, back2);
+        assert!(
+            !persisting(back2 + secs(GATEWAY_ONLY_GRACE_SECS - 1)),
+            "an outage of exactly the grace is a fresh start"
+        );
+
+        // Gateway-only, then a peer, then nothing, then gateway-only again: the
+        // peer ended the old spell, so the new one starts at the reconnect.
+        let t3 = t2 + secs(1_000);
+        reset_to_gateway_only_at(t3);
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.push(ConnectedPeer {
+                address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 1),
+                is_gateway: false,
+                location: None,
+                connected_since: t3 + secs(20),
+                peer_key_location: None,
+            });
+            s.refresh_gateway_only_since(t3 + secs(20));
+            assert!(s.gateway_only_since.is_none());
+        }
+        set_gateway_connected(false, t3 + secs(30));
+        assert!(
+            status.read().unwrap().gateway_only_outage_since.is_none(),
+            "an outage with no gateway-only spell running has nothing to time"
+        );
+        set_gateway_connected(true, t3 + secs(40));
+        assert!(!persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS - 1)));
+        assert!(persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS)));
+
+        set_gateway_connected(false, t3 + secs(500));
+        let mut s = status.write().unwrap();
+        s.gateway_only_since = None;
+        s.gateway_only_outage_since = None;
+    }
+
+    /// Single NAT traversal attempts fail routinely, so a node is not
+    /// "degraded" until every attempt has failed over a real sample.
+    #[test]
+    fn nat_failures_degrade_health_only_over_a_real_sample() {
+        let blocked = |attempts, successes| {
+            NatStatsSnapshot {
+                attempts,
+                successes,
+                ..Default::default()
+            }
+            .looks_blocked()
+        };
+        assert!(!blocked(0, 0));
+        assert!(!blocked(1, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT - 1, 0));
+        assert!(blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT * 10, 1));
+
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 12345);
+        init(31347, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+            s.connected_peers.push(ConnectedPeer {
+                address: peer_addr,
+                is_gateway: false,
+                location: Some(0.3),
+                connected_since: Instant::now(),
+                peer_key_location: None,
+            });
+        }
+
+        record_nat_attempt(false);
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Healthy);
+
+        for _ in 1..NAT_MIN_ATTEMPTS_FOR_VERDICT {
+            record_nat_attempt(false);
+        }
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Degraded);
+
+        let mut s = status.write().unwrap();
+        s.connected_peers.clear();
+        s.nat_stats = NatStats::default();
+    }
+
     #[test]
     fn test_nat_stats() {
         let _lock = TEST_MUTEX.lock().unwrap();
@@ -3061,6 +3443,12 @@ mod tests {
         assert!(html.contains("NAT traversal failed"));
         assert!(html.contains("firewall"));
         assert!(!html.contains("This is normal"));
+        // But it must not claim the gateway is unreachable: this node is
+        // connected to one.
+        assert!(
+            !html.contains("Can't reach gateway"),
+            "a node connected to a gateway must not be told it can't reach one — got: {html}"
+        );
 
         // Cleanup
         record_peer_disconnected(gw_addr);
