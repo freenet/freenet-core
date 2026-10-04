@@ -54,7 +54,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -66,6 +66,10 @@ use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, Out
 use crate::transport::TransportPublicKey;
 use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::util::time_source::TimeSource;
+
+mod peer_records;
+use peer_records::ContractPeers;
+pub use peer_records::PeerInterest;
 
 /// Interval between interest heartbeat messages sent to each peer.
 /// Each heartbeat sends a full `Interests { hashes }` message which refreshes
@@ -786,90 +790,6 @@ impl InterestLifecycleMetrics {
     }
 }
 
-/// Tracking information for a peer's interest in a specific contract.
-#[derive(Clone, Debug)]
-pub struct PeerInterest {
-    /// The peer's current state summary. None if interested but has no state yet.
-    pub summary: Option<StateSummary<'static>>,
-
-    /// Why [`Self::summary`] is absent. Stale (and unread) whenever `summary`
-    /// is `Some` — always read it via [`Self::summary_missing_reason`], which
-    /// returns `None` in that case rather than a misleading last-clear cause.
-    summary_absence: SummaryMissingReason,
-
-    /// Diagnostic-only provenance for the current NeverPopulated epoch.
-    never_populated_origin: NeverPopulatedOrigin,
-
-    /// Start time and send-attempt count for that epoch.
-    never_populated_since: Instant,
-    never_populated_send_starts: u32,
-
-    /// When this interest entry was last refreshed.
-    /// Used for TTL-based expiration.
-    pub last_refreshed: Instant,
-
-    /// Whether this peer is our upstream in the subscription tree.
-    /// Internal routing hint, not exposed to protocol.
-    pub is_upstream: bool,
-}
-
-impl PeerInterest {
-    /// Create a new peer interest entry with the given timestamp.
-    ///
-    /// A `None` summary here is [`SummaryMissingReason::NeverPopulated`] by
-    /// construction — this is the only constructor, so an entry cannot come
-    /// into existence summaryless without carrying that tag.
-    pub fn new(summary: Option<StateSummary<'static>>, is_upstream: bool, now: Instant) -> Self {
-        Self {
-            summary,
-            summary_absence: SummaryMissingReason::NeverPopulated,
-            never_populated_origin: NeverPopulatedOrigin::New { recreated: false },
-            never_populated_since: now,
-            never_populated_send_starts: 0,
-            last_refreshed: now,
-            is_upstream,
-        }
-    }
-
-    /// Refresh the TTL timestamp with the given current time.
-    pub fn refresh(&mut self, now: Instant) {
-        self.last_refreshed = now;
-    }
-
-    /// Check if this interest has expired relative to the given current time.
-    pub fn is_expired_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_refreshed) > INTEREST_TTL
-    }
-
-    /// Why this peer has no cached summary, or `None` when one IS cached.
-    pub fn summary_missing_reason(&self) -> Option<SummaryMissingReason> {
-        self.summary.is_none().then_some(self.summary_absence)
-    }
-
-    /// Cache a summary for this peer and refresh TTL.
-    pub fn set_summary(&mut self, summary: StateSummary<'static>, now: Instant) {
-        self.summary = Some(summary);
-        self.refresh(now);
-    }
-
-    /// Drop the cached summary, recording why, and refresh TTL.
-    ///
-    /// Taking `reason` by value (rather than accepting an `Option` summary) is
-    /// deliberate: it makes an untagged clear unrepresentable, so a future
-    /// clear site cannot silently land in the `NeverPopulated` bucket and
-    /// mis-aim the next fix.
-    pub fn clear_summary(&mut self, reason: SummaryMissingReason, now: Instant) {
-        self.summary = None;
-        self.summary_absence = reason;
-        if reason == SummaryMissingReason::NeverPopulated {
-            self.never_populated_origin = NeverPopulatedOrigin::New { recreated: false };
-            self.never_populated_since = now;
-            self.never_populated_send_starts = 0;
-        }
-        self.refresh(now);
-    }
-}
-
 /// Tracks local reasons for interest in a contract.
 ///
 /// A peer can be interested for multiple reasons. We only deregister interest
@@ -1208,8 +1128,11 @@ pub(crate) struct ReconcileOutcome {
 /// `operations/subscribe.rs` for the sync point.
 pub struct InterestManager<T: TimeSource> {
     /// Track interested peers and their summaries for each contract.
-    /// Key: ContractKey, Value: Map of PeerKey -> PeerInterest
-    interested_peers: DashMap<ContractKey, HashMap<PeerKey, PeerInterest>>,
+    /// Key: ContractKey, Value: the PeerKey -> PeerInterest records, with each
+    /// distinct summary among them stored once (#5786, see [`ContractPeers`]).
+    /// Every summary write goes through a `ContractPeers` method, under this
+    /// map's shard guard, so the shared-summary table needs no lock of its own.
+    interested_peers: DashMap<ContractKey, ContractPeers>,
 
     /// Reverse index: which contracts is each peer interested in?
     /// Enables O(1) cleanup when a peer disconnects instead of O(contracts) scan.
@@ -1493,7 +1416,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(peers) = self.interested_peers.get(contract)
             && let Some(interest) = peers.get(peer)
         {
-            if let Some(summary) = interest.summary.clone() {
+            if let Some(summary) = interest.summary().cloned() {
                 return PeerSummaryForBroadcast::Known(summary);
             }
             let reason = interest.summary_missing_reason();
@@ -1510,7 +1433,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(mut peers) = self.interested_peers.get_mut(contract)
             && let Some(interest) = peers.get_mut(peer)
         {
-            if let Some(summary) = interest.summary.clone() {
+            if let Some(summary) = interest.summary().cloned() {
                 return PeerSummaryForBroadcast::Known(summary);
             }
             let reason = interest.summary_missing_reason();
@@ -1975,15 +1898,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             counters[source.index()].fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut interest = PeerInterest::new(summary, is_upstream, now);
-        if interest.summary.is_none() {
+        let mut never_populated_origin = None;
+        if summary.is_none() {
             if let Some(previous) = entry.get(&peer) {
-                if previous.summary.is_some() {
-                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteKnown;
+                if previous.summary().is_some() {
+                    never_populated_origin = Some(NeverPopulatedOrigin::OverwriteKnown);
                     self.interest_lifecycle_metrics.registration_overwrite_known[source.index()]
                         .fetch_add(1, Ordering::Relaxed);
                 } else {
-                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteMissing;
+                    never_populated_origin = Some(NeverPopulatedOrigin::OverwriteMissing);
                     self.interest_lifecycle_metrics
                         .registration_overwrite_missing[source.index()]
                     .fetch_add(1, Ordering::Relaxed);
@@ -1997,16 +1920,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .filter(|(_, removed_at)| {
                         now.saturating_duration_since(*removed_at) <= INTEREST_TTL
                     });
-                interest.never_populated_origin = NeverPopulatedOrigin::New {
+                never_populated_origin = Some(NeverPopulatedOrigin::New {
                     recreated: recreated.is_some(),
-                };
+                });
                 if let Some((cause, _)) = recreated {
                     self.interest_lifecycle_metrics.recreated_after_removal[cause.index()]
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        entry.insert(peer.clone(), interest);
+        // Replaces any existing record and releases its shared summary.
+        let interest = entry.insert(peer.clone(), summary, is_upstream, now);
+        if let Some(origin) = never_populated_origin {
+            interest.never_populated_origin = origin;
+        }
 
         // Maintain reverse index for O(1) peer disconnect cleanup
         self.peer_contracts
@@ -2120,9 +2047,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-            if let Some(interest) = entry.get_mut(peer) {
-                interest.set_summary(summary, now);
-            }
+            entry.set_summary(peer, summary, now);
         }
     }
 
@@ -2145,9 +2070,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-            if let Some(interest) = entry.get_mut(peer) {
-                interest.clear_summary(reason, now);
-            }
+            entry.clear_summary(peer, reason, now);
         }
     }
 
@@ -2196,13 +2119,13 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // `register_peer_interest`, preventing a concurrent remover from
         // leaving a zombie reverse-index entry.
         let mut entry = self.interested_peers.entry(*contract).or_default();
-        if let Some(interest) = entry.get_mut(peer) {
-            let outcome = if interest.summary.is_some() {
+        if entry.contains_key(peer) {
+            let had_summary = entry.set_summary(peer, summary, now) == Some(true);
+            let outcome = if had_summary {
                 SummaryPopulationOutcome::RefreshedKnown
             } else {
                 SummaryPopulationOutcome::FilledMissing
             };
-            interest.set_summary(summary, now);
             self.missing_summary_history
                 .lock()
                 .pop(&(*contract, peer.clone()));
@@ -2229,7 +2152,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return outcome;
         }
-        entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
+        entry.insert(peer.clone(), Some(summary), false, now);
         self.peer_contracts
             .entry(peer.clone())
             .or_default()
@@ -2366,7 +2289,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) -> Option<StateSummary<'static>> {
         self.interested_peers
             .get(contract)
-            .and_then(|entry| entry.get(peer).and_then(|i| i.summary.clone()))
+            .and_then(|entry| entry.get(peer).and_then(|i| i.summary().cloned()))
     }
 
     /// Whether we hold a cached summary for `peer` on `contract`, WITHOUT
@@ -2380,7 +2303,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     pub fn has_peer_summary(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         self.interested_peers
             .get(contract)
-            .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary.is_some()))
+            .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary().is_some()))
+    }
+
+    /// Bytes of neighbour summaries stored for `contract`, counting each
+    /// distinct summary once, read under one shard guard (#5786).
+    ///
+    /// This is the figure a per-contract memory charge for neighbour summaries
+    /// should use (#5779): identical summaries from many neighbours share one
+    /// allocation, so summing each record's summary length would overcount.
+    /// Excludes the fixed per-record overhead.
+    // Production caller lands with #5779; until then only tests read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn distinct_summary_bytes_for(&self, contract: &ContractKey) -> u64 {
+        self.interested_peers
+            .get(contract)
+            .map_or(0, |entry| entry.held_summary_bytes())
     }
 
     /// Check if enough time has elapsed to send a proactive summary notification
@@ -2881,20 +2819,23 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let mut expired = Vec::new();
 
         // Collect and sort contracts for deterministic iteration order
-        let mut contracts: Vec<_> = self
+        let mut contracts: Vec<(ContractKey, Vec<PeerKey>)> = self
             .interested_peers
             .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
+            .map(|entry| {
+                let expired_peers = entry
+                    .value()
+                    .iter()
+                    .filter(|(_, interest)| interest.is_expired_at(now))
+                    .map(|(peer, _)| peer.clone())
+                    .collect();
+                (*entry.key(), expired_peers)
+            })
             .collect();
         contracts.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-        for (contract, peers_map) in contracts {
-            // Collect and sort peers for deterministic iteration order
-            let mut peers_to_remove: Vec<PeerKey> = peers_map
-                .iter()
-                .filter(|(_, interest)| interest.is_expired_at(now))
-                .map(|(peer, _)| peer.clone())
-                .collect();
+        for (contract, mut peers_to_remove) in contracts {
+            // Sort peers for deterministic iteration order
             peers_to_remove.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
             for peer in peers_to_remove {
@@ -4376,6 +4317,289 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let manager = InterestManager::new(time_source.clone());
         (manager, time_source)
+    }
+
+    // ---- #5786: identical neighbour summaries are stored once ----
+
+    const SHARED_BYTES: [u8; 64] = [1; 64];
+    const UNIQUE_BYTES: [u8; 64] = [2; 64];
+
+    /// Distinct summaries stored for `contract` (0 when it has no records).
+    fn distinct_summaries(manager: &TestInterestManager, contract: &ContractKey) -> usize {
+        manager
+            .interested_peers
+            .get(contract)
+            .map_or(0, |entry| entry.distinct_summaries())
+    }
+
+    /// Every contract's shared-summary table matches its records exactly.
+    fn assert_summary_tables_consistent(manager: &TestInterestManager) {
+        for entry in &manager.interested_peers {
+            entry.value().assert_consistent();
+        }
+    }
+
+    /// A contract where witness `w` holds SHARED_BYTES and two other peers
+    /// hold SHARED_BYTES (`shared`) and UNIQUE_BYTES (`unique`). Removing or
+    /// clearing `shared` and `unique` while `w` stays must leave exactly one
+    /// stored summary; a path that forgets to release leaves two.
+    fn summary_sharing_fixture(
+        manager: &TestInterestManager,
+    ) -> (ContractKey, PeerKey, PeerKey, PeerKey) {
+        let contract = make_contract_key(1);
+        let (w, shared, unique) = (make_peer_key(1), make_peer_key(2), make_peer_key(3));
+        for peer in [&w, &shared] {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                peer,
+                StateSummary::from(SHARED_BYTES.to_vec())
+            ));
+        }
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(manager, &contract), 2);
+        assert_summary_tables_consistent(manager);
+        (contract, w, shared, unique)
+    }
+
+    /// After a path removed or cleared `shared` and `unique`, only the
+    /// witness's summary is stored, once.
+    fn assert_only_witness_summary_left(
+        manager: &TestInterestManager,
+        contract: &ContractKey,
+        w: &PeerKey,
+    ) {
+        assert_summary_tables_consistent(manager);
+        assert_eq!(
+            distinct_summaries(manager, contract),
+            1,
+            "a released summary is still stored"
+        );
+        assert_eq!(
+            manager.get_peer_summary(contract, w).map(|s| s.to_vec()),
+            Some(SHARED_BYTES.to_vec()),
+            "the witness must keep its summary"
+        );
+    }
+
+    #[test]
+    fn identical_neighbour_summaries_are_stored_once() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let other = make_contract_key(2);
+        let peers: Vec<PeerKey> = (0..10).map(make_peer_key).collect();
+        for peer in &peers {
+            manager.register_peer_interest(
+                &contract,
+                peer.clone(),
+                Some(StateSummary::from(vec![7u8; 1000])),
+                false,
+            );
+        }
+        // The same bytes under another contract are stored for that contract.
+        assert!(manager.upsert_peer_summary(
+            &other,
+            &peers[0],
+            StateSummary::from(vec![7u8; 1000])
+        ));
+
+        assert_eq!(distinct_summaries(&manager, &contract), 1);
+        assert_eq!(
+            manager.distinct_summary_bytes_for(&contract),
+            1000,
+            "ten identical summaries must cost one copy"
+        );
+        assert_eq!(manager.distinct_summary_bytes_for(&make_contract_key(9)), 0);
+        let entry = manager
+            .interested_peers
+            .get(&contract)
+            .expect("records exist");
+        let first = entry[&peers[0]].summary().expect("summary held");
+        for peer in &peers[1..] {
+            assert!(
+                std::ptr::eq(first, entry[peer].summary().expect("summary held")),
+                "identical summaries must share one allocation"
+            );
+        }
+        drop(entry);
+        assert_eq!(distinct_summaries(&manager, &other), 1);
+
+        // Different bytes are stored separately.
+        manager.update_peer_summary(&contract, &peers[1], StateSummary::from(vec![8u8; 10]));
+        manager.update_peer_summary(&contract, &peers[2], StateSummary::from(vec![9u8; 10]));
+        assert_eq!(distinct_summaries(&manager, &contract), 3);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peers[1])
+                .map(|s| s.to_vec()),
+            Some(vec![8u8; 10])
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    #[test]
+    fn replacing_summaries_keeps_shared_storage_exact() {
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+
+        // Replace with the same bytes, through each write path.
+        manager.update_peer_summary(
+            &contract,
+            &shared,
+            StateSummary::from(SHARED_BYTES.to_vec()),
+        );
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(&manager, &contract), 2);
+        assert_summary_tables_consistent(&manager);
+
+        // Replace with different bytes: `unique` moves onto the shared bytes,
+        // so UNIQUE_BYTES has no holder left.
+        manager.update_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(SHARED_BYTES.to_vec()),
+        );
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // And off them again via upsert.
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &shared,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(&manager, &contract), 2);
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// A second upsert on a populated record is reported and counted as
+    /// `RefreshedKnown`, with the same bytes and with different bytes.
+    #[test]
+    fn upsert_on_a_populated_record_reports_refreshed_known() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let source = SummaryPopulationSource::Unknown;
+        let count = |outcome: SummaryPopulationOutcome| {
+            manager.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .load(Ordering::Relaxed)
+        };
+        let upsert = |bytes: &[u8]| {
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                StateSummary::from(bytes.to_vec()),
+                source,
+            )
+        };
+
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::CreatedUntracked);
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 1);
+        assert_eq!(upsert(&[2; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 2);
+        assert_eq!(count(SummaryPopulationOutcome::FilledMissing), 0);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.to_vec()),
+            Some(vec![2; 8])
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    #[test]
+    fn clearing_or_reregistering_releases_the_summary() {
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.clear_peer_summary(&contract, &shared, SummaryMissingReason::ClearedByResync);
+        manager.clear_peer_summary(
+            &contract,
+            &unique,
+            SummaryMissingReason::ClearedByDeltaApplyFailure,
+        );
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // A re-registration without a summary overwrites the record and must
+        // release what it held.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.register_peer_interest(&contract, shared, None, false);
+        manager.register_peer_interest(&contract, unique, None, true);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+    }
+
+    #[test]
+    fn every_removal_path_releases_stored_summaries() {
+        // Single removal.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        assert!(manager.remove_peer_interest(&contract, &shared));
+        assert!(manager.remove_peer_interest(&contract, &unique));
+        assert_only_witness_summary_left(&manager, &contract, &w);
+        assert!(manager.remove_peer_interest(&contract, &w));
+        assert!(manager.interested_peers.is_empty());
+
+        // Peer disconnect, immediate and deferred.
+        let (manager, time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        assert_eq!(manager.remove_all_peer_interests(&shared), 1);
+        manager.schedule_deferred_removal(&unique);
+        time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD + Duration::from_secs(1));
+        assert_eq!(manager.execute_pending_removals(), 1);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // TTL expiry: only the witness was refreshed.
+        let (manager, time) = make_manager();
+        let (contract, w, _shared, _unique) = summary_sharing_fixture(&manager);
+        time.advance_time(INTEREST_TTL);
+        assert!(manager.refresh_peer_interest(&contract, &w));
+        time.advance_time(Duration::from_secs(1));
+        assert_eq!(manager.sweep_expired_interests().len(), 2);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // Eviction of an in-use contract's downstream subscribers.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.remove_evicted_in_use(&contract, &[shared, unique], 0);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+    }
+
+    /// #5782's reconcile drop removes records one at a time and can stop part
+    /// way; the records it leaves must still match the stored summaries, and
+    /// a full drop leaves nothing.
+    #[test]
+    fn reconcile_drop_releases_stored_summaries() {
+        let (manager, time) = make_manager();
+        let (contract, _w, _shared, _unique) = summary_sharing_fixture(&manager);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Report the contract as in use from the second record on, so the
+        // pass drops exactly one record and stops.
+        let checks = std::cell::Cell::new(0u32);
+        let in_use_after_first = |_: &ContractKey| {
+            checks.set(checks.get() + 1);
+            // Call 1 is the window check, call 2 the first record's check.
+            checks.get() > 2
+        };
+        let partial = manager.reconcile_with_hosting(&[], no, in_use_after_first, no);
+        assert_eq!(partial.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 2);
+        assert_summary_tables_consistent(&manager);
+
+        // A full drop on the next pass leaves no records and no summaries.
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let done = manager.reconcile_with_hosting(&[], no, no, no);
+        assert_eq!(done.records_dropped, 2);
+        assert_eq!(distinct_summaries(&manager, &contract), 0);
+        assert!(manager.interested_peers.is_empty());
     }
 
     /// A local-client refcount taken with a FULL `ContractKey` is released by an
@@ -7637,7 +7861,7 @@ mod tests {
             "upsert on an existing entry must not clobber the upstream flag"
         );
         assert_eq!(
-            interest.summary.map(|s| s.as_ref().to_vec()),
+            interest.summary().map(|s| s.as_ref().to_vec()),
             Some(vec![5u8])
         );
     }
@@ -8072,7 +8296,7 @@ mod tests {
         manager.register_peer_interest(&contract, upstream.clone(), Some(summary.clone()), true);
         let before = manager.get_peer_interest(&contract, &upstream).unwrap();
         assert!(before.is_upstream);
-        assert_eq!(before.summary.as_ref(), Some(&summary));
+        assert_eq!(before.summary(), Some(&summary));
 
         // FIXED handler path: an existing entry is refreshed, not
         // re-registered. Refresh preserves is_upstream AND the cached summary.
@@ -8084,7 +8308,7 @@ mod tests {
              still find the upstream"
         );
         assert_eq!(
-            after_refresh.summary.as_ref(),
+            after_refresh.summary(),
             Some(&summary),
             "refresh must preserve the cached delta-sync summary"
         );
@@ -8113,7 +8337,7 @@ mod tests {
              true -> false"
         );
         assert!(
-            clobbered.summary.is_none(),
+            clobbered.summary().is_none(),
             "documents the clobber: a bare register(false) wipes the cached summary"
         );
         assert!(

@@ -7276,7 +7276,7 @@ mod tests {
             "an empty-summary broadcast must still refresh the interest TTL"
         );
         assert_eq!(
-            entry.summary,
+            entry.summary().cloned(),
             Some(StateSummary::from(vec![5u8, 5])),
             "refreshing the TTL must not disturb the cached summary"
         );
