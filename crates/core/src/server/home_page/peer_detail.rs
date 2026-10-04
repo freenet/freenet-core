@@ -1170,11 +1170,8 @@ mod tests {
         );
     }
 
-    /// `fmt_contract_term`'s branches, each of which was untested. The
-    /// floor-versus-estimable clause is the one that matters: a transposition
-    /// of the two counts renders a sentence claiming the floor bound MORE
-    /// often than there were refits to bind on, and nothing would have caught
-    /// it. A round-3 testing-review item.
+    /// The discard count is a should-be-zero invariant: zero renders plainly,
+    /// anything else is flagged with the count.
     #[test]
     fn unlocated_discards_render_as_a_clean_zero_or_as_a_flagged_count() {
         assert_eq!(fmt_unlocated_discards(0), "0");
@@ -1185,6 +1182,11 @@ mod tests {
         );
     }
 
+    /// `fmt_contract_term`'s branches, each of which was untested. The
+    /// floor-versus-estimable clause is the one that matters: a transposition
+    /// of the two counts renders a sentence claiming the floor bound MORE
+    /// often than there were refits to bind on, and nothing would have caught
+    /// it. A round-3 testing-review item.
     #[test]
     fn the_contract_term_row_reports_each_regime_distinctly() {
         use arbitrary::{Arbitrary, Unstructured};
