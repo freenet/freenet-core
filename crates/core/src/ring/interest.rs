@@ -128,6 +128,10 @@ fn summary_over_bound(peers: &ContractPeers, peer: &PeerKey, summary: &StateSumm
         || peers.projected_summary_bytes(peer, summary.as_ref()) > peers.summary_cap()
 }
 
+/// One peer's summary that no other neighbour of the contract also sent:
+/// `(length, allocation address, contract)`.
+type UnsharedSummary = (u64, usize, ContractKey);
+
 /// Drop one peer's largest unshared summaries until its total is within
 /// `share_bytes` (#5781). `held` lists `(len, allocation, contract)` as
 /// collected; `clear` drops that exact allocation if the peer still holds it.
@@ -138,7 +142,7 @@ fn summary_over_bound(peers: &ContractPeers, peer: &PeerKey, summary: &StateSumm
 /// its share. Returns the summaries cleared, their bytes, and the total after.
 fn trim_peer_to_share(
     mut total: u64,
-    mut held: Vec<(u64, usize, ContractKey)>,
+    mut held: Vec<UnsharedSummary>,
     share_bytes: u64,
     mut clear: impl FnMut(&ContractKey, usize) -> bool,
 ) -> (u64, u64, u64) {
@@ -2622,7 +2626,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
 
         // 2. Per peer.
-        let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<(u64, usize, ContractKey)>)> =
+        let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<UnsharedSummary>)> =
             std::collections::HashMap::new();
         for key in &keys {
             if let Some(entry) = self.interested_peers.get(key) {
