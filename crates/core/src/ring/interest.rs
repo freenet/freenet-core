@@ -6325,9 +6325,10 @@ mod tests {
             SummaryBoundTrim::default()
         );
 
-        // Share 4,000: A holds 5,000 bytes nobody else sent (our OLD summary,
-        // now just a neighbour's), D holds only our current bytes.
-        let trim = manager.enforce_summary_bounds(4_000, all_hosted);
+        // Share 500: A holds 5,000 bytes nobody else sent (our OLD summary,
+        // now just a neighbour's), D holds only our current 1,000 bytes,
+        // which must not be charged to it.
+        let trim = manager.enforce_summary_bounds(500, all_hosted);
         assert_eq!(trim.contracts_over_cap, 1);
         assert_eq!(trim.peers_over_share, 1);
         assert_eq!(trim.summaries_cleared, 2);
@@ -6375,6 +6376,52 @@ mod tests {
             "190 - 100 = 90 is within the share: stop"
         );
         assert_eq!((cleared, bytes, total), (0, 0, 90));
+    }
+
+    /// #5781: when the cap shrinks and our own summary is the largest held,
+    /// the trim drops the largest summaries that are NOT ours.
+    #[test]
+    fn cap_trim_never_drops_our_own_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        // Our 120,000-byte summary delivered to peer 1: cap 545,536.
+        manager.upsert_peer_summary_from(
+            &contract,
+            &peer(1),
+            StateSummary::from(vec![1u8; 120_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        for i in 2..=5u32 {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                &peer(i),
+                StateSummary::from(vec![i as u8; 90_000])
+            ));
+        }
+        // Our summary becomes 130,000 bytes and peer 6 reports exactly them:
+        // cap 585,536, held 120,000 + 360,000 + 130,000 = 610,000.
+        let ours = StateSummary::from(vec![6u8; 130_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(6),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(trim.contracts_over_cap, 1);
+        assert_eq!(
+            trim.bytes_cleared, 120_000,
+            "our old bytes, now a neighbour's, go"
+        );
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer(6))
+                .map(|s| s.as_ref().len()),
+            Some(130_000),
+            "our current summary is kept although it is the largest"
+        );
     }
 
     /// #5781: one peer may hold at most its share of summary bytes that no

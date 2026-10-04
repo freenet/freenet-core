@@ -392,9 +392,13 @@ impl ContractPeers {
         self.own_len
     }
 
-    /// Record the length of this node's own summary (#5781).
+    /// Record the length of this node's own summary (#5781). Forgets which
+    /// allocation held our previous bytes: they may no longer be ours, and
+    /// [`Self::note_own_summary_held_by`] re-marks the allocation when a
+    /// record holds the current bytes.
     pub(super) fn note_own_summary_len(&mut self, len: usize) {
         self.own_len = Some(len);
+        self.own_shared = Weak::new();
     }
 
     /// Record that `peer`'s stored summary is this node's own summary bytes
