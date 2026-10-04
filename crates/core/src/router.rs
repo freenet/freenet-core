@@ -4415,6 +4415,66 @@ mod tests {
         );
     }
 
+    /// A success with a payload but a zero transfer time has no transfer
+    /// speed: `bytes / 0` is infinite. `RoutingOutcome::from_route_outcome`
+    /// drops the speed for it, so neither transfer estimator learns it, while
+    /// its response time is still learned. The transfer stage would also
+    /// refuse an infinite input (counted in `rejected`), so the test asserts
+    /// it was never offered one: with the drop removed, `rejected` goes to 1.
+    /// (Formerly pinned on the legacy stack's side by `inf_output_rejected`.)
+    #[test]
+    fn a_zero_duration_transfer_is_not_learned_as_an_infinite_speed() {
+        let _seed = GlobalRng::seed_guard(0x4485_0D17);
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let peer = PeerKeyLocation::random();
+        let contract = Location::new(0.4);
+        let timed = |payload_transfer_time: Duration| RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(80),
+                payload_size: 5_000,
+                payload_transfer_time,
+            },
+            op_type: Some(OpType::Get),
+        };
+        // Warm the transfer stage (30 samples) so it predicts.
+        for index in 0..40 {
+            router.add_event(timed(Duration::from_millis(20 + index)));
+        }
+        let before = router.hierarchical.diagnostics();
+        assert!(before[2].active, "the transfer stage must be warm");
+        let isotonic_before = router.transfer_rate_estimator.len();
+
+        router.add_event(timed(Duration::ZERO));
+
+        let after = router.hierarchical.diagnostics();
+        assert_eq!(
+            after[2].window_events, before[2].window_events,
+            "the transfer stage must not learn a speed from a zero-duration transfer"
+        );
+        assert_eq!(
+            after[2].rejected, before[2].rejected,
+            "and must not even be offered one"
+        );
+        assert_eq!(
+            after[1].window_events,
+            before[1].window_events + 1,
+            "the response time is still learned"
+        );
+        assert_eq!(router.transfer_rate_estimator.len(), isotonic_before);
+        let estimate = router.hierarchical.estimate(
+            &peer,
+            contract,
+            contract.distance(peer.location().unwrap()).as_f64(),
+            router.estimator_clock.hours(),
+        );
+        let speed = estimate.transfer_speed_bps.expect("a warm stage predicts");
+        assert!(speed.is_finite() && speed > 0.0, "speed {speed}");
+    }
+
     /// The one place routing differs from the build soaked with
     /// `FREENET_ROUTING_HIERARCHICAL=1` (#4485): a timing stage the
     /// hierarchical estimator cannot estimate yet (fewer than 30 samples) falls
