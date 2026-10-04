@@ -12162,7 +12162,7 @@ mod tests {
                         h.op_manager
                             .interest_manager
                             .get_peer_interest(&keys[0], &pk)
-                            .and_then(|i| i.summary)
+                            .and_then(|i| i.summary().cloned())
                             .map(|s| s.as_ref().to_vec()),
                         Some(theirs.clone()),
                         "{label}: a costed entry must be compared and its bytes \
@@ -12182,7 +12182,7 @@ mod tests {
                     h.op_manager
                         .interest_manager
                         .get_peer_interest(&keys[127], &pk)
-                        .and_then(|i| i.summary),
+                        .and_then(|i| i.summary().cloned()),
                     None,
                     "{label}: a free entry still carries its repair — it clears \
                      our cached belief that the peer holds state. Not charging \
