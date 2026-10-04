@@ -5768,25 +5768,16 @@ impl Ring {
         self.hosting_manager.has_recent_local_client_access(key)
     }
 
-    /// The node-wide budget for distinct neighbour-summary bytes (#5781),
-    /// enforced when a summary is written and trimmed to at each sweep, so
-    /// neighbours cannot force eviction through summaries: a quarter of the
-    /// hosting resident budget, but never more than what the rest of the
-    /// resident charge leaves free (hosted entries, every neighbour record's
-    /// fixed charge, and our own summaries), saturating at 0. The rest is
-    /// read now, so on a node whose entries already fill most of the budget
-    /// the allowance shrinks with them.
+    /// The node-wide budget for distinct neighbour-summary bytes (#5781): a
+    /// fixed quarter of the hosting resident budget, enforced when a summary
+    /// is written and trimmed to at each sweep. It does not shrink with the
+    /// rest of the resident charge: at capacity, neighbour summaries (at most
+    /// this quarter) count as hosting cost and can trigger the ordinary
+    /// demand-ordered eviction of the lowest-ranked contracts, rather than
+    /// being wiped to make room.
     fn neighbour_summary_budget(&self) -> u64 {
-        let resident = self.hosting_manager.resident_overhead_budget_bytes();
-        let entries = (self.hosting_manager.hosting_contracts_count() as u64)
-            .saturating_mul(crate::ring::hosting::HOSTED_ENTRY_BYTES);
-        let records_and_own = self.upgrade_op_manager().map_or(0, |op| {
-            op.interest_manager
-                .total_resident_bytes()
-                .saturating_sub(op.interest_manager.neighbour_summary_bytes())
-        });
-        (resident / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR)
-            .min(resident.saturating_sub(entries.saturating_add(records_and_own)))
+        self.hosting_manager.resident_overhead_budget_bytes()
+            / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
     }
 
     /// Sweep for expired entries in the hosting cache.
@@ -10053,22 +10044,24 @@ mod cost_pressure_seam_tests {
         assert_eq!(im.neighbour_summary_budget(), 16 * MIB);
     }
 
-    /// #5781: on a node whose hosted entries already take ~90% of the
-    /// resident budget, the summary allowance shrinks to what is left, so
-    /// colluding neighbours flooding summaries still cannot push it over
-    /// budget or cause an eviction.
+    /// #5781: on a node at capacity the summary budget stays a quarter of the
+    /// resident budget and the sweep keeps the neighbours' summaries; it does
+    /// not wipe them to clear the breach. Relieving the breach is left to the
+    /// ordinary demand-ordered eviction once it has lasted the sustained
+    /// window (covered by the hosting-cache eviction tests; this sweep runs
+    /// before that window, so nothing is evicted yet).
     #[tokio::test]
-    async fn summaries_cannot_push_a_nearly_full_node_over_budget() {
+    async fn a_node_at_capacity_keeps_its_neighbour_summaries() {
         use freenet_stdlib::prelude::StateSummary;
         const MIB: u64 = 1024 * 1024;
-        let op_manager = attached_op_manager("summary-full-node-5781").await;
+        let op_manager = attached_op_manager("summary-at-capacity-5781").await;
         let hosting = &op_manager.ring.hosting_manager;
         let im = &op_manager.interest_manager;
         hosting.configure_resident_overhead_mem_share(0.125);
         let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
         assert_eq!(budget, 64 * MIB);
-        // 90% of the budget in hosted entries.
-        let hosted = (budget * 9 / 10 / crate::ring::hosting::HOSTED_ENTRY_BYTES) as u32;
+        // Entries alone exceed the budget.
+        let hosted = (budget / crate::ring::hosting::HOSTED_ENTRY_BYTES) as u32 + 100;
         for i in 0..hosted {
             hosting.record_contract_access(
                 wiring_key(i),
@@ -10077,36 +10070,30 @@ mod cost_pressure_seam_tests {
                 crate::ring::hosting::HostingCause::Other,
             );
         }
-        let _ = op_manager.ring.sweep_expired_hosting();
-        let allowance = im.neighbour_summary_budget();
-        assert!(
-            allowance < budget / 4,
-            "allowance {allowance} must shrink below a quarter"
-        );
-
-        let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
-        let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
-        for i in 0..200u32 {
+        for i in 0..50u32 {
             let key = wiring_key(i);
             im.register_local_hosting(&key);
-            for (n, peer) in colluders.iter().enumerate() {
-                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
-                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
-            }
+            assert!(im.upsert_peer_summary(
+                &key,
+                &wiring_peer(),
+                StateSummary::from(vec![i as u8; 10_000])
+            ));
         }
-        assert!(im.neighbour_summary_bytes() > 0);
+        let held = im.neighbour_summary_bytes();
+        assert_eq!(held, 50 * 10_000);
 
         let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(
+            im.neighbour_summary_budget(),
+            budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR,
+            "the summary budget does not collapse at capacity"
+        );
+        assert_eq!(im.neighbour_summary_bytes(), held, "no summary was trimmed");
+        assert_eq!(im.summary_bound_trim_totals(), (0, 0));
         let stats = hosting.hosting_cache_stats();
         assert!(
-            stats.resident_overhead_bytes <= budget,
-            "summaries pushed a nearly full node to {} bytes against {budget}",
-            stats.resident_overhead_bytes
-        );
-        assert_eq!(
-            stats.contract_count,
-            u64::from(hosted),
-            "nothing was evicted"
+            stats.resident_overhead_bytes > budget,
+            "the node is over budget"
         );
         assert_eq!(stats.resident_overhead_evictions_total, 0);
     }

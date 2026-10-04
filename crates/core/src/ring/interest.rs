@@ -2664,12 +2664,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///    holding the same bytes (rounded up). A peer charged more than
     ///    `share_bytes` has its largest charges dropped. Peers sending the
     ///    same bytes together split the charge but do not escape it.
-    /// 3. **Node-wide:** while the node-wide neighbour-summary bytes exceed
-    ///    the budget (writes can overshoot it: concurrent writers, an old own
-    ///    summary moving into the counted set, a budget that shrank), the
-    ///    largest counted summaries of any contract are dropped, never our
-    ///    own, in a fixed order (size, contract key, bytes). So the budget is
-    ///    a ceiling again within one sweep.
+    /// 3. **Node-wide:** while the counted neighbour-summary bytes of the
+    ///    hosted contracts exceed the budget (writes can overshoot it:
+    ///    concurrent writers, an old own summary moving into the counted set,
+    ///    a budget that shrank), the largest counted summaries of hosted
+    ///    contracts are dropped, never our own, in a fixed order (size,
+    ///    contract key, bytes). So what the hosting cache charges for
+    ///    neighbour summaries is within the budget again after every sweep.
+    ///    The write-time check is stricter: it counts every contract,
+    ///    including non-hosted ones until #5782's reconciliation drops them.
     ///
     /// Records stay in every case; the cost to the peer is full-state sends
     /// for those contracts until it reports a summary that fits. Contracts
@@ -2750,13 +2753,19 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                  largest summaries (#5781)"
             );
         }
-        // 3. Node-wide.
+        // 3. Node-wide, over hosted contracts: what the hosting cache charges.
         let budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
-        if self.neighbour_summary_bytes() > budget {
+        let mut hosted_counted: u64 = keys
+            .iter()
+            .filter_map(|key| self.interested_peers.get(key).map(|e| e.counted_bytes()))
+            .sum();
+        if hosted_counted > budget {
             let mut counted: Vec<(ContractKey, std::sync::Arc<StateSummary<'static>>)> = Vec::new();
-            for entry in self.interested_peers.iter() {
-                for summary in entry.value().counted_summaries() {
-                    counted.push((*entry.key(), summary));
+            for key in &keys {
+                if let Some(entry) = self.interested_peers.get(key) {
+                    for summary in entry.counted_summaries() {
+                        counted.push((*key, summary));
+                    }
                 }
             }
             counted.sort_by(|(ka, a), (kb, b)| {
@@ -2767,11 +2776,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .then_with(|| a.cmp(b))
             });
             for (key, victim) in counted {
-                if self.neighbour_summary_bytes() <= budget {
+                if hosted_counted <= budget {
                     break;
                 }
                 if let Some(mut entry) = self.interested_peers.get_mut(&key) {
+                    let before = entry.counted_bytes();
                     let cleared = entry.clear_allocation(&victim, now);
+                    hosted_counted =
+                        hosted_counted.saturating_sub(before.saturating_sub(entry.counted_bytes()));
                     if cleared > 0 {
                         trim.node_budget_drops += 1;
                         trim.summaries_cleared += cleared;
@@ -6856,6 +6868,32 @@ mod tests {
         assert_eq!(manager.neighbour_summary_bytes(), 0);
         assert!(manager.get_peer_summary(&c(1), &peer(1)).is_some());
         assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: the node-wide trim covers hosted contracts only, matching what
+    /// the hosting cache charges: a non-hosted contract's summaries are left
+    /// to #5782's reconciliation, and do not make the trim drop hosted ones.
+    #[test]
+    fn node_wide_trim_walks_hosted_contracts_only() {
+        let (manager, _time) = make_manager();
+        let hosted = make_contract_key(1);
+        let not_hosted = make_contract_key(2);
+        let peer = make_unique_peer_key;
+        assert!(manager.upsert_peer_summary(
+            &hosted,
+            &peer(1),
+            StateSummary::from(vec![1u8; 30_000])
+        ));
+        assert!(manager.upsert_peer_summary(
+            &not_hosted,
+            &peer(2),
+            StateSummary::from(vec![2u8; 60_000])
+        ));
+        manager.set_neighbour_summary_budget(40_000);
+        let trim = manager.enforce_summary_bounds(u64::MAX, |k| *k == hosted);
+        assert_eq!(trim, SummaryBoundTrim::default());
+        assert!(manager.get_peer_summary(&hosted, &peer(1)).is_some());
+        assert!(manager.get_peer_summary(&not_hosted, &peer(2)).is_some());
     }
 
     /// #5781: when our summary changes, the bytes that were ours become a

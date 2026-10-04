@@ -38,8 +38,8 @@ pub(crate) mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
-/// Fixed per-entry resident charge (#5647); `Ring` reads it to size the
-/// node-wide neighbour-summary budget.
+/// Fixed per-entry resident charge; re-exported for the `Ring` wiring tests (#5647).
+#[cfg(test)]
 pub(crate) use cache::HOSTED_ENTRY_BYTES;
 /// Hosting-BEGIN attribution (#5090-family observability): WHY a peer started
 /// hosting a contract. Re-exported so the operation drivers — the only code that

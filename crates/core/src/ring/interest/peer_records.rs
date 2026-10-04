@@ -209,6 +209,11 @@ impl ContractPeers {
         peers
     }
 
+    /// This contract's current contribution to the node-wide counter.
+    pub(super) fn counted_bytes(&self) -> u64 {
+        self.counted
+    }
+
     /// Distinct summary bytes other than our own summary's allocation.
     pub(super) fn neighbour_bytes(&self) -> u64 {
         self.summaries
@@ -482,6 +487,10 @@ impl ContractPeers {
         victim: &Arc<StateSummary<'static>>,
         now: Instant,
     ) -> u64 {
+        // Never our own summary, even if it became ours after collection.
+        if self.is_own(victim) {
+            return 0;
+        }
         let mut holders: Vec<PeerKey> = self
             .peers
             .iter()
