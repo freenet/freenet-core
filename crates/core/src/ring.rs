@@ -2107,14 +2107,20 @@ impl Ring {
             snapshot.hosting_resident_overhead_bytes = Some(hosting.resident_overhead_bytes);
             snapshot.hosting_resident_overhead_evictions_total =
                 Some(hosting.resident_overhead_evictions_total);
-            snapshot.hosting_resident_overhead_evicted_bytes_total =
-                Some(hosting.resident_overhead_evicted_bytes_total);
+            snapshot.hosting_resident_overhead_evicted_charged_bytes_total =
+                Some(hosting.resident_overhead_evicted_charged_bytes_total);
             // All neighbour-record bytes, hosted or not (#5647): compared with
             // the hosted part of `hosting_resident_overhead_bytes`, the excess
             // is what #5782's reconciliation has not yet freed.
             snapshot.interest_resident_bytes_total = ring
                 .upgrade_op_manager()
                 .map(|op| op.interest_manager.total_resident_bytes());
+            // Per-peer summary share trims (#5781).
+            if let Some(op) = ring.upgrade_op_manager() {
+                let (trims, bytes) = op.interest_manager.summary_share_trim_totals();
+                snapshot.interest_summary_share_trims_total = Some(trims);
+                snapshot.interest_summary_share_trimmed_bytes_total = Some(bytes);
+            }
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -5770,6 +5776,20 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
+        // Per-peer summary share (#5781), BEFORE the hosting sweep re-reads the
+        // interest bytes it charges: no single neighbour may make this node
+        // hold more than 1/PEER_SUMMARY_SHARE_DIVISOR of the hosting budget in
+        // summaries only it sent, so one peer cannot push the resident axis
+        // over budget and get other contracts evicted. Running it here, rather
+        // than on the interest manager's own timer, means the cache never
+        // charges a peer's excess.
+        if let Some(op_manager) = self.upgrade_op_manager() {
+            let share = self.hosting_manager.resident_overhead_budget_bytes()
+                / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR;
+            op_manager
+                .interest_manager
+                .enforce_peer_summary_share(share);
+        }
         // Cost-aware eviction (#4861): feed the sweep the node's attributed
         // update-work cost so a zero-subscriber contract dominating CPU /
         // broadcast capacity is shed even while UNDER the byte budget (the
@@ -10615,7 +10635,7 @@ mod hosting_stats_mirror_source_tests {
     /// Adding a field means bumping this deliberately AND mirroring the field.
     // 19 since #5647: `contract_slot_budget` was removed (no per-contract
     // constant to divide by), the estimated field was renamed
-    // `resident_overhead_bytes`, and `resident_overhead_evicted_bytes_total`
+    // `resident_overhead_bytes`, and `resident_overhead_evicted_charged_bytes_total`
     // was added.
     const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
 

@@ -724,6 +724,18 @@ pub(crate) struct HostingManager {
     resident_overhead_mem_share_bits: AtomicU64,
 }
 
+/// Largest `--hosting-mem-share` that does not draw a startup warning (#5647).
+/// The other declared caches already take about a quarter of the memory limit
+/// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`), and the
+/// runtime needs about a tenth, so a share above one half leaves the node
+/// little headroom.
+pub(crate) const MAX_ADVISED_MEM_SHARE: f64 = 0.5;
+
+/// Whether a configured `--hosting-mem-share` is high enough to warn about.
+pub(crate) fn mem_share_leaves_little_for_the_rest(mem_share: f64) -> bool {
+    mem_share > MAX_ADVISED_MEM_SHARE
+}
+
 impl HostingManager {
     /// Construct a `HostingManager` on the production wall-clock time source
     /// ([`InstantTimeSrc`]). Equivalent to
@@ -912,6 +924,18 @@ impl HostingManager {
     /// startup (the config is only reachable there). If never called, the
     /// default set in the ctor applies.
     pub(crate) fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        if mem_share_leaves_little_for_the_rest(mem_share) {
+            // Before #5647 this share applied to spare memory; it now applies to
+            // the whole memory limit, so a value persisted from then can hand
+            // hosting most of the node's memory.
+            tracing::warn!(
+                hosting_mem_share = mem_share,
+                "--hosting-mem-share is above {MAX_ADVISED_MEM_SHARE}: hosted contracts may \
+                 hold more than half of this node's memory limit, leaving little for the \
+                 caches, WASM runtime and connections; the default is {}",
+                cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
+            );
+        }
         self.resident_overhead_mem_share_bits
             .store(mem_share.to_bits(), Ordering::Relaxed);
     }
@@ -2733,8 +2757,8 @@ impl HostingManager {
         self.hosting_cache.read().budget_bytes()
     }
 
-    /// Get the installed resident-overhead budget (#5333, #5647).
-    #[cfg(test)]
+    /// Get the installed resident-overhead budget (#5333, #5647). Also sizes
+    /// the per-peer summary share (`Ring::sweep_expired_hosting`, #5781).
     pub(crate) fn resident_overhead_budget_bytes(&self) -> u64 {
         self.hosting_cache.read().resident_overhead_budget_bytes()
     }

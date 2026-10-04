@@ -462,13 +462,13 @@ pub(crate) struct HostingCacheStats {
     /// [`HostingCache::resident_overhead_evictions_total`] for the exact
     /// semantics (may overlap with [`Self::budget_evictions_total`]).
     pub resident_overhead_evictions_total: u64,
-    /// Monotonic sum of the resident bytes charged to contracts at the moment
-    /// resident-overhead pressure evicted them (#5647). Differenced across the
-    /// snapshot cadence it is the memory this axis released by evicting. The
-    /// neighbour-record part is actually freed later, when #5782's
-    /// reconciliation drops the records of a contract that is neither hosted
-    /// nor in use.
-    pub resident_overhead_evicted_bytes_total: u64,
+    /// Monotonic sum of the resident bytes CHARGED to contracts at the moment
+    /// resident-overhead pressure evicted them (#5647): what the accounting
+    /// stopped counting, not a measurement of memory released. The
+    /// neighbour-record part is freed later, when #5782's reconciliation drops
+    /// the records of a contract that is neither hosted nor in use, and bytes
+    /// that arrived since the last sweep were never charged.
+    pub resident_overhead_evicted_charged_bytes_total: u64,
     /// Monotonic eviction victims by reason × state-size bucket. Reason order:
     /// byte-budget zero-demand, byte-budget in-use, cost pressure.
     pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
@@ -1143,8 +1143,8 @@ pub struct HostingCache<T: TimeSource> {
     /// Monotonic sum of the resident bytes charged to contracts evicted while
     /// resident-overhead pressure was active (#5647): [`HOSTED_ENTRY_BYTES`]
     /// plus the entry's charged interest bytes, per victim. See
-    /// [`HostingCacheStats::resident_overhead_evicted_bytes_total`].
-    resident_overhead_evicted_bytes_total: u64,
+    /// [`HostingCacheStats::resident_overhead_evicted_charged_bytes_total`].
+    resident_overhead_evicted_charged_bytes_total: u64,
     /// Wall-clock timestamp of when the resident-overhead bytes FIRST
     /// crossed [`Self::resident_overhead_budget_bytes`], continuously (#5325
     /// PR review, Must-Fix #1). `None` whenever the raw reading is at or
@@ -1423,7 +1423,7 @@ impl<T: TimeSource> HostingCache<T> {
             interest_bytes_total: 0,
             interest_bytes_provider: None,
             resident_overhead_evictions_total: 0,
-            resident_overhead_evicted_bytes_total: 0,
+            resident_overhead_evicted_charged_bytes_total: 0,
             resident_overhead_breach_since: None,
             eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
@@ -1642,8 +1642,8 @@ impl<T: TimeSource> HostingCache<T> {
                 if resident_pressure_active {
                     self.resident_overhead_evictions_total =
                         self.resident_overhead_evictions_total.saturating_add(1);
-                    self.resident_overhead_evicted_bytes_total = self
-                        .resident_overhead_evicted_bytes_total
+                    self.resident_overhead_evicted_charged_bytes_total = self
+                        .resident_overhead_evicted_charged_bytes_total
                         .saturating_add(HOSTED_ENTRY_BYTES.saturating_add(entry.interest_bytes));
                     // Per-eviction observability for the resident-overhead axis
                     // specifically (#5325 PR review — Ian's soak-test concern):
@@ -2428,7 +2428,8 @@ impl<T: TimeSource> HostingCache<T> {
             resident_overhead_budget_bytes: self.resident_overhead_budget_bytes,
             resident_overhead_bytes: self.resident_overhead_bytes(),
             resident_overhead_evictions_total: self.resident_overhead_evictions_total,
-            resident_overhead_evicted_bytes_total: self.resident_overhead_evicted_bytes_total,
+            resident_overhead_evicted_charged_bytes_total: self
+                .resident_overhead_evicted_charged_bytes_total,
         }
     }
 
@@ -4794,7 +4795,7 @@ mod tests {
         assert_eq!(stats.budget_evictions_total, 3);
         assert_eq!(stats.resident_overhead_evictions_total, 3);
         assert_eq!(
-            stats.resident_overhead_evicted_bytes_total,
+            stats.resident_overhead_evicted_charged_bytes_total,
             3 * (1024 * 1024 + HOSTED_ENTRY_BYTES),
             "the freed-bytes counter records what was charged to each victim"
         );
@@ -4830,7 +4831,7 @@ mod tests {
             HOSTED_ENTRY_BYTES + per_contract
         );
         assert_eq!(
-            stats.resident_overhead_evicted_bytes_total, 0,
+            stats.resident_overhead_evicted_charged_bytes_total, 0,
             "a cost eviction is not a resident-overhead eviction"
         );
     }

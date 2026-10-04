@@ -621,12 +621,19 @@ pub(crate) struct RouterSnapshotInfo {
     /// collector differences to get this axis's eviction rate; it may overlap
     /// with `hosting_budget_evictions_total`. `None` until the ring is built.
     ///
-    /// `hosting_resident_overhead_evicted_bytes_total` is a monotonic sum of the
-    /// bytes charged to each contract this axis evicted, at the moment it was
-    /// evicted; differenced, it is the memory the axis released (#5647). The
-    /// neighbour-record part is freed a few minutes later, when #5782's
-    /// reconciliation drops the records of a contract that is neither hosted
-    /// nor in use.
+    /// `hosting_resident_overhead_evicted_charged_bytes_total` is a monotonic
+    /// sum of the bytes CHARGED to each contract this axis evicted, as of the
+    /// sweep before its eviction (#5647). It is what the accounting stopped
+    /// counting, not a measurement of memory released: the neighbour-record
+    /// part is freed a few minutes later, when #5782's reconciliation drops
+    /// the records of a contract that is neither hosted nor in use, and a
+    /// summary that arrived since the last sweep was never charged.
+    ///
+    /// `interest_summary_share_trims_total` and
+    /// `interest_summary_share_trimmed_bytes_total` count the neighbour
+    /// summaries (and their bytes) dropped because one peer held more than its
+    /// share of summary bytes only it had sent (#5781). Nonzero means a
+    /// neighbour is sending far more summary data than its peers.
     ///
     /// `interest_resident_bytes_total` is the bytes held for neighbour interest
     /// records across EVERY contract, hosted or not, counted the same way as
@@ -642,8 +649,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_resident_overhead_budget_bytes: Option<u64>,
     pub hosting_resident_overhead_bytes: Option<u64>,
     pub hosting_resident_overhead_evictions_total: Option<u64>,
-    pub hosting_resident_overhead_evicted_bytes_total: Option<u64>,
+    pub hosting_resident_overhead_evicted_charged_bytes_total: Option<u64>,
     pub interest_resident_bytes_total: Option<u64>,
+    pub interest_summary_share_trims_total: Option<u64>,
+    pub interest_summary_share_trimmed_bytes_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -3618,8 +3627,10 @@ impl Router {
             hosting_resident_overhead_budget_bytes: None,
             hosting_resident_overhead_bytes: None,
             hosting_resident_overhead_evictions_total: None,
-            hosting_resident_overhead_evicted_bytes_total: None,
+            hosting_resident_overhead_evicted_charged_bytes_total: None,
             interest_resident_bytes_total: None,
+            interest_summary_share_trims_total: None,
+            interest_summary_share_trimmed_bytes_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,

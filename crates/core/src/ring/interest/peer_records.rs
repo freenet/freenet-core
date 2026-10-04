@@ -339,6 +339,30 @@ impl ContractPeers {
         true
     }
 
+    /// The records whose summary no other record of this contract holds, with
+    /// the summary's length (#5781): the summary bytes each peer alone makes
+    /// the node keep for this contract.
+    ///
+    /// Identical bytes always share one allocation (the table's invariant,
+    /// checked by [`Self::assert_consistent`]), so counting records per
+    /// allocation gives each summary's holder count without hashing bytes.
+    pub(super) fn sole_held_summaries(&self) -> Vec<(PeerKey, u64)> {
+        let mut holders: HashMap<*const StateSummary<'static>, usize> = HashMap::new();
+        for record in self.peers.values() {
+            if let Some(shared) = &record.summary {
+                *holders.entry(Arc::as_ptr(shared)).or_default() += 1;
+            }
+        }
+        self.peers
+            .iter()
+            .filter_map(|(peer, record)| {
+                let shared = record.summary.as_ref()?;
+                (holders.get(&Arc::as_ptr(shared)) == Some(&1))
+                    .then(|| (peer.clone(), shared.as_ref().as_ref().len() as u64))
+            })
+            .collect()
+    }
+
     /// Number of distinct summaries stored for this contract.
     #[cfg(test)]
     pub(super) fn distinct_summaries(&self) -> usize {

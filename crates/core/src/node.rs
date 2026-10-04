@@ -4568,13 +4568,19 @@ async fn handle_interest_sync_message(
                         // production and sim-only converged skips, both fixed in
                         // #5055). Pinned by
                         // `summaries_arm_writes_summary_outside_staleness_branch_pin`.
+                        //
+                        // Bounded against OUR summary of the same contract
+                        // when we have it (#5647, #5781): a peer's summary far
+                        // larger than ours is not stored, because its bytes are
+                        // charged to the hosting budget.
                         match their_summary {
                             Some(theirs) => {
-                                op_manager.interest_manager.upsert_peer_summary_from(
+                                op_manager.interest_manager.upsert_peer_summary_bounded(
                                     &contract,
                                     &pk,
                                     theirs,
                                     crate::ring::interest::SummaryPopulationSource::InterestSummary,
+                                    our_summary.as_ref().map(|ours| ours.as_ref().len()),
                                 );
                             }
                             None => op_manager.interest_manager.clear_peer_summary(
@@ -6456,7 +6462,7 @@ mod tests {
                 .expect("end of handler region not found");
         let body: String = src[handler_start..handler_end].split_whitespace().collect();
         assert!(
-            body.contains("upsert_peer_summary_from(&contract,&pk,theirs,"),
+            body.contains("upsert_peer_summary_bounded(&contract,&pk,theirs,"),
             "Summaries arm must upsert a Some(summary) report (seeds untracked \
              co-hosts, #4952)"
         );
@@ -6683,7 +6689,7 @@ mod tests {
 
         // Both writes must be present — they are the only thing refreshing the
         // TTL on this path.
-        let upsert_at = summaries_arm.find("upsert_peer_summary_from(").expect(
+        let upsert_at = summaries_arm.find("upsert_peer_summary_bounded(").expect(
             "the Summaries arm must cache the peer's reported summary via \
              upsert_peer_summary — that write is also what refreshes the peer's \
              interest TTL here (#4952, #3046)",
@@ -6719,7 +6725,8 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            !stripped.contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary_from("),
+            !stripped
+                .contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary_bounded("),
             "the summary write must not be gated on is_stale — see above"
         );
     }

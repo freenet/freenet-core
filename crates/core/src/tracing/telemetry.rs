@@ -3045,12 +3045,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.hosting_resident_overhead_evictions_total),
                 );
                 obj.insert(
-                    "hosting_resident_overhead_evicted_bytes_total".to_string(),
-                    serde_json::json!(snapshot.hosting_resident_overhead_evicted_bytes_total),
+                    "hosting_resident_overhead_evicted_charged_bytes_total".to_string(),
+                    serde_json::json!(
+                        snapshot.hosting_resident_overhead_evicted_charged_bytes_total
+                    ),
                 );
                 obj.insert(
                     "interest_resident_bytes_total".to_string(),
                     serde_json::json!(snapshot.interest_resident_bytes_total),
+                );
+                obj.insert(
+                    "interest_summary_share_trims_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_share_trims_total),
+                );
+                obj.insert(
+                    "interest_summary_share_trimmed_bytes_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_share_trimmed_bytes_total),
                 );
                 // Demand-ordered eviction gauges (#4642 A3). Same
                 // hand-mirrored footgun as the A2 gauges above: a new
@@ -3690,7 +3700,7 @@ mod tests {
             reg_new_m: [value; 7],
             reg_cap: [value; 7],
             removed: [value; crate::ring::interest::InterestRemovalCause::COUNT],
-            current: [value; 5],
+            current: [value; crate::ring::interest::SummaryMissingReason::COUNT + 1],
             recreated: [value; crate::ring::interest::InterestRemovalCause::COUNT],
             populated: [[value; crate::ring::interest::SummaryPopulationOutcome::COUNT]; 6],
             corr_ovf: [value; 2],
@@ -3926,15 +3936,19 @@ mod tests {
         info.hosting_resident_overhead_budget_bytes = Some(277);
         info.hosting_resident_overhead_bytes = Some(281);
         info.hosting_resident_overhead_evictions_total = Some(293);
-        info.hosting_resident_overhead_evicted_bytes_total = Some(307);
+        info.hosting_resident_overhead_evicted_charged_bytes_total = Some(307);
         info.interest_resident_bytes_total = Some(311);
+        info.interest_summary_share_trims_total = Some(313);
+        info.interest_summary_share_trimmed_bytes_total = Some(317);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_resident_overhead_budget_bytes", 277),
             ("hosting_resident_overhead_bytes", 281),
             ("hosting_resident_overhead_evictions_total", 293),
-            ("hosting_resident_overhead_evicted_bytes_total", 307),
+            ("hosting_resident_overhead_evicted_charged_bytes_total", 307),
             ("interest_resident_bytes_total", 311),
+            ("interest_summary_share_trims_total", 313),
+            ("interest_summary_share_trimmed_bytes_total", 317),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
