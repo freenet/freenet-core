@@ -183,7 +183,7 @@ pub(crate) type InterestBytesProvider = std::sync::Arc<dyn Fn(&ContractKey) -> u
 // actually holds to keep each hosted contract current: every neighbour summary
 // the interest manager stores for it (`InterestManager::resident_bytes_for`,
 // read through the provider installed by `HostingManager`) plus a fixed,
-// type-derived charge per hosted entry ([`HOSTED_ENTRY_BYTES`]). A neighbour's
+// measured charge per hosted entry ([`HOSTED_ENTRY_BYTES`]). A neighbour's
 // summary is part of the cost of hosting: a host needs it to send that
 // neighbour the right update, so when these bytes exceed the budget the
 // response is to stop hosting whole contracts, never to trim a hosted
@@ -203,15 +203,24 @@ pub(crate) type InterestBytesProvider = std::sync::Arc<dyn Fn(&ContractKey) -> u
 // demand-ordered decision). The same `victim_order` (subscriber-primary, then
 // GET/PUT recency) picks the victim whichever axis triggered the sweep.
 
-/// Fixed bytes charged per hosted contract for the hosting cache's own entry,
-/// on top of the summary bytes the interest manager reports for it.
+/// Fixed bytes charged per hosted contract, on top of the summary bytes the
+/// interest manager reports for it: 8 KiB, measured.
 ///
-/// Derived from the stored types (the `HostedContract` value, its
-/// `ContractKey` map key, and one hash-table control word), so it is a small,
-/// exact floor rather than an estimate of anything else.
-pub(crate) const HOSTED_ENTRY_BYTES: u64 = (std::mem::size_of::<HostedContract>()
-    + std::mem::size_of::<ContractKey>()
-    + std::mem::size_of::<u64>()) as u64;
+/// A hosted contract holds fixed-size entries in about a dozen per-contract
+/// maps besides this cache's own (interest bookkeeping, governance scores,
+/// disk-usage tracking, state generation, propagation stats, delta
+/// compatibility, neighbour hosting). A jemalloc heap profile of a user peer
+/// hosting 508 contracts (#5647, 2026-10-01) put the heap that grows with the
+/// hosted count at about 10 KB per contract, of which about 4 KB was neighbour
+/// summaries (charged separately) and about 6 KB everything else. The same
+/// profile showed jemalloc resident at 1.22 times allocated bytes, so the
+/// fixed part is about 7.3 KB resident, rounded up to 8 KiB.
+///
+/// This charge is what bounds the number of hosted contracts whose state and
+/// summaries are tiny: at the default share of a 2 GiB limit (256 MiB) it
+/// allows 32,768 such contracts, where the pre-#5647 flat 1 MiB estimate
+/// allowed 508.
+pub(crate) const HOSTED_ENTRY_BYTES: u64 = 8 * 1024;
 
 /// Lower clamp for the resident-overhead budget (64 MiB), equal to the
 /// contract module cache's floor (`wasm_runtime::MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES`)
@@ -261,14 +270,14 @@ pub(crate) fn resident_overhead_budget_for(total_ram: u64, mem_share: f64) -> u6
 ///
 /// Set equal to [`COST_RATE_MIN_WINDOW`] (the #4861 cost-pressure precedent
 /// this mirrors) for a first cut, but declared as its OWN constant rather
-/// than a reference to that one: the two gate conceptually different things
-/// (a per-contract sampled RATE vs. a per-node exact contract COUNT) and
-/// tuning one should not silently retune the other. 300s / 150s-to-arm is
-/// long enough that the 5s periodic sweep (`CLEANUP_INTERVAL`,
-/// `node/op_state_manager.rs`) observes the breach ~30 times before it can
-/// arm, so a single stale/racy read can't trigger it, and short enough that
-/// a genuinely persistent post-upgrade overage still gets addressed within
-/// a few minutes rather than never.
+/// than a reference to that one: the two gate different quantities (a
+/// per-contract rate vs. a per-node byte total) and tuning one should not
+/// silently retune the other. The byte total is re-read from the interest
+/// manager on every 60s hosting sweep (see
+/// [`HostingCache::refresh_interest_bytes`]), so a breach must be seen on at
+/// least three consecutive sweeps before it arms: a burst of incoming
+/// summaries that is gone by the next sweep cannot trigger eviction, and a
+/// persistent overage is still addressed within a few minutes.
 pub(crate) const RESIDENT_OVERHEAD_SUSTAINED_WINDOW: Duration = Duration::from_secs(300);
 
 /// Default fraction of the disk capacity *available to Freenet* used to size the
@@ -453,6 +462,13 @@ pub(crate) struct HostingCacheStats {
     /// [`HostingCache::resident_overhead_evictions_total`] for the exact
     /// semantics (may overlap with [`Self::budget_evictions_total`]).
     pub resident_overhead_evictions_total: u64,
+    /// Monotonic sum of the resident bytes charged to contracts at the moment
+    /// resident-overhead pressure evicted them (#5647). Differenced across the
+    /// snapshot cadence it is the memory this axis released by evicting. The
+    /// neighbour-record part is actually freed later, when #5782's
+    /// reconciliation drops the records of a contract that is neither hosted
+    /// nor in use.
+    pub resident_overhead_evicted_bytes_total: u64,
     /// Monotonic eviction victims by reason × state-size bucket. Reason order:
     /// byte-budget zero-demand, byte-budget in-use, cost pressure.
     pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
@@ -1052,8 +1068,8 @@ pub struct HostingCache<T: TimeSource> {
     eviction_floor: f64,
     /// Monotonic count of contracts evicted because the cache was over
     /// budget on EITHER axis: the state-byte budget (`current_bytes >
-    /// budget_bytes`) or, since #5325, the count-derived resident-overhead
-    /// estimate (sustained over `resident_overhead_budget_bytes` — see
+    /// budget_bytes`) or, since #5325, the counted resident-overhead bytes
+    /// (sustained over `resident_overhead_budget_bytes` — see
     /// [`HostingCache::resident_overhead_over_budget`]). Only
     /// `evict_over_budget` increments it, so it counts over-budget-triggered
     /// evictions specifically (not TTL sweeps that found nothing over
@@ -1124,9 +1140,14 @@ pub struct HostingCache<T: TimeSource> {
     /// hosted contracts hold, not just state bytes, is shaping retention. See
     /// [`HostingCacheStats::resident_overhead_evictions_total`].
     resident_overhead_evictions_total: u64,
+    /// Monotonic sum of the resident bytes charged to contracts evicted while
+    /// resident-overhead pressure was active (#5647): [`HOSTED_ENTRY_BYTES`]
+    /// plus the entry's charged interest bytes, per victim. See
+    /// [`HostingCacheStats::resident_overhead_evicted_bytes_total`].
+    resident_overhead_evicted_bytes_total: u64,
     /// Wall-clock timestamp of when the resident-overhead bytes FIRST
     /// crossed [`Self::resident_overhead_budget_bytes`], continuously (#5325
-    /// PR review, Must-Fix #1). `None` whenever the raw estimate is at or
+    /// PR review, Must-Fix #1). `None` whenever the raw reading is at or
     /// under budget. This is what makes resident-overhead pressure a
     /// SUSTAINED trigger — mirroring the #4861 cost-pressure precedent
     /// (`.claude/rules/hosting-invariants.md` invariant 3: "a single burst
@@ -1402,6 +1423,7 @@ impl<T: TimeSource> HostingCache<T> {
             interest_bytes_total: 0,
             interest_bytes_provider: None,
             resident_overhead_evictions_total: 0,
+            resident_overhead_evicted_bytes_total: 0,
             resident_overhead_breach_since: None,
             eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
@@ -1500,10 +1522,10 @@ impl<T: TimeSource> HostingCache<T> {
         G: Fn(&ContractKey) -> (usize, usize),
     {
         // "Over budget" is true if EITHER the state-byte budget OR the
-        // count-derived resident-overhead estimate (#5325) is exceeded — two
+        // counted resident-overhead bytes (#5325, #5647) are exceeded — two
         // independent axes feeding the SAME eviction decision, not two
         // separate mechanisms. `resident_overhead_over_budget()` is O(1)
-        // (just `contracts.len()` against a stored budget), so this early
+        // (the cached byte total against a stored budget), so this early
         // return stays cheap on the common in-budget path.
         if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
             return Vec::new();
@@ -1603,12 +1625,11 @@ impl<T: TimeSource> HostingCache<T> {
             if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
                 break; // back under budget on both axes, stop evicting
             }
-            // Captured BEFORE removal: `contracts.len()` (and therefore the
-            // resident-overhead estimate) changes once this victim is removed,
-            // so whether resident pressure was the reason THIS victim was
-            // shed must be read against the pre-removal count. Same reasoning
-            // for the state-byte axis, captured alongside for the per-victim
-            // log line below.
+            // Captured BEFORE removal: the resident-overhead bytes drop once
+            // this victim is removed, so whether resident pressure was the
+            // reason THIS victim was shed must be read against the
+            // pre-removal total. Same reasoning for the state-byte axis,
+            // captured alongside for the per-victim log line below.
             let resident_pressure_active = self.resident_overhead_over_budget();
             let state_byte_pressure_active = self.current_bytes > self.budget_bytes;
             if let Some(entry) = self.contracts.remove(&key) {
@@ -1621,6 +1642,9 @@ impl<T: TimeSource> HostingCache<T> {
                 if resident_pressure_active {
                     self.resident_overhead_evictions_total =
                         self.resident_overhead_evictions_total.saturating_add(1);
+                    self.resident_overhead_evicted_bytes_total = self
+                        .resident_overhead_evicted_bytes_total
+                        .saturating_add(HOSTED_ENTRY_BYTES.saturating_add(entry.interest_bytes));
                     // Per-eviction observability for the resident-overhead axis
                     // specifically (#5325 PR review — Ian's soak-test concern):
                     // Must-Fix #1 controls HOW FAST evictions happen; this line
@@ -1644,6 +1668,7 @@ impl<T: TimeSource> HostingCache<T> {
                         read_count = entry.read_count,
                         last_genuine_access_secs_ago,
                         state_bytes = entry.size_bytes,
+                        interest_bytes = entry.interest_bytes,
                         state_byte_pressure_also_active = state_byte_pressure_active,
                         "resident-overhead pressure evicted a contract (#5325) — \
                          local_subscriptions/downstream_subscribers should be 0 \
@@ -2299,6 +2324,12 @@ impl<T: TimeSource> HostingCache<T> {
     /// [`HOSTED_ENTRY_BYTES`] until then. O(hosted contracts x their neighbour
     /// records) map reads under the hosting-cache write lock: about 1 to 5 ms
     /// at 5k contracts, acceptable once a minute, too much for the access path.
+    ///
+    /// Lock order: the provider takes `InterestManager::interested_peers` read
+    /// guards while this cache's write lock is held. That is safe because the
+    /// interest manager never calls into the hosting manager, so no path takes
+    /// the two in the opposite order. A provider that did call back into
+    /// hosting would deadlock here.
     pub(crate) fn refresh_interest_bytes(&mut self) {
         let mut total = 0u64;
         for (key, entry) in self.contracts.iter_mut() {
@@ -2325,24 +2356,22 @@ impl<T: TimeSource> HostingCache<T> {
     /// Mirrors the #4861 cost-pressure precedent
     /// (`.claude/rules/hosting-invariants.md` invariant 3: "SUSTAINED
     /// pressure... a single burst never triggers... continuously for at
-    /// least half the cost window") applied to a per-NODE scalar (hosted
-    /// contract count) rather than a per-contract rate: the raw estimate
-    /// must stay continuously over budget for at least
+    /// least half the cost window") applied to a per-NODE scalar (the
+    /// resident-overhead bytes) rather than a per-contract rate: the raw
+    /// reading must stay continuously over budget for at least
     /// [`RESIDENT_OVERHEAD_SUSTAINED_WINDOW`]`/2` before this axis
     /// contributes eviction pressure. `resident_overhead_breach_since`
     /// records when the CURRENT continuous breach started; it resets to
-    /// `None` the instant the raw estimate dips back to or under budget
-    /// (an eviction bringing the count back down "cures" the breach, exactly
+    /// `None` the instant the raw reading dips back to or under budget
+    /// (an eviction bringing the bytes back down "cures" the breach, exactly
     /// like the raw check would).
     ///
     /// This is a per-node scalar debounce, not a per-contract rate sample
-    /// like the cost axes': there is no "report burst" to filter out
-    /// (`contracts.len()` is exact, not sampled), so the risk this closes is
-    /// different but the same shape — a peer upgrading straight into a large
-    /// pre-existing hosted set gets a grace window (for organic, state-byte-
-    /// driven shrinkage, or operator notice) before this brand-new axis can
-    /// evict anything, instead of reacting on the very first sweep after
-    /// deploy.
+    /// like the cost axes'. The byte total is sampled: it is re-read from the
+    /// interest manager once per sweep, and neighbours' summaries can arrive
+    /// in bursts (a reconnect, an InterestSync round). The debounce stops one
+    /// such burst from shedding contracts, and gives a peer upgrading into a
+    /// large hosted set a grace window before this axis evicts anything.
     ///
     /// `&mut self`: every call site is already inside `evict_over_budget`
     /// (`&mut self`), so recording the breach timer here — rather than as a
@@ -2399,6 +2428,7 @@ impl<T: TimeSource> HostingCache<T> {
             resident_overhead_budget_bytes: self.resident_overhead_budget_bytes,
             resident_overhead_bytes: self.resident_overhead_bytes(),
             resident_overhead_evictions_total: self.resident_overhead_evictions_total,
+            resident_overhead_evicted_bytes_total: self.resident_overhead_evicted_bytes_total,
         }
     }
 
@@ -2513,8 +2543,8 @@ impl<T: TimeSource> HostingCache<T> {
     /// Sweep for evictable contracts when the cache is over budget, at a given
     /// [`MemoryPressure`].
     ///
-    /// Only evicts when `current_bytes > budget_bytes` OR the count-derived
-    /// resident-overhead estimate has been SUSTAINED over its own budget
+    /// Only evicts when `current_bytes > budget_bytes` OR the counted
+    /// resident-overhead bytes have been SUSTAINED over their own budget
     /// (#5325 — see [`HostingCache::resident_overhead_over_budget`]); the two
     /// axes feed the SAME decision, not two separate mechanisms. Victims are
     /// chosen subscriber-primary — ascending
@@ -4749,16 +4779,117 @@ mod tests {
         // The live value collapses before the sustained breach is acted on.
         per_contract.store(0, Ordering::Relaxed);
         clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
-        // An access-triggered eviction (no refresh) must still shed only the
-        // two contracts the charged total is over by.
+        // An access-triggered eviction (no refresh) must shed exactly what the
+        // charged total is over by. The newcomer adds its entry charge, so the
+        // cache holds 20 charged contracts plus one entry against a budget of
+        // 18: two evictions leave it one entry charge over, and a third clears
+        // it, leaving 17 old contracts and the protected newcomer.
         cache.record_access(make_key_u32(1000), 10, AccessType::Put, 1, |_| (0, 0));
         let stats = cache.stats();
-        assert!(
-            stats.contract_count >= 18,
-            "evicted down to {} contracts: subtracting the live value (0) instead \
-             of the charged 1 MiB would have shed nearly all of them",
-            stats.contract_count
+        assert_eq!(
+            stats.contract_count, 18,
+            "subtracting the live value (0) instead of the charged 1 MiB would \
+             have shed nearly every contract"
         );
+        assert_eq!(stats.budget_evictions_total, 3);
+        assert_eq!(stats.resident_overhead_evictions_total, 3);
+        assert_eq!(
+            stats.resident_overhead_evicted_bytes_total,
+            3 * (1024 * 1024 + HOSTED_ENTRY_BYTES),
+            "the freed-bytes counter records what was charged to each victim"
+        );
+        assert_eq!(
+            stats.resident_overhead_bytes,
+            17 * (1024 * 1024 + HOSTED_ENTRY_BYTES) + HOSTED_ENTRY_BYTES
+        );
+    }
+
+    /// Cost-pressure eviction removes the victim's charged interest bytes from
+    /// the resident total, like the over-budget path (#5647).
+    #[test]
+    fn cost_eviction_subtracts_charged_interest_bytes() {
+        let (mut cache, clock) = make_cache(GIB);
+        let per_contract = 1024 * 1024;
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |_| per_contract));
+        let junk = make_key(1);
+        let quiet = make_key(2);
+        cache.record_access(junk, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(quiet, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.refresh_interest_bytes();
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract)
+        );
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&junk, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        let stats = cache.stats();
+        assert_eq!(
+            stats.resident_overhead_bytes,
+            HOSTED_ENTRY_BYTES + per_contract
+        );
+        assert_eq!(
+            stats.resident_overhead_evicted_bytes_total, 0,
+            "a cost eviction is not a resident-overhead eviction"
+        );
+    }
+
+    /// A contract hosted and evicted between two sweeps was never refreshed,
+    /// so it was charged only its entry. Evicting it must subtract that and
+    /// nothing more, leaving the other contracts' charges intact, and the next
+    /// refresh must re-sum to exactly what the provider reports (#5647).
+    #[test]
+    fn contract_hosted_and_evicted_between_sweeps_keeps_the_total_exact() {
+        let (mut cache, _clock) = make_cache(100);
+        let per_contract = 1024 * 1024;
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |_| per_contract));
+        let a = make_key(1);
+        let b = make_key(2);
+        let x = make_key(3);
+        let y = make_key(4);
+        cache.record_access(a, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(b, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.refresh_interest_bytes();
+        // X arrives after the refresh, so it is charged its entry only.
+        cache.record_access(x, 10, AccessType::Put, 1, |_| (0, 0));
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract) + HOSTED_ENTRY_BYTES
+        );
+        // Y pushes state bytes over the 100-byte budget. A and B have a
+        // downstream subscriber, so X is the zero-demand victim.
+        let counts = |key: &ContractKey| {
+            if *key == a || *key == b {
+                (0, 1)
+            } else {
+                (0, 0)
+            }
+        };
+        let evicted = cache
+            .record_access(y, 75, AccessType::Put, 1, counts)
+            .evicted;
+        assert_eq!(evicted.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![x]);
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract) + HOSTED_ENTRY_BYTES,
+            "X's eviction subtracts its entry charge only; Y adds its entry"
+        );
+        cache.refresh_interest_bytes();
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            3 * (HOSTED_ENTRY_BYTES + per_contract)
+        );
+    }
+
+    /// The measured per-entry charge is what bounds a hosted set of contracts
+    /// with tiny state and no neighbour summaries (#5647 re-review): at the
+    /// default share of a 2 GiB limit, 32,768 of them fit, a finite bound well
+    /// above the 508 the old flat 1 MiB estimate allowed.
+    #[test]
+    fn per_entry_charge_bounds_tiny_contracts_on_a_2_gib_node() {
+        let budget = resident_overhead_budget_for(2 * GIB, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
+        assert_eq!(budget / HOSTED_ENTRY_BYTES, 32_768);
     }
 
     /// Without a provider (unit tests, or before the op manager attaches) the

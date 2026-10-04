@@ -714,9 +714,9 @@ pub(crate) struct HostingManager {
     /// gate is a no-op regardless).
     disk_budget_bytes: AtomicU64,
 
-    /// Default share of genuine LIVE host-wide surplus memory the
-    /// resident-overhead budget is willing to claim by default (#5333) —
-    /// the RAM-axis analogue of `disk_pct_bits` above. Defaults to
+    /// Share of the node's memory limit that hosted contracts may hold in RAM
+    /// (`--hosting-mem-share`, #5333, #5647) — the RAM-axis analogue of
+    /// `disk_pct_bits` above. Defaults to
     /// [`cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`]; overridden from config
     /// at startup via [`Self::configure_resident_overhead_mem_share`]. Stored
     /// as bits so it lives in an `AtomicU64` (the recompute reads it off the
@@ -2733,7 +2733,7 @@ impl HostingManager {
         self.hosting_cache.read().budget_bytes()
     }
 
-    /// Get the installed resident-overhead (count-derived) budget (#5333).
+    /// Get the installed resident-overhead budget (#5333, #5647).
     #[cfg(test)]
     pub(crate) fn resident_overhead_budget_bytes(&self) -> u64 {
         self.hosting_cache.read().resident_overhead_budget_bytes()

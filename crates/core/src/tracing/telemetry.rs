@@ -3044,6 +3044,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_resident_overhead_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_resident_overhead_evictions_total),
                 );
+                obj.insert(
+                    "hosting_resident_overhead_evicted_bytes_total".to_string(),
+                    serde_json::json!(snapshot.hosting_resident_overhead_evicted_bytes_total),
+                );
+                obj.insert(
+                    "interest_resident_bytes_total".to_string(),
+                    serde_json::json!(snapshot.interest_resident_bytes_total),
+                );
                 // Demand-ordered eviction gauges (#4642 A3). Same
                 // hand-mirrored footgun as the A2 gauges above: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -3631,13 +3639,13 @@ mod tests {
         // Raised from 14_336 alongside the busy budget, same 40 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
         // measured 15195; no fleet value approaches it, so it constrains
-        // schema shape rather than real bytes. Raised to 15_616 by #5647 for 6
-        // new counters (the `rejected_oversized` population outcome across the
-        // 6 sources): 6 x 21 bytes at u64::MAX = 126, so about 15321.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 15_616;
+        // schema shape rather than real bytes. #5647 added 6 counters (the
+        // `rejected_oversized` population outcome across the 6 sources), 6 x
+        // 21 bytes at u64::MAX = 126: measured 15321, still within this limit.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
         // Raised from 2_048 by #5647 for the same 6 new counters, about 2 bytes
-        // each in an all-zero block.
-        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_112;
+        // each in an all-zero block (6 digits plus 6 commas): measured 2055.
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_064;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
         // arithmetic, not to forbid growth, so here it is:
@@ -3664,9 +3672,9 @@ mod tests {
         // two blocks merged onto this soak branch — measured 15267. This
         // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
         // digits); no fleet value approaches it, so it constrains schema shape
-        // rather than real bytes. Raised to 15_616 by #5647 for the same 6
-        // counters as MAX_WORST_CASE_JSON_BYTES (126 bytes at u64::MAX).
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_616;
+        // rather than real bytes. Raised by #5647 for the same 6 counters as
+        // MAX_WORST_CASE_JSON_BYTES (126 bytes at u64::MAX): measured 15393.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_424;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3908,7 +3916,7 @@ mod tests {
     /// pinned by `ring::hosting_stats_mirror_source_tests`. The axis shipped
     /// computed-and-rendered-but-unexported, so a fleet audit could see a node's
     /// state-byte occupancy sitting at 13% with no way to tell it was
-    /// nevertheless evicting under slot pressure.
+    /// nevertheless evicting under resident-overhead pressure.
     #[test]
     fn router_snapshot_json_includes_resident_overhead_gauges() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -3918,11 +3926,15 @@ mod tests {
         info.hosting_resident_overhead_budget_bytes = Some(277);
         info.hosting_resident_overhead_bytes = Some(281);
         info.hosting_resident_overhead_evictions_total = Some(293);
+        info.hosting_resident_overhead_evicted_bytes_total = Some(307);
+        info.interest_resident_bytes_total = Some(311);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_resident_overhead_budget_bytes", 277),
             ("hosting_resident_overhead_bytes", 281),
             ("hosting_resident_overhead_evictions_total", 293),
+            ("hosting_resident_overhead_evicted_bytes_total", 307),
+            ("interest_resident_bytes_total", 311),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
