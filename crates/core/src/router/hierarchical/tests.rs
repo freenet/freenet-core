@@ -1674,6 +1674,85 @@ fn explanation_reproduces_the_estimate_routing_acts_on() {
     );
 }
 
+/// The same reproduction where the contract term acts (#5702). The test above
+/// queries contracts nothing was trained on, so `explain`'s contract branch
+/// never fires there. Here contracts are drawn from a POOL, each served by a
+/// group of peers and some failing far more than others, so the term's
+/// components are estimable and queried contracts carry a shared effect; the
+/// breakdown must still end on the routing estimate bit for bit, through the
+/// contract step.
+#[test]
+fn explanation_reproduces_the_estimate_through_the_contract_term() {
+    let _guard = GlobalRng::seed_guard(0x4485_c047);
+    let peers: Vec<PeerKeyLocation> = (0..64).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    let contracts: Vec<f64> = (0..32).map(|i| i as f64 / 32.0).collect();
+    let events = 6_000;
+    for i in 0..events {
+        let contract = GlobalRng::random_range(0..contracts.len());
+        let peer = &peers[(contract * 8 + GlobalRng::random_range(0..8)) % peers.len()];
+        let failure_rate = if contract % 8 == 0 { 0.5 } else { 0.03 };
+        let outcome = RoutingOutcome {
+            success: uniform() > failure_rate,
+            time_to_response_start_secs: Some(0.05 + uniform()),
+            transfer_speed_bps: Some(1_000.0 + 50_000.0 * uniform()),
+        };
+        routing.observe_at(
+            peer,
+            Location::new(contracts[contract]),
+            uniform() * 0.5,
+            &outcome,
+            i as f64 / 600.0,
+        );
+    }
+    let now = events as f64 / 600.0;
+    let (mut through_contract, mut moved) = (0, 0);
+    for (q, &contract) in contracts.iter().enumerate() {
+        for offset in 0..8 {
+            let peer = &peers[(q * 8 + offset) % peers.len()];
+            let contract = Location::new(contract);
+            let distance = (q * 8 + offset) as f64 % 50.0 / 100.0;
+            let estimate = routing.estimate(peer, contract, distance, now);
+            let [failure, ..] = routing.explain(peer, contract, distance, now);
+            let failure = failure.expect("the failure stage is warm");
+            assert_eq!(
+                Some(failure.estimate.to_bits()),
+                estimate.failure_probability.map(f64::to_bits),
+                "contract {contract:?}: the breakdown must end on the routing estimate"
+            );
+            let forecast = routing
+                .failure
+                .predict(peer, contract.as_f64(), distance, now)
+                .expect("warm");
+            if let Some(after_band) = failure.after_band {
+                assert_eq!(routing.failure.bound(after_band), forecast.value);
+            }
+            let effect = routing
+                .failure
+                .contracts
+                .as_ref()
+                .and_then(|table| table.shared_effect(contract.as_f64().to_bits(), now));
+            assert_eq!(
+                failure.after_contract.is_some(),
+                effect.is_some(),
+                "the contract step is shown exactly when the term acts"
+            );
+            if let (Some(after_contract), Some(effect)) = (failure.after_contract, effect) {
+                assert_eq!(after_contract, failure.curve + effect);
+                through_contract += 1;
+                if effect != 0.0 {
+                    moved += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        through_contract > 0 && moved > 0,
+        "the contract term must act on some queries, or this is the test above \
+         again: {through_contract} through the contract step, {moved} moved by it"
+    );
+}
+
 /// The dashboard's distance curve for a peer with no record is the failure
 /// estimate routing would make for one, the timing curves follow the curves'
 /// directions, and a peer with a record gets its own curve.
