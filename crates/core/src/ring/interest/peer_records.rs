@@ -432,16 +432,18 @@ impl ContractPeers {
         true
     }
 
-    /// The records whose summary no other record of this contract holds and
-    /// that is not this node's own summary, with the summary's length and
-    /// allocation address (#5781): the summary bytes each peer alone makes the
-    /// node keep for this contract.
+    /// Every record holding a summary other than this node's own, with the
+    /// bytes charged to that peer for it and the allocation address (#5781):
+    /// the summary's length divided by the number of records holding it,
+    /// rounded up. A summary only one peer sent is charged to it in full;
+    /// identical bytes from several peers split the charge, so peers sending
+    /// the same bytes together still use up their shares.
     ///
     /// Identical bytes always share one allocation (the table's invariant,
-    /// checked by [`Self::assert_consistent`]), so the table's holder count is
-    /// read by allocation without hashing bytes.
-    pub(super) fn sole_held_summaries(&self) -> Vec<(PeerKey, u64, usize)> {
-        let mut holders: HashMap<*const StateSummary<'static>, usize> = HashMap::new();
+    /// checked by [`Self::assert_consistent`]), so holders are counted by
+    /// allocation without hashing bytes.
+    pub(super) fn charged_summaries(&self) -> Vec<(PeerKey, u64, Weak<StateSummary<'static>>)> {
+        let mut holders: HashMap<*const StateSummary<'static>, u64> = HashMap::new();
         for record in self.peers.values() {
             if let Some(shared) = &record.summary {
                 *holders.entry(Arc::as_ptr(shared)).or_default() += 1;
@@ -451,16 +453,57 @@ impl ContractPeers {
             .iter()
             .filter_map(|(peer, record)| {
                 let shared = record.summary.as_ref()?;
+                if self.is_own(shared) {
+                    return None;
+                }
                 let ptr = Arc::as_ptr(shared);
-                (holders.get(&ptr) == Some(&1) && !self.is_own(shared)).then(|| {
-                    (
-                        peer.clone(),
-                        shared.as_ref().as_ref().len() as u64,
-                        ptr as usize,
-                    )
-                })
+                let len = shared.as_ref().as_ref().len() as u64;
+                let count = holders.get(&ptr).copied().unwrap_or(1).max(1);
+                Some((peer.clone(), len.div_ceil(count), Arc::downgrade(shared)))
             })
             .collect()
+    }
+
+    /// The distinct summaries counted toward the node-wide budget (every one
+    /// but our own allocation), for the node-wide trim (#5781).
+    pub(super) fn counted_summaries(&self) -> Vec<Arc<StateSummary<'static>>> {
+        self.summaries
+            .values()
+            .filter(|slot| !self.is_own(&slot.shared))
+            .map(|slot| Arc::clone(&slot.shared))
+            .collect()
+    }
+
+    /// Clear every record holding exactly `victim` (by allocation), in
+    /// peer-key order, keeping the records (#5781). Returns the records
+    /// cleared.
+    pub(super) fn clear_allocation(
+        &mut self,
+        victim: &Arc<StateSummary<'static>>,
+        now: Instant,
+    ) -> u64 {
+        let mut holders: Vec<PeerKey> = self
+            .peers
+            .iter()
+            .filter(|(_, r)| r.summary.as_ref().is_some_and(|s| Arc::ptr_eq(s, victim)))
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        holders.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut cleared = 0;
+        for peer in &holders {
+            if self.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now) {
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
+    /// Whether `bytes` are this node's own summary as currently marked.
+    pub(super) fn is_own_bytes(&self, bytes: &[u8]) -> bool {
+        self.own_shared.upgrade().is_some_and(|marked| {
+            let marked: &[u8] = marked.as_ref().as_ref();
+            marked.len() == bytes.len() && marked == bytes
+        })
     }
 
     /// Whether `shared` is the allocation holding this node's own summary.
@@ -490,21 +533,27 @@ impl ContractPeers {
     }
 
     /// Record that `peer`'s stored summary is this node's own summary bytes
-    /// (#5781): the digests matched or the peer reported exactly our bytes
-    /// (`authoritative`), or we just delivered that state. A delivery can
-    /// complete after our summary has moved on, so a delivered summary whose
-    /// length differs from the own length already recorded is not marked.
+    /// (#5781). `authoritative` when the digests matched or the peer reported
+    /// exactly the summary we just computed. A delivery is not: it can
+    /// complete after our summary has moved on, so it marks our summary only
+    /// when none is recorded yet ([`Self::delivery_marks_ours`]).
     pub(super) fn note_own_summary_held_by(&mut self, peer: &PeerKey, authoritative: bool) {
         let Some(shared) = self.peers.get(peer).and_then(|r| r.summary.clone()) else {
             return;
         };
         let len = shared.as_ref().as_ref().len();
-        if !authoritative && self.own_len.is_some_and(|own| own != len) {
+        if !authoritative && !self.delivery_marks_ours() {
             return;
         }
         self.own_len = Some(len);
         self.own_shared = Arc::downgrade(&shared);
         self.resync_neighbour_bytes();
+    }
+
+    /// Whether a delivered summary (not authoritative) may be recorded as our
+    /// own: only while no own summary is recorded yet.
+    pub(super) fn delivery_marks_ours(&self) -> bool {
+        self.own_len.is_none()
     }
 
     /// Most distinct summary bytes this contract may hold
@@ -567,18 +616,7 @@ impl ContractPeers {
                 break;
             }
             let len = victim.as_ref().as_ref().len() as u64;
-            let mut holders: Vec<PeerKey> = self
-                .peers
-                .iter()
-                .filter(|(_, r)| r.summary.as_ref().is_some_and(|s| Arc::ptr_eq(s, &victim)))
-                .map(|(peer, _)| peer.clone())
-                .collect();
-            holders.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            for peer in &holders {
-                if self.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now) {
-                    records_cleared += 1;
-                }
-            }
+            records_cleared += self.clear_allocation(&victim, now);
             held = held.saturating_sub(len);
             bytes_freed = bytes_freed.saturating_add(len);
         }

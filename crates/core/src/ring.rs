@@ -5768,6 +5768,27 @@ impl Ring {
         self.hosting_manager.has_recent_local_client_access(key)
     }
 
+    /// The node-wide budget for distinct neighbour-summary bytes (#5781),
+    /// enforced when a summary is written and trimmed to at each sweep, so
+    /// neighbours cannot force eviction through summaries: a quarter of the
+    /// hosting resident budget, but never more than what the rest of the
+    /// resident charge leaves free (hosted entries, every neighbour record's
+    /// fixed charge, and our own summaries), saturating at 0. The rest is
+    /// read now, so on a node whose entries already fill most of the budget
+    /// the allowance shrinks with them.
+    fn neighbour_summary_budget(&self) -> u64 {
+        let resident = self.hosting_manager.resident_overhead_budget_bytes();
+        let entries = (self.hosting_manager.hosting_contracts_count() as u64)
+            .saturating_mul(crate::ring::hosting::HOSTED_ENTRY_BYTES);
+        let records_and_own = self.upgrade_op_manager().map_or(0, |op| {
+            op.interest_manager
+                .total_resident_bytes()
+                .saturating_sub(op.interest_manager.neighbour_summary_bytes())
+        });
+        (resident / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR)
+            .min(resident.saturating_sub(entries.saturating_add(records_and_own)))
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
@@ -5777,14 +5798,6 @@ impl Ring {
     /// subscribers is evicted LAST (shed only when nothing with fewer
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
-    /// The node-wide budget for distinct neighbour-summary bytes (#5781): a
-    /// quarter of the hosting resident budget, enforced when a summary is
-    /// written so neighbours cannot force eviction through summaries.
-    fn neighbour_summary_budget(&self) -> u64 {
-        self.hosting_manager.resident_overhead_budget_bytes()
-            / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
-    }
-
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
         // Neighbour-summary bounds (#5781), BEFORE the hosting sweep re-reads
         // the interest bytes it charges: each hosted contract's distinct

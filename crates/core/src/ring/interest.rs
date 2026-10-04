@@ -138,23 +138,24 @@ fn summary_over_bound(
         || peers.projected_node_neighbour_bytes(peer, bytes) > node_budget
 }
 
-/// One peer's summary that no other neighbour of the contract also sent:
-/// `(length, allocation address, contract)`.
-type UnsharedSummary = (u64, usize, ContractKey);
+/// One summary charged to a peer: `(charge, allocation, contract)`. The
+/// `Weak` keeps the allocation's address from being reused while the share
+/// pass compares it, without keeping the bytes alive.
+type ChargedSummary = (u64, std::sync::Weak<StateSummary<'static>>, ContractKey);
 
-/// Drop one peer's largest unshared summaries until its total is within
-/// `share_bytes` (#5781). `held` lists `(len, allocation, contract)` as
-/// collected; `clear` drops that exact allocation if the peer still holds it.
+/// Drop one peer's largest charges until its total is within `share_bytes`
+/// (#5781). `held` lists `(charge, identity, contract)` as collected; `clear`
+/// drops that exact summary if the peer still holds it.
 ///
 /// The counted bytes leave the total whether or not `clear` dropped them: a
 /// summary that vanished or was replaced between collection and now is no
 /// longer held either, so keeping it in the total would trim the peer below
 /// its share. Returns the summaries cleared, their bytes, and the total after.
-fn trim_peer_to_share(
+fn trim_peer_to_share<I>(
     mut total: u64,
-    mut held: Vec<UnsharedSummary>,
+    mut held: Vec<(u64, I, ContractKey)>,
     share_bytes: u64,
-    mut clear: impl FnMut(&ContractKey, usize) -> bool,
+    mut clear: impl FnMut(&ContractKey, I) -> bool,
 ) -> (u64, u64, u64) {
     // Largest first, contract key as the tiebreak, so the fewest summaries
     // are dropped.
@@ -265,9 +266,12 @@ pub(crate) struct SummaryBoundTrim {
     pub contracts_over_cap: usize,
     /// Peers over their share.
     pub peers_over_share: usize,
-    /// Summaries dropped (records cleared) by either bound.
+    /// Distinct summaries dropped by the node-wide trim.
+    pub node_budget_drops: usize,
+    /// Summaries dropped (records cleared) by any bound.
     pub summaries_cleared: u64,
-    /// Distinct bytes those drops freed.
+    /// Bytes of those drops: a summary's length for the per-contract and
+    /// node-wide trims, the dropping peer's charge for the per-peer trim.
     pub bytes_cleared: u64,
 }
 
@@ -2078,14 +2082,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // so any summary it held is gone either way, as when an oversized
         // upsert clears it.
         let node_budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
-        let mut refused = false;
-        let summary = summary.filter(|s| {
-            refused = summary_over_bound(&entry, &peer, s, node_budget);
-            if refused {
-                self.count_oversized(SummaryPopulationSource::Unknown);
-            }
-            !refused
-        });
+        let refused = summary
+            .as_ref()
+            .is_some_and(|s| summary_over_bound(&entry, &peer, s, node_budget));
+        let summary = if refused { None } else { summary };
 
         // Cap distinct interested peers per contract to bound an adversarial
         // broadcast-amplification vector (#3798 Gap 2). Reject BEFORE the
@@ -2105,6 +2105,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 "Interested-peer limit reached, rejecting peer"
             );
             return false;
+        }
+        if refused {
+            self.count_oversized(SummaryPopulationSource::Unknown);
         }
 
         if is_new {
@@ -2413,15 +2416,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // after our summary has moved on.
         let authoritative = matches!(source, SummaryPopulationSource::DigestAgreement)
             || ours.is_some_and(|o| o.as_ref() == summary.as_ref());
+        let node_budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
         let over = if is_ours {
-            summary.as_ref().len() > crate::wasm_runtime::MAX_STATE_SIZE
+            let bytes = summary.as_ref();
+            // A delivery that will not be recorded as our own summary (ours
+            // has moved on since) is counted like a neighbour's, so it must
+            // fit the node-wide budget (#5781).
+            let counted = !authoritative
+                && !entry.delivery_marks_ours()
+                && !entry.is_own_bytes(bytes)
+                && !entry.holds_bytes(bytes);
+            bytes.len() > crate::wasm_runtime::MAX_STATE_SIZE
+                || (counted && entry.projected_node_neighbour_bytes(peer, bytes) > node_budget)
         } else {
-            summary_over_bound(
-                &entry,
-                peer,
-                &summary,
-                self.neighbour_summary_budget.load(Ordering::Relaxed),
-            )
+            summary_over_bound(&entry, peer, &summary, node_budget)
         };
         if over {
             entry.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now);
@@ -2651,13 +2659,19 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///    identities acting together cannot get past it. Upserts already
     ///    refuse a summary that would exceed it; this pass catches a cap that
     ///    shrank because our own summary did.
-    /// 2. **Per peer:** each peer may make the node hold at most `share_bytes`
-    ///    in summaries that no other neighbour of the same contract also sent
-    ///    and that are not our own, across hosted contracts. Over that, its
-    ///    largest such summaries are dropped. This limits how much of many
-    ///    contracts' caps one identity can fill.
+    /// 2. **Per peer:** each peer is charged, across hosted contracts, every
+    ///    summary it holds that is not our own, split evenly among the peers
+    ///    holding the same bytes (rounded up). A peer charged more than
+    ///    `share_bytes` has its largest charges dropped. Peers sending the
+    ///    same bytes together split the charge but do not escape it.
+    /// 3. **Node-wide:** while the node-wide neighbour-summary bytes exceed
+    ///    the budget (writes can overshoot it: concurrent writers, an old own
+    ///    summary moving into the counted set, a budget that shrank), the
+    ///    largest counted summaries of any contract are dropped, never our
+    ///    own, in a fixed order (size, contract key, bytes). So the budget is
+    ///    a ceiling again within one sweep.
     ///
-    /// Records stay in both cases; the cost to the peer is full-state sends
+    /// Records stay in every case; the cost to the peer is full-state sends
     /// for those contracts until it reports a summary that fits. Contracts
     /// this node does not host are left to #5782's reconciliation. The hosted
     /// keys are collected first and `is_hosted` is called with no shard guard
@@ -2688,14 +2702,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
 
         // 2. Per peer.
-        let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<UnsharedSummary>)> =
+        let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<ChargedSummary>)> =
             std::collections::HashMap::new();
         for key in &keys {
             if let Some(entry) = self.interested_peers.get(key) {
-                for (peer, len, ptr) in entry.sole_held_summaries() {
+                for (peer, charge, identity) in entry.charged_summaries() {
                     let held = by_peer.entry(peer).or_default();
-                    held.0 = held.0.saturating_add(len);
-                    held.1.push((len, ptr, *key));
+                    held.0 = held.0.saturating_add(charge);
+                    held.1.push((charge, identity, *key));
                 }
             }
         }
@@ -2707,19 +2721,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         for (peer, (total, held)) in over {
             trim.peers_over_share += 1;
             let (cleared, bytes, total) =
-                trim_peer_to_share(total, held, share_bytes, |contract, ptr| {
+                trim_peer_to_share(total, held, share_bytes, |contract, identity| {
                     self.interested_peers
                         .get_mut(contract)
                         .is_some_and(|mut entry| {
                             // Only the exact summary that was counted (the same
                             // allocation); a newer one is judged next pass.
-                            entry.get(&peer).and_then(|r| r.summary()).is_some_and(|s| {
-                                std::ptr::eq(s, ptr as *const StateSummary<'static>)
-                            }) && entry.clear_summary(
-                                &peer,
-                                SummaryMissingReason::ClearedOverSizeBound,
-                                now,
-                            )
+                            entry
+                                .get(&peer)
+                                .and_then(|r| r.summary())
+                                .is_some_and(|s| std::ptr::eq(s, identity.as_ptr()))
+                                && entry.clear_summary(
+                                    &peer,
+                                    SummaryMissingReason::ClearedOverSizeBound,
+                                    now,
+                                )
                         })
                 });
             trim.summaries_cleared += cleared;
@@ -2734,6 +2750,39 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                  largest summaries (#5781)"
             );
         }
+        // 3. Node-wide.
+        let budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
+        if self.neighbour_summary_bytes() > budget {
+            let mut counted: Vec<(ContractKey, std::sync::Arc<StateSummary<'static>>)> = Vec::new();
+            for entry in self.interested_peers.iter() {
+                for summary in entry.value().counted_summaries() {
+                    counted.push((*entry.key(), summary));
+                }
+            }
+            counted.sort_by(|(ka, a), (kb, b)| {
+                let (a, b): (&[u8], &[u8]) = (a.as_ref().as_ref(), b.as_ref().as_ref());
+                b.len()
+                    .cmp(&a.len())
+                    .then_with(|| ka.id().as_bytes().cmp(kb.id().as_bytes()))
+                    .then_with(|| a.cmp(b))
+            });
+            for (key, victim) in counted {
+                if self.neighbour_summary_bytes() <= budget {
+                    break;
+                }
+                if let Some(mut entry) = self.interested_peers.get_mut(&key) {
+                    let cleared = entry.clear_allocation(&victim, now);
+                    if cleared > 0 {
+                        trim.node_budget_drops += 1;
+                        trim.summaries_cleared += cleared;
+                        trim.bytes_cleared = trim
+                            .bytes_cleared
+                            .saturating_add(victim.as_ref().as_ref().len() as u64);
+                    }
+                }
+            }
+        }
+
         self.summary_bound_trims
             .fetch_add(trim.summaries_cleared, Ordering::Relaxed);
         self.summary_bound_trimmed_bytes
@@ -2747,6 +2796,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     pub(crate) fn set_neighbour_summary_budget(&self, budget: u64) {
         self.neighbour_summary_budget
             .store(budget, Ordering::Relaxed);
+    }
+
+    /// The installed node-wide neighbour-summary budget (#5781).
+    pub(crate) fn neighbour_summary_budget(&self) -> u64 {
+        self.neighbour_summary_budget.load(Ordering::Relaxed)
     }
 
     /// Distinct neighbour-summary bytes held across all contracts, excluding
@@ -6742,10 +6796,11 @@ mod tests {
             StateSummary::from(vec![200u8; 5_000])
         ));
 
-        // 92 KB sits between 90 KB and 95 KB, so the result depends on the
-        // shared 5 KB summary on contract 0 NOT being counted against the
-        // flooder: counting it would leave 95 KB and drop a seventh summary.
-        let share = 92_000;
+        // The 5 KB summary on contract 0 is held by both peers, so each is
+        // charged half: 2.5 KB. 93 KB sits between 92.5 KB and 95 KB, so the
+        // result depends on the shared summary being split rather than
+        // charged in full: in full it would leave 95 KB and drop a seventh.
+        let share = 93_000;
         let trim = manager.enforce_summary_bounds(share, all_hosted);
         // Unshared flooder bytes: 20 KB + ... + 100 KB = 540 KB. Dropping the
         // 100, 90, ..., 50 KB summaries leaves 20 + 30 + 40 = 90 KB.
