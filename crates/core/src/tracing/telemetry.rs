@@ -4534,7 +4534,10 @@ mod tests {
     /// fourth is derivable from the two that are exported here
     /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
     /// question ever needs one of them, add it to the mirrored block above and
-    /// to this list together.
+    /// to this list together. `route_events_discarded_unlocated` (route
+    /// events the router discarded for a peer with no location) is likewise
+    /// dashboard-only: it is a should-be-zero invariant counter read on one
+    /// node's page.
     #[test]
     fn router_snapshot_json_includes_contract_term_activation() {
         use arbitrary::{Arbitrary, Unstructured};

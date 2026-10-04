@@ -1220,6 +1220,14 @@ pub(crate) struct RouterSnapshotInfo {
     /// isotonic fallback instead of the hierarchical estimator.
     #[serde(default)]
     pub isotonic_fallback_enabled: bool,
+    /// Route events this router discarded because their peer had no known
+    /// location, since it was built (history included). Always 0 unless a
+    /// route-event producer breaks the invariant `Router::add_event` guards:
+    /// such an event is never learned, so without this count it would look
+    /// exactly like an event that never happened. Dashboard-only, like the
+    /// contract table's refusal counters (see `telemetry.rs`).
+    #[serde(default)]
+    pub route_events_discarded_unlocated: u64,
     /// Where the router's chosen peer sits in distance order, and how often that
     /// choice was made against a FULL candidate window. See
     /// [`SelectionRankStats`] — this is the evidence for whether the
@@ -1341,6 +1349,10 @@ pub(crate) struct Router {
     /// windowed. See [`RouteOutcomeTotals`].
     #[serde(skip)]
     outcome_totals: RouteOutcomeTotals,
+    /// Route events discarded for having no peer location, history included.
+    /// Counted because the discard is otherwise silent in a release build.
+    #[serde(skip)]
+    route_events_discarded_unlocated: u64,
     /// Test-only: `(peer address, source)` of every ingested event, so driver
     /// tests can assert which dataset tag an outcome was recorded under.
     #[cfg(test)]
@@ -1411,6 +1423,7 @@ impl Clone for Router {
             recent_accuracy: self.recent_accuracy.clone(),
             selection_ranks: SelectionRankStats::default(),
             outcome_totals: self.outcome_totals,
+            route_events_discarded_unlocated: self.route_events_discarded_unlocated,
             #[cfg(test)]
             recorded_sources: self.recorded_sources.clone(),
             #[cfg(test)]
@@ -1790,6 +1803,7 @@ impl Router {
         // panic on an event about a peer with no location, so such events are
         // left out of the history rather than trusted not to occur.
         let located: Vec<RouteEvent>;
+        let mut discarded_unlocated = 0u64;
         let history = if history.iter().all(|event| event.peer.location().is_some()) {
             history
         } else {
@@ -1798,8 +1812,9 @@ impl Router {
                 .filter(|event| event.peer.location().is_some())
                 .cloned()
                 .collect();
+            discarded_unlocated = (history.len() - located.len()) as u64;
             tracing::debug!(
-                skipped = history.len() - located.len(),
+                skipped = discarded_unlocated,
                 "route history events about peers with no known location; not learned"
             );
             &located
@@ -2008,6 +2023,7 @@ impl Router {
             recent_accuracy: RecentAccuracy::default(),
             selection_ranks: SelectionRankStats::default(),
             outcome_totals: RouteOutcomeTotals::default(),
+            route_events_discarded_unlocated: discarded_unlocated,
             #[cfg(test)]
             recorded_sources: Vec::new(),
             #[cfg(test)]
@@ -2071,6 +2087,7 @@ impl Router {
         // panic under the router's write lock. Skip it instead: an event about
         // a peer that cannot be placed on the ring says nothing about distance.
         if event.peer.location().is_none() {
+            self.route_events_discarded_unlocated += 1;
             tracing::debug!(
                 peer = ?event.peer,
                 "route event about a peer with no known location; not recorded"
@@ -3293,6 +3310,7 @@ impl Router {
             hierarchical_response_time_pairs: self.recent_accuracy.response_time.to_vec(),
             hierarchical_transfer_speed_pairs: self.recent_accuracy.transfer_speed.to_vec(),
             isotonic_fallback_enabled: isotonic_fallback_enabled(),
+            route_events_discarded_unlocated: self.route_events_discarded_unlocated,
             selection_ranks: self.selection_ranks.snapshot(),
         }
     }
@@ -5043,6 +5061,7 @@ mod tests {
             )
         };
         let before = state(&router);
+        assert_eq!(router.snapshot().route_events_discarded_unlocated, 0);
         let unlocated =
             PeerKeyLocation::with_unknown_addr(PeerKeyLocation::random().pub_key().clone());
         assert!(unlocated.location().is_none(), "sanity: no location");
@@ -5066,6 +5085,11 @@ mod tests {
             state(&router),
             before,
             "an event about a peer with no location must not be recorded"
+        );
+        assert_eq!(
+            router.snapshot().route_events_discarded_unlocated,
+            3,
+            "but each discard must be counted, or it reads as no event at all"
         );
     }
 
@@ -5098,6 +5122,7 @@ mod tests {
             history.push(event(&unlocated, timed()));
         }
         let router = Router::new(&history);
+        assert_eq!(router.snapshot().route_events_discarded_unlocated, 30);
         assert_eq!(router.failure_estimator.len(), 20);
         assert_eq!(router.response_start_time_estimator.len(), 10);
         assert_eq!(router.transfer_rate_estimator.len(), 10);

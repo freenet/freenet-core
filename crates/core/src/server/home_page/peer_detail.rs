@@ -84,6 +84,19 @@ fn fmt_contract_term(rs: &crate::router::RouterSnapshotInfo) -> String {
     )
 }
 
+/// Route events the router discarded because their peer had no known
+/// location. Zero is the expected value; anything else is a producer breaking
+/// an invariant, and those events taught the estimators nothing.
+fn fmt_unlocated_discards(count: u64) -> String {
+    match count {
+        0 => "0".to_string(),
+        count => format!(
+            "<strong>{count}</strong> &mdash; a route-event producer passed a peer with no \
+             known location; these events were not learned (a bug: please report it)"
+        ),
+    }
+}
+
 /// A duration readable at any scale: µs below a millisecond, ms below a second.
 fn fmt_duration_secs(seconds: f64) -> String {
     if seconds < 1e-3 {
@@ -548,6 +561,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">Prediction active</div><div class="info-value">{active}</div>
                     <div class="info-label">Routing estimator</div><div class="info-value">{estimator}</div>
                     <div class="info-label">Global events</div><div class="info-value">{total}</div>
+                    <div class="info-label">Events discarded (peer had no location)</div><div class="info-value">{unlocated}</div>
                     <div class="info-label">This peer: failure record</div><div class="info-value">{pf}</div>
                     <div class="info-label">This peer: response-time record</div><div class="info-value">{pr}</div>
                     <div class="info-label">This peer: transfer-speed record</div><div class="info-value">{pt}</div>
@@ -595,6 +609,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 "hierarchical: evidence-weighted, described below"
             },
             total = total_events,
+            unlocated = fmt_unlocated_discards(rs.route_events_discarded_unlocated),
             pf = record(0),
             pr = record(1),
             pt = record(2),
@@ -1160,6 +1175,16 @@ mod tests {
     /// of the two counts renders a sentence claiming the floor bound MORE
     /// often than there were refits to bind on, and nothing would have caught
     /// it. A round-3 testing-review item.
+    #[test]
+    fn unlocated_discards_render_as_a_clean_zero_or_as_a_flagged_count() {
+        assert_eq!(fmt_unlocated_discards(0), "0");
+        let some = fmt_unlocated_discards(7);
+        assert!(
+            some.contains("<strong>7</strong>") && some.contains("not learned"),
+            "{some}"
+        );
+    }
+
     #[test]
     fn the_contract_term_row_reports_each_regime_distinctly() {
         use arbitrary::{Arbitrary, Unstructured};
