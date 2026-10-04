@@ -998,6 +998,13 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+        // The hosting cache charges each hosted contract the neighbour-summary
+        // bytes the interest manager holds for it (#5647). Holding the
+        // `InterestManager` Arc directly creates no cycle: it references
+        // neither the ring nor the hosting manager.
+        let interest = op_manager.interest_manager.clone();
+        self.hosting_manager
+            .set_interest_bytes_provider(Arc::new(move |key| interest.resident_bytes_for(key)));
     }
 
     /// Shared per-node module-cache telemetry sink (#4440 / #4488). The
@@ -2097,11 +2104,17 @@ impl Ring {
             // `HostingCacheStats` field has no reader in this block.
             snapshot.hosting_resident_overhead_budget_bytes =
                 Some(hosting.resident_overhead_budget_bytes);
-            snapshot.hosting_estimated_resident_overhead_bytes =
-                Some(hosting.estimated_resident_overhead_bytes);
-            snapshot.hosting_contract_slot_budget = Some(hosting.contract_slot_budget);
+            snapshot.hosting_resident_overhead_bytes = Some(hosting.resident_overhead_bytes);
             snapshot.hosting_resident_overhead_evictions_total =
                 Some(hosting.resident_overhead_evictions_total);
+            snapshot.hosting_resident_overhead_evicted_bytes_total =
+                Some(hosting.resident_overhead_evicted_bytes_total);
+            // All neighbour-record bytes, hosted or not (#5647): compared with
+            // the hosted part of `hosting_resident_overhead_bytes`, the excess
+            // is what #5782's reconciliation has not yet freed.
+            snapshot.interest_resident_bytes_total = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.total_resident_bytes());
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -3711,32 +3724,16 @@ impl Ring {
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
 
-            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
-            // recomputed every tick so it tracks LIVE memory pressure rather than
-            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
-            // cgroup that gets tightened externally) re-derives a smaller budget
-            // on the next tick, and one that goes idle re-derives a larger one.
-            // All three reads are cheap (a `/proc` parse or a single syscall on
-            // every platform), so unlike the disk-usage walk above these run
-            // inline rather than on a blocking thread.
+            // Resident-overhead budget (#5325, #5647): the share of the node's
+            // memory limit hosted contracts may hold in RAM. Recomputed every
+            // tick so a cgroup limit changed at runtime is picked up.
             // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
             // that module) for the rare case the RAM read itself fails.
             let total_ram = crate::wasm_runtime::read_total_ram_bytes()
                 .map(|v| v as u64)
                 .unwrap_or(1024 * 1024 * 1024);
-            let pool_size = crate::config::runtime_pool_size().get();
-            let live_signals = match (
-                crate::wasm_runtime::read_own_rss_bytes(),
-                crate::wasm_runtime::read_available_memory_bytes(),
-            ) {
-                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
-                _ => None,
-            };
-            ring.hosting_manager.recompute_resident_overhead_budget(
-                total_ram,
-                pool_size,
-                live_signals,
-            );
+            ring.hosting_manager
+                .recompute_resident_overhead_budget(total_ram);
         }
     }
 
@@ -3943,9 +3940,9 @@ impl Ring {
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
-    /// Install the operator-configurable share of live host-wide surplus
-    /// memory the resident-overhead (count-derived) eviction budget may claim
-    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    /// Install the operator-configurable share of the node's memory limit
+    /// that hosted contracts may hold in RAM (`--hosting-mem-share`, #5333,
+    /// #5647). Called once at startup; the 60s sweep's recompute reads it.
     pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
         self.hosting_manager
             .configure_resident_overhead_mem_share(mem_share);
@@ -5296,8 +5293,7 @@ impl Ring {
             disk_total_bytes,
             disk_budget_bytes,
             resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
-            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
-            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_bytes: stats.resident_overhead_bytes,
             resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
@@ -9776,6 +9772,76 @@ mod cost_pressure_seam_tests {
         )
     }
 
+    /// #5647: `attach_op_manager` must install the interest-bytes provider, so
+    /// the hosting cache charges each hosted contract the neighbour-summary
+    /// bytes the REAL interest manager holds for it. Without the provider the
+    /// cache counts only its fixed per-entry bytes and the resident axis would
+    /// silently stop seeing summaries, with every other test still green.
+    #[tokio::test]
+    async fn attach_op_manager_wires_interest_bytes_into_the_hosting_cache() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, StateSummary};
+        let config_args = crate::config::ConfigArgs {
+            id: Some("interest-bytes-wiring-5647".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+        let neighbour =
+            crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone());
+        assert!(op_manager.interest_manager.upsert_peer_summary(
+            &key,
+            &neighbour,
+            StateSummary::from(vec![0u8; 4096]),
+        ));
+
+        let _ = op_manager.ring.hosting_manager.sweep_expired_hosting();
+        let held = op_manager.interest_manager.resident_bytes_for(&key);
+        assert!(held > 4096);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES + held,
+            "the hosting cache must charge the summary bytes the interest manager holds"
+        );
+    }
+
     /// `Ring::add_connection`'s `bool` reports the READINESS-threshold
     /// crossing, not acceptance — it is `false` both when the ring rejects the
     /// connection and (far more often) when the connection is added while the
@@ -10547,6 +10613,10 @@ mod hosting_stats_mirror_source_tests {
     /// scrape below can only under-count (a declaration shape it cannot parse),
     /// and a floor set below the true count lets exactly that go unnoticed.
     /// Adding a field means bumping this deliberately AND mirroring the field.
+    // 19 since #5647: `contract_slot_budget` was removed (no per-contract
+    // constant to divide by), the estimated field was renamed
+    // `resident_overhead_bytes`, and `resident_overhead_evicted_bytes_total`
+    // was added.
     const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
 
     fn production_source() -> &'static str {
@@ -10809,7 +10879,7 @@ mod hosting_stats_mirror_source_tests {
         );
         // A transposed assignment does NOT contain the expected statement.
         let transposed = "snapshot.hosting_resident_overhead_budget_bytes = \
-                          Some(hosting.estimated_resident_overhead_bytes);";
+                          Some(hosting.resident_overhead_bytes);";
         assert!(!transposed.contains(&e));
         // Neither does a bare read, nor a read into the wrong destination.
         assert!(!"let _ = hosting.resident_overhead_budget_bytes;".contains(&e));

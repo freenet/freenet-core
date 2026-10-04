@@ -205,7 +205,11 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// and post-#5117 series separately. Still an undercount either way: the
     /// removal is only honoured within `INTEREST_TTL` and lives in a bounded LRU.
     pub recreated: [u64; InterestRemovalCause::COUNT],
-    /// Summary-population outcomes by source then outcome.
+    /// Summary-population outcomes by source then outcome. Each row grew from
+    /// 4 to 5 entries in #5647 (`rejected_oversized`, appended last) while the
+    /// schema stayed `v: 1`: positions of existing outcomes are unchanged, so a
+    /// reader indexes by `SummaryPopulationOutcome::ALL` order and treats a
+    /// shorter row as coming from an older node.
     pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
     /// Missing-pair history and active-attempt correlation overflows.
     pub corr_ovf: [u64; 2],
@@ -597,44 +601,49 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
-    /// Resident-overhead pressure axis (#5325), populated by `Ring` from the
-    /// `HostingManager` on the snapshot cadence. This is the SECOND, independent
-    /// eviction pressure: `hosting_budget_bytes` / `hosting_current_bytes` above
-    /// bound contract STATE bytes only, while this axis bounds the per-contract
-    /// resident bookkeeping that scales with hosted-contract COUNT, and either
-    /// can trigger a sweep on its own. Without these four, a node evicting
-    /// purely under slot pressure looks idle in telemetry — its state-byte
-    /// occupancy can sit at 13% while `hosting_resident_overhead_evictions_total`
-    /// climbs, which is exactly the confusion the fleet audit hit.
+    /// Resident-overhead pressure axis (#5325, #5647), populated by `Ring` from
+    /// the `HostingManager` on the snapshot cadence. This is the SECOND,
+    /// independent eviction pressure: `hosting_budget_bytes` /
+    /// `hosting_current_bytes` above bound contract STATE bytes (on disk), while
+    /// this axis bounds the memory hosted contracts hold in RAM, and either can
+    /// trigger a sweep on its own.
     ///
-    /// `hosting_resident_overhead_budget_bytes` is the RAM-scaled ceiling;
-    /// `hosting_estimated_resident_overhead_bytes` is `contract_count *
-    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Treat that pair as a
-    /// contract-COUNT ceiling wearing memory units, NOT as measured RAM: the
-    /// "used" side is a count multiplied by a flat estimate, so a collector that
-    /// renders it as memory will mislead (the node's own dashboard renders
-    /// `hosting_contract_slot_budget` — the same budget expressed as the slot
-    /// count it really bounds — for that reason).
+    /// `hosting_resident_overhead_budget_bytes` is `--hosting-mem-share` of the
+    /// node's memory limit. `hosting_resident_overhead_bytes` is COUNTED, not
+    /// estimated: the neighbour-summary bytes the interest manager holds for the
+    /// hosted contracts plus a fixed per-entry charge, as of the last sweep. Both
+    /// are bytes, so `used / budget` is a utilization ratio; the budget moves
+    /// only if the memory limit does. Compare `hosting_resident_overhead_bytes`
+    /// with the process's `memory_rss_bytes` (resource_utilization) to see how
+    /// much of RSS hosting accounts for.
+    ///
     /// `hosting_resident_overhead_evictions_total` is a monotonic counter the
-    /// collector differences to get a slot-pressure eviction rate; it may overlap
+    /// collector differences to get this axis's eviction rate; it may overlap
     /// with `hosting_budget_evictions_total`. `None` until the ring is built.
-    /// Per-node aggregate scalars.
     ///
-    /// The budget is ALSO a moving target, which matters more to a collector than
-    /// to this node. `ring::hosting::cache::resident_overhead_budget_for` derives
-    /// it as a structural RESIDUAL (total RAM, less the baseline reservation, less
-    /// every declared cache ceiling, less the state-byte budget) and then mins it
-    /// against live memory signals, recomputed every 60s sweep — a known
-    /// limitation, #5334, deferred pending exactly this telemetry. So
-    /// `estimated / budget` graphed as a utilization ratio has a NON-STATIONARY
-    /// DENOMINATOR that moves with unrelated system memory pressure: a rise in
-    /// that ratio does not by itself mean the node took on more contracts. Graph
-    /// the numerator and denominator separately before reading a trend into the
-    /// ratio.
+    /// `hosting_resident_overhead_evicted_bytes_total` is a monotonic sum of the
+    /// bytes charged to each contract this axis evicted, at the moment it was
+    /// evicted; differenced, it is the memory the axis released (#5647). The
+    /// neighbour-record part is freed a few minutes later, when #5782's
+    /// reconciliation drops the records of a contract that is neither hosted
+    /// nor in use.
+    ///
+    /// `interest_resident_bytes_total` is the bytes held for neighbour interest
+    /// records across EVERY contract, hosted or not, counted the same way as
+    /// the per-contract figure inside `hosting_resident_overhead_bytes` (#5647).
+    /// The excess over the hosted part is what the node holds for contracts it
+    /// does not host; #5782's reconciliation should keep it small, so a
+    /// growing excess means records are outliving the hosting they serve.
+    ///
+    /// Before #5647 the second field was `hosting_estimated_resident_overhead_bytes`
+    /// (`contract_count` times a flat 1 MiB) and a `hosting_contract_slot_budget`
+    /// was exported beside it. Both are gone; series from before and after do
+    /// not compare.
     pub hosting_resident_overhead_budget_bytes: Option<u64>,
-    pub hosting_estimated_resident_overhead_bytes: Option<u64>,
-    pub hosting_contract_slot_budget: Option<u64>,
+    pub hosting_resident_overhead_bytes: Option<u64>,
     pub hosting_resident_overhead_evictions_total: Option<u64>,
+    pub hosting_resident_overhead_evicted_bytes_total: Option<u64>,
+    pub interest_resident_bytes_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -3607,9 +3616,10 @@ impl Router {
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
             hosting_resident_overhead_budget_bytes: None,
-            hosting_estimated_resident_overhead_bytes: None,
-            hosting_contract_slot_budget: None,
+            hosting_resident_overhead_bytes: None,
             hosting_resident_overhead_evictions_total: None,
+            hosting_resident_overhead_evicted_bytes_total: None,
+            interest_resident_bytes_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,

@@ -2161,28 +2161,17 @@ pub struct HostingSnapshot {
     /// real value — so the panel can distinguish "not yet computed" from a
     /// genuine (if enormous) budget.
     pub disk_budget_bytes: Option<u64>,
-    /// Configured resident-overhead budget (bytes, #5325): the RAM-scaled
-    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, a
-    /// pressure axis independent of `budget_bytes`/`used_bytes` (which cover
-    /// contract STATE bytes only, not the per-contract resident bookkeeping
-    /// overhead that scales with count). See
+    /// Resident-overhead budget (bytes, #5325/#5647): the memory hosted
+    /// contracts may hold in RAM, `--hosting-mem-share` of the node's memory
+    /// limit. A pressure axis independent of `budget_bytes`/`used_bytes`,
+    /// which cover contract STATE bytes on disk. See
     /// `.claude/rules/hosting-invariants.md` invariant 3.
     pub resident_overhead_budget_bytes: u64,
-    /// Current estimated resident-overhead bytes (#5325): `contract_count *
-    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Compare against
-    /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
-    /// against `budget_bytes`.
-    pub estimated_resident_overhead_bytes: u64,
-    /// The resident-overhead budget expressed as the contract COUNT it really
-    /// bounds (`resident_overhead_budget_bytes / 1 MiB-per-contract`).
-    ///
-    /// The dashboard renders this rather than the byte pair, because the byte
-    /// pair is not a memory measurement: the "used" side is
-    /// `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, so printing
-    /// it in MB reads to an operator as measured RAM when it is really a
-    /// contract-count ceiling. Derived in `HostingCache::contract_slot_budget`
-    /// so the per-contract constant keeps exactly one reader.
-    pub contract_slot_budget: u64,
+    /// Bytes hosted contracts currently hold in RAM (#5647): neighbour
+    /// summaries plus a fixed per-entry charge, counted from what is stored.
+    /// Compare against `resident_overhead_budget_bytes` the same way
+    /// `used_bytes` is compared against `budget_bytes`.
+    pub resident_overhead_bytes: u64,
     /// Monotonic count of evictions where resident-overhead pressure was
     /// active at decision time (#5325); may overlap with
     /// `budget_evictions_total`.
