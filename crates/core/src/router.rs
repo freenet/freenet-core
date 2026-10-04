@@ -3424,6 +3424,15 @@ struct IsotonicTimingForecast {
 /// The costs stay finite and well inside f64: about 1e12 s for a 1 MB mean,
 /// resolved to about 1e-4 s, so the other costs still order degenerate peers.
 ///
+/// A consequence worth knowing, unchanged from the sentinel: sorting last, a
+/// floored peer is offered almost no new transfers (only when nothing better
+/// is a candidate), so it gathers little evidence to correct its estimate. The
+/// state is largely STICKY while it persists: until the hierarchical transfer
+/// stage warms (30 transfers node-wide), after which routing reads that stage
+/// instead, or until a refit re-anchors the peer's adjustment to a moved
+/// curve. With `FREENET_ROUTING_FALLBACK_ISOTONIC` on, the first way out never
+/// comes.
+///
 /// It is ONE absolute value, the same for every candidate, and a lower bound
 /// on every estimate (`max(raw, floor)`). Both are needed for routing to
 /// preserve the order of the raw estimates, so that a peer the estimator

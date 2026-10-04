@@ -257,7 +257,12 @@ WHEN touching the router:
         extrapolates toward zero. Pinned by
         a_degenerate_isotonic_transfer_speed_is_floored and the
         a_floored_transfer_speed_* ranking tests; golden_replay skips the
-        decisions it changes (golden/degenerate.txt).
+        decisions it changes (golden/degenerate.txt). A floored peer sorts
+        last, so while the transfer stage is cold (or the fallback switch is
+        on) it is offered almost no new transfers and its estimate is largely
+        STICKY: it recovers when the hierarchical transfer stage warms (30
+        transfers node-wide; never, with the switch on) or a refit re-anchors
+        its adjustment. Same as main's sentinel, now written down.
     Both act only while a timing stage has no hierarchical curve (fewer than
     30 samples), but they reach golden_replay differently. (1) acts only at
     10-29 samples, the window golden_replay does NOT compare. (2) acts from
