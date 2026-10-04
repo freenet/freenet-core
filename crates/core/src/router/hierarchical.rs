@@ -313,7 +313,7 @@ const EAGER_REFIT_BELOW: usize = 100;
 /// Minimum points before the failure curve is fitted: the legacy isotonic
 /// estimator's own `MIN_POINTS_FOR_REGRESSION`. A failure curve is clamped to
 /// `[0, 1]`, so a sparse one cannot produce an out-of-range estimate.
-const MIN_CURVE_POINTS_FAILURE: usize = 5;
+pub(crate) const MIN_CURVE_POINTS_FAILURE: usize = 5;
 
 /// Minimum points before a log-scale (timing, speed) curve is fitted.
 ///
@@ -324,7 +324,7 @@ const MIN_CURVE_POINTS_FAILURE: usize = 5;
 /// variance roughly 25 degrees of freedom, which is where its own relative
 /// error falls below 30%. Five points, the failure floor, would allow a factor
 /// of two.
-const MIN_CURVE_POINTS_LOG: usize = 30;
+pub(crate) const MIN_CURVE_POINTS_LOG: usize = 30;
 
 /// Log-scale predictions are clamped to the observed target range widened by
 /// this much on each side: a factor of two beyond anything the window has seen.

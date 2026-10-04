@@ -29,7 +29,7 @@ use crate::ring::interest::{
 };
 use crate::ring::{Distance, Location, PeerKeyLocation, Ring};
 use crate::tracing::event_kind::STATE_SIZE_BUCKET_COUNT;
-pub(crate) use hierarchical::Breakdown;
+pub(crate) use hierarchical::{Breakdown, MIN_CURVE_POINTS_FAILURE, MIN_CURVE_POINTS_LOG};
 pub(crate) use isotonic_estimator::{
     AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
 };

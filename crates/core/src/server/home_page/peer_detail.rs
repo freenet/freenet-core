@@ -236,12 +236,13 @@ impl StageKind {
         }
     }
 
-    /// Outcomes a stage needs before it has a curve (the hierarchical
-    /// estimator's `MIN_CURVE_POINTS_*`).
+    /// Outcomes a stage needs before it has a curve.
     fn needs(self) -> usize {
         match self {
-            StageKind::Failure => 5,
-            StageKind::ResponseTime | StageKind::TransferSpeed => 30,
+            StageKind::Failure => crate::router::MIN_CURVE_POINTS_FAILURE,
+            StageKind::ResponseTime | StageKind::TransferSpeed => {
+                crate::router::MIN_CURVE_POINTS_LOG
+            }
         }
     }
 
