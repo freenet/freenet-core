@@ -4580,7 +4580,7 @@ async fn handle_interest_sync_message(
                                     &pk,
                                     theirs,
                                     crate::ring::interest::SummaryPopulationSource::InterestSummary,
-                                    our_summary.as_ref().map(|ours| ours.as_ref().len()),
+                                    our_summary.as_ref(),
                                 );
                             }
                             None => op_manager.interest_manager.clear_peer_summary(

@@ -3055,12 +3055,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.interest_resident_bytes_total),
                 );
                 obj.insert(
-                    "interest_summary_share_trims_total".to_string(),
-                    serde_json::json!(snapshot.interest_summary_share_trims_total),
+                    "interest_summary_bound_trims_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_bound_trims_total),
                 );
                 obj.insert(
-                    "interest_summary_share_trimmed_bytes_total".to_string(),
-                    serde_json::json!(snapshot.interest_summary_share_trimmed_bytes_total),
+                    "interest_summary_bound_trimmed_bytes_total".to_string(),
+                    serde_json::json!(snapshot.interest_summary_bound_trimmed_bytes_total),
                 );
                 // Demand-ordered eviction gauges (#4642 A3). Same
                 // hand-mirrored footgun as the A2 gauges above: a new
@@ -3939,8 +3939,8 @@ mod tests {
         info.hosting_resident_overhead_evictions_total = Some(293);
         info.hosting_resident_overhead_evicted_charged_bytes_total = Some(307);
         info.interest_resident_bytes_total = Some(311);
-        info.interest_summary_share_trims_total = Some(313);
-        info.interest_summary_share_trimmed_bytes_total = Some(317);
+        info.interest_summary_bound_trims_total = Some(313);
+        info.interest_summary_bound_trimmed_bytes_total = Some(317);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_resident_overhead_budget_bytes", 277),
@@ -3948,8 +3948,8 @@ mod tests {
             ("hosting_resident_overhead_evictions_total", 293),
             ("hosting_resident_overhead_evicted_charged_bytes_total", 307),
             ("interest_resident_bytes_total", 311),
-            ("interest_summary_share_trims_total", 313),
-            ("interest_summary_share_trimmed_bytes_total", 317),
+            ("interest_summary_bound_trims_total", 313),
+            ("interest_summary_bound_trimmed_bytes_total", 317),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

@@ -2115,11 +2115,11 @@ impl Ring {
             snapshot.interest_resident_bytes_total = ring
                 .upgrade_op_manager()
                 .map(|op| op.interest_manager.total_resident_bytes());
-            // Per-peer summary share trims (#5781).
+            // Neighbour-summary bound trims (#5781).
             if let Some(op) = ring.upgrade_op_manager() {
-                let (trims, bytes) = op.interest_manager.summary_share_trim_totals();
-                snapshot.interest_summary_share_trims_total = Some(trims);
-                snapshot.interest_summary_share_trimmed_bytes_total = Some(bytes);
+                let (trims, bytes) = op.interest_manager.summary_bound_trim_totals();
+                snapshot.interest_summary_bound_trims_total = Some(trims);
+                snapshot.interest_summary_bound_trimmed_bytes_total = Some(bytes);
             }
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
@@ -5775,19 +5775,21 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
-        // Per-peer summary share (#5781), BEFORE the hosting sweep re-reads the
-        // interest bytes it charges: no single neighbour may make this node
-        // hold more than 1/PEER_SUMMARY_SHARE_DIVISOR of the hosting budget in
-        // summaries only it sent, so one peer cannot push the resident axis
-        // over budget and get other contracts evicted. Running it here, rather
-        // than on the interest manager's own timer, means the cache never
-        // charges a peer's excess.
+        // Neighbour-summary bounds (#5781), BEFORE the hosting sweep re-reads
+        // the interest bytes it charges: each hosted contract's distinct
+        // summaries are capped relative to our own summary (independent of
+        // who sent them), and no single neighbour may make this node hold more
+        // than 1/PEER_SUMMARY_SHARE_DIVISOR of the hosting budget in summaries
+        // only it sent. Neighbours therefore cannot inflate the resident axis
+        // past those bounds to get other contracts evicted. Running it here,
+        // rather than on the interest manager's own timer, means the cache
+        // never charges bytes beyond them.
         if let Some(op_manager) = self.upgrade_op_manager() {
             let share = self.hosting_manager.resident_overhead_budget_bytes()
                 / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR;
             op_manager
                 .interest_manager
-                .enforce_peer_summary_share(share);
+                .enforce_summary_bounds(share, |key| self.is_hosting_contract(key));
         }
         // Cost-aware eviction (#4861): feed the sweep the node's attributed
         // update-work cost so a zero-subscriber contract dominating CPU /
@@ -7984,6 +7986,35 @@ mod k_closest_source_tests {
         );
     }
 
+    /// #5647: the periodic hosting sweep must re-read the memory limit and
+    /// recompute the resident budget every tick, or a cgroup limit changed at
+    /// runtime is never picked up and the budget stays at its startup value.
+    /// Code only, whitespace removed, so a reflow cannot break it and a
+    /// commented-out call cannot satisfy it.
+    #[test]
+    fn sweep_recomputes_the_resident_budget_from_the_memory_limit() {
+        let body = extract_fn_body(
+            production_source(),
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = concat!(
+            "lettotal_ram=crate::ring::hosting::total_ram_or_fallback(",
+            "crate::wasm_runtime::read_total_ram_bytes(),);",
+            "ring.hosting_manager.recompute_resident_overhead_budget(total_ram);"
+        );
+        assert!(
+            code.contains(needle),
+            "sweep_get_subscription_cache must read the memory limit and recompute \
+             the resident budget each tick (#5647)"
+        );
+    }
+
     /// PR #4734 Fix 1: the periodic hosting sweep must retract the local hosting
     /// advertisement for every contract it evicts, exactly like the GET/PUT
     /// host-formation paths (`cache_contract_locally` / the PUT relay store). An
@@ -9873,61 +9904,70 @@ mod cost_pressure_seam_tests {
         );
     }
 
-    /// #5781 review blocker: one neighbour sending the largest summaries the
-    /// per-summary limit allows, for every contract this node hosts, must not
-    /// push the resident axis over budget, so it cannot get any contract
-    /// evicted. `Ring::sweep_expired_hosting` trims the peer to its share
-    /// (1/64 of the budget) before the hosting cache re-reads the bytes.
+    fn wiring_peer() -> crate::ring::PeerKey {
+        crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone())
+    }
+
+    fn host_for_wiring(
+        op_manager: &crate::node::OpManager,
+        key: freenet_stdlib::prelude::ContractKey,
+    ) {
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+    }
+
+    /// #5781 review blocker, at the 64 MiB floor budget: identities acting
+    /// together, sending identical and distinct oversized summaries for
+    /// every hosted contract, cannot push the resident axis over budget, so
+    /// they cannot get any contract evicted. The per-contract cap does not
+    /// depend on who sent a summary.
     #[tokio::test]
-    async fn one_peer_flooding_summaries_cannot_push_hosting_over_budget() {
+    async fn colluding_peers_flooding_summaries_cannot_push_hosting_over_budget() {
         use freenet_stdlib::prelude::StateSummary;
         const MIB: u64 = 1024 * 1024;
         let op_manager = attached_op_manager("summary-flood-5781").await;
         let hosting = &op_manager.ring.hosting_manager;
-        // A 512 MiB limit at the default share: the 64 MiB floor budget, so
-        // the peer's share is 1 MiB.
+        // A 512 MiB limit at the default share: the 64 MiB floor budget.
         hosting.configure_resident_overhead_mem_share(0.125);
         let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
         assert_eq!(budget, 64 * MIB);
 
-        let flooder =
-            crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone());
+        let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
         let hosted = 80u32;
+        let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
         for i in 0..hosted {
             let key = wiring_key(i);
-            hosting.record_contract_access(
-                key,
-                10,
-                crate::ring::hosting::AccessType::Get,
-                crate::ring::hosting::HostingCause::Other,
-            );
-            op_manager.interest_manager.register_local_hosting(&key);
-            // The 1 MiB fallback limit, the most one summary may be. Zeroed
-            // buffers are mapped lazily, so 80 of them cost little memory.
-            assert!(op_manager.interest_manager.upsert_peer_summary(
-                &key,
-                &flooder,
-                StateSummary::from(vec![
-                    0u8;
-                    crate::ring::interest::FALLBACK_NEIGHBOUR_SUMMARY_LIMIT
-                ]),
-            ));
+            host_for_wiring(&op_manager, key);
+            for (n, peer) in colluders.iter().enumerate() {
+                let im = &op_manager.interest_manager;
+                // 1 MiB each, identical across identities: refused.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0u8; MIB as usize]));
+                // Distinct per identity, each under the cap but together over it.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
+                // Identical and exactly at the cap: stored once if it fits.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
+            }
         }
-        // 80 MiB of summaries against a 64 MiB budget before the sweep.
-        assert!(op_manager.interest_manager.total_resident_bytes() > budget);
 
         let _ = op_manager.ring.sweep_expired_hosting();
         let stats = hosting.hosting_cache_stats();
+        let records = u64::from(hosted) * colluders.len() as u64;
         assert!(
-            stats.resident_overhead_bytes <= budget,
-            "one peer pushed the resident axis to {} bytes against a {budget} budget",
+            stats.resident_overhead_bytes
+                <= u64::from(hosted) * (crate::ring::hosting::HOSTED_ENTRY_BYTES + cap as u64)
+                    + records * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES,
+            "each contract holds at most its cap: {} bytes charged",
             stats.resident_overhead_bytes
         );
         assert!(
-            op_manager.interest_manager.total_resident_bytes()
-                <= budget / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR
-                    + u64::from(hosted) * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES,
-            "the peer keeps at most its share of summary bytes"
+            stats.resident_overhead_bytes <= budget,
+            "the colluders pushed the resident axis to {} bytes against a {budget} budget",
+            stats.resident_overhead_bytes
         );
         assert_eq!(
             stats.contract_count,
@@ -9935,8 +9975,49 @@ mod cost_pressure_seam_tests {
             "nothing was evicted"
         );
         assert_eq!(stats.resident_overhead_evictions_total, 0);
-        let (trims, _) = op_manager.interest_manager.summary_share_trim_totals();
-        assert_eq!(trims, u64::from(hosted) - 1, "all but one summary dropped");
+    }
+
+    /// #5781 relative cap, end to end through the production sweep: a
+    /// neighbour's 100,000-byte summary fits the 128 KiB cap while our own
+    /// summary is unknown. Once a delivery records our own 1,000-byte summary
+    /// the cap is 69,536 bytes, and the next `Ring::sweep_expired_hosting`
+    /// drops the oversized summary before the hosting cache charges it.
+    #[tokio::test]
+    async fn relative_summary_cap_is_enforced_before_hosting_charges() {
+        use crate::ring::interest::SummaryPopulationSource;
+        use freenet_stdlib::prelude::StateSummary;
+        let op_manager = attached_op_manager("summary-relative-5781").await;
+        let key = wiring_key(0);
+        host_for_wiring(&op_manager, key);
+        let neighbour = wiring_peer();
+        let us_to = wiring_peer();
+        let im = &op_manager.interest_manager;
+
+        assert!(im.upsert_peer_summary(&key, &neighbour, StateSummary::from(vec![1u8; 100_000])));
+        im.upsert_peer_summary_from(
+            &key,
+            &us_to,
+            StateSummary::from(vec![2u8; 1_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 101_000);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert!(
+            im.get_peer_summary(&key, &neighbour).is_none(),
+            "the neighbour's summary is over 4 x ours + 64 KiB"
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 1_000);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES
+                + 2 * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES
+                + 1_000
+        );
     }
 
     /// `Ring::add_connection`'s `bool` reports the READINESS-threshold
