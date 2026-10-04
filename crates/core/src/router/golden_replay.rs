@@ -646,10 +646,14 @@ fn routing_matches_the_soaked_build_with_starved_timing() {
 /// Prints how long `Router::add_event` and a routing decision take on a
 /// saturated router in the soaked configuration. `add_event` runs entirely under
 /// `ring.router.write()`, so its duration IS the write-lock hold per route
-/// event; a decision runs under the read lock. Not an assertion: a debug test
-/// binary says little about a release node. Measure with
-/// `cargo test -p freenet --lib --release route_event_lock_hold -- --nocapture --test-threads=1`.
+/// event; a decision runs under the read lock.
+///
+/// A benchmark, not a test: it asserts nothing about the timings, and a debug
+/// test binary says little about a release node, so it is ignored by default
+/// rather than spending ~9k events of debug CI time on a print. Measure with
+/// `cargo test -p freenet --lib --release route_event_lock_hold -- --ignored --nocapture --test-threads=1`.
 #[test]
+#[ignore = "benchmark: run with --release -- --ignored"]
 fn route_event_lock_hold_on_a_saturated_router() {
     const WARM_UP: usize = 6_000;
     const MEASURED: usize = 3_000;
