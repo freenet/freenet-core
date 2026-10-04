@@ -1457,16 +1457,38 @@ impl Default for EstimatorClock {
     }
 }
 
+/// What a `FREENET_ROUTING_*` boolean switch was set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingFlag {
+    Unset,
+    On,
+    Off,
+    /// Set, but to something that is neither an affirmative nor a negative,
+    /// including a value that is not valid UTF-8. Routes as [`Self::Off`].
+    Unrecognised,
+}
+
 /// Parse a `FREENET_ROUTING_*` boolean switch, failing safe.
 ///
-/// Only an explicit affirmative turns a switch on. Anything else — unset,
-/// empty, a typo, `0`, `off` — leaves it off, because a switch parsed here
-/// changes live routing and a misspelt value must not do that silently.
-fn parse_routing_flag(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        let value = value.trim().to_ascii_lowercase();
-        value == "1" || value == "true" || value == "yes" || value == "on"
-    })
+/// Only an explicit affirmative (`1`, `true`, `yes`, `on`) turns a switch on.
+/// Anything else leaves it off, because a switch parsed here changes live
+/// routing and a misspelt value must not do that silently; but a value that
+/// is not a recognised negative either (`0`, `false`, `no`, `off`, empty) is
+/// [`RoutingFlag::Unrecognised`], so the startup warning can say it was
+/// ignored. Read with `std::env::var_os`: `std::env::var(..).ok()` would turn
+/// a non-UTF-8 value into "unset" and the warning would never fire.
+fn parse_routing_flag(value: Option<&std::ffi::OsStr>) -> RoutingFlag {
+    let Some(value) = value else {
+        return RoutingFlag::Unset;
+    };
+    let Some(value) = value.to_str() else {
+        return RoutingFlag::Unrecognised;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => RoutingFlag::On,
+        "" | "0" | "false" | "no" | "off" => RoutingFlag::Off,
+        _ => RoutingFlag::Unrecognised,
+    }
 }
 
 /// The environment variable that routes on the isotonic fallback.
@@ -1496,8 +1518,9 @@ fn isotonic_fallback_enabled() -> bool {
         }
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| parse_routing_flag(std::env::var(ISOTONIC_FALLBACK_ENV).ok().as_deref()))
+    *ENABLED.get_or_init(|| {
+        parse_routing_flag(std::env::var_os(ISOTONIC_FALLBACK_ENV).as_deref()) == RoutingFlag::On
+    })
 }
 
 // Test-only override for `isotonic_fallback_enabled`: 0 unset, 1 on, 2 off.
@@ -1546,8 +1569,10 @@ impl Drop for IsotonicFallbackGuard {
 const OBSOLETE_ROUTING_FLAGS: [(&str, &str); 2] = [
     (
         "FREENET_ROUTING_HIERARCHICAL",
-        "the hierarchical estimator now routes by default \
-         (FREENET_ROUTING_FALLBACK_ISOTONIC is the emergency fallback)",
+        "the hierarchical estimator always routes now, and the legacy stack this \
+         switch could select was removed. FREENET_ROUTING_FALLBACK_ISOTONIC does NOT \
+         restore that stack: it routes on the isotonic estimates alone, without the \
+         Renegade blend, a configuration no release has shipped as a whole",
     ),
     (
         "FREENET_ROUTING_RESIDUAL_CORRECTION",
@@ -1555,28 +1580,58 @@ const OBSOLETE_ROUTING_FLAGS: [(&str, &str); 2] = [
     ),
 ];
 
-/// Warn, once per process, about each obsolete routing switch that is set,
-/// and when routing is on the emergency isotonic fallback.
-fn warn_about_routing_flags() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        for (name, reason) in OBSOLETE_ROUTING_FLAGS {
-            if let Ok(value) = std::env::var(name) {
-                tracing::warn!(
-                    variable = name,
-                    value = %value,
-                    "{name} is set but no longer has any effect: {reason} (#4485)"
-                );
-            }
+/// The startup warnings the routing switches call for, as `(variable,
+/// message)`, given how to read an environment variable: one per obsolete
+/// switch that is set, and one for `FREENET_ROUTING_FALLBACK_ISOTONIC` when it
+/// is on or set to a value it does not recognise. Pure, so it is testable
+/// without the process environment.
+fn routing_flag_warnings(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, String)> {
+    let mut warnings = Vec::new();
+    for (name, reason) in OBSOLETE_ROUTING_FLAGS {
+        if let Some(value) = var(name) {
+            warnings.push((
+                name,
+                format!(
+                    "{name} is set (to {:?}) but no longer has any effect: {reason} (#4485)",
+                    value.to_string_lossy()
+                ),
+            ));
         }
-        if isotonic_fallback_enabled() {
-            tracing::warn!(
-                variable = ISOTONIC_FALLBACK_ENV,
+    }
+    let fallback = var(ISOTONIC_FALLBACK_ENV);
+    match parse_routing_flag(fallback.as_deref()) {
+        RoutingFlag::On => warnings.push((
+            ISOTONIC_FALLBACK_ENV,
+            format!(
                 "{ISOTONIC_FALLBACK_ENV} is set: routing on the emergency isotonic fallback \
                  instead of the hierarchical estimator. No release has routed on this \
                  configuration as a whole; unset it once the problem it was set for is \
                  resolved (#4485)"
-            );
+            ),
+        )),
+        RoutingFlag::Unrecognised => warnings.push((
+            ISOTONIC_FALLBACK_ENV,
+            format!(
+                "{ISOTONIC_FALLBACK_ENV} is set to {:?}, which is not a recognised value, so \
+                 routing stays on the hierarchical estimator. Use 1/true/yes/on to route on \
+                 the emergency isotonic fallback, or 0/false/no/off to keep it off (#4485)",
+                fallback.unwrap_or_default().to_string_lossy()
+            ),
+        )),
+        RoutingFlag::Unset | RoutingFlag::Off => {}
+    }
+    warnings
+}
+
+/// Warn, once per process, about the routing switches: see
+/// [`routing_flag_warnings`].
+fn warn_about_routing_flags() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        for (variable, message) in routing_flag_warnings(|name| std::env::var_os(name)) {
+            tracing::warn!(variable, "{message}");
         }
     });
 }
@@ -4443,25 +4498,152 @@ mod tests {
     }
 
     /// The routing switch fails safe: only an explicit affirmative turns on
-    /// something that changes live routing.
+    /// something that changes live routing, and a value that is neither an
+    /// affirmative nor a negative is told apart from one that is.
     #[test]
     fn routing_flags_parse_fail_safe() {
+        use std::ffi::OsStr;
         for on in ["1", "true", "TRUE", " yes ", "On"] {
-            assert!(parse_routing_flag(Some(on)), "{on:?} must enable");
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(on))),
+                RoutingFlag::On,
+                "{on:?} must enable"
+            );
         }
-        for off in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("off"),
-            Some("no"),
-            Some("ture"),
-            Some("enabled"),
-            Some("2"),
-        ] {
-            assert!(!parse_routing_flag(off), "{off:?} must NOT enable");
+        for off in ["", " ", "0", "false", "OFF", "no"] {
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(off))),
+                RoutingFlag::Off,
+                "{off:?} is a recognised negative"
+            );
         }
+        for unrecognised in ["ture", "enabled", "2", "1 0"] {
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(unrecognised))),
+                RoutingFlag::Unrecognised,
+                "{unrecognised:?} must not enable, and must be reported"
+            );
+        }
+        assert_eq!(parse_routing_flag(None), RoutingFlag::Unset);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::from_bytes(b"1\xff"))),
+                RoutingFlag::Unrecognised,
+                "a non-UTF-8 value is set and unrecognised, not unset"
+            );
+        }
+    }
+
+    /// The emergency switch's variable name, spelt out: a typo in the
+    /// constant would make the switch a silent no-op, and every reference to
+    /// it (the docs, `.claude/rules/ring.md`, an operator's unit file) uses
+    /// this spelling.
+    #[test]
+    fn the_isotonic_fallback_switch_reads_its_documented_variable() {
+        assert_eq!(ISOTONIC_FALLBACK_ENV, "FREENET_ROUTING_FALLBACK_ISOTONIC");
+    }
+
+    /// Which routing switches produce a startup warning, and what it says.
+    #[test]
+    fn routing_switches_warn_when_set_obsolete_unrecognised_or_on() {
+        /// An environment holding exactly `pairs`, values as raw bytes.
+        fn env(
+            pairs: &[(&'static str, &[u8])],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+            let pairs: Vec<(&'static str, Vec<u8>)> = pairs
+                .iter()
+                .map(|(key, value)| (*key, value.to_vec()))
+                .collect();
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStringExt;
+                            std::ffi::OsString::from_vec(value.clone())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::ffi::OsString::from(String::from_utf8_lossy(value).into_owned())
+                        }
+                    })
+            }
+        }
+        let variables = |warnings: &[(&'static str, String)]| -> Vec<&'static str> {
+            warnings.iter().map(|(variable, _)| *variable).collect()
+        };
+
+        assert!(
+            routing_flag_warnings(env(&[])).is_empty(),
+            "unset: no warning"
+        );
+        for off in [&b"0"[..], b"off", b""] {
+            assert!(
+                routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", off)]))
+                    .is_empty(),
+                "a recognised negative is not worth a warning"
+            );
+        }
+
+        let warnings = routing_flag_warnings(env(&[
+            ("FREENET_ROUTING_HIERARCHICAL", b"0"),
+            ("FREENET_ROUTING_RESIDUAL_CORRECTION", b"1"),
+        ]));
+        assert_eq!(
+            variables(&warnings),
+            [
+                "FREENET_ROUTING_HIERARCHICAL",
+                "FREENET_ROUTING_RESIDUAL_CORRECTION"
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|(_, m)| m.contains("no longer has any effect"))
+        );
+        // The fallback switch must not be presented as the old legacy stack.
+        assert!(
+            warnings[0].1.contains("does NOT restore that stack"),
+            "{}",
+            warnings[0].1
+        );
+
+        let warnings =
+            routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b"ture")]));
+        assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+        assert!(
+            warnings[0].1.contains("not a recognised value"),
+            "{}",
+            warnings[0].1
+        );
+        assert!(warnings[0].1.contains("\"ture\""), "{}", warnings[0].1);
+
+        #[cfg(unix)]
+        {
+            let warnings =
+                routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b"1\xff")]));
+            assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+            assert!(
+                warnings[0].1.contains("not a recognised value"),
+                "{}",
+                warnings[0].1
+            );
+        }
+
+        let warnings =
+            routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b" On ")]));
+        assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+        assert!(
+            warnings[0]
+                .1
+                .contains("routing on the emergency isotonic fallback"),
+            "{}",
+            warnings[0].1
+        );
     }
 
     /// `FREENET_ROUTING_FALLBACK_ISOTONIC` routes every stage on the isotonic

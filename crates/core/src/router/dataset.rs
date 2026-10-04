@@ -1737,7 +1737,7 @@ pub(crate) fn parse_candidate_rate(value: Option<&str>) -> f64 {
     let Some(raw) = value else {
         return 0.0;
     };
-    if super::parse_routing_flag(Some(raw)) {
+    if super::parse_routing_flag(Some(std::ffi::OsStr::new(raw))) == super::RoutingFlag::On {
         return 1.0;
     }
     match raw.trim().parse::<f64>() {
