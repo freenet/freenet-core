@@ -3065,7 +3065,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 
     /// The forecast for `peer`, or for a peer the stage holds no record of,
     /// across distance `[0, 0.5]` on the stage's own scale, with band effects
-    /// left out: `(distance, value, spread)` per sample. Empty until the stage
+    /// and the contract term left out: `(distance, value, spread)` per sample. Empty until the stage
     /// has a curve. For the dashboard's distance charts.
     pub(crate) fn peer_curve(
         &self,
@@ -3680,7 +3680,9 @@ impl HierarchicalRouting {
     }
 
     /// Distance curves in router units (probability, seconds, bytes/s) for
-    /// `peer`, or for a peer with no record when `None`, band effects left out:
+    /// `peer`, or for a peer with no record when `None`, with band effects AND
+    /// the failure stage's contract term left out, so the failure curve is not
+    /// what [`Self::estimate`] returns for any one contract:
     /// `[failure, response time, transfer speed]`. Converted to router units
     /// the way [`Self::estimate`] converts. See [`Stage::peer_curve`].
     pub(crate) fn peer_curves(

@@ -389,13 +389,20 @@ pub(crate) struct FailureForecasts {
     /// back to, forecast for every event whether or not it turns out to be
     /// timed, so timing can be scored offline on the timed subset. `None`
     /// without a timing estimate. Named `legacy` because it is what remains of
-    /// the legacy stack: builds before #4485's removal recorded the Renegade
-    /// blend here (and the residual correction when that flag was on).
+    /// the legacy stack.
+    ///
+    /// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141),
+    /// as did `log_transfer_speed_legacy` and `RoutingModel::Legacy`: builds
+    /// before it recorded the Renegade blend here (and the residual correction
+    /// when that flag was on). An offline reader spanning that release must
+    /// split on the node's version.
     pub log_response_time_legacy: Option<f64>,
     /// The same forecast from the hierarchical estimator: `ln E[T]`, the value
     /// routing would act on, not the log-scale location.
     pub log_response_time_hierarchical: Option<f64>,
-    /// `ln(bytes/s)` of the transfer speed the legacy stack would act on.
+    /// `ln(bytes/s)` of the isotonic transfer speed a transfer stage without a
+    /// hierarchical curve falls back to (floored, as routing uses it). MEANING
+    /// CHANGED at the release carrying #5681: see `log_response_time_legacy`.
     pub log_transfer_speed_legacy: Option<f64>,
     /// `ln(bytes/s)` of the hierarchical estimator's effective speed (so that
     /// `bytes / speed` is its expected transfer time).
@@ -446,10 +453,10 @@ pub(crate) struct PeerAttributes {
 /// Which estimator routing acted on for a decision.
 ///
 /// `Legacy` is the isotonic fallback (`FREENET_ROUTING_FALLBACK_ISOTONIC`).
-/// Before #4485 removed the legacy stack it was that stack (the isotonic
-/// estimate blended with Renegade); the serialized name is kept so offline
-/// readers of earlier recordings keep working, and they must split on the
-/// release.
+/// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141):
+/// before it, `Legacy` was the legacy stack (the isotonic estimate blended
+/// with Renegade). The serialized name is kept so offline readers of earlier
+/// recordings keep working, and they must split on the node's version.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RoutingModel {

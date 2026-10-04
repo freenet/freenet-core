@@ -202,7 +202,10 @@ ONE estimator routes: the hierarchical empirical-Bayes estimator
 (router/hierarchical.rs). An EB-shrunk isotonic distance curve, then a
 root > peer > (peer, band) hierarchy shrunk by evidence, with the forgetting
 horizon chosen online. The legacy stack (Renegade, the fixed 50:50 blend, the
-residual correction) was removed after the gateway soak.
+residual correction) was removed by #5681, after the hierarchical estimator had
+been soaked on a gateway with FREENET_ROUTING_HIERARCHICAL=1 and shipped as the
+default. The build WITHOUT the legacy stack has not itself been soaked: its
+confirmation soak is pending and gates the release that carries it.
 FREENET_ROUTING_HIERARCHICAL and FREENET_ROUTING_RESIDUAL_CORRECTION are
 ignored, with a warning at startup when set.
 

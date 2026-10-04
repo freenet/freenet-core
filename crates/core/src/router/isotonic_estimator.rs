@@ -833,11 +833,9 @@ impl IsotonicEstimator {
     }
 
     /// The per-peer adjustment mode this estimator was constructed with.
-    ///
-    /// Was `cfg(test)` while only the router test `estimators_use_intended_adjustment_modes`
-    /// needed it. Now real API: the residual correction has to express its target
-    /// in the same space this estimator adjusts in, so it asks rather than
-    /// duplicating the per-target decision and letting the two drift apart.
+    /// Test-only: read by `estimators_use_intended_adjustment_modes`. (The
+    /// residual correction, which also read it, was removed with the legacy
+    /// routing stack in #4485.)
     #[cfg(test)]
     pub(crate) fn adjustment_mode(&self) -> AdjustmentMode {
         self.adjustment_mode

@@ -1,11 +1,25 @@
 //! Golden replay of routing decisions against the reference build (#4485).
 //!
 //! The legacy prediction stack (Renegade, the fixed blend, the residual
-//! correction) was removed after the hierarchical estimator had been soaked with
+//! correction) was removed once the hierarchical estimator had been soaked with
 //! `FREENET_ROUTING_HIERARCHICAL=1` on a production gateway and then shipped as
 //! the default (#5708). That evidence carries over to this build only if it
 //! makes the same routing decisions, so this test replays fixed route-event
-//! sequences and compares every decision with `golden/<scenario>.txt`.
+//! sequences and compares every decision with `golden/<scenario>.txt`. It does
+//! not replace soaking this build: that confirmation soak is pending and gates
+//! the release that carries the removal.
+//!
+//! # Bit-exact, and on which platform
+//!
+//! The comparison is of `f64` bits, so it depends on the platform's `libm`
+//! (`ln`, `exp`, `sqrt` and friends) producing the same last bit as where the
+//! golden files were generated: x86_64 Linux, which is what CI runs it on. If
+//! it fails on another platform with the same code, suspect the math library
+//! first and confirm by diffing a `FREENET_ROUTER_GOLDEN_TRACE` of both
+//! platforms: a difference confined to the last bits of the estimates is that,
+//! a different peer order or strategy is not. Do NOT regenerate the files on
+//! that platform to make it pass; that would re-pin the decisions to an
+//! unsoaked build (see "Regenerating").
 //!
 //! Those files were generated on origin/main `46bf2002f` (release 0.2.141,
 //! which routes on the hierarchical estimator by default) with this harness,
