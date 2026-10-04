@@ -555,10 +555,11 @@ impl IsotonicEstimator {
     /// measured 2.0-8.7ms per event across passes in release on the same
     /// machine, and within every pass the isotonic estimators took under 2% of
     /// it. (The ranges come from different passes, so they are not to be divided
-    /// into each other.) Nearly all of the rest is the
+    /// into each other.) Nearly all of the rest was the
     /// Renegade predictor: in a perf profile about 22% of samples were under
     /// `PredictionStage::train` (renegade's `get_optimal_k`) and about 11% in
-    /// its kNN sort, with no isotonic function above 3% (#5662).
+    /// its kNN sort, with no isotonic function above 3% (#5662). Renegade was
+    /// removed in #5681, which re-measured `add_event` without it.
     ///
     /// The figures this paragraph used to quote (~39µs per `add_event`, ~150µs
     /// per refit, from #4811) no longer reproduce on this build and have been
@@ -809,6 +810,22 @@ impl IsotonicEstimator {
         self.fit_policy
     }
 
+    /// Give `peer` a trusted per-peer adjustment of `value` (past the
+    /// sample-size bar `estimate_retrieval_time` applies), so a router test can
+    /// hold the estimator in a state real traffic reaches only after a long,
+    /// specific history. The next refit replaces it. Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_peer_adjustment_for_test(&mut self, peer: PeerKeyLocation, value: f64) {
+        self.peer_adjustments.insert(
+            peer,
+            Adjustment {
+                smoothed: value,
+                effective_count: 2.0 * MIN_POINTS_FOR_REGRESSION as f64,
+                alpha: EWMA_ALPHA,
+            },
+        );
+    }
+
     /// The raw events in the rolling window, oldest first. Test-only.
     #[cfg(test)]
     pub(crate) fn raw_events_for_test(&self) -> impl Iterator<Item = &IsotonicEvent> {
@@ -816,11 +833,10 @@ impl IsotonicEstimator {
     }
 
     /// The per-peer adjustment mode this estimator was constructed with.
-    ///
-    /// Was `cfg(test)` while only the router test `estimators_use_intended_adjustment_modes`
-    /// needed it. Now real API: the residual correction has to express its target
-    /// in the same space this estimator adjusts in, so it asks rather than
-    /// duplicating the per-target decision and letting the two drift apart.
+    /// Test-only: read by `estimators_use_intended_adjustment_modes`. (The
+    /// residual correction, which also read it, was removed with the legacy
+    /// routing stack in #4485.)
+    #[cfg(test)]
     pub(crate) fn adjustment_mode(&self) -> AdjustmentMode {
         self.adjustment_mode
     }

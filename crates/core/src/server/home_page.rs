@@ -225,9 +225,10 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
-        build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
-        failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+        PeerLine, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, build_reliability_chart,
+        failure_chart_y_max, fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed,
+        fmt_prediction_time,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -239,7 +240,6 @@ mod tests {
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
     };
-    use crate::router::AdjustmentMode;
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(build_renegade_accuracy_panel(&[], &[], &[]), String::new());
+        assert_eq!(build_accuracy_panel(&[], &[], &[]), String::new());
     }
 
     #[test]
@@ -1387,7 +1387,7 @@ mod tests {
         let failure: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, &[], &[]);
+        let svg = build_accuracy_panel(&failure, &[], &[]);
         assert!(svg.contains("Prediction Accuracy"));
         assert!(svg.contains("Failure (calibration)"));
         // Timing models have no data yet -> their placeholders still appear.
@@ -1414,6 +1414,25 @@ mod tests {
         assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
         assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
         assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+        assert_eq!(fmt_prediction_speed(0.5), "0.50 B/s");
+    }
+
+    /// A peer whose isotonic transfer speed is floored has a placeholder speed
+    /// and cost. The cost (`mean x 1e6` s) is below `REASONABLE_TIME_LIMIT`
+    /// for a mean under 1 kB, so without this it rendered as a real time
+    /// ("100000000.000s") and the speed as "0 B/s".
+    #[test]
+    fn a_floored_transfer_speed_renders_as_not_routable() {
+        let floor = crate::router::DEGENERATE_SPEED_FLOOR_BPS;
+        assert_eq!(fmt_prediction_speed(floor), "N/A (degenerate estimate)");
+        let cost = 100.0 / floor;
+        assert!(cost < 1.0e9, "the case this guards: {cost} reads as a time");
+        assert_eq!(
+            fmt_expected_total_time(cost, floor),
+            "N/A (transfer speed degenerate: ranked last)"
+        );
+        assert_eq!(fmt_expected_total_time(1.5, 1024.0), "1.500s");
+        assert_eq!(fmt_expected_total_time(f64::MAX / 2.0, 1024.0), "N/A");
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1430,8 +1449,7 @@ mod tests {
             &[],
             &[],
             (0.0, 0.0),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0",
             "auto",
@@ -1462,8 +1480,7 @@ mod tests {
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0.0",
             "1.0",
@@ -1529,8 +1546,7 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0.0",
             "1.0",
@@ -1590,8 +1606,7 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0.0",
             "1.0",
@@ -1613,8 +1628,7 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0.0",
             "0.01",
@@ -1643,8 +1657,7 @@ mod tests {
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
+            PeerLine::None,
             None,
             "0.0",
             "0.08",
@@ -1656,13 +1669,41 @@ mod tests {
         );
     }
 
+    /// This peer's hierarchical curve is drawn as its own line, not as an
+    /// adjustment of the distance curve, and it widens the auto-scaled axis.
     #[test]
-    fn peer_detail_links_renegade_to_repo() {
-        // The "Renegade" label on the Routing Model card links to the project repo.
-        let src = include_str!("home_page/peer_detail.rs");
+    fn estimator_chart_draws_an_explicit_peer_curve() {
+        let curve = vec![(0.0, 0.1), (0.25, 0.2), (0.5, 0.3)];
+        let peer = vec![(0.0, 0.4), (0.25, 0.8), (0.5, 1.2)];
+        let with_peer = build_estimator_chart(
+            "Response Time (s)",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            PeerLine::Curve(&peer),
+            None,
+            "0",
+            "auto",
+        );
+        let without = build_estimator_chart(
+            "Response Time (s)",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            PeerLine::None,
+            None,
+            "0",
+            "auto",
+        );
+        assert_eq!(
+            with_peer.matches("#8b5cf6").count(),
+            1,
+            "exactly one peer line: {with_peer}"
+        );
+        assert_eq!(without.matches("#8b5cf6").count(), 0);
         assert!(
-            src.contains(r#"href="https://github.com/sanity/renegade""#),
-            "the Renegade label must link to https://github.com/sanity/renegade"
+            with_peer.contains(">1.3") || with_peer.contains(">1.4"),
+            "the axis must extend to the peer curve's top (1.2 plus padding): {with_peer}"
         );
     }
 

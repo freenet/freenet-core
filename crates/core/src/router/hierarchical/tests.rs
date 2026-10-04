@@ -1581,6 +1581,213 @@ fn an_unknown_peer_carries_a_timing_penalty() {
     );
 }
 
+/// An estimator with warm stages and real between-peer differences, for the
+/// dashboard-explanation tests.
+fn trained_routing() -> (HierarchicalRouting, Vec<PeerKeyLocation>) {
+    let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    for i in 0..1_500 {
+        let p = GlobalRng::random_range(0..peers.len());
+        let distance = uniform() * 0.5;
+        let outcome = if uniform() < 0.05 + 0.03 * p as f64 {
+            RoutingOutcome {
+                success: false,
+                time_to_response_start_secs: None,
+                transfer_speed_bps: None,
+            }
+        } else {
+            let seconds = ((0.1f64).ln() + distance + 0.2 * p as f64 + 0.3 * normal()).exp();
+            timed(Some(seconds), Some(1e5 / seconds))
+        };
+        routing.observe_at(
+            &peers[p],
+            Location::new(uniform()),
+            distance,
+            &outcome,
+            i as f64 / 100.0,
+        );
+    }
+    (routing, peers)
+}
+
+/// The dashboard's breakdown must describe the estimate routing acts on, not a
+/// lookalike: each stage's `estimate` equals `HierarchicalRouting::estimate` bit
+/// for bit, and the level-by-level posterior ends exactly where
+/// `Level::residual` does.
+#[test]
+fn explanation_reproduces_the_estimate_routing_acts_on() {
+    let _guard = GlobalRng::seed_guard(0x4485_e791);
+    let (routing, peers) = trained_routing();
+    let now = 15.0;
+    let stranger = PeerKeyLocation::random();
+    let (mut layered, mut weighted) = (0, 0);
+    for q in 0..200 {
+        let peer = if q % 10 == 0 {
+            &stranger
+        } else {
+            &peers[q % peers.len()]
+        };
+        let contract = Location::new((q as f64 * 0.37).fract());
+        let distance = (q % 50) as f64 / 100.0;
+        let estimate = routing.estimate(peer, contract, distance, now);
+        let [failure, response, transfer] = routing.explain(peer, contract, distance, now);
+        assert_eq!(failure.map(|b| b.estimate), estimate.failure_probability);
+        assert_eq!(
+            response.map(|b| b.estimate),
+            estimate.time_to_response_start_secs
+        );
+        assert_eq!(transfer.map(|b| b.estimate), estimate.transfer_speed_bps);
+        for (stage, breakdown) in [
+            (&routing.failure, failure),
+            (&routing.response_time, response),
+            (&routing.transfer_speed, transfer),
+        ] {
+            let breakdown = breakdown.expect("every stage is warm");
+            let forecast = stage
+                .predict(peer, contract.as_f64(), distance, now)
+                .expect("warm");
+            assert_eq!(breakdown.spread, forecast.spread);
+            if let Some(after_band) = breakdown.after_band {
+                assert_eq!(
+                    stage.bound(after_band),
+                    forecast.value,
+                    "the last level must land where `residual` does"
+                );
+                layered += 1;
+            }
+            assert!((0.0..=1.0).contains(&breakdown.peer_weight));
+            assert!((0.0..=1.0).contains(&breakdown.band_weight));
+            if breakdown.peer_weight > 0.0 {
+                weighted += 1;
+            }
+        }
+        if std::ptr::eq(peer, &stranger) {
+            let breakdown = failure.expect("warm");
+            assert_eq!(breakdown.peer_evidence, 0.0, "no record means no evidence");
+            assert_eq!(breakdown.peer_weight, 0.0);
+        }
+    }
+    assert!(
+        layered > 0 && weighted > 0,
+        "the hierarchy must have components and adopt some peer means, or the \
+         checks above are vacuous: layered {layered}, weighted {weighted}"
+    );
+}
+
+/// The same reproduction where the contract term acts (#5702). The test above
+/// queries contracts nothing was trained on, so `explain`'s contract branch
+/// never fires there. Here contracts are drawn from a POOL, each served by a
+/// group of peers and some failing far more than others, so the term's
+/// components are estimable and queried contracts carry a shared effect; the
+/// breakdown must still end on the routing estimate bit for bit, through the
+/// contract step.
+#[test]
+fn explanation_reproduces_the_estimate_through_the_contract_term() {
+    let _guard = GlobalRng::seed_guard(0x4485_c047);
+    let peers: Vec<PeerKeyLocation> = (0..64).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    let contracts: Vec<f64> = (0..32).map(|i| i as f64 / 32.0).collect();
+    let events = 6_000;
+    for i in 0..events {
+        let contract = GlobalRng::random_range(0..contracts.len());
+        let peer = &peers[(contract * 8 + GlobalRng::random_range(0..8)) % peers.len()];
+        let failure_rate = if contract % 8 == 0 { 0.5 } else { 0.03 };
+        let outcome = RoutingOutcome {
+            success: uniform() > failure_rate,
+            time_to_response_start_secs: Some(0.05 + uniform()),
+            transfer_speed_bps: Some(1_000.0 + 50_000.0 * uniform()),
+        };
+        routing.observe_at(
+            peer,
+            Location::new(contracts[contract]),
+            uniform() * 0.5,
+            &outcome,
+            i as f64 / 600.0,
+        );
+    }
+    let now = events as f64 / 600.0;
+    let (mut through_contract, mut moved) = (0, 0);
+    for (q, &contract) in contracts.iter().enumerate() {
+        for offset in 0..8 {
+            let peer = &peers[(q * 8 + offset) % peers.len()];
+            let contract = Location::new(contract);
+            let distance = (q * 8 + offset) as f64 % 50.0 / 100.0;
+            let estimate = routing.estimate(peer, contract, distance, now);
+            let [failure, ..] = routing.explain(peer, contract, distance, now);
+            let failure = failure.expect("the failure stage is warm");
+            assert_eq!(
+                Some(failure.estimate.to_bits()),
+                estimate.failure_probability.map(f64::to_bits),
+                "contract {contract:?}: the breakdown must end on the routing estimate"
+            );
+            let forecast = routing
+                .failure
+                .predict(peer, contract.as_f64(), distance, now)
+                .expect("warm");
+            if let Some(after_band) = failure.after_band {
+                assert_eq!(routing.failure.bound(after_band), forecast.value);
+            }
+            let effect = routing
+                .failure
+                .contracts
+                .as_ref()
+                .and_then(|table| table.shared_effect(contract.as_f64().to_bits(), now));
+            assert_eq!(
+                failure.after_contract.is_some(),
+                effect.is_some(),
+                "the contract step is shown exactly when the term acts"
+            );
+            if let (Some(after_contract), Some(effect)) = (failure.after_contract, effect) {
+                assert_eq!(after_contract, failure.curve + effect);
+                through_contract += 1;
+                if effect != 0.0 {
+                    moved += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        through_contract > 0 && moved > 0,
+        "the contract term must act on some queries, or this is the test above \
+         again: {through_contract} through the contract step, {moved} moved by it"
+    );
+}
+
+/// The dashboard's distance curve for a peer with no record is the failure
+/// estimate routing would make for one, the timing curves follow the curves'
+/// directions, and a peer with a record gets its own curve.
+#[test]
+fn peer_curves_follow_the_estimate() {
+    let _guard = GlobalRng::seed_guard(0x4485_c0e5);
+    let (routing, peers) = trained_routing();
+    let now = 15.0;
+    let stranger = PeerKeyLocation::random();
+    let [failure, response, transfer] = routing.peer_curves(None, now);
+    assert_eq!(failure.len(), 51);
+    for &(distance, value) in &failure {
+        let estimate = routing
+            .estimate(&stranger, Location::new(0.9), distance, now)
+            .failure_probability
+            .expect("warm");
+        assert_eq!(value, estimate, "at distance {distance}");
+    }
+    assert!(!response.is_empty() && !transfer.is_empty());
+    assert!(
+        response.windows(2).all(|pair| pair[1].1 >= pair[0].1),
+        "response time must not fall with distance"
+    );
+    assert!(
+        transfer.windows(2).all(|pair| pair[1].1 <= pair[0].1),
+        "transfer speed must not rise with distance"
+    );
+    let [own_failure, own_response, _] = routing.peer_curves(Some(&peers[11]), now);
+    assert_ne!(
+        (own_failure, own_response),
+        (failure, response),
+        "a peer with a record must get its own curve"
+    );
+}
+
 /// Per-candidate cost of a full three-stage estimate with real peer keys.
 /// Printed, not asserted.
 #[test]
@@ -4615,8 +4822,7 @@ fn add_event_threads_a_repeated_contract_through_the_contract_term() {
     use crate::router::{RouteEvent, RouteOutcome, Router};
 
     let _guard = GlobalRng::seed_guard(0x4485_c012);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let mut router = Router::new(&[]);
     let peers: Vec<PeerKeyLocation> = (0..24).map(|_| PeerKeyLocation::random()).collect();
     let contracts: Vec<Location> = (0..16).map(|i| Location::new(i as f64 / 16.0)).collect();
@@ -4665,11 +4871,11 @@ fn add_event_threads_a_repeated_contract_through_the_contract_term() {
     // between the two contracts is the shared effect; they share a band.
     let unseen = Location::new(0.36);
     assert_eq!(band_of(dead.as_f64()), band_of(unseen.as_f64()));
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let failure_for = |contract: Location| {
         router
             .hierarchical
-            .estimate(&peers[20], contract, 0.05, clock.estimator_hours)
+            .estimate(&peers[20], contract, 0.05, clock)
             .failure_ranking
             .expect("the failure stage predicts after 1,200 events")
     };
@@ -4875,8 +5081,7 @@ fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
     use crate::server::fmt_prediction_time_for_tests as fmt_prediction_time;
 
     let _guard = GlobalRng::seed_guard(0x4485_c00c);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let target = Location::new(0.5);
     // A peer near the target, whose own record is at FAR distances where the
     // curve is high. Its peer-level residual is then far below the curve at
@@ -4924,14 +5129,14 @@ fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
             });
         }
     }
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let distance = target
         .distance(clean.location().expect("a random peer has a location"))
         .as_f64();
     let unbounded = router
         .hierarchical
         .failure
-        .predict(&clean, target.as_f64(), distance, clock.estimator_hours)
+        .predict(&clean, target.as_f64(), distance, clock)
         .expect("the failure stage predicts after 400 events")
         .unbounded;
     assert!(
@@ -5014,8 +5219,7 @@ fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
     use crate::router::{RouteEvent, RouteOutcome, Router};
 
     let _guard = GlobalRng::seed_guard(0x4485_c009);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let (estimator, worse, better, dead, _, _) = clamped_pair();
     let mut router = Router::new(&[]);
     // Untimed traffic only, so no stage has timing and the cost is the
@@ -5033,7 +5237,7 @@ fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
         });
     }
     router.hierarchical = estimator;
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let predict = |peer: &PeerKeyLocation| {
         router
             .predict_routing_outcome_at(peer, dead, clock)

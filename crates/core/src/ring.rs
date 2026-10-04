@@ -4419,12 +4419,6 @@ impl Ring {
     ///    broke the strict-determinism tests (`test_strict_determinism_*`,
     ///    `test_direct_runner_determinism`, `test_thundering_herd_connect_storm`).
     ///
-    /// CAVEAT: `Router::add_event` stamps Renegade observations from the
-    /// router's injected clock, but the ring always injects `InstantTimeSrc`,
-    /// whose `system_time_now()` is `SystemTime::now()`, so this path is not
-    /// deterministic under simulation either; the determinism tests pass
-    /// because that variance is far below what they compare.
-    ///
     /// `source` tags the event in the opt-in routing dataset (#5648): `Relay`
     /// for an outcome a relay hop observed about its downstream peer,
     /// `Originator` for one observed by the node that started the operation.
