@@ -46,25 +46,31 @@ pub(crate) const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 /// correct whether a node holds one shared cache or several per-executor ones,
 /// and keeps a replaced/dropped cache from leaving a phantom contribution.
 ///
-/// `evictions` is a monotonic lifetime counter: every entry removed to honor
-/// either bound (count cap or byte budget). Replacing a key's value is not an
-/// eviction, and neither is refusing an oversized value (it was never cached).
+/// The two eviction counters are monotonic lifetime totals, split by WHICH
+/// bound forced the eviction, so an operator can tell the COUNT cap (`count_cap`
+/// entries — coverage target) binding from the BYTE budget binding. Replacing a
+/// key's value is not an eviction, and neither is refusing an oversized value (it
+/// was never cached).
 #[derive(Debug, Default)]
 pub(crate) struct ByteLruGauges {
     entries: AtomicU64,
     bytes: AtomicU64,
     budget_bytes: AtomicU64,
-    evictions: AtomicU64,
+    count_cap: AtomicU64,
+    count_cap_evictions: AtomicU64,
+    byte_budget_evictions: AtomicU64,
 }
 
-/// Point-in-time read of [`ByteLruGauges`]. The four loads are independent, so a
+/// Point-in-time read of [`ByteLruGauges`]. The loads are independent, so a
 /// read racing a put can be off by one entry; fine for a 5-minute gauge.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ByteLruGaugeSnapshot {
     pub entries: u64,
     pub bytes: u64,
     pub budget_bytes: u64,
-    pub evictions_total: u64,
+    pub count_cap: u64,
+    pub count_cap_evictions_total: u64,
+    pub byte_budget_evictions_total: u64,
 }
 
 impl ByteLruGauges {
@@ -73,7 +79,9 @@ impl ByteLruGauges {
             entries: self.entries.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
-            evictions_total: self.evictions.load(Ordering::Relaxed),
+            count_cap: self.count_cap.load(Ordering::Relaxed),
+            count_cap_evictions_total: self.count_cap_evictions.load(Ordering::Relaxed),
+            byte_budget_evictions_total: self.byte_budget_evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -128,6 +136,13 @@ impl ByteLruGauges {
 /// that cache's values are trusted operator-supplied modules; these are not, so
 /// they get no oversized exemption. Net: `total_bytes <= byte_budget` holds
 /// STRICTLY after every put.
+///
+/// The refusal threshold is `max_entry_bytes`, which defaults to the whole
+/// budget and can be lowered with [`Self::with_max_entry_bytes`]. A cache with a
+/// LARGE aggregate budget (the pool-shared executor caches, #5795) sets it to the
+/// old per-executor budget, so one contract emitting a tens-of-MiB value cannot
+/// be admitted just because the aggregate is big enough to hold it, flushing
+/// hundreds of ordinary entries.
 pub(crate) struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
     inner: LruCache<K, V>,
     /// Running sum of every resident entry's weight
@@ -136,11 +151,15 @@ pub(crate) struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
     total_bytes: usize,
     /// Hard eviction threshold in bytes.
     byte_budget: usize,
+    /// Largest counted entry weight admitted at all; `<= byte_budget`.
+    max_entry_bytes: usize,
     /// Payload byte size of a value; the per-entry structural overhead is added
     /// on top in [`Self::entry_weight`].
     weigh: fn(&V) -> usize,
-    /// Lifetime count of entries this cache evicted to honor either bound.
-    evictions: u64,
+    /// Lifetime count of entries evicted to honor the COUNT cap.
+    count_cap_evictions: u64,
+    /// Lifetime count of entries evicted to honor the BYTE budget.
+    byte_budget_evictions: u64,
     /// Optional node-wide gauges this cache publishes its occupancy into. See
     /// [`ByteLruGauges`]; `None` for callers that export nothing.
     gauges: Option<Arc<ByteLruGauges>>,
@@ -148,14 +167,24 @@ pub(crate) struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
 
 impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     pub(crate) fn new(count_cap: NonZeroUsize, byte_budget: usize, weigh: fn(&V) -> usize) -> Self {
+        let byte_budget = byte_budget.max(1);
         Self {
             inner: LruCache::new(count_cap),
             total_bytes: 0,
-            byte_budget: byte_budget.max(1),
+            byte_budget,
+            max_entry_bytes: byte_budget,
             weigh,
-            evictions: 0,
+            count_cap_evictions: 0,
+            byte_budget_evictions: 0,
             gauges: None,
         }
+    }
+
+    /// Refuse any single entry whose counted weight exceeds `max_entry_bytes`
+    /// (clamped to the byte budget, never above it). See the type docs.
+    pub(crate) fn with_max_entry_bytes(mut self, max_entry_bytes: usize) -> Self {
+        self.max_entry_bytes = max_entry_bytes.clamp(1, self.byte_budget);
+        self
     }
 
     /// Publish this cache's occupancy into `gauges` from now on (and its budget
@@ -164,6 +193,7 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         ByteLruGauges::adjust(&gauges.budget_bytes, 0, self.byte_budget);
         ByteLruGauges::adjust(&gauges.entries, 0, self.inner.len());
         ByteLruGauges::adjust(&gauges.bytes, 0, self.total_bytes);
+        ByteLruGauges::adjust(&gauges.count_cap, 0, self.inner.cap().get());
         self.gauges = Some(gauges);
         self
     }
@@ -172,6 +202,12 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     #[cfg(test)]
     pub(crate) fn byte_budget(&self) -> usize {
         self.byte_budget
+    }
+
+    /// The largest single entry this cache admits.
+    #[cfg(test)]
+    pub(crate) fn max_entry_bytes(&self) -> usize {
+        self.max_entry_bytes
     }
 
     /// Counted weight of one entry: payload length plus the per-entry structural
@@ -192,14 +228,24 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     /// result, so caching buys nothing. Any pre-existing entry under the same key
     /// is left untouched (it was already within budget, so the invariant holds).
     pub(crate) fn put(&mut self, key: K, value: V) {
-        let (len_before, bytes_before, evictions_before) =
-            (self.inner.len(), self.total_bytes, self.evictions);
+        let (len_before, bytes_before, count_ev_before, byte_ev_before) = (
+            self.inner.len(),
+            self.total_bytes,
+            self.count_cap_evictions,
+            self.byte_budget_evictions,
+        );
         self.put_inner(key, value);
         if let Some(g) = &self.gauges {
             ByteLruGauges::adjust(&g.entries, len_before, self.inner.len());
             ByteLruGauges::adjust(&g.bytes, bytes_before, self.total_bytes);
-            g.evictions
-                .fetch_add(self.evictions - evictions_before, Ordering::Relaxed);
+            g.count_cap_evictions.fetch_add(
+                self.count_cap_evictions - count_ev_before,
+                Ordering::Relaxed,
+            );
+            g.byte_budget_evictions.fetch_add(
+                self.byte_budget_evictions - byte_ev_before,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -212,7 +258,9 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         // memory limit, so refuse to cache such a value at all. The caller already
         // owns its result; a later cache miss simply recomputes. Result:
         // total_bytes <= byte_budget holds STRICTLY after every put.
-        if added > self.byte_budget {
+        // `max_entry_bytes <= byte_budget`, so this also enforces the (possibly
+        // tighter) per-entry cap a large shared cache sets.
+        if added > self.max_entry_bytes {
             return;
         }
         // `push` returns the displaced entry: the OLD value when `key` already
@@ -227,7 +275,7 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
                 .total_bytes
                 .saturating_sub(self.entry_weight(&displaced));
             if !replacing {
-                self.evictions += 1;
+                self.count_cap_evictions += 1;
             }
         }
         self.total_bytes = self.total_bytes.saturating_add(added);
@@ -240,7 +288,7 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
             match self.inner.pop_lru() {
                 Some((_, evicted)) => {
                     self.total_bytes = self.total_bytes.saturating_sub(self.entry_weight(&evicted));
-                    self.evictions += 1;
+                    self.byte_budget_evictions += 1;
                 }
                 None => break,
             }
@@ -268,6 +316,9 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         if cap <= self.inner.cap() {
             return;
         }
+        if let Some(g) = &self.gauges {
+            ByteLruGauges::adjust(&g.count_cap, self.inner.cap().get(), cap.get());
+        }
         self.inner.resize(cap);
     }
 
@@ -281,21 +332,33 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         self.inner.len()
     }
 
+    /// Total evictions for either bound.
     #[cfg(test)]
     pub(crate) fn evictions(&self) -> u64 {
-        self.evictions
+        self.count_cap_evictions + self.byte_budget_evictions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_cap_evictions(&self) -> u64 {
+        self.count_cap_evictions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn byte_budget_evictions(&self) -> u64 {
+        self.byte_budget_evictions
     }
 }
 
 impl<K: std::hash::Hash + Eq, V> Drop for ByteBoundedLruCache<K, V> {
     /// Withdraw this cache's contribution from the shared gauges, so a dropped
     /// or replaced cache does not leave phantom entries/bytes/budget behind.
-    /// The eviction counter is lifetime-monotonic and is deliberately kept.
+    /// The eviction counters are lifetime-monotonic and are deliberately kept.
     fn drop(&mut self) {
         if let Some(g) = &self.gauges {
             ByteLruGauges::adjust(&g.entries, self.inner.len(), 0);
             ByteLruGauges::adjust(&g.bytes, self.total_bytes, 0);
             ByteLruGauges::adjust(&g.budget_bytes, self.byte_budget, 0);
+            ByteLruGauges::adjust(&g.count_cap, self.inner.cap().get(), 0);
         }
     }
 }
@@ -535,6 +598,8 @@ mod tests {
         cache.put(2, vec![0u8; 8]);
         cache.put(3, vec![0u8; 8]);
         assert_eq!(cache.evictions(), 1, "count-cap eviction must be counted");
+        assert_eq!(cache.count_cap_evictions(), 1);
+        assert_eq!(cache.byte_budget_evictions(), 0);
 
         // Byte budget for exactly two 100-byte entries: the third evicts by BYTES.
         let budget = 2 * (100 + CACHE_ENTRY_OVERHEAD_BYTES);
@@ -546,6 +611,8 @@ mod tests {
         assert_eq!(cache.evictions(), 0, "everything fits: no eviction");
         cache.put(2, vec![0u8; 100]);
         assert_eq!(cache.evictions(), 1, "byte-budget eviction must be counted");
+        assert_eq!(cache.byte_budget_evictions(), 1);
+        assert_eq!(cache.count_cap_evictions(), 0);
         // An oversized value is refused, never cached, so it evicts nothing.
         cache.put(9, vec![0u8; budget]);
         assert_eq!(
@@ -569,6 +636,7 @@ mod tests {
             ByteBoundedLruCache::new(NonZeroUsize::new(1024).unwrap(), budget, vec_len)
                 .with_gauges(gauges.clone());
         assert_eq!(gauges.snapshot().budget_bytes, 2 * budget as u64);
+        assert_eq!(gauges.snapshot().count_cap, 2048);
 
         for i in 0..6u64 {
             a.put(i, vec![0u8; 10]); // 4 fit, 2 evicted
@@ -579,17 +647,64 @@ mod tests {
         assert_eq!(snap.entries, (a.len() + b.len()) as u64);
         assert_eq!(snap.entries, 5);
         assert_eq!(snap.bytes, (a.total_bytes() + b.total_bytes()) as u64);
-        assert_eq!(snap.evictions_total, 2);
+        assert_eq!(snap.byte_budget_evictions_total, 2);
+        assert_eq!(snap.count_cap_evictions_total, 0);
+
+        // Growing a cache's count cap moves the count-cap gauge with it.
+        b.grow(NonZeroUsize::new(4096).unwrap());
+        assert_eq!(gauges.snapshot().count_cap, 1024 + 4096);
 
         drop(a);
         let snap = gauges.snapshot();
         assert_eq!(snap.entries, 1, "dropping a cache withdraws its entries");
         assert_eq!(snap.bytes, b.total_bytes() as u64);
         assert_eq!(snap.budget_bytes, budget as u64);
-        assert_eq!(snap.evictions_total, 2, "the eviction total is lifetime");
+        assert_eq!(snap.count_cap, 4096);
+        assert_eq!(
+            snap.byte_budget_evictions_total, 2,
+            "the eviction total is lifetime"
+        );
 
         drop(b);
         let snap = gauges.snapshot();
-        assert_eq!((snap.entries, snap.bytes, snap.budget_bytes), (0, 0, 0));
+        assert_eq!(
+            (snap.entries, snap.bytes, snap.budget_bytes, snap.count_cap),
+            (0, 0, 0, 0)
+        );
+    }
+
+    /// A per-entry cap below the budget refuses a value that would fit the
+    /// (large) budget but exceeds the cap, without evicting anything already
+    /// resident. This is what stops one contract's tens-of-MiB summary from
+    /// flushing a pool-shared cache whose aggregate budget could hold it.
+    #[test]
+    fn max_entry_bytes_refuses_large_values_that_fit_the_budget() {
+        let budget = 100 * (10 + CACHE_ENTRY_OVERHEAD_BYTES);
+        let cap = 2 * (10 + CACHE_ENTRY_OVERHEAD_BYTES);
+        let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(1024).unwrap(), budget, vec_len)
+                .with_max_entry_bytes(cap);
+        assert_eq!(cache.max_entry_bytes(), cap);
+        for i in 0..50u64 {
+            cache.put(i, vec![0u8; 10]);
+        }
+        let bytes_before = cache.total_bytes();
+
+        // Fits the budget (~half of it) but exceeds the per-entry cap.
+        cache.put(999, vec![0u8; budget / 2]);
+        assert!(cache.get(&999).is_none(), "over-cap value must be refused");
+        assert_eq!(cache.len(), 50, "nothing resident may be evicted");
+        assert_eq!(cache.total_bytes(), bytes_before);
+        assert_eq!(cache.evictions(), 0);
+
+        // Exactly at the cap is admitted.
+        cache.put(1000, vec![0u8; cap - CACHE_ENTRY_OVERHEAD_BYTES]);
+        assert!(cache.get(&1000).is_some(), "an at-cap value must be cached");
+
+        // The cap is clamped to the budget, never above it.
+        let clamped: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(4).unwrap(), 1000, vec_len)
+                .with_max_entry_bytes(usize::MAX);
+        assert_eq!(clamped.max_entry_bytes(), 1000);
     }
 }

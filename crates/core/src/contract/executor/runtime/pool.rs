@@ -532,17 +532,22 @@ impl RuntimePool {
 
         // One summary cache and one delta cache for the whole pool (#5795),
         // each sized to the aggregate the node already declares for them
-        // (`pool_size × per-executor budget`, see `declared_cache_ceiling`), so
-        // the memory envelope is unchanged but fully usable by whichever
-        // executor the loop checks out. Occupancy is published into the node's
+        // (`pool_size × per-executor budget`, see `declared_cache_ceiling`). The
+        // declared ceiling is unchanged, but resident memory can now approach it
+        // (with per-executor caches only executor 0's slice ever filled). A
+        // single entry is still capped at ONE executor's budget, so a large
+        // contract-controlled summary/delta cannot be admitted just because the
+        // aggregate could hold it. Occupancy is published into the node's
         // contract-exec metrics (`router_snapshot`).
         let exec_metrics = op_manager.ring.contract_exec_metrics();
         let shared_summary_cache = super::new_summary_cache(
             super::pool_summary_cache_budget_bytes(pool_size_usize),
+            super::per_executor_summary_cache_budget_bytes(pool_size_usize),
             Some(exec_metrics.summary_cache_gauges().clone()),
         );
         let shared_delta_cache = super::new_delta_cache(
             super::pool_delta_cache_budget_bytes(pool_size_usize),
+            super::per_executor_delta_cache_budget_bytes(pool_size_usize),
             Some(exec_metrics.delta_cache_gauges().clone()),
         );
 
@@ -1929,6 +1934,20 @@ mod tests {
         assert_eq!(
             delta_budget,
             super::super::pool_delta_cache_budget_bytes(POOL)
+        );
+        // The aggregate is exactly POOL per-executor budgets, and a single entry
+        // is capped at ONE of them.
+        let per_exec_summary = super::super::per_executor_summary_cache_budget_bytes(POOL);
+        let per_exec_delta = super::super::per_executor_delta_cache_budget_bytes(POOL);
+        assert_eq!(summary_budget, POOL * per_exec_summary);
+        assert_eq!(delta_budget, POOL * per_exec_delta);
+        assert_eq!(
+            super::super::lock_fast_path_cache(&pool.shared_summary_cache).max_entry_bytes(),
+            per_exec_summary
+        );
+        assert_eq!(
+            super::super::lock_fast_path_cache(&pool.shared_delta_cache).max_entry_bytes(),
+            per_exec_delta
         );
         let snap = op_manager
             .ring

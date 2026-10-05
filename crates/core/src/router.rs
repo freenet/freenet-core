@@ -866,11 +866,19 @@ pub(crate) struct RouterSnapshotInfo {
     /// `Ring` from the gauges the caches publish into
     /// (`ContractExecMetrics::fast_path_cache_snapshot`). The hit/miss arms
     /// above say whether the cache covered the summarize/delta load; these say
-    /// why not. `*_bytes` pinned at `*_budget_bytes` with `*_evictions_total`
-    /// climbing means the byte budget, not the hosted-set count target, is what
-    /// is forcing WASM re-runs. `*_entries`, `*_bytes` and `*_budget_bytes` are
-    /// gauges summed over every live cache; `*_evictions_total` is a monotonic
-    /// lifetime counter (the collector differences it).
+    /// why not, and WHICH bound is responsible:
+    ///
+    /// - `*_byte_budget_evictions_total` climbing with `*_bytes` pinned near
+    ///   `*_budget_bytes`: the byte budget binds.
+    /// - `*_count_cap_evictions_total` climbing with `*_entries` at
+    ///   `*_count_cap`: the count cap (the hosted-set coverage target) binds —
+    ///   likely for the delta cache, whose key includes the peer's summary hash
+    ///   so one contract can hold several entries.
+    ///
+    /// `*_entries`, `*_bytes`, `*_budget_bytes` and `*_count_cap` are gauges
+    /// summed over every live cache (one shared pair per `RuntimePool`); the two
+    /// `*_evictions_total` are monotonic lifetime counters (the collector
+    /// differences them).
     #[serde(default)]
     pub contract_summary_cache_entries: Option<u64>,
     #[serde(default)]
@@ -878,7 +886,11 @@ pub(crate) struct RouterSnapshotInfo {
     #[serde(default)]
     pub contract_summary_cache_budget_bytes: Option<u64>,
     #[serde(default)]
-    pub contract_summary_cache_evictions_total: Option<u64>,
+    pub contract_summary_cache_count_cap: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_count_cap_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_byte_budget_evictions_total: Option<u64>,
     #[serde(default)]
     pub contract_delta_cache_entries: Option<u64>,
     #[serde(default)]
@@ -886,7 +898,11 @@ pub(crate) struct RouterSnapshotInfo {
     #[serde(default)]
     pub contract_delta_cache_budget_bytes: Option<u64>,
     #[serde(default)]
-    pub contract_delta_cache_evictions_total: Option<u64>,
+    pub contract_delta_cache_count_cap: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_count_cap_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_byte_budget_evictions_total: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -3238,11 +3254,15 @@ impl Router {
             contract_summary_cache_entries: None,
             contract_summary_cache_bytes: None,
             contract_summary_cache_budget_bytes: None,
-            contract_summary_cache_evictions_total: None,
+            contract_summary_cache_count_cap: None,
+            contract_summary_cache_count_cap_evictions_total: None,
+            contract_summary_cache_byte_budget_evictions_total: None,
             contract_delta_cache_entries: None,
             contract_delta_cache_bytes: None,
             contract_delta_cache_budget_bytes: None,
-            contract_delta_cache_evictions_total: None,
+            contract_delta_cache_count_cap: None,
+            contract_delta_cache_count_cap_evictions_total: None,
+            contract_delta_cache_byte_budget_evictions_total: None,
             broadcast_stream_failures_last_snapshot: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).

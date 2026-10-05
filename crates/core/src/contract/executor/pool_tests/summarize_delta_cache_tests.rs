@@ -1112,8 +1112,10 @@ async fn cache_occupancy_reaches_contract_exec_metrics() {
         after.delta.bytes,
         3 * (5 + CACHE_ENTRY_OVERHEAD_BYTES) as u64
     );
-    assert_eq!(after.summary.evictions_total, 0);
-    assert_eq!(after.delta.evictions_total, 0);
+    assert_eq!(after.summary.count_cap_evictions_total, 0);
+    assert_eq!(after.summary.byte_budget_evictions_total, 0);
+    assert_eq!(after.delta.count_cap_evictions_total, 0);
+    assert_eq!(after.delta.byte_budget_evictions_total, 0);
 
     // Dropping the executor withdraws its caches' contribution entirely.
     drop(exec);
@@ -1200,8 +1202,8 @@ async fn summary_cached_via_one_executor_is_a_hit_via_another() {
     let (mut e0, mut e1, _storage) = pool_pair(
         "shared_summary_hit",
         &op_manager,
-        new_summary_cache(1 << 20, None),
-        new_delta_cache(1 << 20, None),
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
     )
     .await;
     let key = put_state(&mut e0, "shared_summary_hit", vec![1, 2, 3]).await;
@@ -1229,13 +1231,13 @@ async fn summary_cached_via_one_executor_is_a_hit_via_another() {
     let (mut e0, mut e1, _storage) = pool_pair(
         "unshared_summary_miss",
         &op_manager,
-        new_summary_cache(1 << 20, None),
-        new_delta_cache(1 << 20, None),
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
     )
     .await;
     e1.set_shared_fast_path_caches(
-        new_summary_cache(1 << 20, None),
-        new_delta_cache(1 << 20, None),
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
     );
     let key = put_state(&mut e0, "unshared_summary_miss", vec![1, 2, 3]).await;
     let before = exec_counts(&op_manager);
@@ -1261,8 +1263,8 @@ async fn delta_cached_via_one_executor_is_a_hit_via_another() {
     let (mut e0, mut e1, _storage) = pool_pair(
         "shared_delta_hit",
         &op_manager,
-        new_summary_cache(1 << 20, None),
-        new_delta_cache(1 << 20, None),
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
     )
     .await;
     let key = put_state(&mut e0, "shared_delta_hit", vec![4, 5, 6]).await;
@@ -1292,8 +1294,8 @@ async fn state_change_via_another_executor_invalidates_shared_entries() {
     let (mut e0, mut e1, _storage) = pool_pair(
         "shared_invalidate",
         &op_manager,
-        new_summary_cache(1 << 20, None),
-        new_delta_cache(1 << 20, None),
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
     )
     .await;
     let state_a = vec![1u8, 1, 1];
@@ -1353,6 +1355,7 @@ async fn no_eviction_when_working_set_fits_the_aggregate_budget() {
         let (op_manager, _guards) = build_op_manager(id).await;
         let summary = new_summary_cache(
             budget,
+            budget,
             Some(
                 op_manager
                     .ring
@@ -1365,7 +1368,7 @@ async fn no_eviction_when_working_set_fits_the_aggregate_budget() {
             id,
             &op_manager,
             summary.clone(),
-            new_delta_cache(1 << 20, None),
+            new_delta_cache(1 << 20, 1 << 20, None),
         )
         .await;
         let mut keys = Vec::new();
@@ -1389,8 +1392,8 @@ async fn no_eviction_when_working_set_fits_the_aggregate_budget() {
             .ring
             .contract_exec_metrics()
             .fast_path_cache_snapshot()
-            .summary
-            .evictions_total;
+            .summary;
+        let evictions = evictions.count_cap_evictions_total + evictions.byte_budget_evictions_total;
         (
             after.summarize_wasm_calls - before.summarize_wasm_calls,
             evictions,
@@ -1426,9 +1429,11 @@ async fn shared_cache_budget_is_enforced_and_evictions_are_counted() {
     let budget = CAPACITY * MOCK_SUMMARY_WEIGHT;
     let (op_manager, _guards) = build_op_manager("shared_budget").await;
     let metrics = op_manager.ring.contract_exec_metrics();
-    let summary = new_summary_cache(budget, Some(metrics.summary_cache_gauges().clone()));
+    let summary = new_summary_cache(budget, budget, Some(metrics.summary_cache_gauges().clone()));
+    let delta_budget = CAPACITY * (2 + CACHE_ENTRY_OVERHEAD_BYTES);
     let delta = new_delta_cache(
-        CAPACITY * (2 + CACHE_ENTRY_OVERHEAD_BYTES),
+        delta_budget,
+        delta_budget,
         Some(metrics.delta_cache_gauges().clone()),
     );
     let (mut e0, mut e1, _storage) =
@@ -1454,7 +1459,110 @@ async fn shared_cache_budget_is_enforced_and_evictions_are_counted() {
     assert_eq!(snap.summary.entries, CAPACITY as u64);
     assert_eq!(snap.summary.bytes, budget as u64);
     assert_eq!(snap.summary.budget_bytes, budget as u64);
-    assert_eq!(snap.summary.evictions_total, (INSERTED - CAPACITY) as u64);
+    assert_eq!(
+        snap.summary.byte_budget_evictions_total,
+        (INSERTED - CAPACITY) as u64,
+        "the byte budget is what binds here, so every eviction is a byte eviction"
+    );
+    assert_eq!(snap.summary.count_cap_evictions_total, 0);
     assert_eq!(snap.delta.entries, CAPACITY as u64);
-    assert_eq!(snap.delta.evictions_total, (INSERTED - CAPACITY) as u64);
+    assert_eq!(
+        snap.delta.byte_budget_evictions_total,
+        (INSERTED - CAPACITY) as u64
+    );
+}
+
+/// The detector-WARM fast path across executors. Executor 0 caches the summary
+/// of state A. Executor 1 then writes state B and warms the shared detector
+/// with B's hash WITHOUT touching the summary cache (a delta call loads and
+/// hashes the state). Executor 0's next summarize therefore finds a warm
+/// detector (B) next to a cached entry for A: only the fast path's hash
+/// comparison stands between it and serving A's summary for state B.
+#[tokio::test(flavor = "current_thread")]
+async fn warm_detector_fast_path_rejects_entry_cached_for_an_older_state() {
+    let (op_manager, _guards) = build_op_manager("warm_detector_cross_exec").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "warm_detector_cross_exec",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let state_a = vec![5u8, 5, 5];
+    let state_b = vec![6u8, 6, 6, 6];
+    let key = put_state(&mut e0, "warm_detector_cross_exec", state_a.clone()).await;
+    let sa = e0.summarize_contract_state(key).await.expect("summarize A");
+    assert_eq!(sa.as_ref(), blake3::hash(&state_a).as_bytes());
+
+    e1.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(state_b.clone())),
+        RelatedContracts::default(),
+        Some(test_contract(b"warm_detector_cross_exec")),
+    )
+    .await
+    .expect("UPDATE B via e1");
+    // Warm the shared detector with B via executor 1, leaving the summary cache
+    // holding A's entry.
+    e1.get_contract_state_delta(key, StateSummary::from(vec![0u8; 4]))
+        .await
+        .expect("delta B via e1 warms the detector");
+    let b_hash = crate::wasm_runtime::state_hash(&WrappedState::new(state_b.clone()));
+    assert_eq!(
+        e0.state_store.cached_state_hash(&key),
+        Some(b_hash),
+        "precondition: executor 0 sees a WARM detector holding B's hash"
+    );
+
+    let before = exec_counts(&op_manager);
+    let sb = e0.summarize_contract_state(key).await.expect("summarize B");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        sb.as_ref(),
+        blake3::hash(&state_b).as_bytes(),
+        "the warm-detector fast path must not serve A's cached summary for B"
+    );
+    assert_eq!(after.summarize_fast_hits, before.summarize_fast_hits);
+    assert_eq!(after.summarize_wasm_calls - before.summarize_wasm_calls, 1);
+}
+
+/// The pool-shared cache refuses a single summary larger than its per-entry
+/// cap (one executor's budget) even though the aggregate budget could hold it,
+/// so it is recomputed rather than cached, and nothing resident is evicted.
+#[tokio::test(flavor = "current_thread")]
+async fn shared_cache_refuses_entry_above_the_per_entry_cap() {
+    let (op_manager, _guards) = build_op_manager("per_entry_cap").await;
+    let metrics = op_manager.ring.contract_exec_metrics();
+    // Aggregate holds plenty of mock summaries; the per-entry cap is just
+    // below one mock summary's counted weight, so every summary is "oversized".
+    let summary = new_summary_cache(
+        100 * MOCK_SUMMARY_WEIGHT,
+        MOCK_SUMMARY_WEIGHT - 1,
+        Some(metrics.summary_cache_gauges().clone()),
+    );
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "per_entry_cap",
+        &op_manager,
+        summary.clone(),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let key = put_state(&mut e0, "per_entry_cap", vec![1, 2, 3]).await;
+
+    let before = exec_counts(&op_manager);
+    e0.summarize_contract_state(key).await.expect("summarize 1");
+    e1.summarize_contract_state(key).await.expect("summarize 2");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        after.summarize_wasm_calls - before.summarize_wasm_calls,
+        2,
+        "an over-cap summary must not be cached, so both calls run the WASM"
+    );
+    assert_eq!(lock_fast_path_cache(&summary).len(), 0);
+    let snap = metrics.fast_path_cache_snapshot().summary;
+    assert_eq!(snap.entries, 0);
+    assert_eq!(
+        snap.count_cap_evictions_total + snap.byte_budget_evictions_total,
+        0
+    );
 }
