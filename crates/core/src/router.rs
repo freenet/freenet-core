@@ -29,7 +29,9 @@ use crate::ring::interest::{
 };
 use crate::ring::{Distance, Location, PeerKeyLocation, Ring};
 use crate::tracing::event_kind::STATE_SIZE_BUCKET_COUNT;
-pub(crate) use hierarchical::{Breakdown, MIN_CURVE_POINTS_FAILURE, MIN_CURVE_POINTS_LOG};
+pub(crate) use hierarchical::{
+    Breakdown, MIN_CURVE_POINTS_FAILURE, MIN_CURVE_POINTS_LOG, PeerOffset,
+};
 pub(crate) use isotonic_estimator::{
     AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
 };
@@ -1281,6 +1283,8 @@ pub struct HierarchicalCurves {
 }
 
 /// Per-peer routing data for the dashboard detail page.
+// TEMP(peer-page): read by the rebuilt peer page later in this branch.
+#[allow(dead_code)]
 pub(crate) struct PeerRoutingSnapshot {
     /// How the hierarchical estimator builds this peer's estimate for a
     /// contract at the peer's own location, per stage (failure, response time,
@@ -1298,6 +1302,35 @@ pub(crate) struct PeerRoutingSnapshot {
     pub transfer_rate_adjustment: Option<(f64, u64)>,
     /// Prediction at the peer's own location (distance ≈ 0).
     pub prediction_at_own_location: Option<RoutingPredictionInfo>,
+    /// What the hierarchical estimator has learned about this peer relative
+    /// to distance alone, per stage. See [`PeerOffset`].
+    pub offsets: [Option<PeerOffset>; 3],
+    /// This peer's observations in the router's isotonic windows (the last
+    /// 500 route events of each kind, all peers), not downsampled:
+    /// `(distance, outcome)`. `outcomes` is every outcome (success or failure),
+    /// `response_times` the timed ones in seconds, `transfer_speeds` the real
+    /// payload transfers in bytes/s.
+    pub window: PeerWindow,
+    /// The same, per operation type (`OpType::as_str`), from the per-op
+    /// windows. An op with no events about this peer is absent.
+    pub window_by_op: HashMap<&'static str, PeerWindow>,
+    /// Recent hierarchical response-time `(forecast, actual)` pairs about this
+    /// peer, seconds, out of the router-wide window of the last 200.
+    pub response_time_pairs: Vec<(f64, f64)>,
+    /// How often this peer was eligible for and chosen in real routing
+    /// decisions since the node started. `None` if it never was (or was
+    /// evicted). See [`PeerSelectionCounts`].
+    pub selection: Option<PeerSelection>,
+}
+
+/// One peer's observations in one set of the router's isotonic windows. See
+/// [`PeerRoutingSnapshot::window`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PeerWindow {
+    /// Outcomes (success or failure) about this peer in the failure window.
+    pub outcomes: usize,
+    pub response_times: Vec<(f64, f64)>,
+    pub transfer_speeds: Vec<(f64, f64)>,
 }
 
 /// # Usage
@@ -1353,6 +1386,10 @@ pub(crate) struct Router {
     /// for the candidate-window size. See [`SelectionRankStats`].
     #[serde(skip)]
     selection_ranks: SelectionRankStats,
+    /// Per-peer eligible and chosen counts for the dashboard. See
+    /// [`PeerSelectionCounts`].
+    #[serde(skip)]
+    peer_selections: PeerSelectionCounts,
     /// Cumulative outcome counts over every [`Self::add_event`], never
     /// windowed. See [`RouteOutcomeTotals`].
     #[serde(skip)]
@@ -1404,8 +1441,9 @@ pub(crate) struct RouteOutcomeTotals {
 
 impl Clone for Router {
     fn clone(&self) -> Self {
-        // Every model and measurement is copied. The selection-rank counters
-        // are atomics and not `Clone`, so the clone's start empty.
+        // Every model and measurement is copied, the per-peer selection counts
+        // included. The selection-rank counters are atomics and not `Clone`,
+        // so the clone's start empty.
         //
         // NOTE: this impl has **no production call site**. The
         // `*router.write() = Router::new(&history)` batch-reconstruction pattern
@@ -1431,6 +1469,7 @@ impl Clone for Router {
             transfer_time_error: self.transfer_time_error,
             recent_accuracy: self.recent_accuracy.clone(),
             selection_ranks: SelectionRankStats::default(),
+            peer_selections: self.peer_selections.clone(),
             outcome_totals: self.outcome_totals,
             route_events_discarded_unlocated: self.route_events_discarded_unlocated,
             #[cfg(test)]
@@ -1805,6 +1844,152 @@ impl SelectionRankSnapshot {
     }
 }
 
+/// How often each peer was a candidate in a routing decision, and how often it
+/// was the router's first choice, for the dashboard's per-peer page.
+///
+/// # What is counted
+///
+/// Only prediction-based decisions (the 50-event gate is open) that the caller
+/// marks as real routing decisions: the ring selections whose outcome is
+/// recorded as a route event (`DecisionLog::Joinable`). Connection
+/// maintenance, CONNECT forwarding and test probes also call the router, and
+/// counting them would credit a peer with requests it was never in line for.
+/// "Eligible" means inside the scored window (the `consider_n_closest_peers`
+/// closest candidates); "chosen" means ranked first, the peer the request goes
+/// to. `even_share` sums `1 / window` over the decisions a peer was eligible
+/// for: what it would have been chosen if the router picked uniformly within
+/// its windows, the baseline the avoided-peer reading compares against.
+///
+/// # Window and bound
+///
+/// Since the router was built, i.e. since the node started. The table holds at
+/// most `capacity` peers ([`hierarchical::peer_capacity`] of
+/// `max_connections`, the same headroom as the estimator's peer tables) and
+/// evicts the least-recently-eligible batch (`capacity / 64`) when full. Every
+/// decision restamps its window's entries, so a cap enforced by refusal would
+/// starve newcomers forever; see `.claude/rules/bug-prevention-patterns.md`.
+/// An evicted peer that returns starts again from zero; `evictions` counts
+/// the removals so a reader can tell that from a peer that was never seen.
+///
+/// Interior mutability because routing runs under the router's READ lock.
+/// The mutex is held for one window's worth of hash updates per decision.
+#[derive(Debug)]
+pub(crate) struct PeerSelectionCounts {
+    table: parking_lot::Mutex<PeerSelectionTable>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerSelectionTable {
+    entries: HashMap<PeerKeyLocation, PeerSelectionEntry>,
+    capacity: usize,
+    use_clock: u64,
+    evictions: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerSelectionEntry {
+    eligible: u64,
+    chosen: u64,
+    even_share: f64,
+    last_used: u64,
+}
+
+/// One peer's [`PeerSelectionCounts`], for the dashboard.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PeerSelection {
+    /// Decisions in which the peer was inside the scored window.
+    pub eligible: u64,
+    /// Of those, decisions in which it was ranked first.
+    pub chosen: u64,
+    /// Sum of `1 / window size` over those decisions.
+    pub even_share: f64,
+}
+
+impl PeerSelectionCounts {
+    fn new(capacity: usize) -> Self {
+        PeerSelectionCounts {
+            table: parking_lot::Mutex::new(PeerSelectionTable {
+                entries: HashMap::new(),
+                capacity: capacity.max(1),
+                use_clock: 0,
+                evictions: 0,
+            }),
+        }
+    }
+
+    /// Record one decision: every peer in `window` was eligible, `chosen` was
+    /// ranked first.
+    fn record(&self, window: &[&PeerKeyLocation], chosen: &PeerKeyLocation) {
+        if window.is_empty() {
+            return;
+        }
+        let share = 1.0 / window.len() as f64;
+        let mut table = self.table.lock();
+        table.use_clock += 1;
+        let stamp = table.use_clock;
+        for &peer in window {
+            if !table.entries.contains_key(peer) && table.entries.len() >= table.capacity {
+                table.evict_batch();
+            }
+            let entry = table.entries.entry(peer.clone()).or_default();
+            entry.eligible += 1;
+            entry.even_share += share;
+            entry.last_used = stamp;
+            if peer == chosen {
+                entry.chosen += 1;
+            }
+        }
+    }
+
+    fn get(&self, peer: &PeerKeyLocation) -> Option<PeerSelection> {
+        self.table
+            .lock()
+            .entries
+            .get(peer)
+            .map(|entry| PeerSelection {
+                eligible: entry.eligible,
+                chosen: entry.chosen,
+                even_share: entry.even_share,
+            })
+    }
+
+    fn evictions(&self) -> u64 {
+        self.table.lock().evictions
+    }
+}
+
+impl PeerSelectionTable {
+    /// Evict the least-recently-eligible `capacity / 64` peers (at least one).
+    /// A batch, so a table kept full by churn does not scan once per decision.
+    fn evict_batch(&mut self) {
+        let mut by_age: Vec<(u64, PeerKeyLocation)> = self
+            .entries
+            .iter()
+            .map(|(peer, entry)| (entry.last_used, peer.clone()))
+            .collect();
+        let batch = (self.capacity / 64).max(1).min(by_age.len());
+        if batch == 0 {
+            return;
+        }
+        if batch < by_age.len() {
+            by_age.select_nth_unstable_by_key(batch - 1, |(last_used, _)| *last_used);
+        }
+        for (_, peer) in by_age.into_iter().take(batch) {
+            if self.entries.remove(&peer).is_some() {
+                self.evictions += 1;
+            }
+        }
+    }
+}
+
+impl Clone for PeerSelectionCounts {
+    fn clone(&self) -> Self {
+        PeerSelectionCounts {
+            table: parking_lot::Mutex::new(self.table.lock().clone()),
+        }
+    }
+}
+
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
         warn_about_routing_flags();
@@ -2033,6 +2218,9 @@ impl Router {
             transfer_time_error: PairedErrorTracker::default(),
             recent_accuracy: RecentAccuracy::default(),
             selection_ranks: SelectionRankStats::default(),
+            peer_selections: PeerSelectionCounts::new(hierarchical::peer_capacity(
+                Ring::DEFAULT_MAX_CONNECTIONS,
+            )),
             outcome_totals: RouteOutcomeTotals::default(),
             route_events_discarded_unlocated: discarded_unlocated,
             #[cfg(test)]
@@ -2060,6 +2248,8 @@ impl Router {
     pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self.hierarchical = hierarchical::HierarchicalRouting::new(max_connections);
+        self.peer_selections =
+            PeerSelectionCounts::new(hierarchical::peer_capacity(max_connections));
         self
     }
 
@@ -2158,6 +2348,7 @@ impl Router {
             now,
         );
         let forecasts = self.score_hierarchical_layer(
+            &event.peer,
             baseline,
             observed,
             ObservedTiming::of(&event.outcome),
@@ -2524,6 +2715,7 @@ impl Router {
     /// read from (`.claude/rules/ring.md`).
     fn score_hierarchical_layer(
         &mut self,
+        peer: &PeerKeyLocation,
         baseline: Option<IsotonicBaseline>,
         observed: hierarchical::Observed,
         actual: ObservedTiming,
@@ -2538,24 +2730,27 @@ impl Router {
         let floor_time = |seconds: f64| seconds.max(hierarchical::MIN_RESPONSE_SECS);
         let hierarchical_time = hierarchical.time_to_response_start_secs.map(floor_time);
         let isotonic_time = baseline.timing.time_to_response_start_secs.map(floor_time);
+        let tag = peer_tag(peer);
         if let Some(probability) = observed.failure {
             self.failure_skill.record(probability, actual_failure);
             self.recent_accuracy
                 .failure
-                .push(probability, actual_failure);
+                .push(probability, actual_failure, tag);
         }
         if let (Some(actual), Some(forecast)) = (
             actual.response_secs,
             hierarchical.time_to_response_start_secs,
         ) {
-            self.recent_accuracy.response_time.push(forecast, actual);
+            self.recent_accuracy
+                .response_time
+                .push(forecast, actual, tag);
         }
         if let (Some((bytes, seconds)), Some(forecast)) =
             (actual.transfer, hierarchical.transfer_speed_bps)
         {
             self.recent_accuracy
                 .transfer_speed
-                .push(forecast, bytes / seconds);
+                .push(forecast, bytes / seconds, tag);
         }
         // Same population for both models: an event counts only when both
         // forecast it and it carries the measurement.
@@ -2779,7 +2974,7 @@ impl Router {
         k: usize,
     ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
         let (selected, decision, _) =
-            self.select_k_best_peers_capturing(peers, target_location, k, false);
+            self.select_k_best_peers_capturing(peers, target_location, k, false, false);
         (selected, decision)
     }
 
@@ -2793,12 +2988,17 @@ impl Router {
     /// [`dataset`]'s "Candidate sets". Without `capture` the path is the plain
     /// routing decision. Building and sending the record is left to the
     /// caller, after the lock is released.
+    ///
+    /// `routes` says the caller routes by this selection and records its
+    /// outcome as a route event (`DecisionLog::Joinable`); only those
+    /// decisions are counted into [`PeerSelectionCounts`].
     pub(crate) fn select_k_best_peers_capturing<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: Location,
         k: usize,
         capture: bool,
+        routes: bool,
     ) -> (
         Vec<&'a PeerKeyLocation>,
         RoutingDecisionInfo,
@@ -2955,9 +3155,12 @@ impl Router {
 
             // Record where the winner sat in distance order, so the cost of the
             // candidate-window truncation can be measured rather than guessed.
-            if let Some((distance_rank, _, _, _)) = scored.first() {
+            if let Some((distance_rank, winner, _, _)) = scored.first() {
                 self.selection_ranks
                     .record(*distance_rank, closest.len(), candidates_available);
+                if routes {
+                    self.peer_selections.record(&closest, winner);
+                }
             }
 
             let strategy = if fallback_count == 0 {
@@ -3358,6 +3561,25 @@ impl Router {
             .and_then(|loc| self.predict_routing_outcome(peer, loc).ok())
             .map(RoutingPredictionInfo::from);
 
+        let window = |failure: Option<&IsotonicEstimator>,
+                      response: Option<&IsotonicEstimator>,
+                      transfer: Option<&IsotonicEstimator>| PeerWindow {
+            outcomes: failure.map_or(0, |e| e.points_for_peer(peer).len()),
+            response_times: response.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+            transfer_speeds: transfer.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+        };
+        let window_by_op = [OpType::Get, OpType::Put, OpType::Update, OpType::Subscribe]
+            .iter()
+            .filter_map(|op| {
+                let found = window(
+                    self.per_op_failure.get(op),
+                    self.per_op_response_time.get(op),
+                    self.per_op_transfer_rate.get(op),
+                );
+                (found != PeerWindow::default()).then(|| (op.as_str(), found))
+            })
+            .collect();
+
         PeerRoutingSnapshot {
             breakdown,
             peer_curves: self.hierarchical.peer_curves(Some(peer), now),
@@ -3365,7 +3587,32 @@ impl Router {
             response_time_adjustment: adjustment(&self.response_start_time_estimator),
             transfer_rate_adjustment: adjustment(&self.transfer_rate_estimator),
             prediction_at_own_location: prediction,
+            offsets: self.hierarchical.peer_offsets(peer, now),
+            window: window(
+                Some(&self.failure_estimator),
+                Some(&self.response_start_time_estimator),
+                Some(&self.transfer_rate_estimator),
+            ),
+            window_by_op,
+            response_time_pairs: self.recent_accuracy.response_time.for_peer(peer_tag(peer)),
+            selection: self.peer_selections.get(peer),
         }
+    }
+
+    /// [`PeerRoutingSnapshot::offsets`] alone, for every connected peer on the
+    /// dashboard's comparison charts. `O(1)` per peer.
+    // TEMP(peer-page): read by the rebuilt peer page later in this branch.
+    #[allow(dead_code)]
+    pub(crate) fn peer_offsets(&self, peer: &PeerKeyLocation) -> [Option<PeerOffset>; 3] {
+        self.hierarchical
+            .peer_offsets(peer, self.estimator_clock.hours())
+    }
+
+    /// Peers evicted from the per-peer selection table since the node started.
+    // TEMP(peer-page): read by the routing page later in this branch.
+    #[allow(dead_code)]
+    pub(crate) fn peer_selection_evictions(&self) -> u64 {
+        self.peer_selections.evictions()
     }
 
     /// Whether we have enough routing events to attempt prediction-based selection.
@@ -3458,23 +3705,52 @@ pub(crate) const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1e-6;
 /// Recent forecast/outcome pairs kept per stage for the accuracy panel.
 const RECENT_PAIRS: usize = 200;
 
-/// A bounded window of recent `(forecast, outcome)` pairs.
+/// A compact identity for the peer a recent pair is about: a hash of its
+/// [`PeerKeyLocation`], so the window holds eight bytes per pair instead of a
+/// public key. A collision would attribute another peer's pair to this one;
+/// at 200 pairs over a 64-bit hash that is not a practical concern.
+///
+/// `DefaultHasher::new()` uses fixed keys, so the tag is stable for the life
+/// of the process, which is all the window (runtime-only, never persisted)
+/// needs.
+fn peer_tag(peer: &PeerKeyLocation) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    peer.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A bounded window of recent `(forecast, outcome)` pairs, each tagged with
+/// the peer it was about ([`peer_tag`]). Runtime-only: the snapshot carries
+/// the untagged pairs, so `RouterSnapshotInfo`'s layout is unchanged.
 #[derive(Debug, Clone, Default)]
-struct RecentPairs(std::collections::VecDeque<(f64, f64)>);
+struct RecentPairs(std::collections::VecDeque<(f64, f64, u64)>);
 
 impl RecentPairs {
-    fn push(&mut self, forecast: f64, outcome: f64) {
+    fn push(&mut self, forecast: f64, outcome: f64, peer: u64) {
         if !(forecast.is_finite() && outcome.is_finite()) {
             return;
         }
         if self.0.len() >= RECENT_PAIRS {
             self.0.pop_front();
         }
-        self.0.push_back((forecast, outcome));
+        self.0.push_back((forecast, outcome, peer));
     }
 
     fn to_vec(&self) -> Vec<(f64, f64)> {
-        self.0.iter().copied().collect()
+        self.0
+            .iter()
+            .map(|&(forecast, outcome, _)| (forecast, outcome))
+            .collect()
+    }
+
+    /// The pairs about one peer, oldest first.
+    fn for_peer(&self, peer: u64) -> Vec<(f64, f64)> {
+        self.0
+            .iter()
+            .filter(|&&(_, _, tag)| tag == peer)
+            .map(|&(forecast, outcome, _)| (forecast, outcome))
+            .collect()
     }
 }
 
@@ -4064,6 +4340,7 @@ mod tests {
         feed_mixed_traffic(&mut router, 300);
         let before = router.response_time_error.count;
         let forecasts = router.score_hierarchical_layer(
+            &PeerKeyLocation::random(),
             Some(IsotonicBaseline {
                 global_failure: 0.1,
                 adjusted_failure: 0.1,
@@ -5207,6 +5484,7 @@ mod tests {
                 Location::new(0.3),
                 candidates.len(),
                 true,
+                false,
             );
             assert!(matches!(
                 decision.strategy,
@@ -5256,6 +5534,7 @@ mod tests {
             Location::new(0.3),
             candidates.len(),
             true,
+            false,
         );
         let captured = captured.expect("a prediction-based decision is captured");
         assert!(
@@ -6283,7 +6562,7 @@ mod tests {
             let _flag = force_isotonic_fallback(!acting_hierarchical);
             let k = 3;
             let (selected, decision, capture) =
-                router.select_k_best_peers_capturing(peers.iter(), contract, k, true);
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, true, false);
             let capture = capture.expect("a prediction-based decision is captured");
             assert_eq!(capture.k, k);
             assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
@@ -6328,7 +6607,7 @@ mod tests {
                 },
             ));
             let (uncaptured, _, none) =
-                router.select_k_best_peers_capturing(peers.iter(), contract, k, false);
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, false, false);
             assert!(none.is_none(), "nothing is captured when not asked");
             assert_eq!(
                 selected, uncaptured,
@@ -6496,7 +6775,7 @@ mod tests {
         offered.push(unknown.clone());
 
         let (_, decision, capture) =
-            router.select_k_best_peers_capturing(offered.iter(), contract, 2, true);
+            router.select_k_best_peers_capturing(offered.iter(), contract, 2, true, false);
         let capture = capture.expect("prediction-based with some fallback");
         assert!(matches!(
             decision.strategy,
@@ -6568,7 +6847,7 @@ mod tests {
             .collect();
         let unlearned = Router::new(&history);
         let (_, _, capture) =
-            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true);
+            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true, false);
         for candidate in capture.expect("prediction-based").candidates {
             assert_eq!(
                 candidate.hierarchical_stages,
@@ -9485,5 +9764,271 @@ mod tests {
                  regression"
             );
         }
+    }
+
+    // ── Per-peer dashboard data (peer page) ─────────────────────────────────
+
+    /// Twelve peers, forty rounds each through `add_event` on a frozen clock:
+    /// `peers[0]` replies four times slower than the rest, `peers[1]` fails
+    /// every other request, the others fail rarely. Timed replies carry no
+    /// payload, so only the failure and response-time stages warm.
+    fn peer_offset_router() -> (Router, Vec<PeerKeyLocation>) {
+        let mut router = warm_hierarchical_router(&[]);
+        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        for round in 0..40u64 {
+            for (index, peer) in peers.iter().enumerate() {
+                let jitter_ms = 100 + (index as u64 * 7 + round * 13) % 50;
+                let outcome = if (index == 1 && round % 2 == 0) || (round + index as u64) % 37 == 0
+                {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(if index == 0 {
+                            jitter_ms * 4
+                        } else {
+                            jitter_ms
+                        }),
+                        payload_size: 0,
+                        payload_transfer_time: Duration::ZERO,
+                    }
+                };
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::random(),
+                    outcome,
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        (router, peers)
+    }
+
+    /// A peer the estimator knows nothing about sits exactly on the
+    /// distance-alone line; a peer with a clear record sits off it in the
+    /// direction of that record. The offset is relative to distance alone,
+    /// not the raw posterior, so an unknown peer cannot read as "faster".
+    #[test]
+    fn peer_offsets_measure_each_peer_against_distance_alone() {
+        let (router, peers) = peer_offset_router();
+
+        let unknown = router.peer_offsets(&PeerKeyLocation::random());
+        for (stage, offset) in unknown.iter().take(2).enumerate() {
+            let offset = offset.expect("a warm stage reports an unknown peer");
+            assert_eq!(
+                (offset.offset, offset.evidence, offset.weight),
+                (0.0, 0.0, 0.0),
+                "stage {stage}: a peer with no record must sit on the distance-alone line"
+            );
+        }
+        assert!(
+            unknown[2].is_none(),
+            "the transfer stage never warmed, so it has nothing to report"
+        );
+
+        let slow = router.peer_offsets(&peers[0])[1].expect("response-time stage is warm");
+        assert!(
+            slow.offset.exp() > 2.0 && slow.weight > 0.5 && slow.evidence > 20.0,
+            "a peer replying 4x slower must read well above distance alone: {slow:?}"
+        );
+        let typical = router.peer_offsets(&peers[5])[1].expect("response-time stage is warm");
+        assert!(
+            typical.offset.exp() < 1.5 && typical.offset.exp() > 1.0 / 1.5,
+            "an ordinary peer stays near distance alone: {typical:?}"
+        );
+        let flaky = router.peer_offsets(&peers[1])[0].expect("failure stage is warm");
+        let steady = router.peer_offsets(&peers[5])[0].expect("failure stage is warm");
+        assert!(
+            flaky.offset > 0.1 && flaky.offset > steady.offset + 0.1,
+            "a peer failing half its requests must read as more likely to fail: \
+             flaky {flaky:?}, steady {steady:?}"
+        );
+
+        // The snapshot carries the same offsets.
+        assert_eq!(
+            router.peer_snapshot(&peers[0]).offsets,
+            router.peer_offsets(&peers[0])
+        );
+    }
+
+    #[test]
+    fn peer_offsets_are_absent_before_any_stage_has_a_curve() {
+        let router = warm_hierarchical_router(&[]);
+        assert_eq!(
+            router.peer_offsets(&PeerKeyLocation::random()),
+            [None, None, None]
+        );
+    }
+
+    /// The per-peer window holds exactly this peer's observations, split per
+    /// operation, with no other peer's mixed in and nothing downsampled.
+    #[test]
+    fn peer_snapshot_window_holds_only_this_peers_observations() {
+        let mut router = Router::new(&[]);
+        let peer = PeerKeyLocation::random();
+        let other = PeerKeyLocation::random();
+        let timed = |ms: u64, bytes: usize| RouteOutcome::Success {
+            time_to_response_start: Duration::from_millis(ms),
+            payload_size: bytes,
+            payload_transfer_time: Duration::from_millis(if bytes > 0 { 40 } else { 0 }),
+        };
+        let mut events = Vec::new();
+        for index in 0..5 {
+            events.push((peer.clone(), timed(100 + index, 4000), OpType::Get));
+        }
+        events.push((peer.clone(), RouteOutcome::Failure, OpType::Get));
+        events.push((peer.clone(), RouteOutcome::Failure, OpType::Get));
+        for _ in 0..3 {
+            events.push((peer.clone(), RouteOutcome::SuccessUntimed, OpType::Put));
+        }
+        for index in 0..30 {
+            events.push((other.clone(), timed(300 + index, 0), OpType::Subscribe));
+        }
+        for (who, outcome, op) in events {
+            router.add_event(RouteEvent {
+                peer: who,
+                contract_location: Location::random(),
+                outcome,
+                op_type: Some(op),
+            });
+        }
+
+        let snapshot = router.peer_snapshot(&peer);
+        assert_eq!(snapshot.window.outcomes, 10);
+        assert_eq!(snapshot.window.response_times.len(), 5);
+        assert!(
+            snapshot
+                .window
+                .response_times
+                .iter()
+                .all(|&(_, seconds)| seconds < 0.2),
+            "only this peer's replies, none of the other peer's 300 ms ones: {:?}",
+            snapshot.window.response_times
+        );
+        assert_eq!(snapshot.window.transfer_speeds.len(), 5);
+        let get = &snapshot.window_by_op["GET"];
+        assert_eq!((get.outcomes, get.response_times.len()), (7, 5));
+        let put = &snapshot.window_by_op["PUT"];
+        assert_eq!((put.outcomes, put.response_times.len()), (3, 0));
+        assert!(
+            !snapshot.window_by_op.contains_key("SUBSCRIBE"),
+            "an op with no event about this peer is absent"
+        );
+        assert_eq!(router.peer_snapshot(&other).window.outcomes, 30);
+    }
+
+    /// The recent response-time pairs are attributed to the peer each was
+    /// about, while the router-wide list stays untagged and complete.
+    #[test]
+    fn response_time_pairs_are_attributed_to_their_peer() {
+        let (mut router, peers) = peer_offset_router();
+        let marked = &peers[3];
+        for _ in 0..10 {
+            router.add_event(RouteEvent {
+                peer: marked.clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_secs(7),
+                    payload_size: 0,
+                    payload_transfer_time: Duration::ZERO,
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+        let pairs = router.peer_snapshot(marked).response_time_pairs;
+        let seven = pairs.iter().filter(|&&(_, actual)| actual == 7.0).count();
+        assert_eq!(
+            seven, 10,
+            "every 7 s reply is attributed to its peer: {pairs:?}"
+        );
+        let others = router.peer_snapshot(&peers[4]).response_time_pairs;
+        assert!(!others.is_empty(), "the other peers' pairs are kept too");
+        assert!(
+            others.iter().all(|&(_, actual)| actual < 1.0),
+            "no 7 s reply is attributed to another peer: {others:?}"
+        );
+        let all = router.snapshot().hierarchical_response_time_pairs;
+        assert_eq!(
+            all.iter().filter(|&&(_, actual)| actual == 7.0).count(),
+            10,
+            "the router-wide list still holds every pair"
+        );
+    }
+
+    /// Only decisions the caller routes by count, every candidate in the
+    /// scored window is eligible, and only the first-ranked one is chosen.
+    #[test]
+    fn peer_selection_counts_only_real_routing_decisions() {
+        let (router, peers) = peer_offset_router();
+        let window: Vec<PeerKeyLocation> = peers[..5].to_vec();
+        let target = Location::new(0.3);
+
+        for _ in 0..3 {
+            router.select_k_best_peers_with_telemetry(window.iter(), target, 1);
+            router.select_k_best_peers_capturing(window.iter(), target, 2, true, false);
+        }
+        assert!(
+            window
+                .iter()
+                .all(|peer| router.peer_snapshot(peer).selection.is_none()),
+            "probes and decisions that do not route must not be counted"
+        );
+
+        let mut chosen = Vec::new();
+        for _ in 0..20 {
+            let (selected, _, _) =
+                router.select_k_best_peers_capturing(window.iter(), target, 2, false, true);
+            chosen.push(selected[0].clone());
+        }
+        let mut chosen_total = 0;
+        for peer in &window {
+            let selection = router
+                .peer_snapshot(peer)
+                .selection
+                .expect("every peer in the window was eligible");
+            assert_eq!(selection.eligible, 20, "{peer:?}");
+            assert!(
+                (selection.even_share - 4.0).abs() < 1e-9,
+                "20 decisions over 5"
+            );
+            assert_eq!(
+                selection.chosen as usize,
+                chosen.iter().filter(|c| *c == peer).count(),
+                "chosen counts only the first-ranked peer, not the second of k = 2"
+            );
+            chosen_total += selection.chosen;
+        }
+        assert_eq!(chosen_total, 20, "exactly one peer is chosen per decision");
+        assert!(
+            router.peer_snapshot(&peers[5]).selection.is_none(),
+            "peers[5] was never in the window, so it has no counts"
+        );
+    }
+
+    /// The table is bounded by evicting the least-recently-eligible peers, a
+    /// batch at a time, and counts what it evicted; a clone keeps the counts.
+    #[test]
+    fn peer_selection_table_evicts_the_stalest_peers_and_counts_them() {
+        let counts = PeerSelectionCounts::new(64);
+        let peers: Vec<PeerKeyLocation> = (0..80).map(|_| PeerKeyLocation::random()).collect();
+        // peers[0] stays fresh; the rest arrive one decision each.
+        for peer in &peers[1..] {
+            counts.record(&[&peers[0], peer], &peers[0]);
+        }
+        let table = counts.table.lock();
+        assert!(table.entries.len() <= 64, "{} entries", table.entries.len());
+        assert_eq!(table.evictions, 80 - 64, "one per newcomer past the cap");
+        drop(table);
+        assert_eq!(counts.evictions(), 16);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| (s.eligible, s.chosen)),
+            Some((79, 79)),
+            "a peer in every decision is never the stalest"
+        );
+        assert!(
+            counts.get(&peers[1]).is_none(),
+            "the oldest newcomer went first"
+        );
+        assert!(counts.get(&peers[79]).is_some());
+        assert_eq!(counts.clone().get(&peers[0]), counts.get(&peers[0]));
     }
 }

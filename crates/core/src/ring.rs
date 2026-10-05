@@ -4140,6 +4140,7 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
         let log = self.candidate_log_for(log_as);
         // The router read lock is held across candidate gathering and
         // selection, as before candidate logging existed; it is released
@@ -4153,6 +4154,7 @@ impl Ring {
                     target,
                     1,
                     log.as_ref().is_some_and(|(log, _)| log.capture),
+                    routes,
                 );
                 drop(router);
                 if let Some((log, op)) = log {
@@ -4321,12 +4323,14 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
         let log = self.candidate_log_for(log_as);
         let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
             candidates.iter(),
             target_location,
             k,
             log.as_ref().is_some_and(|(log, _)| log.capture),
+            routes,
         );
         // `selected` and `capture` borrow from `candidates`, not from the
         // router guard, so the read lock is released at the end of the

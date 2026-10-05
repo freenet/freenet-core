@@ -3100,6 +3100,26 @@ impl<K: Hash + Eq + Clone> Stage<K> {
             .collect()
     }
 
+    /// What the stage has learned about `peer` relative to distance alone. See
+    /// [`PeerOffset`]. `None` until the stage has a curve and its first
+    /// variance components, when there is nothing for any peer to differ from.
+    ///
+    /// A peer the stage holds no record of (never seen, or evicted) gets
+    /// `Some` with offset, evidence and weight all exactly 0: routing predicts
+    /// it from distance alone, so it sits on that line rather than being
+    /// missing from it. `O(1)`: a hash lookup and the selected horizon's
+    /// arithmetic, the same work as [`Self::peer_curve`] minus the sampling.
+    pub(crate) fn peer_offset(&self, peer: &K, now: f64) -> Option<PeerOffset> {
+        self.curve.as_ref()?;
+        let now = self.effective_time(now);
+        let steps = self.levels[self.selected()].residual_steps(self.peers.lookup(peer), 0, now)?;
+        Some(PeerOffset {
+            offset: steps.after_peer.mean - steps.after_root.mean,
+            evidence: steps.peer_evidence,
+            weight: steps.peer_weight,
+        })
+    }
+
     pub(crate) fn diagnostics(&self) -> StageDiagnostics {
         StageDiagnostics {
             window_events: self.sorted.len() + self.fresh.len(),
@@ -3302,6 +3322,30 @@ impl Breakdown {
             estimate,
         }
     }
+}
+
+/// One stage's learned difference between a peer and distance alone, for the
+/// dashboard.
+///
+/// "Distance alone" is what the stage predicts for a peer it holds no record
+/// of: the distance curve plus the all-peers level, which is
+/// [`HierarchicalRouting::peer_curves`]`(None, ..)`. `offset` is how far this
+/// peer's own level moved the posterior from there, so it is constant across
+/// distance and a peer predicted from distance alone has an offset of exactly
+/// 0. Band effects and the failure stage's contract term are left out, as they
+/// are from the peer curves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PeerOffset {
+    /// On the stage's own scale: a probability difference for failure, a
+    /// natural-log difference for the timing stages (so `exp(offset)` is the
+    /// factor on the median response time or transfer speed).
+    pub offset: f64,
+    /// Kish effective sample size behind this peer's own mean.
+    pub evidence: f64,
+    /// Share of the peer's own mean the estimate adopted, in `[0, 1)`. Below
+    /// one half, distance alone still outweighs the peer's own record. Zero
+    /// for every peer while the stage measures no spread between peers.
+    pub weight: f64,
 }
 
 /// What the estimator forecast for an event before learning it.
@@ -3714,6 +3758,20 @@ impl HierarchicalRouting {
                     (speed.is_finite() && speed > 0.0).then_some((distance, speed))
                 })
                 .collect(),
+        ]
+    }
+
+    /// [`Stage::peer_offset`] for every stage, at estimator time `time`
+    /// (hours): `[failure, response time, transfer speed]`.
+    pub(crate) fn peer_offsets(
+        &self,
+        peer: &PeerKeyLocation,
+        time: f64,
+    ) -> [Option<PeerOffset>; 3] {
+        [
+            self.failure.peer_offset(peer, time),
+            self.response_time.peer_offset(peer, time),
+            self.transfer_speed.peer_offset(peer, time),
         ]
     }
 

@@ -960,6 +960,17 @@ impl IsotonicEstimator {
             })
             .collect()
     }
+
+    /// Every retained `(distance, outcome)` observation about `peer`, in
+    /// insertion order and NOT downsampled, for the dashboard's per-peer
+    /// scatter. Linear in the window (at most `MAX_REGRESSION_POINTS`).
+    pub(crate) fn points_for_peer(&self, peer: &PeerKeyLocation) -> Vec<(f64, f64)> {
+        self.raw_events
+            .iter()
+            .filter(|event| &event.peer == peer)
+            .map(|event| (event.route_distance().as_f64(), event.result))
+            .collect()
+    }
 }
 
 /// The global regression's input window, held in exactly the order
