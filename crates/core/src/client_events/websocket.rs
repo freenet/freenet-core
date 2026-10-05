@@ -1,6 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -37,6 +39,12 @@ pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
 /// interval that prevents most idle timeouts while not creating excessive
 /// overhead.
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Most bytes one read syscall on a client WebSocket takes, and so the most
+/// tungstenite zero-fills before each read attempt (see `websocket_commands`).
+/// 16 KiB holds any ordinary request in one read; larger frames just take more
+/// reads into a buffer already reserved at their full length.
+const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Per-client rate limiter for delegate operations.
 ///
@@ -191,7 +199,8 @@ use freenet_stdlib::{
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
 use headers::Header;
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
+use tokio_stream::StreamMap;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -1297,7 +1306,15 @@ async fn websocket_commands(
     // 100MB limit: WASM contract uploads can be very large and the default
     // ~64KB would reject them. Streaming chunks individual responses but the
     // initial PUT still arrives as a single WebSocket message.
+    //
+    // Read buffer: tungstenite's `FrameCodec::read_in` zero-fills the read
+    // buffer up to `read_buffer_size` before EVERY read attempt, including
+    // ones that return WouldBlock, so the 128 KiB default cost a 128 KiB memset
+    // per poll of the connection (2.5% of node CPU on a hosted peer, #5795).
+    // The setting only caps how much one read syscall takes: a frame's full
+    // length is still reserved up front, so large messages are unaffected.
     ws.max_message_size(100 * 1024 * 1024)
+        .read_buffer_size(WEBSOCKET_READ_BUFFER_SIZE)
         .on_upgrade(on_upgrade)
 }
 
@@ -1368,8 +1385,9 @@ async fn websocket_interface(
     if let (Some(ctx), Some(dir)) = (user_context.as_ref(), activity_secrets_dir.as_ref()) {
         stamp_activity(dir, ctx);
     }
-    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    // Subscription notification receivers for this connection. Owned by this
+    // task alone (no lock) and polled event-driven from the select! below.
+    let mut listeners = SubscriptionListeners::default();
 
     // ReassemblyBuffer evicts incomplete streams after STREAM_TTL (60s) via
     // evict_stale(), called on every receive_chunk(). Concurrent streams are
@@ -1443,36 +1461,17 @@ async fn websocket_interface(
     ping_interval.tick().await;
 
     loop {
-        let contract_updates_cp = contract_updates.clone();
-        let listeners_task = async move {
-            loop {
-                let mut lock = contract_updates_cp.lock().await;
-                let active_listeners = &mut *lock;
-                for _ in 0..active_listeners.len() {
-                    if let Some((key, mut listener)) = active_listeners.pop_front() {
-                        match listener.try_recv() {
-                            Ok(r) => {
-                                active_listeners.push_back((key, listener));
-                                return Ok::<_, anyhow::Error>(r);
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                active_listeners.push_back((key, listener));
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                tracing::debug!(contract = %key, "listener removed");
-                            }
-                        }
-                    }
-                }
-                std::mem::drop(lock);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
         // IMPORTANT: Only cancellation-safe futures (recv, next, tick) go inside the
         // select futures below. Processing functions (process_client_request,
         // process_host_response) run in branch handlers AFTER the select resolves,
-        // so they cannot be cancelled by other branches.
+        // so they cannot be cancelled by other branches. `listeners.next()` is
+        // cancel-safe too: it only polls `mpsc::Receiver::poll_recv`, which never
+        // loses a message when the future is dropped before completing.
+        //
+        // Every branch is event-driven (woken by its own waker), so an idle
+        // connection does not wake at all between pings. Do NOT reintroduce a
+        // timer-polled branch here: each loop pass re-polls `client_stream`, and
+        // every such poll costs a read-buffer memset in tungstenite (#5795).
         //
         // NOTE: Do NOT add `biased;` here. Biased select polls branches in declaration
         // order, which starves host responses, subscription notifications, and pings
@@ -1544,18 +1543,15 @@ async fn websocket_interface(
                 };
                 if let Some(NewSubscription { key, callback }) = msg {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
-                    let active_listeners = &mut *contract_updates.lock().await;
-                    active_listeners.push_back((key, callback));
+                    listeners.insert(key, callback);
                 }
             }
-            response = listeners_task => {
-                let response = match response {
-                    Ok(r) => r,
-                    Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
-                        return Err(err);
-                    }
-                };
+            // Guarded so an empty map (whose `next()` resolves to `None` at once)
+            // is not polled. When the last listener closes, `next()` yields
+            // `None`, the pattern does not match, and select! just disables this
+            // branch for the current pass: a closed listener never ends the
+            // connection.
+            Some(response) = listeners.next(), if !listeners.is_empty() => {
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
@@ -1737,6 +1733,71 @@ struct NewSubscription {
     /// delegate app-message routing #3275, a delegate key). Logging only.
     key: String,
     callback: mpsc::Receiver<HostResult>,
+}
+
+/// The subscription notification receivers of one WebSocket connection.
+///
+/// Polled as a single event-driven stream from the connection's select! loop,
+/// so a notification wakes the connection task directly instead of waiting for
+/// a timer poll. Entries are keyed by a per-connection counter rather than by
+/// their label, because one connection may hold several receivers for the same
+/// contract (each subscribe request gets its own channel) and every one of them
+/// must keep delivering. A receiver whose sender is gone is dropped from the
+/// map once its buffered messages have been delivered.
+#[derive(Default)]
+struct SubscriptionListeners {
+    next_id: u64,
+    streams: StreamMap<u64, SubscriptionListener>,
+}
+
+impl SubscriptionListeners {
+    fn insert(&mut self, label: String, rx: mpsc::Receiver<HostResult>) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.streams.insert(id, SubscriptionListener { label, rx });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Next notification from any listener; `None` once no listener is left.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe: it only polls `mpsc::Receiver::poll_recv`, so dropping the
+    /// future before it completes loses no message.
+    async fn next(&mut self) -> Option<HostResult> {
+        self.streams
+            .next()
+            .await
+            .map(|(_, notification)| notification)
+    }
+}
+
+/// One subscription's notification receiver, as a stream that logs its own
+/// removal (the map drops an ended stream without telling its owner).
+struct SubscriptionListener {
+    label: String,
+    rx: mpsc::Receiver<HostResult>,
+}
+
+impl futures::Stream for SubscriptionListener {
+    type Item = HostResult;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<HostResult>> {
+        let this = self.get_mut();
+        let polled = this.rx.poll_recv(cx);
+        if let Poll::Ready(None) = polled {
+            tracing::debug!(contract = %this.label, "listener removed");
+        }
+        polled
+    }
 }
 
 struct ConnectionState {
