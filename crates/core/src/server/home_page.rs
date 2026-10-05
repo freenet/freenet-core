@@ -1562,13 +1562,12 @@ mod tests {
         );
     }
 
-    /// The network-wide routing page is reachable from the home dashboard.
+    /// The network-wide routing page is reachable from the home dashboard,
+    /// even on a node with no peers yet (the status card always renders once
+    /// the node is up; the peers card does not).
     #[test]
-    fn peers_card_links_to_the_routing_page() {
-        let mut snap = base_snapshot();
-        snap.open_connections = 1;
-        snap.peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
-        let html = build_peers_card(&Some(snap));
+    fn status_card_links_to_the_routing_page() {
+        let html = build_status_card(&Some(base_snapshot()));
         assert!(html.contains(r#"href="/routing""#), "{html}");
     }
 

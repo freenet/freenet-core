@@ -286,13 +286,6 @@ main {
   color: var(--text-secondary);
   font-family: var(--font-mono);
 }
-.card-header-aside {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 1rem;
-  align-items: baseline;
-  justify-content: flex-end;
-}
 .card-link {
   font-size: 0.8rem;
   color: var(--accent-primary);

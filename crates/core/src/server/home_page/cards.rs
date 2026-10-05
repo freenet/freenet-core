@@ -473,7 +473,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
 
     format!(
         r#"<div class="card">
-            <h2>Connection Status</h2>
+            <div class="card-header"><h2>Connection Status</h2><a class="card-link" href="/routing">Routing model &rarr;</a></div>
             {health_banner}
             {get_success}
             {ring_stats_html}
@@ -701,7 +701,7 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
 
     format!(
         r#"<div class="card">
-            <div class="card-header"><h2>Network Peers</h2><span class="card-header-aside">{own_loc}<a class="card-link" href="/routing">Routing model &rarr;</a></span></div>
+            <div class="card-header"><h2>Network Peers</h2>{own_loc}</div>
             {ring_svg}
             {filter_controls}
             <div class="table-wrap">

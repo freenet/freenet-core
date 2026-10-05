@@ -457,7 +457,7 @@ fn diagnostics_card(inputs: &RoutingInputs) -> String {
     .concat();
     format!(
         r#"<div class="card">
-            <details class="diag">
+            <details class="diag" id="routing-diagnostics">
                 <summary>Diagnostics</summary>
                 <div class="info-grid">{rows}</div>
             </details>
