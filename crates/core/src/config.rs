@@ -4710,6 +4710,7 @@ std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_FORCE_NOOP_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCED_NOOP_GATE_CONNECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Test-only: treat every remote as running a release at or above
@@ -4733,6 +4734,17 @@ impl SimulationForceNoopGate {
     /// Stop forcing the gate on this thread.
     pub fn disable() {
         SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(false));
+    }
+
+    /// Number of connections created on this thread with the gate forced on,
+    /// so a test can prove the override actually reached the transport.
+    pub fn forced_connection_count() -> u64 {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.get())
+    }
+
+    /// Record one connection created with the gate forced on.
+    pub(crate) fn record_forced_connection() {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
     }
 
     /// Whether the gate is forced on for this thread.

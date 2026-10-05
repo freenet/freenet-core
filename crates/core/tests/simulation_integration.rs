@@ -1269,6 +1269,100 @@ fn ci_quick_simulation() {
         .verify_state_report();
 }
 
+/// Forces the #5795 receive-side NoOp gate on for connections created on this
+/// thread while alive (simulated peers all report the pre-floor crate version,
+/// so without this every sim runs with the gate OFF).
+struct ForceNoopGate {
+    connections_before: u64,
+}
+
+impl ForceNoopGate {
+    fn on() -> Self {
+        freenet::config::SimulationForceNoopGate::enable();
+        Self {
+            connections_before: freenet::config::SimulationForceNoopGate::forced_connection_count(),
+        }
+    }
+
+    /// Fail if no connection was actually created with the gate forced.
+    fn assert_applied(&self) {
+        let now = freenet::config::SimulationForceNoopGate::forced_connection_count();
+        assert!(
+            now > self.connections_before,
+            "the forced NoOp gate never reached a PeerConnection; the test would be vacuous"
+        );
+    }
+}
+
+impl Drop for ForceNoopGate {
+    fn drop(&mut self) {
+        freenet::config::SimulationForceNoopGate::disable();
+    }
+}
+
+/// `ci_quick_simulation` with the #5795 NoOp gate ON (every peer treated as
+/// >= 0.2.142): operations complete and contracts converge.
+#[test_log::test]
+fn test_noop_gate_on_quick_simulation_converges() {
+    let gate = ForceNoopGate::on();
+    TestConfig::small("noop-gate-quick", 0xC1F1_ED5E_ED00)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(50)
+        .with_duration(Duration::from_secs(45))
+        .with_sleep(Duration::from_secs(2))
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence()
+        .verify_state_report();
+    gate.assert_applied();
+}
+
+/// `ci_medium_simulation` with the #5795 NoOp gate ON.
+#[test_log::test]
+fn test_noop_gate_on_medium_simulation_converges() {
+    let gate = ForceNoopGate::on();
+    TestConfig::medium("noop-gate-medium", 0xC1F1_ED7E_ED01)
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence()
+        .verify_state_report();
+    gate.assert_applied();
+}
+
+/// Gate ON under 15% simulated packet loss: the simulation completes and
+/// operations still route (no connection teardown storm from lost acks).
+#[test_log::test]
+fn test_noop_gate_on_lossy_simulation_completes() {
+    let gate = ForceNoopGate::on();
+    let result = TestConfig::small("noop-gate-lossy", 0xFA17_0055_0001)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(60)
+        .with_duration(Duration::from_secs(60))
+        .with_sleep(Duration::from_secs(2))
+        .with_message_loss(0.15)
+        .run()
+        .assert_ok();
+    gate.assert_applied();
+    let rt = create_runtime();
+    let routes = rt.block_on(async {
+        result
+            .logs_handle
+            .lock()
+            .await
+            .iter()
+            .filter(|log| log.kind.variant_name() == "Route")
+            .count()
+    });
+    assert!(
+        routes > 0,
+        "operations must still route with the gate on under loss"
+    );
+}
+
 /// CI simulation test - medium network with more operations.
 #[test_log::test]
 fn ci_medium_simulation() {

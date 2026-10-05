@@ -439,7 +439,11 @@ pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0,
 /// [`crate::config::SimulationForceNoopGate`]. Always `false` in release builds.
 #[cfg(any(test, feature = "testing"))]
 fn force_untracked_noop_gate() -> bool {
-    crate::config::SimulationForceNoopGate::is_enabled()
+    let forced = crate::config::SimulationForceNoopGate::is_enabled();
+    if forced {
+        crate::config::SimulationForceNoopGate::record_forced_connection();
+    }
+    forced
 }
 
 #[cfg(not(any(test, feature = "testing")))]
