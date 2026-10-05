@@ -4709,6 +4709,53 @@ impl GlobalSimulationTime {
 std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCE_NOOP_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCED_NOOP_GATE_CONNECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: treat every remote as running a release at or above
+/// `UNTRACKED_ACK_NOOP_MIN_VERSION` (#5795), so the receive-side "do not ack
+/// a capable peer's NoOps" gate is ON even though simulated peers all report
+/// the current, pre-floor crate version.
+///
+/// Thread-local, like [`SimulationTransportOpt`], so concurrent tests do not
+/// interfere: it applies to connections CREATED on the calling thread while
+/// enabled (the decision is fixed in `PeerConnection::new`). Honoured only in
+/// `test` / `testing` builds; a release binary ignores it. For a whole-suite
+/// local run, `FREENET_TEST_FORCE_NOOP_GATE=1` enables it on every thread.
+pub struct SimulationForceNoopGate;
+
+impl SimulationForceNoopGate {
+    /// Force the gate on for connections created on this thread.
+    pub fn enable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(true));
+    }
+
+    /// Stop forcing the gate on this thread.
+    pub fn disable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(false));
+    }
+
+    /// Number of connections created on this thread with the gate forced on,
+    /// so a test can prove the override actually reached the transport.
+    pub fn forced_connection_count() -> u64 {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.get())
+    }
+
+    /// Record one connection created with the gate forced on.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn record_forced_connection() {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Whether the gate is forced on for this thread.
+    pub fn is_enabled() -> bool {
+        static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.get())
+            || *FROM_ENV.get_or_init(|| {
+                std::env::var("FREENET_TEST_FORCE_NOOP_GATE").is_ok_and(|v| v == "1")
+            })
+    }
 }
 
 /// Opt-in transport timer optimization for large-scale simulations.

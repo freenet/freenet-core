@@ -363,6 +363,26 @@ Current wire-gated floors:
   bootstrapping round-trip and no way for the decision to go stale against a
   peer that downgraded at a reused address.
 
+- `UNTRACKED_ACK_NOOP_MIN_VERSION` in
+  `crates/core/src/transport/peer_connection.rs` (fire-and-forget ack-only
+  `NoOp`s, #5795). Not a new wire variant: it gates a RECEIVE-side decision,
+  "stop acking this peer's NoOps", which is only safe once the peer no longer
+  tracks them.
+
+  Set to **`(0, 2, 142)`** and guarded by `UNTRACKED_ACK_NOOP_SHIPPED_IN`,
+  which is ALREADY `Some((0, 2, 142))` (set in #5803 ahead of the release so
+  the 0.2.142 bump PR stays green), checked by
+  `ack_policy_tests::untracked_noop_floor_tracks_the_shipping_release`
+  (`Some(v)` must equal the floor and be at most the next patch release;
+  `None` requires the floor strictly above the crate version). **Releaser
+  check:** confirm #5803's code is in the 0.2.142 tag. If it is not, raise BOTH
+  constants to the release that carries it — nothing else will catch this.
+  Failure mode of a floor that is too LOW: we ignore NoOps a pre-#5795 peer
+  still tracks, and it retransmits each one up to `MAX_PACKET_RETRANSMITS`
+  times. Bias high.
+  `untracked_noop_floor_stays_above_every_release_that_tracks_noops` catches
+  the floor being lowered.
+
 - `BROADCAST_TARGET_LIST_MIN_VERSION` in
   `crates/core/src/node/network_bridge/p2p_protoc.rs` — the originator target
   list on contract broadcasts (#5147).

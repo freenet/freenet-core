@@ -1615,12 +1615,17 @@ fn test_streaming_get_retries_after_assembly_failure() {
 /// retry after the gateway recovers must store the contract.
 ///
 /// This is the real trigger, not the `relay_stream_fault_injection` hook the
-/// unit and e2e tests use: the gateway's outage (3 s of virtual time) grows
-/// into a fragment gap of at least 5 s at the relay, so its `assemble()` hits
-/// the 5 s inactivity timeout, as in CI run 34422250768. A sweep of the crash
-/// offset reproduced it at 300, 400 (3 runs of 3) and 500 ms after the PUT;
-/// at 20, 50, 150 and 1000 ms the stream either survived the outage or had
-/// already finished.
+/// unit and e2e tests use: the gateway is silent for 6 s of virtual time (the
+/// crash is scheduled twice; the runner settles each special op for 3 s),
+/// which is longer than the relay's 5 s assembly inactivity window, so its
+/// `assemble()` times out, as in CI run 34422250768. The crash lands
+/// `CRASH_AFTER` (400 ms) after the PUT, while the 1 MB stream is in flight.
+///
+/// History: the test used a single 3 s outage, chosen by a sweep of the crash
+/// offset, and relied on the transport's per-packet RTO backoff to stretch the
+/// relay's fragment gap past 5 s. #5795 made the backoff double once per round,
+/// retransmissions then resumed in time and the stream survived, so the outage
+/// was made longer than the window by construction instead.
 ///
 /// The controlled simulation exposes no client results, so this asserts the
 /// relay side (`RELAY_PUT_STREAMING_FAILURES_REPORTED`, a process-global whose
@@ -1637,7 +1642,7 @@ fn test_streaming_put_relay_stream_failure_is_reported_upstream() {
     const NETWORK_NAME: &str = "streaming-put-relay-failure";
     const THRESHOLD: usize = 1024;
     const LARGE_STATE_SIZE: usize = 1024 * 1024; // 1 MB, a long stream
-    // Where in the stream the gateway goes silent; see the sweep above.
+    // Where in the stream the gateway goes silent: while the stream is in flight.
     const CRASH_AFTER: Duration = Duration::from_millis(400);
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1665,8 +1670,13 @@ fn test_streaming_put_relay_stream_failure_is_reported_upstream() {
     };
     let operations = vec![
         put(),
-        // Silent for 3 s (the runner settles each special op for 3 s): the
-        // gateway's outbound stream stalls and the relay stops receiving it.
+        // Silent for 6 s (the runner settles each special op for 3 s, and the
+        // crash is scheduled twice): longer than the relay's 5 s assembly
+        // inactivity window by construction. With a single 3 s outage the
+        // test only worked while the transport's per-packet RTO backoff
+        // stretched the post-recovery gap past 5 s; #5795 fixed that backoff,
+        // so the retransmissions resumed in time and the stream survived.
+        ScheduledOperation::new(gateway.clone(), SimOperation::CrashNode),
         ScheduledOperation::new(gateway.clone(), SimOperation::CrashNode),
         ScheduledOperation::new(gateway.clone(), SimOperation::RecoverNode),
         // The client's retry once the gateway is back.

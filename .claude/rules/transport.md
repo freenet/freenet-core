@@ -127,6 +127,27 @@ packet absent from pending_receipts yields no ack-info and cannot abandon.
   - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
 ```
 
+### RTO backoff: once per round, reset on ACK (#5795)
+
+```
+SentPacketTracker::rto_backoff doubles at most ONCE per round:
+  → the first RTO expiry doubles it and sets backoff_round_end_nanos =
+    now + (new) effective RTO;
+  → other packets timing out before that are retransmitted WITHOUT
+    doubling again (RFC 6298 has one timer per connection; a burst of
+    losses is one expiry);
+  → any ACK that resets rto_backoff to 1 also resets
+    backoff_round_end_nanos to 0, so the next outage backs off at once.
+
+DO NOT go back to doubling per lost packet: a 10-packet burst then hits
+the 60 s cap immediately and the rest of the burst stalls for minutes.
+That was masked until #5795 by the ack-only NoOp chatter, which reset
+the backoff every ~200 ms. DO NOT reset rto_backoff without also
+clearing the round end: a stale round end (up to 60 s ahead) turns the
+next outage into a base-RTO retransmit burst that exhausts
+MAX_PACKET_RETRANSMITS in seconds.
+```
+
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide
@@ -178,9 +199,10 @@ by the 1Hz aggregator tasks:
   traffic), `ShortMessage` is `Short` (opaque serialized `NetMessage`
   — small contract op or control plane, unsplittable at the transport
   layer), and `Ping`/`Pong`/`NoOp`/`AckConnection` are `MustFlow`.
-  Tagged at `packet_sending` (covers `ShortMessage` / `NoOp` /
-  `StreamFragment`) plus the two bypass sites `send_pong` and the
-  keep-alive `Ping`. The split is a classified *subset* of the node
+  Tagged at `packet_sending` (covers `ShortMessage` /
+  `StreamFragment`) plus the bypass sites `send_pong`, the
+  keep-alive `Ping`, and the ack-only `NoOp` (`PeerConnection::noop`,
+  untracked since #5795). The split is a classified *subset* of the node
   total: it excludes retransmits, handshake/intro `AckConnection`, and
   standalone connection ACKs, which are still counted in
   `cumulative_bytes_sent` (the `shadow_rate_demand` total) but not the
@@ -262,10 +284,53 @@ Restart detection (all peers, not just gateways):
 ```
 Keep-alive:
   → Ping every 5 seconds initially
-  → After 5 unanswered pings, interval backs off: 10s → 20s → 40s → 60s cap
+  → After 5 pings unanswered SINCE THE LAST AUTHENTICATED INBOUND PACKET,
+    interval backs off: 10s → 15s cap (MAX_KEEPALIVE_INTERVAL). Any packet
+    from the peer resets the backoff, so lost Pongs on a live link do not
+    stretch it. The 15 s cap is the NAT-keepalive guarantee (#5795): do NOT
+    raise it; the NoOp chatter that used to mask a 60 s cap is gone.
   → Idle timeout: 120s (RealTime), 24h (VirtualTime/simulation)
   → On idle-timeout closure, per-peer backoff is recorded to prevent
     rapid reconnection cycles to dead peers (#3252)
+```
+
+### WHEN changing receipts / acks (#5795)
+
+```
+Which packets earn a receipt is decided by `receipt_policy` in
+peer_connection.rs. A receipt is only useful for a packet the SENDER
+tracks for retransmission:
+  → Ping / Pong: never acked (every release sends them untracked).
+  → AckConnection*: acked on every arrival but NOT recorded for dedup.
+    The handshake's completion ack is tracked at packet id 0 and must be
+    acked; id 0 is also the remote's first data packet, so recording it
+    would drop that packet as a duplicate. Answering a connection ack with
+    `ack_ok` happens at most ONCE per connection: the reply is itself an
+    AckConnection, so answering every one loops forever between two peers.
+  → ShortMessage / StreamFragment: acked within ACK_CHECK_INTERVAL
+    (100 ms), and RE-ACKED when a duplicate arrives (a duplicate means
+    our receipt was lost). A duplicate is never delivered twice.
+  → NoOp: acked only for a remote below UNTRACKED_ACK_NOOP_MIN_VERSION
+    or of unknown version (old releases track their ack-only NoOps).
+    From a remote at/above the floor it is fire-and-forget.
+  → Receipts that do not fit beside a payload go in separate untracked
+    NoOps with FRESH ids; only the payload is tracked under its id.
+  → Our own ack-only NoOps (`PeerConnection::noop`) are NEVER tracked
+    and never touch flight size. Receipt reliability comes from the
+    remote retransmitting + our duplicate re-ack, as TCP does for a
+    lost pure ACK.
+
+DO NOT make ack-only NoOps tracked again, and DO NOT ack NoOps from a
+capable remote: either restores the ack-of-ack ping-pong that cost
+~5 pps per direction on every connection, idle ones included.
+DO NOT stop re-acking duplicates: it is the only recovery for a lost
+receipt now that acks are untracked.
+A receipt for an id we no longer track (an old peer acking our
+untracked NoOp, a re-ack of an already-released packet) is routine.
+report_received_receipts must keep emitting ack-info ONLY for ids still
+in pending_receipts, so such receipts never touch flight size.
+NAT keepalive does NOT depend on any of this: the keepalive task's
+5 s Ping (and the remote's Pong) keeps every mapping open.
 ```
 
 ### WHEN closing connections
