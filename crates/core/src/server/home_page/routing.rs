@@ -223,6 +223,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
             x_range,
             x_points,
             count,
+            windows,
         ) = if all {
             (
                 pick(&hierarchical.failure, &rs.failure_curve),
@@ -235,6 +236,11 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                 rs.transfer_rate_data_range,
                 rs.transfer_rate_points.clone(),
                 rs.failure_events,
+                [
+                    rs.failure_events,
+                    rs.success_events,
+                    rs.transfer_rate_events,
+                ],
             )
         } else if let Some(c) = per_op {
             (
@@ -248,6 +254,11 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                 c.transfer_rate_data_range,
                 c.transfer_rate_points.clone(),
                 c.failure_events,
+                [
+                    c.failure_events,
+                    c.response_time_events,
+                    c.transfer_rate_events,
+                ],
             )
         } else {
             Default::default()
@@ -275,6 +286,28 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
             format!(r#"<div class="empty-chart">No {tab_name} requests yet.</div>"#)
         } else {
             let fail_y_max = failure_chart_y_max(&f_curve).to_string();
+            // What each chart's window holds: the three windows fill at
+            // different rates (every request, timed replies, payload
+            // transfers), so one count would misdescribe two of them.
+            let kind = if all {
+                String::new()
+            } else {
+                format!("{tab_name} ")
+            };
+            // The dots are a sample of at most 100 of each window.
+            let note = |text: String| format!(r#"<p class="chart-note">{text}</p>"#);
+            let fail_note = note(format!(
+                "The last {} {kind}requests, up to 100 drawn. Dots along the bottom succeeded; dots pinned to the top failed.",
+                windows[0]
+            ));
+            let rt_note = note(format!(
+                "The last {} {kind}replies with a measured response time, up to 100 drawn.",
+                windows[1]
+            ));
+            let x_note = note(format!(
+                "The last {} {kind}payload transfers with a measured speed, up to 100 drawn.",
+                windows[2]
+            ));
             [
                 responsive(|width| {
                     build_estimator_chart_or_placeholder(
@@ -289,6 +322,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                         "No outcomes yet.",
                     )
                 }),
+                fail_note,
                 responsive(|width| {
                     build_estimator_chart_or_placeholder(
                         "Response time",
@@ -302,6 +336,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                         "No timed replies yet.",
                     )
                 }),
+                rt_note,
                 responsive(|width| {
                     build_estimator_chart_or_placeholder(
                         "Transfer speed",
@@ -315,6 +350,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                         "No data transfers yet.",
                     )
                 }),
+                x_note,
             ]
             .concat()
         };
@@ -469,19 +505,22 @@ fn diagnostics_card(inputs: &RoutingInputs) -> String {
             &format!("{} closest peers", rs.consider_n_closest_peers),
         ),
         row(
-            "Decisions measured",
+            "Decisions measured (since start)",
             &format!(
                 "{} (every prediction-based decision, connection maintenance included; peer pages count only routed requests)",
                 ranks.total
             ),
         ),
         row(
-            "Mean chosen position",
+            "Mean chosen position (since start)",
             &ranks
                 .mean_rank()
                 .map_or_else(|| "&mdash;".to_string(), |m| format!("{m:.1} (0 = closest)")),
         ),
-        row("Against a full window", &ranks.saturated.to_string()),
+        row(
+            "Against a full window (since start)",
+            &ranks.saturated.to_string(),
+        ),
         row(
             "&#8627; from the farthest quarter",
             &ranks
@@ -489,7 +528,7 @@ fn diagnostics_card(inputs: &RoutingInputs) -> String {
                 .map_or_else(|| "&mdash;".to_string(), |s| format!("{:.1}%", s * 100.0)),
         ),
         row(
-            "Window reading",
+            "Window reading (since start)",
             &fmt_window_reading(ranks.far_quarter_share()),
         ),
     ]
@@ -1078,6 +1117,13 @@ mod tests {
             "Time to transfer a payload, RMS error",
             "(keeps the last 10,000)",
             r#"<details class="diag" id="routing-diagnostics">"#,
+            "requests, up to 100 drawn. Dots along the bottom succeeded; dots pinned to the top failed.",
+            "replies with a measured response time, up to 100 drawn.",
+            "payload transfers with a measured speed, up to 100 drawn.",
+            "The last 120 PUT requests,",
+            "Decisions measured (since start)",
+            "Mean chosen position (since start)",
+            "Window reading (since start)",
         ] {
             assert!(html.contains(section), "missing {section:?}");
         }
@@ -1137,6 +1183,42 @@ mod tests {
                     .find("How good are the predictions across all peers?")
                     .unwrap()
         );
+    }
+
+    /// The failure verdict switches at the noise band on both sides, and the
+    /// calibration sentence adds clamped predictions and counts failures.
+    #[test]
+    fn accuracy_card_reads_the_failure_skill_against_the_noise_band() {
+        let card = |skill: Option<f64>| {
+            let mut rs = snapshot();
+            rs.failure_skill_hierarchical = skill;
+            accuracy_card(&rs)
+        };
+        assert!(card(None).contains("too few failures yet to judge"));
+        assert!(card(Some(f64::NAN)).contains("too few failures yet to judge"));
+        for (skill, verdict) in [
+            (SKILL_NOISE - 0.001, "about as good as"),
+            (-(SKILL_NOISE - 0.001), "about as good as"),
+            (SKILL_NOISE + 0.001, "better than"),
+            (-(SKILL_NOISE + 0.001), "worse than"),
+            (0.4, "better than"),
+        ] {
+            let html = card(Some(skill));
+            assert!(
+                html.contains(&format!("Failure predictions are {verdict} just assuming")),
+                "{skill}: {html}"
+            );
+        }
+        let mut rs = snapshot();
+        rs.failure_skill_hierarchical = Some(0.0);
+        rs.hierarchical_failure_pairs = vec![(0.1, 0.0), (0.2, 1.0), (1.5, 1.0), (-0.3, 0.0)];
+        assert!(
+            accuracy_card(&rs)
+                .contains("Over the last 4 requests it predicted 1.3 failures; 2 happened."),
+            "predictions clamp to [0, 1] before they are added"
+        );
+        rs.hierarchical_failure_pairs.clear();
+        assert!(!accuracy_card(&rs).contains("Over the last"));
     }
 
     #[test]

@@ -322,7 +322,7 @@ pub fn build_estimator_chart(
     if !dots.is_empty() {
         write!(
             svg,
-            r#"<path d="{dots}" class="scatter" fill="none" stroke="var(--text-secondary)" stroke-width="3.6" stroke-linecap="round" opacity="0.5"/>"#,
+            r#"<path d="{dots}" class="scatter" fill="none" stroke="var(--chart-dot, var(--text-secondary))" stroke-width="3.6" stroke-linecap="round" opacity="0.6"/>"#,
         )
         .ok();
     }
@@ -480,7 +480,8 @@ pub fn build_accuracy_panel(
 /// Predicted-vs-actual scatter for a regression model (response time, transfer
 /// speed) on log-log axes, since both targets span orders of magnitude. Points
 /// on the dashed diagonal mean predicted == actual; the headline is the median
-/// absolute percentage error over the retained window.
+/// of `max(predicted / actual, actual / predicted)` over the retained window:
+/// the factor within which half the outcomes landed, either way.
 pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) -> String {
     use std::fmt::Write;
 
@@ -630,7 +631,7 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
     let mid_y = pad_t + plot_h / 2.0;
     write!(
         svg,
-        r#"<text x="{tl:.1}" y="{tt:.1}" font-size="8" fill="var(--text-muted)">{above}</text><text x="{br:.1}" y="{bb:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{below}</text><text x="{ex:.1}" y="{ey:.1}" text-anchor="end" font-size="8" fill="var(--text-secondary)">exact</text><text x="{px:.1}" y="{py:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted</text><text x="9" y="{mid_y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)" transform="rotate(-90 9 {mid_y:.1})">actual</text>"#,
+        r#"<text x="{tl:.1}" y="{tt:.1}" font-size="8" fill="var(--text-muted)" paint-order="stroke" stroke="var(--bg-secondary)" stroke-width="3">{above}</text><text x="{br:.1}" y="{bb:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)" paint-order="stroke" stroke="var(--bg-secondary)" stroke-width="3">{below}</text><text x="{ex:.1}" y="{ey:.1}" text-anchor="end" font-size="8" fill="var(--text-secondary)">exact</text><text x="{px:.1}" y="{py:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted</text><text x="9" y="{mid_y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)" transform="rotate(-90 9 {mid_y:.1})">actual</text>"#,
         tl = pad_l + 4.0,
         tt = pad_t + 10.0,
         br = pad_l + plot_w - 4.0,
@@ -669,4 +670,46 @@ fn mini_chart_placeholder(label: &str, sub: &str) -> String {
         cy = h / 2.0,
         cy2 = h / 2.0 + 14.0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-12 * b.abs().max(1e-300)
+    }
+
+    #[test]
+    fn failure_tops_round_up_to_twice_a_round_step() {
+        // 2 × 8.15% → ticks 0 / 10 / 20 %.
+        assert!(close(round_failure_top(0.163), 0.2));
+        // Already twice a step: unchanged, not bumped to the next.
+        for on_step in [0.02, 0.04, 0.05, 0.1, 0.2, 1.0] {
+            assert!(
+                close(round_failure_top(on_step), on_step),
+                "{on_step} -> {}",
+                round_failure_top(on_step)
+            );
+        }
+        // A tiny but real failure rate keeps a usable axis.
+        let tiny = round_failure_top(1.6e-8);
+        assert!(close(tiny, 2e-8), "{tiny}");
+    }
+
+    #[test]
+    fn the_failure_axis_top_is_capped_at_certainty() {
+        // A right edge at or above one half doubles past 1; a probability
+        // axis stops at 1.
+        for edge in [0.5, 0.6, 0.99] {
+            let top = failure_chart_y_max(&[(0.0, 0.1), (0.5, edge)]);
+            assert_eq!(top, 1.0, "right edge {edge}");
+        }
+        assert!(close(
+            failure_chart_y_max(&[(0.0, 0.01), (0.5, 0.0815)]),
+            0.2
+        ));
+        // Nothing to scale to: the full range.
+        assert_eq!(failure_chart_y_max(&[(0.0, 0.0), (0.5, 1e-10)]), 1.0);
+    }
 }
