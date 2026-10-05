@@ -369,15 +369,17 @@ Current wire-gated floors:
   "stop acking this peer's NoOps", which is only safe once the peer no longer
   tracks them.
 
-  Set to **`(0, 2, 142)`**, the release intended to first ship it, guarded by
-  `UNTRACKED_ACK_NOOP_SHIPPED_IN` (currently `None`) and
-  `ack_policy_tests::untracked_noop_floor_tracks_the_shipping_release`, exactly
-  like the markers above. When the release bump raises `Cargo.toml` to the
-  floor that test fails until the releaser either sets
-  `UNTRACKED_ACK_NOOP_SHIPPED_IN = Some(UNTRACKED_ACK_NOOP_MIN_VERSION)` (this
-  release carries #5795) or raises the floor (it does not). Failure mode of a
-  floor that is too LOW: we ignore NoOps a pre-#5795 peer still tracks, and it
-  retransmits each one up to `MAX_PACKET_RETRANSMITS` times. Bias high.
+  Set to **`(0, 2, 142)`** and guarded by `UNTRACKED_ACK_NOOP_SHIPPED_IN`,
+  which is ALREADY `Some((0, 2, 142))` (set in #5803 ahead of the release so
+  the 0.2.142 bump PR stays green), checked by
+  `ack_policy_tests::untracked_noop_floor_tracks_the_shipping_release`
+  (`Some(v)` must equal the floor and be at most the next patch release;
+  `None` requires the floor strictly above the crate version). **Releaser
+  check:** confirm #5803's code is in the 0.2.142 tag. If it is not, raise BOTH
+  constants to the release that carries it — nothing else will catch this.
+  Failure mode of a floor that is too LOW: we ignore NoOps a pre-#5795 peer
+  still tracks, and it retransmits each one up to `MAX_PACKET_RETRANSMITS`
+  times. Bias high.
   `untracked_noop_floor_stays_above_every_release_that_tracks_noops` catches
   the floor being lowered.
 

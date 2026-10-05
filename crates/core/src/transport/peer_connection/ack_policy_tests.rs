@@ -251,10 +251,20 @@ fn untracked_noop_floor_tracks_the_shipping_release() {
         parts.next().expect("patch"),
     );
     match UNTRACKED_ACK_NOOP_SHIPPED_IN {
-        Some(shipped) => assert_eq!(
-            shipped, UNTRACKED_ACK_NOOP_MIN_VERSION,
-            "the release that ships untracked ack-only NoOps must EQUAL the floor"
-        ),
+        Some(shipped) => {
+            assert_eq!(
+                shipped, UNTRACKED_ACK_NOOP_MIN_VERSION,
+                "the release that ships untracked ack-only NoOps must EQUAL the floor"
+            );
+            // Plausibility: the marker may name at most the NEXT patch release
+            // (set just before the bump PR), never a release further out.
+            let next = (crate_version.0, crate_version.1, crate_version.2 + 1);
+            assert!(
+                shipped <= next,
+                "UNTRACKED_ACK_NOOP_SHIPPED_IN {shipped:?} is beyond the next release \
+                 {next:?} — the marker records the release that carries the code"
+            );
+        }
         None => assert!(
             crate_version < UNTRACKED_ACK_NOOP_MIN_VERSION,
             "floor {UNTRACKED_ACK_NOOP_MIN_VERSION:?} is a PREDICTION about the next release, \

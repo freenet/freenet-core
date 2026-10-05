@@ -398,12 +398,18 @@ pub(super) const UNTRACKED_ACK_NOOP_MIN_VERSION: (u8, u8, u16) = (0, 2, 142);
 
 /// Has the untracked ack-only NoOp change shipped, and in which release?
 ///
-/// `None` — not yet shipped: the floor is a PREDICTION about the next release
-/// and must stay strictly ABOVE the crate version. `Some(v)` — shipped in `v`,
-/// which must EQUAL the floor. If it slips, RAISE THE FLOOR; never set this to
-/// make the guard test pass.
+/// `Some(v)` — this code ships in `v`, which must EQUAL the floor. Set to
+/// `Some((0, 2, 142))` ahead of the 0.2.142 release so the release bump PR
+/// (which lifts `Cargo.toml` to 0.2.142) stays green. That is only correct if
+/// this code is in the 0.2.142 tag: **if it misses 0.2.142, raise BOTH this
+/// and the floor to the release that does carry it before merging.** No test
+/// can detect that slip once the marker says `Some`.
+///
+/// `None` — not yet scheduled: the floor is a PREDICTION and must stay
+/// strictly ABOVE the crate version, so a release bump reaching the floor
+/// turns `untracked_noop_floor_tracks_the_shipping_release` red.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 142));
 
 /// Does a remote at `remote` still track (and so need receipts for) its
 /// ack-only NoOps? Fail-closed: an unknown version is treated as old.
