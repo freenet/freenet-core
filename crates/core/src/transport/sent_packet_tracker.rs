@@ -1819,6 +1819,48 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.rto_backoff(), 4);
     }
 
+    /// Same as `ack_ends_the_backoff_round`, but the ack that resets the
+    /// backoff is for a FRESH (never retransmitted) packet, which goes through
+    /// the other reset site in `report_received_receipts`.
+    #[test]
+    fn fresh_packet_ack_ends_the_backoff_round() {
+        let mut tracker = mock_sent_packet_tracker();
+        // Outage: packet 1 times out repeatedly, backoff climbs and the round
+        // end moves far ahead.
+        tracker.report_sent_packet(1, vec![1].into());
+        for _ in 0..6 {
+            tracker
+                .time_source
+                .advance(tracker.effective_rto() + Duration::from_millis(1));
+            assert!(matches!(tracker.get_resend(), ResendAction::Resend(..)));
+        }
+        assert!(
+            tracker.rto_backoff() >= 32,
+            "premise: long outage backed off"
+        );
+        // The path recovers: a fresh packet is sent and acked (not the
+        // retransmitted packet 1, which would take the Karn branch).
+        tracker.report_sent_packet(2, vec![2].into());
+        tracker.time_source.advance(Duration::from_millis(10));
+        let (acks, _) = tracker.report_received_receipts(&[2]);
+        assert!(
+            matches!(acks.as_slice(), [(Some(_), _, _)]),
+            "premise: acked as a fresh packet with an RTT sample"
+        );
+        assert_eq!(tracker.rto_backoff(), 1);
+        // A new outage: the first expiry must double again right away.
+        tracker.report_sent_packet(3, vec![3].into());
+        tracker
+            .time_source
+            .advance(tracker.effective_rto() + Duration::from_millis(1));
+        while let ResendAction::Resend(..) = tracker.get_resend() {}
+        assert_eq!(
+            tracker.rto_backoff(),
+            2,
+            "a fresh ack must end the backoff round, so the new outage backs off"
+        );
+    }
+
     /// The new-flight signal fires on the empty-to-non-empty transition only,
     /// and is cleared by being taken (#5795 review).
     #[test]

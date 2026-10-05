@@ -1100,10 +1100,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
-            // The resend timer disarms when it fires; if the resend branch left it
-            // unarmed (send error path), re-arm with a short delay rather than
-            // leaving it immediately Ready, which during retransmission storms
-            // would starve inbound packet processing (#3215).
             if self.stalled_fragment.is_some() {
                 self.deliver_stalled_fragment().await?;
             }
@@ -1111,6 +1107,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.receipts_flush_due = false;
                 self.flush_receipts_now().await?;
             }
+            // The resend timer disarms when it fires; if the resend branch left it
+            // unarmed (send error path), re-arm with a short delay rather than
+            // leaving it immediately Ready, which during retransmission storms
+            // would starve inbound packet processing (#3215).
             if !self.recv_timers.resend.is_armed() {
                 self.recv_timers
                     .resend
@@ -2230,6 +2230,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // dropped as a duplicate). Park it on `self` first; a
                     // cancelled send leaves it parked and the next `recv()`
                     // iteration finishes delivering it.
+                    // One slot: the top of the recv loop always finishes a
+                    // parked fragment before another packet is processed.
+                    debug_assert!(
+                        self.stalled_fragment.is_none(),
+                        "a parked fragment must be delivered before the next one"
+                    );
                     self.stalled_fragment = Some((stream_id, fragment_number, payload));
                     self.deliver_stalled_fragment().await?;
                     tracing::trace!(
