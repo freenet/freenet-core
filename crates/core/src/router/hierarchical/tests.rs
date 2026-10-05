@@ -5605,3 +5605,60 @@ fn neither_bound_call_site_may_charge_a_peer_more_than_its_own_residual() {
          nothing: with the term {applied}, control {control}, effect {effect}"
     );
 }
+
+/// A peer's offset is measured from the all-peers level, not from the curve:
+/// when the window as a whole sits off the curve, an unknown peer still reads
+/// as exactly 0 (it is predicted from distance alone) and a known peer reads
+/// as its difference from everyone else.
+#[test]
+fn peer_offset_is_measured_from_distance_alone_not_from_the_curve() {
+    let _guard = GlobalRng::seed_guard(0x4485_0ff5);
+    let mut stage: Stage<u32> = Stage::new(Target::LogResponseTime, 64);
+    for i in 0..400u32 {
+        let distance = (i % 50) as f64 / 100.0;
+        observe(
+            &mut stage,
+            &(i % 7),
+            (i % 13) as f64 / 13.0,
+            distance,
+            distance,
+            0.0,
+        );
+    }
+    assert!(stage.curve.is_some(), "the stage needs a curve");
+    // Replace the predicting level with one whose whole window sits 1.5 above
+    // the curve, and whose peer 3 sits a further 0.8 above everyone else.
+    let selected = stage.selected();
+    let slot = stage.peers.lookup(&3).expect("peer 3 has a slot");
+    let level = &mut stage.levels[selected];
+    *level = Level::new(level.horizon_hours);
+    for peer_slot in 0..7 {
+        for band in 0..BANDS {
+            for _ in 0..20 {
+                let shift = if peer_slot == slot { 0.8 } else { 0.0 };
+                level.add(Some(peer_slot), band, 1.0, 1.5 + shift + 0.2 * normal());
+            }
+        }
+    }
+    level.recount_squares();
+    level.components = level.compute_components();
+    let root = level.residual(None, 0, 0.0).expect("components exist").mean;
+    assert!(
+        root > 1.0,
+        "the all-peers level must sit off the curve: {root}"
+    );
+
+    let unknown = stage.peer_offset(&99, 0.0).expect("a warm stage reports");
+    assert_eq!(
+        (unknown.offset, unknown.evidence, unknown.weight),
+        (0.0, 0.0, 0.0),
+        "an unknown peer is on the distance-alone line even when the window is not on the curve"
+    );
+    let known = stage.peer_offset(&3, 0.0).expect("a warm stage reports");
+    assert!(
+        (known.offset - 0.8).abs() < 0.2 && known.weight > 0.5,
+        "peer 3's offset is its difference from the other peers: {known:?}"
+    );
+    let other = stage.peer_offset(&1, 0.0).expect("a warm stage reports");
+    assert!(other.offset.abs() < 0.3, "{other:?}");
+}
