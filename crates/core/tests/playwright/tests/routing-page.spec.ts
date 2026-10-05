@@ -77,9 +77,24 @@ test.describe("routing page", () => {
       "document scrolls horizontally",
     ).toBeLessThanOrEqual(0);
     // All five operation tabs fit the row; none hides behind a sideways
-    // scroll of the tab bar itself.
+    // scroll of the tab bar itself. The single-node harness has made no
+    // requests, so /routing's tabs carry no count badges; give every tab a
+    // three-digit badge first, as on a busy node and on the peer page, so
+    // the row is measured at its widest.
     const bar = page.locator("main .tab-bar").first();
     await expect(bar.locator(".tab-label")).toHaveCount(5);
+    await bar.evaluate((el) => {
+      for (const tab of el.querySelectorAll(".tab-label")) {
+        let badge = tab.querySelector(".tab-count");
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "tab-count";
+          tab.append(" ", badge);
+        }
+        badge.textContent = "500";
+      }
+    });
+    await expect(bar.locator(".tab-count")).toHaveCount(5);
     expect(
       await bar.evaluate((el) => el.scrollWidth - el.clientWidth),
       "the tab bar scrolls sideways",
