@@ -313,8 +313,10 @@ impl TestConfig {
             }
 
             let logs_handle = sim.event_logs_handle();
-            (sim, logs_handle)
+            let final_states = sim.final_state_handle();
+            (sim, (logs_handle, final_states))
         });
+        let (logs_handle, final_states) = logs_handle;
 
         let sleep_duration = self.sleep_after_events;
         let event_wait = self.event_wait;
@@ -330,7 +332,14 @@ impl TestConfig {
             },
         );
 
-        let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+        // Read each peer's state from its store at the end of the run, not from
+        // its last logged hash: a peer that originated the run's last write to
+        // a contract never logs a hash for its own commit, so the log-only
+        // check reported phantom divergences on ~1 seed in 8 (#5172).
+        let convergence = rt.block_on(async {
+            freenet::dev_tool::check_convergence_from_logs_and_state(&logs_handle, &final_states)
+                .await
+        });
         let event_count = rt.block_on(async { logs_handle.lock().await.len() });
 
         TestResult {
