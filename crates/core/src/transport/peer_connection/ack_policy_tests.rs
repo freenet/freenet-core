@@ -1,4 +1,5 @@
-//! Tests for the receipt policy, ack timing and keepalive guarantees (#5795).
+//! Tests for the receipt policy, ack timing, keepalive guarantees and the
+//! cancellation-safe `recv()` timers (#5795).
 //!
 //! All tests run on a paused tokio clock with `RealTime`, so the keepalive
 //! task is live (as in production) and timing is deterministic.
@@ -602,4 +603,169 @@ async fn new_peer_acks_noops_of_a_peer_it_treats_as_old() {
             acked_at.duration_since(*sent_at)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// recv() timers survive cancellation (#5795)
+//
+// `peer_connection_listener` cancels `recv()` whenever an outbound message
+// wins its select, so `recv()` is re-entered constantly under traffic. These
+// pump `recv()` in slices shorter than each timer's period to reproduce that.
+// ---------------------------------------------------------------------------
+
+/// The 100 ms ack timer must fire even when `recv()` is re-entered every
+/// 10 ms. Before #5795 each call restarted it, so it never fired and receipts
+/// waited for the 20-receipt or 600 ms-on-next-packet fallbacks.
+#[tokio::test(start_paused = true)]
+async fn ack_timer_survives_recv_cancellation() {
+    let mut e = single(CAPABLE);
+    e.deliver(5, short(b"hello"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_secs(1)).await.as_deref(),
+        Some(&b"hello"[..])
+    );
+    let start = tokio::time::Instant::now();
+    let mut acked_at = None;
+    while start.elapsed() < Duration::from_millis(500) && acked_at.is_none() {
+        assert!(e.pump(Duration::from_millis(10)).await.is_none());
+        if receipts_for(&e.drain_sent(), 5) > 0 {
+            acked_at = Some(start.elapsed());
+        }
+    }
+    let acked_at = acked_at.expect("ack timer never fired under recv() re-entry");
+    assert!(
+        acked_at <= ACK_CHECK_INTERVAL + Duration::from_millis(10),
+        "ack took {acked_at:?} under recv() re-entry"
+    );
+}
+
+/// The resend check must fire even when `recv()` is re-entered faster than
+/// its initial 10 ms delay. Before #5795 every call re-armed it 10 ms out, so
+/// under steady traffic an unacked packet was never retransmitted.
+#[tokio::test(start_paused = true)]
+async fn resend_check_survives_recv_cancellation() {
+    let mut e = single(CAPABLE);
+    e.conn.send("needs-ack".to_string()).await.expect("send");
+    let first = e.drain_sent();
+    let data_id = first
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    let start = tokio::time::Instant::now();
+    let mut resent_at = None;
+    while start.elapsed() < Duration::from_secs(3) && resent_at.is_none() {
+        assert!(e.pump(Duration::from_millis(5)).await.is_none());
+        if e.drain_sent().iter().any(|m| m.packet_id == data_id) {
+            resent_at = Some(start.elapsed());
+        }
+    }
+    let resent_at = resent_at.expect("unacked packet never retransmitted under recv() re-entry");
+    // No RTT sample yet, so no TLP: the first retransmission is the initial
+    // RTO (1 s, RFC 6298), checked within one resend poll.
+    assert!(
+        resent_at <= Duration::from_millis(1_050),
+        "retransmission after {resent_at:?}"
+    );
+}
+
+/// The 5 s timeout check (idle-timeout test, `pending_pings` write lock,
+/// streaming-handle sweep) runs once per 5 s, not on every `recv()` call.
+/// Before #5795 its first tick was immediate and the interval was rebuilt per
+/// call, so it ran on every call.
+#[tokio::test(start_paused = true)]
+async fn timeout_check_runs_per_period_not_per_recv_call() {
+    let mut e = single(CAPABLE);
+    for _ in 0..200 {
+        assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    }
+    assert_eq!(
+        e.conn.timeout_checks_run, 0,
+        "200 recv() calls within the first 200 ms must not run the 5 s check"
+    );
+    // Then keep re-entering until just past one period: exactly one check.
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < RecvTimers::<RealTime>::TIMEOUT_CHECK_INTERVAL {
+        assert!(e.pump(Duration::from_millis(50)).await.is_none());
+    }
+    assert_eq!(e.conn.timeout_checks_run, 1, "one check per 5 s period");
+}
+
+/// Time source that counts the sleeps it creates.
+#[derive(Clone)]
+struct CountingTime {
+    inner: RealTime,
+    sleeps: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TimeSource for CountingTime {
+    fn now_nanos(&self) -> u64 {
+        self.inner.now_nanos()
+    }
+    fn sleep(
+        &self,
+        d: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.sleeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.sleep(d)
+    }
+    fn sleep_until(
+        &self,
+        deadline: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.sleeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.sleep_until(deadline)
+    }
+    fn timeout<F, R>(
+        &self,
+        d: Duration,
+        f: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<R>> + Send>>
+    where
+        F: std::future::Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.timeout(d, f)
+    }
+}
+
+/// A `TimeSourceInterval` polled many times within one period (each `tick()`
+/// future cancelled, as a select loop does) creates ONE sleep for that
+/// period, not one per poll — and still ticks on schedule.
+#[tokio::test(start_paused = true)]
+async fn interval_reuses_its_sleep_across_cancelled_ticks() {
+    let ts = CountingTime {
+        inner: RealTime::new(),
+        sleeps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let period = Duration::from_millis(100);
+    let mut interval = TimeSourceInterval::new_at(
+        ts.clone(),
+        ts.now_nanos() + period.as_nanos() as u64,
+        period,
+    );
+    for _ in 0..50 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), interval.tick())
+                .await
+                .is_err(),
+            "must not tick before the period elapses"
+        );
+    }
+    assert_eq!(
+        ts.sleeps.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "50 cancelled polls within one period must share one sleep"
+    );
+    let before = tokio::time::Instant::now();
+    interval.tick().await;
+    assert!(before.elapsed() <= period, "tick fired late");
+    interval.tick().await;
+    assert_eq!(
+        ts.sleeps.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "one sleep per period"
+    );
 }

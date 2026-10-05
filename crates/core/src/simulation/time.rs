@@ -597,11 +597,23 @@ unsafe impl Send for VirtualSleep {}
 ///
 /// Uses "skip" behavior: if time advances past multiple tick deadlines,
 /// we skip to the next future deadline rather than catching up.
+///
+/// # Allocation
+///
+/// The sleep for the pending deadline is created once and kept across polls
+/// (and across cancelled `tick()` futures), so a select loop that polls the
+/// interval many times per period allocates one sleep per period, not one per
+/// poll (#5795).
 pub struct TimeSourceInterval<T: TimeSource> {
     time_source: T,
     period_nanos: u64,
     next_tick_nanos: u64,
+    /// Sleep armed for `next_tick_nanos` (the deadline it was created for).
+    sleep: Option<(u64, BoxedSleep)>,
 }
+
+/// A boxed sleep future as returned by [`TimeSource::sleep_until`].
+pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 impl<T: TimeSource> TimeSourceInterval<T> {
     /// Creates a new interval that ticks every `period`.
@@ -615,6 +627,7 @@ impl<T: TimeSource> TimeSourceInterval<T> {
             period_nanos,
             // First tick is immediate - set next_tick to now so tick() returns immediately first time
             next_tick_nanos: now,
+            sleep: None,
         }
     }
 
@@ -625,6 +638,7 @@ impl<T: TimeSource> TimeSourceInterval<T> {
             time_source,
             period_nanos,
             next_tick_nanos: start_nanos,
+            sleep: None,
         }
     }
 
@@ -632,7 +646,15 @@ impl<T: TimeSource> TimeSourceInterval<T> {
     ///
     /// If the next tick deadline has already passed, returns immediately
     /// and schedules the next tick for the future (skip behavior).
+    ///
+    /// Cancel-safe: dropping the returned future loses nothing; the armed
+    /// sleep and the deadline are kept in `self`.
     pub async fn tick(&mut self) {
+        std::future::poll_fn(|cx| self.poll_tick(cx)).await
+    }
+
+    /// Poll-based form of [`tick`](Self::tick).
+    pub fn poll_tick(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         let now = self.time_source.now_nanos();
 
         if now >= self.next_tick_nanos {
@@ -641,12 +663,26 @@ impl<T: TimeSource> TimeSourceInterval<T> {
             let elapsed = now - self.next_tick_nanos;
             let periods_elapsed = elapsed / self.period_nanos + 1;
             self.next_tick_nanos += periods_elapsed * self.period_nanos;
-            return;
+            self.sleep = None;
+            return std::task::Poll::Ready(());
         }
 
-        // Wait until the deadline
-        self.time_source.sleep_until(self.next_tick_nanos).await;
-        self.next_tick_nanos += self.period_nanos;
+        // Wait until the deadline, reusing the sleep armed for it.
+        let deadline = self.next_tick_nanos;
+        if !matches!(&self.sleep, Some((armed, _)) if *armed == deadline) {
+            self.sleep = Some((deadline, self.time_source.sleep_until(deadline)));
+        }
+        let Some((_, sleep)) = self.sleep.as_mut() else {
+            unreachable!("armed just above");
+        };
+        match sleep.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => {
+                self.sleep = None;
+                self.next_tick_nanos += self.period_nanos;
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 
     /// Returns the period of this interval.
@@ -657,6 +693,7 @@ impl<T: TimeSource> TimeSourceInterval<T> {
     /// Resets the interval to start ticking from now.
     pub fn reset(&mut self) {
         self.next_tick_nanos = self.time_source.now_nanos() + self.period_nanos;
+        self.sleep = None;
     }
 }
 

@@ -272,6 +272,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// (true for a remote below [`UNTRACKED_ACK_NOOP_MIN_VERSION`] or of
     /// unknown version). Fixed at construction from the negotiated version.
     ack_remote_noops: bool,
+    /// `recv()` timers, persisted across `recv()` cancellation.
+    recv_timers: RecvTimers<T>,
+    /// Number of timeout-check ticks handled (observability for tests).
+    timeout_checks_run: u64,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -453,6 +457,124 @@ fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> 
         | SymmetricMessagePayload::AckConnectionV2 { .. } => ReceiptPolicy::Ack {
             reack_duplicate: false,
         },
+    }
+}
+
+/// A one-shot sleep toward a deadline that survives `recv()` cancellation.
+///
+/// Re-arming to the same deadline reuses the existing sleep, so the hot path
+/// does not allocate a boxed sleep per poll (#5795).
+struct DeadlineSleep<T: TimeSource> {
+    time_source: T,
+    armed: Option<(u64, crate::simulation::BoxedSleep)>,
+}
+
+impl<T: TimeSource> DeadlineSleep<T> {
+    fn new(time_source: T) -> Self {
+        Self {
+            time_source,
+            armed: None,
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// Arm for `deadline_nanos`, replacing any other deadline.
+    fn arm_at(&mut self, deadline_nanos: u64) {
+        if !matches!(&self.armed, Some((d, _)) if *d == deadline_nanos) {
+            self.armed = Some((deadline_nanos, self.time_source.sleep_until(deadline_nanos)));
+        }
+    }
+
+    /// Arm for `deadline_nanos` unless already armed for an earlier one.
+    fn arm_no_later_than(&mut self, deadline_nanos: u64) {
+        if self.armed.as_ref().is_none_or(|(d, _)| *d > deadline_nanos) {
+            self.arm_at(deadline_nanos);
+        }
+    }
+
+    /// Ready once the armed deadline passes; disarms itself when it fires.
+    /// Never ready while unarmed.
+    fn poll_fire(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let Some((_, sleep)) = self.armed.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        match sleep.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => {
+                self.armed = None;
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Timers driving `recv()`, kept on the connection so they survive the
+/// cancellation of `recv()` by `peer_connection_listener`'s outer select,
+/// which happens on every outbound message and every returned inbound one
+/// (#5795). Before, each `recv()` call rebuilt all of them, which (a) cost
+/// several boxed sleeps per call and per inner iteration, (b) ran the 5 s
+/// timeout sweep immediately on EVERY call (its first tick was immediate),
+/// and (c) restarted the 100 ms ack timer and the resend check on every call,
+/// so steady traffic could keep either from ever firing.
+struct RecvTimers<T: TimeSource> {
+    /// Idle-timeout check, stale-ping cleanup and streaming-handle sweep.
+    timeout_check: TimeSourceInterval<T>,
+    /// Flushes pending receipts.
+    ack_check: TimeSourceInterval<T>,
+    /// Updates the token bucket rate from the congestion controller.
+    rate_update_check: TimeSourceInterval<T>,
+    /// Next resend / TLP check.
+    resend: DeadlineSleep<T>,
+    /// Upper bound on the wait for a resend check after `recv()` is entered,
+    /// so a packet sent between calls has its TLP/RTO checked promptly.
+    resend_initial: Duration,
+    /// Short re-check delay after a capped burst of resends.
+    resend_yield: Duration,
+}
+
+impl<T: TimeSource> RecvTimers<T> {
+    /// Interval for the timeout check / sweep.
+    const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new(time_source: &T) -> Self {
+        // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce
+        // scheduling overhead from ~900K to ~180K timer firings/sec across all connections.
+        let in_simulation = crate::config::SimulationTransportOpt::is_enabled();
+        let ack_interval = if in_simulation {
+            SIMULATION_ACK_CHECK_INTERVAL
+        } else {
+            ACK_CHECK_INTERVAL
+        };
+        let now = time_source.now_nanos();
+        let first_ack = now + ack_interval.as_nanos() as u64;
+        Self {
+            // First check one period from now, not immediately.
+            timeout_check: TimeSourceInterval::new_at(
+                time_source.clone(),
+                now + Self::TIMEOUT_CHECK_INTERVAL.as_nanos() as u64,
+                Self::TIMEOUT_CHECK_INTERVAL,
+            ),
+            ack_check: TimeSourceInterval::new_at(time_source.clone(), first_ack, ack_interval),
+            rate_update_check: TimeSourceInterval::new_at(
+                time_source.clone(),
+                first_ack,
+                ack_interval,
+            ),
+            resend: DeadlineSleep::new(time_source.clone()),
+            resend_initial: if in_simulation {
+                SIMULATION_RESEND_CHECK_INTERVAL
+            } else {
+                Duration::from_millis(10)
+            },
+            resend_yield: if in_simulation {
+                SIMULATION_RESEND_YIELD_DELAY
+            } else {
+                Duration::from_millis(2)
+            },
+        }
     }
 }
 
@@ -744,8 +866,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             remote_conn.remote_protoc_version,
             UNTRACKED_ACK_NOOP_MIN_VERSION,
         );
+        let recv_timers = RecvTimers::new(&time_source);
         Self {
             ack_remote_noops,
+            recv_timers,
+            timeout_checks_run: 0,
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
@@ -855,61 +980,29 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     #[instrument(name = "peer_connection", skip(self))]
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce
-        // scheduling overhead from ~900K to ~180K timer firings/sec across all connections.
-        let in_simulation = crate::config::SimulationTransportOpt::is_enabled();
-        let ack_interval = if in_simulation {
-            SIMULATION_ACK_CHECK_INTERVAL
-        } else {
-            ACK_CHECK_INTERVAL
-        };
-        let resend_initial = if in_simulation {
-            SIMULATION_RESEND_CHECK_INTERVAL
-        } else {
-            Duration::from_millis(10)
-        };
-        let resend_yield = if in_simulation {
-            SIMULATION_RESEND_YIELD_DELAY
-        } else {
-            Duration::from_millis(2)
-        };
-
-        // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check_sleep: Option<
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        > = Some(self.time_source.sleep(resend_initial));
+        // The timers live on `self` (see `RecvTimers`); only bound the wait for
+        // the next resend check, so packets sent since the last call get their
+        // TLP/RTO checked promptly. This never pushes an earlier check later.
+        let resend_initial = self.recv_timers.resend_initial;
+        let resend_yield = self.recv_timers.resend_yield;
+        self.recv_timers
+            .resend
+            .arm_no_later_than(self.time_source.now_nanos() + resend_initial.as_nanos() as u64);
 
         let kill_connection_after = self.time_source.connection_idle_timeout();
         let kill_connection_after_nanos = kill_connection_after.as_nanos() as u64;
 
-        // Check for timeout periodically
-        let mut timeout_check =
-            TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
-
-        // Background ACK timer - sends pending ACKs proactively
-        // This prevents delays when there's no outgoing traffic to piggyback ACKs on
-        // Use interval_at to delay the first tick - unlike the keep-alive task which can
-        // block to skip its first tick, we're inside a select! loop so we delay instead
-        let ack_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
-        let mut ack_check =
-            TimeSourceInterval::new_at(self.time_source.clone(), ack_start_nanos, ack_interval);
-
-        // Rate update timer - updates TokenBucket rate based on BBR cwnd
-        // This allows the token bucket to adapt to network conditions dynamically
-        let rate_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
-        let mut rate_update_check =
-            TimeSourceInterval::new_at(self.time_source.clone(), rate_start_nanos, ack_interval);
-
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
-            // If resend_check_sleep was consumed by a previous select iteration
-            // (via .take()) but the resend branch didn't win, refill with a short
-            // delay. This prevents the resend branch from being immediately Ready
-            // on every iteration during retransmission storms, which would starve
-            // inbound packet processing and create an ACK-drop feedback loop.
-            if resend_check_sleep.is_none() {
-                resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+            // The resend timer disarms when it fires; if the resend branch left it
+            // unarmed (send error path), re-arm with a short delay rather than
+            // leaving it immediately Ready, which during retransmission storms
+            // would starve inbound packet processing (#3215).
+            if !self.recv_timers.resend.is_armed() {
+                self.recv_timers
+                    .resend
+                    .arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
             }
 
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
@@ -1373,7 +1466,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                     }
                 },
-                _ = timeout_check.tick() => {
+                _ = self.recv_timers.timeout_check.tick() => {
+                    self.timeout_checks_run += 1;
                     let now_nanos = self.time_source.now_nanos();
                     let elapsed_nanos = now_nanos.saturating_sub(self.last_received_nanos);
                     let elapsed = Duration::from_nanos(elapsed_nanos);
@@ -1456,10 +1550,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // fragments are coming.
                     self.sweep_idle_streaming_handles();
                 },
-                // The .take() consumes the sleep future; the unwrap_or(ready()) fallback
-                // should be unreachable since the top-of-loop guard always refills it,
-                // but is kept as a defensive measure.
-                _ = async { resend_check_sleep.take().unwrap_or_else(|| Box::pin(std::future::ready(()))).await } => {
+                // Fires once the armed resend deadline passes (and disarms; the
+                // top-of-loop guard re-arms it). Not consumed when another branch
+                // wins, so it cannot fall back to "always ready" (#3215).
+                _ = std::future::poll_fn(|cx| self.recv_timers.resend.poll_fire(cx)) => {
                     // Bound retransmissions per iteration to prevent monopolizing the
                     // select loop. Remaining resends are deferred by a short sleep
                     // (see top of loop) so inbound branches can interleave.
@@ -1480,7 +1574,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // re-sends nor re-registers). See #4345.
                         let (idx, packet) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
-                                resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
+                                self.recv_timers.resend.arm_at(deadline_nanos);
                                 break;
                             }
                             ResendAction::Abandon { packet_id, payload_len } => {
@@ -1501,7 +1595,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 );
                                 resend_count += 1;
                                 if resend_count >= MAX_RESENDS_PER_ITERATION {
-                                    resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                                    self.recv_timers.resend.arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
                                     break;
                                 }
                                 continue;
@@ -1589,19 +1683,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
-                            resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                            self.recv_timers.resend.arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
                             break;
                         }
                     }
                 },
                 // Background ACK timer - proactively send pending ACKs
                 // This prevents ACK delays when there's no outgoing traffic to piggyback on
-                _ = ack_check.tick() => {
+                _ = self.recv_timers.ack_check.tick() => {
                     self.flush_receipts_now().await?;
                 },
                 // Rate update timer - update TokenBucket rate based on BBR cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
-                _ = rate_update_check.tick() => {
+                _ = self.recv_timers.rate_update_check.tick() => {
                     let now_nanos = self.time_source.now_nanos();
 
                     // Use congestion controller's base delay for rate calculation
