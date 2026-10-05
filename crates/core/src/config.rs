@@ -4743,6 +4743,7 @@ impl SimulationForceNoopGate {
     }
 
     /// Record one connection created with the gate forced on.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn record_forced_connection() {
         SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
     }
