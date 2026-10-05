@@ -5075,7 +5075,7 @@ fn ranking_probability_preserves_order_above_one_and_never_goes_negative() {
 /// (`failure * 3.0`) went negative for exactly the best peers (and the
 /// dashboard of the time printed it as "N/A").
 #[test]
-fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
+fn a_negative_unbounded_forecast_still_yields_a_non_negative_cost() {
     use crate::node::network_status::OpType;
     use crate::router::{RouteEvent, RouteOutcome, Router};
 

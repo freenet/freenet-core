@@ -11273,6 +11273,51 @@ pub(crate) mod candidate_log_wiring_tests {
         ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([0u8; 32]))
     }
 
+    /// The peer page's per-peer eligible/chosen counts take only real routing
+    /// decisions, from both ring entry points; probes and pre-selections
+    /// (`DecisionLog::Unlogged`) leave them untouched.
+    #[tokio::test]
+    async fn only_routing_decisions_count_toward_per_peer_selection() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("selection-counts", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let none: Vec<SocketAddr> = Vec::new();
+        let totals = || {
+            let router = ring.router.read();
+            peers.iter().fold((0u64, 0u64), |(eligible, chosen), peer| {
+                let selection = router.peer_snapshot(peer).selection.unwrap_or_default();
+                (eligible + selection.eligible, chosen + selection.chosen)
+            })
+        };
+
+        ring.k_closest_potentially_hosting(DecisionLog::Unlogged, key.id(), none.as_slice(), 2);
+        ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice());
+        assert_eq!(
+            totals(),
+            (0, 0),
+            "probes and pre-selections are not counted"
+        );
+
+        ring.closest_potentially_hosting(DecisionLog::Joinable(OpType::Put), &key, none.as_slice())
+            .expect("a peer is selected");
+        let (single, chosen) = totals();
+        assert!(
+            single >= 1 && chosen == 1,
+            "the single-peer entry point counts"
+        );
+
+        ring.k_closest_potentially_hosting(
+            DecisionLog::Joinable(OpType::Get),
+            key.id(),
+            none.as_slice(),
+            2,
+        );
+        let (both, chosen) = totals();
+        assert!(both > single, "the k-closest entry point counts");
+        assert_eq!(chosen, 2, "one first choice per decision, even with k = 2");
+    }
+
     #[tokio::test]
     async fn ring_selections_log_only_routing_decisions_with_their_op() {
         let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-wiring", 5).await;

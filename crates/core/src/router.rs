@@ -1317,6 +1317,8 @@ pub(crate) struct PeerRoutingSnapshot {
 pub(crate) struct PeerWindow {
     /// Outcomes (success or failure) about this peer in the failure window.
     pub outcomes: usize,
+    /// Of those, failures.
+    pub failures: usize,
     pub response_times: Vec<(f64, f64)>,
     pub transfer_speeds: Vec<(f64, f64)>,
 }
@@ -1915,17 +1917,37 @@ impl PeerSelectionCounts {
         let mut table = self.table.lock();
         table.use_clock += 1;
         let stamp = table.use_clock;
+        // Stamp every incumbent in the window BEFORE making room, so an
+        // eviction can never take a peer of this same decision (it would be
+        // re-inserted at zero, losing its counts).
+        let mut newcomers = Vec::new();
         for &peer in window {
-            if !table.entries.contains_key(peer) && table.entries.len() >= table.capacity {
-                table.evict_batch();
+            match table.entries.get_mut(peer) {
+                Some(entry) => {
+                    entry.eligible += 1;
+                    entry.even_share += share;
+                    entry.last_used = stamp;
+                    if peer == chosen {
+                        entry.chosen += 1;
+                    }
+                }
+                None => newcomers.push(peer),
             }
-            let entry = table.entries.entry(peer.clone()).or_default();
-            entry.eligible += 1;
-            entry.even_share += share;
-            entry.last_used = stamp;
-            if peer == chosen {
-                entry.chosen += 1;
-            }
+        }
+        let overflow = (table.entries.len() + newcomers.len()).saturating_sub(table.capacity);
+        if overflow > 0 {
+            table.evict_older_than(stamp, overflow);
+        }
+        for peer in newcomers {
+            table.entries.insert(
+                peer.clone(),
+                PeerSelectionEntry {
+                    eligible: 1,
+                    chosen: u64::from(peer == chosen),
+                    even_share: share,
+                    last_used: stamp,
+                },
+            );
         }
     }
 
@@ -1947,15 +1969,20 @@ impl PeerSelectionCounts {
 }
 
 impl PeerSelectionTable {
-    /// Evict the least-recently-eligible `capacity / 64` peers (at least one).
-    /// A batch, so a table kept full by churn does not scan once per decision.
-    fn evict_batch(&mut self) {
+    /// Evict the least-recently-eligible peers stamped before `stamp`: at
+    /// least `needed`, and a batch of `capacity / 64` when that is larger, so
+    /// a table kept full by churn does not scan once per decision. Peers
+    /// stamped at `stamp` (the decision being recorded) are never taken; if
+    /// fewer than `needed` older peers exist the table briefly exceeds its
+    /// capacity by the window's newcomers, which the next decision corrects.
+    fn evict_older_than(&mut self, stamp: u64, needed: usize) {
         let mut by_age: Vec<(u64, PeerKeyLocation)> = self
             .entries
             .iter()
+            .filter(|(_, entry)| entry.last_used < stamp)
             .map(|(peer, entry)| (entry.last_used, peer.clone()))
             .collect();
-        let batch = (self.capacity / 64).max(1).min(by_age.len());
+        let batch = (self.capacity / 64).max(needed).min(by_age.len());
         if batch == 0 {
             return;
         }
@@ -3545,10 +3572,17 @@ impl Router {
 
         let window = |failure: Option<&IsotonicEstimator>,
                       response: Option<&IsotonicEstimator>,
-                      transfer: Option<&IsotonicEstimator>| PeerWindow {
-            outcomes: failure.map_or(0, |e| e.points_for_peer(peer).len()),
-            response_times: response.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
-            transfer_speeds: transfer.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+                      transfer: Option<&IsotonicEstimator>| {
+            let outcomes = failure.map_or_else(Vec::new, |e| e.points_for_peer(peer));
+            PeerWindow {
+                outcomes: outcomes.len(),
+                failures: outcomes
+                    .iter()
+                    .filter(|&&(_, failed)| failed >= 0.5)
+                    .count(),
+                response_times: response.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+                transfer_speeds: transfer.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+            }
         };
         let window_by_op = [OpType::Get, OpType::Put, OpType::Update, OpType::Subscribe]
             .iter()
@@ -3582,6 +3616,12 @@ impl Router {
     pub(crate) fn peer_offsets(&self, peer: &PeerKeyLocation) -> [Option<PeerOffset>; 3] {
         self.hierarchical
             .peer_offsets(peer, self.estimator_clock.hours())
+    }
+
+    /// `(outcomes, failures)` across every peer in the failure window: the
+    /// population [`PeerRoutingSnapshot::window`] is one peer's share of.
+    pub(crate) fn window_outcomes(&self) -> (usize, usize) {
+        self.failure_estimator.outcome_counts()
     }
 
     /// Peers evicted from the per-peer selection table since the node started.
@@ -10004,5 +10044,136 @@ mod tests {
         );
         assert!(counts.get(&peers[79]).is_some());
         assert_eq!(counts.clone().get(&peers[0]), counts.get(&peers[0]));
+    }
+
+    /// With a batch larger than one (capacity 256, batch 4) the stalest
+    /// peers go, and a peer of the decision being recorded is never taken,
+    /// even when it is the stalest entry until that decision stamps it.
+    #[test]
+    fn peer_selection_eviction_never_takes_a_peer_of_the_same_decision() {
+        let counts = PeerSelectionCounts::new(256);
+        let peers: Vec<PeerKeyLocation> = (0..260).map(|_| PeerKeyLocation::random()).collect();
+        for peer in &peers[..256] {
+            counts.record(&[peer], peer);
+        }
+        assert_eq!(counts.evictions(), 0);
+        // peers[0] is the stalest entry, and it is in this decision's window
+        // AFTER a newcomer that forces an eviction.
+        counts.record(&[&peers[256], &peers[0]], &peers[0]);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| (s.eligible, s.chosen)),
+            Some((2, 2)),
+            "a same-decision peer keeps its counts"
+        );
+        assert_eq!(counts.evictions(), 4, "one batch of capacity / 64");
+        for (index, peer) in peers[1..5].iter().enumerate() {
+            assert!(
+                counts.get(peer).is_none(),
+                "peers[{}] was stalest",
+                index + 1
+            );
+        }
+        assert!(counts.get(&peers[5]).is_some(), "only the batch goes");
+        assert_eq!(counts.get(&peers[256]).map(|s| s.eligible), Some(1));
+        assert!(counts.table.lock().entries.len() <= 256);
+
+        counts.record(&[], &peers[0]);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| s.eligible),
+            Some(2),
+            "an empty window records nothing"
+        );
+    }
+
+    /// The per-peer pairs follow the window as it rolls over: only pairs still
+    /// in the last 200 are attributed.
+    #[test]
+    fn recent_pairs_for_a_peer_follow_the_window_roll_over() {
+        let mut pairs = RecentPairs::default();
+        let (a, b) = (1u64, 2u64);
+        for i in 0..150 {
+            pairs.push(i as f64, 0.0, a);
+        }
+        for i in 0..150 {
+            pairs.push(i as f64, 1.0, b);
+        }
+        let mine = pairs.for_peer(a);
+        assert_eq!(mine.len(), 50, "100 of a's pairs rolled out");
+        assert_eq!(
+            mine.first(),
+            Some(&(100.0, 0.0)),
+            "the oldest survivors first"
+        );
+        assert_eq!(pairs.for_peer(b).len(), 150);
+        assert_eq!(pairs.to_vec().len(), RECENT_PAIRS);
+        pairs.push(f64::NAN, 1.0, a);
+        assert_eq!(pairs.for_peer(a).len(), 50, "non-finite pairs are refused");
+    }
+
+    /// The factor the peer page shows for a timing stage is the ratio of
+    /// routing's own predictions, for this peer and for a peer with no record
+    /// at the same spot (same address, so same location, different key),
+    /// where neither has a record in the contract's ring band.
+    #[test]
+    fn the_timing_effect_is_the_ratio_of_routings_own_predictions() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let mut router = warm_hierarchical_router(&[]);
+        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        for round in 0..40u64 {
+            for (index, peer) in peers.iter().enumerate() {
+                let jitter_ms = 100 + (index as u64 * 7 + round * 13) % 50;
+                let factor = 1 + (index as u64 % 4);
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    // Bands 0-3 only.
+                    contract_location: Location::new(
+                        ((round * 7 + index as u64) % 50) as f64 / 100.0,
+                    ),
+                    outcome: RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(jitter_ms * factor),
+                        payload_size: 20_000,
+                        payload_transfer_time: Duration::from_millis(30 * factor + jitter_ms / 5),
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        let contract = Location::new(0.8);
+        let mut checked = 0;
+        for peer in &peers {
+            // A fresh key: `PeerKeyLocation::random` reuses one per thread.
+            let twin = PeerKeyLocation::new(
+                crate::transport::TransportKeypair::new().public().clone(),
+                peer.socket_addr().unwrap(),
+            );
+            let offsets = router.peer_offsets(peer);
+            let (Some(time), Some(speed)) = (offsets[1], offsets[2]) else {
+                panic!("both timing stages are warm");
+            };
+            let mine = router.predict_routing_outcome(peer, contract).unwrap();
+            let alone = router.predict_routing_outcome(&twin, contract).unwrap();
+            let time_ratio = mine.time_to_response_start / alone.time_to_response_start;
+            let speed_ratio = mine.xfer_speed.bytes_per_second / alone.xfer_speed.bytes_per_second;
+            assert!(
+                (time.effect / time_ratio - 1.0).abs() < 1e-9,
+                "response time: effect {} vs routing's ratio {time_ratio}",
+                time.effect
+            );
+            assert!(
+                (speed.effect / speed_ratio - 1.0).abs() < 1e-9,
+                "transfer speed: effect {} vs routing's ratio {speed_ratio}",
+                speed.effect
+            );
+            if (time.effect - time.offset.exp()).abs() > 1e-6 {
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "the scenario must make the spread matter, or exp(offset) would pass too"
+        );
+        let unknown = router.peer_offsets(&PeerKeyLocation::random());
+        assert_eq!(unknown[1].map(|o| o.effect), Some(1.0));
+        assert_eq!(unknown[2].map(|o| o.effect), Some(1.0));
     }
 }

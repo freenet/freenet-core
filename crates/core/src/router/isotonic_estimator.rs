@@ -961,6 +961,17 @@ impl IsotonicEstimator {
             .collect()
     }
 
+    /// `(observations, observations with a result of at least 0.5)` in the
+    /// window: for the failure estimator, `(outcomes, failures)`.
+    pub(crate) fn outcome_counts(&self) -> (usize, usize) {
+        let failures = self
+            .raw_events
+            .iter()
+            .filter(|event| event.result >= 0.5)
+            .count();
+        (self.raw_events.len(), failures)
+    }
+
     /// Every retained `(distance, outcome)` observation about `peer`, in
     /// insertion order and NOT downsampled, for the dashboard's per-peer
     /// scatter. Linear in the window (at most `MAX_REGRESSION_POINTS`).

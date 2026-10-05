@@ -3112,9 +3112,23 @@ impl<K: Hash + Eq + Clone> Stage<K> {
     pub(crate) fn peer_offset(&self, peer: &K, now: f64) -> Option<PeerOffset> {
         self.curve.as_ref()?;
         let now = self.effective_time(now);
-        let steps = self.levels[self.selected()].residual_steps(self.peers.lookup(peer), 0, now)?;
+        let level = &self.levels[self.selected()];
+        let steps = level.residual_steps(self.peers.lookup(peer), 0, now)?;
+        let unknown = level.residual_steps(None, 0, now)?;
+        let offset = steps.after_peer.mean - steps.after_root.mean;
+        // The timing stages predict an expectation, `exp(mu +- spread / 2)`,
+        // and a peer's record narrows its posterior variance as well as moving
+        // its mean, so the ratio routing acts on is not `exp(offset)` alone.
+        // `sigma2` and the band level's variance are common to both and cancel.
+        let narrowing = steps.after_peer.variance - unknown.after_peer.variance;
+        let effect = match self.target {
+            Target::Failure => offset,
+            Target::LogResponseTime => (offset + narrowing / 2.0).exp(),
+            Target::LogTransferSpeed => (offset - narrowing / 2.0).exp(),
+        };
         Some(PeerOffset {
-            offset: steps.after_peer.mean - steps.after_root.mean,
+            offset,
+            effect,
             evidence: steps.peer_evidence,
             weight: steps.peer_weight,
         })
@@ -3333,13 +3347,23 @@ impl Breakdown {
 /// peer's own level moved the posterior from there, so it is constant across
 /// distance and a peer predicted from distance alone has an offset of exactly
 /// 0. Band effects and the failure stage's contract term are left out, as they
-/// are from the peer curves.
+/// are from the peer curves; both are common to a peer and to distance alone
+/// for a contract in a band the peer has no record in, which is where
+/// [`Self::effect`] equals routing's own ratio exactly. The output bound is
+/// ignored too: where it binds, routing's ratio is smaller.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerOffset {
     /// On the stage's own scale: a probability difference for failure, a
     /// natural-log difference for the timing stages (so `exp(offset)` is the
     /// factor on the median response time or transfer speed).
     pub offset: f64,
+    /// What `offset` does to the prediction routing acts on, compared with
+    /// distance alone at the same distance: the probability difference for
+    /// failure; for the timing stages the RATIO of the expected response time
+    /// (or the effective transfer speed), which also reflects how much the
+    /// peer's record narrowed the uncertainty. Exactly 0 (failure) or 1
+    /// (timing) for a peer with no record.
+    pub effect: f64,
     /// Kish effective sample size behind this peer's own mean.
     pub evidence: f64,
     /// Share of the peer's own mean the estimate adopted, in `[0, 1)`. Below
