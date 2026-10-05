@@ -1508,6 +1508,25 @@ mod tests {
     }
 
     #[test]
+    fn estimator_failure_axis_ticks_land_on_round_percentages() {
+        // An auto-scaled top of 16.3% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.08), (0.5, 0.148)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0",
+            "auto",
+        );
+        for tick in [">0%<", ">10%<", ">20%<"] {
+            assert!(html.contains(tick), "missing tick {tick}: {html}");
+        }
+    }
+
+    #[test]
     fn estimator_chart_keeps_offscale_failure_dots_when_zoomed() {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top

@@ -703,10 +703,13 @@ fn strip_chart(
         .ok();
     }
     let zero_x = x(axis.zero);
+    // The line stops above the label row, so "this peer" on the line is not
+    // struck through.
     write!(
         svg,
-        r#"<line x1="{zero_x:.1}" x2="{zero_x:.1}" y1="{:.1}" y2="{axis_y:.1}" class="baseline"/><text x="{zero_x:.1}" y="{:.1}" text-anchor="middle" class="dl">distance alone</text>"#,
+        r#"<line x1="{zero_x:.1}" x2="{zero_x:.1}" y1="{:.1}" y2="{:.1}" class="baseline"/><text x="{zero_x:.1}" y="{:.1}" text-anchor="middle" class="dl">distance alone</text>"#,
         top - 6.0,
+        label_row - 10.0,
         top - 10.0,
     )
     .ok();

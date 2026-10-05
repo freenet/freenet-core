@@ -148,6 +148,22 @@ pub fn build_estimator_chart(
             }
         }
     }
+    // A failure axis from zero reads at round percentages: widen the top to
+    // twice a 1-2-2.5-5 step so the three ticks land on it.
+    if matches!(unit, ChartUnit::Probability)
+        && y_min == 0.0
+        && fixed_y_max.is_none()
+        && y_max > 0.0
+    {
+        let half = y_max / 2.0;
+        let decade = 10f64.powf(half.log10().floor());
+        let step = [1.0, 2.0, 2.5, 5.0, 10.0]
+            .into_iter()
+            .map(|m| m * decade)
+            .find(|&candidate| candidate >= half * (1.0 - 1e-9))
+            .unwrap_or(10.0 * decade);
+        y_max = 2.0 * step;
+    }
     let y_range = y_max - y_min;
     // Response times and transfer speeds span orders of magnitude, so they are
     // drawn on the same log axis the peer page uses.
