@@ -65,10 +65,10 @@ const WINDOW_REQUESTS: usize = 500;
 const MIN_TIMED_REPLIES: usize = crate::router::MIN_CURVE_POINTS_LOG;
 
 /// What the page says in place of a stage's comparison when that stage tells
-/// no peers apart ([`tells_apart`] is false): a statement about every peer,
+/// no peers apart ([`stage_alike`]): a statement about every peer,
 /// so it replaces the strip instead of riding on "this peer".
 const NO_DIFFERENCE: [&str; 2] = [
-    "No measurable difference between your peers' failure rates yet (failures are rare), so your node has not learned any peer to fail more or less often than distance alone predicts.",
+    "No measurable difference between your peers' failure rates yet, so your node has not learned any peer to fail more or less often than distance alone predicts.",
     "No measurable difference between your peers' response times yet, so your node has not learned any peer to be faster or slower than distance alone predicts.",
 ];
 
@@ -278,8 +278,9 @@ struct Learned {
     /// reply than distance alone predicts, when there is enough evidence
     /// behind it to state (see [`known`]).
     response_factor: Option<f64>,
-    /// Whether each of `[failure, response time]` tells any peers apart yet.
-    told_apart: [bool; 2],
+    /// Whether each of `[failure, response time]` finds every peer alike
+    /// (see [`stage_alike`]).
+    alike: [bool; 2],
     learning: Learning,
     /// Why the peer reads as avoided, when it does: `(slower, less reliable)`.
     avoided: Option<(bool, bool)>,
@@ -287,26 +288,33 @@ struct Learned {
 
 /// Whether a stage's reading for a peer can be stated: the peer has evidence
 /// there and the stage adopted at least [`KNOWN_WEIGHT`] of it. A stage that
-/// gives no peer any weight tells nobody apart, and states nothing either.
+/// gives no peer any weight states nothing either.
 fn known(offset: Option<PeerOffset>) -> bool {
     offset.is_some_and(|o| o.evidence > 0.0 && o.weight >= KNOWN_WEIGHT)
 }
 
-/// A stage "tells peers apart" once it gives some connected peer's own record
-/// any weight. While it gives every peer zero, it has found no difference
-/// between peers to learn, which is not the same as lacking evidence.
-fn tells_apart(view: &RouterView, stage: usize) -> bool {
-    view.others
-        .iter()
-        .any(|other| other.offsets[stage].is_some_and(|o| o.weight > 0.0))
+/// A stage finds every connected peer alike when it holds a record of at
+/// least one of them (evidence > 0) yet gives no connected peer's record any
+/// weight: it measured them and found no spread between peers to learn. A
+/// stage with no record of any of them (all fresh, or evicted) also gives
+/// every one weight 0, but that is too few replies, not "no difference".
+fn stage_alike(view: &RouterView, stage: usize) -> bool {
+    let mut measured = false;
+    for offset in view.others.iter().filter_map(|other| other.offsets[stage]) {
+        if offset.weight > 0.0 {
+            return false;
+        }
+        measured |= offset.evidence > 0.0;
+    }
+    measured
 }
 
 impl Learned {
     fn of(view: &RouterView) -> Self {
-        let told_apart = [tells_apart(view, 0), tells_apart(view, 1)];
+        let alike = [stage_alike(view, 0), stage_alike(view, 1)];
         let nothing = Learned {
             response_factor: None,
-            told_apart,
+            alike,
             learning: Learning::No,
             avoided: None,
         };
@@ -343,7 +351,7 @@ impl Learned {
         // found that every peer looks alike, which more requests from this
         // peer will not change.
         let warm_alike = peer.offsets.iter().any(Option::is_some)
-            && (0..3).all(|stage| peer.offsets[stage].is_none() || !tells_apart(view, stage));
+            && (0..3).all(|stage| peer.offsets[stage].is_none() || stage_alike(view, stage));
         let learning = if sources.contains(&Source::Known) {
             Learning::No
         } else if sources.iter().all(|s| *s == Source::Early) {
@@ -370,7 +378,7 @@ impl Learned {
         });
         Learned {
             response_factor,
-            told_apart,
+            alike,
             learning,
             avoided: ((slower || less_reliable) && passed_over).then_some((slower, less_reliable)),
         }
@@ -527,7 +535,7 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
                 time_ratio(factor),
                 fmt_time(alone)
             ),
-            None if !learned.told_apart[1] => {
+            None if learned.alike[1] => {
                 // Short: the comparison card carries the full sentence.
                 "; no measurable difference between peers yet".to_string()
             }
@@ -710,10 +718,12 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     // about all of them in the strip's place, not a row of identical dots.
     let no_difference =
         |stage: usize| format!(r#"<p class="chart-note">{}</p>"#, NO_DIFFERENCE[stage]);
+    let failure_strip = !(fail_others.is_empty() && fail_mine.is_none()) && !stage_alike(view, 0);
+    let time_strip = !(time_others.is_empty() && time_mine.is_none()) && !stage_alike(view, 1);
     let failure = if fail_others.is_empty() && fail_mine.is_none() {
         r#"<div class="empty-box">Too few requests across your peers to compare yet.</div>"#
             .to_string()
-    } else if !tells_apart(view, 0) {
+    } else if !failure_strip {
         no_difference(0)
     } else {
         let values = values(&fail_others, &fail_mine);
@@ -730,7 +740,7 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     let time = if time_others.is_empty() && time_mine.is_none() {
         r#"<div class="empty-box">Too few replies across your peers to compare yet.</div>"#
             .to_string()
-    } else if !tells_apart(view, 1) {
+    } else if !time_strip {
         no_difference(1)
     } else {
         let values = values(&time_others, &time_mine);
@@ -746,11 +756,9 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     };
     // `others` is drawn from `inputs.peers`, so `matched <= connected`; the
     // subtraction below saturates rather than trust that.
-    // The dot caption and the failure unit describe strips; with neither
-    // strip drawn (every stage alike) they would describe nothing.
-    let drawn = |svg: &str| svg.contains("<svg");
-    let any_strip = drawn(&failure) || drawn(&time);
-    let failure_unit = if drawn(&failure) {
+    // The dot caption and the failure unit describe strips, so each says only
+    // what the strips actually drawn need.
+    let failure_unit = if failure_strip {
         r#" <span class="unit">(percentage points)</span>"#
     } else {
         ""
@@ -765,9 +773,15 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             connected.saturating_sub(matched)
         )
     };
-    let caption = if any_strip {
+    let too_few = match (failure_strip, time_strip) {
+        (true, true) => "too few requests (for response time, timed replies)",
+        (true, false) => "too few requests",
+        (false, true) => "too few timed replies",
+        (false, false) => "",
+    };
+    let caption = if failure_strip || time_strip {
         format!(
-            r#"<p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests (for response time, timed replies) to judge is drawn hollow, on the line.</p>"#
+            r#"<p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with {too_few} to judge is drawn hollow, on the line.</p>"#
         )
     } else {
         String::new()
@@ -1217,7 +1231,7 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
                 "{dots} Your node expects this peer to reply about as fast as distance alone predicts."
             ),
             // The comparison card says it once; the caption does not repeat it.
-            None if !learned.told_apart[1] => dots.to_string(),
+            None if learned.alike[1] => dots.to_string(),
             None => format!(
                 "{dots} Too few of its replies yet to say how it differs from what distance alone predicts."
             ),
@@ -2615,7 +2629,7 @@ mod tests {
         let view = view_with(alike, vec![alike, alike], None);
         let learned = Learned::of(&view);
         assert_eq!(learned.response_factor, None);
-        assert_eq!(learned.told_apart, [false, false]);
+        assert_eq!(learned.alike, [true, true]);
         let snaps = [snapshot_of(&PeerKeyLocation::random())];
         let mut view = view;
         view.others.last_mut().unwrap().address = snaps[0].address.to_string();
@@ -2841,9 +2855,49 @@ mod tests {
             "a strip is drawn, so its caption is too"
         );
         assert!(
+            card.contains("A peer with too few timed replies to judge is drawn hollow"),
+            "the caption names only the drawn strip's reason"
+        );
+        assert!(
             !card.contains("(percentage points)"),
             "the failure strip is not"
         );
+    }
+
+    /// A stage with no record of any connected peer (all fresh or evicted)
+    /// gives every one weight 0 too, but that is too few replies, not "no
+    /// difference": the strips stay, hollow, with that reason.
+    #[test]
+    fn peers_without_records_are_too_few_not_alike() {
+        let fresh = [failure(0.0, 0.0, 0.0), timing(1.0, 0.0, 0.0), None];
+        let snaps = [
+            snapshot_of(&PeerKeyLocation::random()),
+            snapshot_of(&PeerKeyLocation::random()),
+        ];
+        let mut view = view_with(fresh, vec![fresh], None);
+        view.others[0].address = snaps[0].address.to_string();
+        view.others.last_mut().unwrap().address = snaps[1].address.to_string();
+        view.peer.as_mut().unwrap().curves[0] = RoutingCurve {
+            distance_alone: vec![(0.0, 0.2), (0.5, 0.4)],
+            this_peer: Vec::new(),
+            early: false,
+        };
+        let learned = Learned::of(&view);
+        assert_eq!(learned.alike, [false, false]);
+        let html = render_peer_page(&inputs(&snaps, 1), Some(&view));
+        for sentence in NO_DIFFERENCE {
+            assert!(!html.contains(sentence), "claims {sentence:?}");
+        }
+        assert!(!html.contains("no measurable difference"));
+        assert!(html.contains("too few timed replies yet to compare it with distance alone"));
+        assert!(html.contains("this peer &middot; too few requests to judge yet"));
+        assert!(html.contains("this peer &middot; too few timed replies to judge yet"));
+        assert!(html.contains("Still learning about this peer"));
+        // One peer with a record but no weight makes the stage alike.
+        let measured = [failure(0.0, 25.0, 0.0), timing(1.0, 25.0, 0.0), None];
+        let mut view = view_with(fresh, vec![measured], None);
+        view.others[0].address = snaps[0].address.to_string();
+        assert_eq!(Learned::of(&view).alike, [true, true]);
     }
 
     #[test]
