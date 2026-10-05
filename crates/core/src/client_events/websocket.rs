@@ -41,7 +41,7 @@ pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Most bytes one read syscall on a client WebSocket takes, and so the most
-/// tungstenite zero-fills before each read attempt (see `websocket_commands`).
+/// tungstenite zero-fills before each read attempt (see `configure_upgrade`).
 /// 16 KiB holds any ordinary request in one read; larger frames just take more
 /// reads into a buffer already reserved at their full length.
 const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
@@ -1303,6 +1303,12 @@ async fn websocket_commands(
         }
     };
 
+    configure_upgrade(ws).on_upgrade(on_upgrade)
+}
+
+/// Transport limits for a client WebSocket. Shared with the end-to-end tests so
+/// they exercise the shipped configuration.
+fn configure_upgrade(ws: WebSocketUpgrade) -> WebSocketUpgrade {
     // 100MB limit: WASM contract uploads can be very large and the default
     // ~64KB would reject them. Streaming chunks individual responses but the
     // initial PUT still arrives as a single WebSocket message.
@@ -1315,7 +1321,6 @@ async fn websocket_commands(
     // length is still reserved up front, so large messages are unaffected.
     ws.max_message_size(100 * 1024 * 1024)
         .read_buffer_size(WEBSOCKET_READ_BUFFER_SIZE)
-        .on_upgrade(on_upgrade)
 }
 
 /// Send a synthetic Disconnect to the node so subscription cleanup always runs.
@@ -4700,5 +4705,312 @@ mod tests {
             "the classified scope must be injected as a request extension so the \
              upgrade path can move it into the connection task"
         );
+    }
+
+    // ---- Event-driven subscription delivery (#5795) ------------------------
+
+    /// A notification tagged so tests can tell deliveries apart.
+    fn tagged_notification(tag: &str) -> HostResult {
+        Err(ErrorKind::Unhandled {
+            cause: tag.to_string().into(),
+        }
+        .into())
+    }
+
+    fn notification_tag(notification: &HostResult) -> String {
+        match notification {
+            Err(err) => err.to_string(),
+            Ok(resp) => panic!("expected a tagged notification, got Ok({resp})"),
+        }
+    }
+
+    /// Counts wake-ups, so a test can tell whether a send woke the parked poll.
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The property the 10 ms polling loop lacked: a notification sent to a
+    /// parked listener poll WAKES it. The old code's `try_recv` registered no
+    /// waker, so delivery waited for its `sleep(10ms)` to fire, and that timer
+    /// woke every idle connection ~100x/s.
+    ///
+    /// The wake count carries the weight here, not timing: a version of
+    /// `SubscriptionListener::poll_next` that checks the receiver without
+    /// registering the waker leaves the count at zero and fails this test.
+    #[test]
+    fn notification_wakes_a_parked_listener_poll() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx, rx) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx);
+
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut next = std::pin::pin!(listeners.next());
+
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        tx.try_send(tagged_notification("first"))
+            .expect("channel has room");
+        assert!(
+            wakes.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a send must wake the parked listener poll, not wait for a timer"
+        );
+        match next.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(n)) => assert!(notification_tag(&n).contains("first")),
+            other @ (Poll::Ready(None) | Poll::Pending) => {
+                panic!("expected the notification, got {other:?}")
+            }
+        }
+    }
+
+    /// A listener whose sender is gone still delivers what it buffered, in
+    /// order, then drops out of the map. The others keep delivering, and only
+    /// once every listener is gone does `next()` report `None` (which the
+    /// connection loop treats as "disable this branch", not "disconnect").
+    #[test]
+    fn closed_listener_drains_then_is_removed_without_affecting_others() {
+        let mut listeners = SubscriptionListeners::default();
+        assert!(listeners.is_empty());
+        assert!(
+            matches!(listeners.next().now_or_never(), Some(None)),
+            "an empty map resolves to None at once, which is why the select! \
+             branch is guarded by `!listeners.is_empty()`"
+        );
+
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx_a);
+        listeners.insert("contract-b".to_string(), rx_b);
+
+        tx_a.try_send(tagged_notification("a-first")).unwrap();
+        tx_a.try_send(tagged_notification("a-second")).unwrap();
+        drop(tx_a);
+
+        let mut a_seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            a_seen.push(notification_tag(&n));
+        }
+        assert_eq!(a_seen.len(), 2, "both buffered notifications delivered");
+        assert!(a_seen[0].contains("a-first") && a_seen[1].contains("a-second"));
+        assert_eq!(listeners.len(), 1, "the closed listener is removed");
+
+        // The surviving listener is unaffected.
+        tx_b.try_send(tagged_notification("b-first")).unwrap();
+        match listeners.next().now_or_never() {
+            Some(Some(n)) => assert!(notification_tag(&n).contains("b-first")),
+            other => panic!("expected b's notification, got {other:?}"),
+        }
+
+        drop(tx_b);
+        assert!(matches!(listeners.next().now_or_never(), Some(None)));
+        assert!(listeners.is_empty());
+    }
+
+    /// The old `VecDeque` held one entry per subscribe request, so two
+    /// subscriptions on the same contract from one connection both delivered.
+    /// Keying the map by the label would silently replace the first.
+    #[test]
+    fn listeners_with_the_same_label_all_deliver() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx_1, rx_1) = mpsc::channel(4);
+        let (tx_2, rx_2) = mpsc::channel(4);
+        listeners.insert("same-contract".to_string(), rx_1);
+        listeners.insert("same-contract".to_string(), rx_2);
+        assert_eq!(listeners.len(), 2);
+
+        tx_1.try_send(tagged_notification("from-one")).unwrap();
+        tx_2.try_send(tagged_notification("from-two")).unwrap();
+
+        let mut seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            seen.push(notification_tag(&n));
+        }
+        seen.sort();
+        assert_eq!(
+            seen.len(),
+            2,
+            "both same-label listeners delivered: {seen:?}"
+        );
+        assert!(seen[0].contains("from-one") && seen[1].contains("from-two"));
+    }
+
+    /// End to end over a real WebSocket, with the shipped upgrade
+    /// configuration: a subscription that arrives while the connection loop is
+    /// parked is delivered; a listener closing does not end the connection;
+    /// a later subscription on the same connection still delivers; and a
+    /// client frame far larger than `WEBSOCKET_READ_BUFFER_SIZE` arrives
+    /// intact.
+    #[tokio::test]
+    async fn websocket_delivers_subscription_notifications_end_to_end() {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use tokio::sync::oneshot;
+
+        const STEP: Duration = Duration::from_secs(5);
+
+        // Fake node backend: assign an id, hand the connection's callback
+        // sender to the test, and forward every client request to the test.
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        let (callbacks_tx, callbacks_rx) =
+            oneshot::channel::<(ClientId, mpsc::UnboundedSender<HostCallbackResult>)>();
+        let (forwarded_tx, mut forwarded_rx) = mpsc::unbounded_channel::<ClientRequest<'static>>();
+        tokio::spawn(async move {
+            let mut callbacks_tx = Some(callbacks_tx);
+            while let Some(conn) = req_rx.recv().await {
+                match conn {
+                    ClientConnection::NewConnection { callbacks, .. } => {
+                        let id = ClientId::next();
+                        callbacks
+                            .send(HostCallbackResult::NewId { id })
+                            .expect("connection under test is waiting for its id");
+                        if let Some(tx) = callbacks_tx.take() {
+                            tx.send((id, callbacks))
+                                .expect("test is waiting for the callbacks");
+                        }
+                    }
+                    ClientConnection::Request { req, .. } => {
+                        // The test may have finished reading; nothing to do then.
+                        drop(forwarded_tx.send(*req));
+                    }
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            configure_upgrade(ws).on_upgrade(move |socket| async move {
+                // The interface's own return value is not under test.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        false,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Serving ends with the test; its result is teardown noise.
+            drop(axum::serve(listener, app).await);
+        });
+
+        let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let (client_id, callbacks) = tokio::time::timeout(STEP, callbacks_rx)
+            .await
+            .expect("timed out waiting for the connection")
+            .expect("backend hands over the callbacks");
+
+        async fn next_notification(
+            client: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> String {
+            tokio::time::timeout(STEP, async {
+                loop {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only binary frames carry notifications; pings and every other frame kind are skipped"
+                    )]
+                    match client.next().await.expect("connection open").expect("ws frame") {
+                        tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                            let decoded: HostResult =
+                                bincode::deserialize(&bytes).expect("native notification frame");
+                            return notification_tag(&decoded);
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                            panic!("connection closed unexpectedly: {frame:?}")
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for a notification")
+        }
+
+        // 1. A subscription arriving while the loop is parked (no listeners
+        //    yet) is picked up, and its notifications arrive in order.
+        let (sub_tx, sub_rx) = mpsc::channel(4);
+        callbacks
+            .send(HostCallbackResult::SubscriptionChannel {
+                key: "contract-e2e".to_string(),
+                id: client_id,
+                callback: sub_rx,
+            })
+            .unwrap();
+        sub_tx.send(tagged_notification("e2e-first")).await.unwrap();
+        sub_tx
+            .send(tagged_notification("e2e-second"))
+            .await
+            .unwrap();
+        assert!(next_notification(&mut client).await.contains("e2e-first"));
+        assert!(next_notification(&mut client).await.contains("e2e-second"));
+
+        // 2. The listener closes. The connection must stay up: a new
+        //    subscription with the same label still delivers.
+        drop(sub_tx);
+        let (sub_tx2, sub_rx2) = mpsc::channel(4);
+        callbacks
+            .send(HostCallbackResult::SubscriptionChannel {
+                key: "contract-e2e".to_string(),
+                id: client_id,
+                callback: sub_rx2,
+            })
+            .unwrap();
+        sub_tx2
+            .send(tagged_notification("e2e-after-close"))
+            .await
+            .unwrap();
+        assert!(
+            next_notification(&mut client)
+                .await
+                .contains("e2e-after-close")
+        );
+
+        // 3. A client frame well past the read buffer size arrives intact.
+        let big_token = "t".repeat(WEBSOCKET_READ_BUFFER_SIZE * 20);
+        let frame = bincode::serialize(&ClientRequest::Authenticate {
+            token: big_token.clone(),
+        })
+        .unwrap();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                frame.into(),
+            ))
+            .await
+            .expect("send large frame");
+        match tokio::time::timeout(STEP, forwarded_rx.recv())
+            .await
+            .expect("timed out waiting for the large request")
+        {
+            Some(ClientRequest::Authenticate { token }) => assert_eq!(token, big_token),
+            other => panic!("expected the large Authenticate request, got {other:?}"),
+        }
     }
 }
