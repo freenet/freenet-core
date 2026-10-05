@@ -3315,6 +3315,257 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // `execute_wasm_blocking` driven with STUB jobs (no guest), so each test
+    // controls exactly when the job starts, how long it runs, and how it ends.
+    // -------------------------------------------------------------------------
+
+    /// A store to hand a stub job: `execute_wasm_blocking` moves one in and
+    /// expects it back with the result.
+    fn stub_store() -> Store<HostState> {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        WasmtimeEngine::new(&config, false)
+            .expect("engine must build")
+            .store
+            .take()
+            .expect("engine store present")
+    }
+
+    /// How long each latency-test job "runs". Production WASM calls take a
+    /// median ~1-4 ms of CPU; 1 ms models the short end. It also makes the test
+    /// decisive: a job that does NO work sometimes finishes before the old
+    /// poll's first `is_finished()` check (measured: 20 no-op calls took 113 ms
+    /// on the multi-thread arm, not 200), while a 1 ms job never does.
+    const LATENCY_JOB_WORK: Duration = Duration::from_millis(1);
+
+    /// Run `calls` short jobs back to back and return the total wall time.
+    fn time_short_calls(calls: u32) -> Duration {
+        let mut store = stub_store();
+        let start = std::time::Instant::now();
+        for _ in 0..calls {
+            let job = move || {
+                std::thread::sleep(LATENCY_JOB_WORK);
+                (Ok(42), store)
+            };
+            match execute_wasm_blocking(job, 5.0) {
+                BlockingResult::Ok(42, s) => store = s,
+                _ => panic!("a short job must come back Ok(42)"),
+            }
+        }
+        start.elapsed()
+    }
+
+    /// Calls per latency test, and the bound on their TOTAL wall time.
+    ///
+    /// The old wait polled `is_finished()` with a 10 ms `thread::sleep` and the
+    /// first poll ran immediately after the spawn, so every 1 ms job cost at
+    /// least 10 ms: 20 calls >= 200 ms. A completion wait costs the job's 1 ms
+    /// plus a thread handoff (tens of microseconds): ~20 ms. The 100 ms bound
+    /// (5 ms mean) is decisive against the poll and leaves a loaded CI runner
+    /// ~5x headroom.
+    const LATENCY_CALLS: u32 = 20;
+    const LATENCY_TOTAL_BOUND: Duration = Duration::from_millis(100);
+
+    /// A job that finishes in 1 ms must return in ~1 ms, not on the next 10 ms
+    /// poll tick. Run on a WORKER (via `tokio::spawn`), the context
+    /// production calls from, so the `block_in_place` path is the real one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_job_returns_promptly_on_multithread_runtime() {
+        let total = tokio::spawn(async { time_short_calls(LATENCY_CALLS) })
+            .await
+            .expect("latency task must not panic");
+        assert!(
+            total < LATENCY_TOTAL_BOUND,
+            "{LATENCY_CALLS} 1 ms WASM jobs took {total:?} (bound {LATENCY_TOTAL_BOUND:?}): \
+             the wait is sleeping on a poll interval instead of waking on completion"
+        );
+    }
+
+    /// Same for the no-runtime arm (dedicated `std::thread`), which had its own
+    /// copy of the 10 ms poll.
+    #[test]
+    fn fast_job_returns_promptly_without_runtime() {
+        let total = time_short_calls(LATENCY_CALLS);
+        assert!(
+            total < LATENCY_TOTAL_BOUND,
+            "{LATENCY_CALLS} 1 ms WASM jobs took {total:?} (bound {LATENCY_TOTAL_BOUND:?}) \
+             on the no-runtime arm"
+        );
+    }
+
+    /// A runtime whose blocking pool has exactly ONE thread, plus a handle that
+    /// occupies it until `hold` elapses. `hold_started` is received once the
+    /// blocker is actually ON the thread, so the next `spawn_blocking` is
+    /// guaranteed to queue.
+    fn one_blocking_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime must build")
+    }
+
+    fn occupy_the_blocking_thread(hold: Duration) -> tokio::task::JoinHandle<()> {
+        let (on_thread_tx, on_thread_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            on_thread_tx
+                .send(())
+                .expect("test is waiting for the blocker");
+            std::thread::sleep(hold);
+        });
+        on_thread_rx
+            .recv()
+            .expect("blocker must reach the blocking thread");
+        blocker
+    }
+
+    /// Saturated blocking pool: the job never starts, so the deadline must
+    /// classify as `QueuedTimeout` (transient; maps to `SchedulerOverloaded`,
+    /// never quarantine), not `Timeout`.
+    #[test]
+    fn job_that_never_starts_on_saturated_pool_is_queued_timeout() {
+        let rt = one_blocking_thread_runtime();
+        rt.block_on(async {
+            let blocker = occupy_the_blocking_thread(Duration::from_secs(1));
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in_job = Arc::clone(&ran);
+            let store = stub_store();
+            let start = std::time::Instant::now();
+            let result = execute_wasm_blocking(
+                move || {
+                    ran_in_job.store(true, Ordering::SeqCst);
+                    (Ok(0), store)
+                },
+                0.2,
+            );
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(result, BlockingResult::QueuedTimeout),
+                "a job stuck behind a saturated pool must be QueuedTimeout"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "the job must not have run");
+            assert!(
+                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(900),
+                "the queue bound (200 ms) must decide the return, took {elapsed:?}"
+            );
+            blocker.await.expect("blocker must finish");
+        });
+    }
+
+    /// A job queued for most of its budget that then starts gets its FULL
+    /// budget from its own start (#4864 round-7). It finishes after the
+    /// enqueue-relative bound, which is exactly where the wait wakes, so this
+    /// also pins that the wait re-arms for the guest deadline instead of
+    /// classifying at the queue bound.
+    ///
+    /// Timeline (budget 300 ms): queued until ~150 ms, runs 200 ms, done at
+    /// ~350 ms. Queue bound 300 ms (passed while running); guest bound ~450 ms.
+    #[test]
+    fn late_started_job_gets_full_budget_from_its_own_start() {
+        let rt = one_blocking_thread_runtime();
+        rt.block_on(async {
+            let _blocker = occupy_the_blocking_thread(Duration::from_millis(150));
+            let store = stub_store();
+            let result = execute_wasm_blocking(
+                move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    (Ok(7), store)
+                },
+                0.3,
+            );
+            assert!(
+                matches!(result, BlockingResult::Ok(7, _)),
+                "a job that started late must get its full budget from its own start"
+            );
+        });
+    }
+
+    /// A job that RUNS past its budget is a real timeout (`Timeout`, which the
+    /// caller quarantines), and the wait returns at the deadline rather than
+    /// when the job eventually finishes.
+    #[test]
+    fn job_overrunning_its_budget_is_timeout() {
+        run_abandoning_guest_test(|| {
+            let store = stub_store();
+            let start = std::time::Instant::now();
+            let result = execute_wasm_blocking(
+                move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    (Ok(0), store)
+                },
+                0.15,
+            );
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(result, BlockingResult::Timeout),
+                "a job that runs past its budget must be Timeout"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(1),
+                "the guest budget (150 ms) must decide the return, took {elapsed:?}"
+            );
+        });
+    }
+
+    /// Same on the no-runtime arm.
+    #[test]
+    fn job_overrunning_its_budget_is_timeout_without_runtime() {
+        let store = stub_store();
+        let start = std::time::Instant::now();
+        let result = execute_wasm_blocking(
+            move || {
+                std::thread::sleep(Duration::from_millis(600));
+                (Ok(0), store)
+            },
+            0.15,
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, BlockingResult::Timeout));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "took {elapsed:?}: returned when the job finished, not at the deadline"
+        );
+    }
+
+    /// A panicking job comes back as `Panic`, on both arms.
+    #[test]
+    fn panicking_job_is_reported_as_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        let store = stub_store();
+        let on_runtime = rt.block_on(async {
+            tokio::spawn(async move {
+                execute_wasm_blocking(
+                    move || -> WasmResult {
+                        drop(store);
+                        panic!("stub job panic")
+                    },
+                    5.0,
+                )
+            })
+            .await
+            .expect("the panic must not unwind into the calling task")
+        });
+        assert!(matches!(on_runtime, BlockingResult::Panic(_)));
+
+        let store = stub_store();
+        let no_runtime = execute_wasm_blocking(
+            move || -> WasmResult {
+                drop(store);
+                panic!("stub job panic (no runtime)")
+            },
+            5.0,
+        );
+        assert!(matches!(no_runtime, BlockingResult::Panic(_)));
+    }
+
     /// #4864 round-7 pin: the blocking guest-entry paths MUST arm the epoch
     /// deadline INSIDE the closure passed to `execute_wasm_blocking` (so the
     /// budget starts at guest-start), not before it (which would let queue wait on
