@@ -128,7 +128,14 @@ fn accuracy_card(rs: &RouterSnapshotInfo) -> String {
         ),
     };
     let calibration = {
-        let pairs = &rs.hierarchical_failure_pairs;
+        // A non-finite forecast or outcome would make the sum NaN; such a
+        // pair is left out, and the count says how many were added.
+        let pairs: Vec<(f64, f64)> = rs
+            .hierarchical_failure_pairs
+            .iter()
+            .copied()
+            .filter(|(p, a)| p.is_finite() && a.is_finite())
+            .collect();
         let predicted: f64 = pairs.iter().map(|&(p, _)| p.clamp(0.0, 1.0)).sum();
         let happened = pairs.iter().filter(|&&(_, a)| a >= 0.5).count();
         if pairs.is_empty() {
@@ -812,6 +819,9 @@ mod tests {
         assert_eq!(fmt_skill(Some(0.049)), "+0.05 (within noise)");
         assert!(fmt_skill(Some(-0.051)).contains("worse"));
         assert_eq!(fmt_skill(Some(0.051)), "+0.05");
+        // Exactly at the band's edge is a real reading too.
+        assert_eq!(fmt_skill(Some(SKILL_NOISE)), "+0.05");
+        assert!(fmt_skill(Some(-SKILL_NOISE)).contains("worse than the average rate"));
     }
 
     #[test]
@@ -1197,6 +1207,9 @@ mod tests {
         assert!(card(None).contains("too few failures yet to judge"));
         assert!(card(Some(f64::NAN)).contains("too few failures yet to judge"));
         for (skill, verdict) in [
+            // The band is open: exactly SKILL_NOISE is a real reading.
+            (SKILL_NOISE, "better than"),
+            (-SKILL_NOISE, "worse than"),
             (SKILL_NOISE - 0.001, "about as good as"),
             (-(SKILL_NOISE - 0.001), "about as good as"),
             (SKILL_NOISE + 0.001, "better than"),
@@ -1217,6 +1230,19 @@ mod tests {
                 .contains("Over the last 4 requests it predicted 1.3 failures; 2 happened."),
             "predictions clamp to [0, 1] before they are added"
         );
+        // A non-finite pair is left out of the sum and the count, not
+        // turned into "predicted NaN failures".
+        rs.hierarchical_failure_pairs.extend([
+            (f64::NAN, 1.0),
+            (0.5, f64::INFINITY),
+            (f64::INFINITY, 0.0),
+        ]);
+        let html = accuracy_card(&rs);
+        assert!(
+            html.contains("Over the last 4 requests it predicted 1.3 failures; 2 happened."),
+            "{html}"
+        );
+        assert!(!html.contains("NaN") && !html.contains("inf"));
         rs.hierarchical_failure_pairs.clear();
         assert!(!accuracy_card(&rs).contains("Over the last"));
     }
