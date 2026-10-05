@@ -1122,7 +1122,20 @@ async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
         .await
         .expect("deliver");
     let a_tracker = a.conn.remote_conn.sent_tracker.clone();
-    let running = start(a, b, keep_all(), keep_all());
+    // Stop forwarding connection acks after a few, so a regression shows up
+    // as a failed count instead of an unbounded loop that never lets the
+    // paused clock advance (the loop answers instantly, forever).
+    fn cap_acks() -> DropFilter {
+        let mut seen = 0usize;
+        Box::new(move |m| {
+            if is_connection_ack(m) {
+                seen += 1;
+                return seen > 20;
+            }
+            false
+        })
+    }
+    let running = start(a, b, cap_acks(), cap_acks());
     tokio::time::sleep(Duration::from_secs(10)).await;
     let link = running.stop();
     let a_acks = link
