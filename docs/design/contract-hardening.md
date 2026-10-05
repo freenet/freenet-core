@@ -141,9 +141,9 @@ Contracts that exceed the threshold can still exist — they just can't conscrip
 
 | Component | Status |
 |-----------|--------|
-| `OutboundRequestCounter` (per-peer request count) | Live — fired from `ring.rs:1658` |
+| `OutboundRequestCounter` (per-peer request count) | Live — fired from `Ring::report_route_outcome_to_health` (`report_outbound_request`) |
 | `RequestDensityTracker` (per-location density) | Fed, but its density map is only read by tests; growth targets come from log-distance gap targeting (updated 2026-10) |
-| `adjust_topology` (Add/Remove/Swap decisions) | Live on ring tick (`ring.rs:2573`) |
+| `adjust_topology` (Add/Remove/Swap decisions) | Live on ring tick (`Ring::connection_maintenance`) |
 | min/max connections enforcement | Live |
 | Topology swap (replace least-routed peer) | Live |
 | `Meter::report` (bandwidth into meter) | Live since this doc was written: per-peer bandwidth is reported via `report_resource_usage` in `ring.rs` (updated 2026-10) |

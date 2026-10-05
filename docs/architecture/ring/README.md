@@ -172,7 +172,7 @@ connection distances in log-distance space:
 | Random Kleinberg samples | When several targets are requested at once (below `min_connections`), `sample_targets` alternates gap targets with random 1/d samples to discover peers via different routes; single steady-state additions are pure gap targets | `small_world_rand::kleinberg_target`, `TopologyManager::sample_targets` |
 | Kleinberg gap score | Inbound candidates are scored by how much they fill a gap in log-distance coverage | `small_world_rand::kleinberg_score`, `ConnectionManager::should_accept` |
 | Topology swaps | At steady state, a connection may be replaced by one targeting the largest gap, with probability proportional to how far that gap exceeds the expected `ln(k)/k` | `TopologyManager::maybe_swap_connection` |
-| Protected pruning | Peers whose removal would open a gap more than 2x the expected size are excluded from composite-score pruning and swaps (if every candidate is protected, a fallback drops the lowest-topology-value peer) | `TopologyManager::select_connections_to_remove`, `TOPOLOGY_PROTECTION_THRESHOLD` |
+| Protected pruning | Peers whose removal would open a gap more than 2x the expected size are excluded from composite-score pruning and from swaps. A fallback drops the lowest-topology-value peer when every removal candidate is protected, or when over `max_connections` and composite pruning finds no candidate | `TopologyManager::select_connections_to_remove`, `TOPOLOGY_PROTECTION_THRESHOLD` |
 
 In addition, peers configured with `max_connections` of at least 25 (production uses 200)
 maintain their nearest ring neighbor on each side (the nearest-neighbor lattice): a new

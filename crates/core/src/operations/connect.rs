@@ -32,8 +32,8 @@
 //! Relay C (loc=0.31) ──> ACCEPTS (at terminus - no closer peer to forward to)
 //! ```
 //!
-//! The joiner typically receives one ConnectResponse (two if a near-terminus relay also
-//! accepted). To get multiple connections, the joiner sends multiple ConnectRequests
+//! The joiner typically receives one ConnectResponse from the terminus, plus one more for
+//! each near-terminus relay that also accepted. To get multiple connections, the joiner sends multiple ConnectRequests
 //! targeting different locations. Terminus acceptance makes the acceptor land near the
 //! joiner's `desired_location`; the choice of `desired_location` (see "Why Target Location
 //! Matters") is what shapes the distance distribution of the joiner's connections.
