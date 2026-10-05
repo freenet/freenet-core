@@ -745,6 +745,15 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     };
     // `others` is drawn from `inputs.peers`, so `matched <= connected`; the
     // subtraction below saturates rather than trust that.
+    // The dot caption and the failure unit describe strips; with neither
+    // strip drawn (every stage alike) they would describe nothing.
+    let drawn = |svg: &str| svg.contains("<svg");
+    let any_strip = drawn(&failure) || drawn(&time);
+    let failure_unit = if drawn(&failure) {
+        r#" <span class="unit">(percentage points)</span>"#
+    } else {
+        ""
+    };
     let matched = view.others.len();
     let connected = inputs.peers.len();
     let whose = if matched == connected {
@@ -755,11 +764,18 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             connected.saturating_sub(matched)
         )
     };
+    let caption = if any_strip {
+        format!(
+            r#"<p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests (for response time, timed replies) to judge is drawn hollow, on the line.</p>"#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<div class="card">
             <h2>Compared with your other peers</h2>
-            <p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests (for response time, timed replies) to judge is drawn hollow, on the line.</p>
-            <div class="chart-title">Chance a request fails <span class="unit">(percentage points)</span></div>
+            {caption}
+            <div class="chart-title">Chance a request fails{failure_unit}</div>
             {failure}
             <div class="chart-title">Response time</div>
             {time}
@@ -2618,6 +2634,10 @@ mod tests {
         let card = compare_card(&inputs(&snaps, 0), &view);
         assert!(!card.contains("<svg"), "no strips are drawn");
         assert!(
+            !card.contains("Each dot is") && !card.contains("(percentage points)"),
+            "no caption or unit for strips that are not there"
+        );
+        assert!(
             !card.contains("this peer"),
             "nothing about all peers rides on this peer"
         );
@@ -2809,6 +2829,14 @@ mod tests {
         );
         assert!(!card.contains("Chance a request fails compared with distance alone"));
         assert!(card.contains(">this peer</text>"));
+        assert!(
+            card.contains("Each dot is"),
+            "a strip is drawn, so its caption is too"
+        );
+        assert!(
+            !card.contains("(percentage points)"),
+            "the failure strip is not"
+        );
     }
 
     #[test]
