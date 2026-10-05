@@ -95,7 +95,7 @@ const SIMULATION_RESEND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
 
 #[must_use]
-pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
+pub(crate) struct RemoteConnection<S = super::UdpTransportSocket, T: TimeSource = RealTime> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
     pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
@@ -242,7 +242,7 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
-pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
+pub struct PeerConnection<S = super::UdpTransportSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
     inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, bytes::Bytes)>>,

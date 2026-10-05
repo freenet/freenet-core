@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
@@ -32,8 +31,8 @@ use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
     BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
-    global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -1284,7 +1283,7 @@ impl P2pConnManager {
         })
     }
 
-    /// Runs the event listener with `UdpSocket` (production mode).
+    /// Runs the event listener with `UdpTransportSocket` (production mode).
     ///
     /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
     #[allow(clippy::too_many_arguments)]
@@ -1296,7 +1295,7 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        self.run_event_listener_with_socket::<UdpSocket>(
+        self.run_event_listener_with_socket::<UdpTransportSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
@@ -1308,7 +1307,7 @@ impl P2pConnManager {
     /// Runs the event listener with a configurable socket type.
     ///
     /// This is the generic version that allows using different socket implementations:
-    /// - `UdpSocket` for production
+    /// - `UdpTransportSocket` for production
     /// - `InMemorySocket` for testing
     ///
     /// The socket type only affects connection establishment. Once connections are
