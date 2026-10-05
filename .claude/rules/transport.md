@@ -263,7 +263,11 @@ Restart detection (all peers, not just gateways):
 ```
 Keep-alive:
   → Ping every 5 seconds initially
-  → After 5 unanswered pings, interval backs off: 10s → 20s → 40s → 60s cap
+  → After 5 pings unanswered SINCE THE LAST AUTHENTICATED INBOUND PACKET,
+    interval backs off: 10s → 15s cap (MAX_KEEPALIVE_INTERVAL). Any packet
+    from the peer resets the backoff, so lost Pongs on a live link do not
+    stretch it. The 15 s cap is the NAT-keepalive guarantee (#5795): do NOT
+    raise it; the NoOp chatter that used to mask a 60 s cap is gone.
   → Idle timeout: 120s (RealTime), 24h (VirtualTime/simulation)
   → On idle-timeout closure, per-peer backoff is recorded to prevent
     rapid reconnection cycles to dead peers (#3252)
@@ -276,12 +280,16 @@ Which packets earn a receipt is decided by `receipt_policy` in
 peer_connection.rs. A receipt is only useful for a packet the SENDER
 tracks for retransmission:
   → Ping / Pong: never acked (every release sends them untracked).
+  → AckConnection*: never acked (untracked, and always packet id 0, which
+    would shadow the remote's first data packet in the dedup window).
   → ShortMessage / StreamFragment: acked within ACK_CHECK_INTERVAL
     (100 ms), and RE-ACKED when a duplicate arrives (a duplicate means
     our receipt was lost). A duplicate is never delivered twice.
   → NoOp: acked only for a remote below UNTRACKED_ACK_NOOP_MIN_VERSION
     or of unknown version (old releases track their ack-only NoOps).
     From a remote at/above the floor it is fire-and-forget.
+  → Receipts that do not fit beside a payload go in separate untracked
+    NoOps with FRESH ids; only the payload is tracked under its id.
   → Our own ack-only NoOps (`PeerConnection::noop`) are NEVER tracked
     and never touch flight size. Receipt reliability comes from the
     remote retransmitting + our duplicate re-ack, as TCP does for a

@@ -480,8 +480,7 @@ fn pair(
 struct Running {
     log_a: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
     log_b: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
-    /// Application messages each end's `recv` returned.
-    got_a: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    /// Application messages B's `recv` returned.
     got_b: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -515,7 +514,6 @@ fn start(
     let b_key = b.outbound_key.clone();
     let log_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let log_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let got_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let got_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let (la, lb) = (log_a.clone(), log_b.clone());
     let mut tasks = Vec::new();
@@ -543,12 +541,10 @@ fn start(
     }));
     let mut a_conn = a.conn;
     let mut b_conn = b.conn;
-    let (ga, gb) = (got_a.clone(), got_b.clone());
-    tasks.push(tokio::spawn(async move {
-        while let Ok(msg) = a_conn.recv().await {
-            ga.lock().push(msg);
-        }
-    }));
+    let gb = got_b.clone();
+    tasks.push(tokio::spawn(
+        async move { while a_conn.recv().await.is_ok() {} },
+    ));
     tasks.push(tokio::spawn(async move {
         while let Ok(msg) = b_conn.recv().await {
             gb.lock().push(msg);
@@ -557,7 +553,6 @@ fn start(
     Running {
         log_a,
         log_b,
-        got_a,
         got_b,
         tasks,
     }
@@ -873,7 +868,10 @@ async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
     let (mut a, b) = pair(CAPABLE, CAPABLE);
     // Pending receipts on A, so they cannot ride along with a near-max message.
     for id in 10_000..10_030 {
-        let _ = a.conn.received_tracker.report_received_packet(id);
+        assert_ne!(
+            a.conn.received_tracker.report_received_packet(id),
+            ReportResult::AlreadyReceived
+        );
     }
     // bincode(Vec<u8>) = 8-byte length + bytes; leave a little slack so the
     // message alone still fits one packet.
@@ -981,17 +979,20 @@ async fn first_probe_of_a_new_burst_is_not_held_to_the_idle_rto() {
 }
 
 /// NAT keepalive under total reverse-path loss: even when the peer is never
-/// heard from, an established connection sends at least every
-/// MAX_KEEPALIVE_INTERVAL (15 s). It used to back off to 60 s.
+/// heard from, an established connection sends at least every 15 s. It used
+/// to back off to 60 s.
 #[tokio::test(start_paused = true)]
 async fn keepalive_gap_is_capped_when_the_peer_is_never_heard() {
     let start_t = tokio::time::Instant::now();
     let dur = Duration::from_secs(100); // under the 120 s idle timeout
     let link = run_lossy_link(CAPABLE, CAPABLE, 0, dur, keep_all(), Box::new(|_| true)).await;
     let gap = max_gap(&link.a_to_b, start_t, start_t + dur);
+    // A literal, not MAX_KEEPALIVE_INTERVAL: the bound is the owner's NAT
+    // requirement, and must not move if someone raises the constant.
+    let nat_cap = Duration::from_secs(15);
     assert!(
-        gap <= MAX_KEEPALIVE_INTERVAL + Duration::from_millis(50),
-        "A was silent for {gap:?} with its peer unheard (cap {MAX_KEEPALIVE_INTERVAL:?})"
+        gap <= nat_cap + Duration::from_millis(50),
+        "A was silent for {gap:?} with its peer unheard (NAT cap {nat_cap:?})"
     );
 }
 
