@@ -3418,10 +3418,10 @@ mod tests {
                 (Ok(42), store)
             };
             let start = std::time::Instant::now();
-            match execute_wasm_blocking(job, 5.0) {
-                BlockingResult::Ok(42, s) => store = s,
-                _ => panic!("a short job must come back Ok(42)"),
-            }
+            let BlockingResult::Ok(42, s) = execute_wasm_blocking(job, 5.0) else {
+                panic!("a short job must come back Ok(42)");
+            };
+            store = s;
             latencies.push(start.elapsed());
         }
         latencies.sort();
@@ -3433,8 +3433,9 @@ mod tests {
     /// The old wait polled `is_finished()` with a 10 ms `thread::sleep` and the
     /// first poll ran immediately after the spawn, so a 1 ms job could only
     /// return early if the caller was preempted for over 1 ms between spawning
-    /// and its first check: in practice every call cost >= 11 ms. A completion
-    /// wait costs the job's 1 ms plus a thread handoff: ~1.1 ms idle.
+    /// and its first check: every call cost one full tick (measured with that
+    /// wait restored: median 10.1 ms on both arms, every call >= 10.07 ms). A
+    /// completion wait costs the job's 1 ms plus a thread handoff.
     ///
     /// The MEDIAN, not the total, because the total is load-sensitive: with
     /// this module's other tests running in parallel on a loaded host, the new
