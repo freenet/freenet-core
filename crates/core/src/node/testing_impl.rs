@@ -1417,6 +1417,10 @@ pub struct SimNetwork {
     running_nodes: HashMap<NodeLabel, RunningNode>,
     /// Map from label to socket address for quick lookup
     node_addresses: HashMap<NodeLabel, SocketAddr>,
+    /// Each node's state store, registered by [`Self::run_simulation`] so a
+    /// convergence check can read what every node ACTUALLY holds at the end
+    /// of the run. See [`FinalStateHandle`].
+    final_states: FinalStateHandle,
     /// Saved configurations for node restart (preserved after crash)
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
@@ -1718,6 +1722,7 @@ impl SimNetwork {
             virtual_time,
             running_nodes: HashMap::new(),
             node_addresses: HashMap::new(),
+            final_states: FinalStateHandle::default(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
             streaming_threshold: None,
@@ -3860,6 +3865,13 @@ impl SimNetwork {
         self.event_listener.logs.clone()
     }
 
+    /// Handle to every node's state store, populated by
+    /// [`Self::run_simulation`]. Take it before the run (the run consumes the
+    /// network) and pass it to [`check_convergence_from_logs_and_state`].
+    pub fn final_state_handle(&self) -> FinalStateHandle {
+        self.final_states.clone()
+    }
+
     /// Recommended to calling after `check_connectivity` to ensure enough time
     /// elapsed for all peers to become connected.
     ///
@@ -4594,6 +4606,8 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            self.final_states
+                .register(self.node_addresses.get(&label), &shared_storage);
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 receiver_ch,
@@ -4660,6 +4674,8 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            self.final_states
+                .register(self.node_addresses.get(&label), &shared_storage);
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 receiver_ch,
@@ -6820,11 +6836,183 @@ pub async fn check_convergence_from_logs(
     }
 }
 
+/// Every node's state store from a [`SimNetwork::run_simulation`] run, keyed
+/// by the node's address (the same address its event-log entries carry).
+///
+/// Exists because the log alone cannot say what a node holds at the end. A
+/// node that originates a client PUT or UPDATE commits the new state locally
+/// and fans it out, but logs no stored-state hash for its own commit (its
+/// `PutSuccess` carries none, and a client-local UPDATE emits no
+/// `UpdateSuccess`). Its last logged hash is the one BEFORE its own write,
+/// while every peer that applied the fan-out logs the new one. When that write
+/// is the last one to a contract in the run, [`check_convergence_from_logs`]
+/// reports a divergence that does not exist (#5172).
+#[derive(Clone, Default)]
+pub struct FinalStateHandle(
+    Arc<std::sync::Mutex<BTreeMap<SocketAddr, crate::wasm_runtime::MockStateStorage>>>,
+);
+
+impl FinalStateHandle {
+    fn register(&self, addr: Option<&SocketAddr>, storage: &crate::wasm_runtime::MockStateStorage) {
+        if let Some(addr) = addr {
+            self.0
+                .lock()
+                .expect("final-state map poisoned")
+                .insert(*addr, storage.clone());
+        }
+    }
+
+    fn final_hash(&self, addr: &SocketAddr, key: &ContractKey) -> Option<String> {
+        let map = self.0.lock().expect("final-state map poisoned");
+        map.get(addr)
+            .and_then(|storage| storage.get_stored_state(key))
+            .map(|state| crate::tracing::state_hash_full(&state))
+    }
+}
+
+/// [`check_convergence_from_logs`], but each peer's state is read from its
+/// store at the end of the run instead of from its last logged hash.
+///
+/// The PEER SET is unchanged: a peer is checked for a contract iff it logged a
+/// stored-state hash for it, exactly as before, so this cannot pull in copies
+/// the old check never compared. Only the value moves from "the last hash it
+/// logged" to "the state it actually holds". A peer whose store no longer has
+/// the contract (evicted) keeps its last logged hash, the old behaviour.
+pub async fn check_convergence_from_logs_and_state(
+    logs: &Arc<tokio::sync::Mutex<Vec<crate::tracing::NetLogMessage>>>,
+    final_states: &FinalStateHandle,
+) -> ConvergenceResult {
+    let logs = logs.lock().await;
+
+    // contract -> (key, peer -> hash). BTreeMap for deterministic order.
+    let mut contract_states: BTreeMap<String, (ContractKey, BTreeMap<SocketAddr, String>)> =
+        BTreeMap::new();
+    for log in logs.iter() {
+        if let (Some(key), Some(hash)) = (log.kind.contract_key(), log.kind.stored_state_hash()) {
+            contract_states
+                .entry(format!("{key:?}"))
+                .or_insert_with(|| (key, BTreeMap::new()))
+                .1
+                .insert(log.peer_id.socket_addr(), hash.to_string());
+        }
+    }
+    drop(logs);
+
+    let mut converged = Vec::new();
+    let mut diverged = Vec::new();
+    for (contract_key, (key, mut peer_states)) in contract_states {
+        if peer_states.len() < 2 {
+            continue;
+        }
+        for (addr, hash) in peer_states.iter_mut() {
+            if let Some(actual) = final_states.final_hash(addr, &key) {
+                *hash = actual;
+            }
+        }
+        let unique_states: HashSet<&String> = peer_states.values().collect();
+        if unique_states.len() == 1 {
+            let state = unique_states.into_iter().next().unwrap().clone();
+            converged.push(ConvergedContract {
+                contract_key,
+                state_hash: state,
+                replica_count: peer_states.len(),
+            });
+        } else {
+            diverged.push(DivergedContract {
+                contract_key,
+                peer_states: peer_states.into_iter().collect(),
+            });
+        }
+    }
+
+    ConvergenceResult {
+        converged,
+        diverged,
+    }
+}
+
 use crate::contract::OperationMode;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5172: the log-only check reads a peer's LAST LOGGED hash, which goes
+    /// stale when the peer's own client write commits without logging one.
+    /// `check_convergence_from_logs_and_state` must read the peer's store
+    /// instead, and must still report a store that really differs.
+    #[tokio::test]
+    async fn convergence_from_state_reads_the_store_not_the_last_logged_hash() {
+        use crate::message::Transaction;
+        use crate::tracing::{EventKind, NetLogMessage, event_kind::UpdateEvent};
+
+        let contract = SimOperation::create_test_contract(7);
+        let key = contract.key();
+        let old_state = WrappedState::new(vec![1, 1, 1]);
+        let new_state = WrappedState::new(vec![2, 2, 2]);
+        let old_hash = crate::tracing::state_hash_full(&old_state);
+        let new_hash = crate::tracing::state_hash_full(&new_state);
+
+        let peer = |port: u16| {
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            let pkl = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+            (addr, pkl)
+        };
+        let (writer_addr, writer) = peer(41_001);
+        let (reader_addr, reader) = peer(41_002);
+        let applied = |pkl: &PeerKeyLocation, hash: &str| NetLogMessage {
+            tx: *Transaction::NULL,
+            datetime: chrono::Utc::now(),
+            peer_id: crate::node::PeerId::new(pkl.pub_key().clone(), pkl.socket_addr().unwrap()),
+            kind: EventKind::Update(UpdateEvent::UpdateSuccess {
+                id: *Transaction::NULL,
+                requester: pkl.clone(),
+                target: pkl.clone(),
+                key,
+                timestamp: 0,
+                state_hash_before: None,
+                state_hash_after: Some(hash.to_string()),
+                state_size: None,
+            }),
+        };
+        // The writer last LOGGED the old state; the reader logged the new one,
+        // which it got from the writer's fan-out.
+        let logs = Arc::new(tokio::sync::Mutex::new(vec![
+            applied(&writer, &old_hash),
+            applied(&reader, &new_hash),
+        ]));
+
+        let writer_store = crate::wasm_runtime::MockStateStorage::new();
+        let reader_store = crate::wasm_runtime::MockStateStorage::new();
+        reader_store.seed_state(key, new_state.clone());
+        let finals = FinalStateHandle::default();
+        finals.register(Some(&writer_addr), &writer_store);
+        finals.register(Some(&reader_addr), &reader_store);
+
+        assert_eq!(
+            check_convergence_from_logs(&logs).await.diverged.len(),
+            1,
+            "precondition: the log-only check reports the phantom divergence"
+        );
+
+        // The writer actually holds the state it wrote: converged.
+        writer_store.seed_state(key, new_state);
+        let result = check_convergence_from_logs_and_state(&logs, &finals).await;
+        assert_eq!(
+            (result.converged.len(), result.diverged.len()),
+            (1, 0),
+            "the writer's store holds the new state, so the contract converged"
+        );
+
+        // A store that really differs is still a divergence.
+        writer_store.seed_state(key, WrappedState::new(vec![9, 9, 9]));
+        let result = check_convergence_from_logs_and_state(&logs, &finals).await;
+        assert_eq!(
+            (result.converged.len(), result.diverged.len()),
+            (0, 1),
+            "a peer whose store disagrees must be reported as diverged"
+        );
+    }
 
     /// Regression for #5673: one simulation finishing (dropping its
     /// `SimNetwork`) must not switch off crash enforcement for another
