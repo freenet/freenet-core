@@ -4847,6 +4847,10 @@ mod tests {
     /// a later subscription on the same connection still delivers; and a
     /// client frame far larger than `WEBSOCKET_READ_BUFFER_SIZE` arrives
     /// intact.
+    ///
+    /// This test is not the guard for the wake-up property: other branches
+    /// waking the loop can mask a listener that registers no waker, so
+    /// `notification_wakes_a_parked_listener_poll` carries that.
     #[tokio::test]
     async fn websocket_delivers_subscription_notifications_end_to_end() {
         use axum::{Extension, Router, response::IntoResponse, routing::get};
@@ -4975,6 +4979,14 @@ mod tests {
         // 2. The listener closes. The connection must stay up: a new
         //    subscription with the same label still delivers.
         drop(sub_tx);
+        // Let the connection task observe the closure BEFORE the next
+        // subscription arrives; otherwise the new listener can join the map in
+        // the same pass and the closure is never seen with the map emptying.
+        // `#[tokio::test]` is single-threaded and the drop wakes the
+        // connection task directly, so yielding runs its pass first.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         let (sub_tx2, sub_rx2) = mpsc::channel(4);
         callbacks
             .send(HostCallbackResult::SubscriptionChannel {
