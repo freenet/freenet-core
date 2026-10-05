@@ -1545,6 +1545,24 @@ where
     ) -> anyhow::Result<Self> {
         ctrl_handler()?;
 
+        let mut summary_cache = ByteBoundedLruCache::new(
+            NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+            summary_cache_budget_bytes(),
+            |(_, summary): &(u64, StateSummary<'static>)| summary.as_ref().len(),
+        );
+        let mut delta_cache = ByteBoundedLruCache::new(
+            NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+            delta_cache_budget_bytes(),
+            |delta: &StateDelta<'static>| delta.as_ref().len(),
+        );
+        // Publish occupancy into the node's contract-exec metrics so the
+        // caches' real footprint and eviction pressure reach `router_snapshot`.
+        if let Some(om) = &op_manager {
+            let metrics = om.ring.contract_exec_metrics();
+            summary_cache = summary_cache.with_gauges(metrics.summary_cache_gauges().clone());
+            delta_cache = delta_cache.with_gauges(metrics.delta_cache_gauges().clone());
+        }
+
         Ok(Self {
             mode,
             runtime,
@@ -1559,16 +1577,8 @@ where
             shared_summaries: None,
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            summary_cache: ByteBoundedLruCache::new(
-                NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
-                summary_cache_budget_bytes(),
-                |(_, summary)| summary.as_ref().len(),
-            ),
-            delta_cache: ByteBoundedLruCache::new(
-                NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
-                delta_cache_budget_bytes(),
-                |delta| delta.as_ref().len(),
-            ),
+            summary_cache,
+            delta_cache,
             delegate_notification_tx: None,
         })
     }

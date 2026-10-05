@@ -2448,6 +2448,18 @@ impl Ring {
             snapshot.contract_exec_delta_wasm_uncached_last_snapshot =
                 Some(ce_d.delta_wasm_uncached);
 
+            // Summary/delta fast-path cache occupancy: WHY the arms above miss
+            // when they do (byte budget binding vs. count target vs. churn).
+            let fpc = ring.contract_exec_metrics.fast_path_cache_snapshot();
+            snapshot.contract_summary_cache_entries = Some(fpc.summary.entries);
+            snapshot.contract_summary_cache_bytes = Some(fpc.summary.bytes);
+            snapshot.contract_summary_cache_budget_bytes = Some(fpc.summary.budget_bytes);
+            snapshot.contract_summary_cache_evictions_total = Some(fpc.summary.evictions_total);
+            snapshot.contract_delta_cache_entries = Some(fpc.delta.entries);
+            snapshot.contract_delta_cache_bytes = Some(fpc.delta.bytes);
+            snapshot.contract_delta_cache_budget_bytes = Some(fpc.delta.budget_bytes);
+            snapshot.contract_delta_cache_evictions_total = Some(fpc.delta.evictions_total);
+
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
             // migration is working, hosting drifts toward each contract's key,
@@ -2697,6 +2709,14 @@ impl Ring {
                 contract_exec_delta_reload_hits_last_snapshot = ce_d.delta_reload_hits,
                 contract_exec_delta_wasm_calls_last_snapshot = ce_d.delta_wasm_calls,
                 contract_exec_delta_wasm_uncached_last_snapshot = ce_d.delta_wasm_uncached,
+                contract_summary_cache_entries = fpc.summary.entries,
+                contract_summary_cache_bytes = fpc.summary.bytes,
+                contract_summary_cache_budget_bytes = fpc.summary.budget_bytes,
+                contract_summary_cache_evictions_total = fpc.summary.evictions_total,
+                contract_delta_cache_entries = fpc.delta.entries,
+                contract_delta_cache_bytes = fpc.delta.bytes,
+                contract_delta_cache_budget_bytes = fpc.delta.budget_bytes,
+                contract_delta_cache_evictions_total = fpc.delta.evictions_total,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,

@@ -13,6 +13,8 @@
 //! pairs a count target (coverage) with a byte budget (safety).
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 
@@ -34,6 +36,68 @@ use lru::LruCache;
 ///     failure the closed PR #4794 fixed with its delta-cache floor). With the
 ///     floor the entry COUNT is capped at `byte_budget / CACHE_ENTRY_OVERHEAD_BYTES`.
 pub(crate) const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
+
+/// Node-wide occupancy gauges that one or more [`ByteBoundedLruCache`]s publish
+/// into, so the cache's real footprint is observable in production telemetry.
+///
+/// Every attached cache adds its contribution (entries, counted bytes, byte
+/// budget) on attach and on every mutation, and REMOVES it on drop, so the
+/// gauges always equal the sum over the caches currently alive. That makes them
+/// correct whether a node holds one shared cache or several per-executor ones,
+/// and keeps a replaced/dropped cache from leaving a phantom contribution.
+///
+/// `evictions` is a monotonic lifetime counter: every entry removed to honor
+/// either bound (count cap or byte budget). Replacing a key's value is not an
+/// eviction, and neither is refusing an oversized value (it was never cached).
+#[derive(Debug, Default)]
+pub(crate) struct ByteLruGauges {
+    entries: AtomicU64,
+    bytes: AtomicU64,
+    budget_bytes: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// Point-in-time read of [`ByteLruGauges`]. The four loads are independent, so a
+/// read racing a put can be off by one entry; fine for a 5-minute gauge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ByteLruGaugeSnapshot {
+    pub entries: u64,
+    pub bytes: u64,
+    pub budget_bytes: u64,
+    pub evictions_total: u64,
+}
+
+impl ByteLruGauges {
+    pub(crate) fn snapshot(&self) -> ByteLruGaugeSnapshot {
+        ByteLruGaugeSnapshot {
+            entries: self.entries.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+            evictions_total: self.evictions.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Apply a signed change to a gauge. `fetch_sub` on a `u64` would wrap if a
+    /// caller ever subtracted more than it added; the contributions here are
+    /// exact (each cache removes only what it added), so this cannot underflow,
+    /// but `saturating` keeps a future accounting slip from emitting 2^64.
+    fn adjust(gauge: &AtomicU64, before: usize, after: usize) {
+        if after >= before {
+            gauge.fetch_add((after - before) as u64, Ordering::Relaxed);
+        } else {
+            let dec = (before - after) as u64;
+            let mut current = gauge.load(Ordering::Relaxed);
+            while let Err(actual) = gauge.compare_exchange_weak(
+                current,
+                current.saturating_sub(dec),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                current = actual;
+            }
+        }
+    }
+}
 
 /// A count-capped LRU cache with a hard total-byte backstop.
 ///
@@ -75,6 +139,11 @@ pub(crate) struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
     /// Payload byte size of a value; the per-entry structural overhead is added
     /// on top in [`Self::entry_weight`].
     weigh: fn(&V) -> usize,
+    /// Lifetime count of entries this cache evicted to honor either bound.
+    evictions: u64,
+    /// Optional node-wide gauges this cache publishes its occupancy into. See
+    /// [`ByteLruGauges`]; `None` for callers that export nothing.
+    gauges: Option<Arc<ByteLruGauges>>,
 }
 
 impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
@@ -84,7 +153,25 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
             total_bytes: 0,
             byte_budget: byte_budget.max(1),
             weigh,
+            evictions: 0,
+            gauges: None,
         }
+    }
+
+    /// Publish this cache's occupancy into `gauges` from now on (and its budget
+    /// immediately). The contribution is removed again when the cache drops.
+    pub(crate) fn with_gauges(mut self, gauges: Arc<ByteLruGauges>) -> Self {
+        ByteLruGauges::adjust(&gauges.budget_bytes, 0, self.byte_budget);
+        ByteLruGauges::adjust(&gauges.entries, 0, self.inner.len());
+        ByteLruGauges::adjust(&gauges.bytes, 0, self.total_bytes);
+        self.gauges = Some(gauges);
+        self
+    }
+
+    /// The hard byte budget this cache enforces.
+    #[cfg(test)]
+    pub(crate) fn byte_budget(&self) -> usize {
+        self.byte_budget
     }
 
     /// Counted weight of one entry: payload length plus the per-entry structural
@@ -105,6 +192,18 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     /// result, so caching buys nothing. Any pre-existing entry under the same key
     /// is left untouched (it was already within budget, so the invariant holds).
     pub(crate) fn put(&mut self, key: K, value: V) {
+        let (len_before, bytes_before, evictions_before) =
+            (self.inner.len(), self.total_bytes, self.evictions);
+        self.put_inner(key, value);
+        if let Some(g) = &self.gauges {
+            ByteLruGauges::adjust(&g.entries, len_before, self.inner.len());
+            ByteLruGauges::adjust(&g.bytes, bytes_before, self.total_bytes);
+            g.evictions
+                .fetch_add(self.evictions - evictions_before, Ordering::Relaxed);
+        }
+    }
+
+    fn put_inner(&mut self, key: K, value: V) {
         let added = self.entry_weight(&value);
         // Skip-oversized guard (#4565): a single value larger than the whole
         // budget would otherwise stay resident (the pop-loop below keeps the MRU
@@ -120,10 +219,16 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         // existed, OR the LRU entry evicted to honor the COUNT cap. In BOTH cases
         // subtract its weight so the running total stays exact (a replace does not
         // grow the count, so it never also evicts — exactly one of the two).
+        // `contains` (no recency update) tells a same-key REPLACE apart from a
+        // count-cap EVICTION, which `push` reports identically.
+        let replacing = self.inner.contains(&key);
         if let Some((_, displaced)) = self.inner.push(key, value) {
             self.total_bytes = self
                 .total_bytes
                 .saturating_sub(self.entry_weight(&displaced));
+            if !replacing {
+                self.evictions += 1;
+            }
         }
         self.total_bytes = self.total_bytes.saturating_add(added);
         // Byte backstop: pop LRU entries until within budget. With the
@@ -135,6 +240,7 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
             match self.inner.pop_lru() {
                 Some((_, evicted)) => {
                     self.total_bytes = self.total_bytes.saturating_sub(self.entry_weight(&evicted));
+                    self.evictions += 1;
                 }
                 None => break,
             }
@@ -173,6 +279,24 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evictions(&self) -> u64 {
+        self.evictions
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> Drop for ByteBoundedLruCache<K, V> {
+    /// Withdraw this cache's contribution from the shared gauges, so a dropped
+    /// or replaced cache does not leave phantom entries/bytes/budget behind.
+    /// The eviction counter is lifetime-monotonic and is deliberately kept.
+    fn drop(&mut self) {
+        if let Some(g) = &self.gauges {
+            ByteLruGauges::adjust(&g.entries, self.inner.len(), 0);
+            ByteLruGauges::adjust(&g.bytes, self.total_bytes, 0);
+            ByteLruGauges::adjust(&g.budget_bytes, self.byte_budget, 0);
+        }
     }
 }
 
@@ -395,5 +519,77 @@ mod tests {
             cap_before,
             "equal-cap grow must not change the count cap"
         );
+    }
+
+    /// Evictions are counted for BOTH bounds, and a same-key replace is not an
+    /// eviction. Without the replace distinction, every summary refresh after a
+    /// state change would read as cache pressure.
+    #[test]
+    fn evictions_count_both_bounds_but_not_replacements() {
+        // Count cap 2, ample bytes: the third distinct key evicts by COUNT.
+        let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(2).unwrap(), 32 * 1024 * 1024, vec_len);
+        cache.put(1, vec![0u8; 8]);
+        cache.put(1, vec![0u8; 16]); // replace
+        assert_eq!(cache.evictions(), 0, "a replace is not an eviction");
+        cache.put(2, vec![0u8; 8]);
+        cache.put(3, vec![0u8; 8]);
+        assert_eq!(cache.evictions(), 1, "count-cap eviction must be counted");
+
+        // Byte budget for exactly two 100-byte entries: the third evicts by BYTES.
+        let budget = 2 * (100 + CACHE_ENTRY_OVERHEAD_BYTES);
+        let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(1024).unwrap(), budget, vec_len);
+        for i in 0..2u64 {
+            cache.put(i, vec![0u8; 100]);
+        }
+        assert_eq!(cache.evictions(), 0, "everything fits: no eviction");
+        cache.put(2, vec![0u8; 100]);
+        assert_eq!(cache.evictions(), 1, "byte-budget eviction must be counted");
+        // An oversized value is refused, never cached, so it evicts nothing.
+        cache.put(9, vec![0u8; budget]);
+        assert_eq!(
+            cache.evictions(),
+            1,
+            "an oversized refusal is not an eviction"
+        );
+    }
+
+    /// The gauges equal the sum over the LIVE caches attached to them: two
+    /// caches add up, and dropping one withdraws exactly its contribution while
+    /// the lifetime eviction total is kept.
+    #[test]
+    fn gauges_sum_live_caches_and_withdraw_on_drop() {
+        let gauges = Arc::new(ByteLruGauges::default());
+        let budget = 4 * (10 + CACHE_ENTRY_OVERHEAD_BYTES);
+        let mut a: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(1024).unwrap(), budget, vec_len)
+                .with_gauges(gauges.clone());
+        let mut b: ByteBoundedLruCache<u64, Vec<u8>> =
+            ByteBoundedLruCache::new(NonZeroUsize::new(1024).unwrap(), budget, vec_len)
+                .with_gauges(gauges.clone());
+        assert_eq!(gauges.snapshot().budget_bytes, 2 * budget as u64);
+
+        for i in 0..6u64 {
+            a.put(i, vec![0u8; 10]); // 4 fit, 2 evicted
+        }
+        b.put(100, vec![0u8; 10]);
+        b.put(100, vec![0u8; 10]); // replace: no change in entries/bytes
+        let snap = gauges.snapshot();
+        assert_eq!(snap.entries, (a.len() + b.len()) as u64);
+        assert_eq!(snap.entries, 5);
+        assert_eq!(snap.bytes, (a.total_bytes() + b.total_bytes()) as u64);
+        assert_eq!(snap.evictions_total, 2);
+
+        drop(a);
+        let snap = gauges.snapshot();
+        assert_eq!(snap.entries, 1, "dropping a cache withdraws its entries");
+        assert_eq!(snap.bytes, b.total_bytes() as u64);
+        assert_eq!(snap.budget_bytes, budget as u64);
+        assert_eq!(snap.evictions_total, 2, "the eviction total is lifetime");
+
+        drop(b);
+        let snap = gauges.snapshot();
+        assert_eq!((snap.entries, snap.bytes, snap.budget_bytes), (0, 0, 0));
     }
 }

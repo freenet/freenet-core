@@ -1044,3 +1044,90 @@ async fn summarize_arms_partition_every_call_exactly_once() {
         "no WASM call fired: the partition holds vacuously"
     );
 }
+
+// =========================================================================
+// CACHE OCCUPANCY GAUGES (why a miss happened, not just that it did)
+// =========================================================================
+
+/// The summary and delta caches publish their occupancy into the node's
+/// `ContractExecMetrics`, which `router_snapshot` exports. Entries and counted
+/// bytes must track what is actually resident, so an operator can see the byte
+/// budget binding (bytes pinned at budget, evictions climbing) instead of
+/// inferring it from a rising WASM-call rate.
+#[tokio::test(flavor = "current_thread")]
+async fn cache_occupancy_reaches_contract_exec_metrics() {
+    use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+    let storage = MockStateStorage::new();
+    let (op_manager, _guards) = build_op_manager("cache_occupancy_gauges").await;
+    let mut exec = Executor::new_mock_wasm_uncached_with_op_manager(
+        "cache_occupancy_gauges",
+        storage.clone(),
+        op_manager.clone(),
+    )
+    .await
+    .expect("create executor with op_manager");
+
+    let before = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    assert!(
+        before.summary.budget_bytes > 0 && before.delta.budget_bytes > 0,
+        "an attached cache must publish its byte budget: {before:?}"
+    );
+    assert_eq!((before.summary.entries, before.summary.bytes), (0, 0));
+
+    let peer_summary = StateSummary::from(vec![7u8; 4]);
+    for i in 0..3u8 {
+        let contract = test_contract(format!("cache_occupancy_{i}").as_bytes());
+        let key = contract.key();
+        exec.upsert_contract_state(
+            key,
+            Either::Left(WrappedState::new(vec![i, 1, 2, 3, 4])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("PUT");
+        exec.summarize_contract_state(key).await.expect("summarize");
+        exec.get_contract_state_delta(key, peer_summary.clone())
+            .await
+            .expect("delta");
+    }
+
+    let after = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    // MockWasmRuntime summaries are blake3 digests (32 B); its deltas are the
+    // full 5-byte state.
+    assert_eq!(after.summary.entries, 3);
+    assert_eq!(
+        after.summary.bytes,
+        3 * (32 + CACHE_ENTRY_OVERHEAD_BYTES) as u64
+    );
+    assert_eq!(after.delta.entries, 3);
+    assert_eq!(
+        after.delta.bytes,
+        3 * (5 + CACHE_ENTRY_OVERHEAD_BYTES) as u64
+    );
+    assert_eq!(after.summary.evictions_total, 0);
+    assert_eq!(after.delta.evictions_total, 0);
+
+    // Dropping the executor withdraws its caches' contribution entirely.
+    drop(exec);
+    let dropped = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    assert_eq!(
+        (
+            dropped.summary.entries,
+            dropped.summary.bytes,
+            dropped.summary.budget_bytes
+        ),
+        (0, 0, 0),
+        "a dropped executor must not leave phantom cache occupancy"
+    );
+}
