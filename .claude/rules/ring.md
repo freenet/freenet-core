@@ -230,8 +230,10 @@ The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in four routing roles
     opens), with the transfer-speed floor below
   - a peer the isotonic failure estimate rejects (no location) gets no
     prediction and sorts after every peer that has one
-  - not routing: the dashboard's distance charts; and ConnectForwardEstimator
-    (CONNECT) is an IsotonicEstimator of its own
+  - not routing: the dashboard's distance charts and the peer page's
+    per-peer windows (IsotonicEstimator::points_for_peer: the scatter, and
+    the reliability tile and request tabs, which count the failure window);
+    and ConnectForwardEstimator (CONNECT) is an IsotonicEstimator of its own
 Do not remove them without replacing every role.
 
 WHEN touching the router:
@@ -291,9 +293,15 @@ WHEN touching the router:
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
-  → The dashboard's per-peer breakdown (HierarchicalRouting::explain) must
-    reproduce the routing estimate bit for bit; pinned by
-    explanation_reproduces_the_estimate_routing_acts_on
+  → HierarchicalRouting::explain must reproduce the routing estimate bit
+    for bit (pinned by explanation_reproduces_the_estimate_routing_acts_on);
+    the peer page's response-time tile reads its estimate. The page's
+    comparisons with "distance alone" read peer_offsets, whose
+    PeerOffset::effect is routing's own prediction ratio for the timing
+    stages (the posterior variance a record narrows included), pinned by
+    the_timing_effect_is_the_ratio_of_routings_own_predictions; do not
+    replace it with exp(offset). Per-peer eligible/chosen counts
+    (PeerSelectionCounts) count only DecisionLog::Joinable decisions
   → PAIRED VALUES, failure probability: the estimator returns TWO failure
     numbers per candidate and they are not interchangeable.
     failure_probability is clamped to [0, 1] and is what is REPORTED and
@@ -304,7 +312,7 @@ WHEN touching the router:
     and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
     the ranking value is pinned at 0 deliberately: carrying the downward
     overshoot made the no-timing cost branch (failure * 3.0) negative for the
-    healthiest peers, which the dashboard prints as "N/A". Consequences to
+    healthiest peers, which the dashboard then printed as "N/A". Consequences to
     keep in mind: an offline tool CANNOT reproduce the router's order among
     candidates that all clamp, because the unbounded value is recorded
     nowhere; and recomputing expected_total_time from the recorded
@@ -341,7 +349,7 @@ WHEN touching the router:
     tau2_contract, so the term is silent on it unless other contracts supply
     the between-contract variance. That is a different gate from the
     present-peer bar and compounds with it. All of these reach the snapshot
-    and the peer-detail dashboard; the OTLP body carries the ones a fleet-wide
+    and the dashboard's /routing page (Diagnostics); the OTLP body carries the ones a fleet-wide
     question needs (_effects_applied, _forecast_offsets, _estimable_refits,
     _qualifying_contracts, _floor_bound_refits, _contracts, _tau2) and NOT the
     saturation gauges or _den_below_two_refits, which are dashboard-only by
