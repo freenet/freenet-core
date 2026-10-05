@@ -718,8 +718,10 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     // about all of them in the strip's place, not a row of identical dots.
     let no_difference =
         |stage: usize| format!(r#"<p class="chart-note">{}</p>"#, NO_DIFFERENCE[stage]);
-    let failure_strip = !(fail_others.is_empty() && fail_mine.is_none()) && !stage_alike(view, 0);
-    let time_strip = !(time_others.is_empty() && time_mine.is_none()) && !stage_alike(view, 1);
+    let has_dots =
+        |others: &[StripDot], mine: &Option<StripDot>| !others.is_empty() || mine.is_some();
+    let failure_strip = has_dots(&fail_others, &fail_mine) && !stage_alike(view, 0);
+    let time_strip = has_dots(&time_others, &time_mine) && !stage_alike(view, 1);
     let failure = if fail_others.is_empty() && fail_mine.is_none() {
         r#"<div class="empty-box">Too few requests across your peers to compare yet.</div>"#
             .to_string()
