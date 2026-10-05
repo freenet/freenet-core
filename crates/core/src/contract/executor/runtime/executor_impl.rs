@@ -79,13 +79,18 @@ where
         let hosted = om.ring.hosting_contracts_count();
         let needed = crate::contract::executor::summary_cache_count_target(hosted);
         // needed >= SUMMARY_CACHE_COUNT_MIN > 0 by construction (summary_cache_count_target clamps); unwrap_or is just panic-proofing.
-        if needed > self.summary_cache.cap().get() {
-            self.summary_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        // Each lock is held for one compare-and-grow only (see
+        // `SharedSummaryCache`'s locking rule).
+        use crate::contract::executor::lock_fast_path_cache;
+        {
+            let mut summary_cache = lock_fast_path_cache(&self.summary_cache);
+            if needed > summary_cache.cap().get() {
+                summary_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+            }
         }
-        if needed > self.delta_cache.cap().get() {
-            self.delta_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        let mut delta_cache = lock_fast_path_cache(&self.delta_cache);
+        if needed > delta_cache.cap().get() {
+            delta_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
         }
     }
 
@@ -1475,12 +1480,10 @@ where
         // secret export) MUST stay read-only w.r.t. contract state, or it could
         // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
-            // Resolve the hit to an owned value BEFORE recording: `LruCache::get`
-            // borrows the executor mutably (it reorders the recency list), so the
-            // counter read cannot overlap it. The clone is the same one the
-            // return did before; it just moves ahead of the borrow's end.
-            let hit = self
-                .summary_cache
+            // Resolve the hit to an owned value inside one statement, so the
+            // shared-cache lock (a temporary guard) is released before anything
+            // else runs — never held across WASM or an `.await`.
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
                 .get(&key)
                 .and_then(|(hash, summary)| (*hash == detector_hash).then(|| summary.clone()));
             if let Some(cached_summary) = hit {
@@ -1516,10 +1519,9 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         // The summary may already be cached under this exact hash even when the
-        // detector was cold (the summary cache is per-executor; the detector is
-        // shared). Reuse it to skip the WASM call.
-        let reload_hit = self
-            .summary_cache
+        // detector was cold (the detector is a bounded moka cache that can evict
+        // independently, and is reset on restart). Reuse it to skip the WASM call.
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
             .get(&key)
             .and_then(|(hash, summary)| (*hash == state_hash).then(|| summary.clone()));
         if let Some(cached_summary) = reload_hit {
@@ -1576,7 +1578,8 @@ where
             .summarize_state(&key, &params, &state)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.summary_cache.put(key, (state_hash, summary.clone()));
+        crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
+            .put(key, (state_hash, summary.clone()));
         Ok(summary)
     }
 
@@ -1616,9 +1619,11 @@ where
         // contract state.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
-            // Owned before recording: `LruCache::get` borrows mutably (see the
-            // summarize twin above).
-            let hit = self.delta_cache.get(&cache_key).cloned();
+            // Owned within one statement so the shared-cache lock is released
+            // immediately (see the summarize twin above).
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+                .get(&cache_key)
+                .cloned();
             if let Some(cached_delta) = hit {
                 // Field-visible cache-HIT count; see the summarize twin above
                 // and `ring::contract_exec_metrics`. This arm runs per-SUBSCRIBER
@@ -1649,7 +1654,9 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         let cache_key = (key, state_hash, summary_hash);
-        let reload_hit = self.delta_cache.get(&cache_key).cloned();
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .get(&cache_key)
+            .cloned();
         if let Some(cached_delta) = reload_hit {
             // Slow path reached (state loaded + hashed) but the WASM call was
             // still elided; see the summarize twin above.
@@ -1678,7 +1685,8 @@ where
             .get_state_delta(&key, &params, &state, &their_summary)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.delta_cache.put(cache_key, delta.clone());
+        crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .put(cache_key, delta.clone());
         Ok(delta)
     }
 

@@ -26,7 +26,7 @@ use super::storages::Storage;
 use crate::config::Config;
 use crate::node::OpManager;
 use crate::operations::get::GetResult;
-use crate::util::byte_bounded_lru::ByteBoundedLruCache;
+use crate::util::byte_bounded_lru::{ByteBoundedLruCache, ByteLruGauges};
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
     SecretsStore, SharedStores, StateStorage, StateStore, StateStoreError, UserSecretContext,
@@ -1219,8 +1219,22 @@ type SharedClientCounts = Arc<dashmap::DashMap<ClientId, usize>>;
 // byte budget has ample headroom, so coverage holds. Only a large-value contract
 // makes the byte budget bind, holding fewer entries but never OOMing.
 //
-// Both byte budgets are PER EXECUTOR, and the pool size is derived from CPU count
-// — which `MemoryMax` does not constrain. So the RAM-scaled clamps alone were not
+// SHARED ACROSS THE POOL (#5795). Each budget below is derived PER EXECUTOR, but
+// a `RuntimePool` holds ONE summary cache and ONE delta cache shared by all its
+// executors, sized to the AGGREGATE `pool_size × per-executor budget`
+// (`pool_summary_budget_for` / `pool_delta_budget_for`). That is exactly the
+// product the node already declared (`declared_cache_ceiling`), so the memory
+// envelope is unchanged; what changes is that it is now usable. The contract
+// loop is serialized and `pop_executor` always takes the first free slot, so
+// with per-executor caches effectively only executor 0's cache ever filled: on
+// a ~6.2k-contract hosted peer (try.freenet.org, v0.2.141) a 32 MiB budget held
+// ~1,900 River room summaries (measured ~16.7 KB each, not the ~512 B floor the
+// comments below assume) while the other workers' reserved slices sat empty,
+// and 74% of WASM CPU went to re-summarizing contracts that had not changed. A
+// standalone `Executor` (tests, local tools) keeps a private per-executor cache.
+//
+// Both per-executor budgets are derived from a pool size that comes from CPU
+// count — which `MemoryMax` does not constrain. So the RAM-scaled clamps alone were not
 // a bound on what the node commits: a 20-core laptop inside the shipped 2 GiB
 // cgroup got 16 workers × (32 MiB summary + 64 MiB delta) = 1.5 GiB of declared
 // ceiling out of a 2 GiB limit, and no code anywhere composed the two (#5268
@@ -1271,8 +1285,9 @@ pub(crate) fn summary_cache_count_target(hosted: usize) -> usize {
 const SUMMARY_CACHE_RAM_DIVISOR: usize = 64;
 
 /// Lower clamp for the summary-cache byte budget (16 MiB). At the ~512 B per-entry
-/// floor this holds ~32k small summaries — far above any realistic hosted count on
-/// a small node — so the count target (coverage) binds, never this floor.
+/// floor this holds ~32k small summaries; at the measured ~16.7 KB of a River room
+/// summary (2026-10, try.freenet.org) it holds ~1,000. Per executor: the pool's
+/// shared cache gets `pool_size ×` this (see the sizing comment above).
 const SUMMARY_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
 
 /// Upper clamp for the summary-cache byte budget (32 MiB), which binds on a host
@@ -1280,6 +1295,9 @@ const SUMMARY_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
 /// enough that the envelope share is wider. At the ~512 B floor 32 MiB holds
 /// ~65k small summaries (≈ the count MAX), so coverage holds at the count cap for
 /// small digests; a large-summary contract instead evicts down to what fits.
+/// Real summaries are NOT all small: a River room summary measured ~16.7 KB, so
+/// 32 MiB holds only ~1,900 of them. That is why the pool shares ONE cache sized
+/// to the aggregate (`pool_size ×` this) rather than leaving it per executor.
 ///
 /// This is a CEILING, not the resolved budget. On a memory-constrained many-core
 /// host `summary_budget_for` composes it down to a share of the node-wide
@@ -1382,6 +1400,99 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
     compose_against_envelope(ram_scaled, DELTA_CACHE_ENVELOPE_SHARE, total_ram, pool_size)
 }
 
+/// Byte budget of the ONE summary cache a `RuntimePool` of `pool_size`
+/// executors shares: the per-executor budget times the pool, i.e. exactly the
+/// summary term of [`declared_cache_ceiling`]. Sharing does not grow the
+/// envelope; it makes the whole declared share usable by whichever executor the
+/// serialized loop happens to check out.
+pub(crate) fn pool_summary_cache_budget_bytes(pool_size: usize) -> usize {
+    pool_summary_budget_for(live_total_ram_bytes(), pool_size)
+}
+
+/// Pure sizing math behind [`pool_summary_cache_budget_bytes`].
+pub(crate) fn pool_summary_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    let pool_size = pool_size.max(1);
+    summary_budget_for(total_ram, pool_size).saturating_mul(pool_size)
+}
+
+/// Delta twin of [`pool_summary_cache_budget_bytes`].
+pub(crate) fn pool_delta_cache_budget_bytes(pool_size: usize) -> usize {
+    pool_delta_budget_for(live_total_ram_bytes(), pool_size)
+}
+
+/// Pure sizing math behind [`pool_delta_cache_budget_bytes`].
+pub(crate) fn pool_delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    let pool_size = pool_size.max(1);
+    delta_budget_for(total_ram, pool_size).saturating_mul(pool_size)
+}
+
+/// The summary fast-path cache: `ContractKey → (state_hash, summary)`.
+pub(crate) type SummaryCache = ByteBoundedLruCache<ContractKey, (u64, StateSummary<'static>)>;
+
+/// The delta fast-path cache: `(ContractKey, state_hash, their_summary_hash) →
+/// delta`.
+pub(crate) type DeltaCache = ByteBoundedLruCache<(ContractKey, u64, u64), StateDelta<'static>>;
+
+/// A summary cache shared by every executor of a `RuntimePool` (or private to a
+/// standalone executor).
+///
+/// # Locking
+///
+/// The mutex is held ONLY for one lookup (with the clone of the hit) or one
+/// insert — never across a WASM call, a state load, or an `.await`. Nothing else
+/// is locked while it is held, so there is no ordering to violate. In
+/// production every access comes from the serialized contract loop, so the lock
+/// is uncontended; it exists so the shared cache is sound regardless (off-loop
+/// work such as the hosted secret export also holds an executor).
+pub(crate) type SharedSummaryCache = Arc<std::sync::Mutex<SummaryCache>>;
+
+/// Delta twin of [`SharedSummaryCache`]; same locking rule.
+pub(crate) type SharedDeltaCache = Arc<std::sync::Mutex<DeltaCache>>;
+
+/// Build a summary cache with `byte_budget`, publishing its occupancy into
+/// `gauges` when given.
+pub(crate) fn new_summary_cache(
+    byte_budget: usize,
+    gauges: Option<Arc<ByteLruGauges>>,
+) -> SharedSummaryCache {
+    let cache: SummaryCache = ByteBoundedLruCache::new(
+        NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+        byte_budget,
+        |(_, summary): &(u64, StateSummary<'static>)| summary.as_ref().len(),
+    );
+    Arc::new(std::sync::Mutex::new(match gauges {
+        Some(g) => cache.with_gauges(g),
+        None => cache,
+    }))
+}
+
+/// Build a delta cache with `byte_budget`; see [`new_summary_cache`].
+pub(crate) fn new_delta_cache(
+    byte_budget: usize,
+    gauges: Option<Arc<ByteLruGauges>>,
+) -> SharedDeltaCache {
+    let cache: DeltaCache = ByteBoundedLruCache::new(
+        NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+        byte_budget,
+        |delta: &StateDelta<'static>| delta.as_ref().len(),
+    );
+    Arc::new(std::sync::Mutex::new(match gauges {
+        Some(g) => cache.with_gauges(g),
+        None => cache,
+    }))
+}
+
+/// Lock a fast-path cache, recovering from poison. A panic while the lock was
+/// held can only have come from inside a single `lru` get/put; every resident
+/// entry is still a complete `(state_hash, value)` pair validated on read, so
+/// serving from it stays correct (at worst the byte accounting is off by the
+/// interrupted entry).
+pub(crate) fn lock_fast_path_cache<T>(cache: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Sum of every cache ceiling a node with `memory_limit` bytes and `pool_size`
 /// workers declares: the per-executor summary, delta, and Store-arena caches
 /// times the pool, plus the single shared contract and delegate module caches,
@@ -1400,7 +1511,10 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
 /// by the aggregate-safety tests, which keep every declared cache in one place.
 #[cfg(test)]
 pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
-    // PER-EXECUTOR — multiplied by the pool.
+    // PER-EXECUTOR — multiplied by the pool. Since #5795 the pool holds one
+    // shared summary cache and one shared delta cache sized to exactly this
+    // product (`pool_summary_budget_for` / `pool_delta_budget_for`;
+    // `pool_cache_budgets_equal_the_declared_product` pins the equality).
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
@@ -1515,13 +1629,18 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// count target grown to the live hosted count (coverage, so the heartbeat
     /// stays warm) AND a hard byte budget (safety, so a large-summary contract
     /// cannot OOM the node). See [`ByteBoundedLruCache`].
-    summary_cache: ByteBoundedLruCache<ContractKey, (u64, StateSummary<'static>)>,
+    ///
+    /// Shared by every executor of a `RuntimePool` (set via
+    /// [`Self::set_shared_fast_path_caches`]); private to a standalone executor.
+    /// See [`SharedSummaryCache`] for the locking rule.
+    summary_cache: SharedSummaryCache,
 
     /// Cache of delta results keyed by (ContractKey, state_hash, their_summary_hash).
     /// Avoids redundant WASM instantiations for get_state_delta() calls. Byte-bounded
     /// like the summary cache (deltas are larger + the per-peer summary hash in the
     /// key means >1 entry per contract during fan-out). See [`ByteBoundedLruCache`].
-    delta_cache: ByteBoundedLruCache<(ContractKey, u64, u64), StateDelta<'static>>,
+    /// Shared across the pool exactly like `summary_cache`.
+    delta_cache: SharedDeltaCache,
 
     /// Channel to send delegate notifications when subscribed contracts change state.
     /// Set when running in a pool via `set_delegate_notification_tx()`.
@@ -1545,23 +1664,21 @@ where
     ) -> anyhow::Result<Self> {
         ctrl_handler()?;
 
-        let mut summary_cache = ByteBoundedLruCache::new(
-            NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+        // Private per-executor caches; a `RuntimePool` replaces them with its
+        // shared pair (`set_shared_fast_path_caches`), dropping these, which
+        // withdraws their gauge contribution. Occupancy is published into the
+        // node's contract-exec metrics so it reaches `router_snapshot`.
+        let metrics = op_manager
+            .as_ref()
+            .map(|om| om.ring.contract_exec_metrics());
+        let summary_cache = new_summary_cache(
             summary_cache_budget_bytes(),
-            |(_, summary): &(u64, StateSummary<'static>)| summary.as_ref().len(),
+            metrics.map(|m| m.summary_cache_gauges().clone()),
         );
-        let mut delta_cache = ByteBoundedLruCache::new(
-            NonZeroUsize::new(SUMMARY_CACHE_COUNT_MIN).unwrap(),
+        let delta_cache = new_delta_cache(
             delta_cache_budget_bytes(),
-            |delta: &StateDelta<'static>| delta.as_ref().len(),
+            metrics.map(|m| m.delta_cache_gauges().clone()),
         );
-        // Publish occupancy into the node's contract-exec metrics so the
-        // caches' real footprint and eviction pressure reach `router_snapshot`.
-        if let Some(om) = &op_manager {
-            let metrics = om.ring.contract_exec_metrics();
-            summary_cache = summary_cache.with_gauges(metrics.summary_cache_gauges().clone());
-            delta_cache = delta_cache.with_gauges(metrics.delta_cache_gauges().clone());
-        }
 
         Ok(Self {
             mode,
@@ -1612,6 +1729,31 @@ where
     /// tracking is consistent regardless of which executor handles a request.
     pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
         self.recovery_guard = guard;
+    }
+
+    /// Point this executor at the pool's shared summary and delta caches
+    /// (#5795), replacing (and dropping) its private ones. Every executor of a
+    /// pool, including replacements, must get the same pair, so a summary
+    /// computed via one executor is a hit via any other.
+    pub(crate) fn set_shared_fast_path_caches(
+        &mut self,
+        summary: SharedSummaryCache,
+        delta: SharedDeltaCache,
+    ) {
+        self.summary_cache = summary;
+        self.delta_cache = delta;
+    }
+
+    /// The summary cache this executor reads and writes (test introspection).
+    #[cfg(test)]
+    pub(crate) fn summary_cache_handle(&self) -> &SharedSummaryCache {
+        &self.summary_cache
+    }
+
+    /// The delta cache this executor reads and writes (test introspection).
+    #[cfg(test)]
+    pub(crate) fn delta_cache_handle(&self) -> &SharedDeltaCache {
+        &self.delta_cache
     }
 
     /// Set the delegate notification sender for pool-based operation.
@@ -1820,6 +1962,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The pool's shared summary/delta caches (#5795) are sized to EXACTLY the
+    /// per-executor terms `declared_cache_ceiling` multiplies by the pool, on
+    /// every host shape the aggregate-safety test checks. Sharing the caches
+    /// must not grow the declared memory envelope.
+    #[test]
+    fn pool_cache_budgets_equal_the_declared_product() {
+        for limit in [1usize << 30, 2 << 30, 7_600 * 1024 * 1024, 64 << 30] {
+            for pool_size in [1usize, 2, 4, 15, 16] {
+                assert_eq!(
+                    pool_summary_budget_for(limit, pool_size),
+                    pool_size * summary_budget_for(limit, pool_size),
+                    "summary: limit={limit} pool={pool_size}"
+                );
+                assert_eq!(
+                    pool_delta_budget_for(limit, pool_size),
+                    pool_size * delta_budget_for(limit, pool_size),
+                    "delta: limit={limit} pool={pool_size}"
+                );
+            }
+        }
+        // A zero pool size is treated as one, never as a zero budget.
+        assert_eq!(
+            pool_summary_budget_for(2 << 30, 0),
+            summary_budget_for(2 << 30, 1)
+        );
     }
 
     /// `declared_cache_ceiling` must keep naming EVERY declared ceiling.
