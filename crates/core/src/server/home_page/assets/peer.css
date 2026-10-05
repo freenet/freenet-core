@@ -71,7 +71,7 @@ a.header-title {
 .accuracy-chart {
   display: block;
   overflow: visible;
-  width: 228px;
+  width: 340px;
   max-width: 100%;
   height: auto;
   flex: 0 0 auto;
@@ -361,8 +361,11 @@ svg.mchart .dot-other {
   fill: var(--text-secondary);
   opacity: 0.6;
 }
-svg.mchart .dot-faint {
-  fill: var(--text-secondary);
+svg.mchart .dots-faint {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 3.6;
+  stroke-linecap: round;
   opacity: 0.35;
 }
 .dot-this {
@@ -450,5 +453,22 @@ svg.mchart .line-peer {
   .accuracy-chart {
     width: 100%;
     max-width: 340px;
+  }
+  /* Label above value: two columns left the values a word wide. */
+  .info-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.1rem;
+  }
+  .info-grid .info-value {
+    margin-bottom: 0.5rem;
+    overflow-wrap: anywhere;
+  }
+  /* The /routing distance charts have one fixed layout: scroll them inside
+     their own box rather than shrinking their text to 6px, as the tables do. */
+  .chart-section {
+    overflow-x: auto;
+  }
+  .chart-section .chart-svg {
+    min-width: 520px;
   }
 }

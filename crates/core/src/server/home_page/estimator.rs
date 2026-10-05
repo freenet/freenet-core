@@ -243,6 +243,10 @@ pub fn build_estimator_chart(
     // is meant to illuminate — clamp them to the nearest edge so they remain
     // visible as a row of dots at the boundary. (Auto-scaled charts always size
     // their range to include the scatter, so the clamp is a no-op there.)
+    //
+    // All dots are ONE path of zero-length round-capped segments: a fifth of
+    // the bytes of a <circle> each, on a page re-fetched every five seconds.
+    let mut dots = String::new();
     for &(x, y) in scatter_points {
         if !(x.is_finite() && y.is_finite()) {
             continue;
@@ -251,10 +255,17 @@ pub fn build_estimator_chart(
             continue;
         }
         write!(
+            dots,
+            "M{:.0} {:.0}h0",
+            to_svg_x(x),
+            to_svg_y(y.clamp(y_min, y_max)),
+        )
+        .ok();
+    }
+    if !dots.is_empty() {
+        write!(
             svg,
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="1.8" fill="var(--text-muted)" opacity="0.35"/>"#,
-            cx = to_svg_x(x),
-            cy = to_svg_y(y.clamp(y_min, y_max)),
+            r#"<path d="{dots}" class="scatter" fill="none" stroke="var(--text-muted)" stroke-width="3.6" stroke-linecap="round" opacity="0.35"/>"#,
         )
         .ok();
     }

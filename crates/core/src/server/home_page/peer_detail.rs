@@ -958,17 +958,13 @@ fn distance_chart(width: f64, chart: &DistanceChart<'_>) -> String {
         }
     )
     .ok();
-    for &(d, v) in chart.all {
-        if d.is_finite() && v.is_finite() && v > 0.0 {
-            write!(
-                svg,
-                r#"<circle cx="{:.1}" cy="{:.1}" r="1.8" class="dot-faint"/>"#,
-                x(d),
-                y(v)
-            )
-            .ok();
-        }
-    }
+    svg.push_str(&faint_dots(
+        chart
+            .all
+            .iter()
+            .filter(|(d, v)| d.is_finite() && v.is_finite() && *v > 0.0)
+            .map(|&(d, v)| (x(d), y(v))),
+    ));
     let path = |points: &[(f64, f64)]| -> String {
         points
             .iter()
@@ -1122,7 +1118,6 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
     write!(
         svg,
         r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" class="baseline"/>
-        <text x="{:.1}" y="{:.1}" text-anchor="end" class="dl halo">exact</text>
         <text x="{:.1}" y="{:.1}">slower than predicted</text>
         <text x="{:.1}" y="{:.1}" text-anchor="end">faster than predicted</text>
         <text x="{:.1}" y="{:.1}" text-anchor="middle">predicted</text>
@@ -1131,8 +1126,6 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
         y(min),
         x(max),
         y(max),
-        x(max) - 18.0,
-        y(max) + 14.0,
         left + 4.0,
         top + 10.0,
         w - right - 4.0,
@@ -1142,17 +1135,11 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
         mid = (top + h - bottom) / 2.0,
     )
     .ok();
-    for &(p, a) in all {
-        if p > 0.0 && a > 0.0 && p.is_finite() && a.is_finite() {
-            write!(
-                svg,
-                r#"<circle cx="{:.1}" cy="{:.1}" r="1.8" class="dot-faint"/>"#,
-                x(p),
-                y(a)
-            )
-            .ok();
-        }
-    }
+    svg.push_str(&faint_dots(
+        all.iter()
+            .filter(|(p, a)| p.is_finite() && a.is_finite() && *p > 0.0 && *a > 0.0)
+            .map(|&(p, a)| (x(p), y(a))),
+    ));
     for &(p, a) in mine {
         if p > 0.0 && a > 0.0 && p.is_finite() && a.is_finite() {
             write!(
@@ -1166,6 +1153,15 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
             .ok();
         }
     }
+    // Last, so this peer's dots cannot hide it; the halo keeps it legible
+    // over them.
+    write!(
+        svg,
+        r#"<text x="{:.1}" y="{:.1}" text-anchor="end" class="dl halo">exact</text>"#,
+        x(max) - 18.0,
+        y(max) + 14.0,
+    )
+    .ok();
     svg.push_str("</svg>");
     svg
 }
@@ -1323,6 +1319,21 @@ impl LogAxis {
     /// Position of `value` along the axis, 0 at the low end and 1 at the high.
     fn fraction(&self, value: f64) -> f64 {
         ((value.max(1e-300).log10() - self.lo) / (self.hi - self.lo)).clamp(0.0, 1.0)
+    }
+}
+
+/// Every other peer's dots as ONE path of zero-length round-capped segments,
+/// about a fifth of the bytes of a `<circle>` each. These dots carry no
+/// tooltip, and the page is re-fetched every five seconds.
+fn faint_dots(points: impl Iterator<Item = (f64, f64)>) -> String {
+    let mut path = String::new();
+    for (x, y) in points {
+        write!(path, "M{x:.0} {y:.0}h0").ok();
+    }
+    if path.is_empty() {
+        path
+    } else {
+        format!(r#"<path d="{path}" class="dots-faint"/>"#)
     }
 }
 

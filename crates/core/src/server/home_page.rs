@@ -1387,9 +1387,10 @@ mod tests {
             "no data",
         );
         assert!(html.contains("<svg"), "should render an SVG, got: {html}");
-        assert!(
-            html.contains("<circle"),
-            "raw observations should render as scatter circles, got: {html}"
+        assert_eq!(
+            html.matches("h0").count(),
+            4,
+            "each raw observation renders as a scatter dot, got: {html}"
         );
     }
 
@@ -1490,8 +1491,8 @@ mod tests {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top
         // edge) instead of vanishing, so failures stay visible on the
-        // low-probability peers the zoom targets. The fitted curve renders as a
-        // <path>, so every <circle> here is a scatter dot.
+        // low-probability peers the zoom targets. The scatter is one path of
+        // zero-length `h0` segments, one per dot; the curve has none.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
@@ -1503,10 +1504,10 @@ mod tests {
             "0.0",
             "0.08",
         );
-        let circles = html.matches("<circle").count();
+        let dots = html.matches("h0").count();
         assert!(
-            circles >= 3,
-            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+            dots >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {dots}: {html}"
         );
     }
 
