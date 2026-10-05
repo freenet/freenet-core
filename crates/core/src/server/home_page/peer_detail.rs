@@ -330,15 +330,19 @@ impl Learned {
             Some(o) if o.weight == 0.0 => Source::DistanceAlone,
             Some(_) => Source::Mostly,
         });
-        let warm_alike =
-            (0..3).all(|stage| peer.offsets[stage].is_some() && !tells_apart(view, stage));
+        // Over the WARM stages only: a cold stage (transfer speed, often,
+        // since transfers are rare) does not stop the warm ones from having
+        // found that every peer looks alike, which more requests from this
+        // peer will not change.
+        let warm_alike = peer.offsets.iter().any(Option::is_some)
+            && (0..3).all(|stage| peer.offsets[stage].is_none() || !tells_apart(view, stage));
         let learning = if sources.contains(&Source::Known) {
             Learning::No
         } else if sources.iter().all(|s| *s == Source::Early) {
             Learning::FirstEstimates
         } else if warm_alike {
-            // Every stage warm and finding no difference between any peers:
-            // every peer is on the line because they look alike.
+            // Every warm stage finds no difference between any peers: every
+            // peer is on the line because they look alike.
             Learning::No
         } else {
             Learning::Still(sources)
@@ -485,12 +489,16 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
     let early = peer.is_some_and(|peer| peer.curves[0].early);
     let Some((seconds, alone)) = peer.and_then(|peer| lines_at_own_location(&peer.curves[0]))
     else {
+        let drawn = peer.is_some_and(|peer| !peer.curves[0].distance_alone.is_empty());
         let why = if !view.snapshot.prediction_active {
             "Your node is not predicting yet."
         } else if peer.is_none() {
             "Your node cannot match this peer to a routing record."
         } else if !view.located {
             "Its ring location is not known yet, so your node does not predict it."
+        } else if drawn {
+            // Lines exist but neither has a usable value at distance 0.
+            "Routing has no usable prediction at this peer's own location right now."
         } else {
             "Too few timed replies to predict it yet."
         };
@@ -517,22 +525,36 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
             None => "; too few timed replies yet to compare it with distance alone".to_string(),
         }
     };
+    // What the line is depends on which estimate routing is using.
+    let source = if view.fallback {
+        "from the emergency fallback's estimate with this peer's own correction"
+    } else if early {
+        "from its early estimate with this peer's own correction"
+    } else {
+        "in a part of the ring this peer has no specific record in"
+    };
     tile(
         "Response time",
         &fmt_time_tile(seconds),
         &format!("predicted for contracts near it{comparison}."),
-        "Routing's prediction for a contract at this peer's location, in a part of the ring \
-         it has no specific record in: the start of the lines under Past requests.",
+        &format!(
+            "Routing's prediction for a contract at this peer's location, {source}: the \
+             start of the lines under Past requests."
+        ),
     )
 }
 
-/// `(this peer, distance alone)` where the drawn response-time lines start, at
+/// `(this peer, distance alone)` where the drawn response-time lines are at
 /// distance 0: the tile's number and the one it is compared with, so the tile
 /// reads exactly off the chart (and `this peer = distance alone × factor`).
+/// `None` when either line has no usable point at distance 0 (a non-finite
+/// value there is dropped from the line, so its first point may be further
+/// out).
 fn lines_at_own_location(curve: &RoutingCurve) -> Option<(f64, f64)> {
     let start = |line: &[(f64, f64)]| {
-        line.first()
-            .filter(|(distance, seconds)| *distance == 0.0 && seconds.is_finite() && *seconds > 0.0)
+        line.iter()
+            .find(|(distance, _)| *distance == 0.0)
+            .filter(|(_, seconds)| seconds.is_finite() && *seconds > 0.0)
             .map(|&(_, seconds)| seconds)
     };
     let alone = start(&curve.distance_alone)?;
@@ -1390,7 +1412,7 @@ fn accuracy_card(view: &RouterView) -> String {
         (None, Some(across)) => {
             format!("Too few timed replies from this peer to judge its predictions yet; {across}.")
         }
-        _ => "Too few requests to judge the predictions yet.".to_string(),
+        _ => "Too few timed replies to judge the predictions yet.".to_string(),
     };
     let fallback = if view.fallback {
         "<p>Routing is on its emergency fallback: these are the main model's predictions, which it is not using right now.</p>"
@@ -1931,6 +1953,57 @@ mod tests {
         assert!(compared > 0);
     }
 
+    /// The tile reads the lines' points AT distance 0; a line whose value there
+    /// was dropped gets the right reason, not "too few timed replies".
+    #[test]
+    fn the_tile_reads_distance_zero_or_says_it_has_none() {
+        let curve = |alone: Vec<(f64, f64)>, mine: Vec<(f64, f64)>| RoutingCurve {
+            distance_alone: alone,
+            this_peer: mine,
+            early: false,
+        };
+        assert_eq!(
+            lines_at_own_location(&curve(vec![(0.0, 0.2), (0.5, 0.4)], vec![(0.0, 0.1)])),
+            Some((0.1, 0.2))
+        );
+        assert_eq!(
+            lines_at_own_location(&curve(vec![(0.01, 0.2), (0.5, 0.4)], Vec::new())),
+            None,
+            "a line starting past 0 has no value at the peer's own location"
+        );
+        let others = vec![[failure(0.0, 30.0, 0.7), timing(1.0, 30.0, 0.7), None]];
+        let mut view = view_with([None, timing(1.0, 30.0, 0.7), None], others, None);
+        view.peer.as_mut().unwrap().curves[0] = curve(vec![(0.01, 0.2), (0.5, 0.4)], Vec::new());
+        let tile = response_tile(&view, &Learned::of(&view));
+        assert!(tile.contains("no usable prediction at this peer"), "{tile}");
+        assert!(!tile.contains("Too few timed replies"));
+    }
+
+    /// The tile's tooltip says which estimate the line comes from.
+    #[test]
+    fn the_tile_tooltip_names_the_estimate_in_use() {
+        let others = vec![[failure(0.0, 30.0, 0.7), timing(1.0, 30.0, 0.7), None]];
+        let mut view = view_with([None, timing(1.0, 30.0, 0.7), None], others, None);
+        view.peer.as_mut().unwrap().curves[0] = RoutingCurve {
+            distance_alone: vec![(0.0, 0.2), (0.5, 0.4)],
+            this_peer: Vec::new(),
+            early: false,
+        };
+        let warm = response_tile(&view, &Learned::of(&view));
+        assert!(warm.contains("no specific record in"), "{warm}");
+        view.peer.as_mut().unwrap().curves[0].early = true;
+        let early = response_tile(&view, &Learned::of(&view));
+        assert!(
+            early.contains("from its early estimate with this peer"),
+            "{early}"
+        );
+        assert!(!early.contains("no specific record in"));
+        view.fallback = true;
+        let fallback = response_tile(&view, &Learned::of(&view));
+        assert!(fallback.contains("emergency fallback"), "{fallback}");
+        assert!(!fallback.contains("no specific record in"));
+    }
+
     /// A peer with a key but no ring location: routing predicts nothing, and
     /// the page says why rather than "too few replies".
     #[test]
@@ -2350,6 +2423,13 @@ mod tests {
             timing(1.0, 40.0, 0.0),
         ];
         assert_eq!(learning(alike, vec![alike, alike]), Learning::No);
+        // The same with the transfer stage cold (transfers are rare): the
+        // warm stages still find every peer alike, so still no banner.
+        let alike_cold = [failure(0.0, 40.0, 0.0), timing(1.0, 40.0, 0.0), None];
+        assert_eq!(
+            learning(alike_cold, vec![alike_cold, alike_cold]),
+            Learning::No
+        );
         // Nothing warm yet: early estimates throughout.
         assert_eq!(
             learning([None, None, None], vec![[None, None, None]]),

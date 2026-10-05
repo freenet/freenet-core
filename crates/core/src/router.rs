@@ -2025,8 +2025,8 @@ impl PeerSelectionCounts {
             })
     }
 
-    /// The peer's counts were evicted, among the last `capacity` evictions,
-    /// and it has not been eligible since.
+    /// The peer's counts were evicted, it is among the last `capacity`
+    /// DISTINCT peers evicted, and it has not been eligible since.
     fn was_evicted(&self, peer: &PeerKeyLocation) -> bool {
         self.table.lock().evicted.contains_key(peer)
     }
