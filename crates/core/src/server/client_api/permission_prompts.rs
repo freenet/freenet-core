@@ -1481,8 +1481,13 @@ async fn permission_events_ws(
     // tungstenite defaults that would be 64 MiB per message and 16 MiB per
     // frame of buffering per socket, times the subscriber cap, for data that
     // is thrown away. Cap it at something no legitimate client exceeds.
+    // The read buffer gets the same cap: tungstenite allocates it per socket
+    // (128 KiB by default) and zero-fills up to its size before every read
+    // attempt (#5795). It only bounds one read; a frame's length is reserved
+    // when its header arrives, so this refuses nothing the limits above accept.
     ws.max_message_size(1024)
         .max_frame_size(1024)
+        .read_buffer_size(1024)
         .on_upgrade(move |socket| async move {
             let (sink, stream) = socket.split();
             pump_permission_events(sink, stream, rx, initial, guard).await;
