@@ -728,7 +728,10 @@ pub(super) struct DelegateCallEnv {
 //     genuinely concurrent one. It makes exactly one access: the `context`
 //     read-back in `delegate/execution.rs`, and that sits AFTER the `?` so it
 //     runs only on the success path -- i.e. only once `execute_wasm_blocking`
-//     has JOINED the guest closure and the guest is provably finished.
+//     has RECEIVED the guest's result. The job sends it only after the guest
+//     closure has returned and dropped its captures, so the guest is provably
+//     finished even though the multi-thread path does not join the thread (see
+//     the send site in `execute_wasm_blocking`).
 //
 //     DO NOT MOVE IT BACK ABOVE THE `?`, and do not add a read of any other
 //     field beside it. That is not a style preference: since #5593 `context` is

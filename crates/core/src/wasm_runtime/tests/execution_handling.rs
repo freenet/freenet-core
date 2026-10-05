@@ -1,7 +1,11 @@
 //! Tests for WASM execution handling edge cases.
 //!
-//! These tests verify the behavior of the sync polling loop in `handle_execution_call`,
-//! including timeout handling, panic recovery, and store management.
+//! These tests exercise a SIMULATED wait loop (`simulate_execution_polling`),
+//! covering timeout handling, panic recovery, and store management in the
+//! abstract. They do not call production code. The real wait,
+//! `execute_wasm_blocking` in `engine/wasmtime_engine.rs`, no longer polls: it
+//! waits on a channel and wakes on completion. Its behaviour is pinned by the
+//! stub-job tests in that file's test module.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -288,43 +292,33 @@ fn test_store_lost_on_timeout() {
 }
 
 // =============================================================================
-// Polling Interval Tests
+// Completion-Wait Tests
 // =============================================================================
 
+/// The shape `execute_wasm_blocking` uses: the job sends its result over a
+/// capacity-1 channel and the waiter blocks in `recv_timeout` until the bound.
+/// ONE blocking call must return the result when the job finishes, not at the
+/// bound and not on a poll interval. (This replaced a test pinning a 10 ms poll
+/// interval, which no longer exists.)
 #[test]
-fn test_polling_does_not_spin() {
-    let poll_count = Arc::new(AtomicU32::new(0));
-    let poll_count_clone = poll_count.clone();
-
-    // Thread that takes 100ms
-    let handle = thread::spawn(move || -> Result<i64, &'static str> {
+fn test_completion_wait_returns_when_the_job_finishes() {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<i64, &'static str>>(1);
+    let handle = thread::spawn(move || {
         thread::sleep(Duration::from_millis(100));
-        Ok(42)
+        tx.send(Ok(42)).expect("waiter is alive");
     });
 
-    let timeout = Duration::from_millis(500);
     let start = Instant::now();
-
-    loop {
-        poll_count_clone.fetch_add(1, Ordering::SeqCst);
-        if handle.is_finished() {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            panic!("Should not timeout");
-        }
-        thread::sleep(Duration::from_millis(10)); // 10ms sleep between polls
-    }
-
+    let result = rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("the job finishes well inside the bound");
+    let elapsed = start.elapsed();
     let _join = handle.join();
 
-    // With 10ms polling interval and 100ms execution, we should have ~10-15 polls
-    // (not hundreds or thousands which would indicate spinning)
-    let polls = poll_count.load(Ordering::SeqCst);
+    assert_eq!(result, Ok(42));
     assert!(
-        (5..=20).contains(&polls),
-        "Expected 5-20 polls, got {}",
-        polls
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(400),
+        "returned at {elapsed:?}: should be ~100 ms, when the job finished"
     );
 }
 

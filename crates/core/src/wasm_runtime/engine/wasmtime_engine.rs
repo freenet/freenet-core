@@ -450,7 +450,7 @@ const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
 /// `EPOCH_TICK_PERIOD`. Combined with a per-execution deadline of
 /// `ceil(max_execution_seconds / EPOCH_TICK_PERIOD)` ticks (see
 /// [`epoch_deadline_ticks`]) this bounds a runaway guest to roughly
-/// `max_execution_seconds` (+ up to one tick of slack) rather than unbounded.
+/// `max_execution_seconds` (+ under two ticks of slack) rather than unbounded.
 const EPOCH_TICK_PERIOD: Duration = Duration::from_millis(100);
 
 /// Process-start reference instant for the epoch-ticker heartbeat (#4864). Real
@@ -674,9 +674,15 @@ fn detect_stale_epoch_ticker() {
 /// deadline is armed can land anywhere in `[0, EPOCH_TICK_PERIOD)`. Without the
 /// margin a `ceil`-computed N-tick deadline could trap up to one whole tick
 /// EARLY (≈4.9s for a 5.0s budget), nondeterministically killing a guest that
-/// legitimately finishes in `[T - tick, T]`. The margin shifts the enforced
-/// window from `[T - tick, T]` to `[T, T + tick]` — never early, at most one
-/// tick (~100 ms) late.
+/// legitimately finishes in `[T - tick, T]`. With the margin the trap lands in
+/// `[ceil(T/tick), ceil(T/tick) + 1] * tick` after arming: never early, and at
+/// most one tick past `T` rounded up to a whole tick (~100 ms late when `T` is a
+/// whole number of ticks, under two ticks for any `T`).
+///
+/// The wall-clock backstop in [`execute_wasm_blocking`] deliberately waits for
+/// the END of this window (plus [`WALL_BACKSTOP_MARGIN`]), see [`WallBounds`], so
+/// that with a live ticker the epoch trap is what stops a runaway guest and the
+/// engine keeps its store.
 fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
     let tick_secs = EPOCH_TICK_PERIOD.as_secs_f64();
     let ticks = (max_execution_seconds / tick_secs).ceil();
@@ -2260,6 +2266,59 @@ enum WallVerdict {
     QueuedTooLong,
 }
 
+/// Extra wall-clock time the backstop allows a RUNNING guest past the end of
+/// the epoch-trap window, so a live ticker's trap normally lands first.
+///
+/// The trap and the backstop both end a runaway guest as
+/// `WasmError::Timeout`, but they differ in what the engine keeps. The trap
+/// unwinds the guest and hands its `Store` back (instances intact); the
+/// backstop abandons the still-running guest, and with it the `Store`, so the
+/// engine must `recover_store()` and drop every instance. The backstop exists
+/// for a guest the trap cannot stop: a dead ticker (#4864), or a blocking host
+/// call in flight. It must not routinely race the trap.
+///
+/// The margin absorbs ticker-thread scheduling jitter (each tick is a
+/// `thread::sleep(EPOCH_TICK_PERIOD)`, so lateness accumulates across ticks)
+/// plus the guest's unwind. It only delays a guest the trap could not stop,
+/// by 50 ms against a multi-second budget.
+const WALL_BACKSTOP_MARGIN: Duration = Duration::from_millis(50);
+
+/// The two wall-clock bounds [`execute_wasm_blocking`] enforces, each measured
+/// from its own origin (see [`classify_wall_timeout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WallBounds {
+    /// How long a job may wait on the blocking-pool queue before it starts.
+    queue: Duration,
+    /// How long a STARTED guest may run, measured from its own start, before
+    /// the backstop abandons it.
+    guest: Duration,
+}
+
+impl WallBounds {
+    /// The bounds for a call with `max_execution_seconds` of budget.
+    ///
+    /// `queue` is the budget itself. `guest` is the latest moment the epoch
+    /// trap can fire ([`epoch_deadline_ticks`] ticks, armed at guest start) plus
+    /// [`WALL_BACKSTOP_MARGIN`], and never less than the budget. With the
+    /// default 5 s budget that is 51 ticks: 5.1 s + 50 ms.
+    ///
+    /// Before the wait woke on completion, the 10 ms poll fired the backstop
+    /// somewhere in `[budget, budget + 10 ms]` while the trap fired in
+    /// `[budget, budget + tick]`, so the backstop already won most races and the
+    /// store was usually discarded. Waking exactly at the bound would have made
+    /// that every race; this bound makes the trap win instead, as the comments
+    /// around `arm_epoch_deadline` always described.
+    fn for_budget(max_execution_seconds: f64) -> Self {
+        let queue = Duration::from_secs_f64(max_execution_seconds);
+        let ticks = u32::try_from(epoch_deadline_ticks(max_execution_seconds)).unwrap_or(u32::MAX);
+        let epoch_window = EPOCH_TICK_PERIOD.saturating_mul(ticks);
+        Self {
+            queue,
+            guest: queue.max(epoch_window).saturating_add(WALL_BACKSTOP_MARGIN),
+        }
+    }
+}
+
 /// #4864 round-7: classify the wall-clock backstop, bounding queue wait and the
 /// per-guest compute budget SEPARATELY.
 ///
@@ -2275,24 +2334,25 @@ enum WallVerdict {
 ///   (transient), and a job that starts gets its FULL budget from its own start.
 /// - (b) A job that started just before an enqueue-relative deadline would be
 ///   classified as a real timeout after mere milliseconds of guest time. Now the
-///   guest must actually consume `budget` of run time to earn `GuestOverran`.
+///   guest must actually consume its full guest bound of run time to earn
+///   `GuestOverran`.
 ///
-/// The total wall bound is `queue_wait + budget`, each individually `<= budget`.
+/// The total wall bound is `queue_wait + guest`, with `queue_wait <= bounds.queue`.
 ///
 /// - `started_at`: `Some(elapsed-at-guest-start)` once the guest began running,
 ///   `None` while still queued.
 /// - `elapsed`: time since enqueue.
-/// - `budget`: both the per-guest compute budget AND the queue bound.
+/// - `bounds`: the queue bound and the per-guest bound, see [`WallBounds`].
 fn classify_wall_timeout(
     started_at: Option<Duration>,
     elapsed: Duration,
-    budget: Duration,
+    bounds: WallBounds,
 ) -> WallVerdict {
     match started_at {
         // Guest is running: a real timeout only once it has consumed its full
         // budget measured from its OWN start, not from enqueue.
         Some(started_at) => {
-            if elapsed.saturating_sub(started_at) >= budget {
+            if elapsed.saturating_sub(started_at) >= bounds.guest {
                 WallVerdict::GuestOverran
             } else {
                 WallVerdict::KeepWaiting
@@ -2300,7 +2360,7 @@ fn classify_wall_timeout(
         }
         // Never started: transient scheduler overload once queued past the bound.
         None => {
-            if elapsed >= budget {
+            if elapsed >= bounds.queue {
                 WallVerdict::QueuedTooLong
             } else {
                 WallVerdict::KeepWaiting
@@ -2317,11 +2377,13 @@ fn classify_wall_timeout(
 fn time_to_next_wall_bound(
     started_at: Option<Duration>,
     elapsed: Duration,
-    budget: Duration,
+    bounds: WallBounds,
 ) -> Duration {
     match started_at {
-        Some(started_at) => started_at.saturating_add(budget).saturating_sub(elapsed),
-        None => budget.saturating_sub(elapsed),
+        Some(started_at) => started_at
+            .saturating_add(bounds.guest)
+            .saturating_sub(elapsed),
+        None => bounds.queue.saturating_sub(elapsed),
     }
 }
 
@@ -2354,14 +2416,14 @@ enum GuestWait {
 fn wait_for_guest(
     rx: &std::sync::mpsc::Receiver<WasmResult>,
     start: std::time::Instant,
-    budget: Duration,
+    bounds: WallBounds,
     read_started_at: &dyn Fn() -> Option<Duration>,
 ) -> GuestWait {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     loop {
         let started_at = read_started_at();
         let elapsed = start.elapsed();
-        match classify_wall_timeout(started_at, elapsed, budget) {
+        match classify_wall_timeout(started_at, elapsed, bounds) {
             WallVerdict::KeepWaiting => {}
             verdict @ (WallVerdict::GuestOverran | WallVerdict::QueuedTooLong) => {
                 return match rx.try_recv() {
@@ -2374,7 +2436,7 @@ fn wait_for_guest(
                 };
             }
         }
-        match rx.recv_timeout(time_to_next_wall_bound(started_at, elapsed, budget)) {
+        match rx.recv_timeout(time_to_next_wall_bound(started_at, elapsed, bounds)) {
             Ok(result) => return GuestWait::Done(result),
             Err(RecvTimeoutError::Disconnected) => return GuestWait::Ended,
             Err(RecvTimeoutError::Timeout) => {}
@@ -2386,24 +2448,24 @@ fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where
     F: FnOnce() -> WasmResult + Send + 'static,
 {
-    // `budget` bounds BOTH the queue wait (before the guest starts) and the
-    // guest's own compute time (after it starts), SEPARATELY — see
+    // Bounds the queue wait (before the guest starts) and the guest's own run
+    // time (after it starts), SEPARATELY — see `WallBounds` and
     // `classify_wall_timeout`.
-    let budget = Duration::from_secs_f64(max_execution_seconds);
+    let bounds = WallBounds::for_budget(max_execution_seconds);
     let start = std::time::Instant::now();
 
     // #4864 round-6/7: distinguish a guest that RAN and blew its budget (a real,
     // contract-intrinsic timeout — the epoch backstop) from a closure that never
     // got off the blocking-pool queue (a transient scheduler overload the guest
-    // never entered). The wrapper records `started_at` (ms since enqueue) then
+    // never entered). The wrapper records `started_at` (ns since enqueue) then
     // flips `started` as the closure's first acts; the CALLER's closure then arms
     // the epoch deadline as ITS first act, so the guest's budget starts at
     // guest-start, not at enqueue. A wall-clock fire with `started == false` means
     // the guest never ran and the failure must NOT be charged to the contract.
     let started = Arc::new(AtomicBool::new(false));
-    let started_at_ms = Arc::new(AtomicU64::new(0));
+    let started_at_ns = Arc::new(AtomicU64::new(0));
     let started_for_guest = Arc::clone(&started);
-    let started_at_for_guest = Arc::clone(&started_at_ms);
+    let started_at_for_guest = Arc::clone(&started_at_ns);
     // Contract WASM runs on a dedicated blocking thread (spawn_blocking, or a
     // plain std::thread — see the match below), never on the calling thread, so
     // a contract-clock override set by a test on the CALLER's thread would not
@@ -2421,11 +2483,21 @@ where
         // Record started_at BEFORE flipping `started`, so a waiter that
         // observes started==true (SeqCst) is guaranteed to read a valid
         // started_at.
-        started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
+        // Full precision: a millisecond-truncated start reads up to 1 ms EARLY,
+        // which would fire the guest bound up to 1 ms early. u64 nanoseconds
+        // cover 584 years.
+        started_at_for_guest.store(start.elapsed().as_nanos() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
         let clock_guard = clock_override.map(native_api::time::override_contract_clock);
         let result = f();
         drop(clock_guard);
+        // Sent only AFTER `f()` has returned, so by the time the waiter can see
+        // a result the caller's closure, and everything it captured (the
+        // delegate env guards, `LiveGuestRegistration`), has already been
+        // dropped. Callers rely on this: a received result means the guest is
+        // finished, without anyone joining the thread (delegate/execution.rs's
+        // context read-back, native_api.rs's DELEGATE_ENV safety argument).
+        //
         // The waiter may have hit its deadline and gone; a failed send is fine.
         #[allow(clippy::let_underscore_must_use)]
         let _ = result_tx.send(result);
@@ -2437,7 +2509,7 @@ where
     let read_started_at = || -> Option<Duration> {
         started
             .load(Ordering::SeqCst)
-            .then(|| Duration::from_millis(started_at_ms.load(Ordering::SeqCst)))
+            .then(|| Duration::from_nanos(started_at_ns.load(Ordering::SeqCst)))
     };
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
@@ -2454,7 +2526,7 @@ where
             // poll slept on the worker itself, outside `block_in_place`, and so
             // took the core out of service without telling the runtime.
             tokio::task::block_in_place(|| {
-                match wait_for_guest(&result_rx, start, budget, &read_started_at) {
+                match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
                     GuestWait::Done((Ok(value), store)) => BlockingResult::Ok(value, store),
                     GuestWait::Done((Err(err), store)) => BlockingResult::WasmError(err, store),
                     // The task is finishing or finished; join it for the cause.
@@ -2508,7 +2580,7 @@ where
             // Same wait and the same started-flag classification as the
             // multi-thread arm. On a deadline the detached thread is left to
             // finish and drop the store on its own (as before).
-            match wait_for_guest(&result_rx, start, budget, &read_started_at) {
+            match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
                 GuestWait::Done((Ok(value), store)) => {
                     let _join = thread_handle.join();
                     BlockingResult::Ok(value, store)
@@ -3327,8 +3399,12 @@ mod tests {
     /// start) rather than from enqueue. Encodes both failure modes the fix closes.
     #[test]
     fn classify_wall_timeout_bounds_queue_and_budget_separately() {
-        use super::{WallVerdict, classify_wall_timeout};
-        let budget = Duration::from_millis(100);
+        use super::{WallBounds, WallVerdict, classify_wall_timeout};
+        // The same 100 ms for both bounds, as before the bounds were split.
+        let budget = WallBounds {
+            queue: Duration::from_millis(100),
+            guest: Duration::from_millis(100),
+        };
 
         // Not started, under the queue bound → keep waiting.
         assert_eq!(
@@ -3379,6 +3455,129 @@ mod tests {
             ),
             WallVerdict::GuestOverran
         );
+    }
+
+    /// The guest bound must outlast the latest moment the epoch trap can fire,
+    /// so a live ticker's trap ends a runaway guest (store kept) before the
+    /// backstop abandons it (store discarded). The queue bound stays the budget.
+    #[test]
+    fn wall_bounds_outlast_the_epoch_trap_window() {
+        for secs in [0.01, 0.05, 0.1, 0.15, 0.3, 0.5, 1.0, 5.0, 30.0] {
+            let bounds = WallBounds::for_budget(secs);
+            let ticks = u32::try_from(epoch_deadline_ticks(secs)).expect("small tick count");
+            let trap_latest = EPOCH_TICK_PERIOD * ticks;
+            assert_eq!(bounds.queue, Duration::from_secs_f64(secs), "budget {secs}");
+            assert!(
+                bounds.guest >= trap_latest + WALL_BACKSTOP_MARGIN,
+                "budget {secs}: guest bound {:?} does not outlast the trap window \
+                 ({trap_latest:?}) by the margin",
+                bounds.guest
+            );
+            assert!(bounds.guest >= bounds.queue, "budget {secs}");
+        }
+        // The production default: 51 ticks = 5.1 s, plus the margin.
+        assert_eq!(
+            WallBounds::for_budget(5.0).guest,
+            Duration::from_millis(5100) + WALL_BACKSTOP_MARGIN
+        );
+    }
+
+    /// `time_to_next_wall_bound` must agree exactly with `classify_wall_timeout`:
+    /// while the verdict is `KeepWaiting` the wait is non-zero (no busy spin),
+    /// the verdict is still `KeepWaiting` 1 ns before the wait ends (no
+    /// premature timeout), and it has flipped when the wait ends (no extra
+    /// wake). Once a bound has passed, the wait is zero.
+    #[test]
+    fn next_wall_bound_agrees_with_classification() {
+        let ms = Duration::from_millis;
+        let bounds = WallBounds {
+            queue: ms(100),
+            guest: ms(170),
+        };
+        let starts = [
+            None,
+            Some(ms(0)),
+            Some(ms(30)),
+            Some(ms(99)),
+            Some(ms(100)),
+            Some(ms(130)),
+        ];
+        for started_at in starts {
+            for step in 0..=400u64 {
+                for extra_ns in [0u64, 1, 999_999] {
+                    let elapsed = ms(step) + Duration::from_nanos(extra_ns);
+                    if started_at.is_some_and(|s| s > elapsed) {
+                        continue; // a guest cannot start after "now"
+                    }
+                    let verdict = classify_wall_timeout(started_at, elapsed, bounds);
+                    let wait = time_to_next_wall_bound(started_at, elapsed, bounds);
+                    if verdict == WallVerdict::KeepWaiting {
+                        assert!(
+                            wait > Duration::ZERO,
+                            "{started_at:?} @ {elapsed:?}: zero wait"
+                        );
+                        assert_eq!(
+                            classify_wall_timeout(
+                                started_at,
+                                elapsed + wait - Duration::from_nanos(1),
+                                bounds
+                            ),
+                            WallVerdict::KeepWaiting,
+                            "{started_at:?} @ {elapsed:?}: bound fires before the wait ends"
+                        );
+                        assert_ne!(
+                            classify_wall_timeout(started_at, elapsed + wait, bounds),
+                            WallVerdict::KeepWaiting,
+                            "{started_at:?} @ {elapsed:?}: wait ends before the bound"
+                        );
+                    } else {
+                        assert_eq!(wait, Duration::ZERO, "{started_at:?} @ {elapsed:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// At a bound, a result already waiting in the channel wins: the old loop
+    /// checked `is_finished()` before classifying, and the wait keeps that
+    /// order with a `try_recv` at the deadline. Driven with a start instant far
+    /// in the past so every bound has already passed on the first check.
+    #[test]
+    fn result_already_waiting_at_the_deadline_wins() {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the monotonic clock is more than 60 s past its origin");
+        let bounds = WallBounds::for_budget(0.1);
+
+        // Completion beats both kinds of bound.
+        for started in [None, Some(Duration::ZERO)] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+            tx.send((Ok(5), stub_store())).expect("receiver alive");
+            let outcome = wait_for_guest(&rx, long_ago, bounds, &|| started);
+            assert!(
+                matches!(outcome, GuestWait::Done((Ok(5), _))),
+                "a waiting result must win the deadline (started {started:?})"
+            );
+        }
+
+        // No result: the bound decides, by whether the guest started.
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            GuestWait::QueuedTooLong
+        ));
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO)),
+            GuestWait::GuestOverran
+        ));
+
+        // A job that ended without sending (panicked, or dropped unrun).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        drop(tx);
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            GuestWait::Ended
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -3443,8 +3642,12 @@ mod tests {
     /// most calls stayed near 1 ms. The median ignores outliers in both
     /// directions, so neither a loaded runner nor a lucky preemption under the
     /// old poll can flip it.
-    const LATENCY_CALLS: usize = 31;
-    const LATENCY_MEDIAN_BOUND: Duration = Duration::from_millis(6);
+    ///
+    /// 8 ms sits below the old poll's 10 ms floor (a `thread::sleep` never
+    /// returns early, so no load can bring the old median under it) and leaves
+    /// ~7 ms of scheduling slack per call for a noisy CI runner.
+    const LATENCY_CALLS: usize = 51;
+    const LATENCY_MEDIAN_BOUND: Duration = Duration::from_millis(8);
 
     fn assert_median_latency(arm: &str, latencies: &[Duration]) {
         let median = latencies[latencies.len() / 2];
@@ -3642,6 +3845,204 @@ mod tests {
             5.0,
         );
         assert!(matches!(no_runtime, BlockingResult::Panic(_)));
+    }
+
+    /// A job that finishes shortly BEFORE its guest bound returns `Ok`, even
+    /// though it ran well past the nominal budget: the guest bound includes the
+    /// epoch-trap window, so only the trap or the bound can end it, not the
+    /// budget alone. Budget 0.1 s: trap window 0.2 s, guest bound 0.25 s; the
+    /// job runs 0.2 s.
+    #[test]
+    fn job_finishing_just_before_its_guest_bound_returns_ok() {
+        let bounds = WallBounds::for_budget(0.1);
+        let run = Duration::from_millis(200);
+        assert!(run > bounds.queue && run < bounds.guest, "test premise");
+        let store = stub_store();
+        let result = execute_wasm_blocking(
+            move || {
+                std::thread::sleep(run);
+                (Ok(3), store)
+            },
+            0.1,
+        );
+        assert!(matches!(result, BlockingResult::Ok(3, _)));
+    }
+
+    /// Everything the job captured has been dropped by the time
+    /// `execute_wasm_blocking` returns `Ok`. The delegate path relies on this:
+    /// it reads the delegate env after a successful call on the grounds that
+    /// the guest closure, and its env guards, are gone. The multi-thread arm no
+    /// longer joins the thread, so this rests on the job sending its result
+    /// only after the closure has returned.
+    #[test]
+    fn job_captures_are_dropped_before_ok_returns() {
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                // Widen the window a premature send would expose.
+                std::thread::sleep(Duration::from_millis(20));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        fn run_once() -> bool {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = SetOnDrop(Arc::clone(&dropped));
+            let store = stub_store();
+            let result = execute_wasm_blocking(
+                move || {
+                    let _guard = guard;
+                    (Ok(1), store)
+                },
+                5.0,
+            );
+            assert!(matches!(result, BlockingResult::Ok(1, _)));
+            dropped.load(Ordering::SeqCst)
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        let on_runtime = rt.block_on(async {
+            tokio::spawn(async { run_once() })
+                .await
+                .expect("task must not panic")
+        });
+        assert!(
+            on_runtime,
+            "multi-thread arm returned Ok before the captures dropped"
+        );
+        assert!(
+            run_once(),
+            "no-runtime arm returned Ok before the captures dropped"
+        );
+    }
+
+    /// Saturated pool, called from a tokio WORKER, the production context. The
+    /// tests above call from the `block_on` thread, where `block_in_place` has
+    /// no core to hand off; here it does, and the replacement worker it spawns
+    /// queues on the same full blocking pool as the job. The wait must still
+    /// classify `QueuedTimeout` at the queue bound, without deadlock, and the
+    /// worker must get its core back.
+    #[test]
+    fn saturated_pool_from_a_worker_is_queued_timeout() {
+        let rt = one_blocking_thread_runtime();
+        rt.block_on(async {
+            let blocker = occupy_the_blocking_thread(Duration::from_secs(1));
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in_job = Arc::clone(&ran);
+            let (result, elapsed) = tokio::spawn(async move {
+                let store = stub_store();
+                let start = std::time::Instant::now();
+                let result = execute_wasm_blocking(
+                    move || {
+                        ran_in_job.store(true, Ordering::SeqCst);
+                        (Ok(0), store)
+                    },
+                    0.2,
+                );
+                (result, start.elapsed())
+            })
+            .await
+            .expect("worker task must not panic");
+            assert!(
+                matches!(result, BlockingResult::QueuedTimeout),
+                "a job stuck behind a saturated pool must be QueuedTimeout"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "the job must not have run");
+            assert!(
+                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(900),
+                "the queue bound (200 ms) must decide the return, took {elapsed:?}"
+            );
+            // The worker is usable afterwards: its core came back.
+            let after = tokio::spawn(async { 7 })
+                .await
+                .expect("runtime still schedules");
+            assert_eq!(after, 7);
+            blocker.await.expect("blocker must finish");
+        });
+    }
+
+    /// Saturated pool from a worker, but the pool frees up in time: the job
+    /// starts late (behind the blocker, ahead of `block_in_place`'s queued
+    /// replacement worker), runs past the queue bound, and still returns `Ok`.
+    #[test]
+    fn late_start_from_a_worker_under_saturation_returns_ok() {
+        let rt = one_blocking_thread_runtime();
+        rt.block_on(async {
+            let _blocker = occupy_the_blocking_thread(Duration::from_millis(150));
+            let result = tokio::spawn(async {
+                let store = stub_store();
+                execute_wasm_blocking(
+                    move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        (Ok(7), store)
+                    },
+                    0.3,
+                )
+            })
+            .await
+            .expect("worker task must not panic");
+            assert!(
+                matches!(result, BlockingResult::Ok(7, _)),
+                "a late-started job must get its full guest bound"
+            );
+        });
+    }
+
+    /// With a live epoch ticker, a runaway guest is stopped by the EPOCH TRAP,
+    /// not the wall-clock backstop, so the engine keeps its store. The two are
+    /// distinguishable afterwards: the backstop abandons the guest and calls
+    /// `recover_store()`, which clears `instances`; the trap hands the store
+    /// back and leaves them. Before `WallBounds` gave the guest bound its slack,
+    /// the backstop fired at the budget and won this race essentially always.
+    ///
+    /// Run on a multi-thread runtime that is shut down without waiting, so a
+    /// regression (backstop wins, guest left spinning until the trap) fails the
+    /// assertion instead of hanging the test.
+    #[test]
+    fn runaway_guest_is_stopped_by_the_epoch_trap_not_the_backstop() {
+        run_abandoning_guest_test(|| {
+            let config = RuntimeConfig {
+                enable_metering: false,
+                ..RuntimeConfig::default()
+            };
+            let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+            // A short budget with the epoch deadline production derives from it.
+            let budget_secs = 0.2;
+            engine.max_execution_seconds = budget_secs;
+            engine.epoch_deadline_ticks = epoch_deadline_ticks(budget_secs);
+
+            // Far above anything `next_instance_id()` allocates; see the R2 note
+            // in `assert_delegate_entry_has_wall_clock_backstop`.
+            let id: i64 = i64::MAX - 54806;
+            let store = engine.store.as_mut().expect("engine store present");
+            let eng = store.engine().clone();
+            let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+            let instance =
+                block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
+                    .expect("instantiation must succeed");
+            engine.instances.insert(id, instance);
+
+            let handle = InstanceHandle { id };
+            let start = std::time::Instant::now();
+            let err = engine
+                .call_3i64_blocking(&handle, "spin", 0, 0, 0)
+                .expect_err("a guest that never returns must not return Ok");
+            let elapsed = start.elapsed();
+
+            assert!(matches!(err, WasmError::Timeout), "got {err:?}");
+            assert!(
+                engine.instances.contains_key(&id),
+                "instances were cleared: the wall-clock backstop abandoned the guest \
+                 (recover_store) instead of the epoch trap stopping it, after {elapsed:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_secs_f64(budget_secs),
+                "the trap fired early: {elapsed:?}"
+            );
+        });
     }
 
     /// #4864 round-7 pin: the blocking guest-entry paths MUST arm the epoch
