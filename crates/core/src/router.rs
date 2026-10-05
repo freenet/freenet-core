@@ -1314,8 +1314,9 @@ pub(crate) struct PeerRoutingSnapshot {
     /// it has not been eligible since). See [`PeerSelectionCounts`].
     pub selection_evicted: bool,
     /// How many times slower (above 1) or faster routing EXPECTS this peer to
-    /// reply than a peer with no record, for a contract at its own location:
-    /// the two [`Self::curves`] response-time lines at distance 0. See
+    /// reply than a peer with no record, for a contract at its own location
+    /// in a ring band the peer has no specific record in: the two
+    /// [`Self::curves`] response-time lines at distance 0. See
     /// [`Router::expected_response_factor`].
     pub expected_response_factor: Option<f64>,
 }
@@ -1906,8 +1907,11 @@ struct PeerSelectionTable {
     capacity: usize,
     use_clock: u64,
     evictions: u64,
-    /// Peers evicted and not eligible since, with the eviction's stamp; at
-    /// most `capacity`, oldest first in `evicted_order`.
+    /// Peers evicted and not eligible since, with their latest eviction's
+    /// stamp: at most `capacity` distinct peers. `evicted_order` is oldest
+    /// first and may hold stale entries (a peer evicted again, or returned),
+    /// which are skipped and compacted away; it never exceeds twice
+    /// `capacity`.
     evicted: HashMap<PeerKeyLocation, u64>,
     evicted_order: std::collections::VecDeque<(PeerKeyLocation, u64)>,
 }
@@ -2070,19 +2074,27 @@ impl PeerSelectionTable {
         }
     }
 
-    /// Remember an evicted peer, forgetting the oldest beyond `capacity`.
+    /// Remember an evicted peer, forgetting the least recently evicted
+    /// DISTINCT peer beyond `capacity`. A peer evicted again only refreshes
+    /// its stamp, so a flapping peer cannot push others out early.
     fn remember_evicted(&mut self, peer: PeerKeyLocation) {
         let stamp = self.evictions;
         self.evicted.insert(peer.clone(), stamp);
         self.evicted_order.push_back((peer, stamp));
-        while self.evicted_order.len() > self.capacity {
-            if let Some((old, at)) = self.evicted_order.pop_front() {
-                // A later eviction of the same peer, or its return, has
-                // already replaced or removed this record.
-                if self.evicted.get(&old) == Some(&at) {
-                    self.evicted.remove(&old);
-                }
+        while self.evicted.len() > self.capacity {
+            let Some((old, at)) = self.evicted_order.pop_front() else {
+                break;
+            };
+            // A stale entry: the peer was evicted again since (a newer
+            // stamp) or returned (no record). Its live record stays.
+            if self.evicted.get(&old) == Some(&at) {
+                self.evicted.remove(&old);
             }
+        }
+        if self.evicted_order.len() > 2 * self.capacity {
+            let live = &self.evicted;
+            self.evicted_order
+                .retain(|(peer, at)| live.get(peer) == Some(at));
         }
     }
 }
@@ -3750,30 +3762,44 @@ impl Router {
     }
 
     /// How many times slower (above 1) or faster routing expects `peer` to
-    /// reply than a peer with no record, for a contract at the peer's own
-    /// location: the ratio of the two response-time lines of
-    /// [`PeerRoutingSnapshot::curves`] at distance 0, so the expected value
-    /// routing ranks with, bound included.
+    /// reply than a peer with no record: the ratio of the two response-time
+    /// lines of [`PeerRoutingSnapshot::curves`] at distance 0, bound
+    /// included. That is routing's expectation for a contract at the peer's
+    /// own location in a ring band the peer has no specific record in; a
+    /// band the peer does have a record in moves its prediction further.
     ///
     /// `None` where those lines are not the hierarchical model's: before the
     /// 50-event gate, for a peer with no location, while the response-time
     /// stage is cold, and on the emergency fallback.
     pub(crate) fn expected_response_factor(&self, peer: &PeerKeyLocation) -> Option<f64> {
-        if isotonic_fallback_enabled()
-            || !self.has_sufficient_routing_events()
-            || peer.location().is_none()
-        {
+        self.expected_response_factor_against(peer, self.response_line_at_zero(None)?)
+    }
+
+    /// The response-time line at distance 0 for `peer`, or for a peer with no
+    /// record: what [`Self::expected_response_factor`] divides. `None` where
+    /// that is not the hierarchical model's line (see there).
+    pub(crate) fn response_line_at_zero(&self, peer: Option<&PeerKeyLocation>) -> Option<f64> {
+        if isotonic_fallback_enabled() || !self.has_sufficient_routing_events() {
             return None;
         }
-        let now = self.estimator_clock.hours();
-        let at_zero = |peer: Option<&PeerKeyLocation>| {
-            let [_, response, _] = self.hierarchical.peer_curves_sampled(peer, now, 1);
-            response
-                .first()
-                .filter(|(distance, _)| *distance == 0.0)
-                .map(|&(_, seconds)| seconds)
-        };
-        let factor = at_zero(Some(peer))? / at_zero(None)?;
+        let [_, response, _] =
+            self.hierarchical
+                .peer_curves_sampled(peer, self.estimator_clock.hours(), 1);
+        response
+            .first()
+            .filter(|(distance, _)| *distance == 0.0)
+            .map(|&(_, seconds)| seconds)
+    }
+
+    /// [`Self::expected_response_factor`] given the no-record line at
+    /// distance 0, so a caller asking for many peers computes it once.
+    pub(crate) fn expected_response_factor_against(
+        &self,
+        peer: &PeerKeyLocation,
+        distance_alone_at_zero: f64,
+    ) -> Option<f64> {
+        peer.location()?;
+        let factor = self.response_line_at_zero(Some(peer))? / distance_alone_at_zero;
         (factor.is_finite() && factor > 0.0).then_some(factor)
     }
 
@@ -10578,6 +10604,54 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 0, "no unclamped comparison");
+    }
+
+    /// The eviction memory holds up to `capacity` DISTINCT peers, forgetting
+    /// the least recently evicted first, and a peer evicted, re-recorded and
+    /// evicted again does not push others out early.
+    #[test]
+    fn eviction_memory_holds_capacity_distinct_peers() {
+        let mut table = PeerSelectionTable {
+            entries: HashMap::new(),
+            capacity: 8,
+            use_clock: 0,
+            evictions: 0,
+            evicted: HashMap::new(),
+            evicted_order: std::collections::VecDeque::new(),
+        };
+        let peers: Vec<PeerKeyLocation> = (0..20).map(|_| PeerKeyLocation::random()).collect();
+        for peer in &peers {
+            table.evictions += 1;
+            table.remember_evicted(peer.clone());
+        }
+        assert_eq!(table.evicted.len(), 8);
+        assert!(table.evicted_order.len() <= 16);
+        assert!(
+            !table.evicted.contains_key(&peers[11]),
+            "the oldest are forgotten"
+        );
+        assert!(table.evicted.contains_key(&peers[12]));
+        // A flapping peer: evicted many times (returning in between).
+        let flapper = &peers[12];
+        for _ in 0..50 {
+            table.evicted.remove(flapper);
+            table.evictions += 1;
+            table.remember_evicted(flapper.clone());
+        }
+        for peer in &peers[13..] {
+            assert!(
+                table.evicted.contains_key(peer),
+                "a flapping peer pushed out a genuinely evicted one"
+            );
+        }
+        assert!(table.evicted.contains_key(flapper));
+        assert!(table.evicted.len() <= 8 && table.evicted_order.len() <= 16);
+        // New evictions now forget the least recently evicted first.
+        let newcomer = PeerKeyLocation::random();
+        table.evictions += 1;
+        table.remember_evicted(newcomer.clone());
+        assert!(!table.evicted.contains_key(&peers[13]));
+        assert!(table.evicted.contains_key(&newcomer) && table.evicted.contains_key(flapper));
     }
 
     /// The selection counts are recent: all three halve together once a

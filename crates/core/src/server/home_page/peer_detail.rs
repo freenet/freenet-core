@@ -86,6 +86,9 @@ pub(super) struct RouterView {
     snapshot: RouterSnapshotInfo,
     /// `None` when this peer has no key location to look up.
     peer: Option<PeerRoutingSnapshot>,
+    /// The peer's key location carries a ring location. Without one, routing
+    /// predicts nothing for it (it has a record to look up, but no distance).
+    located: bool,
     /// Every connected peer that has a key location, this one included.
     others: Vec<OtherPeer>,
     /// `(outcomes, failures)` across every peer in the router's failure
@@ -105,6 +108,8 @@ struct OtherPeer {
 
 impl RouterView {
     pub(super) fn gather(inputs: &PeerPageInputs<'_>, router: &Router) -> Self {
+        // The no-record line is the same for every peer: computed once.
+        let alone = router.response_line_at_zero(None);
         RouterView {
             snapshot: router.snapshot(),
             peer: inputs
@@ -112,6 +117,11 @@ impl RouterView {
                 .peer_key_location
                 .as_ref()
                 .map(|key| router.peer_snapshot(key)),
+            located: inputs
+                .peer
+                .peer_key_location
+                .as_ref()
+                .is_some_and(|key| key.location().is_some()),
             others: inputs
                 .peers
                 .iter()
@@ -120,7 +130,8 @@ impl RouterView {
                     Some(OtherPeer {
                         address: peer.address.to_string(),
                         offsets: router.peer_offsets(key),
-                        response_factor: router.expected_response_factor(key),
+                        response_factor: alone
+                            .and_then(|alone| router.expected_response_factor_against(key, alone)),
                     })
                 })
                 .collect(),
@@ -186,21 +197,71 @@ pub(super) fn render_peer_page(inputs: &PeerPageInputs<'_>, view: Option<&Router
 
 // ─── What the node has learned about this peer ──────────────────────────────
 
-/// Whether, and how far, the node still predicts this peer from distance alone.
+/// Where routing's prediction for one stage of this peer comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The stage is cold: routing uses the early (isotonic) estimate, which
+    /// already corrects per peer, so "distance alone" would be false.
+    Early,
+    /// Warm, and none of the peer's record adopted.
+    DistanceAlone,
+    /// Warm, part of it adopted, less than [`KNOWN_WEIGHT`].
+    Mostly,
+    /// Warm, at least [`KNOWN_WEIGHT`] adopted.
+    Known,
+}
+
+/// The stages a still-learning banner speaks for: all three, the transfer
+/// stage included, because the page draws its lines too.
+const STAGE_NAMES: [&str; 3] = ["failures", "response time", "transfer speed"];
+
+/// Whether, and how, the node still predicts this peer without its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Learning {
-    /// It has learned enough to use the peer's own record, or there is
-    /// nothing to learn yet that would tell this peer from any other.
+    /// Some stage has learned enough to use the peer's own record, or the
+    /// warm stages find nothing that tells any peer from another.
     No,
     /// Routing is not predicting at all yet (the 50-event gate).
     NotPredicting,
-    /// No stage of the model is warm yet: routing uses its early estimate,
-    /// which already corrects per peer, so "distance alone" would be false.
+    /// The peer has no ring location, so routing cannot predict for it.
+    NoLocation,
+    /// Every stage is cold: routing uses its early estimates throughout.
     FirstEstimates,
-    /// No warm stage has adopted any of the peer's record.
-    FromDistanceAlone,
-    /// Some stage has adopted part of it, less than [`KNOWN_WEIGHT`].
-    Mostly,
+    /// Per stage `[failure, response time, transfer speed]`, none known.
+    Still([Source; 3]),
+}
+
+/// "your node predicts its failures from distance alone, and its response
+/// time and transfer speed from an early estimate": the stages grouped by
+/// where their prediction comes from, in stage order.
+fn still_learning_sentence(sources: [Source; 3]) -> String {
+    let phrase = |source: Source| match source {
+        Source::Early => "from an early estimate",
+        Source::DistanceAlone => "from distance alone",
+        Source::Mostly => "mostly from distance alone",
+        Source::Known => "from its own record",
+    };
+    if sources.iter().all(|s| *s == sources[0]) {
+        return format!("your node predicts its results {}", phrase(sources[0]));
+    }
+    let mut groups: Vec<(Source, Vec<&str>)> = Vec::new();
+    for (source, name) in sources.into_iter().zip(STAGE_NAMES) {
+        match groups.iter_mut().find(|(s, _)| *s == source) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((source, vec![name])),
+        }
+    }
+    let clauses: Vec<String> = groups
+        .into_iter()
+        .map(|(source, names)| format!("its {} {}", names.join(" and "), phrase(source)))
+        .collect();
+    let list = match clauses.as_slice() {
+        [one] => one.clone(),
+        [first, second] => format!("{first}, and {second}"),
+        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+        [] => String::new(),
+    };
+    format!("your node predicts {list}")
 }
 
 /// The readings the tiles, banners and charts share, computed once.
@@ -256,23 +317,31 @@ impl Learned {
                 ..nothing
             };
         }
+        if !view.located {
+            return Learned {
+                learning: Learning::NoLocation,
+                ..nothing
+            };
+        }
         let [failure, response, _] = peer.offsets;
-        let warm = [failure, response]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        let learning = if known(failure) || known(response) {
+        let sources = peer.offsets.map(|offset| match offset {
+            None => Source::Early,
+            Some(_) if known(offset) => Source::Known,
+            Some(o) if o.weight == 0.0 => Source::DistanceAlone,
+            Some(_) => Source::Mostly,
+        });
+        let warm_alike =
+            (0..3).all(|stage| peer.offsets[stage].is_some() && !tells_apart(view, stage));
+        let learning = if sources.contains(&Source::Known) {
             Learning::No
-        } else if warm.is_empty() {
+        } else if sources.iter().all(|s| *s == Source::Early) {
             Learning::FirstEstimates
-        } else if !told_apart[0] && !told_apart[1] {
-            // Warm stages that find no difference between any peers: every
-            // peer is on the line because they look alike.
+        } else if warm_alike {
+            // Every stage warm and finding no difference between any peers:
+            // every peer is on the line because they look alike.
             Learning::No
-        } else if warm.iter().all(|o| o.weight == 0.0) {
-            Learning::FromDistanceAlone
         } else {
-            Learning::Mostly
+            Learning::Still(sources)
         };
         // Routing's own expectation, the ratio of the two lines the page
         // draws, so the stated factor and the lines cannot disagree.
@@ -322,12 +391,15 @@ fn learned_card(view: &RouterView, learned: &Learned) -> String {
             Learning::FirstEstimates => banners.push_str(
                 r#"<div class="learning">Your node is still building its first estimates for this peer.</div>"#,
             ),
-            Learning::FromDistanceAlone => banners.push_str(
-                r#"<div class="learning">Still learning about this peer. Until it has handled more requests, your node predicts its results from distance alone.</div>"#,
+            Learning::NoLocation => banners.push_str(
+                r#"<div class="learning">This peer's ring location is not known yet, so your node does not predict its results.</div>"#,
             ),
-            Learning::Mostly => banners.push_str(
-                r#"<div class="learning">Still learning about this peer. Until it has handled more requests, your node predicts its results mostly from distance alone.</div>"#,
-            ),
+            Learning::Still(sources) => write!(
+                banners,
+                r#"<div class="learning">Still learning about this peer. Until it has handled more requests, {}.</div>"#,
+                still_learning_sentence(sources)
+            )
+            .unwrap_or_default(),
             Learning::No if view.peer.is_none() => banners.push_str(
                 r#"<div class="learning">Your node has no routing record it can match to this peer.</div>"#,
             ),
@@ -410,18 +482,17 @@ fn reliability_tile(view: &RouterView) -> String {
 /// has learned it, how the peer typically differs from distance alone.
 fn response_tile(view: &RouterView, learned: &Learned) -> String {
     let peer = view.peer.as_ref();
-    let routed = peer
-        .and_then(|peer| peer.prediction_at_own_location.as_ref())
-        .map(|prediction| prediction.time_to_response_start)
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
     let early = peer.is_some_and(|peer| peer.curves[0].early);
-    let Some(seconds) = routed else {
+    let Some((seconds, alone)) = peer.and_then(|peer| lines_at_own_location(&peer.curves[0]))
+    else {
         let why = if !view.snapshot.prediction_active {
             "Your node is not predicting yet."
         } else if peer.is_none() {
             "Your node cannot match this peer to a routing record."
+        } else if !view.located {
+            "Its ring location is not known yet, so your node does not predict it."
         } else {
-            "Too few replies to judge yet."
+            "Too few timed replies to predict it yet."
         };
         return tile("Response time", "&mdash;", why, "");
     };
@@ -431,22 +502,46 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
         format!("; an early estimate until your node has {MIN_TIMED_REPLIES} timed replies")
     } else {
         match learned.response_factor {
+            Some(factor) if about_same(factor) => format!(
+                "; your node expects it to reply about as fast as the {} distance alone predicts",
+                fmt_time(alone)
+            ),
             Some(factor) => format!(
-                "; your node expects it to reply {}",
-                time_comparison(factor, true)
+                r#"; your node expects it to reply <span class="cmp">{}</span> than the {} distance alone predicts"#,
+                time_ratio(factor),
+                fmt_time(alone)
             ),
             None if !learned.told_apart[1] => {
                 "; your node does not tell its peers apart by response time yet".to_string()
             }
-            None => "; too few replies yet to compare it with distance alone".to_string(),
+            None => "; too few timed replies yet to compare it with distance alone".to_string(),
         }
     };
     tile(
         "Response time",
         &fmt_time_tile(seconds),
         &format!("predicted for contracts near it{comparison}."),
-        "",
+        "Routing's prediction for a contract at this peer's location, in a part of the ring \
+         it has no specific record in: the start of the lines under Past requests.",
     )
+}
+
+/// `(this peer, distance alone)` where the drawn response-time lines start, at
+/// distance 0: the tile's number and the one it is compared with, so the tile
+/// reads exactly off the chart (and `this peer = distance alone × factor`).
+fn lines_at_own_location(curve: &RoutingCurve) -> Option<(f64, f64)> {
+    let start = |line: &[(f64, f64)]| {
+        line.first()
+            .filter(|(distance, seconds)| *distance == 0.0 && seconds.is_finite() && *seconds > 0.0)
+            .map(|&(_, seconds)| seconds)
+    };
+    let alone = start(&curve.distance_alone)?;
+    let mine = if curve.this_peer.is_empty() {
+        alone
+    } else {
+        start(&curve.this_peer)?
+    };
+    Some((mine, alone))
 }
 
 /// Recent routing decisions in which this peer was among the closest
@@ -506,6 +601,16 @@ fn fmt_count(count: f64) -> String {
 // ─── Compared with your other peers ─────────────────────────────────────────
 
 fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
+    // On the fallback routing reads none of these differences, and the
+    // weights that gate them describe a model it is not using: say so instead
+    // of drawing readings with reasons that are not true.
+    if view.fallback {
+        return r#"<div class="card">
+            <h2>Compared with your other peers</h2>
+            <p class="empty">Routing is on its emergency fallback right now and is not using these comparisons with distance alone, so they are not shown.</p>
+        </div>"#
+            .to_string();
+    }
     let this = inputs.peer.address.to_string();
     let dots = |stage: usize| -> (Vec<StripDot>, Option<StripDot>) {
         let apart = tells_apart(view, stage);
@@ -525,7 +630,7 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             } else if stage == 0 {
                 "too few requests to judge yet"
             } else {
-                "too few replies to judge yet"
+                "too few timed replies to judge yet"
             };
             let (value, text, note) = match (stage, known(Some(offset)), factor) {
                 (0, true, _) => (
@@ -616,7 +721,7 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     format!(
         r#"<div class="card">
             <h2>Compared with your other peers</h2>
-            <p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests to judge is drawn hollow, on the line.</p>
+            <p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests (for response time, timed replies) to judge is drawn hollow, on the line.</p>
             <div class="chart-title">Chance a request fails <span class="unit">(percentage points)</span></div>
             {failure}
             <div class="chart-title">Response time</div>
@@ -808,8 +913,8 @@ fn strip_chart(
     .ok();
     let placed = swarm(
         &others.iter().map(|dot| x(dot.value)).collect::<Vec<_>>(),
-        mid,
-        band,
+        (mid, band),
+        (left, width - right),
         OTHER_DOT_R,
     );
     for (dot, (cx, cy)) in others.iter().zip(placed) {
@@ -855,18 +960,24 @@ fn strip_chart(
 /// Radius of another peer's dot on a strip.
 const OTHER_DOT_R: f64 = 2.6;
 
+/// Most dot-widths a strip dot may move sideways from its value.
+const SWARM_MAX_SHIFT: i32 = 2;
+
 /// Place dots at the given x positions in a band `mid ± band`, each at the
 /// first height (centre outward) where it overlaps no dot already placed, so
 /// twenty peers that read alike spread into visible columns instead of one
-/// blob. When a column is full, a dot moves one dot-width sideways, alternating
-/// right and left, so the swarm stays centred on the shared value.
-fn swarm(xs: &[f64], mid: f64, band: f64, r: f64) -> Vec<(f64, f64)> {
+/// blob. When a column is full a dot moves one dot-width sideways,
+/// alternating right and left, at most [`SWARM_MAX_SHIFT`] dot-widths; past
+/// that it is drawn at its own value and may overlap. Every dot stays inside
+/// `x_range`.
+fn swarm(xs: &[f64], (mid, band): (f64, f64), x_range: (f64, f64), r: f64) -> Vec<(f64, f64)> {
     let gap = 2.0 * r + 0.8;
     let rows = (band / gap).floor() as i32;
     let heights: Vec<f64> = std::iter::once(0)
         .chain((1..=rows).flat_map(|k| [k, -k]))
         .map(|k| mid + k as f64 * gap)
         .collect();
+    let inside = |cx: f64| cx.clamp(x_range.0, x_range.1.max(x_range.0));
     let mut order: Vec<usize> = (0..xs.len()).collect();
     order.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
     let mut placed: Vec<(f64, f64)> = Vec::with_capacity(xs.len());
@@ -878,10 +989,10 @@ fn swarm(xs: &[f64], mid: f64, band: f64, r: f64) -> Vec<(f64, f64)> {
                 .all(|&(px, py)| (px - cx).hypot(py - cy) >= gap - 1e-9)
         };
         let mut spot = None;
-        'search: for shift in 0..64i32 {
-            // 0, +1, -1, +2, -2, ... dot-widths.
+        'search: for shift in 0..=2 * SWARM_MAX_SHIFT {
+            // 0, +1, -1, +2, -2 dot-widths.
             let step = (shift + 1) / 2 * if shift % 2 == 0 { -1 } else { 1 };
-            let cx = xs[index] + f64::from(step) * gap;
+            let cx = inside(xs[index] + f64::from(step) * gap);
             for &cy in &heights {
                 if free(cx, cy, &placed) {
                     spot = Some((cx, cy));
@@ -889,7 +1000,7 @@ fn swarm(xs: &[f64], mid: f64, band: f64, r: f64) -> Vec<(f64, f64)> {
                 }
             }
         }
-        let spot = spot.unwrap_or((xs[index], mid));
+        let spot = spot.unwrap_or((inside(xs[index]), mid));
         placed.push(spot);
         out[index] = spot;
     }
@@ -1005,7 +1116,11 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
             }
         };
         let time_note = early_note(time_curve.early, "timed replies");
-        let speed_note = early_note(speed_curve.early, "measured transfers");
+        // Only beside a chart: the empty state already says there is nothing.
+        let speed_note = early_note(
+            speed_curve.early && !my_speeds.is_empty(),
+            "measured transfers",
+        );
         let floored_note = if floored {
             r#"<p class="caption">Your node currently treats transfers through this peer as unusable and ranks it after every other eligible peer.</p>"#
         } else {
@@ -1030,6 +1145,10 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
     } else if !rs.prediction_active {
         format!(
             "{dots} Your node is not predicting yet (it starts after 50 requests), so there are no prediction lines."
+        )
+    } else if view.peer.is_some() && !view.located {
+        format!(
+            "{dots} This peer's ring location is not known yet, so routing does not predict it."
         )
     } else if time_curve.early || view.peer.is_none() {
         // The response-time chart says why its lines are an early estimate.
@@ -1269,7 +1388,7 @@ fn accuracy_card(view: &RouterView) -> String {
             "For this peer, replies typically land within <b>&times;{miss:.1}</b> of the prediction (faster or slower); {across}."
         ),
         (None, Some(across)) => {
-            format!("Too few requests through this peer to judge its predictions yet; {across}.")
+            format!("Too few timed replies from this peer to judge its predictions yet; {across}.")
         }
         _ => "Too few requests to judge the predictions yet.".to_string(),
     };
@@ -1764,6 +1883,93 @@ mod tests {
         );
     }
 
+    /// The response tile's number is where the drawn "this peer" line starts,
+    /// and the number it is compared with is where the distance-alone line
+    /// starts, so tile = distance alone × the stated factor.
+    #[test]
+    fn the_response_tile_reads_off_the_drawn_lines() {
+        let _fallback_off = crate::router::force_isotonic_fallback(false);
+        let (router, peers) = trained_router();
+        let snaps = snapshots(&peers);
+        let mut compared = 0;
+        for index in 0..peers.len() {
+            let inputs = inputs(&snaps, index);
+            let view = RouterView::gather(&inputs, &router);
+            let peer = view.peer.as_ref().unwrap();
+            let (mine, alone) = lines_at_own_location(&peer.curves[0]).expect("lines");
+            let line = if peer.curves[0].this_peer.is_empty() {
+                &peer.curves[0].distance_alone
+            } else {
+                &peer.curves[0].this_peer
+            };
+            assert_eq!(mine, line[0].1);
+            assert_eq!(alone, peer.curves[0].distance_alone[0].1);
+            let factor = peer.expected_response_factor.unwrap();
+            assert!(
+                (mine - alone * factor).abs() <= 1e-12 * mine,
+                "peer {index}"
+            );
+            let html = render_peer_page(&inputs, Some(&view));
+            assert!(
+                html.contains(&fmt_time_tile(mine)),
+                "peer {index}: tile shows the line"
+            );
+            if Learned::of(&view).response_factor.is_some() {
+                assert!(
+                    html.contains(&format!(
+                        "than the {} distance alone predicts",
+                        fmt_time(alone)
+                    )) || html.contains(&format!(
+                        "as fast as the {} distance alone predicts",
+                        fmt_time(alone)
+                    )),
+                    "peer {index}: the comparison names the distance-alone number"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 0);
+    }
+
+    /// A peer with a key but no ring location: routing predicts nothing, and
+    /// the page says why rather than "too few replies".
+    #[test]
+    fn a_peer_without_a_ring_location_says_so() {
+        let (router, peers) = trained_router();
+        let mut snaps = snapshots(&peers);
+        let mut unlocated = snapshot_of(&PeerKeyLocation::random());
+        unlocated.peer_key_location = Some(PeerKeyLocation::with_unknown_addr(
+            PeerKeyLocation::random().pub_key().clone(),
+        ));
+        unlocated.location = None;
+        snaps.push(unlocated);
+        let html = render(&router, &snaps, 12);
+        for needle in [
+            "This peer's ring location is not known yet, so your node does not predict its results.",
+            "Its ring location is not known yet, so your node does not predict it.",
+            "This peer's ring location is not known yet, so routing does not predict it.",
+        ] {
+            assert!(html.contains(needle), "missing {needle:?}");
+        }
+        assert!(
+            !html.contains("too few timed replies yet") && !html.contains(r#"class="line-peer""#)
+        );
+    }
+
+    /// The transfer chart's early note sits beside a chart, never beside the
+    /// empty state.
+    #[test]
+    fn no_early_note_beside_an_empty_transfer_chart() {
+        let (router, peers) = trained_router();
+        let snaps = snapshots(&peers);
+        let inputs = inputs(&snaps, 3);
+        let mut view = RouterView::gather(&inputs, &router);
+        view.peer.as_mut().unwrap().curves[1].early = true;
+        let html = render_peer_page(&inputs, Some(&view));
+        assert!(html.contains("No data transfers measured through this peer yet."));
+        assert!(!html.contains("measured transfers so far"));
+    }
+
     /// The reliability tile and the All tab count one population, the
     /// router's window: parsed from the page itself for every peer, so a tile
     /// that read any other source would disagree here.
@@ -1822,11 +2028,11 @@ mod tests {
         assert!(html.contains("No requests to it of your node's last 500 requests"));
         assert_eq!(tab_count(&html, "all"), 0);
         assert!(
-            html.contains("too few replies yet to compare it with distance alone."),
+            html.contains("too few timed replies yet to compare it with distance alone."),
             "routing predicts it from distance alone, and the tile says it cannot compare yet"
         );
         assert!(html.contains("Not among the closest candidates for a routing decision yet."));
-        assert!(html.contains("Too few requests through this peer to judge its predictions yet"));
+        assert!(html.contains("Too few timed replies from this peer to judge its predictions yet"));
         assert!(html.contains("Each dot is one of your 13 peers"));
         assert!(
             html.contains(r#"class="dot-this hollow""#),
@@ -1939,10 +2145,20 @@ mod tests {
             "Routing is on its emergency fallback; the lines are what it predicts with that.",
             "these are the main model's predictions, which it is not using right now.",
             "predicted for contracts near it.</div>",
+            "Routing is on its emergency fallback right now and is not using these comparisons with distance alone, so they are not shown.",
         ] {
             assert!(fallback.contains(needle), "missing {needle:?}");
         }
-        for absent in [AVOIDED, STILL_LEARNING, "expects this peer to reply"] {
+        for absent in [
+            AVOIDED,
+            STILL_LEARNING,
+            "expects this peer to reply",
+            // The comparison card states no readings and no false reasons.
+            "Each dot is one of",
+            "too few timed replies to judge yet",
+            "too few requests to judge yet",
+            r#"class="dot-other"#,
+        ] {
             assert!(!fallback.contains(absent), "fallback page shows {absent:?}");
         }
     }
@@ -2076,6 +2292,7 @@ mod tests {
                 .map(|(i, offsets)| other(format!("10.0.0.{i}:1"), offsets))
                 .collect(),
             window_outcomes: (0, 0),
+            located: true,
             fallback: false,
         };
         view.snapshot.prediction_active = true;
@@ -2089,58 +2306,87 @@ mod tests {
 
     #[test]
     fn still_learning_says_how_far_the_node_relies_on_distance_alone() {
-        let known_other = [failure(0.02, 30.0, 0.7), timing(1.3, 30.0, 0.7), None];
+        use Source::*;
+        let known_other = [
+            failure(0.02, 30.0, 0.7),
+            timing(1.3, 30.0, 0.7),
+            timing(0.8, 30.0, 0.7),
+        ];
+        let learning = |mine, others: Vec<[Option<PeerOffset>; 3]>| {
+            Learned::of(&view_with(mine, others, None)).learning
+        };
         // Nothing of this peer's record adopted on any warm stage.
-        let none = view_with(
-            [failure(0.0, 1.0, 0.0), timing(1.0, 0.0, 0.0), None],
-            vec![known_other],
-            None,
-        );
-        assert_eq!(Learned::of(&none).learning, Learning::FromDistanceAlone);
-        // Part of it adopted on one stage: "mostly".
-        let part = view_with(
-            [failure(0.0, 1.0, 0.2), timing(1.0, 1.0, 0.0), None],
-            vec![known_other],
-            None,
-        );
-        assert_eq!(Learned::of(&part).learning, Learning::Mostly);
-        // Exactly half adopted counts as known.
-        let known = view_with(
-            [failure(0.0, 9.0, 0.5), None, None],
-            vec![known_other],
-            None,
-        );
-        assert_eq!(Learned::of(&known).learning, Learning::No);
-        // Warm stages that tell nobody apart: every peer is on the line because
-        // they look alike, not because this one is new. No banner.
-        let alike = [failure(0.0, 40.0, 0.0), timing(1.0, 40.0, 0.0), None];
+        let none = [
+            failure(0.0, 1.0, 0.0),
+            timing(1.0, 0.0, 0.0),
+            timing(1.0, 0.0, 0.0),
+        ];
         assert_eq!(
-            Learned::of(&view_with(alike, vec![alike, alike], None)).learning,
+            learning(none, vec![known_other]),
+            Learning::Still([DistanceAlone; 3])
+        );
+        // Part of it adopted on one stage, and a cold stage: per stage.
+        let mixed = [failure(0.0, 1.0, 0.2), timing(1.0, 1.0, 0.0), None];
+        assert_eq!(
+            learning(mixed, vec![known_other]),
+            Learning::Still([Mostly, DistanceAlone, Early])
+        );
+        // The failure stage warm but the timing stages cold: routing corrects
+        // their early estimate per peer, so they are not "distance alone".
+        assert_eq!(
+            learning([failure(0.0, 1.0, 0.0), None, None], vec![known_other]),
+            Learning::Still([DistanceAlone, Early, Early])
+        );
+        // Exactly half adopted counts as known.
+        assert_eq!(
+            learning([failure(0.0, 9.0, 0.5), None, None], vec![known_other]),
             Learning::No
         );
-        // Nothing warm yet: routing uses its early estimate, which corrects
-        // per peer, so the banner must not say "distance alone".
-        let cold = view_with([None, None, None], vec![[None, None, None]], None);
-        assert_eq!(Learned::of(&cold).learning, Learning::FirstEstimates);
-        // Before the 50-event gate routing predicts nothing at all.
-        let mut gated = view_with(
-            [failure(0.0, 1.0, 0.2), None, None],
-            vec![known_other],
-            None,
+        // Every stage warm and telling nobody apart: every peer is on the
+        // line because they look alike. No banner.
+        let alike = [
+            failure(0.0, 40.0, 0.0),
+            timing(1.0, 40.0, 0.0),
+            timing(1.0, 40.0, 0.0),
+        ];
+        assert_eq!(learning(alike, vec![alike, alike]), Learning::No);
+        // Nothing warm yet: early estimates throughout.
+        assert_eq!(
+            learning([None, None, None], vec![[None, None, None]]),
+            Learning::FirstEstimates
         );
+        // Before the 50-event gate routing predicts nothing at all.
+        let mut gated = view_with(mixed, vec![known_other], None);
         gated.snapshot.prediction_active = false;
         assert_eq!(Learned::of(&gated).learning, Learning::NotPredicting);
+        // A key with no ring location: routing cannot predict for it.
+        let mut unlocated = view_with(mixed, vec![known_other], None);
+        unlocated.located = false;
+        assert_eq!(Learned::of(&unlocated).learning, Learning::NoLocation);
         // No key location, or the fallback: no banner.
         let mut keyless = view_with([None, None, None], vec![known_other], None);
         keyless.peer = None;
         assert_eq!(Learned::of(&keyless).learning, Learning::No);
-        let mut fallback = view_with(
-            [failure(0.0, 1.0, 0.2), None, None],
-            vec![known_other],
-            None,
-        );
+        let mut fallback = view_with(mixed, vec![known_other], None);
         fallback.fallback = true;
         assert_eq!(Learned::of(&fallback).learning, Learning::No);
+    }
+
+    #[test]
+    fn the_still_learning_sentence_groups_stages_by_source() {
+        use Source::*;
+        assert_eq!(
+            still_learning_sentence([Early; 3]),
+            "your node predicts its results from an early estimate"
+        );
+        assert_eq!(
+            still_learning_sentence([DistanceAlone, Early, Early]),
+            "your node predicts its failures from distance alone, and its response time and transfer speed from an early estimate"
+        );
+        assert_eq!(
+            still_learning_sentence([Mostly, DistanceAlone, Early]),
+            "your node predicts its failures mostly from distance alone, its response time from distance alone, and its transfer speed from an early estimate"
+        );
     }
 
     /// The stated factor is routing's expectation, gated by the evidence: a
@@ -2233,7 +2479,7 @@ mod tests {
         view.others.last_mut().unwrap().address = snaps[1].address.to_string();
         let html = compare_card(&inputs, &view);
         assert!(html.contains("this peer &middot; too few requests to judge yet"));
-        assert!(html.contains("this peer &middot; too few replies to judge yet"));
+        assert!(html.contains("this peer &middot; too few timed replies to judge yet"));
         assert!(
             !html.contains("2.5&times; slower"),
             "the thin factor is not stated"
@@ -2261,12 +2507,11 @@ mod tests {
         let mut view = view;
         view.others.last_mut().unwrap().address = snaps[0].address.to_string();
         let peer = view.peer.as_mut().unwrap();
-        peer.prediction_at_own_location = Some(crate::router::RoutingPredictionInfo {
-            failure_probability: 0.01,
-            time_to_response_start: 0.2,
-            transfer_speed_bps: 400_000.0,
-            expected_total_time: 0.3,
-        });
+        peer.curves[0] = RoutingCurve {
+            distance_alone: vec![(0.0, 0.2), (0.5, 0.4)],
+            this_peer: Vec::new(),
+            early: false,
+        };
         let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
         assert!(html.contains("your node does not tell its peers apart by response time yet"));
         assert!(!html.contains("about as fast"), "no comparison is claimed");
@@ -2378,17 +2623,28 @@ mod tests {
     }
 
     #[test]
-    fn the_mostly_banner_renders() {
-        let others = vec![[failure(0.02, 30.0, 0.7), timing(1.3, 30.0, 0.7), None]];
-        let view = view_with(
-            [failure(0.0, 1.0, 0.2), timing(1.0, 1.0, 0.0), None],
-            others,
+    fn the_still_learning_banners_render() {
+        let others = vec![[
+            failure(0.02, 30.0, 0.7),
+            timing(1.3, 30.0, 0.7),
+            timing(0.8, 30.0, 0.7),
+        ]];
+        let snaps = [snapshot_of(&PeerKeyLocation::random())];
+        let mostly = view_with(
+            [
+                failure(0.0, 1.0, 0.2),
+                timing(1.0, 1.0, 0.3),
+                timing(1.0, 1.0, 0.1),
+            ],
+            others.clone(),
             None,
         );
-        let snaps = [snapshot_of(&PeerKeyLocation::random())];
-        let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
-        assert!(html.contains(
+        assert!(render_peer_page(&inputs(&snaps, 0), Some(&mostly)).contains(
             "Still learning about this peer. Until it has handled more requests, your node predicts its results mostly from distance alone."
+        ));
+        let mixed = view_with([failure(0.0, 1.0, 0.0), None, None], others, None);
+        assert!(render_peer_page(&inputs(&snaps, 0), Some(&mixed)).contains(
+            "your node predicts its failures from distance alone, and its response time and transfer speed from an early estimate."
         ));
     }
 
@@ -2397,7 +2653,7 @@ mod tests {
     #[test]
     fn alike_peers_spread_into_a_swarm() {
         let xs = vec![100.0; 20];
-        let placed = swarm(&xs, 40.0, 15.0, OTHER_DOT_R);
+        let placed = swarm(&xs, (40.0, 15.0), (34.0, 560.0), OTHER_DOT_R);
         for (i, a) in placed.iter().enumerate() {
             for b in &placed[i + 1..] {
                 assert!(
@@ -2412,7 +2668,18 @@ mod tests {
             .map(|&(x, y)| ((x * 10.0) as i64, (y * 10.0) as i64))
             .collect();
         assert_eq!(spread.len(), 20);
-        assert_eq!(swarm(&[], 40.0, 15.0, OTHER_DOT_R), vec![]);
+        assert_eq!(swarm(&[], (40.0, 15.0), (34.0, 560.0), OTHER_DOT_R), vec![]);
+        // Many alike peers at the edge of the plot: none moves more than the
+        // cap from its value, and none leaves the plot.
+        let crowd = swarm(&[34.5; 60], (40.0, 15.0), (34.0, 560.0), OTHER_DOT_R);
+        let gap = 2.0 * OTHER_DOT_R + 0.8;
+        for &(x, _) in &crowd {
+            assert!((34.0..=560.0).contains(&x), "{x} is off the plot");
+            assert!(
+                (x - 34.5).abs() <= f64::from(SWARM_MAX_SHIFT) * gap + 1e-9,
+                "{x} moved too far from its value"
+            );
+        }
     }
 
     #[test]
