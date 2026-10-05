@@ -64,6 +64,14 @@ const WINDOW_REQUESTS: usize = 500;
 /// uses an early estimate.
 const MIN_TIMED_REPLIES: usize = crate::router::MIN_CURVE_POINTS_LOG;
 
+/// What the page says in place of a stage's comparison when that stage tells
+/// no peers apart ([`tells_apart`] is false): a statement about every peer,
+/// so it replaces the strip instead of riding on "this peer".
+const NO_DIFFERENCE: [&str; 2] = [
+    "No measurable difference between your peers' failure rates yet (failures are rare), so your node has not learned any peer to fail more or less often than distance alone predicts.",
+    "No measurable difference between your peers' response times yet, so your node has not learned any peer to be faster or slower than distance alone predicts.",
+];
+
 /// The link to `/routing`, worded as the title of the card it lands on.
 pub(super) const ROUTING_LINK: &str = "How good are the predictions across all peers?";
 
@@ -520,7 +528,7 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
                 fmt_time(alone)
             ),
             None if !learned.told_apart[1] => {
-                "; your node does not tell its peers apart by response time yet".to_string()
+                "; no measurable difference between your peers' response times yet".to_string()
             }
             None => "; too few timed replies yet to compare it with distance alone".to_string(),
         }
@@ -635,7 +643,6 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     }
     let this = inputs.peer.address.to_string();
     let dots = |stage: usize| -> (Vec<StripDot>, Option<StripDot>) {
-        let apart = tells_apart(view, stage);
         let mut others = Vec::new();
         let mut mine = None;
         for other in &view.others {
@@ -647,9 +654,9 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             // hollow, on the line, rather than as a difference. A response
             // time is placed at routing's expected factor, the tile's number.
             let factor = other.response_factor.filter(|_| known(Some(offset)));
-            let unstated = if !apart {
-                "your node does not tell peers apart here yet"
-            } else if stage == 0 {
+            // Only a reason about THIS dot's peer; a stage that tells nobody
+            // apart is not drawn as a strip at all (see below).
+            let unstated = if stage == 0 {
                 "too few requests to judge yet"
             } else {
                 "too few timed replies to judge yet"
@@ -698,9 +705,15 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             .collect()
     };
 
+    // A stage with readings that tells no peers apart: one plain sentence
+    // about all of them in the strip's place, not a row of identical dots.
+    let no_difference =
+        |stage: usize| format!(r#"<p class="chart-note">{}</p>"#, NO_DIFFERENCE[stage]);
     let failure = if fail_others.is_empty() && fail_mine.is_none() {
         r#"<div class="empty-box">Too few requests across your peers to compare yet.</div>"#
             .to_string()
+    } else if !tells_apart(view, 0) {
+        no_difference(0)
     } else {
         let values = values(&fail_others, &fail_mine);
         responsive(|width| {
@@ -716,6 +729,8 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     let time = if time_others.is_empty() && time_mine.is_none() {
         r#"<div class="empty-box">Too few replies across your peers to compare yet.</div>"#
             .to_string()
+    } else if !tells_apart(view, 1) {
+        no_difference(1)
     } else {
         let values = values(&time_others, &time_mine);
         responsive(|width| {
@@ -1184,9 +1199,7 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
             Some(_) => format!(
                 "{dots} Your node expects this peer to reply about as fast as distance alone predicts."
             ),
-            None if !learned.told_apart[1] => {
-                format!("{dots} Your node does not tell its peers apart by response time yet.")
-            }
+            None if !learned.told_apart[1] => format!("{dots} {}", NO_DIFFERENCE[1]),
             None => format!(
                 "{dots} Too few of its replies yet to say how it differs from what distance alone predicts."
             ),
@@ -2574,8 +2587,10 @@ mod tests {
     }
 
     /// A stage that gives no peer any weight tells nobody apart: plenty of
-    /// evidence, but no factor, and the tile says the node cannot tell peers
-    /// apart rather than "about as fast".
+    /// evidence, but no factor. The tile says there is no measurable
+    /// difference rather than "about as fast", and the comparison card says so
+    /// once in each strip's place instead of drawing identical dots with the
+    /// statement glued to "this peer".
     #[test]
     fn a_stage_that_tells_nobody_apart_states_no_factor() {
         let alike = [failure(0.0, 40.0, 0.0), timing(1.0, 40.0, 0.0), None];
@@ -2593,9 +2608,20 @@ mod tests {
             early: false,
         };
         let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
-        assert!(html.contains("your node does not tell its peers apart by response time yet"));
+        assert!(html.contains(
+            "predicted for contracts near it; no measurable difference between your peers' response times yet."
+        ));
         assert!(!html.contains("about as fast"), "no comparison is claimed");
-        assert!(html.contains("this peer &middot; your node does not tell peers apart here yet"));
+        for sentence in NO_DIFFERENCE {
+            assert!(html.contains(sentence), "missing {sentence:?}");
+        }
+        let card = compare_card(&inputs(&snaps, 0), &view);
+        assert!(!card.contains("<svg"), "no strips are drawn");
+        assert!(
+            !card.contains("this peer"),
+            "nothing about all peers rides on this peer"
+        );
+        assert!(!html.contains("tell peers apart") && !html.contains("tell its peers apart"));
     }
 
     /// Each distance chart names its own stage's early estimate: the
@@ -2760,6 +2786,29 @@ mod tests {
                 "{x} moved too far from its value"
             );
         }
+    }
+
+    /// Only the stage that tells nobody apart is replaced; the other keeps
+    /// its strip, and "this peer" carries only a reason about this peer.
+    #[test]
+    fn only_the_stage_without_differences_loses_its_strip() {
+        let failure_alike = [failure(0.0, 40.0, 0.0), timing(1.4, 40.0, 0.7), None];
+        let snaps = [
+            snapshot_of(&PeerKeyLocation::random()),
+            snapshot_of(&PeerKeyLocation::random()),
+        ];
+        let mut view = view_with(failure_alike, vec![failure_alike], None);
+        view.others[0].address = snaps[0].address.to_string();
+        view.others.last_mut().unwrap().address = snaps[1].address.to_string();
+        let card = compare_card(&inputs(&snaps, 1), &view);
+        assert!(card.contains(NO_DIFFERENCE[0]));
+        assert!(!card.contains(NO_DIFFERENCE[1]));
+        assert!(
+            card.contains("Response time compared with distance alone"),
+            "the time strip stays"
+        );
+        assert!(!card.contains("Chance a request fails compared with distance alone"));
+        assert!(card.contains(">this peer</text>"));
     }
 
     #[test]
