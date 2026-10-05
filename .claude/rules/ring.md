@@ -293,15 +293,21 @@ WHEN touching the router:
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
-  → HierarchicalRouting::explain must reproduce the routing estimate bit
-    for bit (pinned by explanation_reproduces_the_estimate_routing_acts_on);
-    the peer page's response-time tile reads its estimate. The page's
-    comparisons with "distance alone" read peer_offsets, whose
-    PeerOffset::effect is routing's own prediction ratio for the timing
-    stages (the posterior variance a record narrows included), pinned by
-    the_timing_effect_is_the_ratio_of_routings_own_predictions; do not
-    replace it with exp(offset). Per-peer eligible/chosen counts
-    (PeerSelectionCounts) count only DecisionLog::Joinable decisions
+  → The peer page reads the router two ways, and they are not
+    interchangeable. Its "N× faster/slower than distance alone" and failure
+    percentage points come from peer_offsets: the learned TYPICAL difference
+    (exp(offset) for timing), shown only once half the peer's record is
+    adopted. Its prediction LINES are routing's own predictions
+    (PeerRoutingSnapshot::curves: HierarchicalRouting::peer_curves once a
+    timing stage is warm, else the isotonic estimate with its per-peer
+    correction), pinned against predict_routing_outcome by
+    routing_curves_are_what_routing_predicts and
+    a_cold_timing_stage_shows_the_estimate_routing_falls_back_to; the two
+    differ by the spread a record narrows and by the output bound. The
+    response-time tile shows prediction_at_own_location. Per-peer
+    eligible/chosen counts (PeerSelectionCounts) count only
+    DecisionLog::Joinable decisions and halve every
+    SELECTION_RECENT_DECISIONS eligible decisions
   → PAIRED VALUES, failure probability: the estimator returns TWO failure
     numbers per candidate and they are not interchangeable.
     failure_probability is clamped to [0, 1] and is what is REPORTED and

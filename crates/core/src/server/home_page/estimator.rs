@@ -1,3 +1,4 @@
+use super::charts::{LogAxis, fmt_speed, fmt_time};
 use super::*;
 
 /// Choose the top of the failure-probability chart's y-axis.
@@ -37,6 +38,7 @@ pub fn failure_chart_y_max(curve_points: &[(f64, f64)]) -> f64 {
 pub fn build_estimator_chart_or_placeholder(
     title: &str,
     unit: ChartUnit,
+    width: f64,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
@@ -54,6 +56,7 @@ pub fn build_estimator_chart_or_placeholder(
     build_estimator_chart(
         title,
         unit,
+        width,
         curve_points,
         scatter_points,
         data_range,
@@ -64,11 +67,17 @@ pub fn build_estimator_chart_or_placeholder(
 
 /// Build an SVG chart showing a distance curve over the raw outcomes behind it.
 ///
+/// `width` is the viewBox width: render at 600 and 340 through
+/// [`super::charts::responsive`] so a phone gets its own layout. Times and
+/// speeds are on a log axis, as on the peer page; a probability is in percent.
+///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
 /// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
+#[allow(clippy::too_many_arguments)]
 pub fn build_estimator_chart(
     title: &str,
     unit: ChartUnit,
+    width: f64,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
@@ -82,7 +91,8 @@ pub fn build_estimator_chart(
         );
     }
 
-    let w: f64 = 560.0;
+    let w: f64 = width;
+    let narrow = w < 450.0;
     // Bottom padding leaves room for both the distance tick numbers and the
     // ring-distance axis title below them; plot height stays 160px.
     let h: f64 = 210.0;
@@ -139,6 +149,14 @@ pub fn build_estimator_chart(
         }
     }
     let y_range = y_max - y_min;
+    // Response times and transfer speeds span orders of magnitude, so they are
+    // drawn on the same log axis the peer page uses.
+    let log_axis = match unit {
+        ChartUnit::Probability => None,
+        ChartUnit::Seconds | ChartUnit::BytesPerSecond => Some(LogAxis::covering(
+            curve_points.iter().chain(scatter_points).map(|&(_, y)| y),
+        )),
+    };
 
     // X is always distance [0.0, 0.5]
     let x_min: f64 = 0.0;
@@ -146,7 +164,12 @@ pub fn build_estimator_chart(
     let x_range = x_max - x_min;
 
     let to_svg_x = |x: f64| -> f64 { pad_l + ((x - x_min) / x_range) * plot_w };
-    let to_svg_y = |y: f64| -> f64 { pad_t + plot_h - ((y - y_min) / y_range) * plot_h };
+    let to_svg_y = |y: f64| -> f64 {
+        match &log_axis {
+            Some(axis) => pad_t + plot_h - axis.fraction(y) * plot_h,
+            None => pad_t + plot_h - ((y - y_min) / y_range) * plot_h,
+        }
+    };
 
     let mut svg = format!(
         r#"<div class="chart-section"><h3>{title}</h3>
@@ -190,9 +213,14 @@ pub fn build_estimator_chart(
     // X-axis title: the x-axis is always ring distance (peer ↔ contract).
     write!(
         svg,
-        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)</text>"#,
+        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">{caption}</text>"#,
         x = pad_l + plot_w / 2.0,
         y = h - 6.0,
+        caption = if narrow {
+            "ring distance, peer to contract"
+        } else {
+            "ring distance between peer and contract (0 = same spot, 0.5 = opposite side)"
+        },
     )
     .ok();
 
@@ -202,7 +230,7 @@ pub fn build_estimator_chart(
     // distinguishable. The failure chart now zooms to a very small range
     // (probabilities are tiny), where a fixed 2-decimal format would collapse
     // every tick to "0.00".
-    let step = y_range / 2.0;
+    let step = y_range * 100.0 / 2.0;
     let decimals: usize = if step <= 0.0 {
         3
     } else if step >= 10.0 {
@@ -213,14 +241,17 @@ pub fn build_estimator_chart(
         // step in (0, 1): enough places for ~2 significant figures of the step.
         ((-step.log10()).ceil() as usize).saturating_add(1).min(9)
     };
-    for i in 0..=2 {
-        let frac = i as f64 / 2.0;
-        let y_val = y_min + frac * y_range;
+    let ticks: Vec<f64> = match &log_axis {
+        Some(axis) => axis.ticks.clone(),
+        None => (0..=2).map(|i| y_min + i as f64 / 2.0 * y_range).collect(),
+    };
+    for y_val in ticks {
         let sy = to_svg_y(y_val);
         let label = match unit {
-            ChartUnit::Probability => format!("{y_val:.decimals$}"),
-            ChartUnit::Seconds => fmt_reg_axis(RegKind::Time, y_val),
-            ChartUnit::BytesPerSecond => fmt_reg_axis(RegKind::Speed, y_val),
+            // Percent, as the peer page reads failure in percentage points.
+            ChartUnit::Probability => format!("{:.decimals$}%", y_val * 100.0),
+            ChartUnit::Seconds => fmt_time(y_val),
+            ChartUnit::BytesPerSecond => fmt_speed(y_val),
         };
         write!(
             svg,
@@ -258,14 +289,18 @@ pub fn build_estimator_chart(
             dots,
             "M{:.0} {:.0}h0",
             to_svg_x(x),
-            to_svg_y(y.clamp(y_min, y_max)),
+            to_svg_y(if log_axis.is_some() {
+                y
+            } else {
+                y.clamp(y_min, y_max)
+            }),
         )
         .ok();
     }
     if !dots.is_empty() {
         write!(
             svg,
-            r#"<path d="{dots}" class="scatter" fill="none" stroke="var(--text-muted)" stroke-width="3.6" stroke-linecap="round" opacity="0.35"/>"#,
+            r#"<path d="{dots}" class="scatter" fill="none" stroke="var(--text-secondary)" stroke-width="3.6" stroke-linecap="round" opacity="0.5"/>"#,
         )
         .ok();
     }
@@ -285,7 +320,7 @@ pub fn build_estimator_chart(
         for &(x, y) in points {
             // Clamp to the visible axis floor, mirroring the scatter-point
             // clamp above. (`y_min` is 0 for all of these charts.)
-            let y = y.max(y_min);
+            let y = if log_axis.is_some() { y } else { y.max(y_min) };
             if x < data_lo - 0.001 {
                 left_ext.push((x, y));
             } else if x > data_hi + 0.001 {
@@ -468,8 +503,9 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
     }
     let span = (log_hi - log_lo).max(1e-9);
 
-    let (w, h) = (260.0f64, 220.0f64);
-    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
+    // The top padding keeps the highest y-tick label clear of the headline.
+    let (w, h) = (276.0f64, 238.0f64);
+    let (pad_l, pad_r, pad_t, pad_b) = (54.0f64, 12.0f64, 40.0f64, 30.0f64);
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
     let to_x = |v: f64| pad_l + ((v.log10() - log_lo) / span) * plot_w;
@@ -488,7 +524,7 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
     .ok();
     write!(
         svg,
-        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">typically within &#215;{typical_miss:.1} · last {n}</text>"#,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">typically within &#215;{typical_miss:.1} · last {n} predictions</text>"#,
         x = pad_l,
     )
     .ok();
@@ -563,11 +599,24 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
         .ok();
     }
 
+    // Above the diagonal the outcome was larger than predicted: a slower reply,
+    // but a FASTER transfer.
+    let (above, below) = match kind {
+        RegKind::Time => ("slower than predicted", "faster than predicted"),
+        RegKind::Speed => ("faster than predicted", "slower than predicted"),
+    };
+    let mid_y = pad_t + plot_h / 2.0;
     write!(
         svg,
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted (across) against actual (up)</text>"#,
-        x = pad_l + plot_w / 2.0,
-        y = h - 1.0,
+        r#"<text x="{tl:.1}" y="{tt:.1}" font-size="8" fill="var(--text-muted)">{above}</text><text x="{br:.1}" y="{bb:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{below}</text><text x="{ex:.1}" y="{ey:.1}" text-anchor="end" font-size="8" fill="var(--text-secondary)">exact</text><text x="{px:.1}" y="{py:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted</text><text x="9" y="{mid_y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)" transform="rotate(-90 9 {mid_y:.1})">actual</text>"#,
+        tl = pad_l + 4.0,
+        tt = pad_t + 10.0,
+        br = pad_l + plot_w - 4.0,
+        bb = pad_t + plot_h - 5.0,
+        ex = pad_l + plot_w - 14.0,
+        ey = pad_t + 12.0,
+        px = pad_l + plot_w / 2.0,
+        py = h - 1.0,
     )
     .ok();
 
@@ -575,49 +624,17 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
     svg
 }
 
-/// Compact axis label for a regression value: durations as s/ms/µs, throughput
-/// as B/KB/MB/GB per second.
+/// Axis label for a regression value, in the peer page's units.
 fn fmt_reg_axis(kind: RegKind, v: f64) -> String {
     match kind {
-        RegKind::Time => {
-            if v >= 1.0 {
-                format!("{} s", trim_one(v))
-            } else if v >= 0.001 {
-                format!("{:.0} ms", v * 1000.0)
-            } else if v > 0.0 {
-                format!("{:.0} µs", v * 1_000_000.0)
-            } else {
-                "0".to_string()
-            }
-        }
-        RegKind::Speed => {
-            if v >= 1e9 {
-                format!("{} GB/s", trim_one(v / 1e9))
-            } else if v >= 1e6 {
-                format!("{} MB/s", trim_one(v / 1e6))
-            } else if v >= 1e3 {
-                format!("{:.0} KB/s", v / 1e3)
-            } else if v > 0.0 {
-                format!("{v:.0} B/s")
-            } else {
-                "0".to_string()
-            }
-        }
-    }
-}
-
-/// A value with one decimal, or none when it is whole.
-fn trim_one(v: f64) -> String {
-    if (v - v.round()).abs() < 0.05 {
-        format!("{v:.0}")
-    } else {
-        format!("{v:.1}")
+        RegKind::Time => fmt_time(v),
+        RegKind::Speed => fmt_speed(v),
     }
 }
 
 /// A small placeholder chart shown while a model has too little data to plot.
 fn mini_chart_placeholder(label: &str, sub: &str) -> String {
-    let (w, h) = (260.0f64, 220.0f64);
+    let (w, h) = (276.0f64, 238.0f64);
     format!(
         r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">
         <text x="38" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">{label}</text>

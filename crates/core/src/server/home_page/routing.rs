@@ -6,11 +6,29 @@
 //! on that peer's page (`peer_detail.rs`), which links here.
 
 use super::assets::{CSS, JS, PEER_CSS};
+use super::charts::responsive;
 use super::estimator::{
     ChartUnit, build_accuracy_panel, build_estimator_chart_or_placeholder, failure_chart_y_max,
 };
+use super::peer_detail::ROUTING_LINK;
 use super::*;
 use crate::router::RouterSnapshotInfo;
+
+/// The hierarchical estimator's per-stage window.
+const WINDOW_EVENTS: usize = crate::router::HIERARCHICAL_WINDOW_EVENTS;
+
+/// `10000` as `10,000`.
+fn fmt_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// What the page reads from the router, taken under its read lock and
 /// rendered after the lock is released.
@@ -100,7 +118,7 @@ fn accuracy_card(rs: &RouterSnapshotInfo) -> String {
         }
         Some(skill) => format!(
             "Failure predictions are {} just assuming the average failure rate.",
-            if skill.abs() < SKILL_NEAR_ZERO {
+            if skill.abs() < SKILL_NOISE {
                 "about as good as"
             } else if skill > 0.0 {
                 "better than"
@@ -142,7 +160,7 @@ fn accuracy_card(rs: &RouterSnapshotInfo) -> String {
     );
     format!(
         r#"<div class="card">
-            <h2>How good are the predictions?</h2>
+            <h2>{ROUTING_LINK}</h2>
             <div class="acc-facts"><p>{failure}{calibration}</p>{timing}</div>
             {charts}
         </div>"#
@@ -150,8 +168,14 @@ fn accuracy_card(rs: &RouterSnapshotInfo) -> String {
 }
 
 /// A skill score within this of zero reads as "about as good as" the
-/// average-rate guess: at that size its sign is noise.
-const SKILL_NEAR_ZERO: f64 = 0.01;
+/// average-rate guess.
+///
+/// Skill here is `1 - Brier / Brier(average rate)` over a forgetting window of
+/// a few hundred effective forecasts at a ~1% failure rate, so a handful of
+/// failures moves it by a few hundredths: a recorded soak sat between -0.03
+/// and +0.03 with no change in routing. Five hundredths is above that run's
+/// noise and still well below what a model that helps or hurts produces.
+const SKILL_NOISE: f64 = 0.05;
 
 /// The median of `max(predicted / actual, actual / predicted)` over usable
 /// pairs: the factor within which half the outcomes landed, either way.
@@ -238,7 +262,12 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
         let active = if i == 0 { " tab-active" } else { "" };
         write!(
             tab_labels,
-            r#"<span class="tab-label{dim}{active}" data-tab="{tab_id}" onclick="switchTab(this)">{tab_name}{badge}</span>"#,
+            r#"<span class="tab-label{dim}{active}" data-tab="{tab_id}" onclick="switchTab(this)" title="{tab_title}">{tab_name}{badge}</span>"#,
+            tab_title = if all {
+                "Your node's last 500 requests to any peer".to_string()
+            } else {
+                format!("Your node's last 500 {tab_name} requests; each operation keeps its own")
+            },
         )
         .ok();
 
@@ -247,36 +276,45 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
         } else {
             let fail_y_max = failure_chart_y_max(&f_curve).to_string();
             [
-                build_estimator_chart_or_placeholder(
-                    "Failure probability",
-                    ChartUnit::Probability,
-                    &f_curve,
-                    &f_points,
-                    f_range,
-                    "0.0",
-                    &fail_y_max,
-                    "No outcomes yet.",
-                ),
-                build_estimator_chart_or_placeholder(
-                    "Response time",
-                    ChartUnit::Seconds,
-                    &rt_curve,
-                    &rt_points,
-                    rt_range,
-                    "0",
-                    "auto",
-                    "No timed replies yet.",
-                ),
-                build_estimator_chart_or_placeholder(
-                    "Transfer speed",
-                    ChartUnit::BytesPerSecond,
-                    &x_curve,
-                    &x_points,
-                    x_range,
-                    "0",
-                    "auto",
-                    "No data transfers yet.",
-                ),
+                responsive(|width| {
+                    build_estimator_chart_or_placeholder(
+                        "Failure probability",
+                        ChartUnit::Probability,
+                        width,
+                        &f_curve,
+                        &f_points,
+                        f_range,
+                        "0.0",
+                        &fail_y_max,
+                        "No outcomes yet.",
+                    )
+                }),
+                responsive(|width| {
+                    build_estimator_chart_or_placeholder(
+                        "Response time",
+                        ChartUnit::Seconds,
+                        width,
+                        &rt_curve,
+                        &rt_points,
+                        rt_range,
+                        "0",
+                        "auto",
+                        "No timed replies yet.",
+                    )
+                }),
+                responsive(|width| {
+                    build_estimator_chart_or_placeholder(
+                        "Transfer speed",
+                        ChartUnit::BytesPerSecond,
+                        width,
+                        &x_curve,
+                        &x_points,
+                        x_range,
+                        "0",
+                        "auto",
+                        "No data transfers yet.",
+                    )
+                }),
             ]
             .concat()
         };
@@ -291,7 +329,8 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
     format!(
         r#"<div class="card">
             <h2>Outcomes by ring distance</h2>
-            <p class="caption">Recent outcomes across all peers; each tab keeps its own last 500, so the operation tabs need not add up to All. On All, the line is what your node predicts for a peer from distance alone.</p>
+            <p class="caption">Each tab shows the last 500 requests of its kind, so the operation tabs need not add up to All.</p>
+            <div class="legend-row"><span><i class="sw-dot-other"></i>a request</span><span><i class="sw-line-solid"></i>predicted from distance alone (on All, what routing uses)</span><span><i class="sw-line-dash"></i>extrapolated beyond the data</span></div>
             <div class="tab-group">
                 <div class="tab-bar">{tab_labels}</div>
                 {tab_panels}
@@ -387,7 +426,7 @@ fn diagnostics_card(inputs: &RoutingInputs) -> String {
         ),
         row("Brier score", &brier),
         row(
-            "Response time, RMS",
+            "Response time, RMS error",
             &fmt_seconds_error(
                 rs.response_time_rmse_secs_isotonic,
                 rs.response_time_rmse_secs_hierarchical,
@@ -396,7 +435,7 @@ fn diagnostics_card(inputs: &RoutingInputs) -> String {
             ),
         ),
         row(
-            "Transfer time, RMS",
+            "Time to transfer a payload, RMS error",
             &fmt_seconds_error(
                 rs.transfer_time_rmse_secs_isotonic,
                 rs.transfer_time_rmse_secs_hierarchical,
@@ -476,6 +515,8 @@ fn fmt_skill(skill: Option<f64>) -> String {
         Some(value) if value.is_finite() => {
             if value.abs() < 0.01 {
                 "&asymp; 0".to_string()
+            } else if value.abs() < SKILL_NOISE {
+                format!("{value:+.2} (within noise)")
             } else if value < 0.0 {
                 format!("{value:+.2} (worse than the average rate)")
             } else {
@@ -696,7 +737,7 @@ impl StageKind {
 /// fallback, which the row says, because it is what routing uses meanwhile.
 fn fmt_stage_status(stage: StageKind, events: usize, active: bool) -> String {
     if active {
-        return format!("{events} outcomes in the window");
+        return format!("{events} (keeps the last {})", fmt_count(WINDOW_EVENTS));
     }
     let fallback = match stage {
         StageKind::Failure => "",
@@ -726,9 +767,12 @@ mod tests {
             "a clearly negative skill must say so in words, got {worse}"
         );
         assert_eq!(fmt_skill(Some(0.42)), "+0.42");
-        // Just past the band on each side is a real reading.
-        assert!(fmt_skill(Some(-0.011)).contains("worse"));
-        assert_eq!(fmt_skill(Some(0.011)), "+0.01");
+        // Inside the noise band a reading is shown but flagged, and not
+        // called worse; past it, it is a real reading.
+        assert_eq!(fmt_skill(Some(-0.011)), "-0.01 (within noise)");
+        assert_eq!(fmt_skill(Some(0.049)), "+0.05 (within noise)");
+        assert!(fmt_skill(Some(-0.051)).contains("worse"));
+        assert_eq!(fmt_skill(Some(0.051)), "+0.05");
     }
 
     #[test]
@@ -966,7 +1010,7 @@ mod tests {
         );
         assert_eq!(
             fmt_stage_status(StageKind::TransferSpeed, 30, true),
-            "30 outcomes in the window"
+            "30 (keeps the last 10,000)"
         );
     }
 
@@ -1013,7 +1057,7 @@ mod tests {
         let _fallback_off = crate::router::force_isotonic_fallback(false);
         let html = render_routing_page("0.2.141", Some(&trained_inputs()));
         for section in [
-            "How good are the predictions?",
+            "How good are the predictions across all peers?",
             "Failure predictions are",
             "failures;",
             "Replies typically land within",
@@ -1024,6 +1068,16 @@ mod tests {
             "Forgetting horizon (transfer speed)",
             "Selection-table evictions",
             "peer pages count only routed requests",
+            "Each tab shows the last 500 requests of its kind",
+            r#"<i class="sw-dot-other"></i>a request"#,
+            "predicted from distance alone",
+            ">exact<",
+            ">slower than predicted<",
+            ">faster than predicted<",
+            "Response time, RMS error",
+            "Time to transfer a payload, RMS error",
+            "(keeps the last 10,000)",
+            r#"<details class="diag" id="routing-diagnostics">"#,
         ] {
             assert!(html.contains(section), "missing {section:?}");
         }
@@ -1053,6 +1107,16 @@ mod tests {
         );
         assert!(!html.contains("still routes by distance alone"));
         assert!(html.contains(r#"href="/""#), "links back to the dashboard");
+        crate::server::home_page::tests::assert_every_details_has_an_id(&html);
+        assert!(
+            html.contains("%</text>"),
+            "the failure axis reads in percent"
+        );
+        assert_eq!(
+            html.matches(r#"class="w-wide""#).count(),
+            html.matches(r#"class="w-narrow""#).count(),
+            "every chart has a phone variant"
+        );
         assert!(!html.contains("http-equiv=\"refresh\""));
         assert!(
             html.matches(r#"<p class="caption">"#).count() <= 1,
@@ -1067,7 +1131,12 @@ mod tests {
         let notice = html
             .find("Routing is on its emergency fallback")
             .expect("the fallback is named up front");
-        assert!(notice < html.find("How good are the predictions?").unwrap());
+        assert!(
+            notice
+                < html
+                    .find("How good are the predictions across all peers?")
+                    .unwrap()
+        );
     }
 
     #[test]

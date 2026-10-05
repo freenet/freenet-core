@@ -5,6 +5,7 @@
 
 mod assets;
 mod cards;
+mod charts;
 mod contract_detail;
 mod estimator;
 mod favicon;
@@ -615,6 +616,20 @@ mod tests {
         assert!(html.contains("health-trouble"), "trouble banner missing");
     }
 
+    /// dashboard.js reopens only `main details[id]` after it swaps `<main>`,
+    /// so a `<details>` without an id snaps shut on every refresh.
+    pub(super) fn assert_every_details_has_an_id(html: &str) {
+        // The embedded dashboard.js mentions `<details>` in a comment.
+        let html = match (html.find("<script>"), html.rfind("</script>")) {
+            (Some(start), Some(end)) => format!("{}{}", &html[..start], &html[end..]),
+            _ => html.to_string(),
+        };
+        for (at, _) in html.match_indices("<details") {
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains(" id=\""), "{tag} has no id");
+        }
+    }
+
     #[test]
     fn failures_demoted_when_connected() {
         let mut snap = base_snapshot();
@@ -630,6 +645,7 @@ mod tests {
             html.contains("diagnostics-muted"),
             "failures should be demoted when connected"
         );
+        assert_every_details_has_an_id(&html);
         assert!(
             !html.contains(r#"class="diagnostics""#),
             "should not use prominent diagnostics style"
@@ -1349,6 +1365,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
             ChartUnit::Seconds,
+            560.0,
             &[],
             &[],
             (0.0, 0.0),
@@ -1379,6 +1396,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
             ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
@@ -1400,6 +1418,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
             ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
@@ -1447,6 +1466,7 @@ mod tests {
         let html = build_estimator_chart(
             "Failure Probability",
             ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
@@ -1470,6 +1490,7 @@ mod tests {
         let html = build_estimator_chart(
             "Failure Probability",
             ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
@@ -1477,11 +1498,11 @@ mod tests {
             "0.01",
         );
         assert!(
-            html.contains(">0.0050<"),
+            html.contains(">0.50%<"),
             "middle y-tick must remain readable at a small range, got: {html}"
         );
         assert!(
-            html.contains(">0.0100<"),
+            html.contains(">1.00%<"),
             "top y-tick must remain readable at a small range, got: {html}"
         );
     }
@@ -1498,6 +1519,7 @@ mod tests {
         let html = build_estimator_chart(
             "Failure Probability",
             ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),

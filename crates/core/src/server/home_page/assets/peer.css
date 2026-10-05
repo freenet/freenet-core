@@ -220,12 +220,12 @@ details.diag .info-grid {
 }
 .mini-ring {
   flex: 0 0 auto;
-  width: 150px;
+  width: 170px;
   height: auto;
 }
 .mini-ring text {
-  font: 9px var(--font-mono);
-  fill: var(--text-muted);
+  font: 15px var(--font-mono);
+  fill: var(--text-secondary);
 }
 .mini-ring .ring {
   fill: none;
@@ -325,6 +325,17 @@ details.diag .info-grid {
   height: 0;
   border-top: 2px dashed var(--text-secondary);
 }
+.sw-line-solid {
+  width: 16px;
+  height: 0;
+  border-top: 2px solid var(--accent-primary);
+}
+.sw-line-dash {
+  width: 16px;
+  height: 0;
+  border-top: 2px dashed var(--accent-primary);
+  opacity: 0.6;
+}
 .sw-line-peer {
   width: 16px;
   height: 0;
@@ -359,14 +370,28 @@ svg.mchart .baseline {
 }
 svg.mchart .dot-other {
   fill: var(--text-secondary);
-  opacity: 0.6;
+  opacity: 0.75;
+}
+svg.mchart .dot-other.hollow {
+  fill: var(--bg-primary);
+  stroke: var(--text-secondary);
+  stroke-width: 1.2;
+}
+.dot-this.hollow {
+  fill: var(--bg-primary);
+  stroke: var(--accent-primary);
+  stroke-width: 2.5;
+}
+svg.mchart .tick-this {
+  stroke: var(--accent-primary);
+  stroke-width: 1;
 }
 svg.mchart .dots-faint {
   fill: none;
   stroke: var(--text-secondary);
   stroke-width: 3.6;
   stroke-linecap: round;
-  opacity: 0.35;
+  opacity: 0.5;
 }
 .dot-this {
   fill: var(--accent-primary);
@@ -439,7 +464,7 @@ svg.mchart .line-peer {
     grid-template-columns: minmax(0, 1fr);
   }
   .mini-ring {
-    width: 96px;
+    width: 140px;
   }
   .peer-head {
     gap: 0.5rem;
@@ -447,8 +472,10 @@ svg.mchart .line-peer {
   .peer-head .addr {
     font-size: 0.9rem;
   }
+  /* One row that scrolls sideways inside its own box, never an orphan row. */
   .tab-bar {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
   }
   .accuracy-chart {
     width: 100%;
@@ -462,13 +489,5 @@ svg.mchart .line-peer {
   .info-grid .info-value {
     margin-bottom: 0.5rem;
     overflow-wrap: anywhere;
-  }
-  /* The /routing distance charts have one fixed layout: scroll them inside
-     their own box rather than shrinking their text to 6px, as the tables do. */
-  .chart-section {
-    overflow-x: auto;
-  }
-  .chart-section .chart-svg {
-    min-width: 520px;
   }
 }
