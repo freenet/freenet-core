@@ -21,7 +21,7 @@ use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, instrument, span};
+use tracing::{Instrument, span};
 
 mod inbound_stream;
 mod outbound_stream;
@@ -941,7 +941,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
     }
 
-    #[instrument(name = "peer_connection", skip_all)]
     /// Serialize `data` and hand it to the transport.
     ///
     /// Returns the SERIALIZED byte length, so callers that already know the
@@ -966,7 +965,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             let len = data.len();
             self.outbound_stream(data).await;
-            return Ok(len);
+            Ok(len)
         } else {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
@@ -974,11 +973,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             let len = data.len();
             self.outbound_short_message(data).await?;
-            return Ok(len);
+            Ok(len)
         }
     }
 
-    #[instrument(name = "peer_connection", skip(self))]
+    /// Receive the next complete inbound message.
+    ///
+    /// Deliberately not `#[instrument]`ed, and neither is `send`: the span was
+    /// entered and exited on every poll of these per-connection hot paths
+    /// (~1.5% of node CPU on a production peer, #5795) while carrying no
+    /// fields. Log lines here already carry `peer_addr`.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         // The timers live on `self` (see `RecvTimers`); only bound the wait for
         // the next resend check, so packets sent since the last call get their

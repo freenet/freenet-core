@@ -292,6 +292,10 @@ capable remote: either restores the ack-of-ack ping-pong that cost
 ~5 pps per direction on every connection, idle ones included.
 DO NOT stop re-acking duplicates: it is the only recovery for a lost
 receipt now that acks are untracked.
+A receipt for an id we no longer track (an old peer acking our
+untracked NoOp, a re-ack of an already-released packet) is routine.
+report_received_receipts must keep emitting ack-info ONLY for ids still
+in pending_receipts, so such receipts never touch flight size.
 NAT keepalive does NOT depend on any of this: the keepalive task's
 5 s Ping (and the remote's Pong) keeps every mapping open.
 ```
