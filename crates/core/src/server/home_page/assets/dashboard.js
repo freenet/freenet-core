@@ -1163,6 +1163,13 @@ document.addEventListener('DOMContentLoaded', function () {
         /* Read the caret position BEFORE the innerHTML write on the next line
            destroys the element holding it. */
         var focusBeforeSwap = captureFilterFocus();
+        /* Which collapsible sections the reader has opened. The swap rebuilds
+           them closed, so without this an opened <details> (the /routing
+           diagnostics) snapped shut every five seconds. Keyed by id. */
+        var openDetails = [];
+        document.querySelectorAll('main details[id]').forEach(function (d) {
+          if (d.open) openDetails.push(d.id);
+        });
         /* Blur BEFORE the swap, so nothing is focused while <main> is being
            replaced.
 
@@ -1187,6 +1194,10 @@ document.addEventListener('DOMContentLoaded', function () {
           if (active && typeof active.blur === 'function') active.blur();
         }
         if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+        openDetails.forEach(function (id) {
+          var d = document.getElementById(id);
+          if (d) d.open = true;
+        });
         /* Update the tab title (connection state + count, #3509) so a
            backgrounded tab still surfaces the current status at a glance. */
         if (doc.title) document.title = doc.title;

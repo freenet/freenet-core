@@ -731,6 +731,37 @@ impl IsotonicEstimator {
         Ok(adjusted_estimate.max(0.0))
     }
 
+    /// What [`Self::estimate_retrieval_time`] returns across distance
+    /// `[0, 0.5]` (`samples + 1` points), for `peer` or, with `None`, for a
+    /// peer with no adjustment: the same interpolation, base floor, per-peer
+    /// adjustment gate and final clamp. Empty while the window is too small
+    /// to estimate. For the dashboard's prediction lines while a timing stage
+    /// of the hierarchical estimator is still cold.
+    pub(crate) fn estimate_curve(
+        &self,
+        peer: Option<&PeerKeyLocation>,
+        samples: usize,
+    ) -> Vec<(f64, f64)> {
+        let fit = self.current_fit();
+        if fit.len() < MIN_POINTS_FOR_REGRESSION || samples == 0 {
+            return Vec::new();
+        }
+        let adjustment = peer
+            .and_then(|peer| self.peer_adjustments.get(peer))
+            .filter(|adjustment| adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64)
+            .map(Adjustment::value);
+        (0..=samples)
+            .filter_map(|index| {
+                let distance = 0.5 * index as f64 / samples as f64;
+                let base = self.adjustment_mode.floor_base(fit.interpolate(distance)?);
+                let value = adjustment.map_or(base, |adjustment| {
+                    self.adjustment_mode.apply(base, adjustment)
+                });
+                Some((distance, value.max(0.0)))
+            })
+            .collect()
+    }
+
     /// Number of points the global fit is over: the window's size.
     pub(crate) fn len(&self) -> usize {
         match self.fit_policy {
@@ -960,6 +991,28 @@ impl IsotonicEstimator {
             })
             .collect()
     }
+
+    /// `(observations, observations with a result of at least 0.5)` in the
+    /// window: for the failure estimator, `(outcomes, failures)`.
+    pub(crate) fn outcome_counts(&self) -> (usize, usize) {
+        let failures = self
+            .raw_events
+            .iter()
+            .filter(|event| event.result >= 0.5)
+            .count();
+        (self.raw_events.len(), failures)
+    }
+
+    /// Every retained `(distance, outcome)` observation about `peer`, in
+    /// insertion order and NOT downsampled, for the dashboard's per-peer
+    /// scatter. Linear in the window (at most `MAX_REGRESSION_POINTS`).
+    pub(crate) fn points_for_peer(&self, peer: &PeerKeyLocation) -> Vec<(f64, f64)> {
+        self.raw_events
+            .iter()
+            .filter(|event| &event.peer == peer)
+            .map(|event| (event.route_distance().as_f64(), event.result))
+            .collect()
+    }
 }
 
 /// The global regression's input window, held in exactly the order
@@ -1141,6 +1194,7 @@ impl Adjustment {
     }
 
     /// Effective number of events contributing to this adjustment (decayed).
+    #[cfg(test)]
     pub(crate) fn event_count(&self) -> u64 {
         self.effective_count.round() as u64
     }

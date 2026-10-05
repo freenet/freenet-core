@@ -439,9 +439,10 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             ));
         }
         if snap.open_connections > 0 {
-            // Demoted: muted style when node is otherwise connected
+            // Demoted: muted style when node is otherwise connected. The id
+            // lets dashboard.js keep it open across the 5 s refresh.
             format!(
-                r#"<details class="diagnostics-muted">
+                r#"<details class="diagnostics-muted" id="connection-failures">
                     <summary>{n} recent connection attempt(s) failed <span class="muted-hint">(normal)</span></summary>
                     <ul>{items}</ul>
                 </details>"#,
@@ -473,7 +474,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
 
     format!(
         r#"<div class="card">
-            <h2>Connection Status</h2>
+            <div class="card-header"><h2>Connection Status</h2><a class="card-link" href="/routing">Routing model &rarr;</a></div>
             {health_banner}
             {get_success}
             {ring_stats_html}

@@ -4574,18 +4574,18 @@ mod tests {
     /// value under another field's key fails too.
     ///
     /// This covers the counters the COLLECTOR needs, which is NOT the whole
-    /// set the snapshot carries: `_residuals_refused`,
-    /// `_pairs_refused_last_refit`, `_entries_displaced` and
-    /// `_den_below_two_refits` are dashboard-only by choice. The first three
-    /// describe table SATURATION, which is read while looking at one node's
-    /// peer-detail page rather than aggregated across the fleet, and the
-    /// fourth is derivable from the two that are exported here
-    /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
-    /// question ever needs one of them, add it to the mirrored block above and
-    /// to this list together. `route_events_discarded_unlocated` (route
-    /// events the router discarded for a peer with no location) is likewise
-    /// dashboard-only: it is a should-be-zero invariant counter read on one
-    /// node's page.
+    /// set the snapshot carries. `_residuals_refused`,
+    /// `_pairs_refused_last_refit` and `_entries_displaced` describe table
+    /// SATURATION on one node; they are not exported, and no dashboard page
+    /// shows them since the peer page stopped carrying model diagnostics
+    /// (#5794), so they are read only from the snapshot itself.
+    /// `_den_below_two_refits` is shown on `/routing` and is derivable from
+    /// the two exported here (`_estimable_refits` minus the refits that could
+    /// act). If a fleet-wide question ever needs one of them, add it to the
+    /// mirrored block above and to this list together.
+    /// `route_events_discarded_unlocated` (route events the router discarded
+    /// for a peer with no location) is likewise not exported: it is a
+    /// should-be-zero invariant counter read on one node's `/routing` page.
     #[test]
     fn router_snapshot_json_includes_contract_term_activation() {
         use arbitrary::{Arbitrary, Unstructured};

@@ -5,15 +5,12 @@
 
 mod assets;
 mod cards;
+mod charts;
 mod contract_detail;
 mod estimator;
-
-/// Re-exported for the router test that pins the hierarchical cost to the
-/// range this formatter can print.
-#[cfg(test)]
-pub(crate) use estimator::fmt_prediction_time;
 mod favicon;
 mod peer_detail;
+mod routing;
 
 use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
@@ -31,6 +28,7 @@ use cards::{
 use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
+use routing::routing_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
@@ -108,6 +106,11 @@ pub(super) async fn homepage() -> impl IntoResponse {
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
 pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
     Html(peer_detail_html(&address))
+}
+
+/// Handler for `GET /routing` — the network-wide routing model page.
+pub(super) async fn routing() -> impl IntoResponse {
+    Html(routing_html())
 }
 
 /// Per-contract detail page (#5369). Accepts either the full `ContractKey`
@@ -225,10 +228,8 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        PeerLine, RegKind, build_accuracy_panel, build_estimator_chart,
-        build_estimator_chart_or_placeholder, build_regression_chart, build_reliability_chart,
-        failure_chart_y_max, fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed,
-        fmt_prediction_time,
+        ChartUnit, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, failure_chart_y_max,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -284,10 +285,7 @@ mod tests {
     /// tested) makes the rule's edge cases explicit and guards against the JS
     /// drifting from the intended behaviour. It lives in the test module (not as
     /// production code) because the production decision is made in JS, not in the
-    /// server-side render — and keeping it inside the single `#[cfg(test)]`
-    /// boundary preserves the source-scrape pin invariant relied on by
-    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
-    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    /// server-side render.
     ///
     /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
     /// still holding a cached homepage emitted by an old binary while a newer
@@ -618,6 +616,20 @@ mod tests {
         assert!(html.contains("health-trouble"), "trouble banner missing");
     }
 
+    /// dashboard.js reopens only `main details[id]` after it swaps `<main>`,
+    /// so a `<details>` without an id snaps shut on every refresh.
+    pub(super) fn assert_every_details_has_an_id(html: &str) {
+        // The embedded dashboard.js mentions `<details>` in a comment.
+        let html = match (html.find("<script>"), html.rfind("</script>")) {
+            (Some(start), Some(end)) => format!("{}{}", &html[..start], &html[end..]),
+            _ => html.to_string(),
+        };
+        for (at, _) in html.match_indices("<details") {
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains(" id=\""), "{tag} has no id");
+        }
+    }
+
     #[test]
     fn failures_demoted_when_connected() {
         let mut snap = base_snapshot();
@@ -633,6 +645,7 @@ mod tests {
             html.contains("diagnostics-muted"),
             "failures should be demoted when connected"
         );
+        assert_every_details_has_an_id(&html);
         assert!(
             !html.contains(r#"class="diagnostics""#),
             "should not use prominent diagnostics style"
@@ -1234,62 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[]);
-        assert!(svg.contains("collecting data"));
-        assert!(svg.contains("<svg"));
-    }
-
-    #[test]
-    fn reliability_chart_renders_points_and_brier() {
-        // Well-separated: low predicted -> success, high predicted -> failure.
-        let pairs: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
-            .collect();
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("Failure (calibration)"));
-        // The caption is now DERIVED from these pairs rather than supplied, so
-        // this asserts the derivation rather than echoing an argument back.
-        // Predicted i/20 against actual 0 for i<=10 and 1 for i>10:
-        let expected: f64 = (0..20)
-            .map(|i| {
-                let predicted = i as f64 / 20.0;
-                let actual = if i > 10 { 1.0 } else { 0.0 };
-                (predicted - actual).powi(2)
-            })
-            .sum::<f64>()
-            / 20.0;
-        assert!(
-            svg.contains(&format!("Brier {expected:.3}")),
-            "caption must carry the Brier of the plotted pairs ({expected:.3}), got: {svg}"
-        );
-        assert!(svg.contains("n=20"));
-        assert!(svg.contains("<circle"), "bins should render as points");
-    }
-
-    #[test]
-    fn reliability_chart_filters_nonfinite() {
-        let pairs = vec![
-            (0.5, 0.0),
-            (f64::NAN, 1.0),
-            (0.3, f64::NAN),
-            (f64::INFINITY, 0.0),
-            (0.7, 1.0),
-        ];
-        // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
-    fn reliability_chart_boundary_values_no_panic() {
-        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)]);
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
     fn regression_chart_sparse_is_placeholder() {
         // Fewer than 2 valid (positive, finite) points -> placeholder.
         let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
@@ -1308,7 +1265,10 @@ mod tests {
             .collect();
         let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
         assert!(svg.contains("Response time"));
-        assert!(svg.contains("median err"));
+        assert!(
+            svg.contains("typically within &#215;1.1 · last 20"),
+            "the headline is the typical miss factor, as on the peer page: {svg}"
+        );
         assert!(svg.contains("<circle"));
         assert!(
             svg.contains("ms"),
@@ -1379,60 +1339,18 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(build_accuracy_panel(&[], &[], &[]), String::new());
+        assert_eq!(build_accuracy_panel(&[], &[]), String::new());
     }
 
     #[test]
-    fn accuracy_panel_renders_all_three_models() {
-        let failure: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+    fn accuracy_panel_renders_both_timing_models() {
+        let response: Vec<(f64, f64)> = (1..=20)
+            .map(|i| (i as f64 * 0.01, i as f64 * 0.01))
             .collect();
-        let svg = build_accuracy_panel(&failure, &[], &[]);
-        assert!(svg.contains("Prediction Accuracy"));
-        assert!(svg.contains("Failure (calibration)"));
-        // Timing models have no data yet -> their placeholders still appear.
-        assert!(svg.contains("Response time"));
-        assert!(svg.contains("Transfer speed"));
-    }
-
-    #[test]
-    fn fmt_prediction_time_sentinel_values() {
-        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
-        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_time(-1.0), "N/A");
-        assert_eq!(fmt_prediction_time(0.0), "0.000s");
-        assert_eq!(fmt_prediction_time(1.5), "1.500s");
-        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
-        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
-    }
-
-    #[test]
-    fn fmt_prediction_speed_sentinel_values() {
-        assert_eq!(fmt_prediction_speed(0.0), "N/A");
-        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
-        assert_eq!(fmt_prediction_speed(0.5), "0.50 B/s");
-    }
-
-    /// A peer whose isotonic transfer speed is floored has a placeholder speed
-    /// and cost. The cost (`mean x 1e6` s) is below `REASONABLE_TIME_LIMIT`
-    /// for a mean under 1 kB, so without this it rendered as a real time
-    /// ("100000000.000s") and the speed as "0 B/s".
-    #[test]
-    fn a_floored_transfer_speed_renders_as_not_routable() {
-        let floor = crate::router::DEGENERATE_SPEED_FLOOR_BPS;
-        assert_eq!(fmt_prediction_speed(floor), "N/A (degenerate estimate)");
-        let cost = 100.0 / floor;
-        assert!(cost < 1.0e9, "the case this guards: {cost} reads as a time");
-        assert_eq!(
-            fmt_expected_total_time(cost, floor),
-            "N/A (transfer speed degenerate: ranked last)"
-        );
-        assert_eq!(fmt_expected_total_time(1.5, 1024.0), "1.500s");
-        assert_eq!(fmt_expected_total_time(f64::MAX / 2.0, 1024.0), "N/A");
+        let svg = build_accuracy_panel(&response, &[]);
+        assert!(svg.contains("Response time") && svg.contains("<circle"));
+        // The transfer model has no data yet, so its placeholder still appears.
+        assert!(svg.contains("Transfer speed") && svg.contains("collecting data"));
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1446,11 +1364,11 @@ mod tests {
     fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
+            ChartUnit::Seconds,
+            560.0,
             &[],
             &[],
             (0.0, 0.0),
-            PeerLine::None,
-            None,
             "0",
             "auto",
             "No timed responses have been observed from this peer yet.",
@@ -1477,65 +1395,21 @@ mod tests {
         let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "1.0",
             "no data",
         );
         assert!(html.contains("<svg"), "should render an SVG, got: {html}");
-        assert!(
-            html.contains("<circle"),
-            "raw observations should render as scatter circles, got: {html}"
+        assert_eq!(
+            html.matches("h0").count(),
+            4,
+            "each raw observation renders as a scatter dot, got: {html}"
         );
-    }
-
-    /// Regression: the per-tab "Outcomes vs Distance" panel must call
-    /// `build_estimator_chart_or_placeholder` for all three
-    /// prediction-component slots (Failure Probability, Response Time,
-    /// Transfer Rate). Hiding empty slots previously masked the
-    /// driver data-collection regression for months — keeping every
-    /// slot visible makes future regressions detectable on sight.
-    /// Source-scrape rather than HTML-grep because the visible-when-empty
-    /// behaviour depends on a router_snapshot being present, and the
-    /// `home_page.rs::tests` module does not have a snapshot fixture
-    /// builder.
-    #[test]
-    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
-        let src = include_str!("home_page/peer_detail.rs");
-        let prod = src;
-        for title in [
-            "Failure Probability",
-            "Response Time (s)",
-            "Transfer Rate (B/s)",
-        ] {
-            // Find the helper call site and walk forward up to 200 bytes
-            // for the title literal. Whitespace-tolerant so rustfmt
-            // doesn't churn this pin.
-            let mut found = false;
-            let mut cursor = 0;
-            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
-                let abs = cursor + call;
-                let tail_end = (abs + 400).min(prod.len());
-                let needle = format!("\"{title}\"");
-                if prod[abs..tail_end].contains(&needle) {
-                    found = true;
-                    break;
-                }
-                cursor = abs + 1;
-            }
-            assert!(
-                found,
-                "peer-detail panel builder must call \
-                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
-                 always visible. Without this every prediction-component \
-                 slot can silently disappear when its estimator has no \
-                 data — the original regression."
-            );
-        }
     }
 
     #[test]
@@ -1543,11 +1417,11 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "1.0",
             "should not see this",
@@ -1561,11 +1435,18 @@ mod tests {
 
     #[test]
     fn failure_chart_y_max_zooms_to_twice_right_edge() {
-        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
-        // the line sits around mid-height instead of hugging y=0.
+        // Monotonic, tiny failure curve: right edge is 0.04 → twice that is
+        // 0.08, rounded up to 0.10 for round ticks, so the line sits below
+        // mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
-        let y_max = failure_chart_y_max(&curve, None);
-        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+        let y_max = failure_chart_y_max(&curve);
+        assert!((y_max - 0.10).abs() < 1e-9, "expected 0.10, got {y_max}");
+        // Twice the right edge already on a round step stays put.
+        let on_step = failure_chart_y_max(&[(0.0, 0.0), (0.5, 0.025)]);
+        assert!(
+            (on_step - 0.05).abs() < 1e-9,
+            "expected 0.05, got {on_step}"
+        );
     }
 
     #[test]
@@ -1573,28 +1454,16 @@ mod tests {
         // No failures observed (all-zero curve) → keep the original 0..1 axis
         // rather than collapsing to a degenerate zero-height range.
         let curve = vec![(0.0, 0.0), (0.5, 0.0)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
         // An empty curve also falls back to the full range.
-        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+        assert_eq!(failure_chart_y_max(&[]), 1.0);
     }
 
     #[test]
     fn failure_chart_y_max_capped_at_one() {
         // A large right edge would give 2x > 1; a probability axis can't exceed 1.
         let curve = vec![(0.0, 0.2), (0.5, 0.7)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
-    }
-
-    #[test]
-    fn failure_chart_y_max_accounts_for_peer_adjustment() {
-        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
-        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
-        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
-        let up = failure_chart_y_max(&curve, Some(0.03));
-        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
-        // A downward adjustment must not shrink the axis below the global edge.
-        let down = failure_chart_y_max(&curve, Some(-0.01));
-        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
     }
 
     #[test]
@@ -1603,17 +1472,19 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "1.0",
         );
         assert!(
-            html.contains(">Distance<"),
-            "estimator chart must label its x-axis 'Distance', got: {html}"
+            html.contains(
+                ">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)<"
+            ),
+            "estimator chart must label its x-axis as the peer page does, got: {html}"
         );
     }
 
@@ -1625,22 +1496,41 @@ mod tests {
         let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "0.01",
         );
         assert!(
-            html.contains(">0.0050<"),
+            html.contains(">0.50%<"),
             "middle y-tick must remain readable at a small range, got: {html}"
         );
         assert!(
-            html.contains(">0.0100<"),
+            html.contains(">1.00%<"),
             "top y-tick must remain readable at a small range, got: {html}"
         );
+    }
+
+    #[test]
+    fn estimator_failure_axis_ticks_land_on_round_percentages() {
+        // Twice a right edge of 8.15% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.04), (0.5, 0.0815)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0",
+            &failure_chart_y_max(&curve).to_string(),
+        );
+        for tick in [">0%<", ">10%<", ">20%<"] {
+            assert!(html.contains(tick), "missing tick {tick}: {html}");
+        }
     }
 
     #[test]
@@ -1648,74 +1538,25 @@ mod tests {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top
         // edge) instead of vanishing, so failures stay visible on the
-        // low-probability peers the zoom targets. The fitted curve renders as a
-        // <path>, so every <circle> here is a scatter dot.
+        // low-probability peers the zoom targets. The scatter is one path of
+        // zero-length `h0` segments, one per dot; the curve has none.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "0.08",
         );
-        let circles = html.matches("<circle").count();
+        let dots = html.matches("h0").count();
         assert!(
-            circles >= 3,
-            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+            dots >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {dots}: {html}"
         );
-    }
-
-    /// This peer's hierarchical curve is drawn as its own line, not as an
-    /// adjustment of the distance curve, and it widens the auto-scaled axis.
-    #[test]
-    fn estimator_chart_draws_an_explicit_peer_curve() {
-        let curve = vec![(0.0, 0.1), (0.25, 0.2), (0.5, 0.3)];
-        let peer = vec![(0.0, 0.4), (0.25, 0.8), (0.5, 1.2)];
-        let with_peer = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            PeerLine::Curve(&peer),
-            None,
-            "0",
-            "auto",
-        );
-        let without = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            PeerLine::None,
-            None,
-            "0",
-            "auto",
-        );
-        assert_eq!(
-            with_peer.matches("#8b5cf6").count(),
-            1,
-            "exactly one peer line: {with_peer}"
-        );
-        assert_eq!(without.matches("#8b5cf6").count(), 0);
-        assert!(
-            with_peer.contains(">1.3") || with_peer.contains(">1.4"),
-            "the axis must extend to the peer curve's top (1.2 plus padding): {with_peer}"
-        );
-    }
-
-    #[test]
-    fn fmt_prediction_prob_sentinel_values() {
-        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
-        assert_eq!(fmt_prediction_prob(1.1), "N/A");
-        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
-        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
-        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
     }
 
     fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
@@ -1768,6 +1609,15 @@ mod tests {
             html.contains("data-sort=\"2048\""),
             "recv bytes cell must carry raw byte count for sorting"
         );
+    }
+
+    /// The network-wide routing page is reachable from the home dashboard,
+    /// even on a node with no peers yet (the status card always renders once
+    /// the node is up; the peers card does not).
+    #[test]
+    fn status_card_links_to_the_routing_page() {
+        let html = build_status_card(&Some(base_snapshot()));
+        assert!(html.contains(r#"href="/routing""#), "{html}");
     }
 
     #[test]

@@ -4172,6 +4172,7 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
         let log = self.candidate_log_for(log_as);
         // The router read lock is held across candidate gathering and
         // selection, as before candidate logging existed; it is released
@@ -4185,6 +4186,7 @@ impl Ring {
                     target,
                     1,
                     log.as_ref().is_some_and(|(log, _)| log.capture),
+                    routes,
                 );
                 drop(router);
                 if let Some((log, op)) = log {
@@ -4353,12 +4355,14 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
         let log = self.candidate_log_for(log_as);
         let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
             candidates.iter(),
             target_location,
             k,
             log.as_ref().is_some_and(|(log, _)| log.capture),
+            routes,
         );
         // `selected` and `capture` borrow from `candidates`, not from the
         // router guard, so the read lock is released at the end of the
@@ -11299,6 +11303,56 @@ pub(crate) mod candidate_log_wiring_tests {
 
     fn contract_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([0u8; 32]))
+    }
+
+    /// The peer page's per-peer eligible/chosen counts take only real routing
+    /// decisions, from both ring entry points; probes and pre-selections
+    /// (`DecisionLog::Unlogged`) leave them untouched.
+    #[tokio::test]
+    async fn only_routing_decisions_count_toward_per_peer_selection() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("selection-counts", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let none: Vec<SocketAddr> = Vec::new();
+        let totals = || {
+            let router = ring.router.read();
+            peers
+                .iter()
+                .fold((0u64, 0.0f64), |(eligible, chosen), peer| {
+                    let selection = router.peer_snapshot(peer).selection.unwrap_or_default();
+                    (eligible + selection.eligible, chosen + selection.chosen)
+                })
+        };
+
+        ring.k_closest_potentially_hosting(DecisionLog::Unlogged, key.id(), none.as_slice(), 2);
+        ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice());
+        assert_eq!(
+            totals(),
+            (0, 0.0),
+            "probes and pre-selections are not counted"
+        );
+
+        ring.closest_potentially_hosting(DecisionLog::Joinable(OpType::Put), &key, none.as_slice())
+            .expect("a peer is selected");
+        let (single, chosen) = totals();
+        assert!(
+            single >= 1 && chosen == 1.0,
+            "the single-peer entry point counts"
+        );
+
+        ring.k_closest_potentially_hosting(
+            DecisionLog::Joinable(OpType::Get),
+            key.id(),
+            none.as_slice(),
+            2,
+        );
+        let (both, chosen) = totals();
+        assert!(both > single, "the k-closest entry point counts");
+        assert_eq!(
+            chosen, 2.0,
+            "one first choice per decision, even with k = 2"
+        );
     }
 
     #[tokio::test]
