@@ -1639,9 +1639,9 @@ mod tests {
     fn the_reliability_tile_and_the_tabs_count_the_same_requests() {
         let (router, peers) = trained_router();
         let snaps = snapshots(&peers);
-        for index in 0..peers.len() {
+        for (index, peer) in peers.iter().enumerate() {
             let html = render(&router, &snaps, index);
-            let window = router.peer_snapshot(&peers[index]).window;
+            let window = router.peer_snapshot(peer).window;
             assert_eq!(all_tab_count(&html), window.outcomes);
             assert!(
                 html.contains(&format!(

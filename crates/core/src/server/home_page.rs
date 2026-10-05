@@ -227,8 +227,8 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        RegKind, build_accuracy_panel, build_estimator_chart, build_estimator_chart_or_placeholder,
-        build_regression_chart, build_reliability_chart, failure_chart_y_max,
+        ChartUnit, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, failure_chart_y_max,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -1231,62 +1231,6 @@ mod tests {
     }
 
     #[test]
-    fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[]);
-        assert!(svg.contains("collecting data"));
-        assert!(svg.contains("<svg"));
-    }
-
-    #[test]
-    fn reliability_chart_renders_points_and_brier() {
-        // Well-separated: low predicted -> success, high predicted -> failure.
-        let pairs: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
-            .collect();
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("Failure (calibration)"));
-        // The caption is now DERIVED from these pairs rather than supplied, so
-        // this asserts the derivation rather than echoing an argument back.
-        // Predicted i/20 against actual 0 for i<=10 and 1 for i>10:
-        let expected: f64 = (0..20)
-            .map(|i| {
-                let predicted = i as f64 / 20.0;
-                let actual = if i > 10 { 1.0 } else { 0.0 };
-                (predicted - actual).powi(2)
-            })
-            .sum::<f64>()
-            / 20.0;
-        assert!(
-            svg.contains(&format!("Brier {expected:.3}")),
-            "caption must carry the Brier of the plotted pairs ({expected:.3}), got: {svg}"
-        );
-        assert!(svg.contains("n=20"));
-        assert!(svg.contains("<circle"), "bins should render as points");
-    }
-
-    #[test]
-    fn reliability_chart_filters_nonfinite() {
-        let pairs = vec![
-            (0.5, 0.0),
-            (f64::NAN, 1.0),
-            (0.3, f64::NAN),
-            (f64::INFINITY, 0.0),
-            (0.7, 1.0),
-        ];
-        // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs);
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
-    fn reliability_chart_boundary_values_no_panic() {
-        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)]);
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
     fn regression_chart_sparse_is_placeholder() {
         // Fewer than 2 valid (positive, finite) points -> placeholder.
         let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
@@ -1305,7 +1249,10 @@ mod tests {
             .collect();
         let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
         assert!(svg.contains("Response time"));
-        assert!(svg.contains("median err"));
+        assert!(
+            svg.contains("typically within &#215;1.1 · last 20"),
+            "the headline is the typical miss factor, as on the peer page: {svg}"
+        );
         assert!(svg.contains("<circle"));
         assert!(
             svg.contains("ms"),
@@ -1376,19 +1323,18 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(build_accuracy_panel(&[], &[], &[]), String::new());
+        assert_eq!(build_accuracy_panel(&[], &[]), String::new());
     }
 
     #[test]
-    fn accuracy_panel_renders_all_three_models() {
-        let failure: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+    fn accuracy_panel_renders_both_timing_models() {
+        let response: Vec<(f64, f64)> = (1..=20)
+            .map(|i| (i as f64 * 0.01, i as f64 * 0.01))
             .collect();
-        let svg = build_accuracy_panel(&failure, &[], &[]);
-        assert!(svg.contains("Failure (calibration)"));
-        // Timing models have no data yet -> their placeholders still appear.
-        assert!(svg.contains("Response time"));
-        assert!(svg.contains("Transfer speed"));
+        let svg = build_accuracy_panel(&response, &[]);
+        assert!(svg.contains("Response time") && svg.contains("<circle"));
+        // The transfer model has no data yet, so its placeholder still appears.
+        assert!(svg.contains("Transfer speed") && svg.contains("collecting data"));
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1402,6 +1348,7 @@ mod tests {
     fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
+            ChartUnit::Seconds,
             &[],
             &[],
             (0.0, 0.0),
@@ -1431,6 +1378,7 @@ mod tests {
         let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
             &curve,
             &scatter,
             (0.0, 0.5),
@@ -1450,6 +1398,7 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
             &curve,
             &[],
             (0.0, 0.5),
@@ -1494,11 +1443,20 @@ mod tests {
     fn estimator_chart_labels_x_axis_as_distance() {
         // The x-axis is always ring distance; it must carry a "Distance" title.
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
-        let html =
-            build_estimator_chart("Failure Probability", &curve, &[], (0.0, 0.5), "0.0", "1.0");
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0.0",
+            "1.0",
+        );
         assert!(
-            html.contains(">Distance<"),
-            "estimator chart must label its x-axis 'Distance', got: {html}"
+            html.contains(
+                ">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)<"
+            ),
+            "estimator chart must label its x-axis as the peer page does, got: {html}"
         );
     }
 
@@ -1510,6 +1468,7 @@ mod tests {
         let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
             &curve,
             &[],
             (0.0, 0.5),
@@ -1537,6 +1496,7 @@ mod tests {
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
             &curve,
             &scatter,
             (0.0, 0.5),

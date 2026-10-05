@@ -7,7 +7,7 @@
 
 use super::assets::{CSS, JS, PEER_CSS};
 use super::estimator::{
-    build_accuracy_panel, build_estimator_chart_or_placeholder, failure_chart_y_max,
+    ChartUnit, build_accuracy_panel, build_estimator_chart_or_placeholder, failure_chart_y_max,
 };
 use super::*;
 use crate::router::RouterSnapshotInfo;
@@ -18,6 +18,18 @@ pub(super) struct RoutingInputs {
     pub snapshot: RouterSnapshotInfo,
     /// Peers evicted from the router's per-peer selection table.
     pub selection_evictions: u64,
+    /// Each stage's forgetting horizon, `[failure, response time, transfer]`.
+    pub horizons: [Option<f64>; 3],
+}
+
+impl RoutingInputs {
+    pub(super) fn of(router: &crate::router::Router) -> Self {
+        RoutingInputs {
+            snapshot: router.snapshot(),
+            selection_evictions: router.peer_selection_evictions(),
+            horizons: router.hierarchical_horizons(),
+        }
+    }
 }
 
 /// Render `/routing` from the live router.
@@ -26,13 +38,7 @@ pub fn routing_html() -> String {
     let version = snap
         .as_ref()
         .map_or_else(|| "?".to_string(), |s| s.version.clone());
-    let inputs = network_status::get_router().map(|lock| {
-        let router = lock.read();
-        RoutingInputs {
-            snapshot: router.snapshot(),
-            selection_evictions: router.peer_selection_evictions(),
-        }
-    });
+    let inputs = network_status::get_router().map(|lock| RoutingInputs::of(&lock.read()));
     render_routing_page(&version, inputs.as_ref())
 }
 
@@ -40,11 +46,11 @@ pub fn routing_html() -> String {
 pub(super) fn render_routing_page(version: &str, inputs: Option<&RoutingInputs>) -> String {
     let body = match inputs {
         Some(inputs) => format!(
-            "{model}{accuracy}{outcomes}{diagnostics}",
-            model = model_card(&inputs.snapshot),
+            "{notices}{accuracy}{outcomes}{diagnostics}",
+            notices = notices(&inputs.snapshot),
             accuracy = accuracy_card(&inputs.snapshot),
             outcomes = outcomes_card(&inputs.snapshot),
-            diagnostics = diagnostics_card(&inputs.snapshot, inputs.selection_evictions),
+            diagnostics = diagnostics_card(inputs),
         ),
         None => r#"<div class="card"><h2>Routing model</h2><p class="empty">Router data not available yet.</p></div>"#
             .to_string(),
@@ -63,123 +69,100 @@ fn row(label: &str, value: &str) -> String {
     format!(r#"<div class="info-label">{label}</div><div class="info-value">{value}</div>"#)
 }
 
-/// What the model is built on: which estimator routes, whether it predicts
-/// yet, and how much data each stage holds.
-fn model_card(rs: &RouterSnapshotInfo) -> String {
-    let estimator = if rs.isotonic_fallback_enabled {
-        "<strong>emergency fallback</strong> (FREENET_ROUTING_FALLBACK_ISOTONIC is set): \
-         per-distance fit with a per-peer correction"
-    } else {
-        "hierarchical (default)"
-    };
-    let predicting = if rs.prediction_active {
-        "yes".to_string()
-    } else {
-        format!(
-            "no, routing by distance until 50 requests ({} so far)",
+/// The two states that change how everything below reads, said up front.
+fn notices(rs: &RouterSnapshotInfo) -> String {
+    let mut notices = String::new();
+    if rs.isotonic_fallback_enabled {
+        notices.push_str(
+            r#"<div class="learning">Routing is on its emergency fallback (FREENET_ROUTING_FALLBACK_ISOTONIC is set): it predicts from a per-distance fit with a per-peer correction, not from the model described below.</div>"#,
+        );
+    }
+    if !rs.prediction_active {
+        write!(
+            notices,
+            r#"<div class="learning">Your node still routes by distance alone. It starts predicting after 50 requests ({} so far).</div>"#,
             rs.failure_events
         )
-    };
-    let rows = [
-        row("Estimator", estimator),
-        row("Predicting", &predicting),
-        row(
-            "Failure data",
-            &fmt_stage_status(
-                StageKind::Failure,
-                rs.hierarchical_failure_events,
-                rs.hierarchical_failure_active,
-            ),
-        ),
-        row(
-            "Response-time data",
-            &fmt_stage_status(
-                StageKind::ResponseTime,
-                rs.hierarchical_response_time_events,
-                rs.hierarchical_response_time_active,
-            ),
-        ),
-        row(
-            "Transfer-speed data",
-            &fmt_stage_status(
-                StageKind::TransferSpeed,
-                rs.hierarchical_transfer_speed_events,
-                rs.hierarchical_transfer_speed_active,
-            ),
-        ),
-        row(
-            "Forgetting horizon",
-            &fmt_horizon(
-                rs.hierarchical_failure_active,
-                rs.hierarchical_failure_events,
-                rs.hierarchical_failure_horizon_hours,
-            ),
-        ),
-    ]
-    .concat();
-    format!(
-        r#"<div class="card">
-            <h2>Routing model</h2>
-            <p class="caption">What your node has learned from its recent requests, across all peers.</p>
-            <div class="info-grid">{rows}</div>
-        </div>"#
-    )
+        .ok();
+    }
+    if notices.is_empty() {
+        notices
+    } else {
+        format!(r#"<div class="card">{notices}</div>"#)
+    }
 }
 
-/// How good the predictions are: the scores, then the charts they summarise.
+/// How good the predictions are, in sentences, then the timing charts.
 fn accuracy_card(rs: &RouterSnapshotInfo) -> String {
-    let brier = match (rs.failure_brier, rs.failure_climatology_brier) {
-        (Some(brier), Some(climatology)) => {
-            format!("{brier:.4} &middot; average-rate guess {climatology:.4}")
+    let failure = match rs.failure_skill_hierarchical.filter(|s| s.is_finite()) {
+        None => {
+            "There have been too few failures yet to judge the failure predictions.".to_string()
         }
-        (Some(brier), None) => format!("{brier:.4}"),
-        _ => "&mdash;".to_string(),
+        Some(skill) => format!(
+            "Failure predictions are {} just assuming the average failure rate.",
+            if skill.abs() < SKILL_NEAR_ZERO {
+                "about as good as"
+            } else if skill > 0.0 {
+                "better than"
+            } else {
+                "worse than"
+            }
+        ),
     };
-    let rows = [
-        row(
-            "Failure skill",
-            &format!(
-                "{} &middot; n={}",
-                fmt_skill(rs.failure_skill_hierarchical),
-                rs.hierarchical_failure_evaluated
-            ),
+    let calibration = {
+        let pairs = &rs.hierarchical_failure_pairs;
+        let predicted: f64 = pairs.iter().map(|&(p, _)| p.clamp(0.0, 1.0)).sum();
+        let happened = pairs.iter().filter(|&&(_, a)| a >= 0.5).count();
+        if pairs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Over the last {} requests it predicted {predicted:.1} failures; {happened} happened.",
+                pairs.len()
+            )
+        }
+    };
+    let timing = match (
+        typical_miss(&rs.hierarchical_response_time_pairs),
+        typical_miss(&rs.hierarchical_transfer_speed_pairs),
+    ) {
+        (Some(time), Some(speed)) => format!(
+            "<p>Replies typically land within <b>&times;{time:.1}</b> of the predicted response time, and transfers within <b>&times;{speed:.1}</b> of the predicted speed.</p>"
         ),
-        row("Brier score", &brier),
-        row(
-            "Response time, RMS",
-            &fmt_seconds_error(
-                rs.response_time_rmse_secs_isotonic,
-                rs.response_time_rmse_secs_hierarchical,
-                rs.response_time_scored,
-                rs.response_time_weight,
-            ),
+        (Some(time), None) => format!(
+            "<p>Replies typically land within <b>&times;{time:.1}</b> of the predicted response time.</p>"
         ),
-        row(
-            "Transfer time, RMS",
-            &fmt_seconds_error(
-                rs.transfer_time_rmse_secs_isotonic,
-                rs.transfer_time_rmse_secs_hierarchical,
-                rs.transfer_time_scored,
-                rs.transfer_time_weight,
-            ),
-        ),
-    ]
-    .concat();
+        _ => String::new(),
+    };
     let charts = build_accuracy_panel(
-        // The charts derive their own scores from these pairs, so each score
+        // The charts derive their own headline from these pairs, so each
         // describes the window drawn.
-        &rs.hierarchical_failure_pairs,
         &rs.hierarchical_response_time_pairs,
         &rs.hierarchical_transfer_speed_pairs,
     );
     format!(
         r#"<div class="card">
-            <h2>Prediction accuracy</h2>
-            <p class="caption">Each dot is a forecast made before its outcome was known; on the dashed diagonal it was exact.</p>
-            <div class="info-grid">{rows}</div>
+            <h2>How good are the predictions?</h2>
+            <div class="acc-facts"><p>{failure}{calibration}</p>{timing}</div>
             {charts}
         </div>"#
     )
+}
+
+/// A skill score within this of zero reads as "about as good as" the
+/// average-rate guess: at that size its sign is noise.
+const SKILL_NEAR_ZERO: f64 = 0.01;
+
+/// The median of `max(predicted / actual, actual / predicted)` over usable
+/// pairs: the factor within which half the outcomes landed, either way.
+fn typical_miss(pairs: &[(f64, f64)]) -> Option<f64> {
+    let mut misses: Vec<f64> = pairs
+        .iter()
+        .filter(|(p, a)| p.is_finite() && a.is_finite() && *p > 0.0 && *a > 0.0)
+        .map(|(p, a)| (p / a).max(a / p))
+        .collect();
+    misses.sort_by(f64::total_cmp);
+    misses.get(misses.len() / 2).copied()
 }
 
 /// Every recent outcome against ring distance, all peers, per operation type.
@@ -266,6 +249,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
             [
                 build_estimator_chart_or_placeholder(
                     "Failure probability",
+                    ChartUnit::Probability,
                     &f_curve,
                     &f_points,
                     f_range,
@@ -274,7 +258,8 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                     "No outcomes yet.",
                 ),
                 build_estimator_chart_or_placeholder(
-                    "Response time (s)",
+                    "Response time",
+                    ChartUnit::Seconds,
                     &rt_curve,
                     &rt_points,
                     rt_range,
@@ -283,7 +268,8 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
                     "No timed replies yet.",
                 ),
                 build_estimator_chart_or_placeholder(
-                    "Transfer speed (B/s)",
+                    "Transfer speed",
+                    ChartUnit::BytesPerSecond,
                     &x_curve,
                     &x_points,
                     x_range,
@@ -305,7 +291,7 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
     format!(
         r#"<div class="card">
             <h2>Outcomes by ring distance</h2>
-            <p class="caption">Recent outcomes across all peers. On All, the line is what your node predicts for a peer from distance alone.</p>
+            <p class="caption">Recent outcomes across all peers; each tab keeps its own last 500, so the operation tabs need not add up to All. On All, the line is what your node predicts for a peer from distance alone.</p>
             <div class="tab-group">
                 <div class="tab-bar">{tab_labels}</div>
                 {tab_panels}
@@ -315,23 +301,120 @@ fn outcomes_card(rs: &RouterSnapshotInfo) -> String {
 }
 
 /// The readings an operator needs only when something looks wrong, collapsed.
-fn diagnostics_card(rs: &RouterSnapshotInfo, selection_evictions: u64) -> String {
+fn diagnostics_card(inputs: &RoutingInputs) -> String {
+    let rs = &inputs.snapshot;
     let ranks = &rs.selection_ranks;
+    let [failure_h, response_h, transfer_h] = inputs.horizons;
+    let brier = match (rs.failure_brier, rs.failure_climatology_brier) {
+        (Some(brier), Some(climatology)) => {
+            format!("{brier:.4} &middot; average-rate guess {climatology:.4}")
+        }
+        (Some(brier), None) => format!("{brier:.4}"),
+        _ => "&mdash;".to_string(),
+    };
     let rows = [
+        row(
+            "Estimator",
+            if rs.isotonic_fallback_enabled {
+                "emergency fallback (FREENET_ROUTING_FALLBACK_ISOTONIC)"
+            } else {
+                "hierarchical (default)"
+            },
+        ),
+        row(
+            "Predicting",
+            &if rs.prediction_active {
+                "yes".to_string()
+            } else {
+                format!("no, {} of 50 requests", rs.failure_events)
+            },
+        ),
+        row(
+            "Outcomes learned (failure)",
+            &fmt_stage_status(
+                StageKind::Failure,
+                rs.hierarchical_failure_events,
+                rs.hierarchical_failure_active,
+            ),
+        ),
+        row(
+            "Outcomes learned (response time)",
+            &fmt_stage_status(
+                StageKind::ResponseTime,
+                rs.hierarchical_response_time_events,
+                rs.hierarchical_response_time_active,
+            ),
+        ),
+        row(
+            "Outcomes learned (transfer speed)",
+            &fmt_stage_status(
+                StageKind::TransferSpeed,
+                rs.hierarchical_transfer_speed_events,
+                rs.hierarchical_transfer_speed_active,
+            ),
+        ),
+        row(
+            "Forgetting horizon (failure)",
+            &fmt_horizon(
+                rs.hierarchical_failure_active,
+                rs.hierarchical_failure_events,
+                failure_h,
+            ),
+        ),
+        row(
+            "Forgetting horizon (response time)",
+            &fmt_horizon(
+                rs.hierarchical_response_time_active,
+                rs.hierarchical_response_time_events,
+                response_h,
+            ),
+        ),
+        row(
+            "Forgetting horizon (transfer speed)",
+            &fmt_horizon(
+                rs.hierarchical_transfer_speed_active,
+                rs.hierarchical_transfer_speed_events,
+                transfer_h,
+            ),
+        ),
+        row(
+            "Failure skill",
+            &format!(
+                "{} &middot; n={}",
+                fmt_skill(rs.failure_skill_hierarchical),
+                rs.hierarchical_failure_evaluated
+            ),
+        ),
+        row("Brier score", &brier),
+        row(
+            "Response time, RMS",
+            &fmt_seconds_error(
+                rs.response_time_rmse_secs_isotonic,
+                rs.response_time_rmse_secs_hierarchical,
+                rs.response_time_scored,
+                rs.response_time_weight,
+            ),
+        ),
+        row(
+            "Transfer time, RMS",
+            &fmt_seconds_error(
+                rs.transfer_time_rmse_secs_isotonic,
+                rs.transfer_time_rmse_secs_hierarchical,
+                rs.transfer_time_scored,
+                rs.transfer_time_weight,
+            ),
+        ),
         row(
             "Events without a peer location",
             &fmt_unlocated_discards(rs.route_events_discarded_unlocated),
         ),
         row(
             "Peer-table evictions",
-            &fmt_evictions(
-                rs.hierarchical_peer_evictions,
-                rs.hierarchical_peer_capacity,
-            ),
+            &fmt_evictions(rs.hierarchical_peer_evictions, rs.hierarchical_peer_capacity),
         ),
         row(
             "Selection-table evictions",
-            &selection_evictions.to_string(),
+            &inputs.selection_evictions.to_string(),
         ),
         row("Contract term", &fmt_contract_term(rs)),
         row(
@@ -346,13 +429,18 @@ fn diagnostics_card(rs: &RouterSnapshotInfo, selection_evictions: u64) -> String
             "Candidate window",
             &format!("{} closest peers", rs.consider_n_closest_peers),
         ),
-        row("Decisions measured", &ranks.total.to_string()),
+        row(
+            "Decisions measured",
+            &format!(
+                "{} (every prediction-based decision, connection maintenance included; peer pages count only routed requests)",
+                ranks.total
+            ),
+        ),
         row(
             "Mean chosen position",
-            &ranks.mean_rank().map_or_else(
-                || "&mdash;".to_string(),
-                |m| format!("{m:.1} (0 = closest)"),
-            ),
+            &ranks
+                .mean_rank()
+                .map_or_else(|| "&mdash;".to_string(), |m| format!("{m:.1} (0 = closest)")),
         ),
         row("Against a full window", &ranks.saturated.to_string()),
         row(
@@ -882,39 +970,112 @@ mod tests {
         );
     }
 
-    /// The page renders every section from a real router, keeps the deep
+    /// A router trained on enough mixed traffic that every stage is warm.
+    fn trained_inputs() -> RoutingInputs {
+        use crate::node::network_status::OpType;
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::router::{RouteEvent, RouteOutcome, Router};
+        use std::time::Duration;
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        for round in 0..40u64 {
+            for (index, peer) in peers.iter().enumerate() {
+                let ms = 100 + (index as u64 * 7 + round * 13) % 50;
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::random(),
+                    outcome: if (round + index as u64) % 9 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(ms),
+                            payload_size: 20_000,
+                            payload_transfer_time: Duration::from_millis(40 + ms / 4),
+                        }
+                    },
+                    op_type: Some(if round % 4 == 0 {
+                        OpType::Put
+                    } else {
+                        OpType::Get
+                    }),
+                });
+            }
+        }
+        RoutingInputs::of(&router)
+    }
+
+    /// The page renders every section from a trained router, keeps the deep
     /// diagnostics collapsed, links back home, and refreshes by JS only.
     #[test]
     fn routing_page_renders_every_section_with_diagnostics_collapsed() {
-        let inputs = RoutingInputs {
-            snapshot: snapshot(),
-            selection_evictions: 3,
-        };
-        let html = render_routing_page("0.2.141", Some(&inputs));
+        let _fallback_off = crate::router::force_isotonic_fallback(false);
+        let html = render_routing_page("0.2.141", Some(&trained_inputs()));
         for section in [
-            "Routing model",
-            "Prediction accuracy",
+            "How good are the predictions?",
+            "Failure predictions are",
+            "failures;",
+            "Replies typically land within",
             "Outcomes by ring distance",
+            "ring distance between peer and contract (0 = same spot, 0.5 = opposite side)",
             "<summary>Diagnostics</summary>",
+            "Forgetting horizon (response time)",
+            "Forgetting horizon (transfer speed)",
             "Selection-table evictions",
+            "peer pages count only routed requests",
         ] {
             assert!(html.contains(section), "missing {section:?}");
         }
         let details = html.find("<details").expect("diagnostics are collapsed");
-        assert!(
-            html.find("Contract term").is_some_and(|at| at > details),
-            "the contract term is a deep diagnostic and sits inside <details>"
-        );
+        for deep in [
+            "Contract term",
+            "Brier score",
+            "Failure skill",
+            ">Estimator<",
+        ] {
+            assert!(
+                html.find(deep).is_some_and(|at| at > details),
+                "{deep} is a deep diagnostic and sits inside <details>"
+            );
+        }
         assert!(
             !html.contains("<details open"),
             "diagnostics start collapsed"
         );
+        assert!(
+            !html.contains("Failure (calibration)"),
+            "the one-dot chart is a sentence now"
+        );
+        assert!(
+            !html.contains("emergency fallback (FREENET"),
+            "no fallback notice when it is off"
+        );
+        assert!(!html.contains("still routes by distance alone"));
         assert!(html.contains(r#"href="/""#), "links back to the dashboard");
         assert!(!html.contains("http-equiv=\"refresh\""));
         assert!(
-            html.matches(r#"<p class="caption">"#).count() <= 3,
+            html.matches(r#"<p class="caption">"#).count() <= 1,
             "at most one short caption per card"
         );
+    }
+
+    #[test]
+    fn routing_page_says_when_routing_is_on_the_fallback() {
+        let _fallback_on = crate::router::force_isotonic_fallback(true);
+        let html = render_routing_page("0.2.141", Some(&trained_inputs()));
+        let notice = html
+            .find("Routing is on its emergency fallback")
+            .expect("the fallback is named up front");
+        assert!(notice < html.find("How good are the predictions?").unwrap());
+    }
+
+    #[test]
+    fn routing_page_before_prediction_says_it_routes_by_distance() {
+        let inputs = RoutingInputs::of(&crate::router::Router::new(&[]));
+        let html = render_routing_page("0.2.141", Some(&inputs));
+        assert!(html.contains("Your node still routes by distance alone."));
+        assert!(html.contains("too few failures yet"));
     }
 
     #[test]

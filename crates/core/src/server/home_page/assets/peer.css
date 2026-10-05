@@ -447,4 +447,8 @@ svg.mchart .line-peer {
   .tab-bar {
     flex-wrap: wrap;
   }
+  .accuracy-chart {
+    width: 100%;
+    max-width: 340px;
+  }
 }

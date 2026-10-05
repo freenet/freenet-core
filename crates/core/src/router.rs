@@ -3624,6 +3624,15 @@ impl Router {
         self.failure_estimator.outcome_counts()
     }
 
+    /// The forgetting horizon each hierarchical stage is predicting with
+    /// (`None` forgets nothing), `[failure, response time, transfer speed]`.
+    /// Runtime-only; the snapshot carries the failure stage's alone.
+    pub(crate) fn hierarchical_horizons(&self) -> [Option<f64>; 3] {
+        self.hierarchical
+            .diagnostics()
+            .map(|stage| stage.selected_horizon_hours)
+    }
+
     /// Peers evicted from the per-peer selection table since the node started.
     pub(crate) fn peer_selection_evictions(&self) -> u64 {
         self.peer_selections.evictions()

@@ -33,8 +33,10 @@ pub fn failure_chart_y_max(curve_points: &[(f64, f64)]) -> f64 {
 /// masked the data-collection regression in the migration
 /// that fed only `failure_estimator` and left `response_start_time` and
 /// `transfer_rate` permanently empty.
+#[allow(clippy::too_many_arguments)]
 pub fn build_estimator_chart_or_placeholder(
     title: &str,
+    unit: ChartUnit,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
@@ -51,6 +53,7 @@ pub fn build_estimator_chart_or_placeholder(
     }
     build_estimator_chart(
         title,
+        unit,
         curve_points,
         scatter_points,
         data_range,
@@ -65,6 +68,7 @@ pub fn build_estimator_chart_or_placeholder(
 /// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
 pub fn build_estimator_chart(
     title: &str,
+    unit: ChartUnit,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
@@ -80,9 +84,9 @@ pub fn build_estimator_chart(
 
     let w: f64 = 560.0;
     // Bottom padding leaves room for both the distance tick numbers and the
-    // "Distance" axis title below them; plot height stays 160px.
+    // ring-distance axis title below them; plot height stays 160px.
     let h: f64 = 210.0;
-    let pad_l: f64 = 50.0;
+    let pad_l: f64 = 58.0;
     let pad_r: f64 = 10.0;
     let pad_t: f64 = 10.0;
     let pad_b: f64 = 40.0;
@@ -186,7 +190,7 @@ pub fn build_estimator_chart(
     // X-axis title: the x-axis is always ring distance (peer ↔ contract).
     write!(
         svg,
-        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">Distance</text>"#,
+        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)</text>"#,
         x = pad_l + plot_w / 2.0,
         y = h - 6.0,
     )
@@ -213,7 +217,11 @@ pub fn build_estimator_chart(
         let frac = i as f64 / 2.0;
         let y_val = y_min + frac * y_range;
         let sy = to_svg_y(y_val);
-        let label = format!("{y_val:.decimals$}");
+        let label = match unit {
+            ChartUnit::Probability => format!("{y_val:.decimals$}"),
+            ChartUnit::Seconds => fmt_reg_axis(RegKind::Time, y_val),
+            ChartUnit::BytesPerSecond => fmt_reg_axis(RegKind::Speed, y_val),
+        };
         write!(
             svg,
             r#"<text x="{x}" y="{sy:.0}" text-anchor="end" class="axis-label">{label}</text>"#,
@@ -367,6 +375,14 @@ pub(super) fn is_floored_speed(v: f64) -> bool {
     v.is_finite() && v > 0.0 && v <= crate::router::DEGENERATE_SPEED_FLOOR_BPS
 }
 
+/// What a distance chart's y-axis measures, for its tick labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartUnit {
+    Probability,
+    Seconds,
+    BytesPerSecond,
+}
+
 /// Which kind of regression model a scatter chart is rendering, controlling the
 /// axis unit formatting (durations vs throughput).
 #[derive(Clone, Copy)]
@@ -375,195 +391,22 @@ pub enum RegKind {
     Speed,
 }
 
-/// The prediction-accuracy charts for the estimates routing acts on: one
-/// reliability diagram for the failure forecast plus predicted-vs-actual
-/// scatters for response time and transfer speed, all from the hierarchical
-/// estimator's recent forecasts, in one wrapping row. Returns an empty string
-/// when nothing has been scored yet, so a fresh node shows no empty charts.
+/// The predicted-vs-actual charts for the timing estimates routing acts on,
+/// response time and transfer speed, from the hierarchical estimator's recent
+/// forecasts, in one wrapping row. Returns an empty string when nothing has
+/// been scored yet, so a fresh node shows no empty charts. (The failure
+/// forecast is summarised in words: at a failure rate of about 1%, a
+/// calibration chart of it is one dot.)
 pub fn build_accuracy_panel(
-    failure_pairs: &[(f64, f64)],
     response_time_pairs: &[(f64, f64)],
     transfer_speed_pairs: &[(f64, f64)],
 ) -> String {
-    if failure_pairs.is_empty() && response_time_pairs.is_empty() && transfer_speed_pairs.is_empty()
-    {
+    if response_time_pairs.is_empty() && transfer_speed_pairs.is_empty() {
         return String::new();
     }
-
-    let failure = build_reliability_chart(failure_pairs);
     let response = build_regression_chart("Response time", RegKind::Time, response_time_pairs);
     let transfer = build_regression_chart("Transfer speed", RegKind::Speed, transfer_speed_pairs);
-
-    format!(
-        r#"<div class="accuracy-row">{failure}{response}{transfer}</div>"#,
-        failure = failure,
-        response = response,
-        transfer = transfer,
-    )
-}
-
-/// Reliability (calibration) diagram for the binary failure model.
-/// X = predicted failure probability, Y = observed failure rate within each
-/// predicted-probability bin. Dots on the diagonal mean the model is calibrated;
-/// above the line it under-predicts failure, below it over-predicts.
-pub fn build_reliability_chart(pairs: &[(f64, f64)]) -> String {
-    use std::fmt::Write;
-
-    let valid: Vec<(f64, f64)> = pairs
-        .iter()
-        .copied()
-        .filter(|(p, a)| p.is_finite() && a.is_finite())
-        .map(|(p, a)| (p.clamp(0.0, 1.0), a))
-        .collect();
-
-    if valid.is_empty() {
-        return mini_chart_placeholder("Failure (calibration)", "predicted prob vs observed rate");
-    }
-
-    let n = valid.len();
-    let n_bins = 10usize;
-    let mut bin_pred_sum = vec![0.0f64; n_bins];
-    let mut bin_fail = vec![0usize; n_bins];
-    let mut bin_total = vec![0usize; n_bins];
-    for (p, a) in &valid {
-        let bin = ((p * n_bins as f64) as usize).min(n_bins - 1);
-        bin_pred_sum[bin] += p;
-        bin_total[bin] += 1;
-        if *a >= 0.5 {
-            bin_fail[bin] += 1;
-        }
-    }
-
-    let (w, h) = (260.0f64, 220.0f64);
-    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
-    let plot_w = w - pad_l - pad_r;
-    let plot_h = h - pad_t - pad_b;
-    let to_x = |v: f64| pad_l + v.clamp(0.0, 1.0) * plot_w;
-    let to_y = |v: f64| pad_t + (1.0 - v.clamp(0.0, 1.0)) * plot_h;
-
-    let mut svg = format!(
-        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">"#,
-        w = w as u32,
-        h = h as u32,
-    );
-
-    write!(
-        svg,
-        r#"<text x="{x}" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">Failure (calibration)</text>"#,
-        x = pad_l,
-    )
-    .ok();
-    // Computed from the pairs THIS CHART PLOTS, not handed in.
-    //
-    // Both quantities previously available to pass here describe a different
-    // window from the one drawn: the overall Brier is lifetime, and
-    // `recent_brier_score` is an EWMA with alpha=0.01 over the whole run, which
-    // after any regime change weights observations the chart is not showing. So
-    // captioning "Brier x - n=200" with either one states a score and a sample
-    // size that do not belong to each other. Deriving it here makes the caption
-    // true by construction.
-    let headline = {
-        let brier = valid
-            .iter()
-            .map(|(predicted, actual)| (predicted - actual).powi(2))
-            .sum::<f64>()
-            / n as f64;
-        if brier.is_finite() {
-            format!("Brier {brier:.3} · n={n}")
-        } else {
-            format!("n={n}")
-        }
-    };
-    write!(
-        svg,
-        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">{headline}</text>"#,
-        x = pad_l,
-    )
-    .ok();
-
-    write!(
-        svg,
-        r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
-        lx = pad_l,
-        ty = pad_t,
-        pw = plot_w,
-        ph = plot_h,
-    )
-    .ok();
-
-    // perfect-calibration diagonal
-    write!(
-        svg,
-        r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4"/>"#,
-        x1 = to_x(0.0),
-        y1 = to_y(0.0),
-        x2 = to_x(1.0),
-        y2 = to_y(1.0),
-    )
-    .ok();
-
-    // axis ticks at 0 / 0.5 / 1 on both axes
-    for &v in &[0.0_f64, 0.5, 1.0] {
-        write!(
-            svg,
-            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{v}</text>"#,
-            x = to_x(v),
-            y = pad_t + plot_h + 12.0,
-        )
-        .ok();
-        write!(
-            svg,
-            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{v}</text>"#,
-            x = pad_l - 4.0,
-            y = to_y(v) + 3.0,
-        )
-        .ok();
-    }
-
-    // calibration curve through non-empty bins (in predicted-probability order)
-    let mut pts: Vec<(f64, f64, usize)> = Vec::new();
-    for b in 0..n_bins {
-        if bin_total[b] == 0 {
-            continue;
-        }
-        let mean_pred = bin_pred_sum[b] / bin_total[b] as f64;
-        let obs_rate = bin_fail[b] as f64 / bin_total[b] as f64;
-        pts.push((mean_pred, obs_rate, bin_total[b]));
-    }
-    if pts.len() >= 2 {
-        let path = pts
-            .iter()
-            .map(|(px, py, _)| format!("{:.1},{:.1}", to_x(*px), to_y(*py)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        write!(
-            svg,
-            r#"<polyline points="{path}" fill="none" stroke="var(--accent-primary, #58a6ff)" stroke-width="1.5" opacity="0.8"/>"#,
-        )
-        .ok();
-    }
-    let max_bin = bin_total.iter().copied().max().unwrap_or(1).max(1);
-    for (px, py, count) in &pts {
-        let r = 2.5 + 3.5 * (*count as f64 / max_bin as f64).sqrt();
-        write!(
-            svg,
-            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="var(--accent-primary, #58a6ff)" opacity="0.85"/>"#,
-            cx = to_x(*px),
-            cy = to_y(*py),
-        )
-        .ok();
-    }
-
-    write!(
-        svg,
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted fail prob</text>"#,
-        x = pad_l + plot_w / 2.0,
-        y = h - 1.0,
-    )
-    .ok();
-
-    svg.push_str("</svg>");
-    svg
+    format!(r#"<div class="accuracy-row">{response}{transfer}</div>"#)
 }
 
 /// Predicted-vs-actual scatter for a regression model (response time, transfer
@@ -586,16 +429,12 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
 
     let n = valid.len();
 
-    // Median absolute percentage error (robust to the heavy tails of latency /
-    // throughput) as the single headline number.
-    let mut apes: Vec<f64> = valid.iter().map(|(p, a)| ((p - a) / a).abs()).collect();
-    apes.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = apes.len() / 2;
-    let mdape = if apes.len() % 2 == 0 {
-        (apes[mid - 1] + apes[mid]) / 2.0
-    } else {
-        apes[mid]
-    };
+    // The factor within which half the outcomes landed, either way: the same
+    // reading the peer page gives (robust to the heavy tails of latency and
+    // throughput).
+    let mut misses: Vec<f64> = valid.iter().map(|(p, a)| (p / a).max(a / p)).collect();
+    misses.sort_by(f64::total_cmp);
+    let typical_miss = misses[misses.len() / 2];
 
     // Shared log range across predicted and actual so the diagonal is 45°.
     let mut lo = f64::INFINITY;
@@ -638,9 +477,8 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
     .ok();
     write!(
         svg,
-        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">median err {pct:.0}% · n={n}</text>"#,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">typically within &#215;{typical_miss:.1} · last {n}</text>"#,
         x = pad_l,
-        pct = mdape * 100.0,
     )
     .ok();
 
@@ -716,7 +554,7 @@ pub fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) 
 
     write!(
         svg,
-        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted (x) vs actual (y)</text>"#,
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted (across) against actual (up)</text>"#,
         x = pad_l + plot_w / 2.0,
         y = h - 1.0,
     )
@@ -732,24 +570,37 @@ fn fmt_reg_axis(kind: RegKind, v: f64) -> String {
     match kind {
         RegKind::Time => {
             if v >= 1.0 {
-                format!("{v:.0}s")
+                format!("{} s", trim_one(v))
             } else if v >= 0.001 {
-                format!("{:.0}ms", v * 1000.0)
+                format!("{:.0} ms", v * 1000.0)
+            } else if v > 0.0 {
+                format!("{:.0} µs", v * 1_000_000.0)
             } else {
-                format!("{:.0}µs", v * 1_000_000.0)
+                "0".to_string()
             }
         }
         RegKind::Speed => {
             if v >= 1e9 {
-                format!("{:.0}GB/s", v / 1e9)
+                format!("{} GB/s", trim_one(v / 1e9))
             } else if v >= 1e6 {
-                format!("{:.0}MB/s", v / 1e6)
+                format!("{} MB/s", trim_one(v / 1e6))
             } else if v >= 1e3 {
-                format!("{:.0}KB/s", v / 1e3)
+                format!("{:.0} KB/s", v / 1e3)
+            } else if v > 0.0 {
+                format!("{v:.0} B/s")
             } else {
-                format!("{v:.0}B/s")
+                "0".to_string()
             }
         }
+    }
+}
+
+/// A value with one decimal, or none when it is whole.
+fn trim_one(v: f64) -> String {
+    if (v - v.round()).abs() < 0.05 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
     }
 }
 
