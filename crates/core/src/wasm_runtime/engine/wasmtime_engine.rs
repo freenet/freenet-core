@@ -578,7 +578,7 @@ fn start_epoch_ticker() {
             // Thread-spawn failure (e.g. transient thread exhaustion). RESET the
             // started flag so the next engine registration retries (#4864
             // round-8) — a latched failure would permanently disable preemption.
-            // Meanwhile timeouts fall back to the wall-clock poll in
+            // Meanwhile timeouts fall back to the wall-clock backstop in
             // `execute_wasm_blocking` (the pre-#4861 behavior) — degraded, not
             // broken. The never-started liveness check in
             // `detect_stale_epoch_ticker` makes a persistent failure loud.
@@ -595,7 +595,7 @@ fn start_epoch_ticker() {
 /// ticker has ticked before but its heartbeat is now far older than the tick
 /// period, the thread is dead and epoch preemption is silently disabled — emit a
 /// rate-limited ERROR so the degradation is loudly visible. (Execution still
-/// falls back to the wall-clock poll in `execute_wasm_blocking`, so this is
+/// falls back to the wall-clock backstop in `execute_wasm_blocking`, so this is
 /// degraded, not broken.)
 /// Pure liveness decision for the epoch ticker (#4864 review + round-8), factored
 /// out so it is unit-testable without the global ticker statics. Reports the
@@ -659,7 +659,7 @@ fn detect_stale_epoch_ticker() {
             ticks_total = EPOCH_TICKS_TOTAL.load(Ordering::Relaxed),
             never_started = heartbeat == 0,
             "wasm-epoch-ticker appears DEAD — epoch preemption disabled; runaway \
-             guest timeouts now fall back to the wall-clock poll only"
+             guest timeouts now fall back to the wall-clock backstop only"
         );
     }
 }
@@ -1261,7 +1261,7 @@ impl WasmtimeEngine {
         // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
         // at guest-start makes the epoch budget (and the wall-clock backstop in
         // execute_wasm_blocking) measure from when the guest actually runs. The
-        // wall-clock poll is a backstop; the epoch trap is what actually stops a
+        // wall-clock wait is only a backstop; the epoch trap is what actually stops a
         // runaway synchronous guest. Capture the tick budget by value since the
         // closure can't borrow `self`.
         let epoch_ticks = self.epoch_deadline_ticks;
@@ -2245,10 +2245,10 @@ enum BlockingResult {
     Panic(anyhow::Error),
 }
 
-/// Verdict from the wall-clock backstop poll in [`execute_wasm_blocking`].
+/// Verdict from the wall-clock backstop wait in [`execute_wasm_blocking`].
 #[derive(Debug, PartialEq, Eq)]
 enum WallVerdict {
-    /// Neither bound exceeded yet — keep polling.
+    /// Neither bound exceeded yet — keep waiting.
     KeepWaiting,
     /// The guest RAN and consumed its full budget (measured from guest-start,
     /// not from enqueue) — a real, contract-intrinsic timeout backing up the
@@ -2309,6 +2309,79 @@ fn classify_wall_timeout(
     }
 }
 
+/// Time left until the wall-clock bound that applies right now: the queue bound
+/// while the job is still queued, the guest's own budget (from its start) once
+/// it runs. Zero once that bound has passed. The counterpart of
+/// [`classify_wall_timeout`], which it must mirror exactly: whenever that
+/// returns `KeepWaiting`, this is non-zero.
+fn time_to_next_wall_bound(
+    started_at: Option<Duration>,
+    elapsed: Duration,
+    budget: Duration,
+) -> Duration {
+    match started_at {
+        Some(started_at) => started_at.saturating_add(budget).saturating_sub(elapsed),
+        None => budget.saturating_sub(elapsed),
+    }
+}
+
+/// Outcome of [`wait_for_guest`].
+enum GuestWait {
+    /// The job ran to completion and sent its result.
+    Done(WasmResult),
+    /// The job ended without sending a result: it panicked, or it was dropped
+    /// unrun (runtime shutdown). The caller joins the job to find out which.
+    Ended,
+    /// The guest ran past its budget: [`WallVerdict::GuestOverran`].
+    GuestOverran,
+    /// The job never left the queue: [`WallVerdict::QueuedTooLong`].
+    QueuedTooLong,
+}
+
+/// Block until the job's result arrives or a wall-clock bound passes, waking
+/// the moment either happens.
+///
+/// This replaces a loop that slept 10 ms between `is_finished()` checks. Its
+/// first check ran immediately after the spawn, so practically every WASM call
+/// paid at least one full 10 ms tick on top of its ~1-4 ms of CPU.
+///
+/// Classification is unchanged: each wake re-reads `started_at` and asks
+/// [`classify_wall_timeout`]. A job that starts while queued moves its deadline
+/// out; the wait wakes at the old queue bound, sees the job running, and
+/// re-arms for the guest bound, so a late start still gets its full budget.
+/// When a bound passes at the same moment the result lands, the result wins,
+/// as it did when the old loop checked `is_finished()` before the deadline.
+fn wait_for_guest(
+    rx: &std::sync::mpsc::Receiver<WasmResult>,
+    start: std::time::Instant,
+    budget: Duration,
+    read_started_at: &dyn Fn() -> Option<Duration>,
+) -> GuestWait {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    loop {
+        let started_at = read_started_at();
+        let elapsed = start.elapsed();
+        match classify_wall_timeout(started_at, elapsed, budget) {
+            WallVerdict::KeepWaiting => {}
+            verdict @ (WallVerdict::GuestOverran | WallVerdict::QueuedTooLong) => {
+                return match rx.try_recv() {
+                    Ok(result) => GuestWait::Done(result),
+                    Err(TryRecvError::Disconnected) => GuestWait::Ended,
+                    Err(TryRecvError::Empty) if verdict == WallVerdict::GuestOverran => {
+                        GuestWait::GuestOverran
+                    }
+                    Err(TryRecvError::Empty) => GuestWait::QueuedTooLong,
+                };
+            }
+        }
+        match rx.recv_timeout(time_to_next_wall_bound(started_at, elapsed, budget)) {
+            Ok(result) => return GuestWait::Done(result),
+            Err(RecvTimeoutError::Disconnected) => return GuestWait::Ended,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where
     F: FnOnce() -> WasmResult + Send + 'static,
@@ -2339,14 +2412,23 @@ where
     // the duration of this one call. Production never overrides the clock, so
     // this reads and forwards `None` — a no-op.
     let clock_override = native_api::time::current_contract_clock_override();
-    let f = move || {
-        // Record started_at BEFORE flipping `started`, so the poll loop that
+    // The job hands its result back over this channel so the waiter wakes the
+    // moment it finishes. Capacity 1 and exactly one send, so the send never
+    // blocks. A job that panics, or is dropped unrun, drops `result_tx` without
+    // sending, which the waiter sees as a disconnect.
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+    let job = move || {
+        // Record started_at BEFORE flipping `started`, so a waiter that
         // observes started==true (SeqCst) is guaranteed to read a valid
         // started_at.
         started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
-        let _clock_guard = clock_override.map(native_api::time::override_contract_clock);
-        f()
+        let clock_guard = clock_override.map(native_api::time::override_contract_clock);
+        let result = f();
+        drop(clock_guard);
+        // The waiter may have hit its deadline and gone; a failed send is fine.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = result_tx.send(result);
     };
 
     // Read the guest-start clock as `Some` only once the guest has actually
@@ -2365,13 +2447,21 @@ where
     // Production is multi-threaded and keeps the spawn_blocking path.
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            let task_handle = tokio::task::spawn_blocking(f);
+            let task_handle = tokio::task::spawn_blocking(job);
 
-            loop {
-                if task_handle.is_finished() {
-                    return match tokio::task::block_in_place(|| handle.block_on(task_handle)) {
-                        Ok((Ok(value), store)) => BlockingResult::Ok(value, store),
-                        Ok((Err(err), store)) => BlockingResult::WasmError(err, store),
+            // ONE `block_in_place` covers the whole wait, so the calling worker
+            // hands its core to another thread for as long as it blocks. The old
+            // poll slept on the worker itself, outside `block_in_place`, and so
+            // took the core out of service without telling the runtime.
+            tokio::task::block_in_place(|| {
+                match wait_for_guest(&result_rx, start, budget, &read_started_at) {
+                    GuestWait::Done((Ok(value), store)) => BlockingResult::Ok(value, store),
+                    GuestWait::Done((Err(err), store)) => BlockingResult::WasmError(err, store),
+                    // The task is finishing or finished; join it for the cause.
+                    GuestWait::Ended => match handle.block_on(task_handle) {
+                        Ok(()) => BlockingResult::Panic(anyhow::anyhow!(
+                            "WASM task exited without sending result"
+                        )),
                         Err(e) => {
                             if e.is_panic() {
                                 tracing::error!("WASM blocking task panicked during execution");
@@ -2387,21 +2477,17 @@ where
                                 ))
                             }
                         }
-                    };
-                }
-
-                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
-                    WallVerdict::KeepWaiting => {}
-                    WallVerdict::GuestOverran => {
+                    },
+                    GuestWait::GuestOverran => {
                         task_handle.abort();
                         tracing::warn!(
                             timeout_secs = max_execution_seconds,
                             elapsed_ms = start.elapsed().as_millis(),
                             "WASM execution timed out (guest running past its budget; epoch backstop)"
                         );
-                        return BlockingResult::Timeout;
+                        BlockingResult::Timeout
                     }
-                    WallVerdict::QueuedTooLong => {
+                    GuestWait::QueuedTooLong => {
                         task_handle.abort();
                         tracing::warn!(
                             timeout_secs = max_execution_seconds,
@@ -2409,75 +2495,55 @@ where
                             "WASM execution timed out while QUEUED (guest never started; \
                              blocking-pool saturation) — treated as transient, contract not quarantined"
                         );
-                        return BlockingResult::QueuedTimeout;
+                        BlockingResult::QueuedTimeout
                     }
                 }
-
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            })
         }
         // No tokio runtime, or a current_thread runtime (block_in_place would
-        // panic): run on a dedicated std::thread and poll with the timeout.
+        // panic): run on a dedicated std::thread and wait with the timeout.
         _ => {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let thread_handle = std::thread::spawn(move || {
-                let result = f();
-                // Receiver may have timed out; send failure is non-fatal
-                #[allow(clippy::let_underscore_must_use)]
-                let _ = tx.send(result);
-            });
+            let thread_handle = std::thread::spawn(job);
 
-            loop {
-                match rx.try_recv() {
-                    Ok((Ok(value), store)) => {
-                        let _join = thread_handle.join();
-                        return BlockingResult::Ok(value, store);
-                    }
-                    Ok((Err(err), store)) => {
-                        let _join = thread_handle.join();
-                        return BlockingResult::WasmError(err, store);
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return match thread_handle.join() {
-                            Err(_) => {
-                                tracing::error!("WASM thread panicked during execution");
-                                BlockingResult::Panic(anyhow::anyhow!("WASM execution panicked"))
-                            }
-                            Ok(()) => BlockingResult::Panic(anyhow::anyhow!(
-                                "WASM thread exited without sending result"
-                            )),
-                        };
-                    }
+            // Same wait and the same started-flag classification as the
+            // multi-thread arm. On a deadline the detached thread is left to
+            // finish and drop the store on its own (as before).
+            match wait_for_guest(&result_rx, start, budget, &read_started_at) {
+                GuestWait::Done((Ok(value), store)) => {
+                    let _join = thread_handle.join();
+                    BlockingResult::Ok(value, store)
                 }
-
-                // Same started-flag classification as the multi-thread arm. The
-                // detached thread is left to finish and drop the store on its own
-                // (as before); only the RESULT classification differs by whether
-                // the guest ran.
-                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
-                    WallVerdict::KeepWaiting => {}
-                    WallVerdict::GuestOverran => {
-                        tracing::warn!(
-                            timeout_secs = max_execution_seconds,
-                            elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
-                        );
-                        return BlockingResult::Timeout;
-                    }
-                    WallVerdict::QueuedTooLong => {
-                        tracing::warn!(
-                            timeout_secs = max_execution_seconds,
-                            elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out while QUEUED (guest never started; \
-                             blocking-pool saturation, no tokio runtime) — treated as transient, \
-                             contract not quarantined"
-                        );
-                        return BlockingResult::QueuedTimeout;
-                    }
+                GuestWait::Done((Err(err), store)) => {
+                    let _join = thread_handle.join();
+                    BlockingResult::WasmError(err, store)
                 }
-
-                std::thread::sleep(Duration::from_millis(10));
+                GuestWait::Ended => match thread_handle.join() {
+                    Err(_) => {
+                        tracing::error!("WASM thread panicked during execution");
+                        BlockingResult::Panic(anyhow::anyhow!("WASM execution panicked"))
+                    }
+                    Ok(()) => BlockingResult::Panic(anyhow::anyhow!(
+                        "WASM thread exited without sending result"
+                    )),
+                },
+                GuestWait::GuestOverran => {
+                    tracing::warn!(
+                        timeout_secs = max_execution_seconds,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
+                    );
+                    BlockingResult::Timeout
+                }
+                GuestWait::QueuedTooLong => {
+                    tracing::warn!(
+                        timeout_secs = max_execution_seconds,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "WASM execution timed out while QUEUED (guest never started; \
+                         blocking-pool saturation, no tokio runtime) — treated as transient, \
+                         contract not quarantined"
+                    );
+                    BlockingResult::QueuedTimeout
+                }
             }
         }
     }
@@ -3341,65 +3407,73 @@ mod tests {
     /// on the multi-thread arm, not 200), while a 1 ms job never does.
     const LATENCY_JOB_WORK: Duration = Duration::from_millis(1);
 
-    /// Run `calls` short jobs back to back and return the total wall time.
-    fn time_short_calls(calls: u32) -> Duration {
+    /// Run `calls` short jobs back to back and return each call's wall time,
+    /// sorted.
+    fn time_short_calls(calls: usize) -> Vec<Duration> {
         let mut store = stub_store();
-        let start = std::time::Instant::now();
+        let mut latencies = Vec::with_capacity(calls);
         for _ in 0..calls {
             let job = move || {
                 std::thread::sleep(LATENCY_JOB_WORK);
                 (Ok(42), store)
             };
+            let start = std::time::Instant::now();
             match execute_wasm_blocking(job, 5.0) {
                 BlockingResult::Ok(42, s) => store = s,
                 _ => panic!("a short job must come back Ok(42)"),
             }
+            latencies.push(start.elapsed());
         }
-        start.elapsed()
+        latencies.sort();
+        latencies
     }
 
-    /// Calls per latency test, and the bound on their TOTAL wall time.
+    /// Calls per latency test, and the bound on their MEDIAN wall time.
     ///
     /// The old wait polled `is_finished()` with a 10 ms `thread::sleep` and the
-    /// first poll ran immediately after the spawn, so every 1 ms job cost at
-    /// least 10 ms: 20 calls >= 200 ms. A completion wait costs the job's 1 ms
-    /// plus a thread handoff (tens of microseconds): ~20 ms. The 100 ms bound
-    /// (5 ms mean) is decisive against the poll and leaves a loaded CI runner
-    /// ~5x headroom.
-    const LATENCY_CALLS: u32 = 20;
-    const LATENCY_TOTAL_BOUND: Duration = Duration::from_millis(100);
+    /// first poll ran immediately after the spawn, so a 1 ms job could only
+    /// return early if the caller was preempted for over 1 ms between spawning
+    /// and its first check: in practice every call cost >= 11 ms. A completion
+    /// wait costs the job's 1 ms plus a thread handoff: ~1.1 ms idle.
+    ///
+    /// The MEDIAN, not the total, because the total is load-sensitive: with
+    /// this module's other tests running in parallel on a loaded host, the new
+    /// wait's TOTAL for 20 calls reached 132 ms (a few slow outliers) though
+    /// most calls stayed near 1 ms. The median ignores outliers in both
+    /// directions, so neither a loaded runner nor a lucky preemption under the
+    /// old poll can flip it.
+    const LATENCY_CALLS: usize = 31;
+    const LATENCY_MEDIAN_BOUND: Duration = Duration::from_millis(6);
+
+    fn assert_median_latency(arm: &str, latencies: &[Duration]) {
+        let median = latencies[latencies.len() / 2];
+        assert!(
+            median < LATENCY_MEDIAN_BOUND,
+            "{arm}: median of {LATENCY_CALLS} 1 ms WASM jobs was {median:?} (bound \
+             {LATENCY_MEDIAN_BOUND:?}); the wait is sleeping on a poll interval instead of \
+             waking on completion. All latencies: {latencies:?}"
+        );
+    }
 
     /// A job that finishes in 1 ms must return in ~1 ms, not on the next 10 ms
-    /// poll tick. Run on a WORKER (via `tokio::spawn`), the context
-    /// production calls from, so the `block_in_place` path is the real one.
+    /// poll tick. Run on a WORKER (via `tokio::spawn`), the context production
+    /// calls from, so the `block_in_place` path is the real one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fast_job_returns_promptly_on_multithread_runtime() {
-        let total = tokio::spawn(async { time_short_calls(LATENCY_CALLS) })
+        let latencies = tokio::spawn(async { time_short_calls(LATENCY_CALLS) })
             .await
             .expect("latency task must not panic");
-        assert!(
-            total < LATENCY_TOTAL_BOUND,
-            "{LATENCY_CALLS} 1 ms WASM jobs took {total:?} (bound {LATENCY_TOTAL_BOUND:?}): \
-             the wait is sleeping on a poll interval instead of waking on completion"
-        );
+        assert_median_latency("multi-thread runtime", &latencies);
     }
 
     /// Same for the no-runtime arm (dedicated `std::thread`), which had its own
     /// copy of the 10 ms poll.
     #[test]
     fn fast_job_returns_promptly_without_runtime() {
-        let total = time_short_calls(LATENCY_CALLS);
-        assert!(
-            total < LATENCY_TOTAL_BOUND,
-            "{LATENCY_CALLS} 1 ms WASM jobs took {total:?} (bound {LATENCY_TOTAL_BOUND:?}) \
-             on the no-runtime arm"
-        );
+        assert_median_latency("no runtime", &time_short_calls(LATENCY_CALLS));
     }
 
-    /// A runtime whose blocking pool has exactly ONE thread, plus a handle that
-    /// occupies it until `hold` elapses. `hold_started` is received once the
-    /// blocker is actually ON the thread, so the next `spawn_blocking` is
-    /// guaranteed to queue.
+    /// A runtime whose blocking pool has exactly ONE thread.
     fn one_blocking_thread_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -3409,6 +3483,9 @@ mod tests {
             .expect("test runtime must build")
     }
 
+    /// Occupy the single blocking thread of [`one_blocking_thread_runtime`] for
+    /// `hold`. Returns only once the blocker is actually ON the thread, so the
+    /// next `spawn_blocking` is guaranteed to queue.
     fn occupy_the_blocking_thread(hold: Duration) -> tokio::task::JoinHandle<()> {
         let (on_thread_tx, on_thread_rx) = std::sync::mpsc::channel();
         let blocker = tokio::task::spawn_blocking(move || {
