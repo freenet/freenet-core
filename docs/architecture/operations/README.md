@@ -216,7 +216,7 @@ stateDiagram-v2
 ```
 
 **Key features:**
-- Accept-only-at-terminus rule (creates local connections)
+- Terminus acceptance: the peer that can't forward closer to the target accepts (or the request routes uphill if it declines), so the connection lands near where the joiner aimed
 - NAT traversal via ObservedAddress message
 - First relay discovers joiner's external IP
 
@@ -230,10 +230,16 @@ Joiner ← Gateway ← Relay ← ConnectResponse
 ```
 
 **Acceptance criteria:**
-1. Can forward to closer peer? → Forward only
-2. At terminus + below min_connections → Accept
-3. At terminus + at max_connections → Reject
-4. At terminus + between limits → Density-based evaluation
+1. Can forward to closer peer? → Forward (a relay within 0.05 of the target may also accept probabilistically)
+2. At terminus but `should_accept` declines → route uphill (bounded by `uphill_budget`)
+
+`should_accept`:
+1. At max_connections → Reject (except nearest-neighbor lattice edges)
+2. Below min_connections → Accept below 3 open connections, then probabilistically by Kleinberg gap score
+3. Between limits → Kleinberg gap score fed through the `ConnectionEvaluator`
+
+The joiner's choice of target location (own location early on, then log-distance gap
+targeting) shapes the topology; see [ring/README.md](../ring/README.md#small-world-properties).
 
 **Code reference:** `crates/core/src/operations/connect.rs`
 

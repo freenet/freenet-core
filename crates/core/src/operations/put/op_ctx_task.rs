@@ -1752,8 +1752,8 @@ async fn run_relay_put<CB>(
 /// the request keeps wandering — finalizing (and placing its
 /// authoritative replica) far from where greedy GETs will look.
 ///
-/// This is the PUT analogue of the ring's accept-only-at-terminus rule
-/// (`.claude/rules/ring.md`): a node is the routing terminus once it
+/// This is the PUT analogue of CONNECT's terminus acceptance
+/// (`RelayState::step` in `operations/connect.rs`): a node is the routing terminus once it
 /// cannot forward to a peer strictly closer to the target than itself.
 /// When that holds, finalize here — the closest-seen node along the
 /// chain — rather than push the request (and a worse-placed replica) to
@@ -1818,8 +1818,8 @@ async fn run_relay_put<CB>(
 ///   → keep forwarding.
 /// - Only once the chain has provably descended to a local minimum and
 ///   the next hop would climb back out do we finalize — placing the
-///   authoritative replica at the closest-seen node, exactly as the
-///   ring's accept-only-at-terminus rule places connections.
+///   authoritative replica at the closest-seen node, exactly as
+///   CONNECT's terminus acceptance places connections.
 ///
 /// The skip-list still prevents loops and HTL still bounds the chain, so
 /// the guard only ever *shortens* an overshooting tail; it never strands

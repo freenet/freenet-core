@@ -5,15 +5,33 @@
 //!
 //! ## Connection Target Selection
 //!
-//! Outbound connection targets are selected using **gap-based targeting**: the center of
-//! the largest gap in the node's current connection distribution in log-distance space.
-//! This makes target selection adaptive — nodes converge to the ideal 1/d distribution
-//! faster by actively seeking the most deficient distance range. See
-//! `small_world_rand::gap_target_directional`.
+//! A Kleinberg 1/d distance distribution is uniform in log-distance, so the goal is
+//! connection distances that cover log-distance space evenly. The primary mechanism is
+//! **gap-based targeting**: aim at the center of the largest gap in the node's current
+//! connection distances in log-distance space. This makes target selection adaptive:
+//! nodes converge to the 1/d distribution faster by actively seeking the most deficient
+//! distance range. See `small_world_rand::gap_target_directional`, which analyzes the
+//! clockwise and counter-clockwise half-rings independently.
 //!
-//! When the node has no existing connections or its own location is unknown (during very
-//! early bootstrap), the fallback is random Kleinberg 1/d sampling via inverse CDF:
-//! `d = d_min * (d_max/d_min)^U` where U ~ Uniform(0,1).
+//! [`TopologyManager::adjust_topology`] picks targets as follows:
+//!
+//! - Below `DENSITY_SELECTION_THRESHOLD` (5) connections and below `min_connections`:
+//!   own location first, then evenly spaced ring locations (`bootstrap_target_locations`).
+//! - Otherwise `sample_targets` is used. Its first target is always a directional gap
+//!   target. When several targets are requested at once (below min_connections), the
+//!   rest alternate with random Kleinberg 1/d samples (`small_world_rand::kleinberg_target`,
+//!   inverse CDF `d = d_min * (d_max/d_min)^U`), which route along different paths and
+//!   discover peers the gap targets would miss. Steady-state growth requests one target,
+//!   so it is always a gap target.
+//! - Topology swaps target the largest directional gap.
+//!
+//! Random Kleinberg sampling is also the fallback inside `gap_target_directional` when
+//! there are no in-range connection distances. When own location is unknown, targets
+//! are uniformly random.
+//!
+//! `operations::connect::join_ring_request` (gateway joins, cached-peer reconnects, the
+//! startup loop) targets separately: own location (with jitter) below 3 connections, then
+//! the non-directional `small_world_rand::gap_target`.
 //!
 //! ## When to Add/Remove/Swap
 //!
@@ -47,14 +65,17 @@
 //! Two acceptance policies use this score:
 //!
 //! 1. **Below min_connections** (`should_accept` in connection_manager): Probabilistic
-//!    acceptance with a 50% floor. Higher gap scores get higher acceptance probability.
-//!    This shapes the distribution during bootstrap without blocking it.
+//!    acceptance, `accept_prob = floor + gap_score`, where the floor slides from 0.9 at
+//!    `KLEINBERG_FILTER_MIN_CONNECTIONS` down to 0.3 as the node approaches
+//!    min_connections. This shapes the distribution during bootstrap without blocking it.
 //!
 //! 2. **At/above min_connections**: The gap score is fed into the [`ConnectionEvaluator`]
 //!    which rate-limits acceptance by picking the best candidate from recent arrivals.
 //!
 //! Below `KLEINBERG_FILTER_MIN_CONNECTIONS` (3), all connections are accepted
-//! unconditionally to avoid blocking initial bootstrap.
+//! unconditionally to avoid blocking initial bootstrap. Independently of the gap score,
+//! a candidate that would become a new per-side nearest ring neighbor is admitted by the
+//! nearest-neighbor lattice exception (see `ConnectionManager::should_accept`).
 //!
 //! ## Removing Connections
 //!
@@ -101,13 +122,16 @@ use request_density_tracker::DensityMapError;
 
 /// Manages peer connection topology: adding, removing, and evaluating connections.
 ///
-/// New connection targets are sampled from Kleinberg's 1/d distribution centered
-/// on the peer's own ring location (see [`small_world_rand::kleinberg_target`]).
+/// New connection targets come from [`Self::adjust_topology`]: during bootstrap, the
+/// peer's own location plus evenly spaced ring locations; after that, gap-based targets
+/// in log-distance space, sometimes mixed with random Kleinberg 1/d samples (see the
+/// module docs).
 ///
 /// The manager uses a [`ConnectionEvaluator`] to evaluate whether an incoming
-/// connection candidate is better than all other candidates seen within a time
-/// window, and a [`RequestDensityTracker`] to score candidates by request density
-/// at their location.
+/// connection candidate's Kleinberg gap score beats the other candidates seen within
+/// a time window. The [`RequestDensityTracker`] still records request targets, but
+/// the density map it produces is only consumed by tests; it does not influence
+/// targeting or acceptance.
 pub(crate) struct TopologyManager {
     limits: Limits,
     meter: Meter,
@@ -461,8 +485,12 @@ impl TopologyManager {
     ///
     /// When adding connections, targets are selected using gap-based targeting:
     /// the center of the largest gap in the node's connection distribution in
-    /// log-distance space (see `small_world_rand::gap_target_directional`).
-    /// When own location is unknown, random targets are used as fallback.
+    /// log-distance space (see `small_world_rand::gap_target_directional`),
+    /// alternated with random Kleinberg samples by `sample_targets` when several
+    /// targets are requested. Below `DENSITY_SELECTION_THRESHOLD` connections (and
+    /// below min_connections), bootstrap targets are used instead
+    /// (`bootstrap_target_locations`). When own location is unknown, random targets
+    /// are used as fallback.
     pub(crate) fn adjust_topology(
         &mut self,
         neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
@@ -474,7 +502,8 @@ impl TopologyManager {
         if current_connections < self.limits.min_connections {
             let needed = self.limits.min_connections - current_connections;
 
-            // With 5+ connections, use gap-based targeting
+            // With 5+ connections, use gap-based targeting mixed with random
+            // Kleinberg samples (see sample_targets)
             if current_connections >= DENSITY_SELECTION_THRESHOLD {
                 let locations = Self::sample_targets(my_location, neighbor_locations, needed);
                 return TopologyAdjustment::AddConnections(locations);
