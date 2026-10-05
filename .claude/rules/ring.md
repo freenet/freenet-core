@@ -293,21 +293,27 @@ WHEN touching the router:
     Router-level tests inject a SharedMockTimeSource and advance it by hand.
   → Its peer tables are sized from max_connections (peer_capacity), evict
     LRU in batches, and export evictions — do not hard-code a peer cap
-  → The peer page reads the router two ways, and they are not
-    interchangeable. Its "N× faster/slower than distance alone" and failure
-    percentage points come from peer_offsets: the learned TYPICAL difference
-    (exp(offset) for timing), shown only once half the peer's record is
-    adopted. Its prediction LINES are routing's own predictions
+  → The peer page states what routing EXPECTS, from the lines it draws.
+    Its prediction LINES are routing's own predictions
     (PeerRoutingSnapshot::curves: HierarchicalRouting::peer_curves once a
     timing stage is warm, else the isotonic estimate with its per-peer
-    correction), pinned against predict_routing_outcome by
+    correction; empty before the 50-event gate and for a peer with no
+    location), pinned against predict_routing_outcome by
     routing_curves_are_what_routing_predicts and
-    a_cold_timing_stage_shows_the_estimate_routing_falls_back_to; the two
-    differ by the spread a record narrows and by the output bound. The
-    response-time tile shows prediction_at_own_location. Per-peer
+    a_cold_timing_stage_shows_the_estimate_routing_falls_back_to. Its "N×
+    faster/slower than distance alone" is Router::expected_response_factor,
+    the ratio of those two response-time lines at distance 0 (pinned by
+    the_expected_factor_is_the_ratio_of_the_lines_at_distance_zero), NOT
+    exp(offset): the lines are expected values, bound included, and a
+    median would disagree with them. peer_offsets (the learned typical
+    difference and its adopted weight) gates whether a reading is stated
+    (weight >= 0.5) and places the failure dots in percentage points.
+    Level::residual_steps repeats Level::residual's arithmetic for this and
+    is pinned against it by residual_steps_match_the_residual_routing_reads.
+    The response-time tile shows prediction_at_own_location. Per-peer
     eligible/chosen counts (PeerSelectionCounts) count only
-    DecisionLog::Joinable decisions and halve every
-    SELECTION_RECENT_DECISIONS eligible decisions
+    DecisionLog::Joinable decisions and halve (exactly; chosen is f64) when
+    eligible reaches SELECTION_RECENT_DECISIONS
   → PAIRED VALUES, failure probability: the estimator returns TWO failure
     numbers per candidate and they are not interchangeable.
     failure_probability is clamped to [0, 1] and is what is REPORTED and

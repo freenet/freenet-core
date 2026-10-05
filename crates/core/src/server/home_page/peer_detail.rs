@@ -18,6 +18,7 @@ use super::*;
 use crate::node::network_status::PeerSnapshot;
 use crate::router::{
     PeerOffset, PeerRoutingSnapshot, PeerWindow, Router, RouterSnapshotInfo, RoutingCurve,
+    SELECTION_RECENT_DECISIONS,
 };
 
 /// Share of a peer's own record the estimate must adopt before the page treats
@@ -85,12 +86,21 @@ pub(super) struct RouterView {
     snapshot: RouterSnapshotInfo,
     /// `None` when this peer has no key location to look up.
     peer: Option<PeerRoutingSnapshot>,
-    /// Every connected peer's learned differences, this one included.
-    others: Vec<(String, [Option<PeerOffset>; 3])>,
+    /// Every connected peer that has a key location, this one included.
+    others: Vec<OtherPeer>,
     /// `(outcomes, failures)` across every peer in the router's failure
     /// window, the population this peer's window counts are a share of.
     window_outcomes: (usize, usize),
     fallback: bool,
+}
+
+/// One connected peer's readings, for the comparison strips.
+struct OtherPeer {
+    address: String,
+    /// See [`PeerRoutingSnapshot::offsets`].
+    offsets: [Option<PeerOffset>; 3],
+    /// See [`PeerRoutingSnapshot::expected_response_factor`].
+    response_factor: Option<f64>,
 }
 
 impl RouterView {
@@ -107,7 +117,11 @@ impl RouterView {
                 .iter()
                 .filter_map(|peer| {
                     let key = peer.peer_key_location.as_ref()?;
-                    Some((peer.address.to_string(), router.peer_offsets(key)))
+                    Some(OtherPeer {
+                        address: peer.address.to_string(),
+                        offsets: router.peer_offsets(key),
+                        response_factor: router.expected_response_factor(key),
+                    })
                 })
                 .collect(),
             window_outcomes: router.window_outcomes(),
@@ -178,6 +192,11 @@ enum Learning {
     /// It has learned enough to use the peer's own record, or there is
     /// nothing to learn yet that would tell this peer from any other.
     No,
+    /// Routing is not predicting at all yet (the 50-event gate).
+    NotPredicting,
+    /// No stage of the model is warm yet: routing uses its early estimate,
+    /// which already corrects per peer, so "distance alone" would be false.
+    FirstEstimates,
     /// No warm stage has adopted any of the peer's record.
     FromDistanceAlone,
     /// Some stage has adopted part of it, less than [`KNOWN_WEIGHT`].
@@ -186,20 +205,22 @@ enum Learning {
 
 /// The readings the tiles, banners and charts share, computed once.
 struct Learned {
-    /// The response-time factor against distance alone, when there is enough
-    /// evidence behind it to state (see [`known`]).
+    /// How many times slower (above 1) or faster routing expects this peer to
+    /// reply than distance alone predicts, when there is enough evidence
+    /// behind it to state (see [`known`]).
     response_factor: Option<f64>,
+    /// Whether each of `[failure, response time]` tells any peers apart yet.
+    told_apart: [bool; 2],
     learning: Learning,
     /// Why the peer reads as avoided, when it does: `(slower, less reliable)`.
     avoided: Option<(bool, bool)>,
 }
 
 /// Whether a stage's reading for a peer can be stated: the peer has evidence
-/// there, and either the stage adopted at least [`KNOWN_WEIGHT`] of it, or the
-/// stage tells no peers apart at all (then its offset is exactly 0 and "as
-/// distance alone predicts" is the true reading).
-fn known(offset: Option<PeerOffset>, stage_tells_apart: bool) -> bool {
-    offset.is_some_and(|o| o.evidence > 0.0 && (o.weight >= KNOWN_WEIGHT || !stage_tells_apart))
+/// there and the stage adopted at least [`KNOWN_WEIGHT`] of it. A stage that
+/// gives no peer any weight tells nobody apart, and states nothing either.
+fn known(offset: Option<PeerOffset>) -> bool {
+    offset.is_some_and(|o| o.evidence > 0.0 && o.weight >= KNOWN_WEIGHT)
 }
 
 /// A stage "tells peers apart" once it gives some connected peer's own record
@@ -208,13 +229,15 @@ fn known(offset: Option<PeerOffset>, stage_tells_apart: bool) -> bool {
 fn tells_apart(view: &RouterView, stage: usize) -> bool {
     view.others
         .iter()
-        .any(|(_, offsets)| offsets[stage].is_some_and(|o| o.weight > 0.0))
+        .any(|other| other.offsets[stage].is_some_and(|o| o.weight > 0.0))
 }
 
 impl Learned {
     fn of(view: &RouterView) -> Self {
+        let told_apart = [tells_apart(view, 0), tells_apart(view, 1)];
         let nothing = Learned {
             response_factor: None,
+            told_apart,
             learning: Learning::No,
             avoided: None,
         };
@@ -227,16 +250,22 @@ impl Learned {
         if view.fallback {
             return nothing;
         }
+        if !view.snapshot.prediction_active {
+            return Learned {
+                learning: Learning::NotPredicting,
+                ..nothing
+            };
+        }
         let [failure, response, _] = peer.offsets;
-        let differs = [tells_apart(view, 0), tells_apart(view, 1)];
-        let adopted = |o: Option<PeerOffset>| o.is_some_and(|o| o.weight >= KNOWN_WEIGHT);
         let warm = [failure, response]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let learning = if adopted(failure) || adopted(response) {
+        let learning = if known(failure) || known(response) {
             Learning::No
-        } else if !warm.is_empty() && !differs[0] && !differs[1] {
+        } else if warm.is_empty() {
+            Learning::FirstEstimates
+        } else if !told_apart[0] && !told_apart[1] {
             // Warm stages that find no difference between any peers: every
             // peer is on the line because they look alike.
             Learning::No
@@ -245,20 +274,22 @@ impl Learned {
         } else {
             Learning::Mostly
         };
-        let response_factor = known(response, differs[1])
-            .then(|| response.map(|o| o.offset.exp()))
+        // Routing's own expectation, the ratio of the two lines the page
+        // draws, so the stated factor and the lines cannot disagree.
+        let response_factor = known(response)
+            .then_some(peer.expected_response_factor)
             .flatten()
             .filter(|factor| factor.is_finite() && *factor > 0.0);
-        let slower =
-            adopted(response) && response.is_some_and(|o| o.offset.exp() >= AVOIDED_SLOWER_FACTOR);
+        let slower = response_factor.is_some_and(|factor| factor >= AVOIDED_SLOWER_FACTOR);
         let less_reliable =
-            adopted(failure) && failure.is_some_and(|o| o.offset >= AVOIDED_FAILURE_POINTS);
+            known(failure) && failure.is_some_and(|o| o.offset >= AVOIDED_FAILURE_POINTS);
         let passed_over = peer.selection.is_some_and(|selection| {
             selection.eligible >= AVOIDED_MIN_ELIGIBLE
-                && (selection.chosen as f64) < AVOIDED_SHARE_OF_EVEN * selection.even_share
+                && selection.chosen < AVOIDED_SHARE_OF_EVEN * selection.even_share
         });
         Learned {
             response_factor,
+            told_apart,
             learning,
             avoided: ((slower || less_reliable) && passed_over).then_some((slower, less_reliable)),
         }
@@ -280,11 +311,17 @@ fn learned_card(view: &RouterView, learned: &Learned) -> String {
         };
         write!(
             banners,
-            r#"<div class="learning">Your node has learned this peer is {worse} than distance alone predicts, and recently ranks it first far less often than its share.</div>"#
+            r#"<div class="learning">Your node expects this peer to be {worse} than distance alone predicts, and recently ranks it first far less often than its share.</div>"#
         )
         .ok();
     } else {
         match learned.learning {
+            Learning::NotPredicting => banners.push_str(
+                r#"<div class="learning">Your node is not predicting yet: until it has seen 50 requests, it routes by distance alone.</div>"#,
+            ),
+            Learning::FirstEstimates => banners.push_str(
+                r#"<div class="learning">Your node is still building its first estimates for this peer.</div>"#,
+            ),
             Learning::FromDistanceAlone => banners.push_str(
                 r#"<div class="learning">Still learning about this peer. Until it has handled more requests, your node predicts its results from distance alone.</div>"#,
             ),
@@ -342,7 +379,13 @@ fn reliability_tile(view: &RouterView) -> String {
     let title = "Requests to this peer among your node's last 500 routed requests to any \
                  peer, including requests it relayed for others. A failed request may have \
                  failed further along the route, not at this peer.";
-    let window = format!("of your node's last {WINDOW_REQUESTS} requests (relayed ones included)");
+    // The window's real size until it fills, so a young node is not told
+    // about 500 requests it has not made.
+    let window = if network_total < WINDOW_REQUESTS {
+        format!("of your node's {network_total} requests so far (relayed ones included)")
+    } else {
+        format!("of your node's last {WINDOW_REQUESTS} requests (relayed ones included)")
+    };
     match view.peer.as_ref().map(|peer| &peer.window) {
         Some(window_counts) if window_counts.outcomes > 0 => tile(
             "Reliability",
@@ -373,12 +416,14 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
     let early = peer.is_some_and(|peer| peer.curves[0].early);
     let Some(seconds) = routed else {
-        return tile(
-            "Response time",
-            "&mdash;",
-            "Too few replies to judge yet.",
-            "",
-        );
+        let why = if !view.snapshot.prediction_active {
+            "Your node is not predicting yet."
+        } else if peer.is_none() {
+            "Your node cannot match this peer to a routing record."
+        } else {
+            "Too few replies to judge yet."
+        };
+        return tile("Response time", "&mdash;", why, "");
     };
     let comparison = if view.fallback {
         String::new()
@@ -386,7 +431,13 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
         format!("; an early estimate until your node has {MIN_TIMED_REPLIES} timed replies")
     } else {
         match learned.response_factor {
-            Some(factor) => format!("; it {}", time_comparison(factor, true)),
+            Some(factor) => format!(
+                "; your node expects it to reply {}",
+                time_comparison(factor, true)
+            ),
+            None if !learned.told_apart[1] => {
+                "; your node does not tell its peers apart by response time yet".to_string()
+            }
             None => "; too few replies yet to compare it with distance alone".to_string(),
         }
     };
@@ -401,33 +452,55 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
 /// Recent routing decisions in which this peer was among the closest
 /// candidates scored, and how many ranked it first.
 fn chosen_tile(view: &RouterView) -> String {
-    let title = "Counted once your node ranks peers by prediction (after its first 50 \
-                 requests), including requests it relayed and retries. Both counts halve \
-                 every 200 eligible decisions, so they describe the recent past. Eligible: \
-                 among the closest peers your node considered for a request.";
-    match view.peer.as_ref().and_then(|peer| peer.selection) {
-        Some(selection) if selection.eligible > 0 => tile(
-            "Chosen",
-            &format!(
-                "{} <small>of {}</small>",
-                selection.chosen, selection.eligible
-            ),
-            "recent routing decisions it was eligible for (roughly its last 100 to 200) ranked it first.",
-            title,
+    let title = format!(
+        "Counted once your node ranks peers by prediction (after its first 50 requests), \
+         including requests it relayed and retries. Eligible: among the closest peers your \
+         node considered for a request. When the eligible count reaches {recent}, both counts \
+         halve, so it stays between {half} and {top} and older decisions count for \
+         geometrically less.",
+        recent = SELECTION_RECENT_DECISIONS,
+        half = SELECTION_RECENT_DECISIONS / 2,
+        top = SELECTION_RECENT_DECISIONS - 1,
+    );
+    let empty = |text: &str| tile("Chosen", "&mdash;", text, &title);
+    let Some(peer) = view.peer.as_ref() else {
+        return empty("Your node cannot match this peer to a routing record.");
+    };
+    match peer.selection {
+        Some(selection) if selection.eligible > 0 => {
+            let sub = if selection.halved {
+                "recent routing decisions it was eligible for ranked it first; older ones count for less."
+                    .to_string()
+            } else {
+                format!(
+                    "routing decisions it was eligible for ranked it first (all {} so far).",
+                    selection.eligible
+                )
+            };
+            tile(
+                "Chosen",
+                &format!(
+                    "{} <small>of {}</small>",
+                    fmt_count(selection.chosen),
+                    selection.eligible
+                ),
+                &sub,
+                &title,
+            )
+        }
+        _ if !view.snapshot.prediction_active => {
+            empty("Your node is not ranking peers by prediction yet.")
+        }
+        _ if peer.selection_evicted => empty(
+            "Your node dropped this peer's counts to make room for others; they restart the next time it is eligible.",
         ),
-        _ if !view.snapshot.prediction_active => tile(
-            "Chosen",
-            "&mdash;",
-            "Your node is not ranking peers by prediction yet.",
-            title,
-        ),
-        _ => tile(
-            "Chosen",
-            "&mdash;",
-            "Not among the closest candidates for a recent routing decision.",
-            title,
-        ),
+        _ => empty("Not among the closest candidates for a routing decision yet."),
     }
+}
+
+/// A decayed count, which is fractional after a halving, as a whole number.
+fn fmt_count(count: f64) -> String {
+    format!("{}", count.round().max(0.0) as u64)
 }
 
 // ─── Compared with your other peers ─────────────────────────────────────────
@@ -438,21 +511,35 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
         let apart = tells_apart(view, stage);
         let mut others = Vec::new();
         let mut mine = None;
-        for (address, offsets) in &view.others {
-            let Some(offset) = offsets[stage] else {
+        for other in &view.others {
+            let address = &other.address;
+            let Some(offset) = other.offsets[stage] else {
                 continue;
             };
             // The same gate as the tiles: a reading too thin to state is drawn
-            // hollow, on the line, rather than as a difference.
-            let stated = known(Some(offset), apart);
-            let (value, text) = match (stage, stated) {
-                (0, true) => (offset.offset * 100.0, failure_comparison(offset.offset)),
-                (0, false) => (0.0, "too few requests to judge yet".to_string()),
-                (_, true) => (
-                    offset.offset.exp(),
-                    time_comparison(offset.offset.exp(), false),
+            // hollow, on the line, rather than as a difference. A response
+            // time is placed at routing's expected factor, the tile's number.
+            let factor = other.response_factor.filter(|_| known(Some(offset)));
+            let unstated = if !apart {
+                "your node does not tell peers apart here yet"
+            } else if stage == 0 {
+                "too few requests to judge yet"
+            } else {
+                "too few replies to judge yet"
+            };
+            let (value, text, note) = match (stage, known(Some(offset)), factor) {
+                (0, true, _) => (
+                    offset.offset * 100.0,
+                    failure_comparison(offset.offset),
+                    None,
                 ),
-                (_, false) => (1.0, "too few replies to judge yet".to_string()),
+                (0, false, _) => (0.0, unstated.to_string(), Some(unstated)),
+                (_, _, Some(factor)) => (
+                    factor,
+                    format!("expected to reply {}", time_comparison(factor, false)),
+                    None,
+                ),
+                (_, _, None) => (1.0, unstated.to_string(), Some(unstated)),
             };
             let who = if address == &this {
                 "this peer".to_string()
@@ -463,7 +550,8 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
                 value,
                 title: format!("{who} &middot; {text}"),
                 href: (address != &this).then(|| format!("/peer/{}", html_escape(address))),
-                hollow: !stated,
+                hollow: note.is_some(),
+                note,
             };
             if address == &this {
                 mine = Some(dot);
@@ -513,6 +601,8 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
             )
         })
     };
+    // `others` is drawn from `inputs.peers`, so `matched <= connected`; the
+    // subtraction below saturates rather than trust that.
     let matched = view.others.len();
     let connected = inputs.peers.len();
     let whose = if matched == connected {
@@ -520,13 +610,13 @@ fn compare_card(inputs: &PeerPageInputs<'_>, view: &RouterView) -> String {
     } else {
         format!(
             "one of {matched} of your {connected} peers (the other {} cannot be matched to a routing record)",
-            connected - matched
+            connected.saturating_sub(matched)
         )
     };
     format!(
         r#"<div class="card">
             <h2>Compared with your other peers</h2>
-            <p class="caption">Each dot is {whose}, placed by how its results typically differ from what distance alone predicts. A peer with too few requests to judge is drawn hollow, on the line.</p>
+            <p class="caption">Each dot is {whose}, placed by how your node expects its results to differ from what distance alone predicts. A peer with too few requests to judge is drawn hollow, on the line.</p>
             <div class="chart-title">Chance a request fails <span class="unit">(percentage points)</span></div>
             {failure}
             <div class="chart-title">Response time</div>
@@ -543,6 +633,9 @@ struct StripDot {
     href: Option<String>,
     /// Too little evidence to state a difference: drawn hollow, on the line.
     hollow: bool,
+    /// Why it is hollow, shown beside "this peer" so the reason is visible
+    /// without hovering.
+    note: Option<&'static str>,
 }
 
 /// A strip chart's horizontal axis.
@@ -713,14 +806,15 @@ fn strip_chart(
         top - 10.0,
     )
     .ok();
-    for (index, dot) in others.iter().enumerate() {
-        // Deterministic vertical jitter (golden-ratio sequence), so overlapping
-        // peers spread into a band instead of hiding each other.
-        let jitter = ((index as f64 + 1.0) * 0.618_033_988_75).fract() * 2.0 - 1.0;
+    let placed = swarm(
+        &others.iter().map(|dot| x(dot.value)).collect::<Vec<_>>(),
+        mid,
+        band,
+        OTHER_DOT_R,
+    );
+    for (dot, (cx, cy)) in others.iter().zip(placed) {
         let circle = format!(
-            r#"<circle cx="{:.1}" cy="{:.1}" r="3.2" class="{}">{}</circle>"#,
-            x(dot.value),
-            mid + jitter * band,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{OTHER_DOT_R}" class="{}">{}</circle>"#,
             if dot.hollow {
                 "dot-other hollow"
             } else {
@@ -735,10 +829,18 @@ fn strip_chart(
     }
     if let Some(dot) = mine {
         let cx = x(dot.value);
-        let label_x = cx.clamp(left + 24.0, width - right - 24.0);
+        let label = match dot.note {
+            Some(note) => format!("this peer &middot; {note}"),
+            None => "this peer".to_string(),
+        };
+        // Roughly 6.3 px a character at the label's size; kept inside the
+        // chart, centred under the dot where it fits.
+        let glyphs = label.replace("&middot;", "·").chars().count();
+        let half = 3.2 * glyphs as f64;
+        let label_x = cx.clamp(left + half, (width - right - half).max(left + half));
         write!(
             svg,
-            r#"<circle cx="{cx:.1}" cy="{mid:.1}" r="6" class="{class}">{title}</circle><line x1="{cx:.1}" x2="{cx:.1}" y1="{:.1}" y2="{:.1}" class="tick-this"/><text x="{label_x:.1}" y="{label_row:.1}" text-anchor="middle" class="this-label">this peer</text>"#,
+            r#"<circle cx="{cx:.1}" cy="{mid:.1}" r="6" class="{class}">{title}</circle><line x1="{cx:.1}" x2="{cx:.1}" y1="{:.1}" y2="{:.1}" class="tick-this"/><text x="{label_x:.1}" y="{label_row:.1}" text-anchor="middle" class="this-label">{label}</text>"#,
             mid + 7.0,
             label_row - 9.0,
             class = if dot.hollow { "dot-this hollow" } else { "dot-this" },
@@ -748,6 +850,50 @@ fn strip_chart(
     }
     svg.push_str("</svg>");
     svg
+}
+
+/// Radius of another peer's dot on a strip.
+const OTHER_DOT_R: f64 = 2.6;
+
+/// Place dots at the given x positions in a band `mid ± band`, each at the
+/// first height (centre outward) where it overlaps no dot already placed, so
+/// twenty peers that read alike spread into visible columns instead of one
+/// blob. When a column is full, a dot moves one dot-width sideways, alternating
+/// right and left, so the swarm stays centred on the shared value.
+fn swarm(xs: &[f64], mid: f64, band: f64, r: f64) -> Vec<(f64, f64)> {
+    let gap = 2.0 * r + 0.8;
+    let rows = (band / gap).floor() as i32;
+    let heights: Vec<f64> = std::iter::once(0)
+        .chain((1..=rows).flat_map(|k| [k, -k]))
+        .map(|k| mid + k as f64 * gap)
+        .collect();
+    let mut order: Vec<usize> = (0..xs.len()).collect();
+    order.sort_by(|&a, &b| xs[a].total_cmp(&xs[b]));
+    let mut placed: Vec<(f64, f64)> = Vec::with_capacity(xs.len());
+    let mut out = vec![(0.0, 0.0); xs.len()];
+    for index in order {
+        let free = |cx: f64, cy: f64, placed: &[(f64, f64)]| {
+            placed
+                .iter()
+                .all(|&(px, py)| (px - cx).hypot(py - cy) >= gap - 1e-9)
+        };
+        let mut spot = None;
+        'search: for shift in 0..64i32 {
+            // 0, +1, -1, +2, -2, ... dot-widths.
+            let step = (shift + 1) / 2 * if shift % 2 == 0 { -1 } else { 1 };
+            let cx = xs[index] + f64::from(step) * gap;
+            for &cy in &heights {
+                if free(cx, cy, &placed) {
+                    spot = Some((cx, cy));
+                    break 'search;
+                }
+            }
+        }
+        let spot = spot.unwrap_or((xs[index], mid));
+        placed.push(spot);
+        out[index] = spot;
+    }
+    out
 }
 
 // ─── Past requests by ring distance ─────────────────────────────────────────
@@ -849,6 +995,17 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
                 )
             })
         };
+        let early_note = |early: bool, what: &str| {
+            if early && !view.fallback {
+                format!(
+                    r#"<p class="chart-note">Fewer than {MIN_TIMED_REPLIES} {what} so far, so these lines are routing's early estimate.</p>"#
+                )
+            } else {
+                String::new()
+            }
+        };
+        let time_note = early_note(time_curve.early, "timed replies");
+        let speed_note = early_note(speed_curve.early, "measured transfers");
         let floored_note = if floored {
             r#"<p class="caption">Your node currently treats transfers through this peer as unusable and ranks it after every other eligible peer.</p>"#
         } else {
@@ -858,8 +1015,8 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
         write!(
             panels,
             r#"<div class="tab-panel{panel_active}" id="panel-{id}">
-                <div class="chart-title">Response time</div>{times}
-                <div class="chart-title">Transfer speed</div>{floored_note}{speeds}
+                <div class="chart-title">Response time</div>{times}{time_note}
+                <div class="chart-title">Transfer speed</div>{floored_note}{speeds}{speed_note}
             </div>"#,
         )
         .ok();
@@ -870,22 +1027,25 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
         format!(
             "{dots} Routing is on its emergency fallback; the lines are what it predicts with that."
         )
-    } else if time_curve.early {
+    } else if !rs.prediction_active {
         format!(
-            "{dots} Your node has fewer than {MIN_TIMED_REPLIES} timed replies, so the lines are its early estimate."
+            "{dots} Your node is not predicting yet (it starts after 50 requests), so there are no prediction lines."
         )
+    } else if time_curve.early || view.peer.is_none() {
+        // The response-time chart says why its lines are an early estimate.
+        dots.to_string()
     } else {
         match learned.response_factor {
             Some(factor) if !about_same(factor) => format!(
-                "{dots} This peer typically replies <b>{}</b> than distance alone predicts.",
+                "{dots} Your node expects this peer to reply <b>{}</b> than distance alone predicts.",
                 time_ratio(factor),
             ),
-            Some(_) => {
-                format!(
-                    "{dots} This peer typically replies about as fast as distance alone predicts."
-                )
+            Some(_) => format!(
+                "{dots} Your node expects this peer to reply about as fast as distance alone predicts."
+            ),
+            None if !learned.told_apart[1] => {
+                format!("{dots} Your node does not tell its peers apart by response time yet.")
             }
-            None if view.peer.is_none() => dots.to_string(),
             None => format!(
                 "{dots} Too few of its replies yet to say how it differs from what distance alone predicts."
             ),
@@ -1181,8 +1341,8 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
     write!(
         svg,
         r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" class="baseline"/>
-        <text x="{:.1}" y="{:.1}">slower than predicted</text>
-        <text x="{:.1}" y="{:.1}" text-anchor="end">faster than predicted</text>
+        <text x="{:.1}" y="{:.1}" class="halo">slower than predicted</text>
+        <text x="{:.1}" y="{:.1}" text-anchor="end" class="halo">faster than predicted</text>
         <text x="{:.1}" y="{:.1}" text-anchor="middle">predicted</text>
         <text x="12" y="{mid:.1}" text-anchor="middle" transform="rotate(-90 12 {mid:.1})">actual</text>"#,
         x(min),
@@ -1527,14 +1687,14 @@ mod tests {
             "What your node has learned",
             "requests to it succeeded, of your node's last 500 requests (relayed ones included).",
             "Across all your peers, about 1 in",
-            "predicted for contracts near it; it",
+            "predicted for contracts near it; your node expects it to reply",
             "distance alone predicts",
             "Compared with your other peers",
             "Each dot is one of your 12 peers",
             "&larr; fewer failures",
             "more failures &rarr;",
             "Past requests by ring distance",
-            "This peer typically replies",
+            "Your node expects this peer to reply",
             "ring distance between peer and contract (0 = same spot, 0.5 = opposite side)",
             r#"class="line-net""#,
             "How good are the predictions?",
@@ -1553,6 +1713,54 @@ mod tests {
             html.matches(r#"class="w-wide""#).count()
                 == html.matches(r#"class="w-narrow""#).count(),
             "every chart with axis text has a phone variant"
+        );
+    }
+
+    /// The factor the page states is the ratio of the two lines it draws at
+    /// distance 0, for this peer's tile and for every dot on the strip, so the
+    /// caption can never say "about as fast" while the lines part.
+    #[test]
+    fn stated_factor_is_the_ratio_of_the_drawn_lines() {
+        let _fallback_off = crate::router::force_isotonic_fallback(false);
+        let (router, peers) = trained_router();
+        let snaps = snapshots(&peers);
+        let mut stated = 0;
+        for index in 0..peers.len() {
+            let inputs = inputs(&snaps, index);
+            let view = RouterView::gather(&inputs, &router);
+            let peer = view.peer.as_ref().unwrap();
+            let curve = &peer.curves[0];
+            assert!(!curve.early, "the trained router's timing stage is warm");
+            let line = if curve.this_peer.is_empty() {
+                &curve.distance_alone
+            } else {
+                &curve.this_peer
+            };
+            assert_eq!((line[0].0, curve.distance_alone[0].0), (0.0, 0.0));
+            let ratio = line[0].1 / curve.distance_alone[0].1;
+            let expected = peer.expected_response_factor.expect("warm, gate open");
+            assert!(
+                (expected - ratio).abs() < 1e-12,
+                "peer {index}: {expected} vs {ratio}"
+            );
+            let strip = view
+                .others
+                .iter()
+                .find(|other| other.address == snaps[index].address.to_string())
+                .unwrap();
+            assert_eq!(
+                strip.response_factor,
+                Some(expected),
+                "the strip uses the same"
+            );
+            if let Some(factor) = Learned::of(&view).response_factor {
+                assert_eq!(factor, expected);
+                stated += 1;
+            }
+        }
+        assert!(
+            stated > 0,
+            "some peer is known well enough to state a factor"
         );
     }
 
@@ -1617,7 +1825,7 @@ mod tests {
             html.contains("too few replies yet to compare it with distance alone."),
             "routing predicts it from distance alone, and the tile says it cannot compare yet"
         );
-        assert!(html.contains("Not among the closest candidates for a recent routing decision."));
+        assert!(html.contains("Not among the closest candidates for a routing decision yet."));
         assert!(html.contains("Too few requests through this peer to judge its predictions yet"));
         assert!(html.contains("Each dot is one of your 13 peers"));
         assert!(
@@ -1660,16 +1868,18 @@ mod tests {
             );
         }
         let selection = router.peer_snapshot(&peers[0]).selection.unwrap();
-        assert_eq!((selection.eligible, selection.chosen), (40, 0));
+        assert_eq!((selection.eligible, selection.chosen), (40, 0.0));
         let snaps = snapshots(&peers);
         let html = render(&router, &snaps, 0);
         assert!(
-            html.contains("Your node has learned this peer is slower and less reliable than distance alone predicts, and recently ranks it first far less often than its share."),
+            html.contains("Your node expects this peer to be slower and less reliable than distance alone predicts, and recently ranks it first far less often than its share."),
             "the banner names both conditions that fired"
         );
         assert!(!html.contains(STILL_LEARNING));
         assert!(html.contains("0 <small>of 40</small>"));
-        assert!(html.contains("recent routing decisions it was eligible for"));
+        assert!(
+            html.contains("routing decisions it was eligible for ranked it first (all 40 so far).")
+        );
     }
 
     #[test]
@@ -1732,7 +1942,7 @@ mod tests {
         ] {
             assert!(fallback.contains(needle), "missing {needle:?}");
         }
-        for absent in [AVOIDED, STILL_LEARNING, "typically replies"] {
+        for absent in [AVOIDED, STILL_LEARNING, "expects this peer to reply"] {
             assert!(!fallback.contains(absent), "fallback page shows {absent:?}");
         }
     }
@@ -1847,6 +2057,15 @@ mod tests {
         others: Vec<[Option<PeerOffset>; 3]>,
         selection: Option<PeerSelection>,
     ) -> RouterView {
+        // Routing's expected factor taken as the offset's own factor: these
+        // tests are about the gates, not the expectation's arithmetic, which
+        // `stated_factor_is_the_ratio_of_the_drawn_lines` pins.
+        let factor = |offsets: [Option<PeerOffset>; 3]| offsets[1].map(|o| o.offset.exp());
+        let other = |address: String, offsets: [Option<PeerOffset>; 3]| OtherPeer {
+            address,
+            offsets,
+            response_factor: factor(offsets),
+        };
         let router = Router::new(&[]);
         let mut view = RouterView {
             snapshot: router.snapshot(),
@@ -1854,15 +2073,17 @@ mod tests {
             others: others
                 .into_iter()
                 .enumerate()
-                .map(|(i, offsets)| (format!("10.0.0.{i}:1"), offsets))
+                .map(|(i, offsets)| other(format!("10.0.0.{i}:1"), offsets))
                 .collect(),
             window_outcomes: (0, 0),
             fallback: false,
         };
+        view.snapshot.prediction_active = true;
         let peer = view.peer.as_mut().unwrap();
         peer.offsets = mine;
+        peer.expected_response_factor = factor(mine);
         peer.selection = selection;
-        view.others.push(("this".to_string(), mine));
+        view.others.push(other("this".to_string(), mine));
         view
     }
 
@@ -1897,9 +2118,18 @@ mod tests {
             Learned::of(&view_with(alike, vec![alike, alike], None)).learning,
             Learning::No
         );
-        // Nothing warm yet: the node predicts every peer from distance alone.
+        // Nothing warm yet: routing uses its early estimate, which corrects
+        // per peer, so the banner must not say "distance alone".
         let cold = view_with([None, None, None], vec![[None, None, None]], None);
-        assert_eq!(Learned::of(&cold).learning, Learning::FromDistanceAlone);
+        assert_eq!(Learned::of(&cold).learning, Learning::FirstEstimates);
+        // Before the 50-event gate routing predicts nothing at all.
+        let mut gated = view_with(
+            [failure(0.0, 1.0, 0.2), None, None],
+            vec![known_other],
+            None,
+        );
+        gated.snapshot.prediction_active = false;
+        assert_eq!(Learned::of(&gated).learning, Learning::NotPredicting);
         // No key location, or the fallback: no banner.
         let mut keyless = view_with([None, None, None], vec![known_other], None);
         keyless.peer = None;
@@ -1913,9 +2143,9 @@ mod tests {
         assert_eq!(Learned::of(&fallback).learning, Learning::No);
     }
 
-    /// The stated factor is the learned typical difference, exp(offset): a
-    /// peer the node knows well whose replies match distance alone reads as
-    /// "about as fast", not faster for having narrowed the uncertainty.
+    /// The stated factor is routing's expectation, gated by the evidence: a
+    /// peer whose expectation matches distance alone reads as "about as
+    /// fast", and one with too little adopted states nothing.
     #[test]
     fn a_well_known_peer_with_no_difference_reads_as_about_the_same() {
         let others = vec![[None, timing(1.3, 30.0, 0.7), None]];
@@ -1940,11 +2170,12 @@ mod tests {
     #[test]
     fn the_avoided_reading_needs_evidence_a_low_share_and_a_worse_record() {
         let others = vec![[failure(0.0, 30.0, 0.7), timing(1.0, 30.0, 0.7), None]];
-        let selection = |eligible, chosen, even_share| {
+        let selection = |eligible, chosen: u32, even_share| {
             Some(PeerSelection {
                 eligible,
-                chosen,
+                chosen: f64::from(chosen),
                 even_share,
+                halved: false,
             })
         };
         let less_reliable = [failure(0.01, 30.0, 0.6), timing(1.0, 30.0, 0.6), None];
@@ -1998,8 +2229,8 @@ mod tests {
             vec![[failure(0.02, 30.0, 0.7), timing(1.3, 30.0, 0.7), None]],
             None,
         );
-        view.others[0].0 = snaps[0].address.to_string();
-        view.others.last_mut().unwrap().0 = snaps[1].address.to_string();
+        view.others[0].address = snaps[0].address.to_string();
+        view.others.last_mut().unwrap().address = snaps[1].address.to_string();
         let html = compare_card(&inputs, &view);
         assert!(html.contains("this peer &middot; too few requests to judge yet"));
         assert!(html.contains("this peer &middot; too few replies to judge yet"));
@@ -2014,6 +2245,174 @@ mod tests {
             known.response_factor, None,
             "and the tile states no factor either"
         );
+    }
+
+    /// A stage that gives no peer any weight tells nobody apart: plenty of
+    /// evidence, but no factor, and the tile says the node cannot tell peers
+    /// apart rather than "about as fast".
+    #[test]
+    fn a_stage_that_tells_nobody_apart_states_no_factor() {
+        let alike = [failure(0.0, 40.0, 0.0), timing(1.0, 40.0, 0.0), None];
+        let view = view_with(alike, vec![alike, alike], None);
+        let learned = Learned::of(&view);
+        assert_eq!(learned.response_factor, None);
+        assert_eq!(learned.told_apart, [false, false]);
+        let snaps = [snapshot_of(&PeerKeyLocation::random())];
+        let mut view = view;
+        view.others.last_mut().unwrap().address = snaps[0].address.to_string();
+        let peer = view.peer.as_mut().unwrap();
+        peer.prediction_at_own_location = Some(crate::router::RoutingPredictionInfo {
+            failure_probability: 0.01,
+            time_to_response_start: 0.2,
+            transfer_speed_bps: 400_000.0,
+            expected_total_time: 0.3,
+        });
+        let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
+        assert!(html.contains("your node does not tell its peers apart by response time yet"));
+        assert!(!html.contains("about as fast"), "no comparison is claimed");
+        assert!(html.contains("this peer &middot; your node does not tell peers apart here yet"));
+    }
+
+    /// Each distance chart names its own stage's early estimate: the
+    /// transfer-speed stage warms on its own count of transfers.
+    #[test]
+    fn each_chart_names_its_own_early_estimate() {
+        let (router, peers) = trained_router();
+        let snaps = snapshots(&peers);
+        let inputs = inputs(&snaps, 2);
+        let mut view = RouterView::gather(&inputs, &router);
+        let note = |what: &str| format!("Fewer than {MIN_TIMED_REPLIES} {what} so far");
+        let html = render_peer_page(&inputs, Some(&view));
+        assert!(
+            !html.contains(&note("timed replies")) && !html.contains(&note("measured transfers"))
+        );
+        view.peer.as_mut().unwrap().curves[1].early = true;
+        let html = render_peer_page(&inputs, Some(&view));
+        assert!(
+            html.contains(&note("measured transfers")),
+            "the speed chart says so"
+        );
+        assert!(
+            !html.contains(&note("timed replies")),
+            "the time chart does not"
+        );
+    }
+
+    /// Below the 50-event gate routing predicts nothing: no lines, and the
+    /// page says why. The reliability tile counts the window's real size.
+    #[test]
+    fn before_the_prediction_gate_the_page_draws_no_lines() {
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let peer = PeerKeyLocation::random();
+        for round in 0..40u64 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(100 + round),
+                    payload_size: 20_000,
+                    payload_transfer_time: Duration::from_millis(50),
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+        let snaps = vec![snapshot_of(&peer)];
+        let html = render(&router, &snaps, 0);
+        assert!(!html.contains(r#"class="line-net""#) && !html.contains(r#"class="line-peer""#));
+        assert!(html.contains("Your node is not predicting yet (it starts after 50 requests)"));
+        assert!(html.contains("Your node is not predicting yet: until it has seen 50 requests"));
+        assert!(
+            html.contains("of your node's 40 requests so far"),
+            "not 'last 500' with only 40 in the window"
+        );
+    }
+
+    /// The chosen tile tells apart a peer it cannot match, one whose counts
+    /// were evicted, one never eligible, and counts that have halved.
+    #[test]
+    fn the_chosen_tile_says_why_it_has_no_counts() {
+        let others = vec![[failure(0.0, 30.0, 0.7), timing(1.0, 30.0, 0.7), None]];
+        let mine = [failure(0.0, 30.0, 0.7), timing(1.0, 30.0, 0.7), None];
+        let never = view_with(mine, others.clone(), None);
+        assert!(
+            chosen_tile(&never)
+                .contains("Not among the closest candidates for a routing decision yet.")
+        );
+        let mut evicted = view_with(mine, others.clone(), None);
+        evicted.peer.as_mut().unwrap().selection_evicted = true;
+        assert!(chosen_tile(&evicted).contains("dropped this peer's counts"));
+        let mut keyless = view_with(mine, others.clone(), None);
+        keyless.peer = None;
+        assert!(chosen_tile(&keyless).contains("cannot match this peer"));
+        let fresh = view_with(
+            mine,
+            others.clone(),
+            Some(PeerSelection {
+                eligible: 13,
+                chosen: 3.0,
+                even_share: 3.0,
+                halved: false,
+            }),
+        );
+        let tile = chosen_tile(&fresh);
+        assert!(tile.contains("3 <small>of 13</small>") && tile.contains("(all 13 so far)"));
+        let decayed = view_with(
+            mine,
+            others,
+            Some(PeerSelection {
+                eligible: 120,
+                chosen: 2.5,
+                even_share: 30.0,
+                halved: true,
+            }),
+        );
+        let tile = chosen_tile(&decayed);
+        assert!(tile.contains("older ones count for less") && !tile.contains("so far"));
+        assert!(tile.contains(&format!(
+            "stays between {} and {}",
+            SELECTION_RECENT_DECISIONS / 2,
+            SELECTION_RECENT_DECISIONS - 1
+        )));
+    }
+
+    #[test]
+    fn the_mostly_banner_renders() {
+        let others = vec![[failure(0.02, 30.0, 0.7), timing(1.3, 30.0, 0.7), None]];
+        let view = view_with(
+            [failure(0.0, 1.0, 0.2), timing(1.0, 1.0, 0.0), None],
+            others,
+            None,
+        );
+        let snaps = [snapshot_of(&PeerKeyLocation::random())];
+        let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
+        assert!(html.contains(
+            "Still learning about this peer. Until it has handled more requests, your node predicts its results mostly from distance alone."
+        ));
+    }
+
+    /// Twenty peers that read alike spread out instead of stacking on one
+    /// spot, none overlapping another.
+    #[test]
+    fn alike_peers_spread_into_a_swarm() {
+        let xs = vec![100.0; 20];
+        let placed = swarm(&xs, 40.0, 15.0, OTHER_DOT_R);
+        for (i, a) in placed.iter().enumerate() {
+            for b in &placed[i + 1..] {
+                assert!(
+                    (a.0 - b.0).hypot(a.1 - b.1) >= 2.0 * OTHER_DOT_R,
+                    "{a:?} overlaps {b:?}"
+                );
+            }
+            assert!((a.1 - 40.0).abs() <= 15.0 + 1e-9, "inside the band");
+        }
+        let spread: std::collections::HashSet<_> = placed
+            .iter()
+            .map(|&(x, y)| ((x * 10.0) as i64, (y * 10.0) as i64))
+            .collect();
+        assert_eq!(spread.len(), 20);
+        assert_eq!(swarm(&[], 40.0, 15.0, OTHER_DOT_R), vec![]);
     }
 
     #[test]

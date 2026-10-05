@@ -765,6 +765,52 @@ fn shrinkage_limits_no_data_to_pool_and_lots_of_data_to_cell_mean() {
     );
 }
 
+/// `residual_steps` repeats `residual`'s arithmetic for the dashboard; it must
+/// not drift from it. After the peer step, a query in a band the peer has no
+/// record in only adds the band level's prior variance, so `after_peer` plus
+/// `tau2_cell` IS routing's residual there: for a well-known peer, a thinly
+/// known one, and a peer with no record.
+#[test]
+fn residual_steps_match_the_residual_routing_reads() {
+    let _guard = GlobalRng::seed_guard(0x4485_d71f);
+    let mut level = Level::new(None);
+    // Bands 0..6 recorded for every peer; band 7 for none.
+    for slot in 0..30 {
+        let effect = 0.4 * normal();
+        for band in 0..7 {
+            for _ in 0..10 {
+                level.add(Some(slot), band, 1.0, effect + 0.2 * normal());
+            }
+        }
+    }
+    // A thinly known peer: two observations.
+    level.add(Some(30), 0, 1.0, 0.9);
+    level.add(Some(30), 1, 1.0, 1.1);
+    level.recount_squares();
+    level.components = level.compute_components();
+    let tau2_cell = level.components.expect("components exist").tau2_cell;
+    let mut weights = Vec::new();
+    for slot in [Some(3), Some(30), None, Some(31)] {
+        let steps = level.residual_steps(slot, 0.0).expect("steps");
+        let routed = level.residual(slot, 7, 0.0).expect("residual");
+        assert!(
+            (steps.after_peer.mean - routed.mean).abs() < 1e-12,
+            "{slot:?}: mean {} vs {}",
+            steps.after_peer.mean,
+            routed.mean
+        );
+        assert!(
+            (steps.after_peer.variance + tau2_cell - routed.variance).abs() < 1e-12,
+            "{slot:?}: variance {} + {tau2_cell} vs {}",
+            steps.after_peer.variance,
+            routed.variance
+        );
+        weights.push(steps.peer_weight);
+    }
+    assert!(weights[0] > weights[1] && weights[1] > 0.0, "{weights:?}");
+    assert_eq!((weights[2], weights[3]), (0.0, 0.0), "no record, no weight");
+}
+
 // ---------------------------------------------------------------------------
 // Stage
 // ---------------------------------------------------------------------------

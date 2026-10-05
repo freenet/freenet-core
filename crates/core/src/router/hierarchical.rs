@@ -3588,15 +3588,24 @@ impl HierarchicalRouting {
         peer: Option<&PeerKeyLocation>,
         time: f64,
     ) -> [Vec<(f64, f64)>; 3] {
-        const SAMPLES: usize = 50;
+        self.peer_curves_sampled(peer, time, 50)
+    }
+
+    /// [`Self::peer_curves`] at `samples + 1` evenly spaced distances.
+    pub(crate) fn peer_curves_sampled(
+        &self,
+        peer: Option<&PeerKeyLocation>,
+        time: f64,
+        samples: usize,
+    ) -> [Vec<(f64, f64)>; 3] {
         [
             self.failure
-                .peer_curve(peer, time, SAMPLES)
+                .peer_curve(peer, time, samples)
                 .into_iter()
                 .map(|(distance, value, _)| (distance, value))
                 .collect(),
             self.response_time
-                .peer_curve(peer, time, SAMPLES)
+                .peer_curve(peer, time, samples)
                 .into_iter()
                 .filter_map(|(distance, value, spread)| {
                     let seconds = self.response_time.bound(value + spread / 2.0).exp();
@@ -3604,7 +3613,7 @@ impl HierarchicalRouting {
                 })
                 .collect(),
             self.transfer_speed
-                .peer_curve(peer, time, SAMPLES)
+                .peer_curve(peer, time, samples)
                 .into_iter()
                 .filter_map(|(distance, value, spread)| {
                     let speed = self.transfer_speed.bound(value - spread / 2.0).exp();

@@ -155,6 +155,12 @@ a.header-title {
   font-family: var(--font-mono);
 }
 
+/* What one chart's window holds, under the chart. */
+.chart-note {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin: -0.2rem 0 0.8rem;
+}
 /* One-line caption under a card heading. */
 .caption {
   font-size: 0.85rem;
@@ -317,8 +323,8 @@ details.diag .info-grid {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--text-muted);
-  opacity: 0.6;
+  background: var(--chart-dot);
+  opacity: 0.85;
 }
 .sw-line-net {
   width: 16px;
@@ -368,13 +374,26 @@ svg.mchart .baseline {
   stroke-width: 1.5;
   stroke-dasharray: 4 3;
 }
+/* Other peers' dots: a step lighter than secondary text on the dark ground,
+   where --text-secondary at reduced opacity all but disappeared. */
+:root {
+  --chart-dot: #b8babe;
+}
+[data-theme='light'] {
+  --chart-dot: var(--text-secondary);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --chart-dot: var(--text-secondary);
+  }
+}
 svg.mchart .dot-other {
-  fill: var(--text-secondary);
-  opacity: 0.75;
+  fill: var(--chart-dot);
+  opacity: 0.85;
 }
 svg.mchart .dot-other.hollow {
   fill: var(--bg-primary);
-  stroke: var(--text-secondary);
+  stroke: var(--chart-dot);
   stroke-width: 1.2;
 }
 .dot-this.hollow {
@@ -388,10 +407,10 @@ svg.mchart .tick-this {
 }
 svg.mchart .dots-faint {
   fill: none;
-  stroke: var(--text-secondary);
+  stroke: var(--chart-dot);
   stroke-width: 3.6;
   stroke-linecap: round;
-  opacity: 0.5;
+  opacity: 0.6;
 }
 .dot-this {
   fill: var(--accent-primary);
@@ -472,7 +491,7 @@ svg.mchart .line-peer {
   .peer-head .addr {
     font-size: 0.9rem;
   }
-  /* One row that scrolls sideways inside its own box, never an orphan row. */
+  /* One row, never an orphan row. */
   .tab-bar {
     flex-wrap: nowrap;
     overflow-x: auto;
@@ -489,5 +508,22 @@ svg.mchart .line-peer {
   .info-grid .info-value {
     margin-bottom: 0.5rem;
     overflow-wrap: anywhere;
+  }
+}
+/* All five tabs fit a phone's row, so none hides behind a sideways scroll. */
+@media (max-width: 400px) {
+  .tab-bar {
+    justify-content: space-between;
+  }
+  .tab-label {
+    font-size: 0.64rem;
+    letter-spacing: 0;
+    padding: 0.4rem 0.15rem;
+    gap: 0.2rem;
+  }
+  .tab-count {
+    font-size: 0.58rem;
+    padding: 0.05rem 0.2rem;
+    min-width: 0;
   }
 }

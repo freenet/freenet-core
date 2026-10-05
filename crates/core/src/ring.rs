@@ -11285,17 +11285,19 @@ pub(crate) mod candidate_log_wiring_tests {
         let none: Vec<SocketAddr> = Vec::new();
         let totals = || {
             let router = ring.router.read();
-            peers.iter().fold((0u64, 0u64), |(eligible, chosen), peer| {
-                let selection = router.peer_snapshot(peer).selection.unwrap_or_default();
-                (eligible + selection.eligible, chosen + selection.chosen)
-            })
+            peers
+                .iter()
+                .fold((0u64, 0.0f64), |(eligible, chosen), peer| {
+                    let selection = router.peer_snapshot(peer).selection.unwrap_or_default();
+                    (eligible + selection.eligible, chosen + selection.chosen)
+                })
         };
 
         ring.k_closest_potentially_hosting(DecisionLog::Unlogged, key.id(), none.as_slice(), 2);
         ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice());
         assert_eq!(
             totals(),
-            (0, 0),
+            (0, 0.0),
             "probes and pre-selections are not counted"
         );
 
@@ -11303,7 +11305,7 @@ pub(crate) mod candidate_log_wiring_tests {
             .expect("a peer is selected");
         let (single, chosen) = totals();
         assert!(
-            single >= 1 && chosen == 1,
+            single >= 1 && chosen == 1.0,
             "the single-peer entry point counts"
         );
 
@@ -11315,7 +11317,10 @@ pub(crate) mod candidate_log_wiring_tests {
         );
         let (both, chosen) = totals();
         assert!(both > single, "the k-closest entry point counts");
-        assert_eq!(chosen, 2, "one first choice per decision, even with k = 2");
+        assert_eq!(
+            chosen, 2.0,
+            "one first choice per decision, even with k = 2"
+        );
     }
 
     #[tokio::test]
