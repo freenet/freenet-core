@@ -76,6 +76,14 @@ test.describe("routing page", () => {
       await overflow(),
       "document scrolls horizontally",
     ).toBeLessThanOrEqual(0);
+    // All five operation tabs fit the row; none hides behind a sideways
+    // scroll of the tab bar itself.
+    const bar = page.locator("main .tab-bar").first();
+    await expect(bar.locator(".tab-label")).toHaveCount(5);
+    expect(
+      await bar.evaluate((el) => el.scrollWidth - el.clientWidth),
+      "the tab bar scrolls sideways",
+    ).toBeLessThanOrEqual(0);
     const summary = page.locator("details#routing-diagnostics summary");
     await expect(summary).toHaveCount(1);
     await summary.click();
