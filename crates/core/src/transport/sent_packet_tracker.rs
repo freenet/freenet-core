@@ -619,6 +619,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // with full reset. The protection against congestion collapse comes from
                     // the timeout doubling itself, not from delayed recovery on ACK.
                     self.rto_backoff = 1;
+                    // A fresh ack ends the backoff round too: the next
+                    // timeout is a new expiry and must double again.
+                    self.backoff_round_end_nanos = 0;
                 } else {
                     // Non-retransmitted: calculate RTT and update estimation
                     let rtt_nanos = now_nanos.saturating_sub(*sent_time_nanos);
@@ -629,6 +632,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // RFC 6298 Section 5.7: Reset backoff on valid ACK
                     // (only for non-retransmitted packets to be safe)
                     self.rto_backoff = 1;
+                    // A fresh ack ends the backoff round too: the next
+                    // timeout is a new expiry and must double again.
+                    self.backoff_round_end_nanos = 0;
                 }
             }
 
@@ -1762,6 +1768,46 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(2_001));
         assert!(drain(&mut tracker) >= 1);
         assert_eq!(tracker.rto_backoff(), 4, "a new round doubles again");
+    }
+
+    /// An ack ends the backoff round as well as resetting the backoff: after
+    /// outage -> ack -> outage, the second outage doubles again immediately
+    /// instead of retransmitting at the base RTO until a stale round end (up
+    /// to 60 s away) passes, which burned MAX_PACKET_RETRANSMITS in seconds.
+    #[test]
+    fn ack_ends_the_backoff_round() {
+        let mut tracker = mock_sent_packet_tracker();
+        // First outage: packet 1 times out repeatedly, backoff climbs.
+        tracker.report_sent_packet(1, vec![1].into());
+        for _ in 0..6 {
+            tracker
+                .time_source
+                .advance(tracker.effective_rto() + Duration::from_millis(1));
+            assert!(matches!(tracker.get_resend(), ResendAction::Resend(..)));
+        }
+        assert!(
+            tracker.rto_backoff() >= 32,
+            "premise: long outage backed off"
+        );
+        // The path recovers: an ack resets the backoff.
+        let _ = tracker.report_received_receipts(&[1]);
+        assert_eq!(tracker.rto_backoff(), 1);
+        // Second outage: the first timeout must double again right away.
+        tracker.report_sent_packet(2, vec![2].into());
+        tracker
+            .time_source
+            .advance(tracker.effective_rto() + Duration::from_millis(1));
+        assert!(matches!(tracker.get_resend(), ResendAction::Resend(..)));
+        assert_eq!(
+            tracker.rto_backoff(),
+            2,
+            "a new outage after an ack is a new expiry and must back off"
+        );
+        tracker
+            .time_source
+            .advance(tracker.effective_rto() + Duration::from_millis(1));
+        assert!(matches!(tracker.get_resend(), ResendAction::Resend(..)));
+        assert_eq!(tracker.rto_backoff(), 4);
     }
 
     /// The new-flight signal fires on the empty-to-non-empty transition only,
