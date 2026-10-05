@@ -209,9 +209,56 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// ACK or abandon can find those packets, so their bytes are released
     /// exactly once.
     packet_streams: HashMap<PacketId, PacketStream>,
+
+    /// Raised when a packet is registered while nothing was in flight, so the
+    /// recv loop re-evaluates its resend deadline (see [`NewFlightSignal`]).
+    new_flight: std::sync::Arc<NewFlightSignal>,
+}
+
+/// Wakes the recv loop's resend check when the tracker goes from nothing in
+/// flight to something in flight (#5795 review).
+///
+/// With nothing in flight the recv loop parks its resend check a full RTO
+/// out. Packets registered by the spawned `send_stream` task (or by `send`
+/// between `recv()` calls) would otherwise have their first TLP probe, which
+/// can be due after 2·SRTT (tens of ms), held back to that RTO (>= 500 ms):
+/// the per-hop stall shape of #2450/#3215. While packets are already in
+/// flight the armed deadline is the oldest packet's, which is no later than
+/// a newer packet's, so only the empty-to-non-empty transition needs a wake.
+#[derive(Default)]
+pub(super) struct NewFlightSignal {
+    raised: std::sync::atomic::AtomicBool,
+    waker: futures::task::AtomicWaker,
+}
+
+impl NewFlightSignal {
+    fn raise(&self) {
+        self.raised
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.waker.wake();
+    }
+
+    /// Ready (and cleared) once raised since the last ready poll.
+    pub(super) fn poll_take(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.raised.swap(false, Ordering::AcqRel) {
+            return std::task::Poll::Ready(());
+        }
+        self.waker.register(cx.waker());
+        if self.raised.swap(false, Ordering::AcqRel) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
+    /// The signal raised when a packet is registered with nothing in flight.
+    pub(super) fn new_flight_signal(&self) -> std::sync::Arc<NewFlightSignal> {
+        self.new_flight.clone()
+    }
+
     /// Create a new SentPacketTracker with a custom time source.
     pub(super) fn new_with_time_source(time_source: T) -> Self {
         SentPacketTracker {
@@ -230,6 +277,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             tlp_sent_packets: HashSet::new(),
             retransmit_counts: HashMap::new(),
             packet_streams: HashMap::new(),
+            new_flight: std::sync::Arc::new(NewFlightSignal::default()),
         }
     }
 
@@ -398,11 +446,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
             return;
         }
 
+        let was_idle = self.pending_receipts.is_empty();
         self.pending_receipts
             .insert(packet_id, (payload, sent_time_nanos, token, packet_size));
         self.packet_streams.insert(packet_id, stream);
         self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
+        if was_idle {
+            self.new_flight.raise();
+        }
     }
 
     /// Remove every currently-tracked packet owned by `stream_id` and return the

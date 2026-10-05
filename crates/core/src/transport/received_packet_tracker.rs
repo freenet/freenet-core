@@ -242,6 +242,38 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.packet_id_time.len(), 0);
     }
 
+    /// A retransmitted packet's receipt is queued again after the original
+    /// receipt was sent (#5795), once per flush, and still forces a flush at
+    /// capacity.
+    #[test]
+    fn requeue_receipt_queues_once_and_respects_capacity() {
+        let mut tracker = mock_received_packet_tracker();
+        assert_eq!(tracker.report_received_packet(1), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![1], "original receipt sent");
+        assert_eq!(
+            tracker.report_received_packet(1),
+            ReportResult::AlreadyReceived
+        );
+        assert!(
+            tracker.pending_receipts.is_empty(),
+            "dedup alone queues nothing"
+        );
+        assert_eq!(tracker.requeue_receipt(1), ReportResult::Ok);
+        assert_eq!(tracker.requeue_receipt(1), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![1], "re-queued once, not twice");
+        assert_eq!(tracker.time_by_packet_id.len(), 1, "dedup window untouched");
+
+        for id in 100..(100 + MAX_PENDING_RECEIPTS as PacketId - 1) {
+            assert_eq!(tracker.requeue_receipt(id), ReportResult::Ok);
+        }
+        assert_eq!(
+            tracker.requeue_receipt(1),
+            ReportResult::QueueFull,
+            "reaching MAX_PENDING_RECEIPTS must force a flush"
+        );
+        assert_eq!(tracker.get_receipts().len(), MAX_PENDING_RECEIPTS);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_many_trackers() {
         let mut trackers = vec![];

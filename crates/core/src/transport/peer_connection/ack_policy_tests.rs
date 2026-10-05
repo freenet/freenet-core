@@ -71,10 +71,21 @@ fn end(
     inbound: ([u8; 16], Aes128Gcm),
     remote_version: Option<(u8, u8, u16)>,
 ) -> End {
+    end_with_wire_capacity(addr, remote_addr, outbound, inbound, remote_version, 4096)
+}
+
+fn end_with_wire_capacity(
+    addr: SocketAddr,
+    remote_addr: SocketAddr,
+    outbound: ([u8; 16], Aes128Gcm),
+    inbound: ([u8; 16], Aes128Gcm),
+    remote_version: Option<(u8, u8, u16)>,
+    wire_capacity: usize,
+) -> End {
     let _ = addr;
     let time_source = RealTime::new();
     let (inbound_tx, inbound_rx) = mpsc::channel(4096);
-    let (wire_tx, wire_rx) = mpsc::channel(4096);
+    let (wire_tx, wire_rx) = mpsc::channel(wire_capacity);
     let remote_conn = RemoteConnection {
         outbound_symmetric_key: outbound.1.clone(),
         remote_addr,
@@ -441,6 +452,117 @@ struct Link {
     b_to_a: Vec<(tokio::time::Instant, SymmetricMessage)>,
 }
 
+/// Returns `true` for a datagram the simulated path should DROP.
+type DropFilter = Box<dyn FnMut(&SymmetricMessage) -> bool + Send>;
+
+fn keep_all() -> DropFilter {
+    Box::new(|_| false)
+}
+
+/// Build two ends that talk to each other. Nothing runs until `start`.
+fn pair(
+    a_version_seen_by_b: Option<(u8, u8, u16)>,
+    b_version_seen_by_a: Option<(u8, u8, u16)>,
+) -> (End, End) {
+    let ka = random_key();
+    let kb = random_key();
+    let a = end(
+        addr(1),
+        addr(2),
+        ka.clone(),
+        kb.clone(),
+        b_version_seen_by_a,
+    );
+    let b = end(addr(2), addr(1), kb, ka, a_version_seen_by_b);
+    (a, b)
+}
+
+struct Running {
+    log_a: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
+    log_b: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
+    /// Application messages each end's `recv` returned.
+    got_a: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    got_b: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Running {
+    fn stop(self) -> Link {
+        for t in &self.tasks {
+            t.abort();
+        }
+        Link {
+            a_to_b: std::mem::take(&mut *self.log_a.lock()),
+            b_to_a: std::mem::take(&mut *self.log_b.lock()),
+        }
+    }
+}
+
+/// Forward each end's datagrams to the other through a lossy path, logging
+/// every datagram SENT (whether or not the path then drops it), and drive both
+/// `recv` loops.
+fn start(
+    mut a: End,
+    mut b: End,
+    mut drop_a_to_b: DropFilter,
+    mut drop_b_to_a: DropFilter,
+) -> Running {
+    let a_inbound = a.inbound.clone();
+    let b_inbound = b.inbound.clone();
+    let mut a_wire = std::mem::replace(&mut a.wire, mpsc::channel(1).1);
+    let mut b_wire = std::mem::replace(&mut b.wire, mpsc::channel(1).1);
+    let a_key = a.outbound_key.clone();
+    let b_key = b.outbound_key.clone();
+    let log_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let got_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let got_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (la, lb) = (log_a.clone(), log_b.clone());
+    let mut tasks = Vec::new();
+    tasks.push(tokio::spawn(async move {
+        while let Some((_, bytes)) = a_wire.recv().await {
+            let p = PacketData::<UnknownEncryption>::from_buf(&*bytes);
+            let m = SymmetricMessage::deser(p.try_decrypt_sym(&a_key).unwrap().data()).unwrap();
+            let dropped = drop_a_to_b(&m);
+            la.lock().push((tokio::time::Instant::now(), m));
+            if !dropped && b_inbound.send(p).await.is_err() {
+                return;
+            }
+        }
+    }));
+    tasks.push(tokio::spawn(async move {
+        while let Some((_, bytes)) = b_wire.recv().await {
+            let p = PacketData::<UnknownEncryption>::from_buf(&*bytes);
+            let m = SymmetricMessage::deser(p.try_decrypt_sym(&b_key).unwrap().data()).unwrap();
+            let dropped = drop_b_to_a(&m);
+            lb.lock().push((tokio::time::Instant::now(), m));
+            if !dropped && a_inbound.send(p).await.is_err() {
+                return;
+            }
+        }
+    }));
+    let mut a_conn = a.conn;
+    let mut b_conn = b.conn;
+    let (ga, gb) = (got_a.clone(), got_b.clone());
+    tasks.push(tokio::spawn(async move {
+        while let Ok(msg) = a_conn.recv().await {
+            ga.lock().push(msg);
+        }
+    }));
+    tasks.push(tokio::spawn(async move {
+        while let Ok(msg) = b_conn.recv().await {
+            gb.lock().push(msg);
+        }
+    }));
+    Running {
+        log_a,
+        log_b,
+        got_a,
+        got_b,
+        tasks,
+    }
+}
+
 /// Wire two ends together, run both `recv` loops for `dur`, and record every
 /// datagram each sent (decrypted, timestamped). `prime` data packets are sent
 /// in each direction first, so the test covers a connection that has carried
@@ -451,77 +573,33 @@ async fn run_link(
     prime: usize,
     dur: Duration,
 ) -> Link {
-    let ka = random_key();
-    let kb = random_key();
-    let mut a = end(
-        addr(1),
-        addr(2),
-        ka.clone(),
-        kb.clone(),
+    run_lossy_link(
+        a_version_seen_by_b,
         b_version_seen_by_a,
-    );
-    let mut b = end(addr(2), addr(1), kb, ka, a_version_seen_by_b);
+        prime,
+        dur,
+        keep_all(),
+        keep_all(),
+    )
+    .await
+}
 
-    let a_inbound = a.inbound.clone();
-    let b_inbound = b.inbound.clone();
-    let mut a_wire = std::mem::replace(&mut a.wire, mpsc::channel(1).1);
-    let mut b_wire = std::mem::replace(&mut b.wire, mpsc::channel(1).1);
-    let a_key = a.outbound_key.clone();
-    let b_key = b.outbound_key.clone();
-
-    let log_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let log_b = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let (la, lb) = (log_a.clone(), log_b.clone());
-    let fwd_a = tokio::spawn(async move {
-        while let Some((_, bytes)) = a_wire.recv().await {
-            let p = PacketData::<UnknownEncryption>::from_buf(&*bytes);
-            let m = SymmetricMessage::deser(p.try_decrypt_sym(&a_key).unwrap().data()).unwrap();
-            la.lock().push((tokio::time::Instant::now(), m));
-            if b_inbound.send(p).await.is_err() {
-                return;
-            }
-        }
-    });
-    let fwd_b = tokio::spawn(async move {
-        while let Some((_, bytes)) = b_wire.recv().await {
-            let p = PacketData::<UnknownEncryption>::from_buf(&*bytes);
-            let m = SymmetricMessage::deser(p.try_decrypt_sym(&b_key).unwrap().data()).unwrap();
-            lb.lock().push((tokio::time::Instant::now(), m));
-            if a_inbound.send(p).await.is_err() {
-                return;
-            }
-        }
-    });
-
+async fn run_lossy_link(
+    a_version_seen_by_b: Option<(u8, u8, u16)>,
+    b_version_seen_by_a: Option<(u8, u8, u16)>,
+    prime: usize,
+    dur: Duration,
+    drop_a_to_b: DropFilter,
+    drop_b_to_a: DropFilter,
+) -> Link {
+    let (mut a, mut b) = pair(a_version_seen_by_b, b_version_seen_by_a);
     for i in 0..prime {
         a.conn.send(format!("a-{i}")).await.expect("prime send");
         b.conn.send(format!("b-{i}")).await.expect("prime send");
     }
-
-    let mut a_conn = a.conn;
-    let mut b_conn = b.conn;
-    let run_a = tokio::spawn(async move {
-        loop {
-            if a_conn.recv().await.is_err() {
-                return;
-            }
-        }
-    });
-    let run_b = tokio::spawn(async move {
-        loop {
-            if b_conn.recv().await.is_err() {
-                return;
-            }
-        }
-    });
+    let running = start(a, b, drop_a_to_b, drop_b_to_a);
     tokio::time::sleep(dur).await;
-    run_a.abort();
-    run_b.abort();
-    fwd_a.abort();
-    fwd_b.abort();
-    let a_to_b = std::mem::take(&mut *log_a.lock());
-    let b_to_a = std::mem::take(&mut *log_b.lock());
-    Link { a_to_b, b_to_a }
+    running.stop()
 }
 
 fn max_gap(
@@ -777,5 +855,202 @@ async fn interval_reuses_its_sleep_across_cancelled_ticks() {
         ts.sleeps.load(std::sync::atomic::Ordering::Relaxed),
         2,
         "one sleep per period"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes (#5803)
+// ---------------------------------------------------------------------------
+
+/// A near-max short message whose piggybacked receipts do not fit is split:
+/// the message goes alone, the receipts in separate NoOps. If the receiver's
+/// ack for the message is lost, the sender must retransmit the MESSAGE (so the
+/// receiver re-acks the duplicate), not a receipt NoOp that reused its id —
+/// which a capable receiver never acks, so the message was retried until
+/// abandoned although it had been delivered.
+#[tokio::test(start_paused = true)]
+async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
+    let (mut a, b) = pair(CAPABLE, CAPABLE);
+    // Pending receipts on A, so they cannot ride along with a near-max message.
+    for id in 10_000..10_030 {
+        let _ = a.conn.received_tracker.report_received_packet(id);
+    }
+    // bincode(Vec<u8>) = 8-byte length + bytes; leave a little slack so the
+    // message alone still fits one packet.
+    let len = MAX_DATA_SIZE - SymmetricMessage::short_message_overhead() - 8 - 2;
+    let payload = vec![7u8; len];
+    let tracker = a.conn.remote_conn.sent_tracker.clone();
+    a.conn.send(payload.clone()).await.expect("send");
+
+    // The message is the first packet A sends, so it has id 0. Drop B's first
+    // ack for it.
+    let mut dropped = false;
+    let drop_first_ack: DropFilter = Box::new(move |m| {
+        if !dropped && m.confirm_receipt.contains(&0) {
+            dropped = true;
+            return true;
+        }
+        false
+    });
+    let running = start(a, b, keep_all(), drop_first_ack);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let got_b = running.got_b.lock().clone();
+    let link = running.stop();
+
+    let first = &link.a_to_b[0].1;
+    assert!(
+        first.packet_id == 0
+            && matches!(first.payload, SymmetricMessagePayload::ShortMessage { .. }),
+        "premise: the message is A's first packet, id 0: {first:?}"
+    );
+    assert!(
+        link.a_to_b
+            .iter()
+            .filter(|(_, m)| m.packet_id != 0)
+            .any(|(_, m)| m.confirm_receipt.contains(&10_000)),
+        "premise: the receipts went in a separate packet with a fresh id"
+    );
+    for (_, m) in link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0) {
+        assert!(
+            matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }),
+            "every packet sent under the message's id must be the message: {m:?}"
+        );
+    }
+    assert!(
+        link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0).count() >= 2,
+        "premise: the lost ack must have caused a retransmission"
+    );
+    assert!(
+        !tracker.lock().contains_packet(0),
+        "the retransmitted message must be re-acked, clearing it from the tracker"
+    );
+    let expected = bincode::serialize(&payload).unwrap();
+    assert_eq!(
+        got_b.iter().filter(|m| **m == expected).count(),
+        1,
+        "delivered exactly once"
+    );
+}
+
+/// When a packet enters an EMPTY flight from outside `recv()` (the spawned
+/// `send_stream` task does exactly this), its first loss probe must not wait
+/// for the idle resend check, which is parked a full RTO (>= 500 ms) out.
+#[tokio::test(start_paused = true)]
+async fn first_probe_of_a_new_burst_is_not_held_to_the_idle_rto() {
+    let e = single(CAPABLE);
+    let tracker = e.conn.remote_conn.sent_tracker.clone();
+    // One 20 ms RTT sample so TLP is enabled: PTO = 2 * SRTT = 40 ms.
+    tracker
+        .lock()
+        .report_sent_packet(9_000, vec![0u8; 8].into_boxed_slice());
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let _ = tracker.lock().report_received_receipts(&[9_000]);
+
+    let End {
+        mut conn, mut wire, ..
+    } = e;
+    let recv_task = tokio::spawn(async move { while conn.recv().await.is_ok() {} });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Several insertion phases relative to the idle timer; without the wake,
+    // most of them wait hundreds of ms for the probe.
+    for (round, offset_ms) in [7u64, 113, 251, 389, 467].into_iter().enumerate() {
+        tokio::time::sleep(Duration::from_millis(offset_ms)).await;
+        while wire.try_recv().is_ok() {}
+        let id = 9_100 + round as u32;
+        let marker: Box<[u8]> = format!("burst-{round}").into_bytes().into_boxed_slice();
+        let t0 = tokio::time::Instant::now();
+        tracker.lock().report_sent_packet(id, marker.clone());
+        let probe_after = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, bytes) = wire.recv().await.expect("wire open");
+                if *bytes == *marker {
+                    return t0.elapsed();
+                }
+            }
+        })
+        .await
+        .expect("no probe at all");
+        assert!(
+            probe_after <= Duration::from_millis(100),
+            "round {round}: first probe after {probe_after:?}, held to the idle RTO"
+        );
+        let _ = tracker.lock().report_received_receipts(&[id]);
+    }
+    recv_task.abort();
+}
+
+/// NAT keepalive under total reverse-path loss: even when the peer is never
+/// heard from, an established connection sends at least every
+/// MAX_KEEPALIVE_INTERVAL (15 s). It used to back off to 60 s.
+#[tokio::test(start_paused = true)]
+async fn keepalive_gap_is_capped_when_the_peer_is_never_heard() {
+    let start_t = tokio::time::Instant::now();
+    let dur = Duration::from_secs(100); // under the 120 s idle timeout
+    let link = run_lossy_link(CAPABLE, CAPABLE, 0, dur, keep_all(), Box::new(|_| true)).await;
+    let gap = max_gap(&link.a_to_b, start_t, start_t + dur);
+    assert!(
+        gap <= MAX_KEEPALIVE_INTERVAL + Duration::from_millis(50),
+        "A was silent for {gap:?} with its peer unheard (cap {MAX_KEEPALIVE_INTERVAL:?})"
+    );
+}
+
+/// Lost Pongs on a live link must not stretch the keepalive interval: any
+/// packet from the peer (here its own Pings) resets the backoff, so the Ping
+/// cadence stays at KEEP_ALIVE_INTERVAL.
+#[tokio::test(start_paused = true)]
+async fn lost_pongs_do_not_stretch_the_ping_interval_on_a_live_link() {
+    let start_t = tokio::time::Instant::now();
+    let dur = Duration::from_secs(100);
+    let drop_pongs: DropFilter =
+        Box::new(|m| matches!(m.payload, SymmetricMessagePayload::Pong { .. }));
+    let link = run_lossy_link(CAPABLE, CAPABLE, 0, dur, keep_all(), drop_pongs).await;
+    let pings: Vec<_> = link
+        .a_to_b
+        .into_iter()
+        .filter(|(_, m)| matches!(m.payload, SymmetricMessagePayload::Ping { .. }))
+        .collect();
+    let gap = max_gap(&pings, start_t, start_t + dur);
+    assert!(
+        gap <= KEEP_ALIVE_INTERVAL + Duration::from_millis(50),
+        "Ping interval stretched to {gap:?} although the peer was heard every 5 s"
+    );
+}
+
+/// The handshake's connection ack always carries packet id 0, the same id as
+/// the remote's first data packet. Recording it for dedup made that data
+/// packet look like a duplicate and silently dropped it.
+#[tokio::test(start_paused = true)]
+async fn connection_ack_does_not_shadow_the_first_data_packet() {
+    let mut e = single(CAPABLE);
+    let ack = SymmetricMessage::ack_ok(&e.inbound_key, [0u8; 16], addr(2)).expect("ack");
+    e.inbound
+        .send(PacketData::<UnknownEncryption>::from_buf(ack.data()))
+        .await
+        .expect("deliver ack");
+    e.deliver(SymmetricMessage::FIRST_PACKET_ID, short(b"first"), vec![])
+        .await;
+    assert_eq!(
+        e.pump(Duration::from_secs(1)).await.as_deref(),
+        Some(&b"first"[..]),
+        "the first data packet must be delivered"
+    );
+}
+
+/// A packet already recorded in the dedup window must reach `process_inbound`
+/// even if `recv()` is cancelled while receipts are being flushed: the flush is
+/// deferred, never awaited between recording and processing.
+#[tokio::test(start_paused = true)]
+async fn packet_survives_cancellation_during_a_blocked_receipt_flush() {
+    let mut e = end_with_wire_capacity(addr(1), addr(2), random_key(), random_key(), CAPABLE, 1);
+    // Fill the wire so any further send blocks.
+    e.conn.noop(vec![1]).await.expect("fill wire");
+    // Let the 600 ms receipt deadline lapse so the next packet forces a flush.
+    tokio::time::advance(Duration::from_millis(700)).await;
+    e.deliver(5, short(b"keep"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_secs(1)).await.as_deref(),
+        Some(&b"keep"[..]),
+        "recv must deliver the packet without first awaiting the blocked flush"
     );
 }

@@ -704,6 +704,43 @@ mod tests {
     // Tests for the standard VirtualTime implementation (non-MadSim).
     // These use internal APIs like register_wakeup() that only exist in the standard impl.
 
+    /// `TimeSourceInterval` keeps ONE armed sleep per period however often it
+    /// is polled (#5795), and keeps its skip semantics, under VirtualTime.
+    #[test]
+    fn interval_registers_one_wakeup_per_period_under_virtual_time() {
+        let vt = VirtualTime::new();
+        let period = Duration::from_millis(100);
+        let mut iv = TimeSourceInterval::new_at(vt.clone(), period.as_nanos() as u64, period);
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        for _ in 0..20 {
+            assert!(iv.poll_tick(&mut cx).is_pending());
+        }
+        assert_eq!(vt.pending_wakeup_count(), 1, "20 polls, one sleep");
+
+        vt.advance(period);
+        assert!(iv.poll_tick(&mut cx).is_ready(), "ticks at the deadline");
+        for _ in 0..5 {
+            assert!(iv.poll_tick(&mut cx).is_pending());
+        }
+        assert_eq!(
+            vt.pending_wakeup_count(),
+            1,
+            "one sleep for the next period"
+        );
+
+        // Skip behaviour: jumping several periods yields ONE tick, then waits
+        // for the next future deadline.
+        vt.advance(Duration::from_millis(350));
+        assert!(iv.poll_tick(&mut cx).is_ready());
+        assert!(
+            iv.poll_tick(&mut cx).is_pending(),
+            "missed ticks are skipped"
+        );
+        assert_eq!(vt.now_nanos(), 450_000_000);
+    }
+
     #[test]
     fn test_virtual_time_starts_at_zero() {
         let vt = VirtualTime::new();
