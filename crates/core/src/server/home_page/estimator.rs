@@ -13,7 +13,9 @@ use super::*;
 ///
 /// Returns 1.0 (the original full-range axis) when there is no failure signal at
 /// the right edge, avoiding a degenerate zero-height axis. The result is capped
-/// at 1.0 since a probability can never exceed 1.0.
+/// at 1.0 since a probability can never exceed 1.0. The top is rounded up to
+/// twice a 1-2-2.5-5 step, so the chart's three ticks read as round
+/// percentages (0% / 10% / 20%, not 0.0% / 8.2% / 16.3%).
 pub fn failure_chart_y_max(curve_points: &[(f64, f64)]) -> f64 {
     // y-value at the largest sampled distance (the right edge of the chart).
     let right_edge = curve_points
@@ -24,7 +26,19 @@ pub fn failure_chart_y_max(curve_points: &[(f64, f64)]) -> f64 {
     if right_edge <= 1e-9 {
         return 1.0;
     }
-    (2.0 * right_edge).min(1.0)
+    round_failure_top(2.0 * right_edge).min(1.0)
+}
+
+/// `top` rounded up to twice a 1-2-2.5-5 step.
+fn round_failure_top(top: f64) -> f64 {
+    let half = top / 2.0;
+    let decade = 10f64.powf(half.log10().floor());
+    let step = [1.0, 2.0, 2.5, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * decade)
+        .find(|&candidate| candidate >= half * (1.0 - 1e-9))
+        .unwrap_or(10.0 * decade);
+    2.0 * step
 }
 
 /// Render the named estimator chart, or — when no data has been observed
@@ -148,21 +162,13 @@ pub fn build_estimator_chart(
             }
         }
     }
-    // A failure axis from zero reads at round percentages: widen the top to
-    // twice a 1-2-2.5-5 step so the three ticks land on it.
+    // An auto-scaled failure axis from zero reads at round percentages too.
     if matches!(unit, ChartUnit::Probability)
         && y_min == 0.0
         && fixed_y_max.is_none()
         && y_max > 0.0
     {
-        let half = y_max / 2.0;
-        let decade = 10f64.powf(half.log10().floor());
-        let step = [1.0, 2.0, 2.5, 5.0, 10.0]
-            .into_iter()
-            .map(|m| m * decade)
-            .find(|&candidate| candidate >= half * (1.0 - 1e-9))
-            .unwrap_or(10.0 * decade);
-        y_max = 2.0 * step;
+        y_max = round_failure_top(y_max);
     }
     let y_range = y_max - y_min;
     // Response times and transfer speeds span orders of magnitude, so they are

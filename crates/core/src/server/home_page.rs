@@ -1435,11 +1435,18 @@ mod tests {
 
     #[test]
     fn failure_chart_y_max_zooms_to_twice_right_edge() {
-        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
-        // the line sits around mid-height instead of hugging y=0.
+        // Monotonic, tiny failure curve: right edge is 0.04 → twice that is
+        // 0.08, rounded up to 0.10 for round ticks, so the line sits below
+        // mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let y_max = failure_chart_y_max(&curve);
-        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+        assert!((y_max - 0.10).abs() < 1e-9, "expected 0.10, got {y_max}");
+        // Twice the right edge already on a round step stays put.
+        let on_step = failure_chart_y_max(&[(0.0, 0.0), (0.5, 0.025)]);
+        assert!(
+            (on_step - 0.05).abs() < 1e-9,
+            "expected 0.05, got {on_step}"
+        );
     }
 
     #[test]
@@ -1509,8 +1516,8 @@ mod tests {
 
     #[test]
     fn estimator_failure_axis_ticks_land_on_round_percentages() {
-        // An auto-scaled top of 16.3% read as "0.0% / 8.2% / 16.3%".
-        let curve = vec![(0.0, 0.01), (0.25, 0.08), (0.5, 0.148)];
+        // Twice a right edge of 8.15% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.04), (0.5, 0.0815)];
         let html = build_estimator_chart(
             "Failure Probability",
             ChartUnit::Probability,
@@ -1519,7 +1526,7 @@ mod tests {
             &[],
             (0.0, 0.5),
             "0",
-            "auto",
+            &failure_chart_y_max(&curve).to_string(),
         );
         for tick in [">0%<", ">10%<", ">20%<"] {
             assert!(html.contains(tick), "missing tick {tick}: {html}");
