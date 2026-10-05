@@ -10,9 +10,11 @@
 //!   but can be any known peer)
 //! - **Acceptor**: A peer that agrees to connect with the joiner
 //!
-//! ## Critical Behavior: Accept Only at Terminus
+//! ## Critical Behavior: Accept at (or Near) the Terminus
 //!
-//! **Relays only ACCEPT when they can't forward to a closer peer** (terminus). This means:
+//! **Relays ACCEPT when they can't forward to a closer peer** (terminus). Relays within
+//! `NEAR_TERMINUS_DISTANCE` of the target may also accept probabilistically while still
+//! forwarding (near-terminus acceptance). For a single request:
 //!
 //! ```text
 //! Joiner sends ConnectRequest targeting location 0.3
@@ -31,8 +33,10 @@
 //! ```
 //!
 //! The joiner typically receives ONE ConnectResponse from the terminus peer. To get multiple
-//! connections, the joiner sends multiple ConnectRequests (potentially targeting different
-//! locations). This ensures connections are naturally local (short ring distance).
+//! connections, the joiner sends multiple ConnectRequests targeting different locations.
+//! Terminus acceptance makes the acceptor land near the joiner's `desired_location`; the
+//! choice of `desired_location` (see "Why Target Location Matters") is what shapes the
+//! distance distribution of the joiner's connections.
 //!
 //! ## Message Flow
 //!
@@ -49,27 +53,24 @@
 //! 3. First relay fills in `joiner.peer_addr` and sends `ObservedAddress` back to joiner
 //! 4. Subsequent relays see the already-filled address
 //!
-//! ## Acceptance Criteria: Accept Only at Terminus
+//! ## Acceptance Criteria
 //!
-//! Relays only accept connect requests when they're at the routing terminus - meaning they
-//! can't forward to a peer closer to the target location. This naturally creates local
-//! connections without arbitrary distance thresholds.
+//! Relays accept connect requests at the routing terminus - meaning they can't forward to a
+//! peer closer to the target location - so the acceptor is the closest reachable peer to
+//! `desired_location` rather than whichever relay the request happened to pass through.
 //!
-//! **Algorithm:**
+//! **Algorithm** (`RelayState::step`):
 //! 1. First, check if we can forward to a closer peer via `select_next_hop()`
-//! 2. If we CAN forward: forward only (don't accept)
+//! 2. If we CAN forward: forward. If we are within `NEAR_TERMINUS_DISTANCE` of the target,
+//!    also accept with a probability that grows as we get closer, if `should_accept()` allows
 //! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows
 //!
-//! `should_accept()` still uses capacity-based evaluation:
-//! - Below min_connections → **accept**
-//! - At max_connections → **reject**
-//! - Between min and max → use density-based evaluation
-//!
-//! **Why this works for small-world topology:**
-//! - Requests route toward the target location via greedy routing
-//! - Only peers that can't forward further (near the target) accept
-//! - Gateway and early relays forward without accepting
-//! - Result: connections are naturally local (short ring distance)
+//! `should_accept()` (`ConnectionManager::should_accept`) applies capacity limits and the
+//! Kleinberg gap score (see the `topology` module docs):
+//! - At max_connections → **reject** (except nearest-neighbor lattice edges)
+//! - Below min_connections → accept below 3 open connections, then probabilistically,
+//!   favoring candidates that fill gaps in log-distance coverage
+//! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
 //! ## Routing
 //!
@@ -80,13 +81,20 @@
 //!
 //! ## Why Target Location Matters
 //!
-//! If the joiner targets their own location, the request routes toward peers near them on the
-//! ring. With accept-only-at-terminus, only the peer closest to the target (who can't forward
-//! further) accepts. This naturally creates local connections.
+//! The small-world (Kleinberg 1/d) structure comes from WHICH locations a peer targets, not
+//! from terminus acceptance itself. Terminus acceptance only ensures each new connection
+//! lands near its target; target selection and acceptance scoring together aim for
+//! connections spread roughly uniformly in log-distance (the 1/d distribution).
 //!
-//! To build multiple connections, the joiner sends multiple ConnectRequests. Early in bootstrap
-//! (0-4 connections), peers target their own location to build local neighborhoods. Later,
-//! density-based targeting is used to optimize for request patterns.
+//! In `join_ring_request`:
+//! - Fewer than `GAP_TARGET_THRESHOLD` (3) connections: target the peer's own location, with
+//!   jitter after consecutive failures (and an occasional widened step once jitter saturates)
+//! - `GAP_TARGET_THRESHOLD` or more: target the midpoint of the largest gap in the peer's
+//!   connection distances in log-distance space (`small_world_rand::gap_target`)
+//!
+//! Ring maintenance (`TopologyManager::adjust_topology`, executed by `Ring::acquire_new`)
+//! chooses its own targets: own location and evenly spaced ring locations during bootstrap,
+//! then a mix of directional gap targets and random Kleinberg 1/d samples.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -647,17 +655,17 @@ impl RelayState {
             }
         }
 
-        // ACCEPT ONLY AT TERMINUS: Relays only accept when they can't forward to a closer peer.
-        // This naturally creates local connections because only peers near the target accept.
+        // ACCEPT AT TERMINUS: Relays accept when they can't forward to a closer peer, so the
+        // acceptor is the closest reachable peer to the joiner's desired_location.
         //
         // Algorithm:
         // 1. First, check if we can forward to a closer peer
-        // 2. If we can forward: forward only (don't accept)
+        // 2. If we can forward: forward, and if we're within NEAR_TERMINUS_DISTANCE of the
+        //    target, also accept probabilistically
         // 3. If we can't forward (terminus): accept if should_accept() allows
         //
-        // This prevents early relays (gateway, first hops) from accepting connections that
-        // would be non-local on the ring. Only peers that are actually close to the target
-        // (and thus can't forward further) will accept.
+        // This prevents early relays (gateway, first hops) from accepting connections far
+        // from the requested target, which would defeat the joiner's target selection.
 
         let can_forward = self.forwarded_to.is_none() && self.request.ttl > 0;
         let next_hop = if can_forward {

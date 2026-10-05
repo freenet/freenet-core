@@ -618,20 +618,23 @@ then call the existing per-key primary-origin remover for each entry.
    → distance(a, b) must equal distance(b, a)
 ```
 
-### WHEN implementing accept-only-at-terminus
+### WHEN changing where CONNECT relays accept (operations/connect.rs)
 
 ```
-The rule: Only accept connections at terminus (can't forward to closer peer)
+Terminus acceptance is NOT what creates the small-world topology. The 1/d
+distribution comes from target selection (log-distance gap targeting, see
+topology.rs) and the Kleinberg gap score in should_accept (above).
 
-CORRECT:
-  if can_route_closer(target) {
-      forward_only();  // Don't accept
-  } else {
-      evaluate_acceptance();  // May accept
-  }
+Terminus acceptance only makes the acceptor land near the joiner's
+desired_location, so the joiner's targeting takes effect:
+  - can forward closer → forward (relays within NEAR_TERMINUS_DISTANCE of
+    the target may also accept probabilistically)
+  - terminus → accept if should_accept() allows
 
-WRONG:
-  accept_all_requests();  // Breaks small-world topology
+WRONG: gateway/early relays accepting regardless of distance to the target.
+WHY:   the connection lands wherever the request passed through, so the
+       joiner's gap-targeted desired_location is ignored.
+See: RelayState::step in operations/connect.rs
 ```
 
 ## Common Patterns
