@@ -1615,9 +1615,11 @@ fn test_streaming_get_retries_after_assembly_failure() {
 /// retry after the gateway recovers must store the contract.
 ///
 /// This is the real trigger, not the `relay_stream_fault_injection` hook the
-/// unit and e2e tests use: the gateway's outage (3 s of virtual time) grows
-/// into a fragment gap of at least 5 s at the relay, so its `assemble()` hits
-/// the 5 s inactivity timeout, as in CI run 34422250768. A sweep of the crash
+/// unit and e2e tests use: the gateway's outage (6 s of virtual time) is a
+/// fragment gap of more than 5 s at the relay, so its `assemble()` hits the
+/// 5 s inactivity timeout, as in CI run 34422250768. (It was a 3 s outage
+/// that relied on retransmission backoff to stretch the gap; see the
+/// operations below.) A sweep of the crash
 /// offset reproduced it at 300, 400 (3 runs of 3) and 500 ms after the PUT;
 /// at 20, 50, 150 and 1000 ms the stream either survived the outage or had
 /// already finished.
@@ -1665,8 +1667,13 @@ fn test_streaming_put_relay_stream_failure_is_reported_upstream() {
     };
     let operations = vec![
         put(),
-        // Silent for 3 s (the runner settles each special op for 3 s): the
-        // gateway's outbound stream stalls and the relay stops receiving it.
+        // Silent for 6 s (the runner settles each special op for 3 s, and the
+        // crash is scheduled twice): longer than the relay's 5 s assembly
+        // inactivity window by construction. With a single 3 s outage the
+        // test only worked while the transport's per-packet RTO backoff
+        // stretched the post-recovery gap past 5 s; #5795 fixed that backoff,
+        // so the retransmissions resumed in time and the stream survived.
+        ScheduledOperation::new(gateway.clone(), SimOperation::CrashNode),
         ScheduledOperation::new(gateway.clone(), SimOperation::CrashNode),
         ScheduledOperation::new(gateway.clone(), SimOperation::RecoverNode),
         // The client's retry once the gateway is back.
