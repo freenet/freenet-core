@@ -21,6 +21,7 @@ use futures::{
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::{
+    net::UdpSocket,
     sync::{mpsc, oneshot},
     task_local,
 };
@@ -28,7 +29,7 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    Socket, TransportError, UdpTransportSocket,
+    Socket, TransportError,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     global_bandwidth::GlobalBandwidthManager,
@@ -233,7 +234,7 @@ async fn bind_socket_with_retry<S: Socket>(
 }
 
 /// Receives  new inbound connections from the network.
-pub struct InboundConnectionHandler<S = UdpTransportSocket, TS: TimeSource = RealTime> {
+pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
 }
 
@@ -244,7 +245,7 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
 }
 
 /// Requests a new outbound connection to a remote peer.
-pub struct OutboundConnectionHandler<S = UdpTransportSocket, TS: TimeSource = RealTime> {
+pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S, TS>)>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
 }
@@ -641,7 +642,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
 }
 
 /// Handles UDP transport internally.
-struct UdpPacketsListener<S = UdpTransportSocket, T: TimeSource = RealTime> {
+struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
     /// Unified state manager for all remote connections.
     /// Ensures atomic state transitions during connection lifecycle
@@ -2763,7 +2764,7 @@ fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
     hasher.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
-pub(crate) enum ConnectionEvent<S = UdpTransportSocket, TS: TimeSource = RealTime> {
+pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection<S, TS>, TransportError>>,

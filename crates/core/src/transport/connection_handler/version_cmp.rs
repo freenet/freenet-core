@@ -580,13 +580,13 @@ mod tests {
 fn test_atomic_handshake_completion_no_packet_loss() {
     use super::ConnectionStateManager;
     use crate::simulation::VirtualTime;
-    use crate::transport::UdpTransportSocket;
     use crate::transport::packet_data::{PacketData, UnknownEncryption};
     use std::net::SocketAddr;
+    use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
     let time = VirtualTime::new();
-    let mut manager: ConnectionStateManager<UdpTransportSocket, VirtualTime> =
+    let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
         ConnectionStateManager::new(time);
     let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
 
@@ -627,14 +627,14 @@ fn test_atomic_handshake_completion_no_packet_loss() {
 fn test_recently_closed_prevents_asymmetric_decryption() {
     use super::{ConnectionState, ConnectionStateManager, RECENTLY_CLOSED_DURATION};
     use crate::simulation::VirtualTime;
-    use crate::transport::UdpTransportSocket;
     use crate::transport::packet_data::{PacketData, UnknownEncryption};
     use std::net::SocketAddr;
     use std::time::Duration;
+    use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
     let time = VirtualTime::new();
-    let mut manager: ConnectionStateManager<UdpTransportSocket, VirtualTime> =
+    let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
         ConnectionStateManager::new(time.clone());
     let addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
 

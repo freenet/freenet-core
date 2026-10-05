@@ -219,10 +219,6 @@ pub(crate) mod shadow_stats;
 // need to construct the production socket type name it without
 // re-introducing the raw path. `UdpSocket` is in scope via the
 // pre-existing import above.
-//
-// Note: this stays the raw tokio socket on purpose. `reference_ping` relies on
-// its inherent (unmetered) methods. The production `Socket` implementation is
-// `UdpTransportSocket`.
 pub(crate) type DefaultSocket = UdpSocket;
 mod sent_packet_tracker;
 mod symmetric_message;
@@ -451,48 +447,10 @@ fn map_addr_for_send(local_is_ipv6: bool, target: SocketAddr) -> SocketAddr {
     target
 }
 
-/// Production UDP socket: a `tokio::net::UdpSocket` plus its address family,
-/// captured once at bind time.
-///
-/// `send_to` needs to know whether the socket is AF_INET6 so it can map plain
-/// IPv4 targets to `::ffff:x.x.x.x`. Asking the kernel via `local_addr()`
-/// costs a `getsockname` syscall per packet (measured at 0.6-3.6% of node CPU
-/// on a production peer sending ~2,250 pps). The family of a socket never
-/// changes after `bind`, and equals the family of the bind address (a
-/// dual-stack socket bound to `[::]` is AF_INET6), so we cache it.
-///
-/// Deliberately does not implement `Deref` to the tokio socket: the `Socket`
-/// trait methods would shadow the inherent ones, making it unclear which
-/// `send_to` (metered or not) a call site gets. Use [`Self::local_addr`] or
-/// [`Self::into_inner`] for the few operations needed beyond the trait.
-#[derive(Debug)]
-pub struct UdpTransportSocket {
-    sock: UdpSocket,
-    is_ipv6: bool,
-}
-
-impl UdpTransportSocket {
-    /// Local address the socket is bound to.
-    #[allow(dead_code)]
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.sock.local_addr()
-    }
-
-    /// Whether the socket is AF_INET6 (cached at bind; no syscall).
-    #[allow(dead_code)]
-    pub fn is_ipv6(&self) -> bool {
-        self.is_ipv6
-    }
-
-    /// Unwrap the underlying tokio socket.
-    #[allow(dead_code)]
-    pub fn into_inner(self) -> UdpSocket {
-        self.sock
-    }
-}
-
-impl Socket for UdpTransportSocket {
-    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+/// Create, tune and bind the production UDP socket. Shared by the
+/// `Socket` impls for [`UdpSocket`] and [`UdpTransportSocket`].
+async fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
+    {
         // Use socket2 to configure dual-stack before binding, then convert
         // to a tokio UdpSocket. This ensures IPv6 sockets accept IPv4 too.
         let is_ipv6 = addr.is_ipv6();
@@ -571,14 +529,17 @@ impl Socket for UdpTransportSocket {
         }
         tracing::info!(actual_rcv = ?actual_rcv, actual_snd = ?actual_snd, "UDP socket buffer sizes");
         let std_socket: std::net::UdpSocket = sock.into();
-        Ok(Self {
-            sock: UdpSocket::from_std(std_socket)?,
-            is_ipv6,
-        })
+        UdpSocket::from_std(std_socket)
+    }
+}
+
+impl Socket for UdpSocket {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        bind_udp(addr).await
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (len, addr) = self.sock.recv_from(buf).await?;
+        let (len, addr) = self.recv_from(buf).await?;
         // Normalize ::ffff:x.x.x.x → plain IPv4 so the rest of the system
         // sees a consistent address regardless of socket type.
         let addr = normalize_mapped_addr(addr);
@@ -593,6 +554,109 @@ impl Socket for UdpTransportSocket {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         // Convert plain IPv4 targets to mapped form when sending on an IPv6 socket,
         // since AF_INET6 sockets reject AF_INET addresses with EINVAL.
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        let mapped_target = map_addr_for_send(local_is_ipv6, target);
+        let result = self.send_to(buf, mapped_target).await;
+        if let Ok(bytes) = result {
+            // Record against the un-mapped target so per-peer keys match the
+            // normalized form used everywhere else in the system.
+            metrics::TRANSPORT_METRICS.record_packet_sent(target, bytes as u64);
+        }
+        result
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        send_to_blocking_mapped(self, buf, target, local_is_ipv6)
+    }
+}
+
+/// Blocking send shared by the `Socket` impls.
+///
+/// `try_send_to` is synchronous and for UDP typically succeeds immediately.
+/// However, under high load the kernel buffer might be full, returning
+/// WouldBlock. In that case, we retry with exponential backoff since we're in
+/// a blocking context.
+fn send_to_blocking_mapped(
+    sock: &UdpSocket,
+    buf: &[u8],
+    target: SocketAddr,
+    local_is_ipv6: bool,
+) -> io::Result<usize> {
+    let mapped_target = map_addr_for_send(local_is_ipv6, target);
+    let mut backoff_us = 1u64; // Start at 1μs
+    const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
+
+    loop {
+        match sock.try_send_to(buf, mapped_target) {
+            Ok(n) => {
+                metrics::TRANSPORT_METRICS.record_packet_sent(target, n as u64);
+                return Ok(n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Kernel buffer full - exponential backoff
+                std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+                backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Production UDP socket: a `tokio::net::UdpSocket` plus its address family,
+/// captured once at bind time.
+///
+/// The plain `Socket for UdpSocket` impl above has to ask the kernel
+/// (`local_addr()`, a `getsockname` syscall) on every send to learn whether the
+/// socket is AF_INET6. That cost 0.6-3.6% of node CPU on a production peer
+/// sending ~2,250 pps. The family of a socket never changes after `bind` and
+/// equals the family of the bind address (a dual-stack socket bound to `[::]`
+/// is AF_INET6), so this type caches it. The node binds its transport socket
+/// as this type; `UdpSocket` keeps its original impl so the public `Socket`
+/// surface is unchanged.
+///
+/// Deliberately no `Deref` to the tokio socket: the `Socket` trait methods
+/// would shadow the inherent ones, making it unclear whether a call is the
+/// metered trait `send_to` or the raw one.
+#[derive(Debug)]
+pub struct UdpTransportSocket {
+    sock: UdpSocket,
+    is_ipv6: bool,
+}
+
+impl UdpTransportSocket {
+    /// Local address the socket is bound to.
+    #[allow(dead_code)]
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// Whether the socket is AF_INET6 (cached at bind; no syscall).
+    #[allow(dead_code)]
+    pub fn is_ipv6(&self) -> bool {
+        self.is_ipv6
+    }
+
+    /// Unwrap the underlying tokio socket.
+    #[allow(dead_code)]
+    pub fn into_inner(self) -> UdpSocket {
+        self.sock
+    }
+}
+
+impl Socket for UdpTransportSocket {
+    async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        Ok(Self {
+            sock: bind_udp(addr).await?,
+            is_ipv6: addr.is_ipv6(),
+        })
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        Socket::recv_from(&self.sock, buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         let mapped_target = map_addr_for_send(self.is_ipv6, target);
         let result = self.sock.send_to(buf, mapped_target).await;
         if let Ok(bytes) = result {
@@ -604,27 +668,8 @@ impl Socket for UdpTransportSocket {
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        // try_send_to is synchronous and for UDP typically succeeds immediately.
-        // However, under high load the kernel buffer might be full, returning WouldBlock.
-        // In that case, we retry with exponential backoff since we're in a blocking context.
-        let mapped_target = map_addr_for_send(self.is_ipv6, target);
-        let mut backoff_us = 1u64; // Start at 1μs
-        const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
-
-        loop {
-            match self.sock.try_send_to(buf, mapped_target) {
-                Ok(n) => {
-                    metrics::TRANSPORT_METRICS.record_packet_sent(target, n as u64);
-                    return Ok(n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Kernel buffer full - exponential backoff
-                    std::thread::sleep(std::time::Duration::from_micros(backoff_us));
-                    backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        // Same as the `UdpSocket` impl, minus the per-call getsockname.
+        send_to_blocking_mapped(&self.sock, buf, target, self.is_ipv6)
     }
 }
 
@@ -634,7 +679,7 @@ impl Socket for UdpTransportSocket {
 //
 // This trait abstracts over `PeerConnection<S>` to allow the event loop to work
 // with connections without being generic over the socket type. This enables
-// using the same event loop code for both production (UdpSocket) and testing
+// using the same event loop code for both production (UdpTransportSocket) and testing
 // (InMemorySocket) without propagating generics through the entire codebase.
 
 use crate::message::NetMessage;
@@ -885,24 +930,24 @@ mod dual_stack_tests {
     #[tokio::test]
     async fn udp_dual_stack_accepts_ipv4() {
         let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let dual_sock = <UdpTransportSocket as Socket>::bind(dual_addr)
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
             .await
             .expect("bind to [::]:0 should succeed");
         let bound_port = dual_sock.local_addr().unwrap().port();
 
         // Send a packet from an IPv4 socket to the dual-stack socket
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let v4_sender = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let v4_sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let target = SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             bound_port,
         );
-        <UdpTransportSocket as Socket>::send_to(&v4_sender, b"hello", target)
+        <UdpSocket as Socket>::send_to(&v4_sender, b"hello", target)
             .await
             .expect("send from IPv4 should succeed");
 
         let mut buf = [0u8; 16];
-        let (len, src) = <UdpTransportSocket as Socket>::recv_from(&dual_sock, &mut buf)
+        let (len, src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
             .await
             .unwrap();
         assert_eq!(&buf[..len], b"hello");
@@ -917,20 +962,20 @@ mod dual_stack_tests {
     #[tokio::test]
     async fn udp_dual_stack_accepts_ipv6() {
         let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let dual_sock = <UdpTransportSocket as Socket>::bind(dual_addr)
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
             .await
             .expect("bind to [::]:0 should succeed");
         let bound_port = dual_sock.local_addr().unwrap().port();
 
         let v6_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        let v6_sender = <UdpTransportSocket as Socket>::bind(v6_addr).await.unwrap();
+        let v6_sender = <UdpSocket as Socket>::bind(v6_addr).await.unwrap();
         let target = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), bound_port);
-        <UdpTransportSocket as Socket>::send_to(&v6_sender, b"world", target)
+        <UdpSocket as Socket>::send_to(&v6_sender, b"world", target)
             .await
             .expect("send from IPv6 should succeed");
 
         let mut buf = [0u8; 16];
-        let (len, _src) = <UdpTransportSocket as Socket>::recv_from(&dual_sock, &mut buf)
+        let (len, _src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
             .await
             .unwrap();
         assert_eq!(&buf[..len], b"world");
@@ -978,13 +1023,13 @@ mod dual_stack_tests {
     #[tokio::test]
     async fn udp_dual_stack_roundtrip_ipv4() {
         let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let dual_sock = <UdpTransportSocket as Socket>::bind(dual_addr)
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr)
             .await
             .expect("bind to [::]:0 should succeed");
         let dual_port = dual_sock.local_addr().unwrap().port();
 
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let v4_sock = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let v4_sock = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let v4_port = v4_sock.local_addr().unwrap().port();
 
         // IPv4 → dual-stack
@@ -992,12 +1037,12 @@ mod dual_stack_tests {
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             dual_port,
         );
-        <UdpTransportSocket as Socket>::send_to(&v4_sock, b"ping", target)
+        <UdpSocket as Socket>::send_to(&v4_sock, b"ping", target)
             .await
             .unwrap();
 
         let mut buf = [0u8; 16];
-        let (len, src) = <UdpTransportSocket as Socket>::recv_from(&dual_sock, &mut buf)
+        let (len, src) = <UdpSocket as Socket>::recv_from(&dual_sock, &mut buf)
             .await
             .unwrap();
         assert_eq!(&buf[..len], b"ping");
@@ -1005,11 +1050,11 @@ mod dual_stack_tests {
 
         // dual-stack → IPv4 (using the normalized address from recv_from)
         let reply_target = SocketAddr::new(src.ip(), v4_port);
-        <UdpTransportSocket as Socket>::send_to(&dual_sock, b"pong", reply_target)
+        <UdpSocket as Socket>::send_to(&dual_sock, b"pong", reply_target)
             .await
             .expect("sending to normalized IPv4 addr from IPv6 socket should work");
 
-        let (len, _) = <UdpTransportSocket as Socket>::recv_from(&v4_sock, &mut buf)
+        let (len, _) = <UdpSocket as Socket>::recv_from(&v4_sock, &mut buf)
             .await
             .unwrap();
         assert_eq!(&buf[..len], b"pong");
@@ -1029,8 +1074,18 @@ mod dual_stack_tests {
             let addr: SocketAddr = addr.parse().unwrap();
             let sock = match <UdpTransportSocket as Socket>::bind(addr).await {
                 Ok(s) => s,
-                // Sandboxes without IPv6 cannot bind v6 addresses.
-                Err(_) if addr.is_ipv6() => continue,
+                // Sandboxes without IPv6 cannot bind v6 addresses; skip only
+                // for that, not for any error.
+                Err(e)
+                    if addr.is_ipv6()
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                        ) =>
+                {
+                    eprintln!("skipping {addr}: IPv6 unavailable ({e})");
+                    continue;
+                }
                 Err(e) => panic!("bind {addr} failed: {e}"),
             };
             let local = sock.local_addr().unwrap();
@@ -1039,8 +1094,53 @@ mod dual_stack_tests {
         }
     }
 
-    /// Regression: every successful send_to on the production `UdpTransportSocket`
-    /// must update the cumulative + per-peer counters used by the local
+    /// The cached-family socket must behave like the plain impl: v4 targets
+    /// reach a dual-stack receiver, and sends update the packet metrics.
+    #[tokio::test]
+    async fn transport_socket_sends_to_dual_stack_and_records_metrics() {
+        let dual_addr: SocketAddr = "[::]:0".parse().unwrap();
+        let Ok(dual) = <UdpTransportSocket as Socket>::bind(dual_addr).await else {
+            eprintln!("skipping: IPv6 unavailable");
+            return;
+        };
+        let v4 = <UdpTransportSocket as Socket>::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let target: SocketAddr = format!("127.0.0.1:{}", dual.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        <UdpTransportSocket as Socket>::send_to(&v4, b"hi", target)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, src) = <UdpTransportSocket as Socket>::recv_from(&dual, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"hi");
+        assert!(src.is_ipv4(), "source must be normalized, got {src}");
+        // Metrics are keyed by the un-mapped target.
+        assert!(
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .iter()
+                .any(|(a, sent, _)| *a == target && *sent >= 2),
+            "send_to must record per-peer bytes_sent for {target}"
+        );
+        // Reply from the dual-stack socket to a plain v4 peer (needs mapping).
+        let reply = SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            v4.local_addr().unwrap().port(),
+        );
+        <UdpTransportSocket as Socket>::send_to_blocking(&dual, b"yo", reply).unwrap();
+        let (len, _) = <UdpTransportSocket as Socket>::recv_from(&v4, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf[..len], b"yo");
+    }
+
+    /// Regression: every successful send_to on `UdpSocket` (and, via
+    /// `transport_socket_sends_to_dual_stack_and_records_metrics`, on
+    /// `UdpTransportSocket`) must update the cumulative + per-peer counters used by the local
     /// dashboard. Before #3996, those counters only moved on stream-transfer
     /// completion, so a node connected for hours could legitimately show "—"
     /// for SENT despite real keep-alive traffic flowing.
@@ -1053,20 +1153,20 @@ mod dual_stack_tests {
         use crate::transport::metrics::TRANSPORT_METRICS;
 
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let sender = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
-        let receiver = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let receiver = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let receiver_addr = receiver.local_addr().unwrap();
         let sender_addr = sender.local_addr().unwrap();
 
         let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
 
         let payload = b"keep-alive-sized-control-packet";
-        <UdpTransportSocket as Socket>::send_to(&sender, payload, receiver_addr)
+        <UdpSocket as Socket>::send_to(&sender, payload, receiver_addr)
             .await
             .unwrap();
 
         let mut buf = [0u8; 64];
-        let (len, _) = <UdpTransportSocket as Socket>::recv_from(&receiver, &mut buf)
+        let (len, _) = <UdpSocket as Socket>::recv_from(&receiver, &mut buf)
             .await
             .unwrap();
         assert_eq!(len, payload.len());
@@ -1108,13 +1208,12 @@ mod dual_stack_tests {
         use crate::transport::metrics::TRANSPORT_METRICS;
 
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let sender = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let sender = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
 
         // Connect the socket to a known-bad address so subsequent sends
         // synchronously fail with ECONNREFUSED on Linux. This is the
         // simplest way to force a Send error from `send_to`.
         sender
-            .sock
             .connect("127.0.0.1:1") // port 1 is reserved; nothing listens
             .await
             .ok();
@@ -1125,7 +1224,7 @@ mod dual_stack_tests {
         // Capture per-peer state before — the exact behavior depends on the
         // OS (some kernels still accept the sendto), so we tolerate either
         // outcome but assert that *if* the send fails, no metric moves.
-        let result = <UdpTransportSocket as Socket>::send_to(&sender, b"x", unbound).await;
+        let result = <UdpSocket as Socket>::send_to(&sender, b"x", unbound).await;
         if result.is_err() {
             assert_eq!(
                 TRANSPORT_METRICS.cumulative_bytes_sent(),
@@ -1149,8 +1248,8 @@ mod dual_stack_tests {
         use std::sync::Arc;
 
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let sender = Arc::new(<UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap());
-        let receiver = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let sender = Arc::new(<UdpSocket as Socket>::bind(v4_addr).await.unwrap());
+        let receiver = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let receiver_addr = receiver.local_addr().unwrap();
 
         let cumulative_sent_before = TRANSPORT_METRICS.cumulative_bytes_sent();
@@ -1158,7 +1257,7 @@ mod dual_stack_tests {
         let sender_clone = sender.clone();
 
         tokio::task::spawn_blocking(move || {
-            <UdpTransportSocket as Socket>::send_to_blocking(&sender_clone, payload, receiver_addr)
+            <UdpSocket as Socket>::send_to_blocking(&sender_clone, payload, receiver_addr)
                 .expect("blocking send should succeed on localhost UDP");
         })
         .await
@@ -1166,7 +1265,7 @@ mod dual_stack_tests {
 
         // Drain the receiver so the kernel buffer doesn't leak across tests.
         let mut buf = [0u8; 64];
-        let _drain = <UdpTransportSocket as Socket>::recv_from(&receiver, &mut buf).await;
+        let _drain = <UdpSocket as Socket>::recv_from(&receiver, &mut buf).await;
 
         assert!(
             TRANSPORT_METRICS.cumulative_bytes_sent()
@@ -1194,11 +1293,9 @@ mod dual_stack_tests {
         use crate::transport::metrics::TRANSPORT_METRICS;
 
         let dual_addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let dual_sock = <UdpTransportSocket as Socket>::bind(dual_addr)
-            .await
-            .unwrap();
+        let dual_sock = <UdpSocket as Socket>::bind(dual_addr).await.unwrap();
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let v4_recv = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let v4_recv = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let v4_recv_port = v4_recv.local_addr().unwrap().port();
 
         let target = SocketAddr::new(
@@ -1207,7 +1304,7 @@ mod dual_stack_tests {
         );
         assert!(target.is_ipv4(), "test precondition");
 
-        <UdpTransportSocket as Socket>::send_to(&dual_sock, b"dual-stack", target)
+        <UdpSocket as Socket>::send_to(&dual_sock, b"dual-stack", target)
             .await
             .unwrap();
 
@@ -1242,8 +1339,8 @@ mod dual_stack_tests {
         use crate::transport::metrics::TRANSPORT_METRICS;
 
         let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-        let attacker = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
-        let victim = <UdpTransportSocket as Socket>::bind(v4_addr).await.unwrap();
+        let attacker = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
+        let victim = <UdpSocket as Socket>::bind(v4_addr).await.unwrap();
         let victim_addr = victim.local_addr().unwrap();
         let attacker_addr = attacker.local_addr().unwrap();
 
@@ -1253,7 +1350,7 @@ mod dual_stack_tests {
         attacker.send_to(&payload, victim_addr).await.unwrap();
 
         let mut buf = [0u8; 2048];
-        let (len, src) = <UdpTransportSocket as Socket>::recv_from(&victim, &mut buf)
+        let (len, src) = <UdpSocket as Socket>::recv_from(&victim, &mut buf)
             .await
             .unwrap();
         assert_eq!(len, payload.len());
@@ -1302,10 +1399,10 @@ mod dual_stack_tests {
 
         // Tuned: bind via our Socket::bind, which should request 16 MiB
         // SO_RCVBUF / SO_SNDBUF before bind.
-        let tuned = <UdpTransportSocket as Socket>::bind(addr)
+        let tuned = <UdpSocket as Socket>::bind(addr)
             .await
             .expect("tuned bind should succeed");
-        let tuned_sock2 = socket2::Socket::from(tuned.into_inner().into_std().expect("into_std"));
+        let tuned_sock2 = socket2::Socket::from(tuned.into_std().expect("into_std"));
         let tuned_rcv = tuned_sock2
             .recv_buffer_size()
             .expect("tuned recv_buffer_size");

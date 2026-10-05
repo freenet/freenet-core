@@ -1285,7 +1285,7 @@ impl P2pConnManager {
 
     /// Runs the event listener with `UdpTransportSocket` (production mode).
     ///
-    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
+    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpTransportSocket>`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
