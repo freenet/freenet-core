@@ -142,14 +142,14 @@ Contracts that exceed the threshold can still exist — they just can't conscrip
 | Component | Status |
 |-----------|--------|
 | `OutboundRequestCounter` (per-peer request count) | Live — fired from `ring.rs:1658` |
-| `RequestDensityTracker` (per-location density) | Live — drives gap-targeted growth |
+| `RequestDensityTracker` (per-location density) | Fed, but its density map is only read by tests; growth targets come from log-distance gap targeting (updated 2026-10) |
 | `adjust_topology` (Add/Remove/Swap decisions) | Live on ring tick (`ring.rs:2573`) |
 | min/max connections enforcement | Live |
 | Topology swap (replace least-routed peer) | Live |
-| `Meter::report` (bandwidth into meter) | **Dead** — `#[allow(dead_code)] // fixme: use this` |
-| Cost/benefit removal via `select_connections_to_remove` | Wired but starved — meter empty |
+| `Meter::report` (bandwidth into meter) | Live since this doc was written: per-peer bandwidth is reported via `report_resource_usage` in `ring.rs` (updated 2026-10) |
+| Cost/benefit removal via `select_connections_to_remove` | Was starved (meter empty) when written; now fed by the bandwidth reporting above (updated 2026-10) |
 
-So the peer side has the cost/benefit removal pipeline assembled but the bandwidth signal isn't reaching it. `adjust_topology` sits permanently in the "under-utilized" branch.
+When this was written, the peer side had the cost/benefit removal pipeline assembled but the bandwidth signal wasn't reaching it, so `adjust_topology` sat permanently in the "under-utilized" branch. That gap has since been closed.
 
 ### Direct reuse for contract side
 

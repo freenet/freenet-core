@@ -32,11 +32,11 @@
 //! Relay C (loc=0.31) ──> ACCEPTS (at terminus - no closer peer to forward to)
 //! ```
 //!
-//! The joiner typically receives ONE ConnectResponse from the terminus peer. To get multiple
-//! connections, the joiner sends multiple ConnectRequests targeting different locations.
-//! Terminus acceptance makes the acceptor land near the joiner's `desired_location`; the
-//! choice of `desired_location` (see "Why Target Location Matters") is what shapes the
-//! distance distribution of the joiner's connections.
+//! The joiner typically receives one ConnectResponse (two if a near-terminus relay also
+//! accepted). To get multiple connections, the joiner sends multiple ConnectRequests
+//! targeting different locations. Terminus acceptance makes the acceptor land near the
+//! joiner's `desired_location`; the choice of `desired_location` (see "Why Target Location
+//! Matters") is what shapes the distance distribution of the joiner's connections.
 //!
 //! ## Message Flow
 //!
@@ -56,14 +56,18 @@
 //! ## Acceptance Criteria
 //!
 //! Relays accept connect requests at the routing terminus - meaning they can't forward to a
-//! peer closer to the target location - so the acceptor is the closest reachable peer to
-//! `desired_location` rather than whichever relay the request happened to pass through.
+//! peer closer to the target location - so the acceptor is near `desired_location` rather
+//! than whichever relay the request happened to pass through. If the terminus declines
+//! (e.g. the joiner is already connected or pending there, or it is at capacity), the
+//! request routes uphill, bounded by `uphill_budget`, and a peer farther from the target
+//! may accept instead.
 //!
 //! **Algorithm** (`RelayState::step`):
 //! 1. First, check if we can forward to a closer peer via `select_next_hop()`
 //! 2. If we CAN forward: forward. If we are within `NEAR_TERMINUS_DISTANCE` of the target,
 //!    also accept with a probability that grows as we get closer, if `should_accept()` allows
-//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows
+//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows, otherwise route
+//!    uphill. A relay that has already forwarded never also accepts at terminus.
 //!
 //! `should_accept()` (`ConnectionManager::should_accept`) applies capacity limits and the
 //! Kleinberg gap score (see the `topology` module docs):
@@ -86,15 +90,17 @@
 //! lands near its target; target selection and acceptance scoring together aim for
 //! connections spread roughly uniformly in log-distance (the 1/d distribution).
 //!
-//! In `join_ring_request`:
+//! In `join_ring_request` (used for gateway joins, cached-peer reconnects and the startup
+//! loop):
 //! - Fewer than `GAP_TARGET_THRESHOLD` (3) connections: target the peer's own location, with
 //!   jitter after consecutive failures (and an occasional widened step once jitter saturates)
 //! - `GAP_TARGET_THRESHOLD` or more: target the midpoint of the largest gap in the peer's
-//!   connection distances in log-distance space (`small_world_rand::gap_target`)
+//!   connection distances in log-distance space (`small_world_rand::gap_target`), falling
+//!   back to jitter if there are fewer than 3 distinct neighbor locations
 //!
 //! Ring maintenance (`TopologyManager::adjust_topology`, executed by `Ring::acquire_new`)
 //! chooses its own targets: own location and evenly spaced ring locations during bootstrap,
-//! then a mix of directional gap targets and random Kleinberg 1/d samples.
+//! then directional gap targets (see the `topology` module docs).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -656,7 +662,8 @@ impl RelayState {
         }
 
         // ACCEPT AT TERMINUS: Relays accept when they can't forward to a closer peer, so the
-        // acceptor is the closest reachable peer to the joiner's desired_location.
+        // acceptor is near the joiner's desired_location (if the terminus declines, the
+        // request routes uphill below).
         //
         // Algorithm:
         // 1. First, check if we can forward to a closer peer
@@ -737,7 +744,7 @@ impl RelayState {
             }
         }
 
-        // Only accept at terminus (can't forward to a closer peer)
+        // Strict-terminus acceptance (can't forward to a closer peer)
         // IMPORTANT: Also check that we haven't already forwarded - once we forward,
         // we're committed to that path and should not also accept. This prevents
         // the "double-accept" bug where a retry call could trigger acceptance

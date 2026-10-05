@@ -216,7 +216,7 @@ stateDiagram-v2
 ```
 
 **Key features:**
-- Terminus acceptance: the closest reachable peer to the target accepts, so the connection lands where the joiner aimed
+- Terminus acceptance: the peer that can't forward closer to the target accepts (or the request routes uphill if it declines), so the connection lands near where the joiner aimed
 - NAT traversal via ObservedAddress message
 - First relay discovers joiner's external IP
 
@@ -231,6 +231,7 @@ Joiner ← Gateway ← Relay ← ConnectResponse
 
 **Acceptance criteria:**
 1. Can forward to closer peer? → Forward (a relay within 0.05 of the target may also accept probabilistically)
+   - At terminus but `should_accept` declines → route uphill (bounded by `uphill_budget`)
 2. At max_connections → Reject (except nearest-neighbor lattice edges)
 3. Below min_connections → Accept below 3 open connections, then probabilistically by Kleinberg gap score
 4. Between limits → Kleinberg gap score fed through the `ConnectionEvaluator`

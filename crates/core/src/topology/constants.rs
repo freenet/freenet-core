@@ -23,8 +23,8 @@ pub(super) const LOW_USAGE_CONNECTION_GROWTH_FACTOR: f64 = 2.0;
 /// Minimum connections before `adjust_topology` switches from bootstrap targets to
 /// Kleinberg targeting. Below this threshold (and below min_connections), peers target
 /// their own location plus evenly spaced ring locations (`bootstrap_target_locations`).
-/// At or above it, `sample_targets` alternates log-distance gap targets with random
-/// Kleinberg 1/d samples. (The name predates the switch away from request-density
+/// At or above it, `sample_targets` produces log-distance gap targets, alternating with
+/// random Kleinberg 1/d samples when several targets are requested. (The name predates the switch away from request-density
 /// targeting; request density is no longer used to pick targets.)
 pub(super) const DENSITY_SELECTION_THRESHOLD: usize = 5;
 

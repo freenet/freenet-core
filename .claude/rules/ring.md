@@ -629,7 +629,11 @@ Terminus acceptance only makes the acceptor land near the joiner's
 desired_location, so the joiner's targeting takes effect:
   - can forward closer → forward (relays within NEAR_TERMINUS_DISTANCE of
     the target may also accept probabilistically)
-  - terminus → accept if should_accept() allows
+  - terminus → accept if should_accept() allows, else route uphill
+    (bounded by uphill_budget; should_accept rejects already-connected
+    peers precisely to force this)
+  - a relay that has already forwarded MUST NOT also accept at terminus
+    (the double-accept bug)
 
 WRONG: gateway/early relays accepting regardless of distance to the target.
 WHY:   the connection lands wherever the request passed through, so the
