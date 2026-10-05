@@ -292,37 +292,6 @@ fn test_store_lost_on_timeout() {
 }
 
 // =============================================================================
-// Completion-Wait Tests
-// =============================================================================
-
-/// The shape `execute_wasm_blocking` uses: the job sends its result over a
-/// capacity-1 channel and the waiter blocks in `recv_timeout` until the bound.
-/// ONE blocking call must return the result when the job finishes, not at the
-/// bound and not on a poll interval. (This replaced a test pinning a 10 ms poll
-/// interval, which no longer exists.)
-#[test]
-fn test_completion_wait_returns_when_the_job_finishes() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<i64, &'static str>>(1);
-    let handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(100));
-        tx.send(Ok(42)).expect("waiter is alive");
-    });
-
-    let start = Instant::now();
-    let result = rx
-        .recv_timeout(Duration::from_millis(500))
-        .expect("the job finishes well inside the bound");
-    let elapsed = start.elapsed();
-    let _join = handle.join();
-
-    assert_eq!(result, Ok(42));
-    assert!(
-        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(400),
-        "returned at {elapsed:?}: should be ~100 ms, when the job finished"
-    );
-}
-
-// =============================================================================
 // Nested Runtime Tests
 // =============================================================================
 

@@ -3961,6 +3961,18 @@ mod tests {
                 .expect("runtime still schedules");
             assert_eq!(after, 7);
             blocker.await.expect("blocker must finish");
+            // The check above ran while the blocker still held the only thread,
+            // so the job could not have run yet whether or not it was aborted.
+            // Queue a sentinel behind it: the pool is FIFO, so once the sentinel
+            // has run, the aborted job has been dequeued, and it must have been
+            // dropped rather than run.
+            tokio::task::spawn_blocking(|| ())
+                .await
+                .expect("sentinel must run");
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "the aborted job ran once the pool freed up"
+            );
         });
     }
 
@@ -3998,6 +4010,14 @@ mod tests {
     /// back and leaves them. Before `WallBounds` gave the guest bound its slack,
     /// the backstop fired at the budget and won this race essentially always.
     ///
+    /// Not a race against the global ticker. A helper thread advances this
+    /// engine's epoch past the deadline itself, at 250 ms: inside the trap
+    /// window (`[0.2, 0.3]` s for a 0.2 s budget) and 100 ms before the guest
+    /// bound (0.35 s). The global ticker keeps running and can only make the
+    /// trap EARLIER, so a slow ticker cannot fail this. Remove the guest-bound
+    /// slack and the backstop fires at 0.2 s, before either can trap, and this
+    /// fails (checked by mutation).
+    ///
     /// Run on a multi-thread runtime that is shut down without waiting, so a
     /// regression (backstop wins, guest left spinning until the trap) fails the
     /// assertion instead of hanging the test.
@@ -4025,12 +4045,30 @@ mod tests {
                     .expect("instantiation must succeed");
             engine.instances.insert(id, instance);
 
+            // Late in the trap window, early against the guest bound.
+            let advance_at = Duration::from_millis(250);
+            let bounds = WallBounds::for_budget(budget_secs);
+            assert!(
+                advance_at > bounds.queue
+                    && advance_at + Duration::from_millis(100) <= bounds.guest,
+                "test premise: the advance lands after the budget, well before the guest bound"
+            );
+            // Enough increments to pass the deadline from any arming phase.
+            let ticks = engine.epoch_deadline_ticks;
+            let advancer = std::thread::spawn(move || {
+                std::thread::sleep(advance_at);
+                for _ in 0..ticks {
+                    eng.increment_epoch();
+                }
+            });
+
             let handle = InstanceHandle { id };
             let start = std::time::Instant::now();
             let err = engine
                 .call_3i64_blocking(&handle, "spin", 0, 0, 0)
                 .expect_err("a guest that never returns must not return Ok");
             let elapsed = start.elapsed();
+            advancer.join().expect("advancer must not panic");
 
             assert!(matches!(err, WasmError::Timeout), "got {err:?}");
             assert!(
