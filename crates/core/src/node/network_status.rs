@@ -40,14 +40,6 @@ pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync +
 /// Same provider pattern as `SubscriptionProvider`/`GovernanceProvider`.
 pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + 'static>;
 
-/// Provider for per-peer route outcomes, `address -> (successes, failures)`,
-/// read from the connection manager's `PeerHealthTracker`: outcomes of
-/// requests this node ORIGINATED whose first hop was that peer, since it
-/// connected (relayed outcomes feed the router only, never peer health).
-/// Same provider pattern as `RingStatsProvider`; read on every snapshot.
-pub type PeerHealthProvider =
-    Arc<dyn Fn() -> HashMap<SocketAddr, (u64, u64)> + Send + Sync + 'static>;
-
 /// Provider for the contract ban-list snapshot (#4302). Same pattern as
 /// `GovernanceProvider`: registered at node startup, replaceable for
 /// multi-node test harnesses, read by `get_snapshot` on every dashboard
@@ -254,16 +246,6 @@ pub fn set_governance_provider(provider: GovernanceProvider) {
 
 static RING_STATS_PROVIDER: parking_lot::RwLock<Option<RingStatsProvider>> =
     parking_lot::RwLock::new(None);
-
-static PEER_HEALTH_PROVIDER: parking_lot::RwLock<Option<PeerHealthProvider>> =
-    parking_lot::RwLock::new(None);
-
-/// Register the dashboard's per-peer route-outcome source. Replaces any
-/// previously-registered provider so multi-node in-process harnesses can
-/// re-wire to the current node.
-pub fn set_peer_health_provider(provider: PeerHealthProvider) {
-    *PEER_HEALTH_PROVIDER.write() = Some(provider);
-}
 
 /// Register the dashboard's ring-stats data source.
 pub fn set_ring_stats_provider(provider: RingStatsProvider) {
@@ -2097,10 +2079,6 @@ pub struct PeerSnapshot {
     pub bytes_sent: u64,
     /// Cumulative bytes received from this peer.
     pub bytes_received: u64,
-    /// `(successes, failures)` of requests this node started whose first hop
-    /// was this peer, since it connected. See [`PeerHealthProvider`]. `None`
-    /// before the provider is registered or for a peer it does not track.
-    pub route_outcomes: Option<(u64, u64)>,
 }
 
 /// Snapshot of a subscribed contract.
@@ -2388,12 +2366,6 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         .map(|(addr, sent, recv)| (addr, (sent, recv)))
         .collect();
 
-    let route_outcomes: HashMap<SocketAddr, (u64, u64)> = PEER_HEALTH_PROVIDER
-        .read()
-        .as_ref()
-        .map(|provider| provider())
-        .unwrap_or_default();
-
     let peers: Vec<PeerSnapshot> = s
         .connected_peers
         .iter()
@@ -2407,7 +2379,6 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
                 peer_key_location: p.peer_key_location.clone(),
                 bytes_sent: sent,
                 bytes_received: recv,
-                route_outcomes: route_outcomes.get(&p.address).copied(),
             }
         })
         .collect();

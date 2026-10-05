@@ -242,6 +242,7 @@ details.diag .info-grid {
 }
 .tile {
   background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
   border-radius: 8px;
   padding: 0.75rem 0.9rem;
 }
@@ -358,7 +359,7 @@ svg.mchart .baseline {
 }
 svg.mchart .dot-other {
   fill: var(--text-secondary);
-  opacity: 0.5;
+  opacity: 0.6;
 }
 svg.mchart .dot-faint {
   fill: var(--text-secondary);
@@ -368,6 +369,11 @@ svg.mchart .dot-faint {
   fill: var(--accent-primary);
   stroke: var(--bg-primary);
   stroke-width: 1.5;
+}
+svg.mchart text.halo {
+  paint-order: stroke;
+  stroke: var(--bg-primary);
+  stroke-width: 3px;
 }
 svg.mchart text.this-label {
   font-weight: 600;

@@ -1560,7 +1560,6 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 1024,
             bytes_received: 2048,
-            route_outcomes: None,
         }
     }
 
@@ -1714,7 +1713,6 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
-            route_outcomes: None,
         };
         let peer = sample_peer("10.0.0.2:31338", 0.90);
         let svg = build_ring_svg(Some(0.5), &[gw, peer], None, &[]);
@@ -1745,7 +1743,6 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
-            route_outcomes: None,
         };
         assert!(build_ring_svg(None, &[no_loc_peer], None, &[]).is_empty());
         assert!(build_ring_svg(None, &[], None, &[]).is_empty());
@@ -1875,7 +1872,6 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
-            route_outcomes: None,
         }];
         let html = build_peers_card(&Some(snap));
         assert!(
