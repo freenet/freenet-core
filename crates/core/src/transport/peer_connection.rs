@@ -28,6 +28,9 @@ mod outbound_stream;
 pub(crate) mod piped_stream;
 pub(crate) mod streaming;
 
+#[cfg(test)]
+mod ack_policy_tests;
+
 /// Lock-free streaming buffer implementation.
 /// Public when bench feature is enabled for benchmarking.
 #[cfg(feature = "bench")]
@@ -265,6 +268,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// when there is outbound traffic (see #3369).
     last_received_nanos: u64,
     keep_alive_handle: Option<JoinHandle<()>>,
+    /// Whether the remote still tracks its ack-only NoOps, so we must ack them
+    /// (true for a remote below [`UNTRACKED_ACK_NOOP_MIN_VERSION`] or of
+    /// unknown version). Fixed at construction from the negotiated version.
+    ack_remote_noops: bool,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -355,6 +362,97 @@ fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
             .min(MAX_KEEPALIVE_INTERVAL)
     } else {
         KEEP_ALIVE_INTERVAL
+    }
+}
+
+/// First release whose peers send ack-only `NoOp`s fire-and-forget (untracked)
+/// and re-ack duplicates, so their NoOps need no receipt (#5795).
+///
+/// # Why a floor
+///
+/// Releases before this one register every ack-only NoOp in their
+/// `SentPacketTracker`. If we stopped acking such a peer's NoOps it would TLP
+/// and RTO each one (12 retransmits with backoff, `on_timeout` on every RTO)
+/// before abandoning it. So we keep acking NoOps from any peer below the floor
+/// — byte-identical to the old behaviour — and only stop for peers known to be
+/// at or above it.
+///
+/// # Failure mode if this is wrong
+///
+/// Bias HIGH. A floor at or below a release that does NOT carry the change
+/// makes us ignore NoOps that peer still tracks: a bounded retransmit storm of
+/// tiny packets per data ack, not a broken connection, but real waste. A floor
+/// too high only delays the saving. Fail-closed on an unknown version.
+///
+/// # Release-time check
+///
+/// Per the wire-gated-floor rule in `docs/RELEASING.md`, this MUST equal the
+/// release that first ships it, then be frozen. Guarded by
+/// `untracked_noop_floor_tracks_the_shipping_release` via
+/// [`UNTRACKED_ACK_NOOP_SHIPPED_IN`].
+pub(super) const UNTRACKED_ACK_NOOP_MIN_VERSION: (u8, u8, u16) = (0, 2, 142);
+
+/// Has the untracked ack-only NoOp change shipped, and in which release?
+///
+/// `None` — not yet shipped: the floor is a PREDICTION about the next release
+/// and must stay strictly ABOVE the crate version. `Some(v)` — shipped in `v`,
+/// which must EQUAL the floor. If it slips, RAISE THE FLOOR; never set this to
+/// make the guard test pass.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Does a remote at `remote` still track (and so need receipts for) its
+/// ack-only NoOps? Fail-closed: an unknown version is treated as old.
+fn remote_tracks_ack_noops(remote: Option<(u8, u8, u16)>, floor: (u8, u8, u16)) -> bool {
+    remote.is_none_or(|v| v < floor)
+}
+
+/// Whether an inbound packet earns a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptPolicy {
+    /// The sender does not track this packet; a receipt would be wasted (and
+    /// was the seed of the #5795 ack-of-ack ping-pong).
+    Skip,
+    /// Record it for dedup and ack it. `reack_duplicate`: a duplicate of it is
+    /// a retransmission, i.e. our receipt was lost, so ack it again.
+    Ack { reack_duplicate: bool },
+}
+
+/// Which inbound packets get a receipt (#5795).
+///
+/// - `Ping` / `Pong`: never. Every release sends them straight to the socket,
+///   untracked (since #2404), so a receipt for one is pure overhead.
+/// - `NoOp`: only when `ack_remote_noops` (a peer below
+///   [`UNTRACKED_ACK_NOOP_MIN_VERSION`], which tracks its ack-only NoOps).
+///   From a peer at or above the floor a NoOp is fire-and-forget and is NOT
+///   acked — this is what ends the ack-of-ack ping-pong. Note a NoOp can also
+///   be the trailing receipt carrier of a multi-packet message, sharing the
+///   payload packet's id; the payload packet itself earns the receipt.
+/// - `ShortMessage` / `StreamFragment`: always, and re-acked on duplicate.
+/// - `AckConnection*`: acked as before (sent untracked by the handshake, so
+///   the receipt is harmless), not re-acked.
+fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
+    match payload {
+        SymmetricMessagePayload::Ping { .. } | SymmetricMessagePayload::Pong { .. } => {
+            ReceiptPolicy::Skip
+        }
+        SymmetricMessagePayload::NoOp => {
+            if ack_remote_noops {
+                ReceiptPolicy::Ack {
+                    reack_duplicate: true,
+                }
+            } else {
+                ReceiptPolicy::Skip
+            }
+        }
+        SymmetricMessagePayload::ShortMessage { .. }
+        | SymmetricMessagePayload::StreamFragment { .. } => ReceiptPolicy::Ack {
+            reack_duplicate: true,
+        },
+        SymmetricMessagePayload::AckConnection { .. }
+        | SymmetricMessagePayload::AckConnectionV2 { .. } => ReceiptPolicy::Ack {
+            reack_duplicate: false,
+        },
     }
 }
 
@@ -642,7 +740,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
 
         let now_nanos = time_source.now_nanos();
+        let ack_remote_noops = remote_tracks_ack_noops(
+            remote_conn.remote_protoc_version,
+            UNTRACKED_ACK_NOOP_MIN_VERSION,
+        );
         Self {
+            ack_remote_noops,
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
@@ -1098,32 +1201,52 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                     }
 
-                    let report_result = self.received_tracker.report_received_packet(packet_id);
-                    match (report_result, should_send_receipts) {
-                        (ReportResult::QueueFull, _) | (_, true) => {
-                            let receipts = self.received_tracker.get_receipts();
-                            if !receipts.is_empty() {
-                                if let Err(e) = self.noop(receipts).await {
-                                    if e.is_transient_send_failure() {
-                                        tracing::warn!(
-                                            peer_addr = %self.remote_conn.remote_addr,
-                                            "ACK noop send failed, will retry"
-                                        );
-                                    } else {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                        },
-                        (ReportResult::Ok, _) => {}
-                        (ReportResult::AlreadyReceived, _) => {
+                    // Decide whether this packet earns a receipt (#5795). A
+                    // receipt is only useful for a packet the SENDER tracks
+                    // for retransmission; acking anything else costs a
+                    // packet and, before #5795, seeded an endless
+                    // ack-of-ack ping-pong. See `receipt_policy`.
+                    let policy = receipt_policy(&payload, self.ack_remote_noops);
+                    let report_result = match policy {
+                        ReceiptPolicy::Skip => ReportResult::Ok,
+                        ReceiptPolicy::Ack { .. } => {
+                            self.received_tracker.report_received_packet(packet_id)
+                        }
+                    };
+                    let flush_receipts = match report_result {
+                        ReportResult::AlreadyReceived => {
                             tracing::trace!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 packet_id,
                                 "Already received packet"
                             );
+                            // The sender retransmitted a packet we already
+                            // have, so our receipt for it never arrived.
+                            // Re-ack it: our ack-only NoOps are
+                            // fire-and-forget, so this is how a lost receipt
+                            // is recovered, exactly as TCP re-acks a
+                            // duplicate segment. Without it the sender would
+                            // retransmit until MAX_PACKET_RETRANSMITS and
+                            // then abandon a packet we actually delivered.
+                            let queue_full = matches!(
+                                policy,
+                                ReceiptPolicy::Ack { reack_duplicate: true }
+                            ) && self.received_tracker.requeue_receipt(packet_id)
+                                == ReportResult::QueueFull;
+                            if queue_full {
+                                self.flush_receipts_now().await?;
+                            }
+                            // A duplicate is never delivered again. (Before
+                            // #5795 a duplicate arriving while the 600 ms
+                            // receipt deadline had lapsed fell through to
+                            // `process_inbound` and was delivered twice.)
                             continue;
                         }
+                        ReportResult::QueueFull => true,
+                        ReportResult::Ok => should_send_receipts,
+                    };
+                    if flush_receipts {
+                        self.flush_receipts_now().await?;
                     }
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(
@@ -1474,24 +1597,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // Background ACK timer - proactively send pending ACKs
                 // This prevents ACK delays when there's no outgoing traffic to piggyback on
                 _ = ack_check.tick() => {
-                    let receipts = self.received_tracker.get_receipts();
-                    if !receipts.is_empty() {
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            receipt_count = receipts.len(),
-                            "Background ACK timer: sending pending receipts"
-                        );
-                        if let Err(e) = self.noop(receipts).await {
-                            if e.is_transient_send_failure() {
-                                tracing::warn!(
-                                    peer_addr = %self.remote_conn.remote_addr,
-                                    "Background ACK send failed, will retry next tick"
-                                );
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
+                    self.flush_receipts_now().await?;
                 },
                 // Rate update timer - update TokenBucket rate based on BBR cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
@@ -1920,29 +2026,76 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
-    #[inline]
+    /// Drain every pending receipt into ack-only NoOps right now.
+    ///
+    /// A transient send failure is logged and swallowed (the drained receipts
+    /// are recovered by the remote's retransmission and our duplicate re-ack,
+    /// see `noop`); any other error is returned so `recv` tears down.
+    async fn flush_receipts_now(&mut self) -> Result<()> {
+        let receipts = self.received_tracker.get_receipts();
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        match self.noop(receipts).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_transient_send_failure() => {
+                tracing::warn!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    "ACK noop send failed; the remote's retransmission will be re-acked"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send an ack-only `NoOp` carrying `receipts`, fire-and-forget.
+    ///
+    /// The packet is deliberately NOT registered with the `SentPacketTracker`
+    /// and does NOT touch congestion-control flight size (#5795). Before this,
+    /// every ack-only NoOp was tracked, so the remote had to ack it, which it
+    /// did with another tracked NoOp, which we then had to ack — an endless
+    /// ack-of-ack ping-pong at ~5 pps per direction on every connection, even
+    /// fully idle ones.
+    ///
+    /// Reliability of the receipts we carry does not depend on tracking this
+    /// packet: if it is lost, the remote's own TLP/RTO retransmits the
+    /// original packet, and `recv` re-acks a duplicate of any packet type the
+    /// sender tracks (see `reack_duplicate`). A receipt is therefore never
+    /// lost for good, it just arrives one retransmission later — the same
+    /// recovery TCP uses for a lost pure ACK.
+    ///
+    /// Wire-compatible in both directions: the bytes are an ordinary
+    /// `NoOp { confirm_receipt }`. An old remote acks it as before (we ignore
+    /// a receipt for an untracked packet); whether WE ack the remote's NoOps
+    /// is decided separately, by `ack_remote_noops`.
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
-        // Get token before sending (captures send-time state for BBR)
-        // Estimate noop packet size (~50 bytes typically)
-        let token = self
-            .remote_conn
-            .congestion_controller
-            .on_send_with_token(50);
-        packet_sending(
-            self.remote_conn.remote_addr,
-            &self.remote_conn.socket,
-            self.remote_conn
+        let max_per_packet = SymmetricMessage::max_num_of_confirm_receipts_of_noop_message();
+        for chunk in receipts.chunks(max_per_packet.max(1)) {
+            let packet_id = self
+                .remote_conn
                 .last_packet_id
-                .fetch_add(1, std::sync::atomic::Ordering::Release),
-            &self.remote_conn.outbound_symmetric_key,
-            receipts,
-            (),
-            &self.remote_conn.sent_tracker,
-            50,
-            token,
-            PacketStream::Control,
-        )
-        .await
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let packet = SymmetricMessage::serialize_msg_to_packet_data(
+                packet_id,
+                SymmetricMessagePayload::NoOp,
+                &self.remote_conn.outbound_symmetric_key,
+                chunk.to_vec(),
+            )?
+            .prepared_send();
+            self.remote_conn
+                .socket
+                .send_to(&packet, self.remote_conn.remote_addr)
+                .await
+                .map_err(|e| TransportError::SendFailed(self.remote_conn.remote_addr, e.kind()))?;
+            // Phase 1.6 (#4074): ack-only NoOps no longer go through
+            // `packet_sending`, so classify them here (must-flow, as before).
+            super::shadow_demand::record_outbound(
+                super::shadow_demand::OutboundClass::MustFlow,
+                packet.len(),
+            );
+        }
+        Ok(())
     }
 
     /// Send a Pong response to a received Ping.

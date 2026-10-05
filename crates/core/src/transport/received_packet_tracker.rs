@@ -79,6 +79,23 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         }
     }
 
+    /// Queue a receipt again for a packet already reported, because the
+    /// sender retransmitted it (so our previous receipt was lost).
+    ///
+    /// Does not touch the dedup window. A receipt already pending is not
+    /// queued twice. Returns `QueueFull` when the caller must flush now, `Ok`
+    /// otherwise (including the not-queued-twice case).
+    pub(super) fn requeue_receipt(&mut self, packet_id: PacketId) -> ReportResult {
+        if !self.pending_receipts.contains(&packet_id) {
+            self.pending_receipts.push(packet_id);
+        }
+        if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
+            ReportResult::Ok
+        } else {
+            ReportResult::QueueFull
+        }
+    }
+
     /// Returns a list of packets that have been received since the last call to this function.
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (100ms) this should be called and if the returned
