@@ -528,7 +528,8 @@ fn response_tile(view: &RouterView, learned: &Learned) -> String {
                 fmt_time(alone)
             ),
             None if !learned.told_apart[1] => {
-                "; no measurable difference between your peers' response times yet".to_string()
+                // Short: the comparison card carries the full sentence.
+                "; no measurable difference between peers yet".to_string()
             }
             None => "; too few timed replies yet to compare it with distance alone".to_string(),
         }
@@ -1215,7 +1216,8 @@ fn past_requests_card(view: &RouterView, learned: &Learned) -> String {
             Some(_) => format!(
                 "{dots} Your node expects this peer to reply about as fast as distance alone predicts."
             ),
-            None if !learned.told_apart[1] => format!("{dots} {}", NO_DIFFERENCE[1]),
+            // The comparison card says it once; the caption does not repeat it.
+            None if !learned.told_apart[1] => dots.to_string(),
             None => format!(
                 "{dots} Too few of its replies yet to say how it differs from what distance alone predicts."
             ),
@@ -2625,12 +2627,17 @@ mod tests {
         };
         let html = render_peer_page(&inputs(&snaps, 0), Some(&view));
         assert!(html.contains(
-            "predicted for contracts near it; no measurable difference between your peers' response times yet."
+            "predicted for contracts near it; no measurable difference between peers yet."
         ));
         assert!(!html.contains("about as fast"), "no comparison is claimed");
+        // Each full sentence appears once on the page, in the comparison card.
         for sentence in NO_DIFFERENCE {
-            assert!(html.contains(sentence), "missing {sentence:?}");
+            assert_eq!(html.matches(sentence).count(), 1, "{sentence:?}");
         }
+        assert!(
+            html.contains(r#"<p class="caption">Each dot is a reply to a request your node sent to a peer.</p>"#),
+            "the Past requests caption adds nothing in this state"
+        );
         let card = compare_card(&inputs(&snaps, 0), &view);
         assert!(!card.contains("<svg"), "no strips are drawn");
         assert!(
