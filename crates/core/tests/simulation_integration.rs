@@ -12550,6 +12550,16 @@ fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
 /// is recorded ONLY when a consulted advertised host returns Found, so with
 /// migration off it is unambiguous that the consult (not routing or migration)
 /// delivered the state.
+///
+/// **HTL 3 is load-bearing** (#5172). The dead-end is HTL exhaustion inside
+/// the cluster: the HTL-0 peer answers NotFound and a relay above it, which
+/// forwarded and got that NotFound back, consults. Raise the HTL and the walk
+/// can reach the host by routing (no consult at all) or dead-end at a peer
+/// holding no advertisement, depending on the seed's topology. Coverage given
+/// up by this: the downstream NotFound no longer comes from a peer with no
+/// closer unvisited candidate (the deepest greedy terminus). The consult runs
+/// on the same "forwarded, got a clean NotFound" path either way, but a
+/// consult that follows a no-candidate NotFound is no longer exercised here.
 #[test_log::test]
 fn test_terminal_advertisement_consult_closes_get_dead_end() {
     use freenet::config::GlobalTestMetrics;
@@ -12730,6 +12740,13 @@ fn test_terminal_advertisement_consult_closes_get_dead_end() {
 /// Proof is `terminal_consult_resolved_found() > 0` (recorded ONLY when a
 /// consulted host returns Subscribed); with migration off it is unambiguous
 /// that the consult (not routing or migration) closed the subscribe dead-end.
+///
+/// **HTL 3 is load-bearing** (#5172); see the comment at the
+/// `new_with_node_locations` call. Coverage given up, as in the GET test: the
+/// downstream NotFound now comes from HTL exhaustion, not from a peer with no
+/// closer unvisited candidate (which reports NotFound without consulting, see
+/// `drive_relay_subscribe`), so a consult that follows that kind of NotFound
+/// is no longer exercised here.
 #[test_log::test]
 fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
     use freenet::config::GlobalTestMetrics;
@@ -17955,6 +17972,11 @@ struct SuppressionArm {
     sends: u64,
     delta_sends: u64,
     full_state_sends: u64,
+    /// Payload bytes of `delta_sends` / `full_state_sends`. The piggybacked
+    /// `sender_summary_bytes` are NOT included; every leg carries one, so
+    /// leaving them out understates the arm that sends more legs (control).
+    delta_bytes: u64,
+    full_state_bytes: u64,
     resync_suppressed: u64,
     summary_skips: u64,
     /// Contracts that converged, and how many there were.
@@ -18279,6 +18301,8 @@ fn run_5147_arm_with(
         sends: GlobalTestMetrics::delta_sends() + GlobalTestMetrics::full_state_sends(),
         delta_sends: GlobalTestMetrics::delta_sends(),
         full_state_sends: GlobalTestMetrics::full_state_sends(),
+        delta_bytes: GlobalTestMetrics::delta_send_bytes(),
+        full_state_bytes: GlobalTestMetrics::full_state_send_bytes(),
         resync_suppressed: GlobalTestMetrics::resync_requests_suppressed(),
         summary_skips: GlobalTestMetrics::fanout_summary_skips(),
         converged: (convergence.converged.len(), convergence.total_contracts()),
@@ -18489,12 +18513,14 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
 
     tracing::info!(
         "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         bytes(delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
         control.sends,
         control.delta_sends,
         control.full_state_sends,
+        control.delta_bytes,
+        control.full_state_bytes,
         control.suppressed,
         control.summary_skips,
         control.notification_targets,
@@ -18505,12 +18531,14 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     );
     tracing::info!(
         "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         bytes(delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
         treatment.sends,
         treatment.delta_sends,
         treatment.full_state_sends,
+        treatment.delta_bytes,
+        treatment.full_state_bytes,
         treatment.suppressed,
         treatment.summary_skips,
         treatment.notification_targets,
@@ -18622,7 +18650,9 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     //    (`sends` counts only successful ones), the `compute_delta` empty-delta
     //    return, `should_broadcast_contract`, and queue eviction.
     //
-    // With all four buckets the arms land at 877 vs 869: under 1%. So the
+    // With all four buckets the arms landed at 877 vs 869, under 1% (measured
+    // before this arm ran with `gateway_ack_version`; the 5% bound below held
+    // in all 30 perturbed RNG trajectories after that change). So the
     // assertion is a bound, not an identity. It is still a real discriminator —
     // a genuine topology difference between the arms moves this by far more
     // than a few unbucketed legs — while no longer being a tripwire that fires
@@ -18685,8 +18715,9 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     // denominator for exactly this ratio (see its rustdoc) and was previously
     // gathered and never used. Cross-multiplied to stay in integers:
     //   treatment.redundant / treatment.deliveries < control.redundant / control.deliveries
-    // Measured after the gating fix: control 321/440 = 73.0%, treatment
-    // 160/260 = 61.5%.
+    // Measured with `gateway_ack_version`, across 18 perturbed RNG
+    // trajectories: control 73-75% (e.g. 340/452), treatment 61-66% (e.g.
+    // 185/285).
     assert!(
         treatment.redundant * control.deliveries < control.redundant * treatment.deliveries,
         "#5147 reduced redundant deliveries ({} vs control {}) only in step with \
@@ -18699,7 +18730,8 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.deliveries,
     );
 
-    // DISCRIMINATOR E: the saving is in BYTES, not merely in message count.
+    // DISCRIMINATOR E: the saving is not undone by a shift onto the
+    // full-state path (a production BYTES concern, measured here by count).
     //
     // Every assertion above counts legs. This design has a specific, known way
     // to cut legs while RAISING bytes: suppressing a leg also suppresses the
@@ -18707,35 +18739,41 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     // a peer whose cached summary we lack receives FULL STATE
     // (`FullNoTheirSummaryTracked`) instead of a delta — 26.9% of broadcast
     // bytes at a 357 KB mean in the 0.2.109 fleet profile, against a few KB for
-    // a delta. Roughly a dozen extra full states would erase the entire
-    // measured saving while `sends`, `redundant` and `suppressed` all still
-    // moved the right way.
+    // a delta. At production sizes a handful of extra full states could erase
+    // the whole delta saving while `sends`, `redundant` and `suppressed` all
+    // still moved the right way. (An earlier version said "roughly a dozen";
+    // that figure was never derived for any measured delta size.)
     //
     // `full_state_sends` was captured and logged but never asserted, which left
     // the one number that reveals the inversion outside the test's reach.
     //
-    // Measured after the gating fix: **16 in both arms**, saving entirely in
-    // deltas (444 -> 272). The direction of risk is real — every extra
-    // suppressed leg also suppresses the `sender_summary_bytes` piggyback named
-    // above, which is what would push the treatment arm's full-state count up.
+    // Why this counts full-state SENDS rather than bytes: in this sim the
+    // CRDT state is tiny, so a full state (136 B payload) is no larger than a
+    // delta (144 B). Bytes here cannot show the production inversion at all,
+    // so the byte assertion below guards a different thing and the count is
+    // the only proxy for "peers pushed onto the full-state path".
     //
-    // But "16 in both arms" was ONE trajectory, and an exact `<=` between two
-    // independently-scheduled runs cannot be read at that resolution (#5172).
-    // The two arms share a seed but diverge the moment the flag changes
-    // behaviour, so each is one sample of a count that moves with the RNG
-    // trajectory alone. Measured by perturbing the trajectory (one extra
-    // `GlobalRng` draw per transport noop, 0..17 draws, nothing else changed),
-    // the CONTROL arm, whose code is identical in every run, reported anywhere
-    // from 16 to 20 full states; the treatment arm 16 to 19, below control on
-    // average (16.8-17.3 against 18.7). Under the exact comparison, 2 of 18
-    // trajectories failed with no product change at all, by 1 and 2.
+    // Why the count gets a tolerance: the two arms share a seed but diverge
+    // the moment the flag changes behaviour, so each is one sample of a count
+    // that moves with the RNG trajectory alone (#5172). Measured by perturbing
+    // the trajectory (one extra `GlobalRng` draw per transport noop, 0..17
+    // draws, nothing else changed), the CONTROL arm, whose code is identical
+    // in every run, reported anywhere from 16 to 20 full states; the treatment
+    // arm 16 to 19. An exact `<=` failed 2 of 18 trajectories with no product
+    // change, by 1 and 2. The bound is the control arm's own observed spread.
     //
-    // So the bound is the control arm's own observed spread. That still
-    // catches the failure named above with room to spare: about a dozen extra
-    // full states erase the whole saving, and anything beyond the noise (5 or
-    // more) fails here. If this reddens, the first hypothesis is still that
-    // suppression grew; check `suppressed` against the numbers above before
-    // calling it noise.
+    // What the bound does and does not establish. In-sim, it catches the
+    // mechanism named above: removing the `sender_summary_bytes` piggyback
+    // from the treatment arm's broadcasts (the cache-seeding this design
+    // suppresses) took it from 18 to 31 full states against control's 20,
+    // and this assertion failed. It is NOT a production-scale safety margin:
+    // at the 0.2.109 fleet profile's 357 KB per full state, 4 extra full
+    // states may well outweigh the delta saving. Treat it as "no detectable
+    // shift onto the full-state path", and judge production bytes from
+    // telemetry (#5153), not from this sim.
+    //
+    // If this reddens, the first hypothesis is that suppression grew; check
+    // `suppressed` against the numbers above before calling it noise.
     const FULL_STATE_TRAJECTORY_SPREAD: u64 = 4;
     assert!(
         treatment.full_state_sends <= control.full_state_sends + FULL_STATE_TRAJECTORY_SPREAD,
@@ -18749,6 +18787,29 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.sends,
         treatment.full_state_sends,
         control.full_state_sends,
+    );
+
+    // DISCRIMINATOR F: fewer broadcast payload BYTES on the wire, not just
+    // fewer legs. At this sim's state sizes (see E) this is close to C in
+    // bytes, but it is the only assertion that sums what was actually sent:
+    // a change that cut legs while making each remaining payload larger
+    // passes A-E and fails here. Payload only; the per-leg summary piggyback
+    // is left out, which understates the control arm (more legs), so this is
+    // the conservative direction. Measured: control 65-67 KB, treatment
+    // 36-43 KB across 18 trajectories.
+    let control_bytes = control.delta_bytes + control.full_state_bytes;
+    let treatment_bytes = treatment.delta_bytes + treatment.full_state_bytes;
+    assert!(
+        control_bytes > 0,
+        "premise: the control arm sent ZERO broadcast payload bytes, so the byte \
+         comparison below passes vacuously"
+    );
+    assert!(
+        treatment_bytes < control_bytes,
+        "#5147 cut broadcast legs ({} vs control {}) but not broadcast payload \
+         bytes ({treatment_bytes} vs control {control_bytes})",
+        treatment.sends,
+        control.sends,
     );
 
     // SAFETY: no bandwidth saving justifies a peer not converging. This is the

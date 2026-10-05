@@ -4787,6 +4787,7 @@ std::thread_local! {
     /// rather than inferred from the total (#5510).
     static GLOBAL_DELTA_FAILURE_RESYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out legs skipped because the peer's cached summary already matched
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
     static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4803,6 +4804,7 @@ std::thread_local! {
     static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4909,12 +4911,14 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
         GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
@@ -5133,10 +5137,11 @@ impl GlobalTestMetrics {
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.get())
     }
 
-    /// Records that a delta was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = true.
-    pub fn record_delta_send() {
+    /// Records that a delta of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = true.
+    pub fn record_delta_send(payload_bytes: usize) {
         GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of delta sends since last reset.
@@ -5144,15 +5149,26 @@ impl GlobalTestMetrics {
         GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
-    /// Records that full state was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = false.
-    pub fn record_full_state_send() {
+    /// Payload bytes of every delta counted by [`Self::delta_sends`].
+    pub fn delta_send_bytes() -> u64 {
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.get())
+    }
+
+    /// Records that a full state of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = false.
+    pub fn record_full_state_send(payload_bytes: usize) {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
+    }
+
+    /// Payload bytes of every full state counted by [`Self::full_state_sends`].
+    pub fn full_state_send_bytes() -> u64 {
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.get())
     }
 
     pub fn record_pending_op_insert() {
