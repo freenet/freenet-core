@@ -2856,6 +2856,54 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "contract_exec_delta_wasm_uncached_last_snapshot",
                         snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
                     ),
+                    (
+                        "contract_summary_cache_entries",
+                        snapshot.contract_summary_cache_entries,
+                    ),
+                    (
+                        "contract_summary_cache_bytes",
+                        snapshot.contract_summary_cache_bytes,
+                    ),
+                    (
+                        "contract_summary_cache_budget_bytes",
+                        snapshot.contract_summary_cache_budget_bytes,
+                    ),
+                    (
+                        "contract_summary_cache_count_cap",
+                        snapshot.contract_summary_cache_count_cap,
+                    ),
+                    (
+                        "contract_summary_cache_count_cap_evictions_total",
+                        snapshot.contract_summary_cache_count_cap_evictions_total,
+                    ),
+                    (
+                        "contract_summary_cache_byte_budget_evictions_total",
+                        snapshot.contract_summary_cache_byte_budget_evictions_total,
+                    ),
+                    (
+                        "contract_delta_cache_entries",
+                        snapshot.contract_delta_cache_entries,
+                    ),
+                    (
+                        "contract_delta_cache_bytes",
+                        snapshot.contract_delta_cache_bytes,
+                    ),
+                    (
+                        "contract_delta_cache_budget_bytes",
+                        snapshot.contract_delta_cache_budget_bytes,
+                    ),
+                    (
+                        "contract_delta_cache_count_cap",
+                        snapshot.contract_delta_cache_count_cap,
+                    ),
+                    (
+                        "contract_delta_cache_count_cap_evictions_total",
+                        snapshot.contract_delta_cache_count_cap_evictions_total,
+                    ),
+                    (
+                        "contract_delta_cache_byte_budget_evictions_total",
+                        snapshot.contract_delta_cache_byte_budget_evictions_total,
+                    ),
                 ] {
                     obj.insert(name.to_string(), serde_json::json!(value));
                 }
@@ -4609,6 +4657,18 @@ mod tests {
         info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
         info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
         info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
+        info.contract_summary_cache_entries = Some(117);
+        info.contract_summary_cache_bytes = Some(118);
+        info.contract_summary_cache_budget_bytes = Some(119);
+        info.contract_summary_cache_count_cap = Some(120);
+        info.contract_summary_cache_count_cap_evictions_total = Some(121);
+        info.contract_summary_cache_byte_budget_evictions_total = Some(122);
+        info.contract_delta_cache_entries = Some(123);
+        info.contract_delta_cache_bytes = Some(124);
+        info.contract_delta_cache_budget_bytes = Some(125);
+        info.contract_delta_cache_count_cap = Some(126);
+        info.contract_delta_cache_count_cap_evictions_total = Some(127);
+        info.contract_delta_cache_byte_budget_evictions_total = Some(128);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("contract_exec_summarize_fast_hits_total", 101),
@@ -4627,6 +4687,18 @@ mod tests {
             ("contract_exec_delta_reload_hits_last_snapshot", 114),
             ("contract_exec_delta_wasm_calls_last_snapshot", 115),
             ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
+            ("contract_summary_cache_entries", 117),
+            ("contract_summary_cache_bytes", 118),
+            ("contract_summary_cache_budget_bytes", 119),
+            ("contract_summary_cache_count_cap", 120),
+            ("contract_summary_cache_count_cap_evictions_total", 121),
+            ("contract_summary_cache_byte_budget_evictions_total", 122),
+            ("contract_delta_cache_entries", 123),
+            ("contract_delta_cache_bytes", 124),
+            ("contract_delta_cache_budget_bytes", 125),
+            ("contract_delta_cache_count_cap", 126),
+            ("contract_delta_cache_count_cap_evictions_total", 127),
+            ("contract_delta_cache_byte_budget_evictions_total", 128),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
