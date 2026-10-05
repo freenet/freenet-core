@@ -354,9 +354,13 @@ Contract operations use `spawn_blocking` with timeout:
 fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where F: FnOnce() -> WasmResult + Send + 'static
 {
-    // 1. Spawn blocking task (tokio or std::thread)
-    // 2. Poll for completion with 10ms interval
-    // 3. Return Timeout if exceeded
+    // 1. Spawn blocking task (tokio or std::thread); the job sends its
+    //    result over a capacity-1 channel when it finishes
+    // 2. Wait on that channel with recv_timeout (inside one block_in_place on
+    //    a multi-thread runtime), waking on completion or at a wall bound
+    // 3. At a bound: QueuedTimeout if the job never started (queue bound =
+    //    budget), Timeout if it ran past its guest bound (the epoch-trap
+    //    window plus a margin, so the epoch trap normally wins)
     // 4. Store is moved into/out of blocking context
 }
 ```
