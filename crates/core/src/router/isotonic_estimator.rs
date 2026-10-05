@@ -1152,6 +1152,7 @@ impl Adjustment {
     }
 
     /// Effective number of events contributing to this adjustment (decayed).
+    #[cfg(test)]
     pub(crate) fn event_count(&self) -> u64 {
         self.effective_count.round() as u64
     }

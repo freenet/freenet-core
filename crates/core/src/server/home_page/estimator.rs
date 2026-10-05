@@ -1,5 +1,4 @@
 use super::*;
-use crate::router::AdjustmentMode;
 
 /// Choose the top of the failure-probability chart's y-axis.
 ///
@@ -14,33 +13,17 @@ use crate::router::AdjustmentMode;
 /// Returns 1.0 (the original full-range axis) when there is no failure signal at
 /// the right edge, avoiding a degenerate zero-height axis. The result is capped
 /// at 1.0 since a probability can never exceed 1.0.
-pub fn failure_chart_y_max(curve_points: &[(f64, f64)], peer_adjustment: Option<f64>) -> f64 {
+pub fn failure_chart_y_max(curve_points: &[(f64, f64)]) -> f64 {
     // y-value at the largest sampled distance (the right edge of the chart).
     let right_edge = curve_points
         .iter()
         .max_by(|a, b| a.0.total_cmp(&b.0))
         .map(|&(_, y)| y)
         .unwrap_or(0.0);
-    // Keep the peer-adjusted line on-screen too: only an upward (positive)
-    // adjustment can push its right edge above the global curve's.
-    let right_edge = right_edge + peer_adjustment.unwrap_or(0.0).max(0.0);
     if right_edge <= 1e-9 {
         return 1.0;
     }
     (2.0 * right_edge).min(1.0)
-}
-
-/// This peer's line on an estimator chart.
-#[derive(Debug, Clone, Copy)]
-pub enum PeerLine<'a> {
-    /// No per-peer line.
-    None,
-    /// The isotonic per-peer EWMA adjustment, applied to the chart's curve the
-    /// way the router applies it (`AdjustmentMode`). What routing uses for a
-    /// timing stage the hierarchical estimator cannot estimate yet.
-    Adjustment(f64, AdjustmentMode),
-    /// An explicit curve: the hierarchical estimator's estimate for this peer.
-    Curve(&'a [(f64, f64)]),
 }
 
 /// Render the named estimator chart, or — when no data has been observed
@@ -50,14 +33,11 @@ pub enum PeerLine<'a> {
 /// masked the data-collection regression in the migration
 /// that fed only `failure_estimator` and left `response_start_time` and
 /// `transfer_rate` permanently empty.
-#[allow(clippy::too_many_arguments)]
 pub fn build_estimator_chart_or_placeholder(
     title: &str,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
-    peer_line: PeerLine<'_>,
-    peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
     empty_message: &str,
@@ -74,25 +54,20 @@ pub fn build_estimator_chart_or_placeholder(
         curve_points,
         scatter_points,
         data_range,
-        peer_line,
-        peer_location,
         y_min_hint,
         y_max_hint,
     )
 }
 
-/// Build an SVG chart showing a PAV regression curve with optional per-peer adjustment.
+/// Build an SVG chart showing a distance curve over the raw outcomes behind it.
 ///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
 /// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
-#[allow(clippy::too_many_arguments)]
 pub fn build_estimator_chart(
     title: &str,
     curve_points: &[(f64, f64)],
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
-    peer_line: PeerLine<'_>,
-    peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
 ) -> String {
@@ -134,26 +109,6 @@ pub fn build_estimator_chart(
             if y.is_finite() {
                 y_min = y_min.min(*y);
                 y_max = y_max.max(*y);
-            }
-        }
-
-        // Include this peer's line in the range.
-        match peer_line {
-            PeerLine::None => {}
-            PeerLine::Adjustment(adj, mode) => {
-                for (_, y) in curve_points {
-                    let adjusted = mode.apply(*y, adj);
-                    y_min = y_min.min(adjusted);
-                    y_max = y_max.max(adjusted);
-                }
-            }
-            PeerLine::Curve(points) => {
-                for (_, y) in points {
-                    if y.is_finite() {
-                        y_min = y_min.min(*y);
-                        y_max = y_max.max(*y);
-                    }
-                }
             }
         }
 
@@ -296,18 +251,8 @@ pub fn build_estimator_chart(
         .ok();
     }
 
-    // The mode `draw_curve` applies an adjustment in. An explicit curve is drawn
-    // with a zero adjustment, which is neutral in either mode.
-    let adjustment_mode = match peer_line {
-        PeerLine::Adjustment(_, mode) => mode,
-        PeerLine::None | PeerLine::Curve(_) => AdjustmentMode::Additive,
-    };
-
     // Helper: draw a curve with solid line in data range and dashed outside.
-    // `points` are (x, y) pairs; `adj` is the peer adjustment, combined with each
-    // y via `adjustment_mode.apply` (an additive offset or a multiplicative factor
-    // depending on the mode). `adj == 0.0` is the neutral global curve.
-    let draw_curve = |svg: &mut String, points: &[(f64, f64)], adj: f64, color: &str| {
+    let draw_curve = |svg: &mut String, points: &[(f64, f64)], color: &str| {
         if points.len() < 2 {
             return;
         }
@@ -319,21 +264,9 @@ pub fn build_estimator_chart(
         let mut right_ext = Vec::new();
 
         for &(x, y) in points {
-            // Apply the per-peer adjustment via the same `AdjustmentMode` the
-            // router uses (additive `y + adj`, or multiplicative `y * exp(adj)`),
-            // so the drawn curve matches the router's prediction exactly. For the
-            // un-adjusted global curve `adj == 0.0`, which is the neutral value in
-            // both modes (`y + 0` / `y * e^0`), so it is drawn unchanged.
-            //
-            // Then clamp to the visible axis floor. In additive mode a negative
-            // adjustment (a peer faster / more reliable than the global fit) can
-            // drive the value below the axis — e.g. a negative "response time",
-            // which is physically meaningless. The router clamps the same per-peer
-            // estimate to >= 0 (`IsotonicEstimator::estimate_retrieval_time`);
-            // clamping to `y_min` here keeps the drawn curve on-axis and consistent
-            // with that, mirroring the scatter-point clamp above. (`y_min` is 0 for
-            // all of these charts.)
-            let y = adjustment_mode.apply(y, adj).max(y_min);
+            // Clamp to the visible axis floor, mirroring the scatter-point
+            // clamp above. (`y_min` is 0 for all of these charts.)
+            let y = y.max(y_min);
             if x < data_lo - 0.001 {
                 left_ext.push((x, y));
             } else if x > data_hi + 0.001 {
@@ -420,32 +353,7 @@ pub fn build_estimator_chart(
         }
     };
 
-    // Global curve (teal, the brand accent)
-    draw_curve(&mut svg, curve_points, 0.0, "var(--accent-primary)");
-
-    // Peer-adjusted curve (violet — deliberately off the teal/green family so it
-    // is not confused with the teal global curve)
-    match peer_line {
-        PeerLine::None => {}
-        PeerLine::Adjustment(adj, _) => draw_curve(&mut svg, curve_points, adj, "#8b5cf6"),
-        PeerLine::Curve(points) => draw_curve(&mut svg, points, 0.0, "#8b5cf6"),
-    }
-
-    // Peer location marker (vertical dashed line)
-    if let Some(loc) = peer_location {
-        // Distance from peer to itself is 0, but contracts near the peer have small distances.
-        // Mark the peer's ring location on the x-axis as distance=0 (leftmost).
-        let _ = loc; // The peer itself is at distance 0 from contracts at its own location
-        let sx = to_svg_x(0.0);
-        write!(
-            svg,
-            "<line x1=\"{sx:.1}\" y1=\"{ty}\" x2=\"{sx:.1}\" y2=\"{by}\" stroke=\"#fbbf24\" stroke-width=\"1.5\" stroke-dasharray=\"4,3\" opacity=\"0.7\"/>",
-            sx = sx,
-            ty = pad_t,
-            by = pad_t + plot_h,
-        )
-        .ok();
-    }
+    draw_curve(&mut svg, curve_points, "var(--accent-primary)");
 
     svg.push_str("</svg></div>");
     svg
@@ -514,11 +422,11 @@ pub enum RegKind {
     Speed,
 }
 
-/// Build the prediction-accuracy panel for the estimates routing acts on: one
+/// The prediction-accuracy charts for the estimates routing acts on: one
 /// reliability diagram for the failure forecast plus predicted-vs-actual
 /// scatters for response time and transfer speed, all from the hierarchical
-/// estimator's recent forecasts. Returns an empty string when nothing has been
-/// scored yet, so a fresh node shows nothing rather than an empty card.
+/// estimator's recent forecasts, in one wrapping row. Returns an empty string
+/// when nothing has been scored yet, so a fresh node shows no empty charts.
 pub fn build_accuracy_panel(
     failure_pairs: &[(f64, f64)],
     response_time_pairs: &[(f64, f64)],
@@ -534,24 +442,7 @@ pub fn build_accuracy_panel(
     let transfer = build_regression_chart("Transfer speed", RegKind::Speed, transfer_speed_pairs);
 
     format!(
-        r#"<div class="card">
-        <h2>Prediction Accuracy</h2>
-        <p style="font-size:0.8em;color:var(--text-muted);">
-            How well the router's recent estimates matched what happened. Each point is a
-            forecast the hierarchical estimator made before the outcome was known &mdash; the
-            value routing acts on once that stage has a curve. On the dashed diagonal predictions are
-            perfect: for failure, predicted probability equals the observed failure rate
-            (calibration); for the timing models, predicted equals actual. A calibration
-            curve that collapses to the two far corners is a model that only ever says
-            "certainly fine" or "certainly broken", which is worth noticing even when its
-            raw score looks good.
-        </p>
-        <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
-            {failure}
-            {response}
-            {transfer}
-        </div>
-    </div>"#,
+        r#"<div class="accuracy-row">{failure}{response}{transfer}</div>"#,
         failure = failure,
         response = response,
         transfer = transfer,
@@ -924,130 +815,4 @@ fn mini_chart_placeholder(label: &str, sub: &str) -> String {
         cy = h / 2.0,
         cy2 = h / 2.0 + 14.0,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The plot's bottom edge (x-axis) in SVG user units, matching the geometry in
-    // `build_estimator_chart`: pad_t (10) + plot_h (h 210 - pad_t 10 - pad_b 40 = 160).
-    const PLOT_BOTTOM_Y: f64 = 170.0;
-
-    // Extract the y-coordinates from every path drawn in the given stroke color.
-    fn path_y_coords_for_color(svg: &str, color: &str) -> Vec<f64> {
-        let mut ys = Vec::new();
-        for seg in svg.split("<path") {
-            if !seg.contains(color) {
-                continue;
-            }
-            // The `d="..."` attribute precedes the stroke color in the same element.
-            let Some(start) = seg.find("d=\"") else {
-                continue;
-            };
-            let rest = &seg[start + 3..];
-            let Some(end) = rest.find('"') else {
-                continue;
-            };
-            for token in rest[..end].split_whitespace() {
-                // Tokens look like `M50.0,170.0` or `L256.0,131.4`.
-                let cleaned = token.trim_start_matches(['M', 'L']);
-                if let Some((_, y)) = cleaned.split_once(',') {
-                    if let Ok(v) = y.parse::<f64>() {
-                        ys.push(v);
-                    }
-                }
-            }
-        }
-        ys
-    }
-
-    #[test]
-    fn peer_adjusted_curve_additive_never_renders_below_x_axis() {
-        // Additive mode: small positive base curve with a strongly-negative peer
-        // adjustment. The raw `y + adj` would be deeply negative and, on a y-axis
-        // floored at 0, would draw the violet "Peer-adjusted" curve below the
-        // x-axis without the clamp.
-        let curve = [(0.0, 0.10), (0.25, 0.30), (0.50, 0.50)];
-        let svg = build_estimator_chart(
-            "Failure Probability",
-            &curve,
-            &[],        // no scatter
-            (0.0, 0.5), // entire range is data (solid line)
-            // strongly-negative peer adjustment
-            PeerLine::Adjustment(-1000.0, AdjustmentMode::Additive),
-            None,
-            "0.0", // y floor
-            "auto",
-        );
-
-        // "#8b5cf6" is the violet stroke used only for the peer-adjusted curve.
-        let ys = path_y_coords_for_color(&svg, "#8b5cf6");
-        assert!(
-            !ys.is_empty(),
-            "expected a peer-adjusted curve to be drawn; svg: {svg}"
-        );
-        for y in ys {
-            assert!(
-                y <= PLOT_BOTTOM_Y + 0.05,
-                "peer-adjusted curve drawn below the x-axis (y={y} > {PLOT_BOTTOM_Y})"
-            );
-        }
-    }
-
-    #[test]
-    fn peer_adjusted_curve_multiplicative_stays_non_negative() {
-        // Multiplicative mode: a strongly-negative log-adjustment scales the curve
-        // toward zero (`y * exp(-1000) ≈ 0`). It must never render below the axis.
-        let curve = [(0.0, 0.10), (0.25, 0.30), (0.50, 0.50)];
-        let svg = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            // log-ratio: exp(-1000) ≈ 0
-            PeerLine::Adjustment(-1000.0, AdjustmentMode::Multiplicative),
-            None,
-            "0", // y floor as used for the response-time chart
-            "auto",
-        );
-        let ys = path_y_coords_for_color(&svg, "#8b5cf6");
-        assert!(!ys.is_empty(), "expected a peer-adjusted curve; svg: {svg}");
-        for y in ys {
-            assert!(
-                y <= PLOT_BOTTOM_Y + 0.05,
-                "multiplicative peer-adjusted curve drawn below the x-axis (y={y})"
-            );
-        }
-    }
-
-    #[test]
-    fn peer_adjusted_curve_multiplicative_scales_above_global() {
-        // A positive log-adjustment (ln 2) scales the curve UP by 2x, so the violet
-        // peer-adjusted curve must sit ABOVE the teal global curve — i.e. at a
-        // SMALLER SVG y (the y-axis points down). This confirms the chart applies
-        // the multiplicative transform, not an additive offset, and renders it.
-        let curve = [(0.0, 1.0), (0.5, 1.0)]; // flat global at 1.0
-        let svg = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            // factor exp(ln 2) = 2.0
-            PeerLine::Adjustment(std::f64::consts::LN_2, AdjustmentMode::Multiplicative),
-            None,
-            "0",
-            "auto",
-        );
-        let violet = path_y_coords_for_color(&svg, "#8b5cf6");
-        let teal = path_y_coords_for_color(&svg, "var(--accent-primary)");
-        let violet_top = violet.iter().cloned().fold(f64::INFINITY, f64::min);
-        let teal_top = teal.iter().cloned().fold(f64::INFINITY, f64::min);
-        assert!(violet.iter().all(|y| *y <= PLOT_BOTTOM_Y + 0.05));
-        assert!(
-            violet_top < teal_top - 1.0,
-            "multiplicative peer-adjusted curve (factor 2x) should sit above the \
-             global curve: violet_top={violet_top} should be < teal_top={teal_top}"
-        );
-    }
 }

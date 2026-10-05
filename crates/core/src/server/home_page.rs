@@ -14,6 +14,7 @@ mod estimator;
 pub(crate) use estimator::fmt_prediction_time;
 mod favicon;
 mod peer_detail;
+mod routing;
 
 use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
@@ -31,6 +32,7 @@ use cards::{
 use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
+use routing::routing_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
@@ -108,6 +110,11 @@ pub(super) async fn homepage() -> impl IntoResponse {
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
 pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
     Html(peer_detail_html(&address))
+}
+
+/// Handler for `GET /routing` — the network-wide routing model page.
+pub(super) async fn routing() -> impl IntoResponse {
+    Html(routing_html())
 }
 
 /// Per-contract detail page (#5369). Accepts either the full `ContractKey`
@@ -225,10 +232,9 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        PeerLine, RegKind, build_accuracy_panel, build_estimator_chart,
-        build_estimator_chart_or_placeholder, build_regression_chart, build_reliability_chart,
-        failure_chart_y_max, fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed,
-        fmt_prediction_time,
+        RegKind, build_accuracy_panel, build_estimator_chart, build_estimator_chart_or_placeholder,
+        build_regression_chart, build_reliability_chart, failure_chart_y_max,
+        fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -284,10 +290,7 @@ mod tests {
     /// tested) makes the rule's edge cases explicit and guards against the JS
     /// drifting from the intended behaviour. It lives in the test module (not as
     /// production code) because the production decision is made in JS, not in the
-    /// server-side render — and keeping it inside the single `#[cfg(test)]`
-    /// boundary preserves the source-scrape pin invariant relied on by
-    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
-    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    /// server-side render.
     ///
     /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
     /// still holding a cached homepage emitted by an old binary while a newer
@@ -1388,7 +1391,6 @@ mod tests {
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
         let svg = build_accuracy_panel(&failure, &[], &[]);
-        assert!(svg.contains("Prediction Accuracy"));
         assert!(svg.contains("Failure (calibration)"));
         // Timing models have no data yet -> their placeholders still appear.
         assert!(svg.contains("Response time"));
@@ -1449,8 +1451,6 @@ mod tests {
             &[],
             &[],
             (0.0, 0.0),
-            PeerLine::None,
-            None,
             "0",
             "auto",
             "No timed responses have been observed from this peer yet.",
@@ -1480,8 +1480,6 @@ mod tests {
             &curve,
             &scatter,
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "1.0",
             "no data",
@@ -1493,51 +1491,6 @@ mod tests {
         );
     }
 
-    /// Regression: the per-tab "Outcomes vs Distance" panel must call
-    /// `build_estimator_chart_or_placeholder` for all three
-    /// prediction-component slots (Failure Probability, Response Time,
-    /// Transfer Rate). Hiding empty slots previously masked the
-    /// driver data-collection regression for months — keeping every
-    /// slot visible makes future regressions detectable on sight.
-    /// Source-scrape rather than HTML-grep because the visible-when-empty
-    /// behaviour depends on a router_snapshot being present, and the
-    /// `home_page.rs::tests` module does not have a snapshot fixture
-    /// builder.
-    #[test]
-    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
-        let src = include_str!("home_page/peer_detail.rs");
-        let prod = src;
-        for title in [
-            "Failure Probability",
-            "Response Time (s)",
-            "Transfer Rate (B/s)",
-        ] {
-            // Find the helper call site and walk forward up to 200 bytes
-            // for the title literal. Whitespace-tolerant so rustfmt
-            // doesn't churn this pin.
-            let mut found = false;
-            let mut cursor = 0;
-            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
-                let abs = cursor + call;
-                let tail_end = (abs + 400).min(prod.len());
-                let needle = format!("\"{title}\"");
-                if prod[abs..tail_end].contains(&needle) {
-                    found = true;
-                    break;
-                }
-                cursor = abs + 1;
-            }
-            assert!(
-                found,
-                "peer-detail panel builder must call \
-                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
-                 always visible. Without this every prediction-component \
-                 slot can silently disappear when its estimator has no \
-                 data — the original regression."
-            );
-        }
-    }
-
     #[test]
     fn build_estimator_chart_or_placeholder_renders_chart_when_data_present() {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
@@ -1546,8 +1499,6 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "1.0",
             "should not see this",
@@ -1564,7 +1515,7 @@ mod tests {
         // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
         // the line sits around mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
-        let y_max = failure_chart_y_max(&curve, None);
+        let y_max = failure_chart_y_max(&curve);
         assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
     }
 
@@ -1573,44 +1524,24 @@ mod tests {
         // No failures observed (all-zero curve) → keep the original 0..1 axis
         // rather than collapsing to a degenerate zero-height range.
         let curve = vec![(0.0, 0.0), (0.5, 0.0)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
         // An empty curve also falls back to the full range.
-        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+        assert_eq!(failure_chart_y_max(&[]), 1.0);
     }
 
     #[test]
     fn failure_chart_y_max_capped_at_one() {
         // A large right edge would give 2x > 1; a probability axis can't exceed 1.
         let curve = vec![(0.0, 0.2), (0.5, 0.7)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
-    }
-
-    #[test]
-    fn failure_chart_y_max_accounts_for_peer_adjustment() {
-        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
-        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
-        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
-        let up = failure_chart_y_max(&curve, Some(0.03));
-        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
-        // A downward adjustment must not shrink the axis below the global edge.
-        let down = failure_chart_y_max(&curve, Some(-0.01));
-        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
     }
 
     #[test]
     fn estimator_chart_labels_x_axis_as_distance() {
         // The x-axis is always ring distance; it must carry a "Distance" title.
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
-        let html = build_estimator_chart(
-            "Failure Probability",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            PeerLine::None,
-            None,
-            "0.0",
-            "1.0",
-        );
+        let html =
+            build_estimator_chart("Failure Probability", &curve, &[], (0.0, 0.5), "0.0", "1.0");
         assert!(
             html.contains(">Distance<"),
             "estimator chart must label its x-axis 'Distance', got: {html}"
@@ -1628,8 +1559,6 @@ mod tests {
             &curve,
             &[],
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "0.01",
         );
@@ -1657,8 +1586,6 @@ mod tests {
             &curve,
             &scatter,
             (0.0, 0.5),
-            PeerLine::None,
-            None,
             "0.0",
             "0.08",
         );
@@ -1666,44 +1593,6 @@ mod tests {
         assert!(
             circles >= 3,
             "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
-        );
-    }
-
-    /// This peer's hierarchical curve is drawn as its own line, not as an
-    /// adjustment of the distance curve, and it widens the auto-scaled axis.
-    #[test]
-    fn estimator_chart_draws_an_explicit_peer_curve() {
-        let curve = vec![(0.0, 0.1), (0.25, 0.2), (0.5, 0.3)];
-        let peer = vec![(0.0, 0.4), (0.25, 0.8), (0.5, 1.2)];
-        let with_peer = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            PeerLine::Curve(&peer),
-            None,
-            "0",
-            "auto",
-        );
-        let without = build_estimator_chart(
-            "Response Time (s)",
-            &curve,
-            &[],
-            (0.0, 0.5),
-            PeerLine::None,
-            None,
-            "0",
-            "auto",
-        );
-        assert_eq!(
-            with_peer.matches("#8b5cf6").count(),
-            1,
-            "exactly one peer line: {with_peer}"
-        );
-        assert_eq!(without.matches("#8b5cf6").count(), 0);
-        assert!(
-            with_peer.contains(">1.3") || with_peer.contains(">1.4"),
-            "the axis must extend to the peer curve's top (1.2 plus padding): {with_peer}"
         );
     }
 

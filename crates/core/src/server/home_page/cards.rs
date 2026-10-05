@@ -701,7 +701,7 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
 
     format!(
         r#"<div class="card">
-            <div class="card-header"><h2>Network Peers</h2>{own_loc}</div>
+            <div class="card-header"><h2>Network Peers</h2><span class="card-header-aside">{own_loc}<a class="card-link" href="/routing">Routing model &rarr;</a></span></div>
             {ring_svg}
             {filter_controls}
             <div class="table-wrap">

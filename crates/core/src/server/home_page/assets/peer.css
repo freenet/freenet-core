@@ -69,6 +69,12 @@ a.header-title {
 }
 /* Small-multiple accuracy charts: fixed width so the three sit side by side
    in the flex row and wrap on narrow viewports (overridden global width:100%). */
+.accuracy-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
 .accuracy-chart {
   display: block;
   width: 260px;
@@ -190,4 +196,33 @@ a.header-title {
   color: var(--text-muted);
   font-size: 0.8rem;
   font-family: var(--font-mono);
+}
+
+/* One-line caption under a card heading. */
+.caption {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin: -0.25rem 0 0.6rem;
+}
+.more {
+  font-size: 0.85rem;
+  margin: 0.25rem 0 1rem;
+}
+.more a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+.more a:hover {
+  text-decoration: underline;
+}
+details.diag summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+details.diag .info-grid {
+  margin-top: 0.6rem;
 }

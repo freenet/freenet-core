@@ -1290,16 +1290,6 @@ pub(crate) struct PeerRoutingSnapshot {
     /// contract at the peer's own location, per stage (failure, response time,
     /// transfer speed). `None` for a stage without a curve yet.
     pub breakdown: [Option<Breakdown>; 3],
-    /// The hierarchical estimate for this peer across distance, per stage, in
-    /// the router's units (band effects excluded). Empty for a stage without a
-    /// curve.
-    pub peer_curves: [Vec<(f64, f64)>; 3],
-    /// (mean_adjustment, event_count) of the isotonic per-peer EWMA, per stage.
-    /// Routing reads it only for a timing stage the hierarchical estimator
-    /// cannot estimate yet, which is when the dashboard draws it.
-    pub failure_adjustment: Option<(f64, u64)>,
-    pub response_time_adjustment: Option<(f64, u64)>,
-    pub transfer_rate_adjustment: Option<(f64, u64)>,
     /// Prediction at the peer's own location (distance ≈ 0).
     pub prediction_at_own_location: Option<RoutingPredictionInfo>,
     /// What the hierarchical estimator has learned about this peer relative
@@ -1565,7 +1555,7 @@ const ISOTONIC_FALLBACK_ENV: &str = "FREENET_ROUTING_FALLBACK_ISOTONIC";
 /// EWMA), applied to every stage. Default off, and slated for removal once
 /// the hierarchical estimator has proven itself (#5792, #4485). The hierarchical
 /// estimator keeps learning while it is on, so switching back finds it warm.
-fn isotonic_fallback_enabled() -> bool {
+pub(crate) fn isotonic_fallback_enabled() -> bool {
     // Tests override ahead of the cached read: the `OnceLock` is resolved by
     // whichever test touches it first and then fixed for the process, so the
     // switched-on branch would otherwise be untestable, and under plain
@@ -3544,12 +3534,6 @@ impl Router {
 
     /// Produce a per-peer routing snapshot for the dashboard detail page.
     pub(crate) fn peer_snapshot(&self, peer: &PeerKeyLocation) -> PeerRoutingSnapshot {
-        let adjustment = |estimator: &IsotonicEstimator| {
-            estimator
-                .peer_adjustments
-                .get(peer)
-                .map(|a| (a.value(), a.event_count()))
-        };
         let now = self.estimator_clock.hours();
         // At the peer's own location (distance 0), like the sample prediction
         // below, so the breakdown explains the number shown beside it.
@@ -3582,10 +3566,6 @@ impl Router {
 
         PeerRoutingSnapshot {
             breakdown,
-            peer_curves: self.hierarchical.peer_curves(Some(peer), now),
-            failure_adjustment: adjustment(&self.failure_estimator),
-            response_time_adjustment: adjustment(&self.response_start_time_estimator),
-            transfer_rate_adjustment: adjustment(&self.transfer_rate_estimator),
             prediction_at_own_location: prediction,
             offsets: self.hierarchical.peer_offsets(peer, now),
             window: window(
@@ -3609,8 +3589,6 @@ impl Router {
     }
 
     /// Peers evicted from the per-peer selection table since the node started.
-    // TEMP(peer-page): read by the routing page later in this branch.
-    #[allow(dead_code)]
     pub(crate) fn peer_selection_evictions(&self) -> u64 {
         self.peer_selections.evictions()
     }
