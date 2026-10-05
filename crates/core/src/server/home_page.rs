@@ -1603,6 +1603,16 @@ mod tests {
         );
     }
 
+    /// The network-wide routing page is reachable from the home dashboard.
+    #[test]
+    fn peers_card_links_to_the_routing_page() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(html.contains(r#"href="/routing""#), "{html}");
+    }
+
     #[test]
     fn contracts_table_has_copy_button() {
         use crate::node::network_status::ContractSnapshot;

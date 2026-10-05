@@ -820,13 +820,10 @@ fn distance_chart(width: f64, chart: &DistanceChart<'_>) -> String {
         .chain(chart.line)
         .chain(&peer_line)
         .map(|&(_, v)| v);
-    let (lo, hi) = log_decades(values);
+    let axis = LogAxis::covering(values);
     let plot_w = width - left - right;
     let x = |d: f64| left + (d.clamp(0.0, 0.5) / 0.5) * plot_w;
-    let y = |v: f64| {
-        let v = v.clamp(10f64.powi(lo), 10f64.powi(hi));
-        top + (hi as f64 - v.log10()) / (hi - lo) as f64 * (h - top - bottom)
-    };
+    let y = |v: f64| top + (1.0 - axis.fraction(v)) * (h - top - bottom);
     let mut svg = format!(
         r#"<svg viewBox="0 0 {width} {h}" class="mchart" role="img" aria-label="{} against ring distance">"#,
         match chart.kind {
@@ -834,8 +831,7 @@ fn distance_chart(width: f64, chart: &DistanceChart<'_>) -> String {
             Measure::Speed => "Transfer speed",
         }
     );
-    for decade in lo..=hi {
-        let value = 10f64.powi(decade);
+    for &value in &axis.ticks {
         write!(
             svg,
             r#"<line x1="{left}" x2="{:.1}" y1="{yy:.1}" y2="{yy:.1}" class="grid"/><text x="{:.1}" y="{:.1}" text-anchor="end">{}</text>"#,
@@ -1012,16 +1008,13 @@ fn typical_miss(pairs: &[(f64, f64)]) -> Option<f64> {
 
 fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
     let (w, h, left, right, top, bottom) = (300.0, 270.0, 58.0, 10.0, 10.0, 34.0);
-    let (lo, hi) = log_decades(all.iter().chain(mine).flat_map(|&(p, a)| [p, a]));
-    let span = (hi - lo) as f64;
-    let clamp = |v: f64| v.clamp(10f64.powi(lo), 10f64.powi(hi));
-    let x = |v: f64| left + (clamp(v).log10() - lo as f64) / span * (w - left - right);
-    let y = |v: f64| top + (hi as f64 - clamp(v).log10()) / span * (h - top - bottom);
+    let axis = LogAxis::covering(all.iter().chain(mine).flat_map(|&(p, a)| [p, a]));
+    let x = |v: f64| left + axis.fraction(v) * (w - left - right);
+    let y = |v: f64| top + (1.0 - axis.fraction(v)) * (h - top - bottom);
     let mut svg = format!(
         r#"<svg viewBox="0 0 {w} {h}" class="mchart acc-chart" role="img" aria-label="Predicted against actual response time">"#
     );
-    for decade in lo..=hi {
-        let v = 10f64.powi(decade);
+    for &v in &axis.ticks {
         write!(
             svg,
             r#"<line x1="{left}" x2="{:.1}" y1="{yy:.1}" y2="{yy:.1}" class="grid"/><line x1="{xx:.1}" x2="{xx:.1}" y1="{top}" y2="{:.1}" class="grid"/><text x="{:.1}" y="{:.1}" text-anchor="end">{t}</text><text x="{xx:.1}" y="{:.1}" text-anchor="middle">{t}</text>"#,
@@ -1036,7 +1029,7 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
         )
         .ok();
     }
-    let (min, max) = (10f64.powi(lo), 10f64.powi(hi));
+    let (min, max) = (10f64.powf(axis.lo), 10f64.powf(axis.hi));
     write!(
         svg,
         r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" class="baseline"/>
@@ -1049,8 +1042,8 @@ fn accuracy_chart(all: &[(f64, f64)], mine: &[(f64, f64)]) -> String {
         y(min),
         x(max),
         y(max),
-        x(max) - 14.0,
-        y(max) + 22.0,
+        x(max) - 18.0,
+        y(max) + 14.0,
         left + 4.0,
         top + 10.0,
         w - right - 4.0,
@@ -1196,27 +1189,52 @@ fn responsive(render: impl Fn(f64) -> String) -> String {
     )
 }
 
-/// The whole decades `[lo, hi]` covering every positive finite value, at least
-/// two decades wide.
-fn log_decades(values: impl Iterator<Item = f64>) -> (i32, i32) {
-    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-    for value in values.filter(|v| v.is_finite() && *v > 0.0) {
-        min = min.min(value);
-        max = max.max(value);
-    }
-    if !min.is_finite() {
-        return (-2, 1);
-    }
-    let mut lo = min.log10().floor() as i32;
-    let mut hi = max.log10().ceil() as i32;
-    while hi - lo < 2 {
-        if hi - lo < 1 {
-            hi += 1;
-        } else {
-            lo -= 1;
+/// A log axis: its ends in `log10` units, and the values to tick.
+struct LogAxis {
+    lo: f64,
+    hi: f64,
+    ticks: Vec<f64>,
+}
+
+impl LogAxis {
+    /// Covers every positive finite value with a little room either side, at
+    /// least one decade wide. Ticks at the decades inside it, or at 1-2-5
+    /// steps when fewer than two decades fall inside.
+    fn covering(values: impl Iterator<Item = f64>) -> Self {
+        let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for value in values.filter(|v| v.is_finite() && *v > 0.0) {
+            min = min.min(value);
+            max = max.max(value);
         }
+        if !min.is_finite() {
+            (min, max) = (0.1, 1.0);
+        }
+        let (mut lo, mut hi) = ((min / 1.3).log10(), (max * 1.3).log10());
+        if hi - lo < 1.0 {
+            let grow = (1.0 - (hi - lo)) / 2.0;
+            lo -= grow;
+            hi += grow;
+        }
+        let inside = |v: f64| v.log10() >= lo - 1e-9 && v.log10() <= hi + 1e-9;
+        let decades: Vec<f64> = (lo.floor() as i32..=hi.ceil() as i32)
+            .map(|d| 10f64.powi(d))
+            .filter(|v| inside(*v))
+            .collect();
+        let ticks = if decades.len() >= 2 {
+            decades
+        } else {
+            (lo.floor() as i32..=hi.ceil() as i32)
+                .flat_map(|d| [1.0, 2.0, 5.0].map(|m| m * 10f64.powi(d)))
+                .filter(|v| inside(*v))
+                .collect()
+        };
+        LogAxis { lo, hi, ticks }
     }
-    (lo, hi)
+
+    /// Position of `value` along the axis, 0 at the low end and 1 at the high.
+    fn fraction(&self, value: f64) -> f64 {
+        ((value.max(1e-300).log10() - self.lo) / (self.hi - self.lo)).clamp(0.0, 1.0)
+    }
 }
 
 /// Linear interpolation on a curve sorted by distance.

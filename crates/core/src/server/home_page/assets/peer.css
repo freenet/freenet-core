@@ -58,6 +58,7 @@ a.header-title {
   display: block;
   width: 100%;
   max-width: 600px;
+  height: auto;
 }
 /* Small-multiple accuracy charts: fixed width so the three sit side by side
    in the flex row and wrap on narrow viewports (overridden global width:100%). */
@@ -69,7 +70,8 @@ a.header-title {
 }
 .accuracy-chart {
   display: block;
-  width: 260px;
+  overflow: visible;
+  width: 228px;
   max-width: 100%;
   height: auto;
   flex: 0 0 auto;
@@ -355,12 +357,12 @@ svg.mchart .baseline {
   stroke-dasharray: 4 3;
 }
 svg.mchart .dot-other {
-  fill: var(--text-muted);
-  opacity: 0.55;
+  fill: var(--text-secondary);
+  opacity: 0.5;
 }
 svg.mchart .dot-faint {
-  fill: var(--text-muted);
-  opacity: 0.45;
+  fill: var(--text-secondary);
+  opacity: 0.35;
 }
 .dot-this {
   fill: var(--accent-primary);
@@ -428,6 +430,15 @@ svg.mchart .line-peer {
     grid-template-columns: minmax(0, 1fr);
   }
   .mini-ring {
-    width: 110px;
+    width: 96px;
+  }
+  .peer-head {
+    gap: 0.5rem;
+  }
+  .peer-head .addr {
+    font-size: 0.9rem;
+  }
+  .tab-bar {
+    flex-wrap: wrap;
   }
 }
