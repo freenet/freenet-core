@@ -25,16 +25,23 @@ test.skip(
   "FREENET_SHELL_URL is not set — run via `cargo test --test playwright_shell`",
 );
 
-/// Wait for the next auto-refresh of the current page to land.
-async function nextRefresh(page: Page): Promise<void> {
-  const path = new URL(page.url()).pathname;
-  const response = await page.waitForResponse(
-    (r) => new URL(r.url()).pathname === path && r.request().method() === "GET",
+/// Wait for the next auto-refresh to replace <main>'s contents.
+///
+/// Marks the current contents and waits for the mark to vanish, so it
+/// observes the swap itself rather than the response that precedes it. The
+/// swap writes `innerHTML` and restores the reader's state in the same task,
+/// so once the mark is gone the restore has run too.
+async function nextSwap(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const mark = document.createElement("span");
+    mark.id = "pw-before-swap";
+    document.querySelector("main")!.appendChild(mark);
+  });
+  await page.waitForFunction(
+    () => document.getElementById("pw-before-swap") === null,
+    undefined,
     { timeout: 20_000 },
   );
-  await response.finished();
-  // The swap runs after the body is parsed; give it a frame to apply.
-  await page.waitForTimeout(250);
 }
 
 test.describe("routing page", () => {
@@ -70,13 +77,12 @@ test.describe("routing page", () => {
       "document scrolls horizontally",
     ).toBeLessThanOrEqual(0);
     const summary = page.locator("details#routing-diagnostics summary");
-    if ((await summary.count()) > 0) {
-      await summary.click();
-      expect(
-        await overflow(),
-        "document scrolls horizontally with the diagnostics open",
-      ).toBeLessThanOrEqual(0);
-    }
+    await expect(summary).toHaveCount(1);
+    await summary.click();
+    expect(
+      await overflow(),
+      "document scrolls horizontally with the diagnostics open",
+    ).toBeLessThanOrEqual(0);
   });
 
   test("/routing survives the auto-refresh with what the reader opened", async ({
@@ -89,36 +95,28 @@ test.describe("routing page", () => {
     expect(headings.length).toBeGreaterThan(0);
 
     const details = page.locator("details#routing-diagnostics");
-    const hasDetails = (await details.count()) > 0;
-    if (hasDetails) {
-      await details.locator("summary").click();
-      await expect(details).toHaveAttribute("open", "");
-    }
+    await expect(details).toHaveCount(1);
+    await details.locator("summary").click();
+    await expect(details).toHaveAttribute("open", "");
     const getTab = page.locator('.tab-label[data-tab="get"]');
-    const hasTabs = (await getTab.count()) > 0;
-    if (hasTabs) {
-      await getTab.click();
-      await expect(getTab).toHaveClass(/tab-active/);
-    }
+    await expect(getTab).toHaveCount(1);
+    await getTab.click();
+    await expect(getTab).toHaveClass(/tab-active/);
 
-    await nextRefresh(page);
+    await nextSwap(page);
 
     expect(
       await page.locator("main h2, main summary").allTextContents(),
     ).toEqual(headings);
-    if (hasDetails) {
-      await expect(
-        page.locator("details#routing-diagnostics"),
-        "an opened <details> must stay open across the <main> swap",
-      ).toHaveAttribute("open", "");
-    }
-    if (hasTabs) {
-      await expect(
-        page.locator('.tab-label[data-tab="get"]'),
-        "the chosen tab must survive the <main> swap",
-      ).toHaveClass(/tab-active/);
-      await expect(page.locator("#panel-get")).toHaveClass(/tab-panel-active/);
-    }
+    await expect(
+      page.locator("details#routing-diagnostics"),
+      "an opened <details> must stay open across the <main> swap",
+    ).toHaveAttribute("open", "");
+    await expect(
+      page.locator('.tab-label[data-tab="get"]'),
+      "the chosen tab must survive the <main> swap",
+    ).toHaveClass(/tab-active/);
+    await expect(page.locator("#panel-get")).toHaveClass(/tab-panel-active/);
   });
 });
 
