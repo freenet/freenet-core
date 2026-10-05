@@ -513,7 +513,8 @@ fn pair(
 struct Running {
     log_a: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
     log_b: Arc<parking_lot::Mutex<Vec<(tokio::time::Instant, SymmetricMessage)>>>,
-    /// Application messages B's `recv` returned.
+    /// Application messages each end's `recv` returned.
+    got_a: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
     got_b: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -574,10 +575,13 @@ fn start(
     }));
     let mut a_conn = a.conn;
     let mut b_conn = b.conn;
-    let gb = got_b.clone();
-    tasks.push(tokio::spawn(
-        async move { while a_conn.recv().await.is_ok() {} },
-    ));
+    let got_a = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (ga, gb) = (got_a.clone(), got_b.clone());
+    tasks.push(tokio::spawn(async move {
+        while let Ok(msg) = a_conn.recv().await {
+            ga.lock().push(msg);
+        }
+    }));
     tasks.push(tokio::spawn(async move {
         while let Ok(msg) = b_conn.recv().await {
             gb.lock().push(msg);
@@ -586,6 +590,7 @@ fn start(
     Running {
         log_a,
         log_b,
+        got_a,
         got_b,
         tasks,
     }
@@ -1267,9 +1272,24 @@ async fn lossy_exchange(
     // ~14% loss A->B, 20% B->A, hitting data, acks and retransmissions alike.
     let running = start(a, b, drop_every(7), drop_every(5));
     tokio::time::sleep(Duration::from_secs(60)).await;
+    let got_a = running.got_a.lock().clone();
     let got_b = running.got_b.lock().clone();
     let link = running.stop();
 
+    for i in 0..N {
+        let want = bincode::serialize(&format!("b-{i}")).unwrap();
+        assert_eq!(
+            got_a.iter().filter(|m| **m == want).count(),
+            1,
+            "message b-{i} delivered to A exactly once"
+        );
+    }
+    let stream_b = bincode::serialize(&vec![2u8; 200_000]).unwrap();
+    assert_eq!(
+        got_a.iter().filter(|m| **m == stream_b).count(),
+        1,
+        "B's stream delivered to A once"
+    );
     for i in 0..N {
         let want = bincode::serialize(&format!("a-{i}")).unwrap();
         assert_eq!(
@@ -1354,4 +1374,49 @@ async fn force_noop_gate_api_applies_to_new_connections() {
     if std::env::var("FREENET_TEST_FORCE_NOOP_GATE").as_deref() != Ok("1") {
         assert!(normal.conn.ack_remote_noops);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3 (#5803)
+// ---------------------------------------------------------------------------
+
+/// A legacy stream fragment is recorded for dedup BEFORE it is handed to its
+/// reassembly task. If `recv()` is cancelled while that hand-off waits for
+/// channel space, the fragment must not be lost: its retransmission would be
+/// dropped as a duplicate. It stays parked and the next `recv()` delivers it.
+#[tokio::test(start_paused = true)]
+async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
+    let mut e = single(CAPABLE);
+    let stream_id = StreamId::next();
+    assert!(!stream_id.is_operations_stream(), "premise: legacy stream");
+    // A full one-slot channel stands in for a backed-up recv_stream task.
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send((99u32, bytes::Bytes::from_static(b"filler")))
+        .expect("fill");
+    e.conn.inbound_streams.insert(stream_id, tx);
+
+    let fragment = SymmetricMessagePayload::StreamFragment {
+        stream_id,
+        total_length_bytes: 1_000_000,
+        fragment_number: 7,
+        payload: bytes::Bytes::from_static(b"fragment-7"),
+        metadata_bytes: None,
+    };
+    // The hand-off blocks on the full channel; cancel it (as the listener's
+    // select does when an outbound message wins).
+    let blocked =
+        tokio::time::timeout(Duration::from_millis(10), e.conn.process_inbound(fragment)).await;
+    assert!(
+        blocked.is_err(),
+        "premise: the hand-off was blocked and cancelled"
+    );
+
+    // The reassembly task catches up; the next recv() must finish the hand-off.
+    assert_eq!(rx.recv().await.expect("filler").0, 99);
+    assert!(e.pump(Duration::from_millis(10)).await.is_none());
+    let delivered = rx
+        .try_recv()
+        .expect("the parked fragment must be delivered");
+    assert_eq!(delivered.0, 7);
+    assert_eq!(&delivered.1[..], b"fragment-7");
 }

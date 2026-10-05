@@ -284,6 +284,9 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// receipt for every packet, no duplicate re-ack.
     #[cfg(test)]
     legacy_wire_behaviour: bool,
+    /// A legacy stream fragment accepted (and recorded for dedup) but not yet
+    /// handed to its `recv_stream` task; see `deliver_stalled_fragment`.
+    stalled_fragment: Option<(StreamId, u32, bytes::Bytes)>,
     /// Whether we already answered a connection ack on this established
     /// connection (see `process_inbound`).
     answered_connection_ack: bool,
@@ -966,6 +969,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             timeout_checks_run: 0,
             receipts_flush_due: false,
             answered_connection_ack: false,
+            stalled_fragment: None,
             #[cfg(test)]
             legacy_wire_behaviour: false,
             remote_conn,
@@ -1100,6 +1104,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // unarmed (send error path), re-arm with a short delay rather than
             // leaving it immediately Ready, which during retransmission storms
             // would starve inbound packet processing (#3215).
+            if self.stalled_fragment.is_some() {
+                self.deliver_stalled_fragment().await?;
+            }
             if self.receipts_flush_due {
                 self.receipts_flush_due = false;
                 self.flush_receipts_now().await?;
@@ -2215,11 +2222,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // transient executor pressure into `ConnectionClosed` would
                 // abort otherwise-healthy large transfers whenever more than
                 // 64 fragments back up before `recv_stream` is scheduled.
-                if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    sender
-                        .send((fragment_number, payload))
-                        .await
-                        .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                if self.inbound_streams.contains_key(&stream_id) {
+                    // Cancel-safe hand-off (#5803 review). This packet is
+                    // already in the dedup window, so if `recv()` were
+                    // cancelled while this send waits for channel space the
+                    // fragment would be lost for good (its retransmission is
+                    // dropped as a duplicate). Park it on `self` first; a
+                    // cancelled send leaves it parked and the next `recv()`
+                    // iteration finishes delivering it.
+                    self.stalled_fragment = Some((stream_id, fragment_number, payload));
+                    self.deliver_stalled_fragment().await?;
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2259,6 +2271,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // Ping and Pong are handled earlier in recv() before process_inbound is called
             Ping { .. } | Pong { .. } => Ok(None),
         }
+    }
+
+    /// Deliver the legacy stream fragment parked in `stalled_fragment`, if
+    /// any. Cancel-safe: the fragment stays parked until the send completes.
+    async fn deliver_stalled_fragment(&mut self) -> Result<()> {
+        let Some((stream_id, fragment_number, payload)) = self.stalled_fragment.as_ref() else {
+            return Ok(());
+        };
+        let Some(sender) = self.inbound_streams.get(stream_id) else {
+            // The stream finished or was dropped meanwhile; nothing to feed.
+            self.stalled_fragment = None;
+            return Ok(());
+        };
+        sender
+            .send((*fragment_number, payload.clone()))
+            .await
+            .map_err(|_| TransportError::ConnectionClosed(self.remote_conn.remote_addr))?;
+        self.stalled_fragment = None;
+        Ok(())
     }
 
     /// Drain every pending receipt into ack-only NoOps right now.

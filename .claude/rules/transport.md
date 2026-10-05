@@ -127,6 +127,27 @@ packet absent from pending_receipts yields no ack-info and cannot abandon.
   - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
 ```
 
+### RTO backoff: once per round, reset on ACK (#5795)
+
+```
+SentPacketTracker::rto_backoff doubles at most ONCE per round:
+  → the first RTO expiry doubles it and sets backoff_round_end_nanos =
+    now + (new) effective RTO;
+  → other packets timing out before that are retransmitted WITHOUT
+    doubling again (RFC 6298 has one timer per connection; a burst of
+    losses is one expiry);
+  → any ACK that resets rto_backoff to 1 also resets
+    backoff_round_end_nanos to 0, so the next outage backs off at once.
+
+DO NOT go back to doubling per lost packet: a 10-packet burst then hits
+the 60 s cap immediately and the rest of the burst stalls for minutes.
+That was masked until #5795 by the ack-only NoOp chatter, which reset
+the backoff every ~200 ms. DO NOT reset rto_backoff without also
+clearing the round end: a stale round end (up to 60 s ahead) turns the
+next outage into a base-RTO retransmit burst that exhausts
+MAX_PACKET_RETRANSMITS in seconds.
+```
+
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide

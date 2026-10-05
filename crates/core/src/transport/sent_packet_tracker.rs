@@ -210,8 +210,17 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// exactly once.
     packet_streams: HashMap<PacketId, PacketStream>,
 
-    /// End of the current backoff round (time-source nanos). RTOs that fire
-    /// before it do not double the backoff again; see `get_resend`.
+    /// End of the current backoff round (time-source nanos), #5795.
+    ///
+    /// The RTO backoff (`rto_backoff`) doubles at most ONCE per round: the
+    /// first RTO expiry doubles it and starts a round lasting one (new)
+    /// effective RTO; further packets timing out within the round are
+    /// retransmitted without doubling again. This models RFC 6298's single
+    /// per-connection timer. Without it every lost packet of a burst doubled
+    /// the connection-wide backoff, hitting the 60 s cap at once.
+    ///
+    /// Any ack that resets `rto_backoff` to 1 also resets this to 0, so the
+    /// next outage starts a fresh round and backs off immediately.
     backoff_round_end_nanos: u64,
 
     /// Raised when a packet is registered while nothing was in flight, so the
