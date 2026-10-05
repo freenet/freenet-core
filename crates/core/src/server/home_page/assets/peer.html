@@ -14,7 +14,6 @@
             <a href="/" class="header-title">FREENET</a>
             <span class="header-sep">/</span>
             <span class="header-scope">Peer</span>
-            <span class="header-addr">{addr}</span>
             <span class="badge">v{version}</span>
         </div>
         <div class="header-right">
@@ -24,10 +23,8 @@
         </div>
     </header>
     <main>
-        {info_card}
-        {prediction_card}
-        {breakdown_card}
-        <p class="more"><a href="/routing">How your node's routing model is doing overall &rarr;</a></p>
+        {header_card}
+        {body}
     </main>
 </body>
 </html>

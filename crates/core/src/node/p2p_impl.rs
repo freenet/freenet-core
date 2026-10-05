@@ -533,6 +533,17 @@ impl NodeP2P {
             reason_ring.hosted_by_reason()
         }));
 
+        // Per-peer route outcomes for the peer page's reliability tile, read
+        // from the canonical `PeerHealthTracker` rather than mirrored.
+        let health_ring = self.op_manager.ring.clone();
+        super::network_status::set_peer_health_provider(std::sync::Arc::new(move || {
+            health_ring
+                .connection_manager
+                .peer_health
+                .lock()
+                .all_counts()
+        }));
+
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage
         // request.

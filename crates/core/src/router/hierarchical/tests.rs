@@ -5069,16 +5069,15 @@ fn ranking_probability_preserves_order_above_one_and_never_goes_negative() {
 
 /// End to end for finding 6 of the 2026-09-17 review: the healthiest peers on
 /// untimed traffic have a negative unbounded failure forecast, and the cost
-/// the dashboard and the routing dataset read must still be a number the
-/// dashboard can print. Before the fix the ranking value carried the DOWNWARD
+/// the routing dataset and telemetry record must still be a non-negative
+/// finite number. Before the fix the ranking value carried the DOWNWARD
 /// overshoot at the same slope, so the no-timing cost branch
-/// (`failure * 3.0`) went negative and `fmt_prediction_time` printed "N/A"
-/// for exactly the best peers.
+/// (`failure * 3.0`) went negative for exactly the best peers (and the
+/// dashboard of the time printed it as "N/A").
 #[test]
 fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
     use crate::node::network_status::OpType;
     use crate::router::{RouteEvent, RouteOutcome, Router};
-    use crate::server::fmt_prediction_time_for_tests as fmt_prediction_time;
 
     let _guard = GlobalRng::seed_guard(0x4485_c00c);
     let _fallback_off = crate::router::force_isotonic_fallback(false);
@@ -5149,14 +5148,8 @@ fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
         .expect("prediction after warm-up");
     assert_eq!(prediction.failure_probability, 0.0);
     assert!(
-        prediction.expected_total_time >= 0.0,
-        "expected total time must not be negative: {}",
-        prediction.expected_total_time
-    );
-    assert_ne!(
-        fmt_prediction_time(prediction.expected_total_time),
-        "N/A",
-        "the dashboard must be able to print the cost: {}",
+        prediction.expected_total_time >= 0.0 && prediction.expected_total_time.is_finite(),
+        "expected total time must be a non-negative finite cost: {}",
         prediction.expected_total_time
     );
 }

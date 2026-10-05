@@ -332,6 +332,14 @@ impl PeerHealthTracker {
             .map(|stats| (stats.successes, stats.failures))
     }
 
+    /// `(successes, failures)` for every tracked peer, for the dashboard.
+    pub fn all_counts(&self) -> std::collections::HashMap<SocketAddr, (u64, u64)> {
+        self.stats
+            .iter()
+            .map(|(addr, stats)| (*addr, (stats.successes, stats.failures)))
+            .collect()
+    }
+
     /// Initialize health tracking for a newly added peer.
     pub fn init_peer(&mut self, addr: SocketAddr) {
         self.stats.insert(

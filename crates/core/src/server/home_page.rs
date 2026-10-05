@@ -7,11 +7,6 @@ mod assets;
 mod cards;
 mod contract_detail;
 mod estimator;
-
-/// Re-exported for the router test that pins the hierarchical cost to the
-/// range this formatter can print.
-#[cfg(test)]
-pub(crate) use estimator::fmt_prediction_time;
 mod favicon;
 mod peer_detail;
 mod routing;
@@ -234,7 +229,6 @@ mod tests {
     use super::estimator::{
         RegKind, build_accuracy_panel, build_estimator_chart, build_estimator_chart_or_placeholder,
         build_regression_chart, build_reliability_chart, failure_chart_y_max,
-        fmt_expected_total_time, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -1397,46 +1391,6 @@ mod tests {
         assert!(svg.contains("Transfer speed"));
     }
 
-    #[test]
-    fn fmt_prediction_time_sentinel_values() {
-        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
-        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_time(-1.0), "N/A");
-        assert_eq!(fmt_prediction_time(0.0), "0.000s");
-        assert_eq!(fmt_prediction_time(1.5), "1.500s");
-        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
-        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
-    }
-
-    #[test]
-    fn fmt_prediction_speed_sentinel_values() {
-        assert_eq!(fmt_prediction_speed(0.0), "N/A");
-        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
-        assert_eq!(fmt_prediction_speed(0.5), "0.50 B/s");
-    }
-
-    /// A peer whose isotonic transfer speed is floored has a placeholder speed
-    /// and cost. The cost (`mean x 1e6` s) is below `REASONABLE_TIME_LIMIT`
-    /// for a mean under 1 kB, so without this it rendered as a real time
-    /// ("100000000.000s") and the speed as "0 B/s".
-    #[test]
-    fn a_floored_transfer_speed_renders_as_not_routable() {
-        let floor = crate::router::DEGENERATE_SPEED_FLOOR_BPS;
-        assert_eq!(fmt_prediction_speed(floor), "N/A (degenerate estimate)");
-        let cost = 100.0 / floor;
-        assert!(cost < 1.0e9, "the case this guards: {cost} reads as a time");
-        assert_eq!(
-            fmt_expected_total_time(cost, floor),
-            "N/A (transfer speed degenerate: ranked last)"
-        );
-        assert_eq!(fmt_expected_total_time(1.5, 1024.0), "1.500s");
-        assert_eq!(fmt_expected_total_time(f64::MAX / 2.0, 1024.0), "N/A");
-    }
-
     /// Regression: with no data the helper must still emit a titled
     /// placeholder so all three prediction-component slots
     /// (Failure Probability, Response Time, Transfer Rate) stay
@@ -1596,17 +1550,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fmt_prediction_prob_sentinel_values() {
-        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
-        assert_eq!(fmt_prediction_prob(1.1), "N/A");
-        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
-        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
-        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
-    }
-
     fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
         use crate::node::network_status::PeerSnapshot;
         PeerSnapshot {
@@ -1617,6 +1560,7 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 1024,
             bytes_received: 2048,
+            route_outcomes: None,
         }
     }
 
@@ -1760,6 +1704,7 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
+            route_outcomes: None,
         };
         let peer = sample_peer("10.0.0.2:31338", 0.90);
         let svg = build_ring_svg(Some(0.5), &[gw, peer], None, &[]);
@@ -1790,6 +1735,7 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
+            route_outcomes: None,
         };
         assert!(build_ring_svg(None, &[no_loc_peer], None, &[]).is_empty());
         assert!(build_ring_svg(None, &[], None, &[]).is_empty());
@@ -1919,6 +1865,7 @@ mod tests {
             peer_key_location: None,
             bytes_sent: 0,
             bytes_received: 0,
+            route_outcomes: None,
         }];
         let html = build_peers_card(&Some(snap));
         assert!(

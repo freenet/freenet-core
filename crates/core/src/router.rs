@@ -1283,8 +1283,6 @@ pub struct HierarchicalCurves {
 }
 
 /// Per-peer routing data for the dashboard detail page.
-// TEMP(peer-page): read by the rebuilt peer page later in this branch.
-#[allow(dead_code)]
 pub(crate) struct PeerRoutingSnapshot {
     /// How the hierarchical estimator builds this peer's estimate for a
     /// contract at the peer's own location, per stage (failure, response time,
@@ -3581,8 +3579,6 @@ impl Router {
 
     /// [`PeerRoutingSnapshot::offsets`] alone, for every connected peer on the
     /// dashboard's comparison charts. `O(1)` per peer.
-    // TEMP(peer-page): read by the rebuilt peer page later in this branch.
-    #[allow(dead_code)]
     pub(crate) fn peer_offsets(&self, peer: &PeerKeyLocation) -> [Option<PeerOffset>; 3] {
         self.hierarchical
             .peer_offsets(peer, self.estimator_clock.hours())
