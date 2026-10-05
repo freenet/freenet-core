@@ -18,6 +18,8 @@ type WireRx = mpsc::Receiver<(SocketAddr, Arc<[u8]>)>;
 /// Socket that hands every sent datagram to a channel.
 struct ChanSocket {
     tx: mpsc::Sender<(SocketAddr, Arc<[u8]>)>,
+    /// While set, every send fails (as on a network switch).
+    fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl crate::transport::Socket for ChanSocket {
@@ -30,6 +32,9 @@ impl crate::transport::Socket for ChanSocket {
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::ErrorKind::NetworkUnreachable.into());
+        }
         self.tx
             .send((target, buf.into()))
             .await
@@ -62,6 +67,8 @@ struct End {
     outbound_key: Aes128Gcm,
     /// Key the remote encrypts with; used to forge inbound packets.
     inbound_key: Aes128Gcm,
+    /// Make this end's socket fail every send while set.
+    fail_sends: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn end(
@@ -86,6 +93,7 @@ fn end_with_wire_capacity(
     let time_source = RealTime::new();
     let (inbound_tx, inbound_rx) = mpsc::channel(4096);
     let (wire_tx, wire_rx) = mpsc::channel(wire_capacity);
+    let fail_sends = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remote_conn = RemoteConnection {
         outbound_symmetric_key: outbound.1.clone(),
         remote_addr,
@@ -107,7 +115,10 @@ fn end_with_wire_capacity(
             10_000_000,
             time_source.clone(),
         )),
-        socket: Arc::new(ChanSocket { tx: wire_tx }),
+        socket: Arc::new(ChanSocket {
+            tx: wire_tx,
+            fail: fail_sends.clone(),
+        }),
         global_bandwidth: None,
         rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
             remote_addr,
@@ -121,6 +132,7 @@ fn end_with_wire_capacity(
         wire: wire_rx,
         outbound_key: outbound.1,
         inbound_key: inbound.1,
+        fail_sends,
     }
 }
 
@@ -231,6 +243,27 @@ fn receipt_policy_table() {
         Skip,
         "a capable peer's NoOps are fire-and-forget"
     );
+    let ack = SymmetricMessagePayload::AckConnection {
+        result: Ok(symmetric_message::OutboundConnection {
+            key: [0u8; 16],
+            remote_addr: addr(2),
+        }),
+    };
+    let ack_v2 = SymmetricMessagePayload::AckConnectionV2 {
+        connection: symmetric_message::OutboundConnectionV2 {
+            key: [0u8; 16],
+            remote_addr: addr(2),
+            protoc_version: [0u8; 8],
+        },
+    };
+    for ack_noops in [true, false] {
+        assert_eq!(
+            receipt_policy(&ack, ack_noops),
+            AckWithoutDedup,
+            "the handshake ack is tracked at id 0: ack it, never dedup id 0"
+        );
+        assert_eq!(receipt_policy(&ack_v2, ack_noops), AckWithoutDedup);
+    }
 }
 
 /// The gate fails closed on an unknown version and is inclusive at the floor.
@@ -1054,4 +1087,258 @@ async fn packet_survives_cancellation_during_a_blocked_receipt_flush() {
         Some(&b"keep"[..]),
         "recv must deliver the packet without first awaiting the blocked flush"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 (#5803)
+// ---------------------------------------------------------------------------
+
+fn is_connection_ack(m: &SymmetricMessage) -> bool {
+    matches!(
+        m.payload,
+        SymmetricMessagePayload::AckConnection { .. }
+            | SymmetricMessagePayload::AckConnectionV2 { .. }
+    )
+}
+
+/// The handshake leaves each side's completion ack TRACKED at packet id 0,
+/// and our reply to a connection ack is itself a connection ack. Between two
+/// peers that both answered every one, a single ack bounced forever. Each
+/// side answers at most once, and the tracked handshake ack still gets its
+/// receipt, so it stops being retransmitted.
+#[tokio::test(start_paused = true)]
+async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
+    let (a, b) = pair(CAPABLE, CAPABLE);
+    // Production seed: A's completion ack, tracked at id 0 like
+    // `connection_handler` does, and delivered to B.
+    let a_ack = SymmetricMessage::ack_ok(&a.outbound_key, [0u8; 16], addr(2)).expect("ack");
+    a.conn
+        .remote_conn
+        .sent_tracker
+        .lock()
+        .report_sent_packet(SymmetricMessage::FIRST_PACKET_ID, a_ack.data().into());
+    b.inbound
+        .send(PacketData::<UnknownEncryption>::from_buf(a_ack.data()))
+        .await
+        .expect("deliver");
+    let a_tracker = a.conn.remote_conn.sent_tracker.clone();
+    let running = start(a, b, keep_all(), keep_all());
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let link = running.stop();
+    let a_acks = link
+        .a_to_b
+        .iter()
+        .filter(|(_, m)| is_connection_ack(m))
+        .count();
+    let b_acks = link
+        .b_to_a
+        .iter()
+        .filter(|(_, m)| is_connection_ack(m))
+        .count();
+    assert!(
+        b_acks <= 1 && a_acks <= 1,
+        "connection acks must not ping-pong: A sent {a_acks}, B sent {b_acks}"
+    );
+    assert!(b_acks == 1, "premise: B answered A's ack once");
+    assert!(
+        !a_tracker
+            .lock()
+            .contains_packet(SymmetricMessage::FIRST_PACKET_ID),
+        "A's tracked handshake ack must be acked, not retransmitted until abandoned"
+    );
+}
+
+/// The keepalive task must survive a send error (network switch) and resume
+/// pinging, never leaving more than 15 s between attempts. It used to exit on
+/// the first error, leaving only Pong replies to hold the NAT mapping.
+#[tokio::test(start_paused = true)]
+async fn keepalive_survives_send_errors_and_resumes_within_cap() {
+    let mut e = single(CAPABLE);
+    let fail = e.fail_sends.clone();
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 30 s of failing sends (several keepalive ticks).
+    for _ in 0..300 {
+        assert!(e.pump(Duration::from_millis(100)).await.is_none());
+    }
+    assert!(
+        e.drain_sent().is_empty(),
+        "premise: nothing left while failing"
+    );
+    fail.store(false, std::sync::atomic::Ordering::Relaxed);
+    let recovered = tokio::time::Instant::now();
+    let mut pings = Vec::new();
+    while recovered.elapsed() < Duration::from_secs(40) {
+        assert!(e.pump(Duration::from_millis(100)).await.is_none());
+        for m in e.drain_sent() {
+            if matches!(m.payload, SymmetricMessagePayload::Ping { .. }) {
+                pings.push(recovered.elapsed());
+            }
+        }
+    }
+    let first = *pings
+        .first()
+        .expect("keepalive never resumed after send errors");
+    assert!(
+        first <= Duration::from_secs(15),
+        "first Ping {first:?} after recovery, NAT cap is 15 s"
+    );
+    for w in pings.windows(2) {
+        assert!(
+            w[1] - w[0] <= Duration::from_secs(15),
+            "Ping gap {:?}",
+            w[1] - w[0]
+        );
+    }
+}
+
+/// A full receipt queue (MAX_PENDING_RECEIPTS) is flushed right away, not at
+/// the next 100 ms ack tick, even though the flush is deferred to the top of
+/// the recv loop.
+#[tokio::test(start_paused = true)]
+async fn full_receipt_queue_flushes_before_the_ack_tick() {
+    use crate::transport::received_packet_tracker::MAX_PENDING_RECEIPTS;
+    let mut e = single(CAPABLE);
+    let n = MAX_PENDING_RECEIPTS as u32;
+    for id in 0..n {
+        e.deliver(100 + id, short(b"m"), vec![]).await;
+    }
+    let start_t = tokio::time::Instant::now();
+    for _ in 0..n {
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    }
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    assert!(
+        start_t.elapsed() < ACK_CHECK_INTERVAL,
+        "premise: still before the first ack tick"
+    );
+    let sent = e.drain_sent();
+    let acked: std::collections::HashSet<u32> = sent
+        .iter()
+        .flat_map(|m| m.confirm_receipt.clone())
+        .collect();
+    assert!(
+        (100..100 + n).all(|id| acked.contains(&id)),
+        "a full queue must be flushed immediately: acked {acked:?}"
+    );
+}
+
+/// Deterministic loss: drop every `nth` datagram that passes.
+fn drop_every(nth: usize) -> DropFilter {
+    let mut count = 0usize;
+    Box::new(move |_| {
+        count += 1;
+        count % nth == 0
+    })
+}
+
+/// Exchange data both ways over a lossy path, then let it settle. Every
+/// message is delivered exactly once, nothing stays in flight, and no packet
+/// gets anywhere near the abandon limit.
+async fn lossy_exchange(
+    a_seen_by_b: Option<(u8, u8, u16)>,
+    b_seen_by_a: Option<(u8, u8, u16)>,
+    b_legacy: bool,
+) {
+    let (mut a, mut b) = pair(a_seen_by_b, b_seen_by_a);
+    b.conn.legacy_wire_behaviour = b_legacy;
+    let a_tracker = a.conn.remote_conn.sent_tracker.clone();
+    let b_tracker = b.conn.remote_conn.sent_tracker.clone();
+    const N: usize = 40;
+    for i in 0..N {
+        a.conn.send(format!("a-{i}")).await.expect("send");
+        b.conn.send(format!("b-{i}")).await.expect("send");
+    }
+    // One multi-fragment stream each way too.
+    a.conn.send(vec![1u8; 200_000]).await.expect("stream");
+    b.conn.send(vec![2u8; 200_000]).await.expect("stream");
+    // ~14% loss A->B, 20% B->A, hitting data, acks and retransmissions alike.
+    let running = start(a, b, drop_every(7), drop_every(5));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let got_b = running.got_b.lock().clone();
+    let link = running.stop();
+
+    for i in 0..N {
+        let want = bincode::serialize(&format!("a-{i}")).unwrap();
+        assert_eq!(
+            got_b.iter().filter(|m| **m == want).count(),
+            1,
+            "message a-{i} delivered exactly once"
+        );
+    }
+    let stream = bincode::serialize(&vec![1u8; 200_000]).unwrap();
+    assert_eq!(
+        got_b.iter().filter(|m| **m == stream).count(),
+        1,
+        "stream delivered once"
+    );
+    for (name, tracker, log) in [
+        ("A", &a_tracker, &link.a_to_b),
+        ("B", &b_tracker, &link.b_to_a),
+    ] {
+        let t = tracker.lock();
+        // A pre-#5795 stand-in keeps one tracked ack-only NoOp in flight at
+        // any instant (that is the chatter), so NoOps are exempt; every data
+        // packet must have been acked.
+        let noop_ids: std::collections::HashSet<u32> = log
+            .iter()
+            .filter(|(_, m)| matches!(m.payload, SymmetricMessagePayload::NoOp))
+            .map(|(_, m)| m.packet_id)
+            .collect();
+        for id in 0..10_000u32 {
+            assert!(
+                noop_ids.contains(&id) || !t.contains_packet(id),
+                "{name}: data packet {id} still in flight after settling"
+            );
+        }
+    }
+    for (name, log) in [("A", &link.a_to_b), ("B", &link.b_to_a)] {
+        let mut per_id: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (_, m) in log.iter().filter(|(_, m)| {
+            !matches!(
+                m.payload,
+                SymmetricMessagePayload::Ping { .. } | SymmetricMessagePayload::Pong { .. }
+            )
+        }) {
+            *per_id.entry(m.packet_id).or_default() += 1;
+        }
+        let worst = per_id.values().max().copied().unwrap_or(0);
+        // 1 + MAX_PACKET_RETRANSMITS (12) sends means it was abandoned.
+        assert!(
+            worst < 13,
+            "{name}: some packet was sent {worst} times, i.e. abandoned"
+        );
+    }
+}
+
+/// Gate ON (both peers at or above the floor), lossy both ways.
+#[tokio::test(start_paused = true)]
+async fn lossy_exchange_between_capable_peers_recovers_every_ack() {
+    lossy_exchange(CAPABLE, CAPABLE, false).await;
+}
+
+/// Mixed versions, lossy: B behaves like a pre-#5795 peer (tracked ack-only
+/// NoOps, a receipt for every packet, no duplicate re-ack). A sees B's version
+/// as old, so it acks B's NoOps; B never ends up retransmitting them to the
+/// abandon limit.
+#[tokio::test(start_paused = true)]
+async fn lossy_exchange_with_an_old_peer_stand_in() {
+    lossy_exchange(CAPABLE, OLD, true).await;
+}
+
+/// The thread-local test API turns the receive-side gate on for connections
+/// created while it is enabled, whatever version the remote reports.
+#[tokio::test(start_paused = true)]
+async fn force_noop_gate_api_applies_to_new_connections() {
+    crate::config::SimulationForceNoopGate::enable();
+    let forced = single(OLD);
+    crate::config::SimulationForceNoopGate::disable();
+    let normal = single(OLD);
+    assert!(
+        !forced.conn.ack_remote_noops,
+        "forced: an old-version remote is treated as capable"
+    );
+    // Unless the whole run set the env override.
+    if std::env::var("FREENET_TEST_FORCE_NOOP_GATE").as_deref() != Ok("1") {
+        assert!(normal.conn.ack_remote_noops);
+    }
 }

@@ -210,6 +210,10 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// exactly once.
     packet_streams: HashMap<PacketId, PacketStream>,
 
+    /// End of the current backoff round (time-source nanos). RTOs that fire
+    /// before it do not double the backoff again; see `get_resend`.
+    backoff_round_end_nanos: u64,
+
     /// Raised when a packet is registered while nothing was in flight, so the
     /// recv loop re-evaluates its resend deadline (see [`NewFlightSignal`]).
     new_flight: std::sync::Arc<NewFlightSignal>,
@@ -278,6 +282,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             retransmit_counts: HashMap::new(),
             packet_streams: HashMap::new(),
             new_flight: std::sync::Arc::new(NewFlightSignal::default()),
+            backoff_round_end_nanos: 0,
         }
     }
 
@@ -899,8 +904,20 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 // Mark as retransmitted for Karn's algorithm
                 self.mark_retransmitted(entry.packet_id);
 
-                // RFC 6298 Section 5.5: Back off the timer on retransmission
-                self.on_timeout();
+                // RFC 6298 Section 5.5: back off the timer on expiry. RFC 6298
+                // has ONE retransmission timer per connection, so a burst of
+                // losses is one expiry and one doubling. Here every lost
+                // packet times out individually, and doubling per packet
+                // drove a 10-packet burst to the 60 s cap at once, stalling
+                // the remaining retransmissions for minutes. That used to be
+                // hidden because the ack-only NoOp chatter reset the backoff
+                // every ~200 ms; #5795 removed the chatter. So double at most
+                // once per round: until one (new) effective RTO has passed.
+                if now_nanos >= self.backoff_round_end_nanos {
+                    self.on_timeout();
+                    self.backoff_round_end_nanos =
+                        now_nanos.saturating_add(self.effective_rto().as_nanos() as u64);
+                }
 
                 // Clean up TLP tracking for this packet
                 self.tlp_sent_packets.remove(&entry.packet_id);
@@ -1710,6 +1727,71 @@ pub(in crate::transport) mod tests {
     //
     // TLP timer (PTO) = 2 * SRTT (minimum 10ms)
     // TLP fires BEFORE RTO, and doesn't apply backoff (it's speculative)
+
+    /// A burst of losses is ONE timer expiry: it doubles the backoff once,
+    /// not once per lost packet (#5795 review). Per-packet doubling drove a
+    /// 10-packet burst straight to the 60 s cap.
+    #[test]
+    fn burst_of_timeouts_doubles_backoff_once_per_round() {
+        let mut tracker = mock_sent_packet_tracker();
+        for id in 0..10 {
+            tracker.report_sent_packet(id, vec![id as u8].into());
+        }
+        let drain = |tracker: &mut SentPacketTracker<VirtualTime>| {
+            let mut n = 0;
+            while let ResendAction::Resend(..) = tracker.get_resend() {
+                n += 1;
+            }
+            n
+        };
+        // No RTT sample, so no TLP. The first RTO expiry (1 s) doubles the
+        // backoff, so the rest of the burst is judged against 2 s.
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        let first = drain(&mut tracker);
+        assert!(first >= 1);
+        assert_eq!(tracker.rto_backoff(), 2, "one expiry, one doubling");
+        // The rest of the burst times out within the same round: retransmitted,
+        // but no further doubling. (Per-packet doubling made each successive
+        // packet wait twice as long as the one before: 2, 4, 8 ... 60 s.)
+        tracker.time_source.advance(Duration::from_millis(1_000));
+        let rest = drain(&mut tracker);
+        assert_eq!(first + rest, 10, "the whole burst is retransmitted by 2 s");
+        assert_eq!(tracker.rto_backoff(), 2, "still one doubling for one burst");
+
+        // A later round (the burst timing out again) is a new expiry.
+        tracker.time_source.advance(Duration::from_millis(2_001));
+        assert!(drain(&mut tracker) >= 1);
+        assert_eq!(tracker.rto_backoff(), 4, "a new round doubles again");
+    }
+
+    /// The new-flight signal fires on the empty-to-non-empty transition only,
+    /// and is cleared by being taken (#5795 review).
+    #[test]
+    fn new_flight_signal_fires_only_when_flight_was_empty() {
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut tracker = mock_sent_packet_tracker();
+        let signal = tracker.new_flight_signal();
+        assert!(signal.poll_take(&mut cx).is_pending(), "nothing sent yet");
+
+        tracker.report_sent_packet(1, vec![1].into());
+        assert!(signal.poll_take(&mut cx).is_ready(), "empty -> non-empty");
+        assert!(signal.poll_take(&mut cx).is_pending(), "taken");
+
+        tracker.report_sent_packet(2, vec![2].into());
+        assert!(
+            signal.poll_take(&mut cx).is_pending(),
+            "already in flight: the armed deadline is no later than the new one"
+        );
+
+        // Re-registering an in-flight packet (resend refresh) is not new flight.
+        tracker.report_sent_packet(1, vec![1].into());
+        assert!(signal.poll_take(&mut cx).is_pending());
+
+        let _ = tracker.report_received_receipts(&[1, 2]);
+        tracker.report_sent_packet(3, vec![3].into());
+        assert!(signal.poll_take(&mut cx).is_ready(), "empty again -> fires");
+    }
 
     #[test]
     fn test_tlp_fires_before_rto() {

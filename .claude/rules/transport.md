@@ -280,8 +280,12 @@ Which packets earn a receipt is decided by `receipt_policy` in
 peer_connection.rs. A receipt is only useful for a packet the SENDER
 tracks for retransmission:
   → Ping / Pong: never acked (every release sends them untracked).
-  → AckConnection*: never acked (untracked, and always packet id 0, which
-    would shadow the remote's first data packet in the dedup window).
+  → AckConnection*: acked on every arrival but NOT recorded for dedup.
+    The handshake's completion ack is tracked at packet id 0 and must be
+    acked; id 0 is also the remote's first data packet, so recording it
+    would drop that packet as a duplicate. Answering a connection ack with
+    `ack_ok` happens at most ONCE per connection: the reply is itself an
+    AckConnection, so answering every one loops forever between two peers.
   → ShortMessage / StreamFragment: acked within ACK_CHECK_INTERVAL
     (100 ms), and RE-ACKED when a duplicate arrives (a duplicate means
     our receipt was lost). A duplicate is never delivered twice.

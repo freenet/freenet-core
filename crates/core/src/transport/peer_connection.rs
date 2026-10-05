@@ -280,6 +280,13 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Raised by the sent tracker when a packet enters an empty flight, so the
     /// resend check is re-evaluated instead of waiting out an idle RTO.
     new_flight: Arc<super::sent_packet_tracker::NewFlightSignal>,
+    /// Test-only stand-in for a pre-#5795 peer: tracked ack-only NoOps and a
+    /// receipt for every packet, no duplicate re-ack.
+    #[cfg(test)]
+    legacy_wire_behaviour: bool,
+    /// Whether we already answered a connection ack on this established
+    /// connection (see `process_inbound`).
+    answered_connection_ack: bool,
     /// Receipts must be flushed at the next loop iteration (QueueFull or the
     /// receipt deadline); see the cancellation note in `recv`.
     receipts_flush_due: bool,
@@ -428,15 +435,11 @@ pub(super) const UNTRACKED_ACK_NOOP_MIN_VERSION: (u8, u8, u16) = (0, 2, 142);
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 142));
 
-/// Test/simulation hook: treat every remote as at or above
-/// [`UNTRACKED_ACK_NOOP_MIN_VERSION`], so the #5795 receive-side gate is ON
-/// even though simulated peers report the current (pre-floor) crate version.
-/// Enabled by `FREENET_TEST_FORCE_NOOP_GATE=1`; compiled only into test and
-/// `testing` builds, never into a release binary.
+/// Whether the #5795 receive-side gate is forced on for tests; see
+/// [`crate::config::SimulationForceNoopGate`]. Always `false` in release builds.
 #[cfg(any(test, feature = "testing"))]
 fn force_untracked_noop_gate() -> bool {
-    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCE.get_or_init(|| std::env::var("FREENET_TEST_FORCE_NOOP_GATE").is_ok_and(|v| v == "1"))
+    crate::config::SimulationForceNoopGate::is_enabled()
 }
 
 #[cfg(not(any(test, feature = "testing")))]
@@ -459,6 +462,10 @@ enum ReceiptPolicy {
     /// Record it for dedup and ack it. `reack_duplicate`: a duplicate of it is
     /// a retransmission, i.e. our receipt was lost, so ack it again.
     Ack { reack_duplicate: bool },
+    /// Ack it (every time it arrives) but do NOT record its id for dedup.
+    /// For connection acks, whose id 0 is shared with the remote's first data
+    /// packet.
+    AckWithoutDedup,
 }
 
 /// Which inbound packets get a receipt (#5795).
@@ -472,10 +479,13 @@ enum ReceiptPolicy {
 ///   be the trailing receipt carrier of a multi-packet message, sharing the
 ///   payload packet's id; the payload packet itself earns the receipt.
 /// - `ShortMessage` / `StreamFragment`: always, and re-acked on duplicate.
-/// - `AckConnection*`: never acked. The handshake sends them untracked, and
-///   always with packet id 0 (`SymmetricMessage::FIRST_PACKET_ID`), the same id
-///   as the remote's first data packet: recording it would make that data
-///   packet look like a duplicate and drop it. Still processed normally.
+/// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
+///   completion ack is TRACKED by its sender (`report_sent_packet` at
+///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
+///   receipt for id 0 arrives, so it must be acked. But id 0 is also the id of
+///   the remote's first data packet, so recording it for dedup would make that
+///   packet look like a duplicate and drop it. Replying to a connection ack is
+///   separately limited to once per connection (`answered_connection_ack`).
 fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
     match payload {
         SymmetricMessagePayload::Ping { .. } | SymmetricMessagePayload::Pong { .. } => {
@@ -495,7 +505,7 @@ fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> 
             reack_duplicate: true,
         },
         SymmetricMessagePayload::AckConnection { .. }
-        | SymmetricMessagePayload::AckConnectionV2 { .. } => ReceiptPolicy::Skip,
+        | SymmetricMessagePayload::AckConnectionV2 { .. } => ReceiptPolicy::AckWithoutDedup,
     }
 }
 
@@ -791,6 +801,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
             let mut tick_count = 0u64;
             let mut ping_seq = 0u64;
+            let mut consecutive_send_errors = 0u32;
             let task_start_nanos = task_time_source.now_nanos();
 
             loop {
@@ -860,6 +871,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                 match socket.send_to(&ping_packet, remote_addr).await {
                     Ok(_) => {
+                        if consecutive_send_errors > 0 {
+                            tracing::info!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                failed_pings = consecutive_send_errors,
+                                "Keep-alive Ping send recovered"
+                            );
+                            consecutive_send_errors = 0;
+                        }
                         // Phase 1.6 (#4074): keep-alive Ping bypasses
                         // `packet_sending`; count it as must-flow here.
                         // Observation only.
@@ -876,20 +896,33 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                     }
                     Err(e) => {
-                        let elapsed = Duration::from_nanos(
-                            task_time_source
-                                .now_nanos()
-                                .saturating_sub(task_start_nanos),
-                        );
-                        tracing::warn!(
-                            target: "freenet_core::transport::keepalive_lifecycle",
-                            remote = ?remote_addr,
-                            error = ?e,
-                            elapsed_since_start_secs = elapsed.as_secs_f64(),
-                            total_ticks = tick_count,
-                            "Keep-alive task STOPPING - socket error"
-                        );
-                        break;
+                        // Keep going (#5795 review). A send error here is
+                        // usually transient (network switch, ENETUNREACH,
+                        // ENOBUFS). Exiting would leave the connection with no
+                        // outbound keepalive at all, relying on our Pong
+                        // replies to hold the NAT mapping. The failed ping
+                        // stays in `pending_pings`, so the interval backs off
+                        // to at most MAX_KEEPALIVE_INTERVAL (15 s). The task
+                        // ends when the connection is dropped (aborted in
+                        // `Drop`) or the idle timeout closes it.
+                        consecutive_send_errors += 1;
+                        if consecutive_send_errors == 1 {
+                            tracing::warn!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                error = ?e,
+                                total_ticks = tick_count,
+                                "Keep-alive Ping send failed; will keep retrying"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                error = ?e,
+                                consecutive_send_errors,
+                                "Keep-alive Ping send failed again"
+                            );
+                        }
                     }
                 }
             }
@@ -928,6 +961,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             recv_timers,
             timeout_checks_run: 0,
             receipts_flush_due: false,
+            answered_connection_ack: false,
+            #[cfg(test)]
+            legacy_wire_behaviour: false,
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
@@ -1367,8 +1403,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // packet and, before #5795, seeded an endless
                     // ack-of-ack ping-pong. See `receipt_policy`.
                     let policy = receipt_policy(&payload, self.ack_remote_noops);
+                    #[cfg(test)]
+                    let policy = if self.legacy_wire_behaviour {
+                        ReceiptPolicy::Ack { reack_duplicate: false }
+                    } else {
+                        policy
+                    };
                     let report_result = match policy {
                         ReceiptPolicy::Skip => ReportResult::Ok,
+                        ReceiptPolicy::AckWithoutDedup => {
+                            self.received_tracker.requeue_receipt(packet_id)
+                        }
                         ReceiptPolicy::Ack { .. } => {
                             self.received_tracker.report_received_packet(packet_id)
                         }
@@ -1947,6 +1992,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // version from our intro packet, and answering a V2 ack with a V2
             // ack would tell it nothing it does not have.
             AckConnection { result: Ok(_) } | AckConnectionV2 { .. } => {
+                // Answer at most ONCE per connection (#5795 review). Our reply
+                // is itself an `AckConnection { Ok }`, so two peers that both
+                // answered every one would bounce acks forever. Before #5795
+                // the dedup window stopped that by accident (every connection
+                // ack has id 0, so the second one was dropped as a duplicate);
+                // connection acks are no longer recorded for dedup, so the
+                // limit is explicit. The remote's tracked handshake ack is
+                // still acked by receipt on every arrival (`receipt_policy`).
+                if self.answered_connection_ack {
+                    return Ok(None);
+                }
+                self.answered_connection_ack = true;
                 let packet = SymmetricMessage::ack_ok(
                     &self.remote_conn.outbound_symmetric_key,
                     self.remote_conn.inbound_symmetric_key_bytes,
@@ -2244,6 +2301,30 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// a receipt for an untracked packet); whether WE ack the remote's NoOps
     /// is decided separately, by `ack_remote_noops`.
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
+        #[cfg(test)]
+        if self.legacy_wire_behaviour {
+            // Pre-#5795: the ack-only NoOp is tracked for retransmission.
+            let token = self
+                .remote_conn
+                .congestion_controller
+                .on_send_with_token(50);
+            return packet_sending(
+                self.remote_conn.remote_addr,
+                &self.remote_conn.socket,
+                self.remote_conn
+                    .last_packet_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Release),
+                &self.remote_conn.outbound_symmetric_key,
+                receipts,
+                (),
+                &self.remote_conn.sent_tracker,
+                50,
+                token,
+                PacketStream::Control,
+                &self.remote_conn.last_packet_id,
+            )
+            .await;
+        }
         send_untracked_receipts(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
@@ -4973,6 +5054,13 @@ mod tests {
         };
 
         let mut conn = PeerConnection::new(remote_conn);
+        // This test is about the send path. Stop the keepalive task: with this
+        // module's no-op mock sleep it would emit Pings back to back once the
+        // socket recovers (since #5795 it no longer exits on a send error) and
+        // race the `sock_rx` assertions below.
+        if let Some(handle) = conn.keep_alive_handle.take() {
+            handle.abort();
+        }
 
         // Burst phase: several consecutive io::Errors hit the same live
         // connection. Each must surface as a transient error and must NOT
@@ -5005,17 +5093,8 @@ mod tests {
         // connection object. Success + an actual packet on the rx side proves
         // the outbound path recovered on the same `&mut conn`.
         //
-        // Determinism note (keepalive task): `SharedMockTimeSource` inherits
-        // the default `supports_keepalive() == true`, so `PeerConnection::new`
-        // spawned a live keepalive task. Because that time source's `sleep` is
-        // a no-op, the task immediately attempted a Ping `socket.send_to`,
-        // which failed (the fail flag was still `true` at construction) and
-        // made the task `break` out and self-terminate on its first send error
-        // — BEFORE this recovery phase runs. That is why the keepalive task
-        // cannot race the `sock_rx` assertions below (it can never emit a Ping
-        // into the now-succeeding socket). If a future keepalive change makes
-        // the task survive a transient send error, this test would need an
-        // explicit drain/filter on `sock_rx` to stay deterministic.
+        // The keepalive task was aborted above, so it cannot emit a Ping into
+        // the now-succeeding socket.
         fail_sends.store(false, std::sync::atomic::Ordering::Relaxed);
         conn.send(b"payload".to_vec())
             .await
