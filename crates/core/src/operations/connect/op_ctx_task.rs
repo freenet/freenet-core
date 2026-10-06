@@ -371,7 +371,9 @@ async fn drive_client_connect_inner(
                     })
                     .await?;
 
-                let hole_punch_ok = match rx.recv().await {
+                // The address the connection was made to, which can differ from
+                // the advertised one when an existing transport is reused.
+                let (hole_punch_ok, connected_addr) = match rx.recv().await {
                     Some(Ok((peer_id, _remaining))) => {
                         tracing::info!(
                             %peer_id,
@@ -396,7 +398,7 @@ async fn drive_client_connect_inner(
                             true,
                             now,
                         );
-                        true
+                        (true, peer_id)
                     }
                     Some(Err(_)) => {
                         tracing::warn!(
@@ -404,7 +406,7 @@ async fn drive_client_connect_inner(
                             elapsed_ms = tx.elapsed().as_millis(),
                             "connect driver: ConnectPeer failed"
                         );
-                        false
+                        (false, acceptor_addr)
                     }
                     None => {
                         tracing::warn!(
@@ -412,7 +414,7 @@ async fn drive_client_connect_inner(
                             acceptor = %payload.acceptor,
                             "connect driver: ConnectPeer callback closed without result"
                         );
-                        false
+                        (false, acceptor_addr)
                     }
                 };
 
@@ -434,8 +436,8 @@ async fn drive_client_connect_inner(
                 if let ClientConnectKind::LatticeProbe { generation } = kind {
                     let cm = &op_manager.ring.connection_manager;
                     if cm.record_lattice_probe_result(
-                        Location::from_address(&acceptor_addr),
-                        acceptor_addr,
+                        Location::from_address(&connected_addr),
+                        connected_addr,
                         generation,
                         hole_punch_ok,
                         cm.at_max_connections(),
@@ -1754,6 +1756,19 @@ mod tests {
             tick < drain,
             "the probe must be scheduled before the drain, so it launches in the same tick"
         );
+        assert!(
+            maintenance.contains(
+                "ifletSome(interval)=outcome.fired{self.connection_manager.record_lattice_probe_issued();pending_conn_adds.insert(me);"
+            ),
+            "the probe target must be queued only when the scheduler fires"
+        );
+        assert!(
+            maintenance.contains("#[cfg(not(test))]letprobe_timing=lattice_probe_timing::production();")
+                && maintenance.contains(
+                    "LatticeProbeScheduler::new(self.time_source.now(),self.connection_manager.lattice_probe_misses(),probe_timing,)"
+                ),
+            "connection_maintenance must run the scheduler on the production timing"
+        );
         assert_eq!(
             squash(&ring)
                 .matches("ClientConnectKind::LatticeProbe{")
@@ -1815,7 +1830,7 @@ mod tests {
         let gate_block = &body[gate..failed];
         assert!(
             gate_block.contains(
-                "ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,hole_punch_ok,cm.at_max_connections(),)"
+                "ifcm.record_lattice_probe_result(Location::from_address(&connected_addr),connected_addr,generation,hole_punch_ok,cm.at_max_connections(),)"
             ),
             "every probe acceptor must be classified, for the probe's generation"
         );

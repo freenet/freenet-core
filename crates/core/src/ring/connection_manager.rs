@@ -1412,8 +1412,9 @@ impl ConnectionManager {
     /// is GLOBAL (shared with unrelated in-flight handshakes), not lattice-private:
     /// a node genuinely AT max whose budget is already consumed by ordinary CONNECT
     /// traffic has its over-cap tightening throttled until those reservations drain
-    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; a refused closer peer
-    /// is a failed hit, so discovery re-checks on its retry ladder). This bites
+    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; when the far end
+    /// refuses us this way our probe never sees it and lands farther out, a
+    /// miss, so lattice discovery's re-checks are what heal it). This bites
     /// only for nodes at max (mostly busy gateways) — a peer below max tightens
     /// via the under-cap path, which never consults this ceiling. A
     /// lattice-private budget is a possible future refinement.
@@ -1469,10 +1470,9 @@ impl ConnectionManager {
         // tightening has room only when the node holds fewer than SLACK other
         // non-stale reservations, and a node at max whose budget is already
         // consumed by ordinary CONNECT traffic throttles tightening until those
-        // drain or expire (PENDING_RESERVATION_TTL). That is bounded and the
-        // discovery re-checks (a refused closer peer is a failed hit, which
-        // puts it on the retry ladder); the global count is also the more
-        // conservative choice
+        // drain or expire (PENDING_RESERVATION_TTL). That is bounded, and
+        // lattice discovery's re-checks retry it; the global count is also the
+        // more conservative choice
         // for the hard ceiling. It only bites at nodes
         // genuinely AT max (mostly busy gateways) — a peer below max tightens via
         // the under-cap path, which never consults this ceiling. A lattice-private
@@ -4430,7 +4430,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn lattice_discovery_sleeps_at_max_connections() {
         use crate::ring::{LatticeProbeScheduler, lattice_probe_timing as t};
-        use crate::util::backoff::ExponentialBackoff;
         let cm = make_connection_manager(None, 1, 4, false);
         cm.update_location(Some(Location::new(0.5)));
         let kp = TransportKeypair::new();
@@ -4443,13 +4442,8 @@ mod tests {
             );
         }
         assert!(cm.at_max_connections());
-        let mut s = LatticeProbeScheduler::new(
-            Instant::now(),
-            cm.lattice_probe_misses(),
-            ExponentialBackoff::new(t::TAU0, t::TAU_MAX),
-            ExponentialBackoff::new(t::RECHECK_MIN, t::RECHECK_MAX),
-            ExponentialBackoff::new(t::RETRY_MIN, t::RETRY_MAX),
-        );
+        let mut s =
+            LatticeProbeScheduler::new(Instant::now(), cm.lattice_probe_misses(), t::production());
         assert!(s.tick_for(&cm, Instant::now(), || 1.0).fired.is_some());
         // The probe lands on two non-lattice peers our cap refused.
         let g = s.generation();
@@ -4468,7 +4462,8 @@ mod tests {
             false,
             at_cap
         ));
-        for _ in 0..60 {
+        // Hours of ticks: no probe; the first re-check is 2h out.
+        for _ in 0..90 {
             tokio::time::advance(std::time::Duration::from_secs(60)).await;
             assert!(
                 s.tick_for(&cm, Instant::now(), || 1.0).fired.is_none(),
@@ -4482,9 +4477,8 @@ mod tests {
     #[test]
     fn lattice_recheck_intervals_outlast_failed_addr_exclusion() {
         use crate::ring::lattice_probe_timing as t;
-        assert!(t::RECHECK_MIN.mul_f64(0.8) > FAILED_ADDR_MAX_TTL);
-        assert!(t::RETRY_MIN.mul_f64(0.8) > FAILED_ADDR_BASE_TTL);
-        assert!(t::RETRY_MAX <= t::RECHECK_MAX);
+        assert!(t::RECHECK_MIN.mul_f64(t::JITTER_LOW) > FAILED_ADDR_MAX_TTL);
+        assert!(t::RETRY_MIN.mul_f64(t::JITTER_LOW) > FAILED_ADDR_BASE_TTL);
     }
 
     /// Regression for the speculative-state over-cap ceiling: non-stale pending

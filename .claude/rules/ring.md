@@ -78,8 +78,7 @@ WHEN accepting a new connection (should_accept):
      populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
      not just over-cap lattice ones), so on a node AT max unrelated in-flight
      handshakes can throttle tightening until they drain (bounded by the TTL;
-     a refused closer peer is a failed hit, so discovery re-checks on its retry
-     ladder). This only bites nodes genuinely at max (mostly
+     lattice discovery's re-checks retry it). This only bites nodes genuinely at max (mostly
      busy gateways); a peer below max tightens via the under-cap path, which never
      consults this ceiling. A lattice-private budget is a possible future
      refinement. A second, independent bound: each admitted candidate that
@@ -95,15 +94,16 @@ WHEN accepting a new connection (should_accept):
      ClientConnectKind::LatticeProbe with the scheduler generation current at
      launch. A miss on each side in the current generation puts discovery to
      sleep until a per-side nearest distance changes (fill, tighten, loss, or
-     widening) or a re-check starts a new generation: 2h doubling to 16h, or
-     10 min doubling to 16h if a closer peer was found but could not be
-     connected (a failed hit; separate attempt counter, and a late failed hit
-     shortens a sleep already begun). A miss is EVIDENCE, not proof: a failed
+     widening) or a re-check starts a new generation. Re-checks are FINITE
+     per lattice state, because each re-check of a tight lattice keeps a link
+     (ring.rs lattice_probe_timing: 2h, 4h, 8h; after a failed hit, i.e. a
+     closer peer found but not connected, 10 to 80 min, up to four times,
+     not reset by lattice changes). A miss is EVIDENCE, not proof: a failed
      hole punch, a near-terminus relay, or a recently-failed nearest peer, or
-     one that rejected the request, can make a loose side look tight, which is
-     why sleep is bounded and acceptors that failed to connect are not misses
-     (except at this peer's own max_connections, where our cap refuses every
-     non-lattice acceptor). Probe acceptors are never DROPPED by the driver:
+     one that rejected the request, can make a loose side look tight, which
+     is why it re-checks and why acceptors that failed to connect are not
+     misses (except at this peer's own max_connections, where our cap refuses
+     every non-lattice acceptor). Probe acceptors are never DROPPED by the driver:
      the transport has no close message, so a dropped link stays dead on the
      far end until its idle timeout. Probing forever and keeping every result
      added a non-lattice link per probe (nothing prunes below max at low

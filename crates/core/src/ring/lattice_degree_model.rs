@@ -41,11 +41,7 @@ const CHECK_TICK: f64 = 60.0;
 const FAST_TICK: f64 = 5.0;
 const FAST_TICK_BACKOFF_THRESHOLD: u32 = 6;
 // The lattice probe intervals are the production ones.
-use super::super::lattice_probe_timing::{
-    RECHECK_MAX as LATTICE_RECHECK_MAX, RECHECK_MIN as LATTICE_RECHECK_MIN,
-    RETRY_MAX as LATTICE_RETRY_MAX, RETRY_MIN as LATTICE_RETRY_MIN, TAU_MAX as LATTICE_TAU_MAX,
-    TAU0 as LATTICE_TAU0,
-};
+use super::super::lattice_probe_timing;
 /// Chance that an accepted connection fails to establish (hole punch).
 const CONNECT_FAILURE_RATE: f64 = 0.2;
 const DEFERRED_SWAP_DROP_TTL: f64 = 120.0;
@@ -101,9 +97,7 @@ impl Probe {
             Discovery::Production => Probe::Production(LatticeProbeScheduler::new(
                 Instant::now(),
                 Default::default(),
-                ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX),
-                ExponentialBackoff::new(LATTICE_RECHECK_MIN, LATTICE_RECHECK_MAX),
-                ExponentialBackoff::new(LATTICE_RETRY_MIN, LATTICE_RETRY_MAX),
+                lattice_probe_timing::production(),
             )),
         }
     }
@@ -391,8 +385,11 @@ impl Model {
                 succ: node.cm.nearest_lattice_neighbor_dist(true),
                 pred: node.cm.nearest_lattice_neighbor_dist(false),
             };
-            let backoff = ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX);
-            let jitter = GlobalRng::random_range(0.8..=1.2);
+            let backoff =
+                ExponentialBackoff::new(lattice_probe_timing::TAU0, lattice_probe_timing::TAU_MAX);
+            let jitter = GlobalRng::random_range(
+                lattice_probe_timing::JITTER_LOW..=lattice_probe_timing::JITTER_HIGH,
+            );
             let fire = match &mut node.probe {
                 Probe::Continuous {
                     next_at,

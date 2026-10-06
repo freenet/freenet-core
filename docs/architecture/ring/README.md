@@ -179,9 +179,9 @@ maintain their nearest ring neighbor on each side (the nearest-neighbor lattice)
 nearest neighbor is admitted even at capacity (up to a small over-max allowance), lattice
 edges are excluded from score-based pruning and swaps, and a periodic route-to-self probe
 keeps discovering closer neighbors. Once a probe on each side has found nothing closer than the
-current nearest neighbor, the probe sleeps until a nearest-neighbor distance changes or a
-re-check is due (2h, doubling to 16h), so a converged peer does not keep adding non-lattice
-links.
+current nearest neighbor, the probe sleeps until a nearest-neighbor distance changes, apart from
+a few re-checks (`ring::lattice_probe_timing`). Each probe keeps whatever it connected to, so a
+converged peer adds a non-lattice link or two per lattice change rather than one per probe.
 
 **Acceptance:**
 - At `max_connections` → reject (except new nearest-neighbor lattice edges)
