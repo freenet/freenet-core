@@ -10,6 +10,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
+use freenet::util::os_trust::add_os_root_certificates;
 use freenet_stdlib::client_api::{
     ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery,
     QueryResponse, WebApi,
@@ -391,9 +392,15 @@ impl ReportCommand {
         let compressed = encoder.finish()?;
 
         // Upload
-        let client = reqwest::Client::builder()
-            .user_agent("freenet-report")
-            .build()?;
+        // OS roots so this works behind TLS-intercepting proxies, whose CA
+        // lives in the OS store (see util::os_trust for why only here).
+        let client = add_os_root_certificates(
+            reqwest::Client::builder()
+                .user_agent("freenet-report")
+                .connect_timeout(StdDuration::from_secs(30))
+                .timeout(StdDuration::from_secs(300)),
+        )
+        .build()?;
 
         let response = client
             .post(&self.server)
@@ -410,7 +417,12 @@ impl ReportCommand {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Upload failed: {} - {}", status, body);
+            anyhow::bail!(
+                "Upload failed: {} - {}. To send it another way, re-run with \
+                 `--local <PATH>` to save it to a file instead",
+                status,
+                body
+            );
         }
 
         let upload_response: UploadResponse = response
