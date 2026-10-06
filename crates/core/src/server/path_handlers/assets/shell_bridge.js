@@ -556,6 +556,19 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     return { url: url.toString(), delay: delay };
   }
+
+  // The frame path for a SAME-CONTRACT navigation (the iframe's src, and
+  // history.state.iframePath, which Back/Forward restore): the link's path and
+  // query with the routing flag __sandbox=1, and without `_freload` — the
+  // shell's own top-level recovery stamp, never the app's (a stale one in the
+  // frame would make a later framed connecting page give up at once; see
+  // shell_page's filter). `hash` is the already-capped fragment.
+  function sameContractFramePath(href, hash) {
+    var u = new URL(href);
+    u.searchParams.set('__sandbox', '1');
+    u.searchParams.delete('_freload');
+    return u.pathname + u.search + hash;
+  }
   // reload-url-cap:END
 
   // Whether a WebSocket close should trigger recovery: ONLY the node's trusted
@@ -1315,15 +1328,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
               } catch (e) {}
             });
             connections.clear();
-            // Build new sandbox URL preserving __sandbox=1. `_freload` is
-            // the shell's own top-level recovery stamp: never the app's, so
-            // a same-contract link that carries one does not take it into
-            // the frame (a stale stamp there would make a later framed
-            // connecting page give up at once). See shell_page's filter.
-            resolved.searchParams.set('__sandbox', '1');
-            resolved.searchParams.delete('_freload');
-            var newIframePath =
-              resolved.pathname + resolved.search + cappedHash;
+            // Build new sandbox URL preserving __sandbox=1, without the
+            // recovery stamp (see sameContractFramePath).
+            var newIframePath = sameContractFramePath(
+              resolved.href,
+              cappedHash,
+            );
             iframe.src = newIframePath;
             // Push a history entry so back/forward navigate between
             // visited subpages, and update the address bar to the

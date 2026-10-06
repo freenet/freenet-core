@@ -303,6 +303,28 @@ const freloadStripDecision = new Function(
   );
 }
 
+// 8. A same-contract navigation's frame path (iframe.src and the
+//    history.state.iframePath Back/Forward restore) never carries the shell's
+//    `_freload` stamp, whatever the encoding of its name, and keeps the app's
+//    own query, the routing flag and the fragment (Codex on #5750).
+{
+  const sameContractFramePath = new Function(
+    `${extractFrom('reload-url-cap:BEGIN', 'reload-url-cap:END', 'function reloadUrlCapDecision(')}\nreturn sameContractFramePath;`,
+  )();
+  const p = sameContractFramePath(
+    'http://n.test/v1/contract/web/k/page?x=1&_freload=1000-0&_fre%6Coad=2-1&y=2',
+    '#h',
+  );
+  check(
+    `a same-contract frame path drops _freload (${p})`,
+    !/_fre(load|%6Coad)/i.test(p),
+  );
+  check(
+    'a same-contract frame path keeps the app query, __sandbox=1 and the hash',
+    p === '/v1/contract/web/k/page?x=1&y=2&__sandbox=1#h',
+  );
+}
+
 if (failures > 0) {
   console.error(`\nshell-bridge-reload: ${failures} check(s) FAILED`);
   process.exit(1);
