@@ -183,34 +183,54 @@ const freloadStripDecision = new Function(
   let deferred = 0;
   let violations = 0;
   let firstViolation = null;
+  let maxDelay = 0;
+  // One stamp: stripped (now or after its delay), every later reload decision
+  // compared. A delay is re-decided when it fires (stripFreload), so a clamped
+  // delay is followed until the decision says "now" (bounded: a stamp years
+  // ahead re-decides every WINDOW_MS, so the walk is capped and counted).
+  const sweep = (raw, label) => {
+    const href = `${base}?view=chat&_freload=${raw}#m`;
+    let at = T;
+    let d = freloadStripDecision(href, at);
+    if (!d) {
+      violations++;
+      return;
+    }
+    if (d.url !== `${base}?view=chat#m`) violations++;
+    if (d.delay > 0) deferred++;
+    for (let hops = 0; d.delay > 0 && hops < 3; hops++) {
+      maxDelay = Math.max(maxDelay, d.delay);
+      at += d.delay;
+      d = freloadStripDecision(href, at);
+    }
+    maxDelay = Math.max(maxDelay, d.delay);
+    // Every reload decision from the moment of stripping on: the stripped
+    // URL is never allowed where the stamped one is refused, and never
+    // carries a lower count.
+    for (const later of [0, 1, 1_000, 30_000, 59_999, 60_000, 120_000]) {
+      const t = at + d.delay + later;
+      const a = reloadUrlCapDecision(href, t);
+      const b = reloadUrlCapDecision(d.url, t);
+      swept++;
+      if (b.allow && !a.allow) {
+        violations++;
+        firstViolation ??= `${label}, stripped after ${at - T + d.delay} ms, reload at +${later} ms`;
+      }
+      const ca = /_freload=\d+-(\d+)/.test(a.url) ? countOf(a.url) : 0;
+      const cb = /_freload=\d+-(\d+)/.test(b.url) ? countOf(b.url) : 0;
+      if (a.allow && b.allow && cb < ca) violations++;
+    }
+  };
   for (const age of [
     0, 1, 5_000, 59_999, 60_000, 60_001, 3_600_000, -5_000, -120_000,
+    // Far future (review of #5750): a hand-made link or a stamp written before
+    // a large backwards clock correction — years ahead.
+    -3 * 365 * 86_400_000,
   ]) {
-    for (const count of [0, 1, 2, 3, 4]) {
-      const href = `${base}?view=chat&_freload=${T - age}-${count}#m`;
-      const d = freloadStripDecision(href, T);
-      if (!d) {
-        violations++;
-        continue;
-      }
-      if (d.url !== `${base}?view=chat#m`) violations++;
-      if (d.delay > 0) deferred++;
-      // Every reload decision from the moment of stripping on: the stripped
-      // URL is never allowed where the stamped one is refused, and never
-      // carries a lower count.
-      for (const later of [0, 1, 1_000, 30_000, 59_999, 60_000, 120_000]) {
-        const t = T + d.delay + later;
-        const a = reloadUrlCapDecision(href, t);
-        const b = reloadUrlCapDecision(d.url, t);
-        swept++;
-        if (b.allow && !a.allow) {
-          violations++;
-          firstViolation ??= `stamp age ${age} count ${count}, stripped after ${d.delay} ms, reload at +${later} ms`;
-        }
-        if (a.allow && b.allow && countOf(b.url) < countOf(a.url)) violations++;
-      }
-    }
+    for (const count of [0, 1, 2, 3, 4]) sweep(`${T - age}-${count}`, `stamp age ${age} count ${count}`);
   }
+  // Malformed stamps (review of #5750): each the cap already reads as fresh.
+  for (const raw of ['abc', '5-abc', '', '-', `${T}-NaN`, `${T - 5_000}-`, 'NaN-2']) sweep(raw, `malformed ${JSON.stringify(raw)}`);
   check(
     `stripping never loosens the reload cap (${swept} cases${firstViolation ? `; first: ${firstViolation}` : ''})`,
     violations === 0 && swept > 200,
@@ -219,6 +239,29 @@ const freloadStripDecision = new Function(
     `a live window (count >= 1) is kept until it expires (${deferred} deferred)`,
     deferred > 0,
   );
+  check(
+    `no strip timer is longer than the window (longest ${maxDelay} ms)`,
+    maxDelay <= 60_000,
+  );
+  check(
+    'a stamp years in the future re-decides every window, never a delay past it',
+    freloadStripDecision(`${base}?_freload=99999999999999-1`, T).delay === 60_000,
+  );
+  // The two windows are one value: the strip is cap-safe only because it
+  // expires a stamp exactly when the cap stops honouring it.
+  {
+    const windowOf = (fn) => {
+      const at = src.indexOf(`function ${fn}(`);
+      const m = /var WINDOW_MS = (\d+);/.exec(src.slice(at));
+      return m && Number(m[1]);
+    };
+    const cap = windowOf('reloadUrlCapDecision');
+    const strip = windowOf('freloadStripDecision');
+    check(
+      `freloadStripDecision's WINDOW_MS equals reloadUrlCapDecision's (${strip} vs ${cap})`,
+      cap !== null && cap === strip,
+    );
+  }
   check(
     "the connecting page's own stamp (count 0) is dropped at once",
     freloadStripDecision(`${base}?_freload=${T - 5_000}-0`, T).delay === 0,
