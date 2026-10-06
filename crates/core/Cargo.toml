@@ -107,11 +107,11 @@ xz2 = { workspace = true }
 # opentelemetry-http) because tracing::otel constructs reqwest::blocking::Client.
 reqwest = { workspace = true, features = ["blocking"] }
 # util::os_trust: opt-in OS trust store for `freenet service report` only (see
-# that module for why it is not the workspace-wide default). rustls is already
-# in the graph via reqwest; here only RootCertStore is used, so no provider.
+# that module for why it is not the workspace-wide default).
+rustls-native-certs = "0.8.4"
+# Already in the graph via reqwest; only RootCertStore is used, so no provider.
 # Keep it semver-compatible with reqwest's rustls: os_trust probes certificates
 # with it on the assumption that reqwest validates them identically.
-rustls-native-certs = "0.8.4"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).

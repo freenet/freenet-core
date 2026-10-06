@@ -9,7 +9,7 @@
 # three files together after regenerating.
 set -euo pipefail
 
-out="$(cd "$(dirname "$0")" && pwd)"
+out="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -r "$work"' EXIT
 cd "$work"

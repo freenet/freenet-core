@@ -109,7 +109,8 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///
 /// While this is false, update fetches must trust only the bundled webpki
 /// roots, so they fail behind TLS-intercepting proxies. Once it is true they
-/// can opt in to the OS trust store via `freenet::util::os_trust`.
+/// may be able to opt in to the OS trust store via `freenet::util::os_trust`
+/// (see #5815 for what else that decision depends on).
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
 
 // Tripwire for the two-release rollout, checked at compile time so flipping

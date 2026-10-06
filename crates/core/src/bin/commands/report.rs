@@ -46,6 +46,11 @@ const WS_RETRY_ATTEMPTS: u32 = 1;
 /// `ws-api-address = "::"` combined with `IPV6_V6ONLY=1` (or a v4-only
 /// bind) doesn't silently drop the diagnostics.
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "[::1]"];
+/// Appended to upload failures. Private, not the public Matrix room: the saved
+/// report holds the node's config and recent logs (peer addresses included).
+const SEND_LOCALLY_HINT: &str = "To send it another way, re-run with `--local <PATH>` \
+     to save it to a file and send that file privately to a Freenet developer \
+     (it contains your config and recent logs)";
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -410,30 +415,25 @@ impl ReportCommand {
             .send()
             .await
             .with_context(|| {
-                format!(
-                    "Failed to upload report ({os_trust}). To send it another way, \
-                     re-run with `--local <PATH>` to save it to a file and share \
-                     that file with the Freenet team on Matrix"
-                )
+                format!("Failed to upload report ({os_trust}). {SEND_LOCALLY_HINT}")
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            // A proxy block page can be a whole HTML document; keep the hint visible.
-            let body: String = response
+            // A proxy block page can be a whole HTML document: keep the hint
+            // visible, and keep server-sent control characters off the terminal.
+            let body: Vec<char> = response
                 .text()
                 .await
                 .unwrap_or_default()
                 .chars()
-                .take(500)
+                .filter(|c| !c.is_control() || *c == '\n')
                 .collect();
-            anyhow::bail!(
-                "Upload failed: {} - {}. To send it another way, re-run with \
-                 `--local <PATH>` to save it to a file and share that file with \
-                 the Freenet team on Matrix",
-                status,
-                body
-            );
+            let mut shown: String = body.iter().take(500).collect();
+            if body.len() > 500 {
+                shown.push('…');
+            }
+            anyhow::bail!("Upload failed: {status} - {shown}. {SEND_LOCALLY_HINT}");
         }
 
         let upload_response: UploadResponse = response
@@ -843,15 +843,26 @@ mod tests {
         let len = src[start..]
             .find("\n    }\n")
             .expect("end of upload_report");
+        // Code only (comment lines dropped), whitespace removed so a rustfmt
+        // reflow cannot break or satisfy the pin.
+        let code: String = src[start..start + len]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
         // Built with concat! so this file's own text never contains the needle.
-        let needle = concat!("let (builder, os_trust) = add_os_root", "_certificates(");
+        let helper_call = concat!("let(builder,os_trust)=add_os_root", "_certificates(");
         assert!(
-            src[start..start + len]
-                .lines()
-                .any(|line| line.trim_start().starts_with(needle)),
-            "upload_report must build its client with add_os_root_certificates \
-             (a statement, not a comment)"
+            code.contains(helper_call),
+            "upload_report must build its client with add_os_root_certificates"
         );
+        // ...and that builder must be the one that POSTs: one client, built
+        // from it, with no second client to shadow it or post instead.
+        assert!(code.contains("letclient=builder.build()?;"));
+        assert_eq!(code.matches("letclient").count(), 1, "a second client");
+        assert_eq!(code.matches("Client::").count(), 1, "a second client");
+        assert!(code.contains("client.post("));
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub struct OsTrustSummary {
     pub first_error: Option<String>,
     /// The platform loader panicked, so only the bundled roots are in use.
     pub panicked: bool,
+    /// `SSL_CERT_FILE` / `SSL_CERT_DIR` settings that replaced the platform
+    /// store. A file that exists but lacks the proxy's CA loads cleanly, so
+    /// this is the clue in that case.
+    pub env_override: Option<String>,
 }
 
 impl std::fmt::Display for OsTrustSummary {
@@ -35,11 +39,18 @@ impl std::fmt::Display for OsTrustSummary {
         if self.panicked {
             return f.write_str("loading the OS trust store panicked; used bundled roots only");
         }
-        write!(
-            f,
-            "{} of {} OS trust store certificates added",
-            self.added, self.found
-        )?;
+        match &self.env_override {
+            Some(source) => write!(
+                f,
+                "{} of {} certificates from {source} added, in place of the OS trust store",
+                self.added, self.found
+            )?,
+            None => write!(
+                f,
+                "{} of {} OS trust store certificates added",
+                self.added, self.found
+            )?,
+        }
         if let Some(error) = &self.first_error {
             write!(f, "; error reading the store: {error}")?;
         }
@@ -56,7 +67,20 @@ impl std::fmt::Display for OsTrustSummary {
 pub fn add_os_root_certificates(
     builder: reqwest::ClientBuilder,
 ) -> (reqwest::ClientBuilder, OsTrustSummary) {
-    add_root_certificates_from(builder, rustls_native_certs::load_native_certs)
+    let (builder, mut summary) =
+        add_root_certificates_from(builder, rustls_native_certs::load_native_certs);
+    // Mirrors rustls-native-certs: either variable, when set, replaces the
+    // platform store.
+    let overrides: Vec<String> = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var_os(name).map(|value| format!("{name}={}", value.to_string_lossy()))
+        })
+        .collect();
+    if !overrides.is_empty() {
+        summary.env_override = Some(overrides.join(", "));
+    }
+    (builder, summary)
 }
 
 fn add_root_certificates_from(
@@ -120,6 +144,7 @@ mod tests {
                 added: 1,
                 first_error: None,
                 panicked: false,
+                env_override: None,
             },
             "the usable certificate must still be added"
         );

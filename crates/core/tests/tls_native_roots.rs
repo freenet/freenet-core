@@ -74,7 +74,12 @@ async fn spawn_https_server() -> u16 {
 fn only_opted_in_clients_trust_ca_installed_in_os_trust_store() {
     // SAFETY: set before the runtime exists, so no other thread can be reading
     // the environment. This is the only test in this binary.
-    unsafe { std::env::set_var("SSL_CERT_FILE", CA_PEM_PATH) };
+    unsafe {
+        std::env::set_var("SSL_CERT_FILE", CA_PEM_PATH);
+        // cargo exports SSL_CERT_DIR (the system CA directory) to the tests it
+        // runs; left set, rustls-native-certs loads it alongside the file.
+        std::env::remove_var("SSL_CERT_DIR");
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
