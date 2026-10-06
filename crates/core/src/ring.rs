@@ -9146,9 +9146,9 @@ pub(crate) mod lattice_probe_timing {
     /// exclusion (`FAILED_ADDR_BASE_TTL`, 5 min).
     pub(crate) const RETRY_MIN: Duration = Duration::from_secs(600);
     /// Retries for such a peer (10, 20, 40, 80 min), not reset by lattice
-    /// changes, only by a sleep that runs its course without one: a closer
-    /// peer that is never reachable costs at most this many retries, then the
-    /// re-check ladder takes over.
+    /// changes, only by a sleep that runs its course without a failed hit: a
+    /// closer peer that is never reachable costs at most this many retries
+    /// between such clean sleeps, then the re-check ladder takes over.
     pub(crate) const RETRIES: u32 = 4;
     /// Bounds of the jitter multiplier on every interval, against synchronized
     /// bursts across peers that bootstrapped together.
@@ -9925,10 +9925,9 @@ mod lattice_probe_state_machine_tests {
             }
         }
         assert!(
-            fired.len() <= 4 + 3,
-            "at most the retries and then the re-checks: {fired:?}"
+            fired.len() == 4 + 3,
+            "the retries and then the re-checks, nothing more: {fired:?}"
         );
-        assert!(fired.len() >= 4, "{fired:?}");
     }
 
     /// Once retries are used up, a failed hit falls back to the re-check
@@ -9987,38 +9986,64 @@ mod lattice_probe_state_machine_tests {
         assert!(tick.fired.is_some());
     }
 
-    /// The jitter scales every sleep, and a late failed hit is considered only
-    /// once per sleep even when later draws would make the retry sooner.
+    /// The jitter scales the awake backoff and the re-check sleeps.
     #[test]
-    fn jitter_scales_sleeps_and_late_hits_are_considered_once() {
+    fn jitter_scales_awake_probes_and_rechecks() {
         let start = tokio::time::Instant::now();
         let mut s = scheduler(start);
         let mut fired = Vec::new();
-        let mut draws = [1.2f64, 0.8].into_iter().cycle();
         for t in 1..=3 * HOUR {
             let g = s.generation();
-            // Clean misses until 2000 s, then a late failed hit.
-            let m = if t < 2000 { misses(g, g) } else { failed(g) };
-            let m = if t < 60 { misses(0, 0) } else { m };
-            if s.tick(start + Duration::from_secs(t), BOTH, m, || {
-                draws.next().unwrap()
-            })
-            .fired
-            .is_some()
+            let m = if t < 100 { misses(0, 0) } else { misses(g, g) };
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || 1.2)
+                .fired
+                .is_some()
             {
                 fired.push(t);
             }
         }
-        // The 1h clean sleep from 60 is jittered (0.8 or 1.2); the late
-        // failed hit at 2000 is considered once: a 600 s retry with that one
-        // draw if it is sooner, never re-drawn on later ticks.
-        let wake = fired.iter().copied().find(|t| *t > 60).unwrap();
-        assert!(
-            [2000 + 480, 2000 + 720, 60 + 2880, 60 + 4320]
-                .iter()
-                .any(|at| within(wake, *at)),
-            "{fired:?}"
-        );
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(&gaps[..3], &[6, 12, 24], "{fired:?}");
+        // Asleep from 100 on the 1h rung, scaled by 1.2.
+        let wake = fired.iter().copied().find(|t| *t > 100).unwrap();
+        assert!(within(wake, 100 + 4320), "{fired:?}");
+    }
+
+    /// A late failed hit is considered once per sleep: if the retry rung it
+    /// draws would end after the clean sleep, a later, luckier draw does not
+    /// get to shorten the sleep after all.
+    #[test]
+    fn late_failed_hit_is_considered_once() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let draw = std::cell::Cell::new(1.0);
+        let mut fired = Vec::new();
+        for t in 1..=2 * HOUR {
+            let g = s.generation();
+            // Clean sleep from 61 (due 3661); the failed hit appears at 3000,
+            // first with a draw of 1.2 (3720, not sooner), then 0.8 (it would
+            // be 3481 if it were considered again).
+            let m = if t <= 60 {
+                misses(0, 0)
+            } else if t < 3000 {
+                misses(g, g)
+            } else {
+                failed(g)
+            };
+            draw.set(match t {
+                3000 => 1.2,
+                3001.. => 0.8,
+                _ => 1.0,
+            });
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || draw.get())
+                .fired
+                .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        let wake = fired.iter().copied().find(|t| *t > 61).unwrap();
+        assert!(within(wake, 3661), "{fired:?}");
     }
 
     /// A scheduler created on a peer with earlier evidence starts above it, so
@@ -10104,7 +10129,7 @@ mod lattice_probe_state_machine_tests {
         assert_eq!(p.retry.delay(0), t::RETRY_MIN);
         assert_eq!(p.retry.delay(t::RETRIES - 1), t::RETRY_MIN * 8);
         assert_eq!((p.rechecks, p.retries), (t::RECHECKS, t::RETRIES));
-        const { assert!(t::JITTER_LOW > 0.0 && t::JITTER_LOW < 1.0 && t::JITTER_HIGH > 1.0) };
+        assert_eq!((t::JITTER_LOW, t::JITTER_HIGH), (0.8, 1.2));
     }
 }
 

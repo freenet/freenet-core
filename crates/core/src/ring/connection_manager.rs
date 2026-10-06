@@ -1225,7 +1225,7 @@ impl ConnectionManager {
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
     /// lattice edge that could not be connected, for any reason (a failed hole
     /// punch, or our own refusal at the cap, whose outbound pre-flight check
-    /// does not exempt lattice edges), is recorded as a failed hit, and the
+    /// does not exempt lattice edges, #5827), is recorded as a failed hit, and the
     /// scheduler re-checks on its retry ladder. Returns whether a miss was
     /// recorded.
     pub(crate) fn record_lattice_probe_result(
@@ -4696,18 +4696,9 @@ mod tests {
             .matches("admits_lattice_edge_over_cap(loc)")
             .count();
         assert!(
-            hits >= 3,
-            "the outbound pre-flight cap check and both lifecycle promotion \
-             cap-gates must apply admits_lattice_edge_over_cap(loc); found {hits} \
-             call site(s)"
-        );
-        let preflight = LIFECYCLE_SRC
-            .find("Pre-flight max_connections check")
-            .expect("outbound pre-flight cap check not found");
-        let window = &LIFECYCLE_SRC[preflight..preflight + 1500];
-        assert!(
-            window.contains("!connection_manager.admits_lattice_edge_over_cap(loc)"),
-            "the outbound pre-flight cap check must exempt lattice edges (#5827)"
+            hits >= 2,
+            "both lifecycle promotion cap-gates must apply \
+             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
         );
     }
 

@@ -509,14 +509,7 @@ impl P2pConnManager {
         if !transient && !peer_addr.ip().is_unspecified() {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let current = connection_manager.connection_count();
-            // Except a strictly-closer per-side nearest-neighbor lattice edge
-            // within the over-max ceiling, as at the promotion gates below:
-            // without this, a peer at max could never tighten its lattice from
-            // its own route-to-self probe (#5827).
-            let loc = Location::from_address(&peer_addr);
-            if current >= connection_manager.max_connections
-                && !connection_manager.admits_lattice_edge_over_cap(loc)
-            {
+            if current >= connection_manager.max_connections {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
