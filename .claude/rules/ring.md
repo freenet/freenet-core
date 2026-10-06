@@ -97,12 +97,15 @@ WHEN accepting a new connection (should_accept):
      sleep until a per-side nearest distance changes (fill, tighten, loss, or
      widening) or a re-check starts a new generation: 2h doubling to 16h, or
      10 min doubling to 2h if a closer peer was found but could not be
-     connected (a failed hit). A miss is EVIDENCE, not proof: a failed hole
-     punch, a near-terminus relay, or a recently-failed or rejected nearest
-     peer can make a loose side look tight, which is why sleep is bounded and
-     failed acceptors are not misses. Every probe acceptor is KEPT (never dropped:
+     connected (a failed hit; separate attempt counter, and a late failed hit
+     shortens a sleep already begun). A miss is EVIDENCE, not proof: a failed
+     hole punch, a near-terminus relay, or a recently-failed nearest peer, or
+     one that rejected the request, can make a loose side look tight, which is
+     why sleep is bounded and acceptors that failed to connect are not misses
+     (except at this peer's own max_connections, where our cap refuses every
+     non-lattice acceptor). Probe acceptors are never DROPPED by the driver:
      the transport has no close message, so a dropped link stays dead on the
-     far end until its idle timeout). Probing forever and keeping every result
+     far end until its idle timeout. Probing forever and keeping every result
      added a non-lattice link per probe (nothing prunes below max at low
      bandwidth), so degree crept with uptime (#5814). See
      connection_manager.rs and ring.rs.

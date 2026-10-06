@@ -6062,36 +6062,24 @@ impl Ring {
         // Results are never dropped after connecting: the transport has no close
         // message, so a dropped link would sit dead on the far end until its
         // idle timeout. See `LatticeProbeScheduler`.
+        // Lattice probe intervals: production values in `lattice_probe_timing`
+        // (shared with the topology model test); shorter ones under test.
         #[cfg(not(test))]
-        const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
+        use lattice_probe_timing::{
+            RECHECK_MAX as LATTICE_PROBE_RECHECK_MAX, RECHECK_MIN as LATTICE_PROBE_RECHECK_MIN,
+            RETRY_MAX as LATTICE_PROBE_RETRY_MAX, RETRY_MIN as LATTICE_PROBE_RETRY_MIN,
+            TAU_MAX as LATTICE_PROBE_TAU_MAX, TAU0 as LATTICE_PROBE_TAU0,
+        };
         #[cfg(test)]
         const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(1);
-        #[cfg(not(test))]
-        const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(300);
         #[cfg(test)]
         const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(8);
-        // Sleep (re-check) interval once both sides are tight. The minimum
-        // outlasts the recently-failed-address exclusion (FAILED_ADDR_MAX_TTL,
-        // 1h), so a re-check can reach a nearest peer whose hole punch failed.
-        // Each re-check of a tight lattice keeps a non-lattice link or two, so
-        // it is kept rare; a lattice change wakes discovery at once anyway.
-        #[cfg(not(test))]
-        const LATTICE_PROBE_RECHECK_MIN: Duration = Duration::from_secs(2 * 3600);
         #[cfg(test)]
         const LATTICE_PROBE_RECHECK_MIN: Duration = Duration::from_secs(60);
-        #[cfg(not(test))]
-        const LATTICE_PROBE_RECHECK_MAX: Duration = Duration::from_secs(16 * 3600);
         #[cfg(test)]
         const LATTICE_PROBE_RECHECK_MAX: Duration = Duration::from_secs(600);
-        // Re-check ladder after a generation in which a closer peer was found
-        // but could not be connected. The minimum outlasts the first
-        // recently-failed-address exclusion (FAILED_ADDR_BASE_TTL, 5 min).
-        #[cfg(not(test))]
-        const LATTICE_PROBE_RETRY_MIN: Duration = Duration::from_secs(600);
         #[cfg(test)]
         const LATTICE_PROBE_RETRY_MIN: Duration = Duration::from_secs(20);
-        #[cfg(not(test))]
-        const LATTICE_PROBE_RETRY_MAX: Duration = Duration::from_secs(2 * 3600);
         #[cfg(test)]
         const LATTICE_PROBE_RETRY_MAX: Duration = Duration::from_secs(120);
 
@@ -6572,7 +6560,8 @@ impl Ring {
             // `LatticeProbeScheduler`, to fill or tighten each peer's
             // successor/predecessor lattice slots. Queued into pending_conn_adds
             // just before it is drained below, so the probe launches this tick
-            // and its results are in by the next tick's scheduler decision. No
+            // and its results are usually in by the next tick's scheduler
+            // decision (late ones are fenced by the generation tag). No
             // wire change: the probe is a plain CONNECT toward own_location whose
             // bloom already excludes held peers, so it aims at the nearest
             // UNCONNECTED peer, and the terminus installs the edge via the
@@ -9167,6 +9156,31 @@ mod deferred_swap_drop_tests {
 ///
 /// If you add a new production time read, route it through
 /// `self.time_source.now()` rather than bumping this count.
+/// Production intervals of the route-to-self lattice probe (#4760, #5814),
+/// see [`LatticeProbeScheduler`]. Also used by the topology model test, so it
+/// exercises the real values.
+pub(crate) mod lattice_probe_timing {
+    use std::time::Duration;
+
+    /// Awake probe backoff: first interval.
+    pub(crate) const TAU0: Duration = Duration::from_secs(5);
+    /// Awake probe backoff: cap.
+    pub(crate) const TAU_MAX: Duration = Duration::from_secs(300);
+    /// Re-check after sleeping on a tight lattice: first interval. It outlasts
+    /// the recently-failed-address exclusion (`FAILED_ADDR_MAX_TTL`, 1h), and
+    /// each re-check of a tight lattice keeps a non-lattice link or two, so it
+    /// is kept rare; a lattice change wakes discovery at once anyway.
+    pub(crate) const RECHECK_MIN: Duration = Duration::from_secs(2 * 3600);
+    /// Re-check ladder cap.
+    pub(crate) const RECHECK_MAX: Duration = Duration::from_secs(16 * 3600);
+    /// Re-check after a generation in which a closer peer was found but could
+    /// not be connected: first interval. It outlasts the first
+    /// recently-failed-address exclusion (`FAILED_ADDR_BASE_TTL`, 5 min).
+    pub(crate) const RETRY_MIN: Duration = Duration::from_secs(600);
+    /// Retry ladder cap.
+    pub(crate) const RETRY_MAX: Duration = Duration::from_secs(2 * 3600);
+}
+
 /// Per-side nearest-neighbor lattice distances observed at a maintenance tick:
 /// the unsigned ring distance to the nearest connected successor / predecessor,
 /// or `None` when that side has no connected neighbor. Used by
@@ -9244,26 +9258,27 @@ pub(crate) fn lattice_probe_progress(
 /// `ConnectionManager::record_lattice_probe_result` with the generation current
 /// when the probe was launched) is evidence that side is tight: the probe aims
 /// at the nearest unconnected peer, and it found nothing closer than the held
-/// nearest. A miss farther out than the other side's held nearest is evidence
-/// for that side too. One side's miss says nothing about the other
-/// side (the nearest unconnected peer may simply be on the tight side), so
-/// discovery keeps probing, outward past each kept miss, until BOTH sides have
-/// missed in the current generation. Misses from earlier generations (probes
-/// in flight across a change) do not count.
+/// nearest. A miss is evidence for the other side only if it lies farther out
+/// than that side's held nearest; otherwise the nearest unconnected peer may
+/// simply be on the tight side, so discovery keeps probing, outward past each
+/// kept miss, until BOTH sides have missed in the current generation. Misses
+/// from earlier generations (probes in flight across a change) do not count.
 ///
-/// It then SLEEPS until the next re-check (in production 2h, doubling to 16h,
-/// each +/-20% jitter, while nothing changes; a change resets it). If a closer
-/// peer WAS found in the generation but could not be connected (a failed hole
-/// punch: `failed_hit`), the misses that followed may just be the walk going
-/// past it, so the re-check uses the shorter retry ladder (in production 10
-/// minutes, past the failed-address exclusion, doubling to 2h). A re-check starts a new generation, so fresh
-/// misses on both sides are needed to sleep again. The re-check is there
-/// because a miss is evidence, not proof: the walk can stop short of the true
-/// nearest (a failed hole punch, a near-terminus relay accepting first, a
-/// recently-failed or rejected peer), and without it such a side would stay
-/// loose until something else changed. Before #5814 there was no sleep: a
-/// converged peer probed every tau_max and kept every non-lattice result, so
-/// degree grew with uptime.
+/// It then SLEEPS until the next re-check (production values in
+/// [`lattice_probe_timing`]: 2h, doubling to 16h, each +/-20% jitter, while
+/// nothing changes; a change resets it). If a closer peer WAS found in the
+/// generation but could not be connected (a failed hole punch: `failed_hit`),
+/// the misses around it may just be the walk going past it, so the re-check
+/// uses the separate, shorter retry ladder (10 minutes, past the failed-address
+/// exclusion, doubling to 2h); a failed hit reported after the sleep began
+/// shortens it. A re-check starts a new generation, so fresh misses on both
+/// sides are needed to sleep again. The re-check is there because a miss is
+/// evidence, not proof: the walk can stop short of the true nearest (a failed
+/// hole punch, a near-terminus relay accepting first, a recently-failed peer,
+/// or a closer peer that rejected the request), and without it such a side
+/// would stay loose until something else changed. Before #5814 there was no
+/// sleep: a converged peer probed every tau_max and kept every non-lattice
+/// result, so degree grew with uptime.
 pub(crate) struct LatticeProbeScheduler {
     probe_backoff: crate::util::backoff::ExponentialBackoff,
     recheck_backoff: crate::util::backoff::ExponentialBackoff,
@@ -9272,9 +9287,10 @@ pub(crate) struct LatticeProbeScheduler {
     backoff_attempt: u32,
     last_sides: Option<LatticeSides>,
     generation: u64,
-    /// When asleep: when to re-check.
-    recheck_at: Option<Instant>,
+    /// When asleep: when to re-check, and whether that is on the retry ladder.
+    recheck_at: Option<(Instant, bool)>,
     recheck_attempt: u32,
+    retry_attempt: u32,
 }
 
 /// What one [`LatticeProbeScheduler::tick`] decided.
@@ -9307,6 +9323,7 @@ impl LatticeProbeScheduler {
             generation: misses.succ.max(misses.pred).max(misses.failed_hit) + 1,
             recheck_at: None,
             recheck_attempt: 0,
+            retry_attempt: 0,
         }
     }
 
@@ -9339,9 +9356,9 @@ impl LatticeProbeScheduler {
     }
 
     /// One maintenance tick. `sides` is this tick's per-side nearest distances,
-    /// `misses` the latest generation with a probe miss on each side, `jitter`
-    /// draws the multiplier applied to a newly scheduled interval (e.g.
-    /// 0.8..=1.2); it is only called when an interval is scheduled.
+    /// `misses` the latest generations with probe evidence, `jitter` draws the
+    /// multiplier applied to a newly scheduled interval (e.g. 0.8..=1.2); it is
+    /// only called when an interval is scheduled.
     pub(crate) fn tick(
         &mut self,
         now: Instant,
@@ -9355,26 +9372,33 @@ impl LatticeProbeScheduler {
             // The lattice changed: work on it promptly, there may be an even
             // closer neighbor to find (or a lost edge to replace).
             self.recheck_attempt = 0;
+            self.retry_attempt = 0;
             self.restart(now);
         }
         let tight = |g: u64| misses.succ >= g && misses.pred >= g;
         if tight(self.generation) {
+            // A closer peer was found this generation but could not be
+            // connected: the misses may be the walk going past it, so re-check
+            // on the retry ladder, including when the failed hit was reported
+            // after the sleep began.
+            let failed_hit = misses.failed_hit >= self.generation;
             match self.recheck_at {
-                None => {
-                    // A closer peer was found this generation but could not be
-                    // connected: the misses may be the walk going past it, so
-                    // re-check on the shorter retry ladder.
-                    let ladder = if misses.failed_hit >= self.generation {
-                        &self.retry_backoff
+                Some((at, _)) if now >= at => self.restart(now),
+                Some((_, true)) => {}
+                Some((_, false)) if !failed_hit => {}
+                _ => {
+                    let sleep = if failed_hit {
+                        self.retry_attempt = self.retry_attempt.saturating_add(1);
+                        self.retry_backoff.delay(self.retry_attempt - 1)
                     } else {
-                        &self.recheck_backoff
+                        self.recheck_attempt = self.recheck_attempt.saturating_add(1);
+                        self.recheck_backoff.delay(self.recheck_attempt - 1)
                     };
-                    let sleep = ladder.delay(self.recheck_attempt);
-                    self.recheck_at = Some(now + sleep.mul_f64(jitter()));
-                    self.recheck_attempt = self.recheck_attempt.saturating_add(1);
+                    let at = now + sleep.mul_f64(jitter());
+                    // A late failed hit only ever shortens the sleep.
+                    let at = self.recheck_at.map_or(at, |(prev, _)| prev.min(at));
+                    self.recheck_at = Some((at, failed_hit));
                 }
-                Some(at) if now >= at => self.restart(now),
-                Some(_) => {}
             }
         }
         let asleep = tight(self.generation);
@@ -9664,6 +9688,63 @@ mod lattice_probe_state_machine_tests {
         );
     }
 
+    /// The two re-check ladders keep separate attempt counters: clean sleeps
+    /// do not push a later failed hit's retry off 10 min, and retries do not
+    /// push a later clean sleep off its own ladder.
+    #[test]
+    fn recheck_and_retry_ladders_are_independent() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Two clean sleeps: re-checks at +1h, then 2h after that; the third
+        // sleep (4h) starts right after.
+        let end = 60 + 3 * HOUR + 10;
+        let fired = run(&mut s, start, 60, end - 60, BOTH, |g| misses(g, g));
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        // A failed hit in the sleeping generation: the first rung of the retry
+        // ladder (10 min), not the third; after that generation, clean misses.
+        let sleeping = s.generation();
+        let fired = run(&mut s, start, end, 10 * HOUR, BOTH, move |g| {
+            LatticeProbeMisses {
+                succ: g,
+                pred: g,
+                failed_hit: if g == sleeping { g } else { 0 },
+            }
+        });
+        assert!(
+            (end + 601..end + 606).contains(&fired[0]),
+            "retry 10 min after the failed hit: {fired:?} from {end}"
+        );
+        // The re-check ladder resumes at its own fourth rung (8h), unaffected
+        // by the retry.
+        let t = fired[0] + 1;
+        assert!(
+            (t + 8 * HOUR..t + 8 * HOUR + 5).contains(&fired[1]),
+            "next clean re-check 8h later: {fired:?}"
+        );
+    }
+
+    /// A failed hit reported after the sleep began shortens it to the retry
+    /// ladder.
+    #[test]
+    fn late_failed_hit_shortens_sleep() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Asleep on the 1h re-check...
+        assert!(run(&mut s, start, 60, 300, BOTH, |g| misses(g, g)).is_empty());
+        // ...then the failed hit from an in-flight probe of this generation.
+        let fired = run(&mut s, start, 360, HOUR, BOTH, |g| LatticeProbeMisses {
+            succ: g,
+            pred: g,
+            failed_hit: g,
+        });
+        assert!(
+            (961..966).contains(&fired[0]),
+            "re-check 10 min after the late failed hit: {fired:?}"
+        );
+    }
+
     /// A scheduler created on a peer with earlier misses starts above them, so
     /// those misses cannot put it to sleep.
     #[test]
@@ -9671,12 +9752,16 @@ mod lattice_probe_state_machine_tests {
         let start = tokio::time::Instant::now();
         let mut s = LatticeProbeScheduler::new(
             start,
-            misses(7, 9),
+            LatticeProbeMisses {
+                succ: 7,
+                pred: 9,
+                failed_hit: 11,
+            },
             ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300)),
             ExponentialBackoff::new(Duration::from_secs(HOUR), Duration::from_secs(16 * HOUR)),
             ExponentialBackoff::new(Duration::from_secs(600), Duration::from_secs(2 * HOUR)),
         );
-        assert!(s.generation() > 9);
+        assert!(s.generation() > 11);
         assert!(run(&mut s, start, 0, 600, BOTH, |_| misses(7, 9)).len() >= 4);
     }
 

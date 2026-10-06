@@ -1200,8 +1200,9 @@ impl ConnectionManager {
 
     /// Classify the acceptor `addr` at `loc` of a route-to-self lattice probe
     /// issued in scheduler `generation` (#5814). `connected` is whether the
-    /// connection was established, or refused only by this peer's own
-    /// `max_connections` cap (the probe still landed there).
+    /// connection was established; `at_cap` whether this peer was at its
+    /// `max_connections` when it was not, in which case our own cap may have
+    /// refused it (the CONNECT failure does not say why).
     ///
     /// A connected acceptor that is not a lattice edge
     /// ([`Self::is_per_side_nearest`]) is a probe MISS: evidence that its side
@@ -1211,17 +1212,20 @@ impl ConnectionManager {
     /// than that would have been nearer to the probe's target), so it is
     /// recorded there as well. Once both sides have missed in the current
     /// generation discovery sleeps (`ring::LatticeProbeScheduler`). An acceptor
-    /// whose hole punch failed is not counted as a miss: a failed walk gets
+    /// that could not be connected is not counted as a miss (a failed walk gets
     /// re-routed past the peer it failed on, so where it lands next is weak
-    /// evidence. A lattice edge that could not be connected is recorded as a
-    /// failed hit, so the scheduler re-checks soon. Returns whether a miss was
-    /// recorded.
+    /// evidence), except at the cap: there our own cap refuses every
+    /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
+    /// lattice edge that could not be connected is recorded as a failed hit
+    /// (the cap admits lattice edges, so that failure is genuine), and the
+    /// scheduler re-checks soon. Returns whether a miss was recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
         addr: SocketAddr,
         generation: u64,
         connected: bool,
+        at_cap: bool,
     ) -> bool {
         let Some(me) = self.get_stored_location() else {
             return false;
@@ -1237,7 +1241,7 @@ impl ConnectionManager {
             }
             return false;
         }
-        if !connected {
+        if !connected && !at_cap {
             return false;
         }
         let successor_side = sd > 0.0;
@@ -4235,6 +4239,16 @@ mod tests {
         assert!(cm.is_per_side_nearest(Location::new(0.40), make_addr(9999)));
         assert!(cm.is_per_side_nearest(Location::new(0.20), make_addr(8404)));
 
+        // Two peers at one (masked) location: only the asking peer's own
+        // connection is ignored, so the other still counts and neither is
+        // closer than it.
+        add(0.47, 8406);
+        add(0.47, 8407);
+        assert!(!cm.is_per_side_nearest(Location::new(0.47), make_addr(8406)));
+        assert!(!cm.is_per_side_nearest(Location::new(0.47), make_addr(8407)));
+        cm.prune_alive_connection(make_addr(8406));
+        cm.prune_alive_connection(make_addr(8407));
+
         // Empty side: any peer on it is a fill.
         cm.prune_alive_connection(make_addr(8404));
         assert!(cm.is_per_side_nearest(Location::new(0.10), make_addr(9999)));
@@ -4270,34 +4284,76 @@ mod tests {
         // Nearest 0.55 (succ, 0.05) and 0.45 (pred, 0.05).
         let cm = cm_with(0.5, &[(0.55, 8501), (0.45, 8502)]);
         assert!(
-            !cm.record_lattice_probe_result(Location::new(0.52), make_addr(9001), 5, true),
+            !cm.record_lattice_probe_result(Location::new(0.52), make_addr(9001), 5, true, false),
             "a tighten is a hit"
         );
-        assert!(!cm.record_lattice_probe_result(Location::new(0.5), make_addr(9002), 5, true));
+        assert!(!cm.record_lattice_probe_result(
+            Location::new(0.5),
+            make_addr(9002),
+            5,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses(), misses(0, 0));
         // A predecessor at 0.10 is farther than both held nearest: both sides.
-        assert!(cm.record_lattice_probe_result(Location::new(0.40), make_addr(9003), 5, true));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.40),
+            make_addr(9003),
+            5,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses(), misses(5, 5));
         // Latest generation wins.
-        assert!(cm.record_lattice_probe_result(Location::new(0.40), make_addr(9003), 3, true));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.40),
+            make_addr(9003),
+            3,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses(), misses(5, 5));
         assert_eq!(cm.lattice_probe_miss_total(), 2);
         // Another peer at the nearest's own (masked) location is not closer, so
         // it is a miss, not an edge.
-        assert!(cm.record_lattice_probe_result(Location::new(0.55), make_addr(9004), 7, true));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.55),
+            make_addr(9004),
+            7,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses().succ, 7);
 
         // Successor nearest 0.01, predecessor nearest 0.2: a successor miss at
         // 0.1 says nothing about the predecessor side.
         let cm = cm_with(0.5, &[(0.51, 8511), (0.30, 8512)]);
-        assert!(cm.record_lattice_probe_result(Location::new(0.60), make_addr(9011), 4, true));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.60),
+            make_addr(9011),
+            4,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses(), misses(4, 0));
 
         // A failed acceptor is not a miss; a lattice edge that could not be
         // connected is a failed hit.
         let cm = cm_with(0.5, &[(0.55, 8531), (0.45, 8532)]);
-        assert!(!cm.record_lattice_probe_result(Location::new(0.40), make_addr(9031), 2, false));
-        assert!(!cm.record_lattice_probe_result(Location::new(0.52), make_addr(9032), 3, false));
+        assert!(!cm.record_lattice_probe_result(
+            Location::new(0.40),
+            make_addr(9031),
+            2,
+            false,
+            false
+        ));
+        assert!(!cm.record_lattice_probe_result(
+            Location::new(0.52),
+            make_addr(9032),
+            3,
+            false,
+            false
+        ));
         assert_eq!(
             cm.lattice_probe_misses(),
             LatticeProbeMisses {
@@ -4307,9 +4363,42 @@ mod tests {
             }
         );
 
+        // At the cap, an acceptor that could not be connected counts as landed
+        // (our own cap refuses non-lattice peers), but a lattice edge that
+        // failed is still a failed hit.
+        let cm = cm_with(0.5, &[(0.55, 8541), (0.45, 8542)]);
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.60),
+            make_addr(9041),
+            6,
+            false,
+            true
+        ));
+        assert!(!cm.record_lattice_probe_result(
+            Location::new(0.52),
+            make_addr(9042),
+            6,
+            false,
+            true
+        ));
+        assert_eq!(
+            cm.lattice_probe_misses(),
+            LatticeProbeMisses {
+                succ: 6,
+                pred: 6,
+                failed_hit: 6
+            }
+        );
+
         // Across the wrap: from 0.95, 0.05 is a successor.
         let cm = cm_with(0.95, &[(0.97, 8521)]);
-        assert!(cm.record_lattice_probe_result(Location::new(0.05), make_addr(9021), 1, true));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.05),
+            make_addr(9021),
+            1,
+            true,
+            false
+        ));
         assert_eq!(cm.lattice_probe_misses(), misses(1, 0));
     }
 

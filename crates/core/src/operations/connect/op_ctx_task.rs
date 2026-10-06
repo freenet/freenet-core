@@ -424,21 +424,21 @@ async fn drive_client_connect_inner(
                 // lattice changes or its re-check, instead of probing every
                 // tau_max and keeping a non-lattice link each time. Classified
                 // before the failure branch below can `continue`: at
-                // max_connections our own cap refuses a non-lattice acceptor and
-                // reports it as a failure, but the probe did land there, so it
-                // counts as connected (otherwise a peer at max would never sleep).
-                // A lattice edge whose hole punch failed is reported as a failed
-                // hit, so the scheduler re-checks soon. An established link
+                // max_connections our own cap can refuse a non-lattice acceptor,
+                // which arrives here as a failure, but the probe did land there
+                // (otherwise a peer at max would never sleep). A lattice edge
+                // whose hole punch failed is reported as a failed hit, so the
+                // scheduler re-checks soon. An established link
                 // is kept: dropping it would leave it dead on the far end until
                 // its idle timeout, since the transport has no close message.
                 if let ClientConnectKind::LatticeProbe { generation } = kind {
                     let cm = &op_manager.ring.connection_manager;
-                    let landed = hole_punch_ok || cm.connection_count() >= cm.max_connections;
                     if cm.record_lattice_probe_result(
                         Location::from_address(&acceptor_addr),
                         acceptor_addr,
                         generation,
-                        landed,
+                        hole_punch_ok,
+                        cm.connection_count() >= cm.max_connections,
                     ) {
                         tracing::debug!(
                             tx = %tx,
@@ -1758,6 +1758,16 @@ mod tests {
             ),
             "the probe-target comparison must select the LatticeProbe tag with the current generation"
         );
+        let tick = ring_sq
+            .find("lattice_probe.tick_for(&self.connection_manager,")
+            .unwrap();
+        let drain = ring_sq
+            .find("whileletSome(ideal_location)=pending_conn_adds.pop_first()")
+            .expect("acquisition drain loop not found");
+        assert!(
+            tick < drain,
+            "the probe must be scheduled before the drain, so it launches in the same tick"
+        );
         let acquire = item(&ring, "async fn acquire_new(", "\n    }\n");
         assert!(
             acquire.contains("kind:ClientConnectKind,")
@@ -1801,7 +1811,7 @@ mod tests {
         let gate_block = &body[gate..failed];
         assert!(
             gate_block.contains(
-                "letlanded=hole_punch_ok||cm.connection_count()>=cm.max_connections;ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,landed,)"
+                "ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,hole_punch_ok,cm.connection_count()>=cm.max_connections,)"
             ),
             "every probe acceptor must be classified, for the probe's generation"
         );

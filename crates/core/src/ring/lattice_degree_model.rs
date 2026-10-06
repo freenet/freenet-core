@@ -40,12 +40,12 @@ const MAX_HTL: u8 = 10;
 const CHECK_TICK: f64 = 60.0;
 const FAST_TICK: f64 = 5.0;
 const FAST_TICK_BACKOFF_THRESHOLD: u32 = 6;
-const LATTICE_TAU0: Duration = Duration::from_secs(5);
-const LATTICE_TAU_MAX: Duration = Duration::from_secs(300);
-const LATTICE_RECHECK_MIN: Duration = Duration::from_secs(2 * 3600);
-const LATTICE_RECHECK_MAX: Duration = Duration::from_secs(16 * 3600);
-const LATTICE_RETRY_MIN: Duration = Duration::from_secs(600);
-const LATTICE_RETRY_MAX: Duration = Duration::from_secs(2 * 3600);
+// The lattice probe intervals are the production ones.
+use super::super::lattice_probe_timing::{
+    RECHECK_MAX as LATTICE_RECHECK_MAX, RECHECK_MIN as LATTICE_RECHECK_MIN,
+    RETRY_MAX as LATTICE_RETRY_MAX, RETRY_MIN as LATTICE_RETRY_MIN, TAU_MAX as LATTICE_TAU_MAX,
+    TAU0 as LATTICE_TAU0,
+};
 /// Chance that an accepted connection fails to establish (hole punch).
 const CONNECT_FAILURE_RATE: f64 = 0.2;
 const DEFERRED_SWAP_DROP_TTL: f64 = 120.0;
@@ -295,6 +295,8 @@ impl Model {
                 self.nodes[r].addr,
                 generation,
                 connected,
+                // Model peers stay far below max_connections.
+                false,
             );
         }
     }
