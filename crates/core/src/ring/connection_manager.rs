@@ -593,13 +593,14 @@ pub(crate) struct ConnectionManager {
     /// surfaced via the dashboard ring-stats provider.
     lattice_probes_issued: Arc<AtomicU64>,
     lattice_probe_improvements: Arc<AtomicU64>,
-    /// Route-to-self probes whose acceptor was not a lattice edge (#5814), on
-    /// the successor ([0]) and predecessor ([1]) side.
+    /// Latest probe generation whose acceptor was not a lattice edge (#5814),
+    /// on the successor ([0]) and predecessor ([1]) side.
     lattice_probe_misses: Arc<[AtomicU64; 2]>,
+    lattice_probe_miss_total: Arc<AtomicU64>,
 }
 
-/// Per-side lattice probe miss counts, see
-/// [`ConnectionManager::record_lattice_probe_miss`].
+/// Latest lattice probe miss generation per side, see
+/// [`ConnectionManager::record_lattice_probe_result`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LatticeProbeMisses {
     pub succ: u64,
@@ -758,6 +759,7 @@ impl ConnectionManager {
             lattice_probes_issued: Arc::new(AtomicU64::new(0)),
             lattice_probe_improvements: Arc::new(AtomicU64::new(0)),
             lattice_probe_misses: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
+            lattice_probe_miss_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1131,9 +1133,21 @@ impl ConnectionManager {
         connections: &BTreeMap<Location, Vec<Connection>>,
         successor_side: bool,
     ) -> Option<f64> {
+        self.nearest_lattice_neighbor_dist_excluding(connections, successor_side, None)
+    }
+
+    /// [`Self::nearest_lattice_neighbor_dist_in`], ignoring any connection held
+    /// at `exclude`.
+    fn nearest_lattice_neighbor_dist_excluding(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        successor_side: bool,
+        exclude: Option<Location>,
+    ) -> Option<f64> {
         let me = self.get_stored_location()?;
         connections
             .keys()
+            .filter(|loc| Some(**loc) != exclude)
             .filter_map(|loc| {
                 let sd = me.signed_distance(*loc);
                 // A neighbor exactly at own location (sd == 0.0) belongs to
@@ -1164,44 +1178,61 @@ impl ConnectionManager {
         if sd == 0.0 {
             return false;
         }
-        let successor_side = sd > 0.0;
         let others_nearest = self
-            .connections_by_location
-            .read()
-            .keys()
-            .filter(|other| **other != loc)
-            .filter_map(|other| {
-                let osd = me.signed_distance(*other);
-                (osd != 0.0 && (osd > 0.0) == successor_side).then_some(osd.abs())
-            })
-            .fold(f64::INFINITY, f64::min);
+            .nearest_lattice_neighbor_dist_excluding(
+                &self.connections_by_location.read(),
+                sd > 0.0,
+                Some(loc),
+            )
+            .unwrap_or(f64::INFINITY);
         sd.abs() < others_nearest
     }
 
-    /// Record a lattice probe MISS: a route-to-self probe connected to a peer
-    /// at `loc` that is not a lattice edge. The probe lands on the nearest
-    /// unconnected peer, so a miss shows that `loc`'s side of the lattice is
-    /// tight; once both sides have missed, discovery can sleep
-    /// (`ring::LatticeProbeScheduler`, #5814). A peer at exactly own location
-    /// is on neither side and is not counted.
-    pub(crate) fn record_lattice_probe_miss(&self, loc: Location) {
+    /// Classify the peer at `loc` that a route-to-self lattice probe issued in
+    /// scheduler `generation` just connected to (#5814). If it is not a lattice
+    /// edge ([`Self::is_per_side_nearest`]) it is a probe MISS, recorded for its
+    /// side: evidence that side of the lattice is tight, and once both sides
+    /// have missed in the current generation discovery sleeps
+    /// (`ring::LatticeProbeScheduler`). Returns whether it was a miss.
+    pub(crate) fn record_lattice_probe_result(&self, loc: Location, generation: u64) -> bool {
+        let miss = !self.is_per_side_nearest(loc);
+        if miss {
+            self.record_lattice_probe_miss(loc, generation);
+        }
+        miss
+    }
+
+    /// Record a probe miss at `loc` for `generation` on `loc`'s side. A peer at
+    /// exactly own location is on neither side and is not recorded.
+    fn record_lattice_probe_miss(&self, loc: Location, generation: u64) {
         let Some(me) = self.get_stored_location() else {
             return;
         };
         let sd = me.signed_distance(loc);
-        if sd > 0.0 {
-            self.lattice_probe_misses[0].fetch_add(1, Ordering::Relaxed);
+        let side = if sd > 0.0 {
+            0
         } else if sd < 0.0 {
-            self.lattice_probe_misses[1].fetch_add(1, Ordering::Relaxed);
-        }
+            1
+        } else {
+            return;
+        };
+        self.lattice_probe_misses[side].fetch_max(generation, Ordering::Relaxed);
+        self.lattice_probe_miss_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Monotonic lattice probe miss counts since startup, per side.
+    /// The latest scheduler generation with a probe miss on each side (0 if
+    /// none).
     pub(crate) fn lattice_probe_misses(&self) -> LatticeProbeMisses {
         LatticeProbeMisses {
             succ: self.lattice_probe_misses[0].load(Ordering::Relaxed),
             pred: self.lattice_probe_misses[1].load(Ordering::Relaxed),
         }
+    }
+
+    /// Probe misses recorded since startup (telemetry).
+    pub(crate) fn lattice_probe_miss_total(&self) -> u64 {
+        self.lattice_probe_miss_total.load(Ordering::Relaxed)
     }
 
     /// Record that a route-to-self lattice discovery probe was ISSUED. Telemetry
@@ -4113,7 +4144,7 @@ mod tests {
     /// change once the peer itself is connected, because the CONNECT driver may
     /// ask either before or after ring promotion.
     #[test]
-    fn is_per_side_nearest_keeps_only_lattice_edges() {
+    fn is_per_side_nearest_identifies_lattice_edges() {
         let cm = make_connection_manager(None, 2, 200, false);
         cm.update_location(Some(Location::new(0.5)));
         let kp = TransportKeypair::new();
@@ -4132,11 +4163,11 @@ mod tests {
         add(0.45, 8402);
         add(0.20, 8404);
 
-        // Converged: anything farther than the per-side nearest is not kept.
+        // Converged: anything farther than the per-side nearest is not an edge.
         for far in [0.60, 0.40, 0.90, 0.10] {
             assert!(
                 !cm.is_per_side_nearest(Location::new(far)),
-                "{far} is farther than the nearest on its side and must be dropped"
+                "{far} is farther than the nearest on its side: a probe miss, not an edge"
             );
         }
         // Held long links are not lattice edges either.
@@ -4145,11 +4176,11 @@ mod tests {
         // Own location is on neither side.
         assert!(!cm.is_per_side_nearest(Location::new(0.5)));
 
-        // Tighten: strictly closer on its side is kept, on either side.
+        // Tighten: strictly closer on its side is an edge, on either side.
         assert!(cm.is_per_side_nearest(Location::new(0.52)));
         assert!(cm.is_per_side_nearest(Location::new(0.48)));
-        // Asked after it connected, the tighten is still kept (its own entry is
-        // ignored), and the former nearest it displaced is no longer an edge.
+        // Asked after it connected, the tighten is still an edge (its own entry
+        // is ignored), and the former nearest it displaced is no longer one.
         add(0.52, 8405);
         assert!(cm.is_per_side_nearest(Location::new(0.52)));
         assert!(!cm.is_per_side_nearest(Location::new(0.55)));
@@ -4157,7 +4188,7 @@ mod tests {
         assert!(cm.is_per_side_nearest(Location::new(0.45)));
 
         // Losing the predecessor lattice edge: the next one out on that side
-        // becomes the nearest again, so a peer between them is kept.
+        // becomes the nearest again, so a peer between them is an edge.
         cm.prune_alive_connection(make_addr(8402));
         assert!(cm.is_per_side_nearest(Location::new(0.40)));
         assert!(cm.is_per_side_nearest(Location::new(0.20)));
@@ -4166,6 +4197,64 @@ mod tests {
         cm.prune_alive_connection(make_addr(8404));
         assert!(cm.is_per_side_nearest(Location::new(0.10)));
         assert!(cm.is_per_side_nearest(Location::new(0.49)));
+    }
+
+    /// A probe miss is recorded on the acceptor's side, as the latest
+    /// generation seen there; a peer at own location is on neither side.
+    #[test]
+    fn record_lattice_probe_miss_tracks_latest_generation_per_side() {
+        let cm = make_connection_manager(None, 2, 200, false);
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.lattice_probe_misses(), LatticeProbeMisses::default());
+        cm.record_lattice_probe_miss(Location::new(0.6), 3);
+        cm.record_lattice_probe_miss(Location::new(0.9), 2);
+        assert_eq!(
+            cm.lattice_probe_misses(),
+            LatticeProbeMisses { succ: 3, pred: 0 }
+        );
+        // From 0.5, 0.05 is a predecessor (signed distance -0.45).
+        cm.record_lattice_probe_miss(Location::new(0.05), 4);
+        cm.record_lattice_probe_miss(Location::new(0.5), 9);
+        assert_eq!(
+            cm.lattice_probe_misses(),
+            LatticeProbeMisses { succ: 3, pred: 4 }
+        );
+        assert_eq!(cm.lattice_probe_miss_total(), 3);
+        // Across the wrap: from 0.95, 0.05 is a successor.
+        let wrap = make_connection_manager(None, 2, 200, false);
+        wrap.update_location(Some(Location::new(0.95)));
+        wrap.record_lattice_probe_miss(Location::new(0.05), 1);
+        assert_eq!(
+            wrap.lattice_probe_misses(),
+            LatticeProbeMisses { succ: 1, pred: 0 }
+        );
+    }
+
+    /// `record_lattice_probe_result` records a miss exactly when the acceptor
+    /// is not a lattice edge.
+    #[test]
+    fn record_lattice_probe_result_records_only_misses() {
+        let cm = make_connection_manager(None, 2, 200, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        for (l, port) in [(0.55, 8501), (0.45, 8502)] {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(port),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert!(
+            !cm.record_lattice_probe_result(Location::new(0.52), 5),
+            "a tighten is a hit"
+        );
+        assert_eq!(cm.lattice_probe_misses(), LatticeProbeMisses::default());
+        assert!(cm.record_lattice_probe_result(Location::new(0.40), 5));
+        assert_eq!(
+            cm.lattice_probe_misses(),
+            LatticeProbeMisses { succ: 0, pred: 5 }
+        );
     }
 
     /// Regression for the speculative-state over-cap ceiling: non-stale pending

@@ -86,13 +86,17 @@ WHEN accepting a new connection (should_accept):
      is strictly decreasing (a short records chain) and the absolute ceiling
      hard-bounds the ESTABLISHED set. The route-to-self discovery probe does
      not stop when both sides are filled (decaying toward tau_max), so a
-     filled-but-loose edge keeps tightening, BUT it SLEEPS once both sides are
-     proven tight (ring.rs LatticeProbeScheduler): a probe acceptor that is not
-     the per-side nearest (ConnectionManager::is_per_side_nearest) is a MISS
-     for its side, recorded by the CONNECT driver for ClientConnectKind::
-     LatticeProbe, and a miss on each side with no lattice change in between
-     puts discovery to sleep until a per-side nearest distance changes (fill,
-     tighten, loss, or widening). Every probe acceptor is KEPT (never dropped:
+     filled-but-loose edge keeps tightening, BUT it SLEEPS once both sides look
+     tight (ring.rs LatticeProbeScheduler): a probe acceptor that is not the
+     per-side nearest (ConnectionManager::record_lattice_probe_result) is a
+     MISS for its side, recorded by the CONNECT driver for ClientConnectKind::
+     LatticeProbe with the scheduler generation the probe was issued in, and a
+     miss on each side in the current generation puts discovery to sleep until
+     a per-side nearest distance changes (fill, tighten, loss, or widening) or
+     a re-check (2h doubling to 16h) starts a new generation. A miss is
+     EVIDENCE, not proof: a failed hole punch, a near-terminus relay, or a
+     recently-failed or rejected nearest peer can make a loose side look tight,
+     which is why sleep is bounded. Every probe acceptor is KEPT (never dropped:
      the transport has no close message, so a dropped link stays dead on the
      far end until its idle timeout). Probing forever and keeping every result
      added a non-lattice link per probe (nothing prunes below max at low

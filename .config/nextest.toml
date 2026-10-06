@@ -32,7 +32,7 @@ filter = "test(test_evicted_contracts_keep_no_interest_records)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
 # #5814 degree-creep model: two arms of a 1000-peer topology model over 3h of
-# virtual time, on parallel threads. Measured ~60s wall-clock locally; give it
+# virtual time, on parallel threads. Measured ~90s wall-clock locally; give it
 # headroom on a contended runner.
 [[profile.ci.overrides]]
 filter = "test(lattice_probe_does_not_grow_degree_with_uptime)"
