@@ -44,6 +44,8 @@ const LATTICE_TAU0: Duration = Duration::from_secs(5);
 const LATTICE_TAU_MAX: Duration = Duration::from_secs(300);
 const LATTICE_RECHECK_MIN: Duration = Duration::from_secs(2 * 3600);
 const LATTICE_RECHECK_MAX: Duration = Duration::from_secs(16 * 3600);
+const LATTICE_RETRY_MIN: Duration = Duration::from_secs(600);
+const LATTICE_RETRY_MAX: Duration = Duration::from_secs(2 * 3600);
 /// Chance that an accepted connection fails to establish (hole punch).
 const CONNECT_FAILURE_RATE: f64 = 0.2;
 const DEFERRED_SWAP_DROP_TTL: f64 = 120.0;
@@ -98,8 +100,10 @@ impl Probe {
             },
             Discovery::Production => Probe::Production(LatticeProbeScheduler::new(
                 Instant::now(),
+                Default::default(),
                 ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX),
                 ExponentialBackoff::new(LATTICE_RECHECK_MIN, LATTICE_RECHECK_MAX),
+                ExponentialBackoff::new(LATTICE_RETRY_MIN, LATTICE_RETRY_MAX),
             )),
         }
     }
@@ -275,15 +279,24 @@ impl Model {
                 .cm
                 .prune_in_transit_connection(self.nodes[j].addr);
             self.nodes[j].cm.record_failed_addr(self.nodes[r].addr);
+            self.classify(r, j, probe_generation, false);
             return false;
         }
         self.link(r, j);
-        if let Some(generation) = probe_generation {
-            self.nodes[j]
-                .cm
-                .record_lattice_probe_result(self.nodes[r].loc, generation);
-        }
+        self.classify(r, j, probe_generation, true);
         true
+    }
+
+    /// The production CONNECT driver's lattice-probe classification.
+    fn classify(&self, r: usize, j: usize, probe_generation: Option<u64>, connected: bool) {
+        if let Some(generation) = probe_generation {
+            self.nodes[j].cm.record_lattice_probe_result(
+                self.nodes[r].loc,
+                self.nodes[r].addr,
+                generation,
+                connected,
+            );
+        }
     }
 
     /// Modelled CONNECT from `j` toward `target`, entering at `first_hop`.
@@ -369,6 +382,44 @@ impl Model {
             self.connect(i, self.nodes[i].loc, 0, None);
         }
 
+        // Route-to-self lattice probe (ring.rs), queued just before the drain.
+        if self.nodes[i].cm.nn_lattice_active() {
+            let node = &mut self.nodes[i];
+            let sides = LatticeSides {
+                succ: node.cm.nearest_lattice_neighbor_dist(true),
+                pred: node.cm.nearest_lattice_neighbor_dist(false),
+            };
+            let backoff = ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX);
+            let jitter = GlobalRng::random_range(0.8..=1.2);
+            let fire = match &mut node.probe {
+                Probe::Continuous {
+                    next_at,
+                    attempt,
+                    last,
+                } => {
+                    let progress = old_lattice_probe_progress(*last, sides);
+                    *last = Some(sides);
+                    if progress.improved || progress.regressed {
+                        *attempt = 0;
+                        *next_at = now;
+                    }
+                    let fire = now >= *next_at;
+                    if fire {
+                        *next_at = now + backoff.delay(*attempt).as_secs_f64() * jitter;
+                        *attempt = attempt.saturating_add(1);
+                    }
+                    fire
+                }
+                Probe::Production(scheduler) => scheduler
+                    .tick_for(&node.cm, Instant::now(), || jitter)
+                    .fired
+                    .is_some(),
+            };
+            if fire {
+                node.pending.insert(node.loc);
+            }
+        }
+
         // Drain queued targets, bounded by the production concurrency cap.
         let max_concurrent = super::super::calculate_max_concurrent_connections(count, min);
         let mut active = 0;
@@ -439,44 +490,6 @@ impl Model {
                 }
             }
             TopologyAdjustment::NoChange => {}
-        }
-
-        // Route-to-self lattice probe (ring.rs).
-        if self.nodes[i].cm.nn_lattice_active() {
-            let node = &mut self.nodes[i];
-            let sides = LatticeSides {
-                succ: node.cm.nearest_lattice_neighbor_dist(true),
-                pred: node.cm.nearest_lattice_neighbor_dist(false),
-            };
-            let backoff = ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX);
-            let jitter = GlobalRng::random_range(0.8..=1.2);
-            let fire = match &mut node.probe {
-                Probe::Continuous {
-                    next_at,
-                    attempt,
-                    last,
-                } => {
-                    let progress = old_lattice_probe_progress(*last, sides);
-                    *last = Some(sides);
-                    if progress.improved || progress.regressed {
-                        *attempt = 0;
-                        *next_at = now;
-                    }
-                    let fire = now >= *next_at;
-                    if fire {
-                        *next_at = now + backoff.delay(*attempt).as_secs_f64() * jitter;
-                        *attempt = attempt.saturating_add(1);
-                    }
-                    fire
-                }
-                Probe::Production(scheduler) => scheduler
-                    .tick_for(&node.cm, Instant::now(), jitter)
-                    .fired
-                    .is_some(),
-            };
-            if fire {
-                node.pending.insert(node.loc);
-            }
         }
 
         // Deferred swap drops.
@@ -663,9 +676,9 @@ fn lattice_probe_does_not_grow_degree_with_uptime() {
         growth(&new_degree) < growth(&old_degree) / 3.0,
         "degree still climbs with uptime: new {new_degree:.1?}, old {old_degree:.1?}"
     );
-    // Sleeping costs a little coverage when connections fail (a failed nearest
-    // peer can leave a side looking tight until the next change or re-check):
-    // 0.3 to 1.1 points across seeds. Turning the probe off costs ~2 points.
+    // Sleeping must not cost lattice coverage at this failure rate: measured
+    // -0.1 to +0.3 points against the old discovery across seeds (at a 60%
+    // failure rate, -1.2 to -3.4). Turning the probe off costs ~3 points.
     assert!(
         new_coverage > 0.96 && new_coverage >= old_coverage - 0.015,
         "lattice coverage fell: new {new_coverage:.3}, old {old_coverage:.3}"

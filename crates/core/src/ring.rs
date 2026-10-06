@@ -6049,7 +6049,8 @@ impl Ring {
         // a MISS: evidence that the acceptor's side is tight, since the probe
         // aims at the nearest unconnected peer. Once both sides have missed since
         // the last change, discovery SLEEPS: it re-checks after 2h, doubling to
-        // 16h, and wakes at once on any per-side distance change. It used to
+        // 16h (after 10 min, doubling to 2h, if a closer peer was found but its
+        // hole punch failed), and wakes at once on any per-side distance change. It used to
         // keep re-probing every tau_max forever, and every result it found was
         // kept (below max_connections the far end usually accepts, and nothing
         // prunes below max at low bandwidth), so a converged peer gained a
@@ -6082,6 +6083,17 @@ impl Ring {
         const LATTICE_PROBE_RECHECK_MAX: Duration = Duration::from_secs(16 * 3600);
         #[cfg(test)]
         const LATTICE_PROBE_RECHECK_MAX: Duration = Duration::from_secs(600);
+        // Re-check ladder after a generation in which a closer peer was found
+        // but could not be connected. The minimum outlasts the first
+        // recently-failed-address exclusion (FAILED_ADDR_BASE_TTL, 5 min).
+        #[cfg(not(test))]
+        const LATTICE_PROBE_RETRY_MIN: Duration = Duration::from_secs(600);
+        #[cfg(test)]
+        const LATTICE_PROBE_RETRY_MIN: Duration = Duration::from_secs(20);
+        #[cfg(not(test))]
+        const LATTICE_PROBE_RETRY_MAX: Duration = Duration::from_secs(2 * 3600);
+        #[cfg(test)]
+        const LATTICE_PROBE_RETRY_MAX: Duration = Duration::from_secs(120);
 
         /// How often to probe a gateway for version discovery (#3677).
         #[cfg(not(test))]
@@ -6099,6 +6111,7 @@ impl Ring {
         // `ExponentialBackoff` (code-style: don't hand-roll doubling).
         let mut lattice_probe = LatticeProbeScheduler::new(
             self.time_source.now(),
+            self.connection_manager.lattice_probe_misses(),
             crate::util::backoff::ExponentialBackoff::new(
                 LATTICE_PROBE_TAU0,
                 LATTICE_PROBE_TAU_MAX,
@@ -6106,6 +6119,10 @@ impl Ring {
             crate::util::backoff::ExponentialBackoff::new(
                 LATTICE_PROBE_RECHECK_MIN,
                 LATTICE_PROBE_RECHECK_MAX,
+            ),
+            crate::util::backoff::ExponentialBackoff::new(
+                LATTICE_PROBE_RETRY_MIN,
+                LATTICE_PROBE_RETRY_MAX,
             ),
         );
         let mut zero_connections_since: Option<Instant> = None;
@@ -6550,8 +6567,45 @@ impl Ring {
                 current_conn_count,
                 self.connection_manager.min_connections,
             );
+            // Nearest-neighbor lattice discovery (mechanism 2): inject a
+            // route-to-self probe target (own_location), gated by
+            // `LatticeProbeScheduler`, to fill or tighten each peer's
+            // successor/predecessor lattice slots. Queued into pending_conn_adds
+            // just before it is drained below, so the probe launches this tick
+            // and its results are in by the next tick's scheduler decision. No
+            // wire change: the probe is a plain CONNECT toward own_location whose
+            // bloom already excludes held peers, so it aims at the nearest
+            // UNCONNECTED peer, and the terminus installs the edge via the
+            // per-side clause in should_accept. The CONNECT driver classifies
+            // each acceptor (`record_lattice_probe_result`); a non-lattice one is
+            // the scheduler's evidence that a side is tight (see the discovery
+            // comment above).
+            if self.connection_manager.nn_lattice_active() {
+                if let Some(me) = self.connection_manager.get_stored_location() {
+                    let outcome = lattice_probe.tick_for(
+                        &self.connection_manager,
+                        self.time_source.now(),
+                        // +/-20% jitter to avoid synchronized probe bursts across
+                        // peers that bootstrapped together.
+                        || crate::config::GlobalRng::random_range(0.8..=1.2),
+                    );
+                    if outcome.improved {
+                        self.connection_manager.record_lattice_probe_improvement();
+                    }
+                    if let Some(interval) = outcome.fired {
+                        self.connection_manager.record_lattice_probe_issued();
+                        pending_conn_adds.insert(me);
+                        tracing::debug!(
+                            generation = lattice_probe.generation(),
+                            interval_secs = interval.as_secs(),
+                            "lattice discovery: queued route-to-self probe"
+                        );
+                    }
+                }
+            }
+
             // The route-to-self lattice probe is queued as own location (see the
-            // discovery block below); tag it, with the scheduler's current
+            // discovery block above); tag it, with the scheduler's current
             // generation, so the CONNECT driver reports a result that is not a
             // lattice edge as a probe miss for that generation (#5814). Only a
             // bootstrap target (fewer than 5 connections) can share own location,
@@ -6795,43 +6849,6 @@ impl Ring {
                     }
                 }
                 TopologyAdjustment::NoChange => {}
-            }
-
-            // Nearest-neighbor lattice discovery (mechanism 2): inject a
-            // route-to-self probe target (own_location), gated by
-            // `LatticeProbeScheduler`, to fill or tighten each peer's
-            // successor/predecessor lattice slots. Queued into pending_conn_adds so
-            // it is acquired next tick alongside long-link targets. No wire change:
-            // the probe is a plain CONNECT toward own_location whose bloom already
-            // excludes held peers, so it lands on the nearest UNCONNECTED peer and
-            // the terminus installs the edge via the per-side clause in
-            // should_accept. The CONNECT driver reports a result that is not a
-            // lattice edge (`record_lattice_probe_miss`), which is the
-            // scheduler's evidence that a side is tight (see the discovery
-            // comment above).
-            if self.connection_manager.nn_lattice_active() {
-                if let Some(me) = self.connection_manager.get_stored_location() {
-                    // +/-20% jitter to avoid synchronized probe bursts across
-                    // peers that bootstrapped together.
-                    let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
-                    let outcome = lattice_probe.tick_for(
-                        &self.connection_manager,
-                        self.time_source.now(),
-                        jitter,
-                    );
-                    if outcome.improved {
-                        self.connection_manager.record_lattice_probe_improvement();
-                    }
-                    if let Some(interval) = outcome.fired {
-                        self.connection_manager.record_lattice_probe_issued();
-                        pending_conn_adds.insert(me);
-                        tracing::debug!(
-                            generation = lattice_probe.generation(),
-                            interval_secs = interval.as_secs(),
-                            "lattice discovery: queued route-to-self probe"
-                        );
-                    }
-                }
             }
 
             // Execute deferred swap drops: only drop as many peers as we
@@ -9222,18 +9239,24 @@ pub(crate) fn lattice_probe_progress(
 /// GENERATION, resets the backoff to tau0 and probes promptly, so a loose or
 /// broken lattice is worked on at once.
 ///
-/// A probe MISS on one side (the CONNECT driver kept an acceptor there that is
-/// not a lattice edge, recorded with the generation the probe was issued in by
-/// `ConnectionManager::record_lattice_probe_miss`) is evidence that side is
-/// tight: the probe aims at the nearest unconnected peer, and it found nothing
-/// closer than the held nearest. One side's miss says nothing about the other
+/// A probe MISS on one side (an acceptor there that is not a lattice edge,
+/// recorded by the CONNECT driver through
+/// `ConnectionManager::record_lattice_probe_result` with the generation current
+/// when the probe was launched) is evidence that side is tight: the probe aims
+/// at the nearest unconnected peer, and it found nothing closer than the held
+/// nearest. A miss farther out than the other side's held nearest is evidence
+/// for that side too. One side's miss says nothing about the other
 /// side (the nearest unconnected peer may simply be on the tight side), so
 /// discovery keeps probing, outward past each kept miss, until BOTH sides have
 /// missed in the current generation. Misses from earlier generations (probes
 /// in flight across a change) do not count.
 ///
-/// It then SLEEPS until the next re-check (in production 2h, doubling to 16h
-/// while nothing changes; a change resets it). A re-check starts a new generation, so fresh
+/// It then SLEEPS until the next re-check (in production 2h, doubling to 16h,
+/// each +/-20% jitter, while nothing changes; a change resets it). If a closer
+/// peer WAS found in the generation but could not be connected (a failed hole
+/// punch: `failed_hit`), the misses that followed may just be the walk going
+/// past it, so the re-check uses the shorter retry ladder (in production 10
+/// minutes, past the failed-address exclusion, doubling to 2h). A re-check starts a new generation, so fresh
 /// misses on both sides are needed to sleep again. The re-check is there
 /// because a miss is evidence, not proof: the walk can stop short of the true
 /// nearest (a failed hole punch, a near-terminus relay accepting first, a
@@ -9244,6 +9267,7 @@ pub(crate) fn lattice_probe_progress(
 pub(crate) struct LatticeProbeScheduler {
     probe_backoff: crate::util::backoff::ExponentialBackoff,
     recheck_backoff: crate::util::backoff::ExponentialBackoff,
+    retry_backoff: crate::util::backoff::ExponentialBackoff,
     next_at: Instant,
     backoff_attempt: u32,
     last_sides: Option<LatticeSides>,
@@ -9263,19 +9287,24 @@ pub(crate) struct LatticeProbeTick {
 }
 
 impl LatticeProbeScheduler {
-    /// Awake, due to fire on the first tick at or after `now`.
+    /// Awake, due to fire on the first tick at or after `now`. `misses` is the
+    /// peer's miss record so far: the first generation starts above it, so
+    /// misses from any earlier scheduler on the same peer never count.
     pub(crate) fn new(
         now: Instant,
+        misses: LatticeProbeMisses,
         probe_backoff: crate::util::backoff::ExponentialBackoff,
         recheck_backoff: crate::util::backoff::ExponentialBackoff,
+        retry_backoff: crate::util::backoff::ExponentialBackoff,
     ) -> Self {
         Self {
             probe_backoff,
             recheck_backoff,
+            retry_backoff,
             next_at: now,
             backoff_attempt: 0,
             last_sides: None,
-            generation: 1,
+            generation: misses.succ.max(misses.pred).max(misses.failed_hit) + 1,
             recheck_at: None,
             recheck_attempt: 0,
         }
@@ -9300,7 +9329,7 @@ impl LatticeProbeScheduler {
         &mut self,
         cm: &ConnectionManager,
         now: Instant,
-        jitter: f64,
+        jitter: impl FnMut() -> f64,
     ) -> LatticeProbeTick {
         let sides = LatticeSides {
             succ: cm.nearest_lattice_neighbor_dist(true),
@@ -9311,14 +9340,14 @@ impl LatticeProbeScheduler {
 
     /// One maintenance tick. `sides` is this tick's per-side nearest distances,
     /// `misses` the latest generation with a probe miss on each side, `jitter`
-    /// the multiplier applied to the next interval (the caller draws it, e.g.
-    /// 0.8..=1.2).
+    /// draws the multiplier applied to a newly scheduled interval (e.g.
+    /// 0.8..=1.2); it is only called when an interval is scheduled.
     pub(crate) fn tick(
         &mut self,
         now: Instant,
         sides: LatticeSides,
         misses: LatticeProbeMisses,
-        jitter: f64,
+        mut jitter: impl FnMut() -> f64,
     ) -> LatticeProbeTick {
         let progress = lattice_probe_progress(self.last_sides, sides);
         self.last_sides = Some(sides);
@@ -9332,8 +9361,16 @@ impl LatticeProbeScheduler {
         if tight(self.generation) {
             match self.recheck_at {
                 None => {
-                    let sleep = self.recheck_backoff.delay(self.recheck_attempt);
-                    self.recheck_at = Some(now + sleep.mul_f64(jitter));
+                    // A closer peer was found this generation but could not be
+                    // connected: the misses may be the walk going past it, so
+                    // re-check on the shorter retry ladder.
+                    let ladder = if misses.failed_hit >= self.generation {
+                        &self.retry_backoff
+                    } else {
+                        &self.recheck_backoff
+                    };
+                    let sleep = ladder.delay(self.recheck_attempt);
+                    self.recheck_at = Some(now + sleep.mul_f64(jitter()));
                     self.recheck_attempt = self.recheck_attempt.saturating_add(1);
                 }
                 Some(at) if now >= at => self.restart(now),
@@ -9343,7 +9380,7 @@ impl LatticeProbeScheduler {
         let asleep = tight(self.generation);
         let fired = (!asleep && now >= self.next_at).then(|| {
             let interval = self.probe_backoff.delay(self.backoff_attempt);
-            self.next_at = now + interval.mul_f64(jitter);
+            self.next_at = now + interval.mul_f64(jitter());
             self.backoff_attempt = self.backoff_attempt.saturating_add(1);
             interval
         });
@@ -9497,13 +9534,19 @@ mod lattice_probe_state_machine_tests {
     fn scheduler(start: Instant) -> LatticeProbeScheduler {
         LatticeProbeScheduler::new(
             start,
+            LatticeProbeMisses::default(),
             ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300)),
             ExponentialBackoff::new(Duration::from_secs(HOUR), Duration::from_secs(16 * HOUR)),
+            ExponentialBackoff::new(Duration::from_secs(600), Duration::from_secs(2 * HOUR)),
         )
     }
 
     fn misses(succ: u64, pred: u64) -> LatticeProbeMisses {
-        LatticeProbeMisses { succ, pred }
+        LatticeProbeMisses {
+            succ,
+            pred,
+            failed_hit: 0,
+        }
     }
 
     /// Ticks once a second over `(from, from + secs]` with unchanged sides;
@@ -9520,7 +9563,7 @@ mod lattice_probe_state_machine_tests {
         (from + 1..=from + secs)
             .filter(|t| {
                 let m = misses_for(s.generation());
-                s.tick(start + Duration::from_secs(*t), sides, m, 1.0)
+                s.tick(start + Duration::from_secs(*t), sides, m, || 1.0)
                     .fired
                     .is_some()
             })
@@ -9602,6 +9645,41 @@ mod lattice_probe_state_machine_tests {
         );
     }
 
+    /// A closer peer found but not connected in this generation means the
+    /// misses that followed may be the walk going past it: re-check on the
+    /// short retry ladder (10 min) instead of 2h.
+    #[test]
+    fn failed_hit_rechecks_soon() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let fired = run(&mut s, start, 60, HOUR, BOTH, |g| LatticeProbeMisses {
+            succ: g,
+            pred: g,
+            failed_hit: g,
+        });
+        assert!(
+            (660..665).contains(&fired[0]),
+            "re-check 10 min after sleeping: {fired:?}"
+        );
+    }
+
+    /// A scheduler created on a peer with earlier misses starts above them, so
+    /// those misses cannot put it to sleep.
+    #[test]
+    fn new_scheduler_ignores_earlier_misses() {
+        let start = tokio::time::Instant::now();
+        let mut s = LatticeProbeScheduler::new(
+            start,
+            misses(7, 9),
+            ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300)),
+            ExponentialBackoff::new(Duration::from_secs(HOUR), Duration::from_secs(16 * HOUR)),
+            ExponentialBackoff::new(Duration::from_secs(600), Duration::from_secs(2 * HOUR)),
+        );
+        assert!(s.generation() > 9);
+        assert!(run(&mut s, start, 0, 600, BOTH, |_| misses(7, 9)).len() >= 4);
+    }
+
     /// An asleep scheduler wakes immediately on any lattice change: a widened
     /// side (lattice edge lost, farther neighbor remains), a lost side, or a
     /// tighten.
@@ -9631,7 +9709,7 @@ mod lattice_probe_state_machine_tests {
                 start + Duration::from_secs(1861),
                 changed,
                 misses(gen_asleep, gen_asleep),
-                1.0,
+                || 1.0,
             );
             assert_eq!(
                 woke.fired,

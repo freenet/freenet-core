@@ -108,7 +108,7 @@ pub(crate) enum ClientConnectKind {
     /// Route-to-self nearest-neighbor lattice probe (`Ring::connection_maintenance`),
     /// issued in scheduler `generation`: an acceptor that is not a lattice edge
     /// is reported as a probe miss for that generation
-    /// (`ConnectionManager::record_lattice_probe_miss`, #5814).
+    /// (`ConnectionManager::record_lattice_probe_result`, #5814).
     LatticeProbe { generation: u64 },
 }
 
@@ -416,6 +416,39 @@ async fn drive_client_connect_inner(
                     }
                 };
 
+                // Lattice-probe result (#5814). The route-to-self probe aims at
+                // the nearest UNCONNECTED peer (and near-terminus relays may also
+                // accept). If an acceptor neither fills nor tightens a lattice
+                // side, that is evidence the side is tight: report a miss, and
+                // once both sides have missed the scheduler sleeps until the
+                // lattice changes or its re-check, instead of probing every
+                // tau_max and keeping a non-lattice link each time. Classified
+                // before the failure branch below can `continue`: at
+                // max_connections our own cap refuses a non-lattice acceptor and
+                // reports it as a failure, but the probe did land there, so it
+                // counts as connected (otherwise a peer at max would never sleep).
+                // A lattice edge whose hole punch failed is reported as a failed
+                // hit, so the scheduler re-checks soon. An established link
+                // is kept: dropping it would leave it dead on the far end until
+                // its idle timeout, since the transport has no close message.
+                if let ClientConnectKind::LatticeProbe { generation } = kind {
+                    let cm = &op_manager.ring.connection_manager;
+                    let landed = hole_punch_ok || cm.connection_count() >= cm.max_connections;
+                    if cm.record_lattice_probe_result(
+                        Location::from_address(&acceptor_addr),
+                        acceptor_addr,
+                        generation,
+                        landed,
+                    ) {
+                        tracing::debug!(
+                            tx = %tx,
+                            acceptor = %acceptor_addr,
+                            generation,
+                            "connect driver: lattice probe found no closer neighbor"
+                        );
+                    }
+                }
+
                 if !hole_punch_ok {
                     accepted.remove(&payload.acceptor);
                     let failed_msg = ConnectMsg::ConnectFailed {
@@ -449,35 +482,6 @@ async fn drive_client_connect_inner(
                         );
                     }
                     continue;
-                }
-
-                // Lattice-probe result (#5814). The route-to-self probe aims at
-                // the nearest UNCONNECTED peer (and near-terminus relays may also
-                // accept). If an acceptor neither fills nor tightens a lattice
-                // side, that is evidence the side is tight: report a miss, and
-                // once both sides have missed the scheduler sleeps until the
-                // lattice changes or its re-check, instead of probing every
-                // tau_max and keeping a non-lattice link each time. The link
-                // itself is kept: dropping it would leave it dead on the far end
-                // until its idle timeout, since the transport has no close
-                // message. The check ignores the acceptor's own entry, so it gives
-                // the same answer whether or not the ring has promoted it yet.
-                if let ClientConnectKind::LatticeProbe { generation } = kind {
-                    if op_manager
-                        .ring
-                        .connection_manager
-                        .record_lattice_probe_result(
-                            Location::from_address(&acceptor_addr),
-                            generation,
-                        )
-                    {
-                        tracing::debug!(
-                            tx = %tx,
-                            acceptor = %acceptor_addr,
-                            generation,
-                            "connect driver: lattice probe found no closer neighbor"
-                        );
-                    }
                 }
 
                 if accepted.len() >= target_connections {
@@ -1711,83 +1715,99 @@ mod tests {
     fn lattice_probe_miss_is_wired() {
         const DRIVER: &str = include_str!("op_ctx_task.rs");
         const RING: &str = include_str!("../../ring.rs");
-        // Production code only (before the first test module), with all
-        // whitespace removed so formatting changes do not matter.
+        // Production code only (before the first test module), with `//`
+        // comments removed so a commented-out call does not count.
         let prod = |src: &str| -> String {
             src[..src
                 .find("\n#[cfg(test)]\nmod ")
                 .expect("expected a `#[cfg(test)]` test module")]
-                .split_whitespace()
-                .collect()
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let fn_body = |src: &str, start: &str| -> String {
-            let from = src
+        // Whitespace removed, so formatting changes do not matter.
+        let squash = |s: &str| -> String { s.split_whitespace().collect() };
+        // The item starting at `start`, up to its closing line `end`, squashed.
+        let item = |src: &str, start: &str, end: &str| -> String {
+            let rest = &src[src
                 .find(start)
-                .unwrap_or_else(|| panic!("{start} not found"));
-            let rest = &src[from + start.len()..];
-            // Up to the next top-level item in the squashed source.
-            rest[..rest.find("fn").unwrap_or(rest.len())].to_string()
+                .unwrap_or_else(|| panic!("{start} not found"))..];
+            squash(&rest[..rest.find(end).unwrap_or_else(|| panic!("end of {start}"))])
         };
 
-        // (1) ring.rs: the scheduler reads this peer's connection manager, and
-        // exactly one acquisition is tagged as a lattice probe, chosen by the
-        // probe-target comparison, with the scheduler's generation.
+        // (1) ring.rs: the scheduler reads this peer's connection manager,
+        // exactly one acquisition is tagged as a lattice probe (chosen by the
+        // probe-target comparison, with the scheduler's generation),
+        // `acquire_new` forwards the kind, and the miss count reaches the
+        // router snapshot.
         let ring = prod(RING);
+        let ring_sq = squash(&ring);
         assert!(
-            ring.contains("lattice_probe.tick_for(&self.connection_manager,"),
+            ring_sq.contains("lattice_probe.tick_for(&self.connection_manager,"),
             "the maintenance loop must drive LatticeProbeScheduler from its own ConnectionManager"
         );
         assert_eq!(
-            ring.matches("ClientConnectKind::LatticeProbe{").count(),
+            ring_sq.matches("ClientConnectKind::LatticeProbe{").count(),
             1,
             "ring.rs must tag exactly one acquisition as a lattice probe"
         );
         assert!(
-            ring.contains(
+            ring_sq.contains(
                 "iflattice_probe_target==Some(ideal_location){ClientConnectKind::LatticeProbe{generation:lattice_probe.generation(),}"
             ),
             "the probe-target comparison must select the LatticeProbe tag with the current generation"
         );
-        // `acquire_new` hands its `kind` parameter to the driver.
-        let acquire = fn_body(&ring, "asyncfnacquire_new(");
+        let acquire = item(&ring, "async fn acquire_new(", "\n    }\n");
         assert!(
             acquire.contains("kind:ClientConnectKind,")
                 && acquire.contains("ideal_location,None,kind,)"),
             "acquire_new must forward its kind to start_client_connect"
         );
+        assert!(
+            ring_sq.contains("snapshot.lattice_probe_misses=Some(cm.lattice_probe_miss_total());"),
+            "the router snapshot must export the probe miss count"
+        );
 
-        // (2) The client driver threads the kind through and, after a
-        // successful hole punch and before the completion check, classifies
-        // every lattice-probe acceptor for the probe's generation, keeping it.
+        // (2) The client driver threads the kind through and classifies every
+        // lattice-probe acceptor for the probe's generation once the hole-punch
+        // result is known, before the failure branch can `continue`, and
+        // never drops it.
         let driver = prod(DRIVER);
-        let start = fn_body(&driver, "pub(crate)asyncfnstart_client_connect(");
+        let start = item(
+            &driver,
+            "pub(crate) async fn start_client_connect(",
+            "\n}\n",
+        );
         assert!(
             start.contains("kind:ClientConnectKind,") && start.contains("op_manager,kind,);"),
             "start_client_connect must forward its kind to the inner driver"
         );
-        let body = fn_body(&driver, "asyncfndrive_client_connect_inner(");
+        let body = item(&driver, "async fn drive_client_connect_inner(", "\n}\n");
         let joined = body
             .find("\"connectdriver:joinedpeer\"")
-            .expect("hole-punch success log not found");
+            .expect("hole-punch result handling not found");
         let gate = body
             .find("ifletClientConnectKind::LatticeProbe{generation}=kind{")
             .expect("lattice-probe miss report not found in drive_client_connect_inner");
-        let complete = body
-            .find("ifaccepted.len()>=target_connections{")
-            .expect("completion check not found");
+        let failed = body
+            .find("if!hole_punch_ok{")
+            .expect("hole-punch failure branch not found");
         assert!(
-            joined < gate && gate < complete,
-            "the miss report must run after the hole punch and before completion"
+            joined < gate && gate < failed,
+            "the miss report must run once the hole-punch result is known and before the \
+             failure branch can `continue`, so a cap-refused acceptor still counts"
         );
-        let gate_block = &body[gate..complete];
+        let gate_block = &body[gate..failed];
         assert!(
             gate_block.contains(
-                ".record_lattice_probe_result(Location::from_address(&acceptor_addr),generation"
+                "letlanded=hole_punch_ok||cm.connection_count()>=cm.max_connections;ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,landed,)"
             ),
             "every probe acceptor must be classified, for the probe's generation"
         );
         assert!(
-            !gate_block.contains("DropConnection") && !gate_block.contains("continue;"),
+            !body.contains("NodeEvent::DropConnection(acceptor_addr)")
+                && !gate_block.contains("continue;"),
             "a probe acceptor must be kept (a dropped link stays dead on the far end)"
         );
     }
