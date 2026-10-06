@@ -78,7 +78,7 @@ WHEN accepting a new connection (should_accept):
      populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
      not just over-cap lattice ones), so on a node AT max unrelated in-flight
      handshakes can throttle tightening until they drain (bounded by the TTL;
-     lattice discovery's re-checks retry it). This only bites nodes genuinely at max (mostly
+     lattice discovery's finite re-checks may retry it). This only bites nodes genuinely at max (mostly
      busy gateways); a peer below max tightens via the under-cap path, which never
      consults this ceiling. A lattice-private budget is a possible future
      refinement. A second, independent bound: each admitted candidate that
@@ -98,7 +98,10 @@ WHEN accepting a new connection (should_accept):
      per lattice state, because each re-check of a tight lattice keeps a link
      (ring.rs lattice_probe_timing: 2h, 4h, 8h; after a failed hit, i.e. a
      closer peer found but not connected, 10 to 80 min, up to four times,
-     not reset by lattice changes). A miss is EVIDENCE, not proof: a failed
+     not reset by lattice changes, then the re-check ladder). The over-cap
+     exception also applies at the outbound pre-flight cap check in
+     connection_lifecycle.rs handle_connect_peer, so a peer at max can tighten
+     from its own probe. A miss is EVIDENCE, not proof: a failed
      hole punch, a near-terminus relay, or a recently-failed nearest peer, or
      one that rejected the request, can make a loose side look tight, which
      is why it re-checks and why acceptors that failed to connect are not

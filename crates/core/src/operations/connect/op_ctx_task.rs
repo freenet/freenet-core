@@ -1769,6 +1769,12 @@ mod tests {
                 ),
             "connection_maintenance must run the scheduler on the production timing"
         );
+        assert!(
+            maintenance.contains(
+                "GlobalRng::random_range(lattice_probe_timing::JITTER_LOW..=lattice_probe_timing::JITTER_HIGH,)"
+            ),
+            "the probe intervals must be jittered with the production bounds"
+        );
         assert_eq!(
             squash(&ring)
                 .matches("ClientConnectKind::LatticeProbe{")

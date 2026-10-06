@@ -9146,8 +9146,9 @@ pub(crate) mod lattice_probe_timing {
     /// exclusion (`FAILED_ADDR_BASE_TTL`, 5 min).
     pub(crate) const RETRY_MIN: Duration = Duration::from_secs(600);
     /// Retries for such a peer (10, 20, 40, 80 min), not reset by lattice
-    /// changes, only by a generation that goes to sleep without one: a closer
-    /// peer that is never reachable costs at most this many retries.
+    /// changes, only by a sleep that runs its course without one: a closer
+    /// peer that is never reachable costs at most this many retries, then the
+    /// re-check ladder takes over.
     pub(crate) const RETRIES: u32 = 4;
     /// Bounds of the jitter multiplier on every interval, against synchronized
     /// bursts across peers that bootstrapped together.
@@ -9291,7 +9292,8 @@ pub(crate) fn lattice_probe_progress(
 /// around it may just be the walk going past it, so the sleep uses the shorter
 /// retry ladder instead. Its count survives lattice changes (a closer peer that
 /// is never reachable is re-found after every change) and resets only when a
-/// generation sleeps without a failed hit. A failed hit reported after a
+/// sleep runs its full course without a failed hit; once it is used up, such
+/// sleeps fall back to the re-check ladder. A failed hit reported after a
 /// clean sleep began moves it onto the retry ladder, if that is sooner.
 ///
 /// Before #5814 there was no sleep: a converged peer probed every tau_max and
@@ -9390,33 +9392,35 @@ impl LatticeProbeScheduler {
         jitter: &mut impl FnMut() -> f64,
     ) -> LatticeProbeSleep {
         if failed_hit {
-            let until = self.next_retry(now, jitter);
-            if until.is_some() {
+            if let Some(until) = self.next_retry(now, jitter) {
                 self.retry_attempt += 1;
+                return LatticeProbeSleep {
+                    until: Some(until),
+                    saw_failed_hit: true,
+                };
             }
-            LatticeProbeSleep {
-                until,
-                saw_failed_hit: true,
-            }
-        } else {
-            // Nothing in the way this time: a later failed hit starts its
-            // retry ladder afresh.
-            self.retry_attempt = 0;
-            let until = (self.recheck_attempt < self.timing.rechecks).then(|| {
-                now + self
-                    .timing
-                    .recheck
-                    .delay(self.recheck_attempt)
-                    .mul_f64(jitter())
-            });
-            if until.is_some() {
-                self.recheck_attempt += 1;
-            }
-            LatticeProbeSleep {
-                until,
-                saw_failed_hit: false,
-            }
+            // Retries used up: fall back to the ordinary re-checks, which also
+            // guard the other side against a false miss.
         }
+        let until = self.next_recheck(now, jitter);
+        if until.is_some() {
+            self.recheck_attempt += 1;
+        }
+        LatticeProbeSleep {
+            until,
+            saw_failed_hit: failed_hit,
+        }
+    }
+
+    /// The next rung of the re-check ladder, if any is left.
+    fn next_recheck(&self, now: Instant, jitter: &mut impl FnMut() -> f64) -> Option<Instant> {
+        (self.recheck_attempt < self.timing.rechecks).then(|| {
+            now + self
+                .timing
+                .recheck
+                .delay(self.recheck_attempt)
+                .mul_f64(jitter())
+        })
     }
 
     /// One maintenance tick for the peer behind `cm`: reads its per-side
@@ -9461,8 +9465,18 @@ impl LatticeProbeScheduler {
             let failed_hit = misses.failed_hit >= self.generation;
             match self.sleep {
                 Some(LatticeProbeSleep {
-                    until: Some(at), ..
-                }) if now >= at => self.restart(now),
+                    until: Some(at),
+                    saw_failed_hit,
+                }) if now >= at => {
+                    // A sleep that ended with nothing in the way: whatever
+                    // blocked us is gone, so a later failed hit starts its
+                    // retry ladder afresh. (Reset when the sleep ENDS, not when
+                    // it begins: a failed hit can still arrive during it.)
+                    if !saw_failed_hit {
+                        self.retry_attempt = 0;
+                    }
+                    self.restart(now);
+                }
                 None => self.sleep = Some(self.fall_asleep(now, failed_hit, &mut jitter)),
                 // A failed hit reported after a clean sleep began, considered
                 // once: move onto the retry ladder if that is sooner. The clean
@@ -9790,8 +9804,8 @@ mod lattice_probe_state_machine_tests {
         let fired = run(&mut s, start, 60, 12 * HOUR, BOTH, failed);
         assert_eq!(
             fired.len(),
-            4,
-            "retries after 10, 20, 40, 80 min: {fired:?}"
+            4 + 3,
+            "retries after 10, 20, 40, 80 min, then the re-checks: {fired:?}"
         );
         assert!(within(fired[0], 61 + 600), "{fired:?}");
         assert!(within(fired[1], fired[0] + 1 + 1200), "{fired:?}");
@@ -9881,6 +9895,132 @@ mod lattice_probe_state_machine_tests {
         assert!(within(fired[1], fired[0] + 1 + 600), "{fired:?}");
     }
 
+    /// A failed hit in every generation, always reported late (after a clean
+    /// sleep began, as when a near-terminus relay's miss arrives before the
+    /// closer peer's hole punch fails), still uses up the retry ladder: a
+    /// closer peer that is never reachable costs at most `retries` retries,
+    /// then the re-check ladder, then nothing until the lattice changes.
+    #[test]
+    fn unreachable_closer_peer_costs_finitely_many_wakes() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Each generation sleeps clean on its first tick, and the failed hit
+        // for it shows up 30 s later.
+        let mut slept_at: std::collections::HashMap<u64, u64> = Default::default();
+        let mut fired = Vec::new();
+        for t in 61..61 + 48 * HOUR {
+            let g = s.generation();
+            let first = *slept_at.entry(g).or_insert(t);
+            let m = if t >= first + 30 {
+                failed(g)
+            } else {
+                misses(g, g)
+            };
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || 1.0)
+                .fired
+                .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        assert!(
+            fired.len() <= 4 + 3,
+            "at most the retries and then the re-checks: {fired:?}"
+        );
+        assert!(fired.len() >= 4, "{fired:?}");
+    }
+
+    /// Once retries are used up, a failed hit falls back to the re-check
+    /// ladder rather than sleeping until a change, so the other side keeps
+    /// its guard against a false miss.
+    #[test]
+    fn exhausted_retries_fall_back_to_rechecks() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let fired = run(&mut s, start, 60, 48 * HOUR, BOTH, failed);
+        assert_eq!(fired.len(), 4 + 3, "4 retries then 3 re-checks: {fired:?}");
+        let t = fired[3] + 1;
+        assert!(within(fired[4], t + HOUR), "{fired:?}");
+    }
+
+    /// A sleep that runs its course without a failed hit resets the retry
+    /// count: the next failed hit starts at 10 min again.
+    #[test]
+    fn clean_sleep_resets_retries() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Two retries (10, 20 min), then the third sleep starts...
+        let fired = run(&mut s, start, 60, 1900, BOTH, failed);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        // ...a clean generation sleeps its full hour...
+        let t = 60 + 1900 + 2400 + 10;
+        run(&mut s, start, 1960, t - 1960, BOTH, |g| misses(g, g));
+        let fired = run(&mut s, start, t, 2 * HOUR, BOTH, |g| misses(g, g));
+        // ...and the failed hit after that is back on the first rung.
+        let t2 = fired[0];
+        let fired = run(&mut s, start, t2, HOUR, BOTH, failed);
+        assert!(within(fired[0], t2 + 1 + 600), "{fired:?}");
+    }
+
+    /// Awake, the probe backs off 5 s doubling to 300 s; a change while the
+    /// next probe is far off fires at once.
+    #[test]
+    fn awake_cadence_and_prompt_wake() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let fired = run(&mut s, start, 0, 1300, BOTH, |_| misses(0, 0));
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(&gaps[..7], &[5, 10, 20, 40, 80, 160, 300], "{fired:?}");
+        let widened = LatticeSides {
+            succ: Some(0.02),
+            pred: Some(0.01),
+        };
+        let tick = s.tick(
+            start + Duration::from_secs(1301),
+            widened,
+            misses(0, 0),
+            || 1.0,
+        );
+        assert!(tick.fired.is_some());
+    }
+
+    /// The jitter scales every sleep, and a late failed hit is considered only
+    /// once per sleep even when later draws would make the retry sooner.
+    #[test]
+    fn jitter_scales_sleeps_and_late_hits_are_considered_once() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let mut fired = Vec::new();
+        let mut draws = [1.2f64, 0.8].into_iter().cycle();
+        for t in 1..=3 * HOUR {
+            let g = s.generation();
+            // Clean misses until 2000 s, then a late failed hit.
+            let m = if t < 2000 { misses(g, g) } else { failed(g) };
+            let m = if t < 60 { misses(0, 0) } else { m };
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || {
+                draws.next().unwrap()
+            })
+            .fired
+            .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        // The 1h clean sleep from 60 is jittered (0.8 or 1.2); the late
+        // failed hit at 2000 is considered once: a 600 s retry with that one
+        // draw if it is sooner, never re-drawn on later ticks.
+        let wake = fired.iter().copied().find(|t| *t > 60).unwrap();
+        assert!(
+            [2000 + 480, 2000 + 720, 60 + 2880, 60 + 4320]
+                .iter()
+                .any(|at| within(wake, *at)),
+            "{fired:?}"
+        );
+    }
+
     /// A scheduler created on a peer with earlier evidence starts above it, so
     /// that evidence cannot put it to sleep; each of the three records alone
     /// sets the floor.
@@ -9955,6 +10095,10 @@ mod lattice_probe_state_machine_tests {
     fn production_ladders() {
         use super::lattice_probe_timing as t;
         let p = t::production();
+        assert_eq!(p.probe.delay(0), Duration::from_secs(5));
+        assert_eq!(p.probe.delay(20), Duration::from_secs(300));
+        assert_eq!(p.recheck.delay(0), Duration::from_secs(2 * HOUR));
+        assert_eq!(p.retry.delay(0), Duration::from_secs(600));
         assert_eq!(p.recheck.delay(0), t::RECHECK_MIN);
         assert_eq!(p.recheck.delay(t::RECHECKS - 1), t::RECHECK_MIN * 4);
         assert_eq!(p.retry.delay(0), t::RETRY_MIN);

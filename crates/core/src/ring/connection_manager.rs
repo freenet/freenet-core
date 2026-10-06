@@ -1414,7 +1414,7 @@ impl ConnectionManager {
     /// traffic has its over-cap tightening throttled until those reservations drain
     /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; when the far end
     /// refuses us this way our probe never sees it and lands farther out, a
-    /// miss, so lattice discovery's re-checks are what heal it). This bites
+    /// miss, which lattice discovery's finite re-checks may heal). This bites
     /// only for nodes at max (mostly busy gateways) — a peer below max tightens
     /// via the under-cap path, which never consults this ceiling. A
     /// lattice-private budget is a possible future refinement.
@@ -1471,8 +1471,8 @@ impl ConnectionManager {
         // non-stale reservations, and a node at max whose budget is already
         // consumed by ordinary CONNECT traffic throttles tightening until those
         // drain or expire (PENDING_RESERVATION_TTL). That is bounded, and
-        // lattice discovery's re-checks retry it; the global count is also the
-        // more conservative choice
+        // lattice discovery's finite re-checks may retry it; the global count
+        // is also the more conservative choice
         // for the hard ceiling. It only bites at nodes
         // genuinely AT max (mostly busy gateways) — a peer below max tightens via
         // the under-cap path, which never consults this ceiling. A lattice-private
@@ -4696,9 +4696,18 @@ mod tests {
             .matches("admits_lattice_edge_over_cap(loc)")
             .count();
         assert!(
-            hits >= 2,
-            "both lifecycle promotion cap-gates must apply \
-             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
+            hits >= 3,
+            "the outbound pre-flight cap check and both lifecycle promotion \
+             cap-gates must apply admits_lattice_edge_over_cap(loc); found {hits} \
+             call site(s)"
+        );
+        let preflight = LIFECYCLE_SRC
+            .find("Pre-flight max_connections check")
+            .expect("outbound pre-flight cap check not found");
+        let window = &LIFECYCLE_SRC[preflight..preflight + 1500];
+        assert!(
+            window.contains("!connection_manager.admits_lattice_edge_over_cap(loc)"),
+            "the outbound pre-flight cap check must exempt lattice edges (#5827)"
         );
     }
 

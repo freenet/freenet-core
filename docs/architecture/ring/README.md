@@ -181,7 +181,7 @@ edges are excluded from score-based pruning and swaps, and a periodic route-to-s
 keeps discovering closer neighbors. Once a probe on each side has found nothing closer than the
 current nearest neighbor, the probe sleeps until a nearest-neighbor distance changes, apart from
 a few re-checks (`ring::lattice_probe_timing`). Each probe keeps whatever it connected to, so a
-converged peer adds a non-lattice link or two per lattice change rather than one per probe.
+converged peer adds a few non-lattice links per lattice change rather than one per probe.
 
 **Acceptance:**
 - At `max_connections` → reject (except new nearest-neighbor lattice edges)
