@@ -100,25 +100,28 @@ fn env_override(var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
 
 impl OsTrustSummary {
     /// `Some(self)` when `error` is the failure this summary explains, as
-    /// decided by [`is_unknown_issuer_error`].
+    /// decided by [`is_untrusted_issuer_error`].
     pub fn explaining(&self, error: &(dyn std::error::Error + 'static)) -> Option<&Self> {
-        is_unknown_issuer_error(error).then_some(self)
+        is_untrusted_issuer_error(error).then_some(self)
     }
 }
 
 /// Whether `error`, or anything in its source chain, is a TLS rejection of the
-/// server's certificate as issued by an untrusted CA: the failure a missing
-/// interceptor CA causes, and the one an [`OsTrustSummary`] explains. Other
+/// server's certificate because no trusted CA vouches for it: the failure an
+/// [`OsTrustSummary`] explains. That is `UnknownIssuer` when the interceptor's
+/// CA is missing, or `BadSignature` when a same-named older copy of it is
+/// trusted (a root renewed with a new key, a stale `SSL_CERT_FILE`). Other
 /// certificate errors (an expired one usually means clock skew), DNS failures,
 /// refused connections and timeouts are not, and showing the summary for them
 /// would send the user chasing CAs.
-pub fn is_unknown_issuer_error(error: &(dyn std::error::Error + 'static)) -> bool {
+pub fn is_untrusted_issuer_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    use rustls::CertificateError::{BadSignature, UnknownIssuer};
     let mut next = Some(error);
     while let Some(error) = next {
         if matches!(
             error.downcast_ref::<rustls::Error>(),
             Some(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer
+                UnknownIssuer | BadSignature
             ))
         ) {
             return true;
@@ -128,7 +131,7 @@ pub fn is_unknown_issuer_error(error: &(dyn std::error::Error + 'static)) -> boo
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
         {
-            if is_unknown_issuer_error(inner) {
+            if is_untrusted_issuer_error(inner) {
                 return true;
             }
         }
@@ -258,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_issuer_is_told_apart_from_other_failures() {
+    fn untrusted_issuer_is_told_apart_from_other_failures() {
         let certificate = |error| {
             // How hyper-rustls surfaces it: wrapped in an io::Error.
             std::io::Error::new(
@@ -267,21 +270,25 @@ mod tests {
             )
         };
         let unknown_issuer = certificate(rustls::CertificateError::UnknownIssuer);
-        assert!(is_unknown_issuer_error(&unknown_issuer));
-        assert!(is_unknown_issuer_error(&rustls::Error::InvalidCertificate(
-            rustls::CertificateError::UnknownIssuer
-        )));
+        assert!(is_untrusted_issuer_error(&unknown_issuer));
+        assert!(is_untrusted_issuer_error(
+            &rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+        ));
+
+        // A same-named older copy of the interceptor's CA is trusted.
+        let renewed_root = certificate(rustls::CertificateError::BadSignature);
+        assert!(is_untrusted_issuer_error(&renewed_root));
 
         // Usually clock skew, not a missing CA.
         let expired = certificate(rustls::CertificateError::Expired);
-        assert!(!is_unknown_issuer_error(&expired));
+        assert!(!is_untrusted_issuer_error(&expired));
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert!(!is_unknown_issuer_error(&refused));
+        assert!(!is_untrusted_issuer_error(&refused));
         let other_tls = std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             rustls::Error::General("handshake".into()),
         );
-        assert!(!is_unknown_issuer_error(&other_tls));
+        assert!(!is_untrusted_issuer_error(&other_tls));
 
         let summary = OsTrustSummary::default();
         assert_eq!(summary.explaining(&unknown_issuer), Some(&summary));

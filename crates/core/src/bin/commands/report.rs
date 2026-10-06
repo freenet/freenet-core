@@ -384,6 +384,17 @@ impl ReportCommand {
     }
 
     async fn upload_report(&self, report: &DiagnosticReport) -> Result<()> {
+        self.upload_report_with(report, reqwest::Client::builder())
+            .await
+    }
+
+    /// `base` is a fresh `reqwest::Client::builder()` in production; tests pass
+    /// one that ignores proxy settings in the environment.
+    async fn upload_report_with(
+        &self,
+        report: &DiagnosticReport,
+        base: reqwest::ClientBuilder,
+    ) -> Result<()> {
         println!();
         print!("Uploading report...");
         io::stdout().flush()?;
@@ -400,8 +411,7 @@ impl ReportCommand {
         // OS roots so this works behind TLS-intercepting proxies, whose CA
         // lives in the OS store (see util::os_trust for why only here).
         let (builder, os_trust) = add_os_root_certificates(
-            reqwest::Client::builder()
-                .user_agent("freenet-report")
+            base.user_agent("freenet-report")
                 .connect_timeout(StdDuration::from_secs(30))
                 .timeout(StdDuration::from_secs(300)),
         );
@@ -421,10 +431,16 @@ impl ReportCommand {
         // Capped whatever the status: a captive portal or proxy page can be
         // large, and this upload trusts more CAs than any other client.
         let status = response.status();
-        let body = read_capped(&mut response).await;
+        let (body, read_error) = read_capped(&mut response).await;
         if !status.is_success() {
+            // Whatever arrived is worth showing, even if the read broke off.
             let shown = printable_error_body(&String::from_utf8_lossy(&body));
             anyhow::bail!("Upload failed: {status} - {shown}. {SEND_LOCALLY_HINT}");
+        }
+        if let Some(error) = read_error {
+            return Err(anyhow::Error::new(error).context(format!(
+                "Failed to read upload response. {SEND_LOCALLY_HINT}"
+            )));
         }
 
         // A 200 that is not our JSON is usually a captive portal or proxy page.
@@ -465,9 +481,9 @@ fn upload_failure_message(os_trust: Option<&OsTrustSummary>) -> String {
 /// bytes of JSON; only the first [`MAX_ERROR_BODY_CHARS`] of an error are shown.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Reads at most [`MAX_RESPONSE_BYTES`] of the body. A read error ends it
-/// early: what arrived is still worth showing, or fails to parse.
-async fn read_capped(response: &mut reqwest::Response) -> Vec<u8> {
+/// Reads at most [`MAX_RESPONSE_BYTES`] of the body, returning what arrived
+/// and the error that ended the read early, if one did.
+async fn read_capped(response: &mut reqwest::Response) -> (Vec<u8>, Option<reqwest::Error>) {
     let mut raw = Vec::new();
     while raw.len() < MAX_RESPONSE_BYTES {
         match response.chunk().await {
@@ -475,10 +491,11 @@ async fn read_capped(response: &mut reqwest::Response) -> Vec<u8> {
                 let room = MAX_RESPONSE_BYTES - raw.len();
                 raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(error) => return (raw, Some(error)),
         }
     }
-    raw
+    (raw, None)
 }
 
 /// Report codes are short ASCII tokens (six characters from the server).
@@ -500,6 +517,7 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 fn printable_error_body(body: &str) -> String {
     let mut after_space = false;
     let mut chars = body
+        .trim()
         .chars()
         .filter_map(|c| match c {
             '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' | ' ' => Some(' '),
@@ -910,19 +928,31 @@ mod tests {
     #[test]
     fn upload_client_is_built_with_os_root_certificates() {
         let src = include_str!("report.rs");
-        let code = item_code(src, "    async fn upload_report(", "\n    }\n");
-        // Built with concat! so this file's own text never contains the needle.
-        let helper_call = concat!("let(builder,os_trust)=add_os_root", "_certificates(");
+        // Production hands the upload a fresh builder (tests pass one that
+        // ignores proxy settings)...
+        let entry = item_code(src, "    async fn upload_report(", "\n    }\n");
+        assert!(
+            entry.contains("self.upload_report_with(report,reqwest::Client::builder())"),
+            "upload_report must start from a fresh client builder"
+        );
+        let code = item_code(src, "    async fn upload_report_with(", "\n    }\n");
+        // ...which gets the OS roots. Built with concat! so this file's own
+        // text never contains the needle.
+        let helper_call = concat!("let(builder,os_trust)=add_os_root", "_certificates(base.");
         assert!(
             code.contains(helper_call),
-            "upload_report must build its client with add_os_root_certificates"
+            "the upload must build its client with add_os_root_certificates"
         );
         // ...and that builder must be the one that POSTs: one client, built
         // from it, with no second client or builder to replace it.
         assert!(code.contains("letclient=builder.build().with_context("));
         assert_eq!(code.matches("letclient").count(), 1, "a second client");
-        assert_eq!(code.matches("Client::").count(), 1, "a second client");
-        assert!(!code.contains("ClientBuilder"), "a second builder");
+        assert_eq!(code.matches("Client::").count(), 0, "a second client");
+        assert_eq!(
+            code.matches("ClientBuilder").count(),
+            1,
+            "a second builder (the one expected is the `base` parameter)"
+        );
         assert!(!code.contains("builder="), "the builder replaced");
         assert!(code.contains("client.post("));
         assert!(
@@ -983,9 +1013,9 @@ mod tests {
         }
     }
 
-    /// Runs the real `upload_report` against a local server answering with
-    /// `status` and `body`. Plain HTTP, so it covers everything after the TLS
-    /// handshake; a proxy set in the environment would intercept it.
+    /// Runs the real upload against a local server answering with `status` and
+    /// `body`. Plain HTTP, so it covers everything after the TLS handshake;
+    /// proxy settings in the environment are ignored so they cannot intercept.
     async fn upload_against(status: u16, body: String) -> Result<()> {
         use httptest::{Expectation, Server, matchers::request, responders::status_code};
         let server = Server::run();
@@ -999,7 +1029,23 @@ mod tests {
             no_message: true,
             server: server.url("/api/reports").to_string(),
         };
-        command.upload_report(&sample_report()).await
+        command
+            .upload_report_with(&sample_report(), reqwest::Client::builder().no_proxy())
+            .await
+    }
+
+    /// The upload reads its reply through the cap. Leading whitespace is valid
+    /// JSON, so only a capped read can fail on this reply.
+    #[tokio::test]
+    async fn upload_reads_the_reply_through_the_cap() {
+        let padded = format!("{}{{\"code\":\"Q69UF2\"}}", " ".repeat(MAX_RESPONSE_BYTES));
+        let error = upload_against(200, padded)
+            .await
+            .expect_err("the reply lies beyond the cap");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to parse upload response. {SEND_LOCALLY_HINT}")
+        );
     }
 
     #[tokio::test]
@@ -1066,7 +1112,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(read_capped(&mut response).await.len(), MAX_RESPONSE_BYTES);
+        let (body, read_error) = read_capped(&mut response).await;
+        assert!(read_error.is_none());
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
     }
 
     #[test]
@@ -1169,6 +1217,9 @@ mod tests {
             assert_eq!(printable_error_body(&format!("a{c}b")), "a b", "{c:?}");
         }
         assert_eq!(printable_error_body("a \n\t  \r\n b"), "a b");
+        // Leading and trailing whitespace (an error page's final newline) is
+        // dropped rather than shown before the hint.
+        assert_eq!(printable_error_body("\n  Forbidden\n"), "Forbidden");
         // Ordinary text, including non-ASCII, passes through untouched.
         let text = "日本語 é\u{a0}x\u{ae}";
         assert_eq!(printable_error_body(text), text);
