@@ -247,6 +247,20 @@ const freloadStripDecision = new Function(
     'a stamp years in the future re-decides every window, never a delay past it',
     freloadStripDecision(`${base}?_freload=99999999999999-1`, T).delay === 60_000,
   );
+  // ...and is still kept when the clock reaches it, through its whole window,
+  // while the cap honours it (Codex on #5750: the sweep's three hops never got
+  // there). Dropped only at its end, when the cap gives a fresh budget anyway.
+  {
+    const S = T + 3 * 365 * 86_400_000;
+    const far = `${base}?_freload=${S}-3`;
+    const keptThrough = freloadStripDecision(far, S - 1).delay > 0 && [S, S + 1, S + 30_000, S + 59_999].every(
+      (t) => freloadStripDecision(far, t).delay > 0 && !reloadUrlCapDecision(far, t).allow,
+    );
+    check(
+      'a far-future maxed stamp is kept through its own window (the cap refuses there)',
+      keptThrough && freloadStripDecision(far, S + 60_000).delay === 0,
+    );
+  }
   // The two windows are one value: the strip is cap-safe only because it
   // expires a stamp exactly when the cap stops honouring it.
   {

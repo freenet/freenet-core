@@ -89,18 +89,13 @@
       // its params/locals) so the extraction works.
       function connectingRecoveryDecision(search, atTop, now, pathname) {
         var RECOVERY_MAX_MS = 120000; // 2 min: bound the retry-in-place loop
-        var m = /[?&]_freload=([^&]*)/.exec(search || '');
+        // Read the stamp as the shell's cap does (URLSearchParams: the name
+        // percent-decoded, `_fre%6Coad` is `_freload`), and without throwing
+        // on a malformed escape (`%E0%A4%A`), which decodeURIComponent did
+        // inside the retry timer, leaving the page on "Connecting" for good.
+        var val = new URLSearchParams(search || '').get('_freload');
         var recoveryStart = null;
-        if (m) {
-          var val;
-          try {
-            val = decodeURIComponent(m[1]);
-          } catch (e) {
-            // A malformed escape (`%E0%A4%A`) would throw inside the retry
-            // timer and leave the page on "Connecting" for good: read it as
-            // an unmarked request instead.
-            val = '';
-          }
+        if (val !== null) {
           var dash = val.indexOf('-');
           var ts = parseInt(dash >= 0 ? val.slice(0, dash) : val, 10);
           if (isFinite(ts)) recoveryStart = ts;
