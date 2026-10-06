@@ -49,8 +49,8 @@ const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "[::1]"];
 /// Appended to upload failures. Private, not the public Matrix room: the saved
 /// report holds the node's config and recent logs (peer addresses included).
 const SEND_LOCALLY_HINT: &str = "To send it another way, re-run with `--local <PATH>` \
-     to save it to a file and send that file privately to a Freenet developer \
-     (it contains your config and recent logs)";
+     to save it to a file and send that file privately to a Freenet developer, \
+     e.g. as a direct message on Matrix (it contains your config and recent logs)";
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -414,32 +414,30 @@ impl ReportCommand {
             .body(compressed)
             .send()
             .await
-            .with_context(|| {
-                format!("Failed to upload report ({os_trust}). {SEND_LOCALLY_HINT}")
+            .map_err(|error| {
+                // The trust summary only explains connection and TLS failures;
+                // on a DNS error or timeout it would send the user chasing CAs.
+                let trust = if error.is_connect() {
+                    format!(" ({os_trust})")
+                } else {
+                    String::new()
+                };
+                anyhow::Error::new(error).context(format!(
+                    "Failed to upload report{trust}. {SEND_LOCALLY_HINT}"
+                ))
             })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            // A proxy block page can be a whole HTML document: keep the hint
-            // visible, and keep server-sent control characters off the terminal.
-            let body: Vec<char> = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\n')
-                .collect();
-            let mut shown: String = body.iter().take(500).collect();
-            if body.len() > 500 {
-                shown.push('…');
-            }
-            anyhow::bail!("Upload failed: {status} - {shown}. {SEND_LOCALLY_HINT}");
+            let body = printable_error_body(&response.text().await.unwrap_or_default());
+            anyhow::bail!("Upload failed: {status} - {body}. {SEND_LOCALLY_HINT}");
         }
 
+        // A 200 that is not our JSON is usually a captive portal or proxy page.
         let upload_response: UploadResponse = response
             .json()
             .await
-            .context("Failed to parse upload response")?;
+            .with_context(|| format!("Failed to parse upload response. {SEND_LOCALLY_HINT}"))?;
 
         println!(" done");
         println!();
@@ -451,6 +449,30 @@ impl ReportCommand {
 
         Ok(())
     }
+}
+
+/// Maximum characters of an HTTP error body shown to the user.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// Makes a server- or proxy-sent error body safe and short enough to print: a
+/// block page can be a whole HTML document, and its bytes must not drive the
+/// terminal (escape sequences, carriage returns, bidi overrides).
+fn printable_error_body(body: &str) -> String {
+    let mut chars = body.chars().filter_map(|c| match c {
+        '\n' => Some(c),
+        '\t' | '\r' => Some(' '),
+        // Bidi controls, zero-width characters and the BOM (category Cf),
+        // which `is_control` (Cc only) lets through.
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+        '\u{FEFF}' => None,
+        c if c.is_control() => None,
+        c => Some(c),
+    });
+    let mut shown: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push('…');
+    }
+    shown
 }
 
 /// Find log files matching the given prefix.
@@ -862,7 +884,32 @@ mod tests {
         assert!(code.contains("letclient=builder.build()?;"));
         assert_eq!(code.matches("letclient").count(), 1, "a second client");
         assert_eq!(code.matches("Client::").count(), 1, "a second client");
+        assert!(!code.contains("ClientBuilder"), "a second builder");
+        assert!(!code.contains("builder="), "the builder replaced");
         assert!(code.contains("client.post("));
+        // Failures carry the diagnosis and the way out.
+        assert!(code.contains("({os_trust})"), "trust summary not shown");
+        assert_eq!(
+            code.matches("SEND_LOCALLY_HINT").count(),
+            3,
+            "send, status and parse failures each carry the hint"
+        );
+    }
+
+    #[test]
+    fn printable_error_body_keeps_terminal_control_out_and_marks_truncation() {
+        // Escape sequences, CR and bidi overrides cannot reach the terminal.
+        assert_eq!(
+            printable_error_body("a\u{1b}[2Jb\rc\td\u{202E}e\u{200B}f\ng"),
+            "a[2Jb c def\ng"
+        );
+        let exactly = "x".repeat(MAX_ERROR_BODY_CHARS);
+        assert_eq!(printable_error_body(&exactly), exactly);
+        let over = "x".repeat(MAX_ERROR_BODY_CHARS + 1);
+        assert_eq!(printable_error_body(&over), format!("{exactly}…"));
+        // Stripped characters do not count toward the limit.
+        let padded = format!("{}{exactly}", "\u{1b}".repeat(10));
+        assert_eq!(printable_error_body(&padded), exactly);
     }
 
     #[test]

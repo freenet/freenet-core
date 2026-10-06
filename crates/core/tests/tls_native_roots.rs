@@ -76,8 +76,9 @@ fn only_opted_in_clients_trust_ca_installed_in_os_trust_store() {
     // the environment. This is the only test in this binary.
     unsafe {
         std::env::set_var("SSL_CERT_FILE", CA_PEM_PATH);
-        // cargo exports SSL_CERT_DIR (the system CA directory) to the tests it
-        // runs; left set, rustls-native-certs loads it alongside the file.
+        // cargo exports SSL_CERT_FILE and SSL_CERT_DIR (its probed system CA
+        // paths) to the tests it runs; a leftover SSL_CERT_DIR would be loaded
+        // alongside the file.
         std::env::remove_var("SSL_CERT_DIR");
     }
     tokio::runtime::Builder::new_current_thread()
@@ -112,6 +113,13 @@ async fn check_trust() {
         (os_trust.found, os_trust.added),
         (1, 1),
         "SSL_CERT_FILE holds exactly the test CA: {os_trust}"
+    );
+    // The override is named, since it is the user's clue when it is stale.
+    assert_eq!(
+        os_trust.to_string(),
+        format!(
+            "1 of 1 certificates from SSL_CERT_FILE={CA_PEM_PATH} added, in place of the OS trust store"
+        )
     );
     let client = builder.build().unwrap();
     let response = client
