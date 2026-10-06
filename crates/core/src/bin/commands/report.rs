@@ -516,7 +516,7 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 /// overrides), so it is shown as one plain line with runs of spaces collapsed.
 fn printable_error_body(body: &str) -> String {
     let mut after_space = false;
-    // The body was read through `read_capped`, so this is at most 64 KiB.
+    // Bounded: the body comes from `read_capped` (at most 64 KiB of bytes).
     let cleaned: String = body
         .chars()
         .filter_map(|c| match c {
@@ -1300,7 +1300,7 @@ mod tests {
         );
         let exactly = "x".repeat(MAX_ERROR_BODY_CHARS);
         assert_eq!(
-            printable_error_body(&format!("{exactly}\u{200b}\n")),
+            printable_error_body(&format!("{exactly} \u{200b}")),
             exactly,
             "only stripped characters followed: nothing was cut off"
         );
