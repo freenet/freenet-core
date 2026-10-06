@@ -241,6 +241,9 @@ regex = { workspace = true }
 serial_test = { workspace = true }
 url = "2"
 tower = { version = "0.5", features = ["util"] }
+# Test-only HTTPS server for tests/tls_native_roots.rs. Already in the graph via
+# hyper-rustls; ring only, since default features would add aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]

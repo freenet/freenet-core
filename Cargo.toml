@@ -39,7 +39,11 @@ socket2 = "0.6"
 headers = "0.4"
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config", "tls-ring"] }
 http = "1.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# rustls-tls-native-roots on top of the bundled webpki roots: reqwest unions the
+# two, so CAs installed in the OS trust store are also accepted. Without it,
+# users behind TLS-intercepting proxies (corporate networks) fail every HTTPS
+# call (`freenet service report`, update checks) with `UnknownIssuer`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.18"
 tokio-tungstenite = "0.27.0"

@@ -22,10 +22,13 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio_tungstenite::connect_async;
 
-const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
+/// Older releases upload to `https://nova.locut.us/api/reports`; the server
+/// keeps that route for them.
+const DEFAULT_REPORT_SERVER: &str = "https://telemetry.freenet.org/api/reports";
 /// Only include log entries from the last 30 minutes
 const LOG_RETENTION_MINUTES: i64 = 30;
-/// Maximum size for all logs combined in the report (2 MB)
+/// Maximum size of each log stream in the report (2 MB for the main log and
+/// 2 MB for the error log)
 const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
 /// Maximum length for a single log line (10 KB) - longer lines are truncated
 const MAX_LINE_LENGTH: usize = 10 * 1024;
@@ -399,7 +402,10 @@ impl ReportCommand {
             .body(compressed)
             .send()
             .await
-            .context("Failed to upload report")?;
+            .context(
+                "Failed to upload report. To send it another way, re-run with \
+                 `--local <PATH>` to save it to a file instead",
+            )?;
 
         if !response.status().is_success() {
             let status = response.status();
