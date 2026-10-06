@@ -106,6 +106,13 @@ xz2 = { workspace = true }
 # `blocking` named explicitly (not just inherited via feature unification from
 # opentelemetry-http) because tracing::otel constructs reqwest::blocking::Client.
 reqwest = { workspace = true, features = ["blocking"] }
+# util::os_trust: opt-in OS trust store for `freenet service report` only (see
+# that module for why it is not the workspace-wide default).
+rustls-native-certs = "0.8.4"
+# Already in the graph via reqwest; only RootCertStore is used, so no provider.
+# Keep it semver-compatible with reqwest's rustls: os_trust probes certificates
+# with it on the assumption that reqwest validates them identically.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).
 rpassword = "7"
@@ -241,6 +248,9 @@ regex = { workspace = true }
 serial_test = { workspace = true }
 url = "2"
 tower = { version = "0.5", features = ["util"] }
+# Test-only HTTPS server for tests/tls_native_roots.rs. Already in the graph via
+# hyper-rustls; ring only, since default features would add aws-lc-rs.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 # CI-optimized benchmark suite (~5 min, deterministic)
 [[bench]]

@@ -10,6 +10,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
+use freenet::util::os_trust::{OsTrustSummary, add_os_root_certificates};
 use freenet_stdlib::client_api::{
     ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery,
     QueryResponse, WebApi,
@@ -22,10 +23,13 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio_tungstenite::connect_async;
 
-const DEFAULT_REPORT_SERVER: &str = "https://nova.locut.us/api/reports";
+/// Older releases upload to `https://nova.locut.us/api/reports`; the server
+/// keeps that route for them.
+const DEFAULT_REPORT_SERVER: &str = "https://telemetry.freenet.org/api/reports";
 /// Only include log entries from the last 30 minutes
 const LOG_RETENTION_MINUTES: i64 = 30;
-/// Maximum size for all logs combined in the report (2 MB)
+/// Maximum size of each log stream in the report (2 MB for the main log and
+/// 2 MB for the error log)
 const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
 /// Maximum length for a single log line (10 KB) - longer lines are truncated
 const MAX_LINE_LENGTH: usize = 10 * 1024;
@@ -42,6 +46,11 @@ const WS_RETRY_ATTEMPTS: u32 = 1;
 /// `ws-api-address = "::"` combined with `IPV6_V6ONLY=1` (or a v4-only
 /// bind) doesn't silently drop the diagnostics.
 const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "[::1]"];
+/// Appended to upload failures. Private, not the public Matrix room: the saved
+/// report holds the node's config and recent logs (peer addresses included).
+const SEND_LOCALLY_HINT: &str = "To send it another way, re-run with `--local <PATH>` \
+     to save it to a file and send that file privately to a Freenet developer, \
+     e.g. as a direct message on Matrix (it contains your config and recent logs)";
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportCommand {
@@ -375,6 +384,17 @@ impl ReportCommand {
     }
 
     async fn upload_report(&self, report: &DiagnosticReport) -> Result<()> {
+        self.upload_report_with(report, reqwest::Client::builder())
+            .await
+    }
+
+    /// `base` is a fresh `reqwest::Client::builder()` in production; tests pass
+    /// one that ignores proxy settings in the environment.
+    async fn upload_report_with(
+        &self,
+        report: &DiagnosticReport,
+        base: reqwest::ClientBuilder,
+    ) -> Result<()> {
         println!();
         print!("Uploading report...");
         io::stdout().flush()?;
@@ -388,40 +408,145 @@ impl ReportCommand {
         let compressed = encoder.finish()?;
 
         // Upload
-        let client = reqwest::Client::builder()
-            .user_agent("freenet-report")
-            .build()?;
+        // OS roots so this works behind TLS-intercepting proxies, whose CA
+        // lives in the OS store (see util::os_trust for why only here).
+        let (builder, os_trust) = add_os_root_certificates(
+            base.user_agent("freenet-report")
+                .connect_timeout(StdDuration::from_secs(30))
+                .timeout(StdDuration::from_secs(300)),
+        );
+        let client = builder
+            .build()
+            .with_context(|| format!("Failed to set up the upload. {SEND_LOCALLY_HINT}"))?;
 
-        let response = client
+        let mut response = client
             .post(&self.server)
             .header("Content-Type", "application/json")
             .header("Content-Encoding", "gzip")
             .body(compressed)
             .send()
             .await
-            .context("Failed to upload report")?;
+            .map_err(|error| upload_send_error(error, &os_trust))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("Upload failed: {} - {}", status, body);
+        // Capped whatever the status: a captive portal or proxy page can be
+        // large, and this upload trusts more CAs than any other client.
+        let status = response.status();
+        let (body, read_error) = read_capped(&mut response).await;
+        if !status.is_success() {
+            // Whatever arrived is worth showing, even if the read broke off.
+            let shown = printable_error_body(&String::from_utf8_lossy(&body));
+            anyhow::bail!("Upload failed: {status} - {shown}. {SEND_LOCALLY_HINT}");
+        }
+        if let Some(error) = read_error {
+            return Err(anyhow::Error::new(error).context(format!(
+                "Failed to read upload response. {SEND_LOCALLY_HINT}"
+            )));
         }
 
-        let upload_response: UploadResponse = response
-            .json()
-            .await
-            .context("Failed to parse upload response")?;
+        // A 200 that is not our JSON is usually a captive portal or proxy page.
+        let upload_response: UploadResponse = serde_json::from_slice(&body)
+            .with_context(|| format!("Failed to parse upload response. {SEND_LOCALLY_HINT}"))?;
+        // The response may come through an interceptor this upload trusts, so
+        // never print a code that could drive the terminal.
+        let code = validated_report_code(&upload_response.code)
+            .with_context(|| format!("Unexpected upload response. {SEND_LOCALLY_HINT}"))?;
 
         println!(" done");
         println!();
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  Report code: {}", upload_response.code);
+        println!("  Report code: {code}");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!();
         println!("Share this code with the Freenet team on Matrix.");
 
         Ok(())
     }
+}
+
+/// Context for a failed send, with the trust summary only when it explains the
+/// failure (see `OsTrustSummary::explaining`).
+fn upload_send_error(error: reqwest::Error, os_trust: &OsTrustSummary) -> anyhow::Error {
+    let message = upload_failure_message(os_trust.explaining(&error));
+    anyhow::Error::new(error).context(message)
+}
+
+fn upload_failure_message(os_trust: Option<&OsTrustSummary>) -> String {
+    match os_trust {
+        Some(summary) => format!("Failed to upload report ({summary}). {SEND_LOCALLY_HINT}"),
+        None => format!("Failed to upload report. {SEND_LOCALLY_HINT}"),
+    }
+}
+
+/// Upper bound on how much of a response body is read. The real reply is a few
+/// bytes of JSON; only the first [`MAX_ERROR_BODY_CHARS`] of an error are shown.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Reads at most [`MAX_RESPONSE_BYTES`] of the body, returning what arrived
+/// and the error that ended the read early, if one did.
+async fn read_capped(response: &mut reqwest::Response) -> (Vec<u8>, Option<reqwest::Error>) {
+    let mut raw = Vec::new();
+    while raw.len() < MAX_RESPONSE_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_RESPONSE_BYTES - raw.len();
+                raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) => break,
+            Err(error) => return (raw, Some(error)),
+        }
+    }
+    (raw, None)
+}
+
+/// Report codes are short ASCII tokens (six characters from the server).
+fn validated_report_code(code: &str) -> Result<&str> {
+    anyhow::ensure!(
+        (4..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "the server returned an unexpected report code"
+    );
+    Ok(code)
+}
+
+/// Maximum characters of an HTTP error body shown to the user.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// Makes a server- or proxy-sent error body safe and short enough to print: a
+/// block page can be a whole HTML document, and its bytes must not drive the
+/// terminal (escape sequences, line breaks that fake extra output, bidi
+/// overrides), so it is shown as one plain line with runs of spaces collapsed.
+fn printable_error_body(body: &str) -> String {
+    let mut after_space = false;
+    // Bounded: the body comes from `read_capped` (at most 64 KiB of bytes).
+    let cleaned: String = body
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' | ' ' => Some(' '),
+            // Format characters (category Cf) that reorder or hide text, which
+            // `is_control` (Cc only) lets through.
+            '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}' => None,
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .filter(|&c| {
+            let repeated = c == ' ' && after_space;
+            after_space = c == ' ';
+            !repeated
+        })
+        .collect();
+    // Trimmed after stripping, so a dropped character next to the edge cannot
+    // leave a stray space, nor count as text that was cut off.
+    let mut chars = cleaned.trim().chars();
+    let mut shown: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push('…');
+    }
+    shown
 }
 
 /// Find log files matching the given prefix.
@@ -798,6 +923,398 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tests/tls_native_roots.rs proves `add_os_root_certificates` makes a
+    /// client trust a TLS-intercepting proxy's CA, and that the real rejection
+    /// is what `OsTrustSummary::explaining` recognises. This pins the wiring in
+    /// the binary, which no test can reach over TLS: without it, uploads fail
+    /// behind such proxies with `UnknownIssuer` and those tests stay green.
+    #[test]
+    fn upload_client_is_built_with_os_root_certificates() {
+        let src = include_str!("report.rs");
+        // Production hands the upload a fresh builder (tests pass one that
+        // ignores proxy settings)...
+        let entry = item_code(src, "    async fn upload_report(", "\n    }\n");
+        assert!(
+            entry.contains("self.upload_report_with(report,reqwest::Client::builder())"),
+            "upload_report must start from a fresh client builder"
+        );
+        let code = item_code(src, "    async fn upload_report_with(", "\n    }\n");
+        // ...which gets the OS roots. Built with concat! so this file's own
+        // text never contains the needle.
+        let helper_call = concat!("let(builder,os_trust)=add_os_root", "_certificates(base.");
+        assert!(
+            code.contains(helper_call),
+            "the upload must build its client with add_os_root_certificates"
+        );
+        // ...and that builder must be the one that POSTs: one client, built
+        // from it, with no second client or builder to replace it.
+        assert!(code.contains("letclient=builder.build().with_context("));
+        assert_eq!(code.matches("letclient").count(), 1, "a second client");
+        assert_eq!(code.matches("Client::").count(), 0, "a second client");
+        assert_eq!(
+            code.matches("ClientBuilder").count(),
+            1,
+            "a second builder (the one expected is the `base` parameter)"
+        );
+        assert!(!code.contains("builder="), "the builder replaced");
+        assert!(code.contains("client.post("));
+        assert!(
+            code.contains("upload_send_error(error,&os_trust)"),
+            "send failures lose the trust summary"
+        );
+        let send_error = item_code(src, "fn upload_send_error(", "\n}\n");
+        assert!(
+            send_error.contains("upload_failure_message(os_trust.explaining(&error))"),
+            "the summary is no longer chosen by OsTrustSummary::explaining"
+        );
+    }
+
+    /// Code-only text of the item starting at `signature` (outside the test
+    /// module): comment lines dropped and whitespace removed, so a rustfmt
+    /// reflow cannot break or satisfy a pin.
+    fn item_code(src: &str, signature: &str, end: &str) -> String {
+        let tests_at = src.find("#[cfg(test)]").expect("test module marker");
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` moved; update this pin"));
+        assert!(start < tests_at, "`{signature}` matched inside the tests");
+        let len = src[start..].find(end).expect("end of item");
+        src[start..start + len]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    fn sample_report() -> DiagnosticReport {
+        DiagnosticReport {
+            client_timestamp: "2025-01-01T00:00:00Z".to_string(),
+            system_info: SystemInfo {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                hostname: "test".to_string(),
+            },
+            version_info: VersionInfo {
+                version: "0.1.0".to_string(),
+                git_commit: "abc123".to_string(),
+                git_dirty: false,
+                build_timestamp: "2025-01-01".to_string(),
+            },
+            logs: LogContents {
+                main_log: None,
+                error_log: None,
+                main_log_size_bytes: 0,
+                error_log_size_bytes: 0,
+                main_log_original_size_bytes: 0,
+                error_log_original_size_bytes: 0,
+            },
+            config: None,
+            network_status: None,
+            network_status_error: None,
+            user_message: None,
+        }
+    }
+
+    /// Runs the real upload against a local server answering with `status` and
+    /// `body`. Plain HTTP, so it covers everything after the TLS handshake;
+    /// proxy settings in the environment are ignored so they cannot intercept.
+    async fn upload_against(status: u16, body: String) -> Result<()> {
+        use httptest::{Expectation, Server, matchers::request, responders::status_code};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/api/reports"))
+                .respond_with(status_code(status).body(body)),
+        );
+        let command = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: server.url("/api/reports").to_string(),
+        };
+        command
+            .upload_report_with(&sample_report(), reqwest::Client::builder().no_proxy())
+            .await
+    }
+
+    /// The upload reads its reply through the cap. Leading whitespace is valid
+    /// JSON, so only a capped read can fail on this reply.
+    #[tokio::test]
+    async fn upload_reads_the_reply_through_the_cap() {
+        let padded = format!("{}{{\"code\":\"Q69UF2\"}}", " ".repeat(MAX_RESPONSE_BYTES));
+        let error = upload_against(200, padded)
+            .await
+            .expect_err("the reply lies beyond the cap");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to parse upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    /// Serves one reply whose body stops short of its Content-Length, then
+    /// hangs up, so reading the reply fails part-way.
+    async fn truncated_reply_server(status_line: &'static str, partial: &'static str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/reports", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            // Take the whole request first, so the client is reading the reply
+            // (not still sending) when the connection drops.
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; length];
+            stream.read_exact(&mut request_body).await.unwrap();
+            let reply = format!(
+                "{status_line}\r\ncontent-length: {}\r\n\r\n{partial}",
+                partial.len() + 100
+            );
+            stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        });
+        url
+    }
+
+    async fn upload_to(url: String) -> Result<()> {
+        let command = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: url,
+        };
+        command
+            .upload_report_with(&sample_report(), reqwest::Client::builder().no_proxy())
+            .await
+    }
+
+    /// Even with the whole code received, a reply that breaks off is reported
+    /// as a failed read, not accepted or blamed on the reply's format.
+    #[tokio::test]
+    async fn upload_reports_a_reply_that_breaks_off() {
+        let url = truncated_reply_server("HTTP/1.1 200 OK", r#"{"code":"Q69UF2"}"#).await;
+        let error = upload_to(url)
+            .await
+            .expect_err("a broken-off reply is not a success");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to read upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    /// For an error status, whatever arrived is still shown.
+    #[tokio::test]
+    async fn upload_shows_what_arrived_of_an_error_page_that_breaks_off() {
+        let url = truncated_reply_server("HTTP/1.1 403 Forbidden", "Blocked by policy").await;
+        let error = upload_to(url).await.expect_err("a 403 fails the upload");
+        assert_eq!(
+            error.to_string(),
+            format!("Upload failed: 403 Forbidden - Blocked by policy. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_a_valid_code() {
+        upload_against(200, r#"{"code":"Q69UF2"}"#.into())
+            .await
+            .expect("a well-formed reply is accepted");
+    }
+
+    #[tokio::test]
+    async fn upload_failure_shows_a_capped_sanitised_body_and_the_hint() {
+        let page = format!(
+            "\u{1b}[2J<html>\n  <body>{}</body>",
+            "x".repeat(MAX_RESPONSE_BYTES * 2)
+        );
+        let error = upload_against(403, page)
+            .await
+            .expect_err("a 403 fails the upload")
+            .to_string();
+        assert!(!error.contains('\u{1b}'), "{error}");
+        assert!(
+            error.starts_with("Upload failed: 403 Forbidden - [2J<html> <body>xxx"),
+            "{error}"
+        );
+        assert!(error.contains("…."), "truncation not marked: {error}");
+        assert!(error.ends_with(SEND_LOCALLY_HINT), "{error}");
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_code_that_could_drive_the_terminal() {
+        let error = upload_against(200, r#"{"code":"\u001b]0;x\u0007"}"#.into())
+            .await
+            .expect_err("an escape sequence is not a report code");
+        assert_eq!(
+            error.to_string(),
+            format!("Unexpected upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_success_page_that_is_not_the_reply() {
+        let error = upload_against(200, "<html>Sign in to the network</html>".into())
+            .await
+            .expect_err("a captive portal page is not a reply");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to parse upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_is_capped() {
+        use httptest::{Expectation, Server, matchers::request, responders::status_code};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/"))
+                .respond_with(status_code(200).body("x".repeat(MAX_RESPONSE_BYTES * 2 + 7))),
+        );
+        let mut response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(server.url("/").to_string())
+            .send()
+            .await
+            .unwrap();
+        let (body, read_error) = read_capped(&mut response).await;
+        assert!(read_error.is_none());
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn upload_failure_shows_the_trust_summary_only_when_given() {
+        let summary = OsTrustSummary {
+            found: 3,
+            added: 2,
+            ..OsTrustSummary::default()
+        };
+        assert_eq!(
+            upload_failure_message(Some(&summary)),
+            format!(
+                "Failed to upload report (2 of 3 OS trust store certificates added). \
+                 {SEND_LOCALLY_HINT}"
+            )
+        );
+        assert_eq!(
+            upload_failure_message(None),
+            format!("Failed to upload report. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    /// A refused connection is a connect error (`is_connect()`), like a TLS
+    /// rejection, but the trust summary would mislead there.
+    #[tokio::test]
+    async fn refused_connection_does_not_show_the_trust_summary() {
+        // Bound but never listening: the port stays ours, and connecting to
+        // it is refused, with no window for another socket to take it.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(StdDuration::from_secs(10))
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing listens on the reserved port");
+        assert!(error.is_connect());
+        let summary = OsTrustSummary {
+            found: 3,
+            added: 2,
+            ..OsTrustSummary::default()
+        };
+        assert_eq!(
+            upload_send_error(error, &summary).to_string(),
+            upload_failure_message(None)
+        );
+    }
+
+    #[test]
+    fn report_codes_are_short_ascii_tokens() {
+        assert_eq!(validated_report_code("Q69UF2").unwrap(), "Q69UF2");
+        assert!(validated_report_code("ABCD").is_ok());
+        assert!(validated_report_code(&"A".repeat(32)).is_ok());
+        for bad in [
+            "",
+            "ABC",
+            "\u{1b}]0;pwned\u{7}",
+            "ABC DEF",
+            "ABC\nDEF",
+            "ÄBCDEF",
+        ] {
+            assert!(validated_report_code(bad).is_err(), "{bad:?} accepted");
+        }
+        assert!(validated_report_code(&"A".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn printable_error_body_keeps_terminal_control_out_and_marks_truncation() {
+        assert_eq!(printable_error_body(""), "");
+        // Each character that could drive or fake terminal output, including
+        // both ends of every stripped range and the bidi isolates inside one.
+        for c in [
+            '\u{1b}',
+            '\u{7f}',
+            '\u{9b}',
+            '\u{ad}',
+            '\u{61c}',
+            '\u{200b}',
+            '\u{200f}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{206f}',
+            '\u{feff}',
+            '\u{e0000}',
+            '\u{e007f}',
+        ] {
+            assert_eq!(printable_error_body(&format!("a{c}b")), "ab", "{c:?} kept");
+        }
+        // Line breaks and tabs become spaces, so the body cannot fake lines,
+        // and runs of them collapse so indentation does not use up the budget.
+        for c in ['\n', '\r', '\t', '\u{2028}', '\u{2029}'] {
+            assert_eq!(printable_error_body(&format!("a{c}b")), "a b", "{c:?}");
+        }
+        assert_eq!(printable_error_body("a \n\t  \r\n b"), "a b");
+        // Leading and trailing whitespace (an error page's final newline) is
+        // dropped rather than shown before the hint.
+        assert_eq!(printable_error_body("\n  Forbidden\n"), "Forbidden");
+        assert_eq!(
+            printable_error_body("\u{1b} Forbidden \u{200b}"),
+            "Forbidden"
+        );
+        let exactly = "x".repeat(MAX_ERROR_BODY_CHARS);
+        assert_eq!(
+            printable_error_body(&format!("{exactly} \u{200b}")),
+            exactly,
+            "only stripped characters followed: nothing was cut off"
+        );
+        // Ordinary text, including non-ASCII, passes through untouched.
+        let text = "日本語 é\u{a0}x\u{ae}";
+        assert_eq!(printable_error_body(text), text);
+        let exactly = "é".repeat(MAX_ERROR_BODY_CHARS);
+        assert_eq!(printable_error_body(&exactly), exactly);
+        let over = "é".repeat(MAX_ERROR_BODY_CHARS + 1);
+        assert_eq!(printable_error_body(&over), format!("{exactly}…"));
+        // Stripped characters do not count toward the limit.
+        let padded = format!("{}{exactly}", "\u{1b}".repeat(10));
+        assert_eq!(printable_error_body(&padded), exactly);
+    }
 
     #[test]
     fn test_format_bytes() {
