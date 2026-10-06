@@ -78,8 +78,8 @@ WHEN accepting a new connection (should_accept):
      populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
      not just over-cap lattice ones), so on a node AT max unrelated in-flight
      handshakes can throttle tightening until they drain (bounded by the TTL;
-     discovery retries, staying awake since a refused closer peer is not a probe
-     miss). This only bites nodes genuinely at max (mostly
+     a refused closer peer is a failed hit, so discovery re-checks on its retry
+     ladder). This only bites nodes genuinely at max (mostly
      busy gateways); a peer below max tightens via the under-cap path, which never
      consults this ceiling. A lattice-private budget is a possible future
      refinement. A second, independent bound: each admitted candidate that
@@ -96,7 +96,7 @@ WHEN accepting a new connection (should_accept):
      launch. A miss on each side in the current generation puts discovery to
      sleep until a per-side nearest distance changes (fill, tighten, loss, or
      widening) or a re-check starts a new generation: 2h doubling to 16h, or
-     10 min doubling to 2h if a closer peer was found but could not be
+     10 min doubling to 16h if a closer peer was found but could not be
      connected (a failed hit; separate attempt counter, and a late failed hit
      shortens a sleep already begun). A miss is EVIDENCE, not proof: a failed
      hole punch, a near-terminus relay, or a recently-failed nearest peer, or

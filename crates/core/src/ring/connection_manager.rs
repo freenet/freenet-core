@@ -1170,6 +1170,13 @@ impl ConnectionManager {
             .fold(None, |acc, d| Some(acc.map_or(d, |a: f64| a.min(d))))
     }
 
+    /// Whether this peer is at (or over) its `max_connections`. A lattice probe
+    /// acceptor that failed to connect at the cap may have been refused by our
+    /// own cap (see [`Self::record_lattice_probe_result`]).
+    pub(crate) fn at_max_connections(&self) -> bool {
+        self.connection_count() >= self.max_connections
+    }
+
     /// Whether the peer `addr` at `loc` is, or on connecting would become, this
     /// peer's NEAREST connected neighbor on its own ring side, i.e. a lattice
     /// edge. A connection to `addr` itself is ignored (other peers at the same
@@ -1216,9 +1223,11 @@ impl ConnectionManager {
     /// re-routed past the peer it failed on, so where it lands next is weak
     /// evidence), except at the cap: there our own cap refuses every
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
-    /// lattice edge that could not be connected is recorded as a failed hit
-    /// (the cap admits lattice edges, so that failure is genuine), and the
-    /// scheduler re-checks soon. Returns whether a miss was recorded.
+    /// lattice edge that could not be connected, for any reason (a failed hole
+    /// punch, or our own refusal at the cap, whose outbound pre-flight check
+    /// does not exempt lattice edges), is recorded as a failed hit, and the
+    /// scheduler re-checks on its retry ladder. Returns whether a miss was
+    /// recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
@@ -1403,8 +1412,8 @@ impl ConnectionManager {
     /// is GLOBAL (shared with unrelated in-flight handshakes), not lattice-private:
     /// a node genuinely AT max whose budget is already consumed by ordinary CONNECT
     /// traffic has its over-cap tightening throttled until those reservations drain
-    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; discovery retries,
-    /// staying awake since a refused closer peer is not a probe miss). This bites
+    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; a refused closer peer
+    /// is a failed hit, so discovery re-checks on its retry ladder). This bites
     /// only for nodes at max (mostly busy gateways) — a peer below max tightens
     /// via the under-cap path, which never consults this ceiling. A
     /// lattice-private budget is a possible future refinement.
@@ -1461,8 +1470,9 @@ impl ConnectionManager {
         // non-stale reservations, and a node at max whose budget is already
         // consumed by ordinary CONNECT traffic throttles tightening until those
         // drain or expire (PENDING_RESERVATION_TTL). That is bounded and the
-        // discovery retries (a refused closer peer is not a probe miss, so it
-        // stays awake); the global count is also the more conservative choice
+        // discovery re-checks (a refused closer peer is a failed hit, which
+        // puts it on the retry ladder); the global count is also the more
+        // conservative choice
         // for the hard ceiling. It only bites at nodes
         // genuinely AT max (mostly busy gateways) — a peer below max tightens via
         // the under-cap path, which never consults this ceiling. A lattice-private
@@ -4295,7 +4305,8 @@ mod tests {
             false
         ));
         assert_eq!(cm.lattice_probe_misses(), misses(0, 0));
-        // A predecessor at 0.10 is farther than both held nearest: both sides.
+        // A predecessor at distance 0.10 is farther than both held nearest:
+        // both sides.
         assert!(cm.record_lattice_probe_result(
             Location::new(0.40),
             make_addr(9003),
@@ -4324,6 +4335,17 @@ mod tests {
             false
         ));
         assert_eq!(cm.lattice_probe_misses().succ, 7);
+
+        // Exactly as far as the other side's nearest is not evidence for it.
+        let cm = cm_with(0.5, &[(0.55, 8551), (0.40, 8552)]);
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.60),
+            make_addr(9051),
+            8,
+            true,
+            false
+        ));
+        assert_eq!(cm.lattice_probe_misses(), misses(8, 0));
 
         // Successor nearest 0.01, predecessor nearest 0.2: a successor miss at
         // 0.1 says nothing about the predecessor side.
@@ -4400,6 +4422,69 @@ mod tests {
             false
         ));
         assert_eq!(cm.lattice_probe_misses(), misses(1, 0));
+    }
+
+    /// A peer at max_connections can put lattice discovery to sleep: the
+    /// non-lattice acceptors our own cap refuses still count as misses, and
+    /// the scheduler then stops probing (#5814).
+    #[tokio::test(start_paused = true)]
+    async fn lattice_discovery_sleeps_at_max_connections() {
+        use crate::ring::{LatticeProbeScheduler, lattice_probe_timing as t};
+        use crate::util::backoff::ExponentialBackoff;
+        let cm = make_connection_manager(None, 1, 4, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        for (l, port) in [(0.55, 8601), (0.45, 8602), (0.7, 8603), (0.3, 8604)] {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(port),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert!(cm.at_max_connections());
+        let mut s = LatticeProbeScheduler::new(
+            Instant::now(),
+            cm.lattice_probe_misses(),
+            ExponentialBackoff::new(t::TAU0, t::TAU_MAX),
+            ExponentialBackoff::new(t::RECHECK_MIN, t::RECHECK_MAX),
+            ExponentialBackoff::new(t::RETRY_MIN, t::RETRY_MAX),
+        );
+        assert!(s.tick_for(&cm, Instant::now(), || 1.0).fired.is_some());
+        // The probe lands on two non-lattice peers our cap refused.
+        let g = s.generation();
+        let at_cap = cm.at_max_connections();
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.62),
+            make_addr(9601),
+            g,
+            false,
+            at_cap
+        ));
+        assert!(cm.record_lattice_probe_result(
+            Location::new(0.38),
+            make_addr(9602),
+            g,
+            false,
+            at_cap
+        ));
+        for _ in 0..60 {
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            assert!(
+                s.tick_for(&cm, Instant::now(), || 1.0).fired.is_none(),
+                "a tight lattice at max must not keep probing"
+            );
+        }
+    }
+
+    /// The re-check intervals outlast the recently-failed-address exclusion
+    /// they are meant to wait out, even at the low end of the +/-20% jitter.
+    #[test]
+    fn lattice_recheck_intervals_outlast_failed_addr_exclusion() {
+        use crate::ring::lattice_probe_timing as t;
+        assert!(t::RECHECK_MIN.mul_f64(0.8) > FAILED_ADDR_MAX_TTL);
+        assert!(t::RETRY_MIN.mul_f64(0.8) > FAILED_ADDR_BASE_TTL);
+        assert!(t::RETRY_MAX <= t::RECHECK_MAX);
     }
 
     /// Regression for the speculative-state over-cap ceiling: non-stale pending

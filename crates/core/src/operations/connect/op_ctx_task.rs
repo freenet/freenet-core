@@ -424,11 +424,11 @@ async fn drive_client_connect_inner(
                 // lattice changes or its re-check, instead of probing every
                 // tau_max and keeping a non-lattice link each time. Classified
                 // before the failure branch below can `continue`: at
-                // max_connections our own cap can refuse a non-lattice acceptor,
+                // max_connections our own cap refuses a non-lattice acceptor,
                 // which arrives here as a failure, but the probe did land there
                 // (otherwise a peer at max would never sleep). A lattice edge
-                // whose hole punch failed is reported as a failed hit, so the
-                // scheduler re-checks soon. An established link
+                // that could not be connected is reported as a failed hit, so
+                // the scheduler re-checks on its retry ladder. An established link
                 // is kept: dropping it would leave it dead on the far end until
                 // its idle timeout, since the transport has no close message.
                 if let ClientConnectKind::LatticeProbe { generation } = kind {
@@ -438,7 +438,7 @@ async fn drive_client_connect_inner(
                         acceptor_addr,
                         generation,
                         hole_punch_ok,
-                        cm.connection_count() >= cm.max_connections,
+                        cm.at_max_connections(),
                     ) {
                         tracing::debug!(
                             tx = %tx,
@@ -1736,37 +1736,36 @@ mod tests {
             squash(&rest[..rest.find(end).unwrap_or_else(|| panic!("end of {start}"))])
         };
 
-        // (1) ring.rs: the scheduler reads this peer's connection manager,
+        // (1) ring.rs, inside `connection_maintenance`: the scheduler reads
+        // this peer's connection manager before the acquisition drain, and
         // exactly one acquisition is tagged as a lattice probe (chosen by the
-        // probe-target comparison, with the scheduler's generation),
-        // `acquire_new` forwards the kind, and the miss count reaches the
-        // router snapshot.
+        // probe-target comparison, with the scheduler's generation);
+        // `acquire_new` forwards the kind; and the router snapshot task
+        // exports the miss count.
         let ring = prod(RING);
-        let ring_sq = squash(&ring);
+        let maintenance = item(&ring, "async fn connection_maintenance(", "\n    }\n");
+        let tick = maintenance
+            .find("lattice_probe.tick_for(&self.connection_manager,")
+            .expect("connection_maintenance must drive LatticeProbeScheduler from its own ConnectionManager");
+        let drain = maintenance
+            .find("whileletSome(ideal_location)=pending_conn_adds.pop_first()")
+            .expect("acquisition drain loop not found in connection_maintenance");
         assert!(
-            ring_sq.contains("lattice_probe.tick_for(&self.connection_manager,"),
-            "the maintenance loop must drive LatticeProbeScheduler from its own ConnectionManager"
+            tick < drain,
+            "the probe must be scheduled before the drain, so it launches in the same tick"
         );
         assert_eq!(
-            ring_sq.matches("ClientConnectKind::LatticeProbe{").count(),
+            squash(&ring)
+                .matches("ClientConnectKind::LatticeProbe{")
+                .count(),
             1,
             "ring.rs must tag exactly one acquisition as a lattice probe"
         );
         assert!(
-            ring_sq.contains(
+            maintenance.contains(
                 "iflattice_probe_target==Some(ideal_location){ClientConnectKind::LatticeProbe{generation:lattice_probe.generation(),}"
             ),
-            "the probe-target comparison must select the LatticeProbe tag with the current generation"
-        );
-        let tick = ring_sq
-            .find("lattice_probe.tick_for(&self.connection_manager,")
-            .unwrap();
-        let drain = ring_sq
-            .find("whileletSome(ideal_location)=pending_conn_adds.pop_first()")
-            .expect("acquisition drain loop not found");
-        assert!(
-            tick < drain,
-            "the probe must be scheduled before the drain, so it launches in the same tick"
+            "the drain in connection_maintenance must tag the probe target with the current generation"
         );
         let acquire = item(&ring, "async fn acquire_new(", "\n    }\n");
         assert!(
@@ -1774,9 +1773,14 @@ mod tests {
                 && acquire.contains("ideal_location,None,kind,)"),
             "acquire_new must forward its kind to start_client_connect"
         );
+        let snapshot = item(
+            &ring,
+            "async fn emit_router_snapshot_telemetry(",
+            "\n    }\n",
+        );
         assert!(
-            ring_sq.contains("snapshot.lattice_probe_misses=Some(cm.lattice_probe_miss_total());"),
-            "the router snapshot must export the probe miss count"
+            snapshot.contains("snapshot.lattice_probe_misses=Some(cm.lattice_probe_miss_total());"),
+            "the router snapshot task must export the probe miss count"
         );
 
         // (2) The client driver threads the kind through and classifies every
@@ -1811,7 +1815,7 @@ mod tests {
         let gate_block = &body[gate..failed];
         assert!(
             gate_block.contains(
-                "ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,hole_punch_ok,cm.connection_count()>=cm.max_connections,)"
+                "ifcm.record_lattice_probe_result(Location::from_address(&acceptor_addr),acceptor_addr,generation,hole_punch_ok,cm.at_max_connections(),)"
             ),
             "every probe acceptor must be classified, for the probe's generation"
         );
