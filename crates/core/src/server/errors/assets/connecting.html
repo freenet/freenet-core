@@ -92,7 +92,15 @@
         var m = /[?&]_freload=([^&]*)/.exec(search || '');
         var recoveryStart = null;
         if (m) {
-          var val = decodeURIComponent(m[1]);
+          var val;
+          try {
+            val = decodeURIComponent(m[1]);
+          } catch (e) {
+            // A malformed escape (`%E0%A4%A`) would throw inside the retry
+            // timer and leave the page on "Connecting" for good: read it as
+            // an unmarked request instead.
+            val = '';
+          }
           var dash = val.indexOf('-');
           var ts = parseInt(dash >= 0 ? val.slice(0, dash) : val, 10);
           if (isFinite(ts)) recoveryStart = ts;

@@ -2169,6 +2169,17 @@ fn shell_page(
             if super::client_api::is_sensitive_query_param(param) {
                 continue;
             }
+            // `_freload` is the shell's own recovery stamp (connecting.html
+            // and the 4401 reload cap read it from the TOP-LEVEL URL). In the
+            // app's frame it is a node-internal param in the app's
+            // `location.search`, and a stale one there would make a later
+            // framed connecting page read an expired window and give up
+            // instead of retrying. Dropped here only: the 308/303 redirects
+            // share `is_sensitive_query_param` and must keep it for the
+            // top-level bound.
+            if super::client_api::is_recovery_stamp_param(param) {
+                continue;
+            }
             iframe_params.push(param.to_string());
         }
     }
@@ -7511,6 +7522,32 @@ mod tests {
         assert!(
             html.contains(&format!("freenetBridge(\"{}\"", token.as_str())),
             "shell must still bind the freshly-generated auth token"
+        );
+    }
+
+    /// PR #5750 review: the shell's `_freload` recovery stamp must not reach
+    /// the app's iframe (its `data-src`), whatever the encoding of its name,
+    /// while the app's own params still do.
+    #[tokio::test]
+    async fn shell_page_drops_recovery_stamp_from_iframe_params() {
+        let token = AuthToken::generate();
+        let qs = Some("invite=abc&_freload=1700000000000-0&_fre%6Coad=1-1&b=2".to_string());
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
+        let data_src = html
+            .split("data-src=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("the shell has an iframe data-src");
+        assert!(
+            !data_src.contains("_freload") && !data_src.contains("_fre%6Coad"),
+            "the recovery stamp must not be forwarded into the iframe: {data_src}"
+        );
+        assert!(
+            data_src.contains("invite=abc") && data_src.contains("b=2"),
+            "the app's own params must still be forwarded: {data_src}"
         );
     }
 

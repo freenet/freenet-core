@@ -523,9 +523,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // count of 0 (connecting.html's own stamp, no recovery reload counted) at
   // once; a live window (count >= 1) once it has expired, when the cap ignores
   // it anyway. Returns null when there is nothing to drop, else { url, delay }:
-  // the URL without the param, and the ms to wait before dropping it.
+  // the URL without the param, and the ms to wait before dropping it. The
+  // delay is at most WINDOW_MS: a stamp further in the future (a hand-made
+  // link, or one written before a large backwards clock correction) is
+  // re-decided every WINDOW_MS instead, because a setTimeout delay past
+  // 2^31-1 ms fires at once and stripFreload would re-arm it without end.
   // WINDOW_MS must equal reloadUrlCapDecision's; shell_bridge_reload.test.mjs
-  // sweeps that stripping never loosens the cap.
+  // asserts it, and sweeps that stripping never loosens the cap.
   function freloadStripDecision(href, now) {
     var PARAM = '_freload';
     var WINDOW_MS = 60000;
@@ -548,7 +552,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Anything else (no count, a malformed stamp, an expired window) the cap
     // already treats as fresh: dropped at once.
     if (isFinite(ts) && isFinite(c) && c > 0 && ts + WINDOW_MS > now) {
-      delay = ts + WINDOW_MS - now;
+      delay = Math.min(ts + WINDOW_MS - now, WINDOW_MS);
     }
     return { url: url.toString(), delay: delay };
   }
@@ -573,12 +577,6 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   // close-recovery-decision:END
 
-  // Re-fetch THIS shell HTML to mint a fresh auth token — the autonomous
-  // recovery a manual refresh performs, now driven by the node's trusted 4401
-  // close (see AUTH_TOKEN_INVALID_CLOSE_CODE) rather than any iframe request.
-  // Bounded fail-closed by reloadUrlCapDecision, and once-per-document by
-  // recoveryReloadTriggered. location.replace (not assign) leaves no dead
-  // history entry.
   // Drop the recovery stamp from the address bar (see freloadStripDecision).
   // Re-decided from the CURRENT URL when the timer fires, since the shell's
   // hash forwarding may have replaced it meanwhile; history.state is kept.
@@ -597,6 +595,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   stripFreload();
 
+  // Re-fetch THIS shell HTML to mint a fresh auth token — the autonomous
+  // recovery a manual refresh performs, now driven by the node's trusted 4401
+  // close (see AUTH_TOKEN_INVALID_CLOSE_CODE) rather than any iframe request.
+  // Bounded fail-closed by reloadUrlCapDecision, and once-per-document by
+  // recoveryReloadTriggered. location.replace (not assign) leaves no dead
+  // history entry.
   function triggerRecoveryReload() {
     if (recoveryReloadTriggered) return;
     var decision = reloadUrlCapDecision(location.href, Date.now());

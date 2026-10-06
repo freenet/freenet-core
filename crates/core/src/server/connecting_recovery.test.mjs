@@ -204,6 +204,23 @@ check(
   );
 }
 
+// A malformed escape in the stamp (review of #5750): decodeURIComponent would
+// throw inside the retry timer and leave the page on "Connecting" for good.
+// Read as an unmarked request instead: an app link stamps and retries.
+{
+  let d = null;
+  let threw = null;
+  try {
+    d = connectingRecoveryDecision('?_freload=%E0%A4%A', true, NOW, APP_PATH);
+  } catch (e) {
+    threw = e;
+  }
+  check(
+    `a malformed _freload escape does not throw (${threw})`,
+    threw === null && d.action === 'stamp',
+  );
+}
+
 if (failures > 0) {
   console.error(
     `\nconnecting-recovery: ${checks - failures} passed, ${failures} failed`,

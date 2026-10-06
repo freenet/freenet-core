@@ -428,7 +428,7 @@ mod tests {
         );
         assert!(
             page.contains("function connectingRecoveryDecision("),
-            "the redirect decision must be a pure, testable function of (_freload, atTop, now)"
+            "the redirect decision must be a pure, testable function of (_freload, atTop, now, pathname)"
         );
         // MAJOR #3 (PR #4781 review): the retry-in-place must be BOUNDED, not a
         // 3s-forever loop. `_freload` carries a start timestamp; after the window

@@ -854,6 +854,14 @@ pub(super) fn is_sensitive_query_param(param: &str) -> bool {
     decoded.starts_with("__sandbox") || decoded.starts_with("authToken")
 }
 
+/// The shell's recovery stamp `_freload` (name percent-decoded, as above).
+/// Not part of [`is_sensitive_query_param`]: the canonicalising redirects must
+/// keep it (it bounds the top-level retry), only the app's iframe drops it.
+pub(super) fn is_recovery_stamp_param(param: &str) -> bool {
+    let name = param.split('=').next().unwrap_or(param);
+    percent_decode_ascii(name) == "_freload"
+}
+
 /// Percent-decodes the ASCII escapes in a query-parameter NAME so it can be
 /// compared against a literal. Deliberately minimal: invalid escapes are left
 /// as-is (they cannot form the names we are looking for), and non-ASCII bytes
