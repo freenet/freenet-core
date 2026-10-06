@@ -411,15 +411,24 @@ impl ReportCommand {
             .await
             .context(
                 "Failed to upload report. To send it another way, re-run with \
-                 `--local <PATH>` to save it to a file instead",
+                 `--local <PATH>` to save it to a file and share that file with \
+                 the Freenet team on Matrix",
             )?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // A proxy block page can be a whole HTML document; keep the hint visible.
+            let body: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
             anyhow::bail!(
                 "Upload failed: {} - {}. To send it another way, re-run with \
-                 `--local <PATH>` to save it to a file instead",
+                 `--local <PATH>` to save it to a file and share that file with \
+                 the Freenet team on Matrix",
                 status,
                 body
             );
@@ -816,6 +825,32 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tests/tls_native_roots.rs proves `add_os_root_certificates` makes a
+    /// client trust a TLS-intercepting proxy's CA; this pins that the upload
+    /// client is still built through it. Without it, uploads fail behind such
+    /// proxies with `UnknownIssuer` and that test stays green.
+    #[test]
+    fn upload_client_is_built_with_os_root_certificates() {
+        let src = include_str!("report.rs");
+        let tests_at = src.find("#[cfg(test)]").expect("test module marker");
+        let start = src
+            .find("    async fn upload_report(")
+            .expect("upload_report signature moved; update this pin");
+        assert!(start < tests_at, "matched inside the test module");
+        let len = src[start..]
+            .find("\n    }\n")
+            .expect("end of upload_report");
+        // Built with concat! so this file's own text never contains the needle.
+        let needle = concat!("let client = add_os_root", "_certificates(");
+        assert!(
+            src[start..start + len]
+                .lines()
+                .any(|line| line.trim_start().starts_with(needle)),
+            "upload_report must build its client with add_os_root_certificates \
+             (a statement, not a comment)"
+        );
+    }
 
     #[test]
     fn test_format_bytes() {

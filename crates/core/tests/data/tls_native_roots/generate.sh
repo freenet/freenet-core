@@ -5,10 +5,11 @@
 #   leaf.key.der  the server cert's PKCS#8 private key (test-only, not a secret)
 #
 # Validity is 2020-01-01 to 2126-01-01: backdated so a runner whose clock is
-# behind cannot see the certs as not yet valid. Run from this directory.
+# behind cannot see the certs as not yet valid. Keys are random, so commit all
+# three files together after regenerating.
 set -euo pipefail
 
-out="$(pwd)"
+out="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -r "$work"' EXIT
 cd "$work"

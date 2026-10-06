@@ -106,6 +106,10 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///     updating from publishes a signature — i.e. after the signed floor is
 ///     established — otherwise nodes on the unsigned lineage brick their own
 ///     auto-update.
+///
+/// While this is false, update fetches must trust only the bundled webpki
+/// roots, so they fail behind TLS-intercepting proxies. Once it is true they
+/// can opt in to the OS trust store via `freenet::util::os_trust`.
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
 
 // Tripwire for the two-release rollout, checked at compile time so flipping
