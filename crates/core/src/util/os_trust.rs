@@ -110,7 +110,9 @@ impl OsTrustSummary {
 /// server's certificate because no trusted CA vouches for it: the failure an
 /// [`OsTrustSummary`] explains. That is `UnknownIssuer` when the interceptor's
 /// CA is missing, or `BadSignature` when a same-named older copy of it is
-/// trusted (a root renewed with a new key, a stale `SSL_CERT_FILE`). Other
+/// trusted (a root renewed with a new key, a stale `SSL_CERT_FILE`); rustls
+/// also reports a server's mismatched handshake signature as `BadSignature`,
+/// but that needs a broken server or an active attack, so it is rare. Other
 /// certificate errors (an expired one usually means clock skew), DNS failures,
 /// refused connections and timeouts are not, and showing the summary for them
 /// would send the user chasing CAs.

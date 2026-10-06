@@ -516,8 +516,8 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 /// overrides), so it is shown as one plain line with runs of spaces collapsed.
 fn printable_error_body(body: &str) -> String {
     let mut after_space = false;
-    let mut chars = body
-        .trim()
+    // The body was read through `read_capped`, so this is at most 64 KiB.
+    let cleaned: String = body
         .chars()
         .filter_map(|c| match c {
             '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' | ' ' => Some(' '),
@@ -537,7 +537,11 @@ fn printable_error_body(body: &str) -> String {
             let repeated = c == ' ' && after_space;
             after_space = c == ' ';
             !repeated
-        });
+        })
+        .collect();
+    // Trimmed after stripping, so a dropped character next to the edge cannot
+    // leave a stray space, nor count as text that was cut off.
+    let mut chars = cleaned.trim().chars();
     let mut shown: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
     if chars.next().is_some() {
         shown.push('…');
@@ -1048,6 +1052,76 @@ mod tests {
         );
     }
 
+    /// Serves one reply whose body stops short of its Content-Length, then
+    /// hangs up, so reading the reply fails part-way.
+    async fn truncated_reply_server(status_line: &'static str, partial: &'static str) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/reports", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            // Take the whole request first, so the client is reading the reply
+            // (not still sending) when the connection drops.
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; length];
+            stream.read_exact(&mut request_body).await.unwrap();
+            let reply = format!(
+                "{status_line}\r\ncontent-length: {}\r\n\r\n{partial}",
+                partial.len() + 100
+            );
+            stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        });
+        url
+    }
+
+    async fn upload_to(url: String) -> Result<()> {
+        let command = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: url,
+        };
+        command
+            .upload_report_with(&sample_report(), reqwest::Client::builder().no_proxy())
+            .await
+    }
+
+    /// Even with the whole code received, a reply that breaks off is reported
+    /// as a failed read, not accepted or blamed on the reply's format.
+    #[tokio::test]
+    async fn upload_reports_a_reply_that_breaks_off() {
+        let url = truncated_reply_server("HTTP/1.1 200 OK", r#"{"code":"Q69UF2"}"#).await;
+        let error = upload_to(url)
+            .await
+            .expect_err("a broken-off reply is not a success");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to read upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    /// For an error status, whatever arrived is still shown.
+    #[tokio::test]
+    async fn upload_shows_what_arrived_of_an_error_page_that_breaks_off() {
+        let url = truncated_reply_server("HTTP/1.1 403 Forbidden", "Blocked by policy").await;
+        let error = upload_to(url).await.expect_err("a 403 fails the upload");
+        assert_eq!(
+            error.to_string(),
+            format!("Upload failed: 403 Forbidden - Blocked by policy. {SEND_LOCALLY_HINT}")
+        );
+    }
+
     #[tokio::test]
     async fn upload_accepts_a_valid_code() {
         upload_against(200, r#"{"code":"Q69UF2"}"#.into())
@@ -1220,6 +1294,16 @@ mod tests {
         // Leading and trailing whitespace (an error page's final newline) is
         // dropped rather than shown before the hint.
         assert_eq!(printable_error_body("\n  Forbidden\n"), "Forbidden");
+        assert_eq!(
+            printable_error_body("\u{1b} Forbidden \u{200b}"),
+            "Forbidden"
+        );
+        let exactly = "x".repeat(MAX_ERROR_BODY_CHARS);
+        assert_eq!(
+            printable_error_body(&format!("{exactly}\u{200b}\n")),
+            exactly,
+            "only stripped characters followed: nothing was cut off"
+        );
         // Ordinary text, including non-ASCII, passes through untouched.
         let text = "日本語 é\u{a0}x\u{ae}";
         assert_eq!(printable_error_body(text), text);
