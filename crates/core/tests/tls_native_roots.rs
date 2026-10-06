@@ -102,9 +102,13 @@ async fn check_trust() {
     );
 
     // The helper `freenet service report` builds its client with.
-    let client = add_os_root_certificates(test_client_builder())
-        .build()
-        .unwrap();
+    let (builder, os_trust) = add_os_root_certificates(test_client_builder());
+    assert_eq!(
+        (os_trust.found, os_trust.added),
+        (1, 1),
+        "SSL_CERT_FILE holds exactly the test CA: {os_trust}"
+    );
+    let client = builder.build().unwrap();
     let response = client
         .get(&url)
         .send()

@@ -394,13 +394,13 @@ impl ReportCommand {
         // Upload
         // OS roots so this works behind TLS-intercepting proxies, whose CA
         // lives in the OS store (see util::os_trust for why only here).
-        let client = add_os_root_certificates(
+        let (builder, os_trust) = add_os_root_certificates(
             reqwest::Client::builder()
                 .user_agent("freenet-report")
                 .connect_timeout(StdDuration::from_secs(30))
                 .timeout(StdDuration::from_secs(300)),
-        )
-        .build()?;
+        );
+        let client = builder.build()?;
 
         let response = client
             .post(&self.server)
@@ -409,11 +409,13 @@ impl ReportCommand {
             .body(compressed)
             .send()
             .await
-            .context(
-                "Failed to upload report. To send it another way, re-run with \
-                 `--local <PATH>` to save it to a file and share that file with \
-                 the Freenet team on Matrix",
-            )?;
+            .with_context(|| {
+                format!(
+                    "Failed to upload report ({os_trust}). To send it another way, \
+                     re-run with `--local <PATH>` to save it to a file and share \
+                     that file with the Freenet team on Matrix"
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -842,7 +844,7 @@ mod tests {
             .find("\n    }\n")
             .expect("end of upload_report");
         // Built with concat! so this file's own text never contains the needle.
-        let needle = concat!("let client = add_os_root", "_certificates(");
+        let needle = concat!("let (builder, os_trust) = add_os_root", "_certificates(");
         assert!(
             src[start..start + len]
                 .lines()
