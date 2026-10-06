@@ -1315,8 +1315,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
               } catch (e) {}
             });
             connections.clear();
-            // Build new sandbox URL preserving __sandbox=1
+            // Build new sandbox URL preserving __sandbox=1. `_freload` is
+            // the shell's own top-level recovery stamp: never the app's, so
+            // a same-contract link that carries one does not take it into
+            // the frame (a stale stamp there would make a later framed
+            // connecting page give up at once). See shell_page's filter.
             resolved.searchParams.set('__sandbox', '1');
+            resolved.searchParams.delete('_freload');
             var newIframePath =
               resolved.pathname + resolved.search + cappedHash;
             iframe.src = newIframePath;

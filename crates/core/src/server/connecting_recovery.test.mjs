@@ -120,6 +120,7 @@ for (const elapsed of [0, WINDOW_MS - 1, WINDOW_MS, WINDOW_MS + 1]) {
     window,
     location,
     URL,
+    URLSearchParams,
     Date: { now: () => NOW },
     setTimeout: (fn) => fn(),
   });
@@ -220,6 +221,15 @@ check(
     threw === null && d.action === 'stamp',
   );
 }
+
+// An encoded stamp NAME is the same stamp (review of #5750, Codex): the cap
+// reads `_fre%6Coad` as `_freload` (URLSearchParams), so the connecting page
+// must too — else an expired encoded stamp restarts the recovery window.
+check(
+  'an expired stamp with a percent-encoded name is the expired stamp',
+  connectingRecoveryDecision('?_fre%6Coad=1-3', true, NOW, APP_PATH).action ===
+    connectingRecoveryDecision('?_freload=1-3', true, NOW, APP_PATH).action,
+);
 
 if (failures > 0) {
   console.error(
