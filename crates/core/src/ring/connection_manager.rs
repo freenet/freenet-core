@@ -593,6 +593,17 @@ pub(crate) struct ConnectionManager {
     /// surfaced via the dashboard ring-stats provider.
     lattice_probes_issued: Arc<AtomicU64>,
     lattice_probe_improvements: Arc<AtomicU64>,
+    /// Route-to-self probes whose acceptor was not a lattice edge (#5814), on
+    /// the successor ([0]) and predecessor ([1]) side.
+    lattice_probe_misses: Arc<[AtomicU64; 2]>,
+}
+
+/// Per-side lattice probe miss counts, see
+/// [`ConnectionManager::record_lattice_probe_miss`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LatticeProbeMisses {
+    pub succ: u64,
+    pub pred: u64,
 }
 
 /// A point-in-time read of the version-gate refusal counters (#5156). See
@@ -746,6 +757,7 @@ impl ConnectionManager {
             acceptor_reliability: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             lattice_probes_issued: Arc::new(AtomicU64::new(0)),
             lattice_probe_improvements: Arc::new(AtomicU64::new(0)),
+            lattice_probe_misses: Arc::new([AtomicU64::new(0), AtomicU64::new(0)]),
         }
     }
 
@@ -1142,9 +1154,8 @@ impl ConnectionManager {
     /// ring. `false` for a location exactly at own location (on neither side) or
     /// when own location is unknown.
     ///
-    /// This is the keep/drop test for a route-to-self lattice probe's result
-    /// (#5814): the probe exists to fill or tighten the two lattice slots, so an
-    /// acceptor that is neither is dropped instead of kept as an extra link.
+    /// This classifies a route-to-self lattice probe's result (#5814): an
+    /// acceptor that neither fills nor tightens a side is a probe miss.
     pub(crate) fn is_per_side_nearest(&self, loc: Location) -> bool {
         let Some(me) = self.get_stored_location() else {
             return false;
@@ -1167,12 +1178,30 @@ impl ConnectionManager {
         sd.abs() < others_nearest
     }
 
-    /// Whether a route-to-self lattice probe keeps the acceptor at `loc` (#5814):
-    /// a lattice edge ([`Self::is_per_side_nearest`]) always, anything else only
-    /// while this peer is below `min_connections`, where every link is wanted
-    /// (and bootstrap targets share the probe's own-location target).
-    pub(crate) fn keeps_lattice_probe_acceptor(&self, loc: Location) -> bool {
-        self.connection_count() < self.min_connections || self.is_per_side_nearest(loc)
+    /// Record a lattice probe MISS: a route-to-self probe connected to a peer
+    /// at `loc` that is not a lattice edge. The probe lands on the nearest
+    /// unconnected peer, so a miss shows that `loc`'s side of the lattice is
+    /// tight; once both sides have missed, discovery can sleep
+    /// (`ring::LatticeProbeScheduler`, #5814). A peer at exactly own location
+    /// is on neither side and is not counted.
+    pub(crate) fn record_lattice_probe_miss(&self, loc: Location) {
+        let Some(me) = self.get_stored_location() else {
+            return;
+        };
+        let sd = me.signed_distance(loc);
+        if sd > 0.0 {
+            self.lattice_probe_misses[0].fetch_add(1, Ordering::Relaxed);
+        } else if sd < 0.0 {
+            self.lattice_probe_misses[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Monotonic lattice probe miss counts since startup, per side.
+    pub(crate) fn lattice_probe_misses(&self) -> LatticeProbeMisses {
+        LatticeProbeMisses {
+            succ: self.lattice_probe_misses[0].load(Ordering::Relaxed),
+            pred: self.lattice_probe_misses[1].load(Ordering::Relaxed),
+        }
     }
 
     /// Record that a route-to-self lattice discovery probe was ISSUED. Telemetry
@@ -4076,14 +4105,13 @@ mod tests {
         // that would leak force-active ON to a later same-thread test.
     }
 
-    /// The lattice probe's keep/drop test (#5814). Below min_connections every
-    /// acceptor is kept. At/above it, with both sides filled, a
-    /// peer farther than the per-side nearest is NOT a lattice edge, so the
-    /// probe drops it instead of adding a link; a strictly-closer peer
-    /// (tighten), a peer on an empty side (fill), and a peer that becomes the
-    /// nearest after the lattice edge on its side is lost are all kept. The
-    /// answer must not change once the peer itself is connected, because the
-    /// CONNECT driver may ask either before or after ring promotion.
+    /// The lattice probe's hit/miss test (#5814). With both sides filled, a
+    /// peer farther than the per-side nearest is NOT a lattice edge (a miss,
+    /// which lets discovery sleep); a strictly-closer peer (tighten), a peer on
+    /// an empty side (fill), and a peer that becomes the nearest after the
+    /// lattice edge on its side is lost are all edges. The answer must not
+    /// change once the peer itself is connected, because the CONNECT driver may
+    /// ask either before or after ring promotion.
     #[test]
     fn is_per_side_nearest_keeps_only_lattice_edges() {
         let cm = make_connection_manager(None, 2, 200, false);
@@ -4097,9 +4125,7 @@ mod tests {
                 false
             ));
         };
-        // Below min_connections (2) every probe acceptor is kept.
         add(0.70, 8403);
-        assert!(cm.keeps_lattice_probe_acceptor(Location::new(0.90)));
         // Both sides filled: successor nearest 0.55, predecessor nearest 0.45,
         // plus two long links.
         add(0.55, 8401);
@@ -4113,7 +4139,6 @@ mod tests {
                 "{far} is farther than the nearest on its side and must be dropped"
             );
         }
-        assert!(!cm.keeps_lattice_probe_acceptor(Location::new(0.90)));
         // Held long links are not lattice edges either.
         assert!(!cm.is_per_side_nearest(Location::new(0.70)));
         assert!(!cm.is_per_side_nearest(Location::new(0.20)));
@@ -4122,7 +4147,6 @@ mod tests {
 
         // Tighten: strictly closer on its side is kept, on either side.
         assert!(cm.is_per_side_nearest(Location::new(0.52)));
-        assert!(cm.keeps_lattice_probe_acceptor(Location::new(0.52)));
         assert!(cm.is_per_side_nearest(Location::new(0.48)));
         // Asked after it connected, the tighten is still kept (its own entry is
         // ignored), and the former nearest it displaced is no longer an edge.

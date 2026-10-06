@@ -84,15 +84,19 @@ WHEN accepting a new connection (should_accept):
      refinement. A second, independent bound: each admitted candidate that
      ESTABLISHES advances the per-side current-nearest, so the established sequence
      is strictly decreasing (a short records chain) and the absolute ceiling
-     hard-bounds the ESTABLISHED set. The route-to-self discovery probe
-     likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
-     sides are filled) so a filled-but-loose edge keeps tightening, BUT its
-     result is kept only when the acceptor is the new per-side nearest
-     (ConnectionManager::keeps_lattice_probe_acceptor; below min_connections
-     everything is kept); the CONNECT driver drops any other probe acceptor
-     (ClientConnectKind::LatticeProbe). Keeping every acceptor added a link per
-     probe forever (nothing prunes below max at low bandwidth), so degree crept
-     with uptime (#5814). See
+     hard-bounds the ESTABLISHED set. The route-to-self discovery probe does
+     not stop when both sides are filled (decaying toward tau_max), so a
+     filled-but-loose edge keeps tightening, BUT it SLEEPS once both sides are
+     proven tight (ring.rs LatticeProbeScheduler): a probe acceptor that is not
+     the per-side nearest (ConnectionManager::is_per_side_nearest) is a MISS
+     for its side, recorded by the CONNECT driver for ClientConnectKind::
+     LatticeProbe, and a miss on each side with no lattice change in between
+     puts discovery to sleep until a per-side nearest distance changes (fill,
+     tighten, loss, or widening). Every probe acceptor is KEPT (never dropped:
+     the transport has no close message, so a dropped link stays dead on the
+     far end until its idle timeout). Probing forever and keeping every result
+     added a non-lattice link per probe (nothing prunes below max at low
+     bandwidth), so degree crept with uptime (#5814). See
      connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)

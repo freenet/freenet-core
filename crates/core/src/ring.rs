@@ -34,6 +34,7 @@ use crate::operations::connect::op_ctx_task::ClientConnectKind;
 use crate::topology::TopologyAdjustment;
 use crate::topology::rate::Rate;
 use crate::tracing::{NetEventLog, NetEventRegister};
+use connection_manager::LatticeProbeMisses;
 
 use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
@@ -6032,36 +6033,30 @@ impl Ring {
         // are never gated on lattice completion (they supply the weak connectivity
         // that lets route-to-self converge from a cold start).
         //
-        // CONTINUOUS, DECAYING DISCOVERY — the probe NEVER stops. It keeps
-        // route-to-self probing even when both sides are filled, so a filled-but-
-        // LOOSE edge (holding a farther neighbor while the exact nearest is an
-        // unconnected peer) keeps tightening toward this peer's TRUE nearest ring
-        // neighbor. But the EFFORT DECAYS: the probability of finding a strictly-
-        // closer neighbor drops as the peer converges, so an unproductive probe
-        // (found nothing closer) backs the interval off exponentially toward
-        // tau_max, while any IMPROVEMENT (a side filled OR an edge tightened) or a
-        // LOST edge resets it to the aggressive tau0 and probes promptly. The
-        // interval floors at tau_max (a churn-tied maximum), so a fully-converged
-        // peer still re-checks periodically — decayed, but never silent. This
-        // replaces the earlier fill-only STOP-when-filled probe: relying on the
-        // passive per-side acceptance clause alone left ~half the ring's last-mile
-        // edges loose at the exact-nearest layer, so the tightening lattice is what
-        // pulls each peer onto its true ring neighbors. tau_max is the Chord
-        // half-life floor — it must comfortably exceed the churn interval so a
-        // dropped edge is re-formed well within a node's lifetime. The steady-state
-        // cost is one route-to-self CONNECT per peer roughly every tau_max.
+        // DISCOVERY RUNS UNTIL THE LATTICE IS TIGHT, THEN SLEEPS UNTIL IT CHANGES
+        // (#5814). The probe keeps firing while it makes progress, including when
+        // both sides are filled, so a filled-but-LOOSE edge (holding a farther
+        // neighbor while the exact nearest is an unconnected peer) tightens toward
+        // this peer's TRUE nearest ring neighbor (#4760 review N1: relying on the
+        // passive per-side acceptance clause alone left ~half the last-mile edges
+        // loose). The interval backs off exponentially toward tau_max while
+        // nothing changes, and any change to a per-side nearest distance (a fill,
+        // a tighten, a lost side, or a widening when the nearest drops and a
+        // farther peer remains) resets it to tau0 and probes promptly.
         //
-        // ONLY LATTICE RESULTS ARE KEPT (#5814). Once a peer has converged, the
-        // nearest unconnected peer the probe lands on is neither a fill nor a
-        // tighten, yet below max_connections it usually accepts through its
-        // ordinary evaluator, and nothing prunes below max at low bandwidth. Kept,
-        // each such result was a permanent extra link, so degree climbed with
-        // uptime (live median 36 -> ~100 over 20h). The CONNECT driver therefore
-        // keeps a probe acceptor only if it is the new per-side nearest (or the
-        // peer is still below min_connections, see
-        // `ConnectionManager::keeps_lattice_probe_acceptor`) and drops any other,
-        // so a probe that finds nothing closer costs a short-lived connection,
-        // not a link.
+        // A probe whose acceptor is NOT a lattice edge (`is_per_side_nearest`)
+        // shows that the acceptor's side is tight, since the probe lands on the
+        // nearest unconnected peer. Once both sides have shown that, discovery
+        // SLEEPS until a per-side distance changes. It used to keep re-probing
+        // every tau_max forever, and every result it found was kept (below
+        // max_connections the far end usually accepts, and nothing prunes below
+        // max at low bandwidth), so a converged peer gained a non-lattice link per
+        // probe and degree climbed with uptime (live median 36 -> ~100 over 20h).
+        // Now non-lattice results are kept only until both sides are proven
+        // tight, once per lattice change rather than once per probe. Results are
+        // never dropped after connecting: the transport has no close message, so
+        // a dropped link would sit dead on the far end until its idle timeout.
+        // See `LatticeProbeScheduler`.
         #[cfg(not(test))]
         const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
         #[cfg(test)]
@@ -6091,23 +6086,9 @@ impl Ring {
             LATTICE_PROBE_TAU_MAX,
         );
 
-        // Nearest-neighbor lattice discovery state (mechanism 2). Tracks the next
-        // route-to-self probe time, the current backoff attempt (0 = aggressive
-        // tau0; grows one step per fire, resets to 0 on an improvement or a lost
-        // edge), and the per-side nearest-neighbor DISTANCES observed at the
-        // previous tick — used to detect a fill OR a tighten (a distance that
-        // strictly decreased) as an improvement. Seeded to fire on the first
-        // eligible tick.
-        struct LatticeProbeState {
-            next_at: Instant,
-            backoff_attempt: u32,
-            last_sides: Option<LatticeSides>,
-        }
-        let mut lattice_probe = LatticeProbeState {
-            next_at: self.time_source.now(),
-            backoff_attempt: 0,
-            last_sides: None,
-        };
+        // Nearest-neighbor lattice discovery state (mechanism 2), seeded to fire
+        // on the first eligible tick.
+        let mut lattice_probe = LatticeProbeScheduler::new(self.time_source.now());
         let mut zero_connections_since: Option<Instant> = None;
         // Track whether we've ever had ring connections. Before the first
         // successful connection, use a shorter isolation escalation threshold
@@ -6551,8 +6532,10 @@ impl Ring {
                 self.connection_manager.min_connections,
             );
             // The route-to-self lattice probe is queued as own location (see the
-            // discovery block below); tag it so the CONNECT driver keeps only a
-            // lattice-edge result (#5814).
+            // discovery block below); tag it so the CONNECT driver reports a
+            // result that is not a lattice edge as a probe miss (#5814). Only a
+            // bootstrap target (fewer than 5 connections) can share own location,
+            // and a miss reported for it is harmless.
             let lattice_probe_target = self
                 .connection_manager
                 .get_stored_location()
@@ -6793,85 +6776,44 @@ impl Ring {
             }
 
             // Nearest-neighbor lattice discovery (mechanism 2): inject a
-            // route-to-self probe target (own_location), gated by exponential
-            // backoff, to FILL each peer's empty successor/predecessor lattice
-            // slots. Queued into pending_conn_adds so it is acquired next tick
-            // alongside long-link targets. No wire change: the probe is a plain
-            // CONNECT toward own_location whose bloom already excludes held peers,
-            // so it lands on the nearest UNCONNECTED peer and the terminus
-            // installs the edge via the per-side clause in should_accept. The
-            // CONNECT driver keeps the result only if it is a lattice edge and
-            // drops it otherwise (#5814, see the discovery comment above).
-            //
-            // CONTINUOUS, DECAYING discovery: the probe keeps firing even when both
-            // sides are filled, so a filled-but-loose edge tightens toward the TRUE
-            // nearest. `lattice_probe_progress` classifies the change since the last
-            // tick — an improvement (a side filled OR an edge tightened) or a
-            // regression (a side lost) resets the cadence to the aggressive tau0 and
-            // probes promptly, while a plateau (nothing closer found) lets the
-            // interval grow geometrically toward tau_max. The probe never goes
-            // silent; the effort decays as the peer converges (see the module-level
-            // discovery comment above).
+            // route-to-self probe target (own_location), gated by
+            // `LatticeProbeScheduler`, to fill or tighten each peer's
+            // successor/predecessor lattice slots. Queued into pending_conn_adds so
+            // it is acquired next tick alongside long-link targets. No wire change:
+            // the probe is a plain CONNECT toward own_location whose bloom already
+            // excludes held peers, so it lands on the nearest UNCONNECTED peer and
+            // the terminus installs the edge via the per-side clause in
+            // should_accept. The CONNECT driver reports a result that is not a
+            // lattice edge (`record_lattice_probe_miss`), which tells the
+            // scheduler the lattice is tight (see the discovery comment above).
             if self.connection_manager.nn_lattice_active() {
                 if let Some(me) = self.connection_manager.get_stored_location() {
                     let probe_now = self.time_source.now();
                     let succ = self.connection_manager.nearest_lattice_neighbor_dist(true);
                     let pred = self.connection_manager.nearest_lattice_neighbor_dist(false);
-                    let curr = LatticeSides { succ, pred };
-                    let sides_held = u8::from(succ.is_some()) + u8::from(pred.is_some());
-
-                    // Classify the change since the previous tick: an IMPROVEMENT is
-                    // a side newly filled OR an already-held side whose nearest got
-                    // strictly closer (a successful tighten); a REGRESSION is a side
-                    // that was lost.
-                    let progress = lattice_probe_progress(lattice_probe.last_sides, curr);
-                    if progress.improved {
+                    // +/-20% jitter to avoid synchronized probe bursts across
+                    // peers that bootstrapped together.
+                    let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
+                    let outcome = lattice_probe.tick(
+                        probe_now,
+                        LatticeSides { succ, pred },
+                        self.connection_manager.lattice_probe_misses(),
+                        &lattice_probe_backoff,
+                        jitter,
+                    );
+                    if outcome.improved {
                         self.connection_manager.record_lattice_probe_improvement();
                     }
-
-                    // An improvement or a lost edge resets the cadence to the
-                    // aggressive tau0 and probes promptly: a lost edge is a routing
-                    // dead-end to re-fill NOW, and an improvement means progress is
-                    // being made, so keep tightening aggressively (there may be an
-                    // even-closer neighbor still to find). A plateau leaves the
-                    // growing backoff untouched (see the fire site below).
-                    if progress.improved || progress.regressed {
-                        lattice_probe.backoff_attempt = 0;
-                        lattice_probe.next_at = probe_now;
-                    }
-
-                    // CONTINUOUS discovery: no sides-based stop condition — the only
-                    // gate is timing. The probe keeps firing (decayed toward tau_max
-                    // on a plateau) so a converged peer still re-checks and a
-                    // filled-but-loose edge keeps tightening toward the true nearest.
-                    if probe_now >= lattice_probe.next_at {
+                    if let Some(interval) = outcome.fired {
                         self.connection_manager.record_lattice_probe_issued();
-
                         pending_conn_adds.insert(me);
-
-                        // +/-20% jitter to avoid synchronized probe bursts across
-                        // peers that bootstrapped together.
-                        let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
-                        let interval = lattice_probe_backoff.delay(lattice_probe.backoff_attempt);
-                        lattice_probe.next_at = probe_now + interval.mul_f64(jitter);
-                        // Grow the interval one step for the NEXT fire; an
-                        // improvement or a regression resets it back to 0 above.
-                        lattice_probe.backoff_attempt =
-                            lattice_probe.backoff_attempt.saturating_add(1);
-
                         tracing::debug!(
-                            sides_held,
                             succ_dist = ?succ,
                             pred_dist = ?pred,
-                            backoff_attempt = lattice_probe.backoff_attempt,
                             interval_secs = interval.as_secs(),
                             "lattice discovery: queued route-to-self probe"
                         );
                     }
-                    // Record the observed per-side distances each tick (whether or
-                    // not we probed) so the next tick's progress check compares
-                    // against the latest reality.
-                    lattice_probe.last_sides = Some(curr);
                 }
             }
 
@@ -9202,26 +9144,27 @@ pub(crate) struct LatticeSides {
 }
 
 /// Classification of the lattice change between two consecutive maintenance
-/// ticks, for the CONTINUOUS discovery backoff.
+/// ticks, for the discovery backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LatticeProbeProgress {
     /// A side was newly FILLED, or an already-held side's nearest neighbor got
     /// strictly CLOSER (a successful tighten). Resets the probe backoff to tau0.
     pub improved: bool,
-    /// A side was LOST (a held neighbor dropped, leaving the side empty). Resets
-    /// the backoff to tau0 and re-probes promptly to re-fill the dead-end.
+    /// A side was LOST (left empty) or WIDENED (its nearest dropped and a farther
+    /// neighbor remains). Either way a lattice edge is gone, so discovery wakes,
+    /// resets the backoff to tau0 and re-probes promptly.
     pub regressed: bool,
 }
 
 /// Classify the lattice change between the previous tick's per-side nearest
-/// distances (`prev`, `None` on the first observation) and this tick's (`curr`),
-/// for CONTINUOUS discovery. An IMPROVEMENT — a side newly filled OR an
-/// already-held side whose nearest got strictly closer — keeps the probe
-/// aggressive; a REGRESSION — a side lost — re-probes promptly; a plateau
-/// (neither) lets the backoff decay toward tau_max. This is the tighten-aware
-/// replacement for the old fill-only STOP-when-filled gate: a filled side is no
-/// longer a stop condition, only a plateau input, so the probe keeps tightening
-/// a loose edge toward the peer's TRUE nearest ring neighbor.
+/// distances (`prev`, `None` on the first observation) and this tick's (`curr`).
+/// An IMPROVEMENT (a side newly filled, or an already-held side whose nearest
+/// got strictly closer) keeps the probe aggressive; a REGRESSION (a side lost,
+/// or its nearest got farther) re-probes promptly; a plateau (neither) lets the
+/// backoff decay toward tau_max. A filled side is not a stop condition, so the
+/// probe keeps tightening a loose edge toward the peer's TRUE nearest ring
+/// neighbor; what stops it is a probe result that is not a lattice edge (see
+/// [`LatticeProbeScheduler`]).
 pub(crate) fn lattice_probe_progress(
     prev: Option<LatticeSides>,
     curr: LatticeSides,
@@ -9234,32 +9177,128 @@ pub(crate) fn lattice_probe_progress(
         };
     };
     // A side improved if it went empty -> held (a fill) or held -> strictly closer
-    // (a tighten). Distances are derived from fixed peer locations, so a side's
-    // nearest only changes when the connection set changes; a strict `<` is a real
-    // tighten, not float jitter.
+    // (a tighten), and regressed if it went held -> empty or held -> strictly
+    // farther. Distances are derived from fixed peer locations, so a side's
+    // nearest only changes when the connection set changes; a strict comparison
+    // is a real change, not float jitter.
     let side_improved = |p: Option<f64>, c: Option<f64>| match (p, c) {
         (None, Some(_)) => true,
         (Some(pd), Some(cd)) => cd < pd,
         _ => false,
     };
-    let side_regressed = |p: Option<f64>, c: Option<f64>| matches!((p, c), (Some(_), None));
+    let side_regressed = |p: Option<f64>, c: Option<f64>| match (p, c) {
+        (Some(_), None) => true,
+        (Some(pd), Some(cd)) => cd > pd,
+        _ => false,
+    };
     LatticeProbeProgress {
         improved: side_improved(prev.succ, curr.succ) || side_improved(prev.pred, curr.pred),
         regressed: side_regressed(prev.succ, curr.succ) || side_regressed(prev.pred, curr.pred),
     }
 }
 
+/// When the route-to-self lattice probe fires (mechanism 2, #4760, #5814).
+///
+/// The probe fires on an exponential backoff (`tau0 * 2^attempt`, capped at
+/// tau_max) while discovery is ACTIVE. Any change to a per-side nearest
+/// distance ([`lattice_probe_progress`]: fill, tighten, loss or widening)
+/// reactivates discovery and resets the backoff to tau0, so a loose or broken
+/// lattice is worked on promptly.
+///
+/// A probe MISS on one side (the CONNECT driver found an acceptor there that
+/// is not a lattice edge, counted by
+/// `ConnectionManager::record_lattice_probe_miss`) shows that side is tight:
+/// the probe lands on the nearest unconnected peer, and that peer is farther
+/// than the held nearest on its side. One miss says nothing about the other
+/// side (the nearest unconnected peer may simply be on the tight side), so
+/// discovery keeps probing, outward past each kept miss, until BOTH sides have
+/// missed with no change in between, and then SLEEPS until a distance changes.
+/// Without the sleep a converged peer kept probing every tau_max and kept
+/// every non-lattice result, so degree grew with uptime (#5814).
+pub(crate) struct LatticeProbeScheduler {
+    next_at: Instant,
+    backoff_attempt: u32,
+    last_sides: Option<LatticeSides>,
+    misses_seen: LatticeProbeMisses,
+    /// Sides (successor, predecessor) that have missed since the last change.
+    tight: (bool, bool),
+}
+
+/// What one [`LatticeProbeScheduler::tick`] decided.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LatticeProbeTick {
+    /// A side filled or tightened since the previous tick (telemetry).
+    pub improved: bool,
+    /// `Some(interval until the next probe)` if a probe should be queued now.
+    pub fired: Option<Duration>,
+}
+
+impl LatticeProbeScheduler {
+    /// Active, due to fire on the first tick at or after `now`.
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            next_at: now,
+            backoff_attempt: 0,
+            last_sides: None,
+            misses_seen: LatticeProbeMisses::default(),
+            tight: (false, false),
+        }
+    }
+
+    /// One maintenance tick. `sides` is this tick's per-side nearest distances,
+    /// `misses` the monotonic per-side probe-miss counts, `jitter` the
+    /// multiplier applied to the next interval (the caller draws it, e.g.
+    /// 0.8..=1.2).
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        sides: LatticeSides,
+        misses: LatticeProbeMisses,
+        backoff: &crate::util::backoff::ExponentialBackoff,
+        jitter: f64,
+    ) -> LatticeProbeTick {
+        let progress = lattice_probe_progress(self.last_sides, sides);
+        self.last_sides = Some(sides);
+        let (succ_missed, pred_missed) = (
+            misses.succ > self.misses_seen.succ,
+            misses.pred > self.misses_seen.pred,
+        );
+        self.misses_seen = misses;
+        if progress.improved || progress.regressed {
+            // The lattice changed: work on it promptly, there may be an even
+            // closer neighbor to find (or a lost edge to replace).
+            self.tight = (false, false);
+            self.backoff_attempt = 0;
+            self.next_at = now;
+        } else {
+            self.tight.0 |= succ_missed;
+            self.tight.1 |= pred_missed;
+        }
+        let asleep = self.tight.0 && self.tight.1;
+        let fired = (!asleep && now >= self.next_at).then(|| {
+            let interval = backoff.delay(self.backoff_attempt);
+            self.next_at = now + interval.mul_f64(jitter);
+            self.backoff_attempt = self.backoff_attempt.saturating_add(1);
+            interval
+        });
+        LatticeProbeTick {
+            improved: progress.improved,
+            fired,
+        }
+    }
+}
+
 #[cfg(test)]
 mod lattice_probe_state_machine_tests {
-    use super::{LatticeSides, lattice_probe_progress};
+    use super::{LatticeProbeMisses, LatticeProbeScheduler, LatticeSides, lattice_probe_progress};
     use crate::util::backoff::ExponentialBackoff;
     use std::time::Duration;
+    use tokio::time::Instant;
 
-    /// CONTINUOUS discovery has NO sides-based stop condition. A tick where both
-    /// sides are filled and UNCHANGED is a plateau (neither improved nor
-    /// regressed) — the backoff grows, but the probe still fires on timing, so
-    /// discovery never goes silent when both sides are filled. This is the
-    /// behavioral reversal of the old fill-only stop-when-filled gate.
+    /// Filled sides are not a stop condition. A tick where both sides are
+    /// filled and UNCHANGED is a plateau (neither improved nor regressed): the
+    /// backoff grows, and only probe misses (see the scheduler tests below) put
+    /// discovery to sleep.
     #[test]
     fn both_sides_filled_and_unchanged_is_a_plateau_not_a_stop() {
         let both = LatticeSides {
@@ -9308,11 +9347,12 @@ mod lattice_probe_state_machine_tests {
         assert!(!p.regressed);
     }
 
-    /// A lost side (held -> empty) is a regression; re-widening a held side (a
-    /// farther nearest, e.g. the closest dropped and a farther one remains) is NOT
-    /// an improvement.
+    /// A lost side (held -> empty) is a regression, and so is a widened side (a
+    /// farther nearest: the closest dropped and a farther one remains). At
+    /// production degree a side almost never empties, so widening is how a lost
+    /// lattice edge shows up, and it must wake sleeping discovery (#5814).
     #[test]
-    fn lost_side_is_a_regression_and_widening_is_not_improvement() {
+    fn lost_or_widened_side_is_a_regression() {
         let prev = LatticeSides {
             succ: Some(0.05),
             pred: Some(0.05),
@@ -9330,8 +9370,8 @@ mod lattice_probe_state_machine_tests {
         };
         let p2 = lattice_probe_progress(Some(prev), widened);
         assert!(
-            !p2.improved && !p2.regressed,
-            "a farther nearest on a still-held side is a plateau, not an improvement"
+            p2.regressed && !p2.improved,
+            "a farther nearest on a still-held side is a regression"
         );
     }
 
@@ -9355,12 +9395,10 @@ mod lattice_probe_state_machine_tests {
     }
 
     /// The probe backoff uses the shared `ExponentialBackoff` and DECAYS toward
-    /// tau_max on a plateau, never stopping. The maintenance loop grows the attempt
-    /// one step per fire and resets it to 0 on an improvement/regression; mirror
-    /// that rule here and assert the interval is always finite (the probe keeps
-    /// firing — continuous, never silent), monotonic, and floored at tau_max.
+    /// tau_max on a plateau: the interval is always finite, monotonic, and
+    /// floored at tau_max.
     #[test]
-    fn backoff_decays_to_tau_max_and_never_stops() {
+    fn backoff_decays_to_tau_max() {
         let tau0 = Duration::from_secs(5);
         let tau_max = Duration::from_secs(300);
         let backoff = ExponentialBackoff::new(tau0, tau_max);
@@ -9382,6 +9420,135 @@ mod lattice_probe_state_machine_tests {
 
         // An improvement or a lost edge resets the attempt to 0 -> aggressive tau0.
         assert_eq!(backoff.delay(0), tau0);
+    }
+
+    const BOTH: LatticeSides = LatticeSides {
+        succ: Some(0.01),
+        pred: Some(0.01),
+    };
+
+    fn misses(succ: u64, pred: u64) -> LatticeProbeMisses {
+        LatticeProbeMisses { succ, pred }
+    }
+
+    /// Ticks once a second for `secs` seconds with unchanged inputs and
+    /// returns how many times the probe fired.
+    fn fires_over(
+        s: &mut LatticeProbeScheduler,
+        start: Instant,
+        secs: u64,
+        sides: LatticeSides,
+        m: LatticeProbeMisses,
+    ) -> usize {
+        let backoff = ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300));
+        (1..=secs)
+            .filter(|t| {
+                s.tick(start + Duration::from_secs(*t), sides, m, &backoff, 1.0)
+                    .fired
+                    .is_some()
+            })
+            .count()
+    }
+
+    /// Converged discovery sleeps (#5814): once BOTH sides have had a probe
+    /// miss with nothing changing, the probe stops firing for good, instead of
+    /// re-firing every tau_max and keeping a non-lattice link each time.
+    #[test]
+    fn misses_on_both_sides_put_discovery_to_sleep() {
+        let start = tokio::time::Instant::now();
+        let mut s = LatticeProbeScheduler::new(start);
+        assert!(fires_over(&mut s, start, 600, BOTH, misses(0, 0)) >= 4);
+        let t = start + Duration::from_secs(600);
+        assert_eq!(
+            fires_over(&mut s, t, 24 * 3600, BOTH, misses(1, 1)),
+            0,
+            "a tight lattice must not be probed again"
+        );
+    }
+
+    /// One side's miss only proves that side tight: the probe lands on the
+    /// nearest unconnected peer, which may simply be on the tight side, so the
+    /// other side must still be probed.
+    #[test]
+    fn a_miss_on_one_side_keeps_probing() {
+        let start = tokio::time::Instant::now();
+        let mut s = LatticeProbeScheduler::new(start);
+        // The first tick is a fill (a change), so the misses come after it.
+        fires_over(&mut s, start, 60, BOTH, misses(0, 0));
+        let t = start + Duration::from_secs(60);
+        assert!(fires_over(&mut s, t, 3600, BOTH, misses(3, 0)) >= 10);
+        // Misses on the two sides may arrive on different ticks.
+        let t = t + Duration::from_secs(3600);
+        fires_over(&mut s, t, 1, BOTH, misses(3, 1));
+        assert_eq!(
+            fires_over(&mut s, t + Duration::from_secs(1), 3600, BOTH, misses(3, 1)),
+            0
+        );
+    }
+
+    /// A sleeping scheduler wakes immediately on any lattice change: a widened
+    /// side (lattice edge lost, farther neighbor remains), a lost side, or a
+    /// tighten, and the misses before the change no longer count.
+    #[test]
+    fn any_lattice_change_wakes_discovery() {
+        let changes = [
+            LatticeSides {
+                succ: Some(0.02),
+                pred: Some(0.01),
+            },
+            LatticeSides {
+                succ: None,
+                pred: Some(0.01),
+            },
+            LatticeSides {
+                succ: Some(0.005),
+                pred: Some(0.01),
+            },
+        ];
+        let backoff = ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300));
+        for changed in changes {
+            let start = tokio::time::Instant::now();
+            let mut s = LatticeProbeScheduler::new(start);
+            fires_over(&mut s, start, 60, BOTH, misses(0, 0));
+            let t = start + Duration::from_secs(60);
+            fires_over(&mut s, t, 60, BOTH, misses(1, 1));
+            let t = t + Duration::from_secs(60);
+            assert_eq!(fires_over(&mut s, t, 3600, BOTH, misses(1, 1)), 0);
+            let t = t + Duration::from_secs(3601);
+            let woke = s.tick(t, changed, misses(1, 1), &backoff, 1.0);
+            assert_eq!(
+                woke.fired,
+                Some(Duration::from_secs(5)),
+                "{changed:?} must wake discovery at tau0"
+            );
+            // Old misses do not put it back to sleep; it keeps probing.
+            assert!(fires_over(&mut s, t, 600, changed, misses(1, 1)) >= 4);
+        }
+    }
+
+    /// A miss that lands in the same tick as a lattice change is not evidence
+    /// of tightness (the change may have come from the same probe's closer
+    /// acceptor), so discovery stays awake.
+    #[test]
+    fn a_miss_with_a_change_does_not_sleep() {
+        let start = tokio::time::Instant::now();
+        let mut s = LatticeProbeScheduler::new(start);
+        fires_over(&mut s, start, 60, BOTH, misses(0, 0));
+        let tighter = LatticeSides {
+            succ: Some(0.005),
+            pred: Some(0.005),
+        };
+        let t = start + Duration::from_secs(60);
+        fires_over(&mut s, t, 1, tighter, misses(1, 1));
+        assert!(
+            fires_over(
+                &mut s,
+                t + Duration::from_secs(1),
+                600,
+                tighter,
+                misses(1, 1)
+            ) >= 3
+        );
     }
 }
 

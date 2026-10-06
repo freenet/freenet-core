@@ -2,24 +2,26 @@
 //!
 //! Every model node owns a real `ConnectionManager` (and through it a real
 //! `TopologyManager`), so acceptance (`should_accept`), targets, swaps and
-//! pruning (`adjust_topology`), the add/concurrency budgets and the lattice
-//! probe's keep/drop decision (`keeps_lattice_probe_acceptor`) are production
-//! code. Only the plumbing is modelled: the CONNECT walk (greedy toward the target over
-//! the model graph with the joiner's connections pre-excluded, near-terminus
-//! probabilistic acceptance, terminus acceptance, bounded uphill retry),
-//! instant connection establishment, and the maintenance-loop scheduling
-//! (production tick, backoff and lattice-probe cadence constants). Not
-//! modelled: transport, NAT, failures, traffic (the bandwidth meter stays empty,
-//! i.e. a lightly loaded network, which is where nothing prunes below
-//! `max_connections`), location backoff and router learning.
+//! pruning (`adjust_topology`), the add/concurrency budgets, the lattice
+//! probe's hit/miss test (`is_per_side_nearest`) and its scheduling
+//! (`LatticeProbeScheduler`) are production code. Only the plumbing is
+//! modelled: the CONNECT walk (greedy toward the target over the model graph
+//! with the joiner's connections pre-excluded, near-terminus probabilistic
+//! acceptance, terminus acceptance, bounded uphill retry), instant connection
+//! establishment, peer restarts, and the maintenance-loop tick (production
+//! tick and backoff constants). Not modelled: transport, NAT, failures,
+//! traffic (the bandwidth meter stays empty, i.e. a lightly loaded network,
+//! which is where nothing prunes below `max_connections`), location backoff
+//! and router learning.
 //!
-//! The production route-to-self probe lands on the nearest UNCONNECTED peer
-//! every few minutes forever. Before #5814 every acceptor was kept, so each
-//! probe that found nothing closer still added a link and degree climbed with
-//! uptime. The test runs the same seed with and without the keep/drop gate:
-//! the ungated arm must reproduce the creep (so the model is sensitive to it)
-//! and the gated arm must stay in the low-usage band.
+//! Before #5814 the route-to-self probe re-fired every few minutes forever and
+//! every acceptor was kept, so a converged peer gained a non-lattice link per
+//! probe and degree climbed with uptime. The test runs the same seed under the
+//! old discovery and the production scheduler: the old arm must reproduce the
+//! creep (so the model is sensitive to it), and the new arm must hold degree
+//! near the low-usage band without losing lattice coverage.
 
+use super::super::{LatticeProbeScheduler, LatticeSides, lattice_probe_progress};
 use super::*;
 use crate::topology::TopologyAdjustment;
 use crate::topology::rate::Rate;
@@ -55,21 +57,91 @@ struct Node {
     deferred_drops: Vec<(SocketAddr, f64)>,
     last_count: usize,
     no_progress_ticks: u32,
-    probe_next_at: f64,
-    probe_attempt: u32,
-    probe_last: Option<super::super::LatticeSides>,
+    probe: Probe,
+    /// When this peer next restarts (drops every link and rejoins), if churn is on.
+    restart_at: f64,
+}
+
+/// How the route-to-self lattice probe is scheduled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Discovery {
+    /// Pre-#5814: re-fire on a backoff capped at tau_max, forever.
+    Continuous,
+    /// Production `LatticeProbeScheduler`: sleep once a probe misses.
+    Production,
+}
+
+enum Probe {
+    Continuous {
+        next_at: f64,
+        attempt: u32,
+        last: Option<LatticeSides>,
+    },
+    Production(LatticeProbeScheduler),
+}
+
+impl Probe {
+    fn new(discovery: Discovery) -> Self {
+        match discovery {
+            Discovery::Continuous => Probe::Continuous {
+                next_at: 0.0,
+                attempt: 0,
+                last: None,
+            },
+            Discovery::Production => Probe::Production(LatticeProbeScheduler::new(Instant::now())),
+        }
+    }
+}
+
+/// Mean degree and lattice coverage at one sample time.
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    degree: f64,
+    /// Fraction of peers connected to BOTH their true ring successor and
+    /// predecessor.
+    coverage: f64,
 }
 
 struct Model {
     nodes: Vec<Node>,
     key: TransportPublicKey,
-    /// Whether a lattice probe's acceptors go through the production keep/drop
-    /// gate. `false` reproduces the pre-#5814 behavior (keep every acceptor).
-    probe_gate: bool,
+    discovery: Discovery,
+    /// Mean time between restarts of one peer, if peers restart.
+    mean_uptime_secs: Option<f64>,
+    /// Node indices in ring order.
+    ring_order: Vec<usize>,
+}
+
+fn new_cm(
+    key: &TransportPublicKey,
+    addr: SocketAddr,
+    loc: Location,
+    gateway: bool,
+) -> ConnectionManager {
+    ConnectionManager::init(
+        Rate::new_per_second(1_000_000.0),
+        Rate::new_per_second(1_000_000.0),
+        MIN_CONNECTIONS,
+        MAX_CONNECTIONS,
+        7,
+        (
+            key.clone(),
+            Some(addr),
+            AtomicU64::new(u64::from_le_bytes(loc.as_f64().to_le_bytes())),
+        ),
+        gateway,
+        10,
+        Duration::from_secs(60),
+        0,
+    )
+}
+
+fn exp_sample(mean: f64) -> f64 {
+    -mean * (1.0 - GlobalRng::random_range(0.0..1.0_f64)).ln()
 }
 
 impl Model {
-    fn new(n: usize, probe_gate: bool) -> Self {
+    fn new(n: usize, discovery: Discovery, mean_uptime_secs: Option<f64>) -> Self {
         let key = TransportKeypair::new().public().clone();
         let mut used = HashSet::new();
         let mut nodes = Vec::with_capacity(n + 1);
@@ -84,40 +156,44 @@ impl Model {
             if !used.insert(loc.as_f64().to_bits()) {
                 continue;
             }
-            let cm = ConnectionManager::init(
-                Rate::new_per_second(1_000_000.0),
-                Rate::new_per_second(1_000_000.0),
-                MIN_CONNECTIONS,
-                MAX_CONNECTIONS,
-                7,
-                (
-                    key.clone(),
-                    Some(addr),
-                    AtomicU64::new(u64::from_le_bytes(loc.as_f64().to_le_bytes())),
-                ),
-                nodes.is_empty(), // node 0 is the gateway
-                10,
-                Duration::from_secs(60),
-                0,
-            );
             nodes.push(Node {
-                cm,
+                cm: new_cm(&key, addr, loc, nodes.is_empty()), // node 0 is the gateway
                 addr,
                 loc,
                 pending: BTreeSet::new(),
                 deferred_drops: Vec::new(),
                 last_count: 0,
                 no_progress_ticks: 0,
-                probe_next_at: 0.0,
-                probe_attempt: 0,
-                probe_last: None,
+                probe: Probe::new(discovery),
+                restart_at: mean_uptime_secs.map_or(f64::INFINITY, exp_sample),
             });
         }
+        let mut ring_order: Vec<usize> = (0..nodes.len()).collect();
+        ring_order.sort_by(|a, b| nodes[*a].loc.as_f64().total_cmp(&nodes[*b].loc.as_f64()));
         Self {
             nodes,
             key,
-            probe_gate,
+            discovery,
+            mean_uptime_secs,
+            ring_order,
         }
+    }
+
+    /// Peer `i` restarts: every link drops, and it comes back with fresh state
+    /// and rejoins through the gateway on its next tick.
+    fn restart(&mut self, i: usize, now: f64) {
+        for n in self.neighbors(i) {
+            self.unlink(i, n);
+        }
+        let (addr, loc) = (self.nodes[i].addr, self.nodes[i].loc);
+        let node = &mut self.nodes[i];
+        node.cm = new_cm(&self.key, addr, loc, false);
+        node.pending.clear();
+        node.deferred_drops.clear();
+        node.last_count = 0;
+        node.no_progress_ticks = 0;
+        node.probe = Probe::new(self.discovery);
+        node.restart_at = now + self.mean_uptime_secs.map_or(f64::INFINITY, exp_sample);
     }
 
     fn neighbors(&self, i: usize) -> Vec<usize> {
@@ -156,8 +232,8 @@ impl Model {
     }
 
     /// Relay `r` considers accepting joiner `j`; on acceptance the link forms,
-    /// and a lattice probe's acceptor the production gate rejects is dropped
-    /// again (the CONNECT driver's connect-then-drop).
+    /// and a lattice probe's acceptor that is not a lattice edge is reported as
+    /// a miss (the production CONNECT driver).
     fn try_accept(&self, r: usize, j: usize, lattice_probe: bool) -> bool {
         if !self.nodes[r]
             .cm
@@ -166,13 +242,10 @@ impl Model {
             return false;
         }
         self.link(r, j);
-        if lattice_probe
-            && self.probe_gate
-            && !self.nodes[j]
+        if lattice_probe && !self.nodes[j].cm.is_per_side_nearest(self.nodes[r].loc) {
+            self.nodes[j]
                 .cm
-                .keeps_lattice_probe_acceptor(self.nodes[r].loc)
-        {
-            self.unlink(r, j);
+                .record_lattice_probe_miss(self.nodes[r].loc);
         }
         true
     }
@@ -239,6 +312,9 @@ impl Model {
     /// One `connection_maintenance` iteration for node `i`; returns the delay
     /// until the next one.
     fn tick(&mut self, i: usize, now: f64) -> f64 {
+        if i != 0 && now >= self.nodes[i].restart_at {
+            self.restart(i, now);
+        }
         let min = self.nodes[i].cm.min_connections;
         let max = self.nodes[i].cm.max_connections;
         let count = self.nodes[i].cm.connection_count();
@@ -318,26 +394,48 @@ impl Model {
             TopologyAdjustment::NoChange => {}
         }
 
-        // Route-to-self lattice probe, production cadence (ring.rs).
+        // Route-to-self lattice probe (ring.rs).
         if self.nodes[i].cm.nn_lattice_active() {
             let node = &mut self.nodes[i];
-            let curr = super::super::LatticeSides {
+            let sides = LatticeSides {
                 succ: node.cm.nearest_lattice_neighbor_dist(true),
                 pred: node.cm.nearest_lattice_neighbor_dist(false),
             };
-            let progress = super::super::lattice_probe_progress(node.probe_last, curr);
-            if progress.improved || progress.regressed {
-                node.probe_attempt = 0;
-                node.probe_next_at = now;
-            }
-            if now >= node.probe_next_at {
+            let backoff = ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX);
+            let jitter = GlobalRng::random_range(0.8..=1.2);
+            let fire = match &mut node.probe {
+                Probe::Continuous {
+                    next_at,
+                    attempt,
+                    last,
+                } => {
+                    let progress = lattice_probe_progress(*last, sides);
+                    *last = Some(sides);
+                    if progress.improved || progress.regressed {
+                        *attempt = 0;
+                        *next_at = now;
+                    }
+                    let fire = now >= *next_at;
+                    if fire {
+                        *next_at = now + backoff.delay(*attempt).as_secs_f64() * jitter;
+                        *attempt = attempt.saturating_add(1);
+                    }
+                    fire
+                }
+                Probe::Production(scheduler) => scheduler
+                    .tick(
+                        Instant::now(),
+                        sides,
+                        node.cm.lattice_probe_misses(),
+                        &backoff,
+                        jitter,
+                    )
+                    .fired
+                    .is_some(),
+            };
+            if fire {
                 node.pending.insert(node.loc);
-                let backoff = ExponentialBackoff::new(LATTICE_TAU0, LATTICE_TAU_MAX);
-                let jitter = GlobalRng::random_range(0.8..=1.2);
-                node.probe_next_at = now + backoff.delay(node.probe_attempt).as_secs_f64() * jitter;
-                node.probe_attempt = node.probe_attempt.saturating_add(1);
             }
-            node.probe_last = Some(curr);
         }
 
         // Deferred swap drops.
@@ -383,22 +481,38 @@ impl Model {
         }
     }
 
-    /// Mean degree over the non-gateway nodes.
-    fn mean_degree(&self) -> f64 {
-        let peers = &self.nodes[1..];
-        peers
+    fn sample(&self) -> Sample {
+        let peers = self.nodes.len() - 1;
+        let degree = self.nodes[1..]
             .iter()
             .map(|x| x.cm.connection_count() as f64)
             .sum::<f64>()
-            / peers.len() as f64
+            / peers as f64;
+        let len = self.ring_order.len();
+        let covered = (0..len)
+            .filter(|k| {
+                let i = self.ring_order[*k];
+                if i == 0 {
+                    return false;
+                }
+                let succ = self.nodes[self.ring_order[(k + 1) % len]].addr;
+                let pred = self.nodes[self.ring_order[(k + len - 1) % len]].addr;
+                let held = self.nodes[i].cm.connected_peer_addrs();
+                held.contains(&succ) && held.contains(&pred)
+            })
+            .count();
+        Sample {
+            degree,
+            coverage: covered as f64 / peers as f64,
+        }
     }
 }
 
-/// Runs the model for `total_secs` of virtual time and returns the mean peer
-/// degree at each multiple of `sample_secs`.
-async fn run(n: usize, seed: u64, total_secs: f64, sample_secs: f64, probe_gate: bool) -> Vec<f64> {
+/// Runs the model for `MODEL_HORIZON_SECS` of virtual time and samples it
+/// every `SAMPLE_SECS`.
+async fn run(seed: u64, discovery: Discovery, mean_uptime_secs: Option<f64>) -> Vec<Sample> {
     let _seed = GlobalRng::seed_guard(seed);
-    let mut model = Model::new(n, probe_gate);
+    let mut model = Model::new(MODEL_PEERS, discovery, mean_uptime_secs);
 
     // Maintenance ticks (time, node), earliest first; joins spread over 5 min.
     #[derive(PartialEq)]
@@ -416,19 +530,19 @@ async fn run(n: usize, seed: u64, total_secs: f64, sample_secs: f64, probe_gate:
     }
     let mut queue = BinaryHeap::new();
     queue.push(Ev(0.0, 0));
-    for i in 1..=n {
-        queue.push(Ev(300.0 * i as f64 / n as f64, i));
+    for i in 1..=MODEL_PEERS {
+        queue.push(Ev(300.0 * i as f64 / MODEL_PEERS as f64, i));
     }
 
     let mut now = 0.0_f64;
     let mut samples = Vec::new();
-    let mut next_sample = sample_secs;
+    let mut next_sample = SAMPLE_SECS;
     while let Some(Ev(t, i)) = queue.pop() {
-        while next_sample <= t && next_sample <= total_secs {
-            samples.push(model.mean_degree());
-            next_sample += sample_secs;
+        while next_sample <= t && next_sample <= MODEL_HORIZON_SECS {
+            samples.push(model.sample());
+            next_sample += SAMPLE_SECS;
         }
-        if t > total_secs {
+        if t > MODEL_HORIZON_SECS {
             break;
         }
         if t > now {
@@ -442,21 +556,19 @@ async fn run(n: usize, seed: u64, total_secs: f64, sample_secs: f64, probe_gate:
 }
 
 /// Runs [`run`] on its own thread with a paused-clock current-thread runtime,
-/// so the two arms proceed in parallel without sharing thread-local state.
-fn spawn_arm(seed: u64, probe_gate: bool) -> std::thread::JoinHandle<Vec<f64>> {
+/// so arms proceed in parallel without sharing thread-local state.
+fn spawn_arm(
+    seed: u64,
+    discovery: Discovery,
+    mean_uptime_secs: Option<f64>,
+) -> std::thread::JoinHandle<Vec<Sample>> {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
             .build()
             .expect("runtime")
-            .block_on(run(
-                MODEL_PEERS,
-                seed,
-                MODEL_HORIZON_SECS,
-                SAMPLE_SECS,
-                probe_gate,
-            ))
+            .block_on(run(seed, discovery, mean_uptime_secs))
     })
 }
 
@@ -465,34 +577,55 @@ const MODEL_HORIZON_SECS: f64 = 3.0 * 3600.0;
 const SAMPLE_SECS: f64 = 1800.0;
 const MODEL_SEED: u64 = 0x5814;
 
+/// Peers restart (drop every link and rejoin) with exponentially distributed
+/// uptimes of this mean, so the lattice must also be repaired, not just built.
+const MEAN_UPTIME_SECS: f64 = 4.0 * 3600.0;
+
 /// #5814 regression: at production limits (min 25 / max 200) on a lightly
-/// loaded network, mean peer degree must stay near the low-usage band
-/// (2 * min = 50) instead of climbing with uptime. The ungated arm (every
-/// probe acceptor kept, the pre-#5814 behavior) runs on the same seed and must
-/// reproduce the creep, which shows the model can see it.
+/// loaded network with peer churn, mean degree must stay near the low-usage
+/// band (2 * min = 50) instead of climbing with uptime, and the lattice must
+/// stay as complete as it was under the old always-on discovery. The old arm
+/// runs on the same seed and must reproduce the creep, which shows the model
+/// can see it.
 #[test]
 fn lattice_probe_does_not_grow_degree_with_uptime() {
-    let gated = spawn_arm(MODEL_SEED, true);
-    let ungated = spawn_arm(MODEL_SEED, false);
-    let gated = gated.join().expect("gated arm panicked");
-    let ungated = ungated.join().expect("ungated arm panicked");
-    eprintln!("gated mean degree every 30 min: {gated:.1?}");
-    eprintln!("ungated mean degree every 30 min: {ungated:.1?}");
+    let old = spawn_arm(MODEL_SEED, Discovery::Continuous, Some(MEAN_UPTIME_SECS));
+    let new = spawn_arm(MODEL_SEED, Discovery::Production, Some(MEAN_UPTIME_SECS));
+    let old = old.join().expect("old arm panicked");
+    let new = new.join().expect("new arm panicked");
+    let degree = |s: &[Sample]| s.iter().map(|x| x.degree).collect::<Vec<_>>();
+    let (old_degree, new_degree) = (degree(&old), degree(&new));
+    eprintln!("old discovery, mean degree every 30 min: {old_degree:.1?}");
+    eprintln!("new discovery, mean degree every 30 min: {new_degree:.1?}");
 
     let band = (2 * MIN_CONNECTIONS) as f64;
     // Growth over the second half of the run, after bootstrap has settled.
     let late_growth = |s: &[f64]| s[s.len() - 1] - s[s.len() / 2 - 1];
-    let (gated_end, ungated_end) = (gated[gated.len() - 1], ungated[ungated.len() - 1]);
-    assert!(
-        ungated_end > band * 1.5 && late_growth(&ungated) > 20.0,
-        "the ungated arm must reproduce the creep (model sensitivity): {ungated:.1?}"
+    let (old_end, new_end) = (
+        old_degree[old_degree.len() - 1],
+        new_degree[new_degree.len() - 1],
     );
     assert!(
-        gated_end < band * 1.25,
-        "mean degree crept to {gated_end:.1}, low-usage band is {band}: {gated:.1?}"
+        old_end > band * 1.5,
+        "the old arm must reproduce the creep (model sensitivity): {old_degree:.1?}"
     );
     assert!(
-        late_growth(&gated) < late_growth(&ungated) / 5.0,
-        "degree still climbs with uptime: gated {gated:.1?}, ungated {ungated:.1?}"
+        new_end < band * 1.25,
+        "mean degree crept to {new_end:.1}, low-usage band is {band}: {new_degree:.1?}"
+    );
+    assert!(
+        late_growth(&new_degree) < late_growth(&old_degree) / 4.0,
+        "degree still climbs with uptime: new {new_degree:.1?}, old {old_degree:.1?}"
+    );
+
+    // Lattice coverage after bootstrap: sleeping discovery must not leave more
+    // peers without a true ring neighbor than always-on discovery did.
+    let coverage =
+        |s: &[Sample]| s[1..].iter().map(|x| x.coverage).sum::<f64>() / (s.len() - 1) as f64;
+    let (old_coverage, new_coverage) = (coverage(&old), coverage(&new));
+    eprintln!("mean lattice coverage: old {old_coverage:.3}, new {new_coverage:.3}");
+    assert!(
+        new_coverage > 0.97 && new_coverage >= old_coverage - 0.01,
+        "lattice coverage fell: new {new_coverage:.3}, old {old_coverage:.3}"
     );
 }
