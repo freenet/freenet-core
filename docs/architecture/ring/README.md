@@ -178,7 +178,10 @@ In addition, peers configured with `max_connections` of at least 25 (production 
 maintain their nearest ring neighbor on each side (the nearest-neighbor lattice): a new
 nearest neighbor is admitted even at capacity (up to a small over-max allowance), lattice
 edges are excluded from score-based pruning and swaps, and a periodic route-to-self probe
-keeps discovering closer neighbors.
+keeps discovering closer neighbors. Once a probe on each side has found nothing closer than the
+current nearest neighbor, the probe sleeps until a nearest-neighbor distance changes, apart from
+a few re-checks (`ring::lattice_probe_timing`). Each probe keeps whatever it connected to, so a
+converged peer adds a few non-lattice links per lattice change rather than one per probe.
 
 **Acceptance:**
 - At `max_connections` → reject (except new nearest-neighbor lattice edges)

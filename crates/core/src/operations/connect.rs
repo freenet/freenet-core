@@ -1701,6 +1701,7 @@ pub(crate) async fn join_ring_request(
         own,
         desired_location,
         overall_timeout,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }
@@ -1745,6 +1746,7 @@ pub(crate) async fn gateway_version_probe(
         own,
         desired_location,
         None,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }

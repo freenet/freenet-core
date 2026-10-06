@@ -78,15 +78,36 @@ WHEN accepting a new connection (should_accept):
      populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
      not just over-cap lattice ones), so on a node AT max unrelated in-flight
      handshakes can throttle tightening until they drain (bounded by the TTL;
-     continuous discovery retries). This only bites nodes genuinely at max (mostly
+     lattice discovery's finite re-checks may retry it). This only bites nodes genuinely at max (mostly
      busy gateways); a peer below max tightens via the under-cap path, which never
      consults this ceiling. A lattice-private budget is a possible future
      refinement. A second, independent bound: each admitted candidate that
      ESTABLISHES advances the per-side current-nearest, so the established sequence
      is strictly decreasing (a short records chain) and the absolute ceiling
-     hard-bounds the ESTABLISHED set. The route-to-self discovery probe
-     likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
-     sides are filled) so a filled-but-loose edge keeps tightening. See
+     hard-bounds the ESTABLISHED set. The route-to-self discovery probe does
+     not stop when both sides are filled (decaying toward tau_max), so a
+     filled-but-loose edge keeps tightening, BUT it SLEEPS once both sides look
+     tight (ring.rs LatticeProbeScheduler): a connected probe acceptor that is
+     not the per-side nearest (ConnectionManager::record_lattice_probe_result)
+     is a MISS for its side, and for the other side too when it lies farther
+     out than that side's held nearest, recorded by the CONNECT driver for
+     ClientConnectKind::LatticeProbe with the scheduler generation current at
+     launch. A miss on each side in the current generation puts discovery to
+     sleep until a per-side nearest distance changes (fill, tighten, loss, or
+     widening) or a re-check starts a new generation. Re-checks are FINITE
+     per lattice state, because each re-check of a tight lattice keeps a link
+     (ring.rs lattice_probe_timing: 2h, 4h, 8h; after a failed hit, i.e. a
+     closer peer found but not connected, 10 to 80 min, up to four times,
+     not reset by lattice changes, then the re-check ladder). A miss is EVIDENCE, not proof: a failed
+     hole punch, a near-terminus relay, or a recently-failed nearest peer, or
+     one that rejected the request, can make a loose side look tight, which
+     is why it re-checks and why acceptors that failed to connect are not
+     misses (except at this peer's own max_connections, where our cap refuses
+     every non-lattice acceptor). Probe acceptors are never DROPPED by the driver:
+     the transport has no close message, so a dropped link stays dead on the
+     far end until its idle timeout. Probing forever and keeping every result
+     added a non-lattice link per probe (nothing prunes below max at low
+     bandwidth), so degree crept with uptime (#5814). See
      connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)

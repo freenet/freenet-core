@@ -975,6 +975,12 @@ pub(crate) struct RouterSnapshotInfo {
     pub lattice_predecessor_distance: Option<f64>,
     pub lattice_probes_issued: Option<u64>,
     pub lattice_probe_improvements: Option<u64>,
+    /// Route-to-self probe ACCEPTORS that were not a lattice edge (monotonic
+    /// lifetime total; one probe can have several acceptors, so this can
+    /// exceed `lattice_probes_issued`). Each one is evidence a side is tight;
+    /// once both sides have one, discovery sleeps, so on a converged peer
+    /// `probes_issued` flattens by design (#5814).
+    pub lattice_probe_misses: Option<u64>,
     /// Version-gate refusal counters (#5156), populated by `Ring` on the
     /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
     /// `supports_hash_first_summaries` and `supports_summary_first_put` both
@@ -3610,6 +3616,7 @@ impl Router {
             lattice_predecessor_distance: None,
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
+            lattice_probe_misses: None,
             // Version-gate refusal counters, populated by Ring on the
             // snapshot cadence (#5156).
             hash_first_summaries_declined_unknown_version: None,

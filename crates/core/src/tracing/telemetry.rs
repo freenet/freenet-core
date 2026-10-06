@@ -2999,6 +2999,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "lattice_probe_improvements".to_string(),
                     serde_json::json!(snapshot.lattice_probe_improvements),
                 );
+                obj.insert(
+                    "lattice_probe_misses".to_string(),
+                    serde_json::json!(snapshot.lattice_probe_misses),
+                );
                 // Version-gate refusal counters (#5156): same hand-mirror
                 // footgun as the gauges above — a new `RouterSnapshotInfo`
                 // field is invisible to the collector unless added here.
@@ -4740,6 +4744,7 @@ mod tests {
         info.lattice_predecessor_distance = Some(0.07);
         info.lattice_probes_issued = Some(31);
         info.lattice_probe_improvements = Some(17);
+        info.lattice_probe_misses = Some(19);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosted_contracts_count", 5u64),
@@ -4755,6 +4760,7 @@ mod tests {
             ("subscribe_hint_acted_failed", 26),
             ("lattice_probes_issued", 31),
             ("lattice_probe_improvements", 17),
+            ("lattice_probe_misses", 19),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
