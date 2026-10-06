@@ -98,6 +98,33 @@ fn env_override(var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
     (!overrides.is_empty()).then(|| overrides.join(", "))
 }
 
+/// Whether `error`, or anything in its source chain, is a TLS rejection of the
+/// server's certificate: the failure an [`OsTrustSummary`] explains. DNS
+/// failures, refused connections and timeouts are not, and showing the summary
+/// for them would send the user chasing CAs.
+pub fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(error) = next {
+        if matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        ) {
+            return true;
+        }
+        // io::Error's `source` skips the error it wraps, so look inside it.
+        if let Some(inner) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            if is_certificate_error(inner) {
+                return true;
+            }
+        }
+        next = error.source();
+    }
+    false
+}
+
 fn add_root_certificates_from(
     mut builder: reqwest::ClientBuilder,
     load: impl FnOnce() -> rustls_native_certs::CertificateResult + std::panic::UnwindSafe,
@@ -187,23 +214,53 @@ mod tests {
                 _ => None,
             })
         };
+        // Path lists in this platform's syntax (':' on Unix, ';' on Windows).
+        let list = |dirs: &[&str]| std::env::join_paths(dirs).unwrap().into_string().unwrap();
+        let empty_list = list(&["", ""]);
+        let mixed_list = list(&["", "/certs"]);
+
         assert_eq!(lookup(None, None), None);
         // Empty directory entries are dropped by the loader, which then reads
-        // the platform store, so they are not an override.
+        // the platform store, so they are not an override...
         assert_eq!(lookup(None, Some("")), None);
-        assert_eq!(lookup(None, Some(":")), None);
+        assert_eq!(lookup(None, Some(&empty_list)), None);
+        // ...but one non-empty entry is.
         assert_eq!(
-            lookup(Some("/a.pem"), None).as_deref(),
-            Some("SSL_CERT_FILE=/a.pem")
+            lookup(None, Some(&mixed_list)),
+            Some(format!("SSL_CERT_DIR={mixed_list}"))
         );
         assert_eq!(
             lookup(None, Some("/certs")).as_deref(),
             Some("SSL_CERT_DIR=/certs")
         );
+        // The file counts whenever it is set, even empty (it then fails to load).
+        assert_eq!(lookup(Some(""), None).as_deref(), Some("SSL_CERT_FILE="));
+        assert_eq!(
+            lookup(Some("/a.pem"), Some(&empty_list)).as_deref(),
+            Some("SSL_CERT_FILE=/a.pem")
+        );
         assert_eq!(
             lookup(Some("/a.pem"), Some("/certs")).as_deref(),
             Some("SSL_CERT_FILE=/a.pem, SSL_CERT_DIR=/certs")
         );
+    }
+
+    #[test]
+    fn certificate_errors_are_told_apart_from_other_connect_failures() {
+        let unknown_issuer =
+            || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        assert!(is_certificate_error(&unknown_issuer()));
+        // How hyper-rustls surfaces it: wrapped in an io::Error.
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, unknown_issuer());
+        assert!(is_certificate_error(&wrapped));
+
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(!is_certificate_error(&refused));
+        let other_tls = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("handshake".into()),
+        );
+        assert!(!is_certificate_error(&other_tls));
     }
 
     #[test]
@@ -216,6 +273,17 @@ mod tests {
         assert_eq!(
             plain.to_string(),
             "139 of 140 OS trust store certificates added"
+        );
+
+        let one_error = OsTrustSummary {
+            first_error: Some("permission denied".into()),
+            error_count: 1,
+            ..OsTrustSummary::default()
+        };
+        assert_eq!(
+            one_error.to_string(),
+            "0 of 0 OS trust store certificates added; error reading the store: \
+             permission denied"
         );
 
         let stale_override = OsTrustSummary {

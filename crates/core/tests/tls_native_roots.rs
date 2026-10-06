@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use freenet::util::os_trust::add_os_root_certificates;
+use freenet::util::os_trust::{add_os_root_certificates, is_certificate_error};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -27,6 +27,10 @@ use tokio_rustls::rustls::{self, pki_types};
 const CA_PEM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/data/tls_native_roots/ca.pem"
+);
+const MISSING_PEM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/tls_native_roots/does-not-exist.pem"
 );
 const LEAF_CERT_DER: &[u8] = include_bytes!("data/tls_native_roots/leaf.der");
 const LEAF_KEY_DER: &[u8] = include_bytes!("data/tls_native_roots/leaf.key.der");
@@ -72,20 +76,38 @@ async fn spawn_https_server() -> u16 {
 
 #[test]
 fn only_opted_in_clients_trust_ca_installed_in_os_trust_store() {
-    // SAFETY: set before the runtime exists, so no other thread can be reading
-    // the environment. This is the only test in this binary.
+    // cargo exports SSL_CERT_FILE and SSL_CERT_DIR (its probed system CA paths)
+    // to the tests it runs; a leftover SSL_CERT_DIR would be loaded alongside
+    // the file.
+    // SAFETY: before the runtime exists, so no other thread can be reading the
+    // environment. This is the only test in this binary.
     unsafe {
-        std::env::set_var("SSL_CERT_FILE", CA_PEM_PATH);
-        // cargo exports SSL_CERT_FILE and SSL_CERT_DIR (its probed system CA
-        // paths) to the tests it runs; a leftover SSL_CERT_DIR would be loaded
-        // alongside the file.
         std::env::remove_var("SSL_CERT_DIR");
+        std::env::set_var("SSL_CERT_FILE", MISSING_PEM_PATH);
     }
+    stale_override_is_reported();
+    // SAFETY: as above; still before the runtime exists.
+    unsafe { std::env::set_var("SSL_CERT_FILE", CA_PEM_PATH) };
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(check_trust());
+}
+
+/// A stale `SSL_CERT_FILE` replaces the platform store and loads nothing; the
+/// summary must say so, since it is the user's only clue.
+fn stale_override_is_reported() {
+    let (_, os_trust) = add_os_root_certificates(test_client_builder());
+    assert_eq!((os_trust.found, os_trust.added), (0, 0));
+    assert_eq!(os_trust.error_count, 1, "{os_trust}");
+    let shown = os_trust.to_string();
+    let expected_start = format!(
+        "0 of 0 certificates from SSL_CERT_FILE={MISSING_PEM_PATH} added, in place of the \
+         OS trust store; error reading the store: "
+    );
+    assert!(shown.starts_with(&expected_start), "{shown}");
+    assert!(!shown.contains("more)"), "{shown}");
 }
 
 async fn check_trust() {
@@ -106,6 +128,23 @@ async fn check_trust() {
         format!("{err:?}").contains("UnknownIssuer"),
         "expected an UnknownIssuer rejection, got: {err:?}"
     );
+    // The real rejection must be recognised, or report upload drops the trust
+    // summary in exactly the case it exists for (pins the error chain shape of
+    // reqwest / hyper-rustls / rustls across upgrades).
+    assert!(is_certificate_error(&err), "not recognised: {err:?}");
+    // ...and a refused connection, also `is_connect()`, must not be.
+    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let refused = default_client
+        .get(format!("https://127.0.0.1:{closed_port}/"))
+        .send()
+        .await
+        .expect_err("nothing listens on a port whose listener was dropped");
+    assert!(refused.is_connect());
+    assert!(!is_certificate_error(&refused), "misread: {refused:?}");
 
     // The helper `freenet service report` builds its client with.
     let (builder, os_trust) = add_os_root_certificates(test_client_builder());
