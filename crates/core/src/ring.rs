@@ -30,6 +30,7 @@ pub use hosting::{
 };
 
 use crate::message::TransactionType;
+use crate::operations::connect::op_ctx_task::ClientConnectKind;
 use crate::topology::TopologyAdjustment;
 use crate::topology::rate::Rate;
 use crate::tracing::{NetEventLog, NetEventRegister};
@@ -1430,6 +1431,7 @@ impl Ring {
                         &op_manager.to_event_listener,
                         &ring.live_tx_tracker,
                         &op_manager,
+                        ClientConnectKind::Standard,
                     )
                     .await
                 {
@@ -6048,6 +6050,18 @@ impl Ring {
         // half-life floor — it must comfortably exceed the churn interval so a
         // dropped edge is re-formed well within a node's lifetime. The steady-state
         // cost is one route-to-self CONNECT per peer roughly every tau_max.
+        //
+        // ONLY LATTICE RESULTS ARE KEPT (#5814). Once a peer has converged, the
+        // nearest unconnected peer the probe lands on is neither a fill nor a
+        // tighten, yet below max_connections it usually accepts through its
+        // ordinary evaluator, and nothing prunes below max at low bandwidth. Kept,
+        // each such result was a permanent extra link, so degree climbed with
+        // uptime (live median 36 -> ~100 over 20h). The CONNECT driver therefore
+        // keeps a probe acceptor only if it is the new per-side nearest (or the
+        // peer is still below min_connections, see
+        // `ConnectionManager::keeps_lattice_probe_acceptor`) and drops any other,
+        // so a probe that finds nothing closer costs a short-lived connection,
+        // not a link.
         #[cfg(not(test))]
         const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
         #[cfg(test)]
@@ -6536,6 +6550,13 @@ impl Ring {
                 current_conn_count,
                 self.connection_manager.min_connections,
             );
+            // The route-to-self lattice probe is queued as own location (see the
+            // discovery block below); tag it so the CONNECT driver keeps only a
+            // lattice-edge result (#5814).
+            let lattice_probe_target = self
+                .connection_manager
+                .get_stored_location()
+                .filter(|_| self.connection_manager.nn_lattice_active());
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if respect_backoff && self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
@@ -6569,6 +6590,11 @@ impl Ring {
                         &notifier,
                         &live_tx_tracker,
                         &op_manager,
+                        if lattice_probe_target == Some(ideal_location) {
+                            ClientConnectKind::LatticeProbe
+                        } else {
+                            ClientConnectKind::Standard
+                        },
                     )
                     .await
                     .map_err(|error| {
@@ -6773,7 +6799,9 @@ impl Ring {
             // alongside long-link targets. No wire change: the probe is a plain
             // CONNECT toward own_location whose bloom already excludes held peers,
             // so it lands on the nearest UNCONNECTED peer and the terminus
-            // installs the edge via the per-side clause in should_accept.
+            // installs the edge via the per-side clause in should_accept. The
+            // CONNECT driver keeps the result only if it is a lattice edge and
+            // drops it otherwise (#5814, see the discovery comment above).
             //
             // CONTINUOUS, DECAYING discovery: the probe keeps firing even when both
             // sides are filled, so a filled-but-loose edge tightens toward the TRUE
@@ -6981,6 +7009,7 @@ impl Ring {
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
         op_manager: &Arc<OpManager>,
+        kind: ClientConnectKind,
     ) -> anyhow::Result<Option<Transaction>> {
         let current_connections = self.connection_manager.connection_count();
         let is_gateway = self.is_gateway;
@@ -7090,6 +7119,7 @@ impl Ring {
                 joiner_for_driver,
                 ideal_location,
                 None,
+                kind,
             )
             .await
             {

@@ -86,7 +86,13 @@ WHEN accepting a new connection (should_accept):
      is strictly decreasing (a short records chain) and the absolute ceiling
      hard-bounds the ESTABLISHED set. The route-to-self discovery probe
      likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
-     sides are filled) so a filled-but-loose edge keeps tightening. See
+     sides are filled) so a filled-but-loose edge keeps tightening, BUT its
+     result is kept only when the acceptor is the new per-side nearest
+     (ConnectionManager::keeps_lattice_probe_acceptor; below min_connections
+     everything is kept); the CONNECT driver drops any other probe acceptor
+     (ClientConnectKind::LatticeProbe). Keeping every acceptor added a link per
+     probe forever (nothing prunes below max at low bandwidth), so degree crept
+     with uptime (#5814). See
      connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)

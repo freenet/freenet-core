@@ -1135,6 +1135,46 @@ impl ConnectionManager {
             .fold(None, |acc, d| Some(acc.map_or(d, |a: f64| a.min(d))))
     }
 
+    /// Whether a neighbor at `loc` is, or on connecting would become, this peer's
+    /// NEAREST connected neighbor on its own ring side, i.e. a lattice edge. Any
+    /// connection already held at `loc` itself is ignored, so the answer is the
+    /// same whether it is asked before or after that connection is added to the
+    /// ring. `false` for a location exactly at own location (on neither side) or
+    /// when own location is unknown.
+    ///
+    /// This is the keep/drop test for a route-to-self lattice probe's result
+    /// (#5814): the probe exists to fill or tighten the two lattice slots, so an
+    /// acceptor that is neither is dropped instead of kept as an extra link.
+    pub(crate) fn is_per_side_nearest(&self, loc: Location) -> bool {
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        let sd = me.signed_distance(loc);
+        if sd == 0.0 {
+            return false;
+        }
+        let successor_side = sd > 0.0;
+        let others_nearest = self
+            .connections_by_location
+            .read()
+            .keys()
+            .filter(|other| **other != loc)
+            .filter_map(|other| {
+                let osd = me.signed_distance(*other);
+                (osd != 0.0 && (osd > 0.0) == successor_side).then_some(osd.abs())
+            })
+            .fold(f64::INFINITY, f64::min);
+        sd.abs() < others_nearest
+    }
+
+    /// Whether a route-to-self lattice probe keeps the acceptor at `loc` (#5814):
+    /// a lattice edge ([`Self::is_per_side_nearest`]) always, anything else only
+    /// while this peer is below `min_connections`, where every link is wanted
+    /// (and bootstrap targets share the probe's own-location target).
+    pub(crate) fn keeps_lattice_probe_acceptor(&self, loc: Location) -> bool {
+        self.connection_count() < self.min_connections || self.is_per_side_nearest(loc)
+    }
+
     /// Record that a route-to-self lattice discovery probe was ISSUED. Telemetry
     /// only — surfaced via the dashboard ring-stats provider.
     pub(crate) fn record_lattice_probe_issued(&self) {
@@ -4036,6 +4076,74 @@ mod tests {
         // that would leak force-active ON to a later same-thread test.
     }
 
+    /// The lattice probe's keep/drop test (#5814). Below min_connections every
+    /// acceptor is kept. At/above it, with both sides filled, a
+    /// peer farther than the per-side nearest is NOT a lattice edge, so the
+    /// probe drops it instead of adding a link; a strictly-closer peer
+    /// (tighten), a peer on an empty side (fill), and a peer that becomes the
+    /// nearest after the lattice edge on its side is lost are all kept. The
+    /// answer must not change once the peer itself is connected, because the
+    /// CONNECT driver may ask either before or after ring promotion.
+    #[test]
+    fn is_per_side_nearest_keeps_only_lattice_edges() {
+        let cm = make_connection_manager(None, 2, 200, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        let add = |l: f64, port: u16| {
+            assert!(cm.add_connection(
+                Location::new(l),
+                make_addr(port),
+                kp.public().clone(),
+                false
+            ));
+        };
+        // Below min_connections (2) every probe acceptor is kept.
+        add(0.70, 8403);
+        assert!(cm.keeps_lattice_probe_acceptor(Location::new(0.90)));
+        // Both sides filled: successor nearest 0.55, predecessor nearest 0.45,
+        // plus two long links.
+        add(0.55, 8401);
+        add(0.45, 8402);
+        add(0.20, 8404);
+
+        // Converged: anything farther than the per-side nearest is not kept.
+        for far in [0.60, 0.40, 0.90, 0.10] {
+            assert!(
+                !cm.is_per_side_nearest(Location::new(far)),
+                "{far} is farther than the nearest on its side and must be dropped"
+            );
+        }
+        assert!(!cm.keeps_lattice_probe_acceptor(Location::new(0.90)));
+        // Held long links are not lattice edges either.
+        assert!(!cm.is_per_side_nearest(Location::new(0.70)));
+        assert!(!cm.is_per_side_nearest(Location::new(0.20)));
+        // Own location is on neither side.
+        assert!(!cm.is_per_side_nearest(Location::new(0.5)));
+
+        // Tighten: strictly closer on its side is kept, on either side.
+        assert!(cm.is_per_side_nearest(Location::new(0.52)));
+        assert!(cm.keeps_lattice_probe_acceptor(Location::new(0.52)));
+        assert!(cm.is_per_side_nearest(Location::new(0.48)));
+        // Asked after it connected, the tighten is still kept (its own entry is
+        // ignored), and the former nearest it displaced is no longer an edge.
+        add(0.52, 8405);
+        assert!(cm.is_per_side_nearest(Location::new(0.52)));
+        assert!(!cm.is_per_side_nearest(Location::new(0.55)));
+        // The held nearest predecessor is an edge too.
+        assert!(cm.is_per_side_nearest(Location::new(0.45)));
+
+        // Losing the predecessor lattice edge: the next one out on that side
+        // becomes the nearest again, so a peer between them is kept.
+        cm.prune_alive_connection(make_addr(8402));
+        assert!(cm.is_per_side_nearest(Location::new(0.40)));
+        assert!(cm.is_per_side_nearest(Location::new(0.20)));
+
+        // Empty side: any peer on it is a fill.
+        cm.prune_alive_connection(make_addr(8404));
+        assert!(cm.is_per_side_nearest(Location::new(0.10)));
+        assert!(cm.is_per_side_nearest(Location::new(0.49)));
+    }
+
     /// Regression for the speculative-state over-cap ceiling: non-stale pending
     /// reservations count toward `max_connections + LATTICE_OVERMAX_SLACK`, so a
     /// full node fed a burst of strictly-closer fresh-address requests stops
@@ -6652,3 +6760,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lattice_degree_model.rs"]
+mod lattice_degree_model;
