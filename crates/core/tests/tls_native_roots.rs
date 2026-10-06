@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use freenet::util::os_trust::{add_os_root_certificates, is_certificate_error};
+use freenet::util::os_trust::{OsTrustSummary, add_os_root_certificates};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -128,23 +128,27 @@ async fn check_trust() {
         format!("{err:?}").contains("UnknownIssuer"),
         "expected an UnknownIssuer rejection, got: {err:?}"
     );
-    // The real rejection must be recognised, or report upload drops the trust
-    // summary in exactly the case it exists for (pins the error chain shape of
-    // reqwest / hyper-rustls / rustls across upgrades).
-    assert!(is_certificate_error(&err), "not recognised: {err:?}");
-    // ...and a refused connection, also `is_connect()`, must not be.
-    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // The real rejection must be the failure the trust summary explains, or
+    // report upload drops it in exactly the case it exists for (pins the error
+    // chain shape of reqwest / hyper-rustls / rustls across upgrades)...
+    let summary = OsTrustSummary::default();
+    assert_eq!(
+        summary.explaining(&err),
+        Some(&summary),
+        "not recognised: {err:?}"
+    );
+    // ...and a refused connection, also `is_connect()`, must not be. The port
+    // is bound but never listening, so it stays ours and is refused.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let reserved_port = reserved.local_addr().unwrap().port();
     let refused = default_client
-        .get(format!("https://127.0.0.1:{closed_port}/"))
+        .get(format!("https://127.0.0.1:{reserved_port}/"))
         .send()
         .await
-        .expect_err("nothing listens on a port whose listener was dropped");
+        .expect_err("nothing listens on the reserved port");
     assert!(refused.is_connect());
-    assert!(!is_certificate_error(&refused), "misread: {refused:?}");
+    assert_eq!(summary.explaining(&refused), None, "misread: {refused:?}");
 
     // The helper `freenet service report` builds its client with.
     let (builder, os_trust) = add_os_root_certificates(test_client_builder());

@@ -98,16 +98,28 @@ fn env_override(var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
     (!overrides.is_empty()).then(|| overrides.join(", "))
 }
 
+impl OsTrustSummary {
+    /// `Some(self)` when `error` is the failure this summary explains, as
+    /// decided by [`is_unknown_issuer_error`].
+    pub fn explaining(&self, error: &(dyn std::error::Error + 'static)) -> Option<&Self> {
+        is_unknown_issuer_error(error).then_some(self)
+    }
+}
+
 /// Whether `error`, or anything in its source chain, is a TLS rejection of the
-/// server's certificate: the failure an [`OsTrustSummary`] explains. DNS
-/// failures, refused connections and timeouts are not, and showing the summary
-/// for them would send the user chasing CAs.
-pub fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
+/// server's certificate as issued by an untrusted CA: the failure a missing
+/// interceptor CA causes, and the one an [`OsTrustSummary`] explains. Other
+/// certificate errors (an expired one usually means clock skew), DNS failures,
+/// refused connections and timeouts are not, and showing the summary for them
+/// would send the user chasing CAs.
+pub fn is_unknown_issuer_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut next = Some(error);
     while let Some(error) = next {
         if matches!(
             error.downcast_ref::<rustls::Error>(),
-            Some(rustls::Error::InvalidCertificate(_))
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
         ) {
             return true;
         }
@@ -116,7 +128,7 @@ pub fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
         {
-            if is_certificate_error(inner) {
+            if is_unknown_issuer_error(inner) {
                 return true;
             }
         }
@@ -246,21 +258,34 @@ mod tests {
     }
 
     #[test]
-    fn certificate_errors_are_told_apart_from_other_connect_failures() {
-        let unknown_issuer =
-            || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
-        assert!(is_certificate_error(&unknown_issuer()));
-        // How hyper-rustls surfaces it: wrapped in an io::Error.
-        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, unknown_issuer());
-        assert!(is_certificate_error(&wrapped));
+    fn unknown_issuer_is_told_apart_from_other_failures() {
+        let certificate = |error| {
+            // How hyper-rustls surfaces it: wrapped in an io::Error.
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(error),
+            )
+        };
+        let unknown_issuer = certificate(rustls::CertificateError::UnknownIssuer);
+        assert!(is_unknown_issuer_error(&unknown_issuer));
+        assert!(is_unknown_issuer_error(&rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer
+        )));
 
+        // Usually clock skew, not a missing CA.
+        let expired = certificate(rustls::CertificateError::Expired);
+        assert!(!is_unknown_issuer_error(&expired));
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert!(!is_certificate_error(&refused));
+        assert!(!is_unknown_issuer_error(&refused));
         let other_tls = std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             rustls::Error::General("handshake".into()),
         );
-        assert!(!is_certificate_error(&other_tls));
+        assert!(!is_unknown_issuer_error(&other_tls));
+
+        let summary = OsTrustSummary::default();
+        assert_eq!(summary.explaining(&unknown_issuer), Some(&summary));
+        assert_eq!(summary.explaining(&expired), None);
     }
 
     #[test]

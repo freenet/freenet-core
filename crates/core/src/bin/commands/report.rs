@@ -10,7 +10,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use freenet::config::ConfigPaths;
 use freenet::tracing::tracer::get_log_dir;
-use freenet::util::os_trust::{OsTrustSummary, add_os_root_certificates, is_certificate_error};
+use freenet::util::os_trust::{OsTrustSummary, add_os_root_certificates};
 use freenet_stdlib::client_api::{
     ClientRequest, HostResponse, NodeDiagnosticsConfig, NodeDiagnosticsResponse, NodeQuery,
     QueryResponse, WebApi,
@@ -418,16 +418,17 @@ impl ReportCommand {
             .await
             .map_err(|error| upload_send_error(error, &os_trust))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = printable_error_body(&read_capped(&mut response).await);
-            anyhow::bail!("Upload failed: {status} - {body}. {SEND_LOCALLY_HINT}");
+        // Capped whatever the status: a captive portal or proxy page can be
+        // large, and this upload trusts more CAs than any other client.
+        let status = response.status();
+        let body = read_capped(&mut response).await;
+        if !status.is_success() {
+            let shown = printable_error_body(&String::from_utf8_lossy(&body));
+            anyhow::bail!("Upload failed: {status} - {shown}. {SEND_LOCALLY_HINT}");
         }
 
         // A 200 that is not our JSON is usually a captive portal or proxy page.
-        let upload_response: UploadResponse = response
-            .json()
-            .await
+        let upload_response: UploadResponse = serde_json::from_slice(&body)
             .with_context(|| format!("Failed to parse upload response. {SEND_LOCALLY_HINT}"))?;
         // The response may come through an interceptor this upload trusts, so
         // never print a code that could drive the terminal.
@@ -446,11 +447,11 @@ impl ReportCommand {
     }
 }
 
-/// Context for a failed send. The trust summary is added only when the TLS
-/// handshake rejected the server's certificate, the failure it explains.
+/// Context for a failed send, with the trust summary only when it explains the
+/// failure (see `OsTrustSummary::explaining`).
 fn upload_send_error(error: reqwest::Error, os_trust: &OsTrustSummary) -> anyhow::Error {
-    let summary = is_certificate_error(&error).then_some(os_trust);
-    anyhow::Error::new(error).context(upload_failure_message(summary))
+    let message = upload_failure_message(os_trust.explaining(&error));
+    anyhow::Error::new(error).context(message)
 }
 
 fn upload_failure_message(os_trust: Option<&OsTrustSummary>) -> String {
@@ -460,20 +461,24 @@ fn upload_failure_message(os_trust: Option<&OsTrustSummary>) -> String {
     }
 }
 
-/// Upper bound on how much of an HTTP error body is read: only the first
-/// [`MAX_ERROR_BODY_CHARS`] are shown, and a block page can be large.
-const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Upper bound on how much of a response body is read. The real reply is a few
+/// bytes of JSON; only the first [`MAX_ERROR_BODY_CHARS`] of an error are shown.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-async fn read_capped(response: &mut reqwest::Response) -> String {
+/// Reads at most [`MAX_RESPONSE_BYTES`] of the body. A read error ends it
+/// early: what arrived is still worth showing, or fails to parse.
+async fn read_capped(response: &mut reqwest::Response) -> Vec<u8> {
     let mut raw = Vec::new();
-    while raw.len() < MAX_ERROR_BODY_BYTES {
+    while raw.len() < MAX_RESPONSE_BYTES {
         match response.chunk().await {
-            Ok(Some(chunk)) => raw.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                let room = MAX_RESPONSE_BYTES - raw.len();
+                raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
             Ok(None) | Err(_) => break,
         }
     }
-    raw.truncate(MAX_ERROR_BODY_BYTES);
-    String::from_utf8_lossy(&raw).into_owned()
+    raw
 }
 
 /// Report codes are short ASCII tokens (six characters from the server).
@@ -491,22 +496,30 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 /// Makes a server- or proxy-sent error body safe and short enough to print: a
 /// block page can be a whole HTML document, and its bytes must not drive the
 /// terminal (escape sequences, line breaks that fake extra output, bidi
-/// overrides), so it is shown as one plain line.
+/// overrides), so it is shown as one plain line with runs of spaces collapsed.
 fn printable_error_body(body: &str) -> String {
-    let mut chars = body.chars().filter_map(|c| match c {
-        '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' => Some(' '),
-        // Format characters (category Cf) that reorder or hide text, which
-        // `is_control` (Cc only) lets through.
-        '\u{00AD}'
-        | '\u{061C}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{206F}'
-        | '\u{FEFF}'
-        | '\u{E0000}'..='\u{E007F}' => None,
-        c if c.is_control() => None,
-        c => Some(c),
-    });
+    let mut after_space = false;
+    let mut chars = body
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' | ' ' => Some(' '),
+            // Format characters (category Cf) that reorder or hide text, which
+            // `is_control` (Cc only) lets through.
+            '\u{00AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}' => None,
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .filter(|&c| {
+            let repeated = c == ' ' && after_space;
+            after_space = c == ' ';
+            !repeated
+        });
     let mut shown: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
     if chars.next().is_some() {
         shown.push('…');
@@ -890,28 +903,14 @@ mod tests {
     use super::*;
 
     /// tests/tls_native_roots.rs proves `add_os_root_certificates` makes a
-    /// client trust a TLS-intercepting proxy's CA; this pins that the upload
-    /// client is still built through it. Without it, uploads fail behind such
-    /// proxies with `UnknownIssuer` and that test stays green.
+    /// client trust a TLS-intercepting proxy's CA, and that the real rejection
+    /// is what `OsTrustSummary::explaining` recognises. This pins the wiring in
+    /// the binary, which no test can reach over TLS: without it, uploads fail
+    /// behind such proxies with `UnknownIssuer` and those tests stay green.
     #[test]
     fn upload_client_is_built_with_os_root_certificates() {
         let src = include_str!("report.rs");
-        let tests_at = src.find("#[cfg(test)]").expect("test module marker");
-        let start = src
-            .find("    async fn upload_report(")
-            .expect("upload_report signature moved; update this pin");
-        assert!(start < tests_at, "matched inside the test module");
-        let len = src[start..]
-            .find("\n    }\n")
-            .expect("end of upload_report");
-        // Code only (comment lines dropped), whitespace removed so a rustfmt
-        // reflow cannot break or satisfy the pin.
-        let code: String = src[start..start + len]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .flat_map(str::chars)
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let code = item_code(src, "    async fn upload_report(", "\n    }\n");
         // Built with concat! so this file's own text never contains the needle.
         let helper_call = concat!("let(builder,os_trust)=add_os_root", "_certificates(");
         assert!(
@@ -919,31 +918,155 @@ mod tests {
             "upload_report must build its client with add_os_root_certificates"
         );
         // ...and that builder must be the one that POSTs: one client, built
-        // from it, with no second client to shadow it or post instead.
-        assert!(code.contains("letclient=builder.build()"));
+        // from it, with no second client or builder to replace it.
+        assert!(code.contains("letclient=builder.build().with_context("));
         assert_eq!(code.matches("letclient").count(), 1, "a second client");
         assert_eq!(code.matches("Client::").count(), 1, "a second client");
         assert!(!code.contains("ClientBuilder"), "a second builder");
         assert!(!code.contains("builder="), "the builder replaced");
         assert!(code.contains("client.post("));
-        // Failures carry the diagnosis and the way out, and nothing the server
-        // (or an interceptor) sends reaches the terminal unchecked.
         assert!(
             code.contains("upload_send_error(error,&os_trust)"),
             "send failures lose the trust summary"
         );
-        assert!(code.contains("printable_error_body(&read_capped(&mutresponse)"));
-        assert!(code.contains("validated_report_code(&upload_response.code)"));
-        assert_eq!(
-            code.matches("upload_response.code").count(),
-            1,
-            "the raw code is used somewhere besides validation"
+        let send_error = item_code(src, "fn upload_send_error(", "\n}\n");
+        assert!(
+            send_error.contains("upload_failure_message(os_trust.explaining(&error))"),
+            "the summary is no longer chosen by OsTrustSummary::explaining"
         );
-        assert_eq!(
-            code.matches("SEND_LOCALLY_HINT").count(),
-            4,
-            "setup, status, parse and code failures each carry the hint"
+    }
+
+    /// Code-only text of the item starting at `signature` (outside the test
+    /// module): comment lines dropped and whitespace removed, so a rustfmt
+    /// reflow cannot break or satisfy a pin.
+    fn item_code(src: &str, signature: &str, end: &str) -> String {
+        let tests_at = src.find("#[cfg(test)]").expect("test module marker");
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` moved; update this pin"));
+        assert!(start < tests_at, "`{signature}` matched inside the tests");
+        let len = src[start..].find(end).expect("end of item");
+        src[start..start + len]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    fn sample_report() -> DiagnosticReport {
+        DiagnosticReport {
+            client_timestamp: "2025-01-01T00:00:00Z".to_string(),
+            system_info: SystemInfo {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                hostname: "test".to_string(),
+            },
+            version_info: VersionInfo {
+                version: "0.1.0".to_string(),
+                git_commit: "abc123".to_string(),
+                git_dirty: false,
+                build_timestamp: "2025-01-01".to_string(),
+            },
+            logs: LogContents {
+                main_log: None,
+                error_log: None,
+                main_log_size_bytes: 0,
+                error_log_size_bytes: 0,
+                main_log_original_size_bytes: 0,
+                error_log_original_size_bytes: 0,
+            },
+            config: None,
+            network_status: None,
+            network_status_error: None,
+            user_message: None,
+        }
+    }
+
+    /// Runs the real `upload_report` against a local server answering with
+    /// `status` and `body`. Plain HTTP, so it covers everything after the TLS
+    /// handshake; a proxy set in the environment would intercept it.
+    async fn upload_against(status: u16, body: String) -> Result<()> {
+        use httptest::{Expectation, Server, matchers::request, responders::status_code};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/api/reports"))
+                .respond_with(status_code(status).body(body)),
         );
+        let command = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: server.url("/api/reports").to_string(),
+        };
+        command.upload_report(&sample_report()).await
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_a_valid_code() {
+        upload_against(200, r#"{"code":"Q69UF2"}"#.into())
+            .await
+            .expect("a well-formed reply is accepted");
+    }
+
+    #[tokio::test]
+    async fn upload_failure_shows_a_capped_sanitised_body_and_the_hint() {
+        let page = format!(
+            "\u{1b}[2J<html>\n  <body>{}</body>",
+            "x".repeat(MAX_RESPONSE_BYTES * 2)
+        );
+        let error = upload_against(403, page)
+            .await
+            .expect_err("a 403 fails the upload")
+            .to_string();
+        assert!(!error.contains('\u{1b}'), "{error}");
+        assert!(
+            error.starts_with("Upload failed: 403 Forbidden - [2J<html> <body>xxx"),
+            "{error}"
+        );
+        assert!(error.contains("…."), "truncation not marked: {error}");
+        assert!(error.ends_with(SEND_LOCALLY_HINT), "{error}");
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_code_that_could_drive_the_terminal() {
+        let error = upload_against(200, r#"{"code":"\u001b]0;x\u0007"}"#.into())
+            .await
+            .expect_err("an escape sequence is not a report code");
+        assert_eq!(
+            error.to_string(),
+            format!("Unexpected upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_success_page_that_is_not_the_reply() {
+        let error = upload_against(200, "<html>Sign in to the network</html>".into())
+            .await
+            .expect_err("a captive portal page is not a reply");
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to parse upload response. {SEND_LOCALLY_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_is_capped() {
+        use httptest::{Expectation, Server, matchers::request, responders::status_code};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/"))
+                .respond_with(status_code(200).body("x".repeat(MAX_RESPONSE_BYTES * 2 + 7))),
+        );
+        let mut response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(server.url("/").to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(&mut response).await.len(), MAX_RESPONSE_BYTES);
     }
 
     #[test]
@@ -970,19 +1093,20 @@ mod tests {
     /// rejection, but the trust summary would mislead there.
     #[tokio::test]
     async fn refused_connection_does_not_show_the_trust_summary() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Bound but never listening: the port stays ours, and connecting to
+        // it is refused, with no window for another socket to take it.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
         let error = reqwest::Client::builder()
             .no_proxy()
+            .timeout(StdDuration::from_secs(10))
             .build()
             .unwrap()
             .get(format!("http://127.0.0.1:{port}/"))
             .send()
             .await
-            .expect_err("nothing listens on a port whose listener was dropped");
+            .expect_err("nothing listens on the reserved port");
         assert!(error.is_connect());
         let summary = OsTrustSummary {
             found: 3,
@@ -995,31 +1119,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn error_body_read_is_capped() {
-        use httptest::{Expectation, Server, matchers::request, responders::status_code};
-        let server = Server::run();
-        server.expect(
-            Expectation::matching(request::method_path("GET", "/"))
-                .respond_with(status_code(403).body("x".repeat(MAX_ERROR_BODY_BYTES * 2))),
-        );
-        let mut response = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(server.url("/").to_string())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(read_capped(&mut response).await.len(), MAX_ERROR_BODY_BYTES);
-    }
-
     #[test]
     fn report_codes_are_short_ascii_tokens() {
         assert_eq!(validated_report_code("Q69UF2").unwrap(), "Q69UF2");
+        assert!(validated_report_code("ABCD").is_ok());
+        assert!(validated_report_code(&"A".repeat(32)).is_ok());
         for bad in [
             "",
-            "abc",
+            "ABC",
             "\u{1b}]0;pwned\u{7}",
             "ABC DEF",
             "ABC\nDEF",
@@ -1034,7 +1141,7 @@ mod tests {
     fn printable_error_body_keeps_terminal_control_out_and_marks_truncation() {
         assert_eq!(printable_error_body(""), "");
         // Each character that could drive or fake terminal output, including
-        // both ends of every stripped range.
+        // both ends of every stripped range and the bidi isolates inside one.
         for c in [
             '\u{1b}',
             '\u{7f}',
@@ -1044,8 +1151,11 @@ mod tests {
             '\u{200b}',
             '\u{200f}',
             '\u{202a}',
+            '\u{202b}',
             '\u{202e}',
             '\u{2060}',
+            '\u{2066}',
+            '\u{2069}',
             '\u{206f}',
             '\u{feff}',
             '\u{e0000}',
@@ -1053,10 +1163,15 @@ mod tests {
         ] {
             assert_eq!(printable_error_body(&format!("a{c}b")), "ab", "{c:?} kept");
         }
-        // Line breaks and tabs become spaces, so the body cannot fake lines.
+        // Line breaks and tabs become spaces, so the body cannot fake lines,
+        // and runs of them collapse so indentation does not use up the budget.
         for c in ['\n', '\r', '\t', '\u{2028}', '\u{2029}'] {
             assert_eq!(printable_error_body(&format!("a{c}b")), "a b", "{c:?}");
         }
+        assert_eq!(printable_error_body("a \n\t  \r\n b"), "a b");
+        // Ordinary text, including non-ASCII, passes through untouched.
+        let text = "日本語 é\u{a0}x\u{ae}";
+        assert_eq!(printable_error_body(text), text);
         let exactly = "é".repeat(MAX_ERROR_BODY_CHARS);
         assert_eq!(printable_error_body(&exactly), exactly);
         let over = "é".repeat(MAX_ERROR_BODY_CHARS + 1);
