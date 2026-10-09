@@ -519,6 +519,9 @@ mod tests {
                 "{stranded} cannot auto-update (#5221) and must be refused, \
                  but the shipped floor {MIN_COMPATIBLE_VERSION} accepts it"
             );
+            // Arguments swapped on purpose: this is the stranded peer's view
+            // (it is "local") of our handshake bytes, i.e. whether it learns
+            // that it is below our floor.
             assert!(
                 remote_requires_newer_than_us(&remote, &PROTOC_VERSION),
                 "a refused {stranded} peer must be told it is below our floor"

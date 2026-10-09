@@ -15,10 +15,10 @@ readme = "README.md"
 # this value unchanged; scripts/release.sh rewrites it. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
 #
-# 0.2.122: 0.2.120 and 0.2.121 cannot auto-update (they parse the raw "v"-
-# prefixed release tag as semver and drop every update, #5221, fixed in
-# 0.2.122 by #5225), and a share of 0.2.120 peers never deliver their GET
-# replies, so requesters wait out the full 60 s attempt timeout.
+# 0.2.122: 0.2.120 and 0.2.121 cannot detect updates themselves (they parse
+# the raw "v"-prefixed release tag as semver and drop every update, #5221,
+# fixed in 0.2.122 by #5225), so they stay on those versions indefinitely.
+# Every later version can auto-update.
 min-compatible-version = "0.2.122"
 
 [package.metadata.binstall]

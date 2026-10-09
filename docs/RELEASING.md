@@ -705,6 +705,22 @@ If you're bumping a major or minor version, double-check the binstall
 URL rewrite (a regression test in `crates/fdev/tests/binstall_metadata.rs`
 covers this).
 
+### The handshake floor (`min-compatible-version`)
+
+`[package.metadata.freenet] min-compatible-version` in `crates/core/Cargo.toml`
+is the oldest peer version a node will connect to. The check runs in both
+directions, so once a release carries a higher floor, its nodes refuse older
+peers whichever side dials. `release.yml` ships the committed value unchanged.
+Raising it is a deliberate change in its own reviewed PR, never a side effect
+of a release. (`scripts/release.sh` still rewrites it; see #5833.)
+
+Raise it only to cut off versions that cannot rejoin by themselves, for
+example 0.2.120 and 0.2.121, which cannot detect updates (#5221). Keep it at
+or below the oldest version that can still auto-update, so peers that are
+merely lagging keep connecting until they update. Peers still on older
+releases keep accepting the refused versions until they update, so the
+refusal reaches the whole network only as the release spreads.
+
 ## Rollback
 
 The release-agent refuses downgrades by design (`X.Y.Z < installed` returns
