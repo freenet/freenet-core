@@ -2495,7 +2495,7 @@ mod tests {
             // -- but "correctly excluded" was luck rather than a decision
             // until this row existed.
             // ---- Everything below became visible when the type predicate
-            // widened to `u64`. All fourteen are legitimately excluded, which
+            // widened to `u64`. All fourteen were legitimately excluded, which
             // is the point worth recording: nothing was WRONG, and none of it
             // was a decision anybody had written down. A guard that cannot see
             // a name cannot be said to have excluded it.
@@ -2588,7 +2588,9 @@ mod tests {
             (
                 "MAX_STORED_PARAMS_BYTES",
                 "per-delegate cap on the parameters kept for lifecycle runs, a \
-                 size limit on one entry rather than a cache budget",
+                 size limit on one entry rather than a cache budget. Stored in \
+                 redb in the default build; the non-redb in-memory store can \
+                 hold MAX_CAPABILITY_RECORDS of them",
             ),
             (
                 "MAX_RESPONSE_BYTES",
@@ -2621,7 +2623,8 @@ mod tests {
             (
                 "EVENT_BYTES",
                 "compile-time size bound on one hierarchical-router struct; the \
-                 router's whole published budget is a few hundred KB",
+                 router's whole working set is about 1.5 MB plus a per-peer level \
+                 table, sized by its own published budget",
             ),
             (
                 "PREPARED_BYTES",

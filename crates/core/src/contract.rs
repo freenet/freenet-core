@@ -621,8 +621,9 @@ fn within_fetch_allowance(
         // request succeeded on a busier node that refused the park and went
         // inline. The states are dropped at this statement (`states` is owned
         // and goes out of scope), so nothing oversized is retained; the upsert
-        // is re-run on the loop at resume, which costs a second fetch and a
-        // stall and completes the write.
+        // is re-run on the loop at resume, which costs a second fetch under the
+        // inline 10 s timeout (it can fail where this fetch succeeded, #5831)
+        // and a stall.
         return delegate_park::FetchDisposition::RetryInline;
     }
     delegate_park::FetchDisposition::Resolved(Ok(states))
@@ -7133,14 +7134,67 @@ mod tests {
             // A call to a function DEFINED IN THE SCANNED TEXT is not itself a
             // spawn: whatever it spawns is written inside its own body, which
             // this same loop reaches and scans where it is written
-            // (`spawn_capability_prompt`, #5730, is the first). Exempting it by
-            // that fact rather than by name keeps the rule syntactic: a spawn
-            // helper imported from ANOTHER file has no definition here and
-            // still reaches the panic below, because its body is never scanned.
-            if [format!("fn {ident}("), format!("fn {ident}<")]
-                .iter()
-                .any(|decl| code.contains(decl.as_str()))
+            // (`spawn_capability_prompt`, #5730, is the first). Three
+            // conditions keep that from becoming a hole:
+            //
+            //  * The call is UNQUALIFIED. `other::spawn_x(` or `obj.spawn_x(`
+            //    may name a different function than the local `fn spawn_x`,
+            //    and `GlobalExecutor::spawn(` must never be exempted by a
+            //    local `fn spawn`.
+            //  * The local declaration HAS A BODY. A trait method declared
+            //    here with `;` has its body somewhere this scan never reads.
+            //  * The call's ARGUMENTS are still scanned, as a body of their
+            //    own. A helper taking a future (`spawn_detached(async move {
+            //    .. })`) runs that block off the loop, and its own body shows
+            //    only `f.await`.
+            //
+            // A helper that fails any of these reaches the panic below.
+            let before = code[..start].trim_end();
+            // A DECLARATION (`fn spawn_x(`) is not a call and spawns nothing.
+            if before.ends_with("fn")
+                && !before[..before.len() - 2]
+                    .as_bytes()
+                    .last()
+                    .copied()
+                    .is_some_and(is_ident)
             {
+                continue;
+            }
+            let qualified = before.ends_with(|c: char| c == ':' || c == '.');
+            let has_local_body = || {
+                [format!("fn {ident}("), format!("fn {ident}<")]
+                    .iter()
+                    .filter_map(|decl| code.find(decl.as_str()))
+                    .any(|at| {
+                        let rest = &code[at..];
+                        match (rest.find('{'), rest.find(';')) {
+                            (Some(open), Some(semi)) => open < semi,
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    })
+            };
+            if !qualified && has_local_body() {
+                let mut depth = 0usize;
+                let mut close = None;
+                for (off, b) in bytes[name_end..].iter().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(name_end + off);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close = close.unwrap_or_else(|| {
+                    panic!("`{ident}` at byte {start} opens an argument list that is never closed")
+                });
+                out.push(&code[name_end..=close]);
+                cursor = close + 1;
                 continue;
             }
 
@@ -7282,8 +7336,10 @@ mod tests {
         let code = "fn caller() { spawn_helper(a, b); } \
                     fn spawn_helper<P>(a: P, b: u8) { GlobalExecutor::spawn(async move { NEEDLE }); }";
         let bodies = spawned_bodies(code);
-        assert_eq!(bodies.len(), 1, "only the helper's real spawn is a task");
-        assert!(bodies[0].contains("NEEDLE"));
+        assert!(
+            bodies.iter().any(|b| b.contains("NEEDLE")),
+            "the helper's own spawn must be scanned at its definition, got {bodies:?}"
+        );
     }
 
     /// ...and a spawn helper with NO definition in the scanned text (imported
@@ -7293,6 +7349,39 @@ mod tests {
     fn a_spawn_helper_defined_elsewhere_still_panics() {
         let code = "fn caller() { other::spawn_helper(a, b); }";
         let _ = spawned_bodies(code);
+    }
+
+    /// A QUALIFIED call is not exempted by a same-named local function: the
+    /// path may name a different one.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_qualified_call_is_not_exempted_by_a_local_namesake() {
+        let code = "fn caller() { other::spawn_helper(a, b); } \
+                    fn spawn_helper(a: u8, b: u8) { }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// A local declaration with no body (a trait method) does not exempt the
+    /// call: the body that runs is somewhere this scan never reads.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_bodiless_local_declaration_does_not_exempt_the_call() {
+        let code = "trait S { fn spawn_task(&self, f: F); } \
+                    fn caller() { spawn_task(fut); }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// A block handed TO a local helper runs off the loop too, and the
+    /// helper's own body shows only `f.await`. The arguments must be scanned.
+    #[test]
+    fn a_block_handed_to_a_local_helper_is_scanned() {
+        let code = "fn caller() { spawn_detached(async move { NEEDLE }); } \
+                    fn spawn_detached(f: F) { GlobalExecutor::spawn(async move { f.await }); }";
+        let bodies = spawned_bodies(code);
+        assert!(
+            bodies.iter().any(|b| b.contains("NEEDLE")),
+            "the block passed to the helper must be scanned, got {bodies:?}"
+        );
     }
 
     /// The second audit defeat, and the subtler one: it uses a RECOGNISED spawn
@@ -8627,8 +8716,10 @@ mod hol_4391_tests {
             // state big enough to take the refusal branch.
             //
             // That was a fact about the tests that happened to exist. Wrapping
-            // every installed stub makes it a fact about all of them, including
-            // the ones nobody has written, and it fails the test that made the
+            // every stub installed THROUGH THIS GUARD makes it a fact about
+            // those, including the ones nobody has written. Tests that call
+            // `set_off_loop_fetch_override` directly bypass it, so a new test
+            // should install through here. It fails the test that made the
             // mistake: an oversized stub records the reason, and `Drop` below
             // panics with it in that test's own thread. It does not panic
             // HERE, because this closure runs inside the spawned off-loop task,
@@ -8636,31 +8727,42 @@ mod hol_4391_tests {
             // synthesized upsert failure, which a test expecting failure would
             // read as a pass.
             //
+            // The check is on the SUM per call, because that is what
+            // `within_fetch_allowance` refuses on: two states each under the
+            // floor can still take the refusal branch together.
+            //
             // For scale: every stub today returns seven bytes against a floor
             // allowance of 512 KiB, so this is not load-bearing now. It is here
             // for the test that is not written yet.
             let floor = delegate_park::min_upsert_fetch_allowance();
+            // A violation left by an earlier test's still-running task must
+            // not be blamed on this one.
+            STUB_OVER_FLOOR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             let checked: OffLoopFetchStub = Arc::new(move |missing| {
                 let inner = stub(missing);
                 Box::pin(async move {
                     let out = inner.await;
                     if let Ok(states) = &out {
-                        for (id, state) in states {
-                            if delegate_park::ByteCount::new(state.as_ref().len()) <= floor {
-                                continue;
-                            }
+                        let total: delegate_park::ByteCount = states
+                            .iter()
+                            .map(|(_, state)| delegate_park::ByteCount::new(state.as_ref().len()))
+                            .sum();
+                        if total > floor {
                             let reason = format!(
-                                "off-loop fetch stub returned {} bytes for {id}, over the \
-                                 floor per-fetch allowance of {floor}. That reaches the \
-                                 refusal branch of `within_fetch_allowance`, which \
-                                 increments the process-global \
-                                 REFUSED_OVERSIZED_FETCHES and breaks \
+                                "off-loop fetch stub returned {total} bytes for {} \
+                                 contract(s), over the floor per-fetch allowance of \
+                                 {floor}. That reaches the refusal branch of \
+                                 `within_fetch_allowance`, which increments the \
+                                 process-global REFUSED_OVERSIZED_FETCHES and breaks \
                                  `an_oversized_related_fetch_is_refused_and_counted`'s \
                                  exact-equality assertion intermittently. Either shrink \
                                  the stub, or join that test's \
                                  `#[serial_test::serial(oversized_fetch_counter)]` group \
                                  and say why",
-                                state.as_ref().len()
+                                states.len()
                             );
                             STUB_OVER_FLOOR
                                 .lock()
@@ -11980,8 +12082,9 @@ mod hol_4391_tests {
     ///
     /// Note the allowance is well under `MAX_STATE_SIZE` (50 MiB) by design —
     /// see `upsert_fetch_allowance`. A legitimately large related contract
-    /// degrades to the pre-#5544 inline path, which is slower but loses
-    /// nothing.
+    /// degrades to the pre-#5544 inline path: slower, and its re-fetch runs
+    /// under the inline 10 s timeout, so it can fail where the off-loop fetch
+    /// succeeded (#5831).
     ///
     /// AMBIENT STATE, HANDLED RATHER THAN IGNORED. `REFUSED_OVERSIZED_FETCHES`
     /// is a process-global static and this binary runs tests in one process,
@@ -12056,7 +12159,7 @@ mod hol_4391_tests {
         assert!(
             refused_oversized_fetches() > before,
             "the refusal must be COUNTED. It is a legitimate degradation — the \
-             delegate keeps its write, it just costs a stall — which is exactly \
+             write is retried inline at the cost of a stall — which is exactly \
              why an operator needs to be able to see that it happened"
         );
     }

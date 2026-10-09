@@ -215,6 +215,14 @@ BYTES_CASES = [
         "RED",
     ),
     (
+        "task_bytes pending network-op context charged ONCE instead of twice",
+        PARK,
+        "        .map(|op| ctx_len(&op.context) + ctx_len(&op.context))",
+        "        .map(|op| ctx_len(&op.context))",
+        BYTE_TESTS,
+        "RED",
+    ),
+    (
         "inbound WakeupFired tag zeroed",
         PARK,
         "InboundDelegateMsg::WakeupFired { tag } => ByteCount::new(tag.len()),",
@@ -463,6 +471,32 @@ GUARDS_CASES = [
         "                }\n"
         "            })",
         ["a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context"],
+        "RED",
+    ),
+    (
+        "network-op reconciliation reverted to a (contract, kind) multiset",
+        PARK,
+        "        let mut unresolved_contract_ops = Vec::new();\n"
+        "        for (op_id, id, kind, context) in owed_contract_ops {\n"
+        "            if !resolved_ids.contains(&op_id) {\n"
+        "                unresolved_contract_ops.push((id, kind, context));\n"
+        "            }\n"
+        "        }",
+        "        let _ = &resolved_ids;\n"
+        "        let mut keyed: Vec<(ContractInstanceId, ContractOpKind)> = contract_ops\n"
+        "            .iter()\n"
+        "            .map(|r| (r.pending.contract_id, r.pending.kind))\n"
+        "            .collect();\n"
+        "        let mut unresolved_contract_ops = Vec::new();\n"
+        "        for (_op_id, id, kind, context) in owed_contract_ops {\n"
+        "            match keyed.iter().position(|k| *k == (id, kind)) {\n"
+        "                Some(i) => {\n"
+        "                    keyed.remove(i);\n"
+        "                }\n"
+        "                None => unresolved_contract_ops.push((id, kind, context)),\n"
+        "            }\n"
+        "        }",
+        ["network_ops_are_reconciled_by_count_not_by_set"],
         "RED",
     ),
 ]

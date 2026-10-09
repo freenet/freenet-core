@@ -338,8 +338,9 @@ pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
 /// takes an unexplained constant for arithmetic. The previous shape allowed
 /// EIGHT fetching parks per budget; this allows four. Four parks x four upserts
 /// is sixteen concurrent related fetches. The reserve is per UPSERT, so sixteen
-/// single-upsert parks fill the budget just the same, and the seventeenth goes
-/// inline however small its related states turn out to be (#5831). Halving the
+/// single-upsert parks fill it just the same (fewer, since each park also
+/// charges its own payloads), and the rest go inline however small their
+/// related states turn out to be (#5831). Halving the
 /// concurrency is part of how the per-upsert figure gets large enough to be
 /// useful. It is a choice about how many parks may fetch at once, riding inside
 /// a fix for how much each may retain — change it deliberately, not as a
@@ -1284,8 +1285,9 @@ pub(super) enum FetchDisposition {
     /// Over the reserve. The states have been DROPPED — nothing oversized ever
     /// reaches the sink, the guard or the resume channel — and the upsert must
     /// be re-run INLINE on the serial loop at resume, which is the degradation
-    /// [`upsert_fetch_allowance`] documents: slower, holds the loop, re-fetches,
-    /// and completes the write.
+    /// [`upsert_fetch_allowance`] documents: slower, holds the loop, and
+    /// re-fetches under the inline timeout, so it can fail where the off-loop
+    /// fetch succeeded (#5831).
     RetryInline,
 }
 
@@ -3454,6 +3456,26 @@ mod tests {
         // A real answer lands first, so the delivery has something to carry and
         // the assertion below cannot pass by delivering nothing.
         answers.lock().unwrap().push(answer(1));
+        // ...and a resolved upsert, so delivery THROUGH the poisoned fetches
+        // lock is checked as well, not only that it does not abort.
+        let upsert_key = ContractKey::from_params_and_code(
+            Parameters::from(vec![]),
+            freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
+        );
+        let upsert_id = UpsertId::next();
+        fetches.lock().unwrap().push(ResolvedUpsert {
+            pending: PendingUpsert {
+                id: upsert_id,
+                key: upsert_key,
+                update: Either::Right(StateDelta::from(vec![])),
+                related_contracts: RelatedContracts::default(),
+                code: None,
+                is_put: true,
+                context: DelegateContext::new(b"up".to_vec()),
+                missing: Vec::new(),
+            },
+            fetched: FetchDisposition::Resolved(Ok(Vec::new())),
+        });
 
         // POISON BOTH, the way the production path does it: panic while holding
         // the guard. `catch_unwind` keeps the poisoning panic out of the test's
@@ -3509,7 +3531,12 @@ mod tests {
             k.clone(),
             7,
             vec![1],
-            Vec::new(),
+            vec![OwedUpsert {
+                id: upsert_id,
+                contract: *upsert_key.id(),
+                is_put: true,
+                context: DelegateContext::new(b"up".to_vec()),
+            }],
             answers,
             fetches,
             vec![(
@@ -3550,6 +3577,20 @@ mod tests {
             resume.unresolved_contract_ops.is_empty(),
             "the delivered op discharges its own obligation, so nothing may be \
              synthesized as failed"
+        );
+        assert_eq!(
+            resume
+                .upserts
+                .iter()
+                .map(|r| r.pending.id)
+                .collect::<Vec<_>>(),
+            vec![upsert_id],
+            "the upsert resolved before the poisoning must be delivered through \
+             the poisoned fetches lock"
+        );
+        assert!(
+            resume.unresolved_upserts.is_empty(),
+            "the delivered upsert discharges its own obligation"
         );
     }
 
