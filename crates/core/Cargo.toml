@@ -10,10 +10,16 @@ repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
 
 [package.metadata.freenet]
-# Minimum compatible protocol version. Peers older than this are rejected.
-# Updated by scripts/release.sh during releases. The env var
+# Minimum compatible protocol version. Peers older than this are rejected at
+# the handshake, in both directions. The release workflow (release.yml) ships
+# this value unchanged; scripts/release.sh rewrites it. The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
-min-compatible-version = "0.2.64"
+#
+# 0.2.122: 0.2.120 and 0.2.121 cannot detect updates themselves (they parse
+# the raw "v"-prefixed release tag as semver and drop every update, #5221,
+# fixed in 0.2.122 by #5225). 0.2.122 is the first release after them. The
+# floor is a single threshold, so it also refuses every older release.
+min-compatible-version = "0.2.122"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
