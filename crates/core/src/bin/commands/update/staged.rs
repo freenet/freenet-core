@@ -163,16 +163,17 @@ fn tag_dir(root: &Path, tag: &str) -> Result<PathBuf> {
 /// A POSIX record lock (`fcntl`), not `flock`: a `flock` is shared with every
 /// child forked while it is held, until that child execs, so a process that
 /// spawns children could keep it held after releasing it. Record locks belong
-/// to the process and are never inherited. Two consequences: they do not
-/// exclude other threads of the same process (each process stages from one
-/// task, so nothing needs that), and closing ANY descriptor of the lock file
-/// in this process releases the lock, so nothing else may open it.
+/// to the process and are never inherited. They do not exclude other callers
+/// in the same process, and closing ANY descriptor of the lock file in this
+/// process releases the lock, so [`HELD_LOCKS`] refuses a second in-process
+/// holder before it can open one.
 ///
 /// Unix only. Elsewhere this always succeeds; the write order (archive moved
 /// into place before the manifest is written) and the installer's checksums
 /// still keep a cache that two processes wrote from being installed wrong.
 struct CacheLock {
-    _file: fs::File,
+    /// `Option` so `drop` can close it while still holding [`HELD_LOCKS`].
+    file: Option<fs::File>,
     path: PathBuf,
 }
 
@@ -186,6 +187,10 @@ impl Drop for CacheLock {
         // Poisoning cannot leave this list wrong: every critical section is a
         // single push or retain.
         let mut held = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        // Release the lock before the registry entry. In the other order a
+        // second in-process caller could open the file in between, and this
+        // close would then release the lock it believes it holds.
+        drop(self.file.take());
         held.retain(|p| p != &self.path);
     }
 }
@@ -225,7 +230,10 @@ fn try_lock(root: &Path) -> std::io::Result<Option<CacheLock>> {
         }
     }
     held.push(path.clone());
-    Ok(Some(CacheLock { _file: file, path }))
+    Ok(Some(CacheLock {
+        file: Some(file),
+        path,
+    }))
 }
 
 /// Remove every staged release except `keep`, so the cache never holds more
@@ -929,13 +937,10 @@ mod tests {
         (tmp, root)
     }
 
-    /// A local port nothing listens on, so the live-manifest re-check fails
-    /// at once and offline.
+    /// Port 0 cannot be connected to, so the live-manifest re-check fails at
+    /// once and offline, and can never reach another test's mock server.
     fn refused_url() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}/")
+        "http://127.0.0.1:0/".to_string()
     }
 
     fn release_listing(names: &[&str]) -> Release {
@@ -1670,6 +1675,12 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
         // SAFETY: as above.
         assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        // Close-on-exec, so a process another test spawns meanwhile cannot
+        // keep the release pipe open and stall the child until its alarm.
+        for fd in ready.into_iter().chain(release) {
+            // SAFETY: setting a flag on a descriptor we just created.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
 
         // SAFETY: the child only calls async-signal-safe functions on data
         // prepared before the fork, then _exits without unwinding.

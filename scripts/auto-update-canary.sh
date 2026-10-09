@@ -2054,7 +2054,11 @@ cmd_selfupdate() {
   if log_has "$work/logs" "$MARKER_STAGE_STARTED"; then
     staging_armed=1
     if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
-      if log_has "$work/logs" "$MARKER_RATE_LIMITED"; then
+      # Only a rate limit on the staging failure itself, not one anywhere in
+      # the log. log_lines greps the files directly; no pipe (SIGPIPE).
+      local staging_failure
+      staging_failure="$(log_lines "$work/logs" "Could not download the update in advance")"
+      if [[ "$staging_failure" == *"$MARKER_RATE_LIMITED"* ]]; then
         fail "UNVERIFIED: v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
         log_lines "$work/logs" "the update" | head -8 >&2
         return "$EXIT_UNVERIFIED_ENVIRONMENTAL"

@@ -718,7 +718,8 @@ fi
 #    version it reports.
 # ---------------------------------------------------------------------------
 make_fake_prev() {
-    # make_fake_prev <path> <node-log-lines> <install-from-cache:0|1>
+    # make_fake_prev <path> <node-log-lines> <install-from-cache:0|1|2>
+    #   2 = installs only from a staged download; its own download path fails
     local path="$1" lines="$2" use_cache="$3" stages=0
     [[ "$lines" == *"Update downloaded and verified"* ]] && stages=1
     cat > "$path" <<FAKE
@@ -729,8 +730,10 @@ case "\${1:-}" in
         echo "Freenet version: \$(cat "\$ver_file" 2>/dev/null || echo 0.2.121) (deadbeefcafe)"
         exit 0 ;;
     update)
-        if [ -d "\$HOME/.local/state/freenet/staged_update" ] && [ "$use_cache" = 1 ]; then
-            echo "Installing v0.2.122 from the update downloaded in advance." >&2
+        if [ -d "\$HOME/.local/state/freenet/staged_update" ]; then
+            [ "$use_cache" != 0 ] && echo "Installing v0.2.122 from the update downloaded in advance." >&2
+        elif [ "$use_cache" = 2 ]; then
+            exit 1   # the installer's own download path is broken
         fi
         echo 0.2.122 > "\$ver_file"
         exit 0 ;;
@@ -792,6 +795,13 @@ $STAGE_DL
 $STAGE_DONE" 0)"
 expect_rc "$rc" 1 "Gate B fails when the installer ignores the staged download" \
     "when \`freenet update\` re-downloaded instead of using the staged copy; expected 1. That is the #5790 loop on slow links, invisible on a fast runner."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_DONE" 2)"
+expect_rc "$rc" 1 "Gate B fails when the installer's own download path is broken" \
+    "the second, no-staging install failed and Gate B did not notice, so the fallback every node whose staging failed relies on is uncovered."
 
 rc="$(gate_b_rc_for "$TRIGGER_LINE
 $STAGE_PREP

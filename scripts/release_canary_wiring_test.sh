@@ -2737,6 +2737,8 @@ fi
 #    30  the runner reachability probe after the node attempts (same bound)
 #   300  `freenet update` downloading and installing the new release. Estimate:
 #        update.rs bounds a STALLED transfer (30s idle), not a slow one.
+#   300  the second `freenet update` Gate B runs without a staged download once
+#        the previous release stages (#5790). Same estimate.
 #    60  checkout, previous-release lookup, runner overhead. Estimate.
 # shellcheck disable=SC2016  # the inner script expands in the child, on purpose
 canary_defaults="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
@@ -2751,7 +2753,7 @@ if [[ -z "$gate_b_timeout_min" || -z "${_sleep:-}" ]]; then
         "timeout-minutes='${gate_b_timeout_min}' defaults='${canary_defaults}'" \
         "Without both, the check below cannot say whether the job can finish."
 else
-    _worst=$(( 300 + _wait + _poll + 120 + 30 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 60 ))
+    _worst=$(( 300 + _wait + _poll + 120 + 30 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 300 + 60 ))
     if [[ $(( gate_b_timeout_min * 60 )) -ge "$_worst" ]]; then
         pass "Gate B's timeout-minutes ($gate_b_timeout_min) holds the canary's worst case (${_worst}s)"
     else
