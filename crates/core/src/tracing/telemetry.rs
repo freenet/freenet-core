@@ -2856,6 +2856,54 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "contract_exec_delta_wasm_uncached_last_snapshot",
                         snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
                     ),
+                    (
+                        "contract_summary_cache_entries",
+                        snapshot.contract_summary_cache_entries,
+                    ),
+                    (
+                        "contract_summary_cache_bytes",
+                        snapshot.contract_summary_cache_bytes,
+                    ),
+                    (
+                        "contract_summary_cache_budget_bytes",
+                        snapshot.contract_summary_cache_budget_bytes,
+                    ),
+                    (
+                        "contract_summary_cache_count_cap",
+                        snapshot.contract_summary_cache_count_cap,
+                    ),
+                    (
+                        "contract_summary_cache_count_cap_evictions_total",
+                        snapshot.contract_summary_cache_count_cap_evictions_total,
+                    ),
+                    (
+                        "contract_summary_cache_byte_budget_evictions_total",
+                        snapshot.contract_summary_cache_byte_budget_evictions_total,
+                    ),
+                    (
+                        "contract_delta_cache_entries",
+                        snapshot.contract_delta_cache_entries,
+                    ),
+                    (
+                        "contract_delta_cache_bytes",
+                        snapshot.contract_delta_cache_bytes,
+                    ),
+                    (
+                        "contract_delta_cache_budget_bytes",
+                        snapshot.contract_delta_cache_budget_bytes,
+                    ),
+                    (
+                        "contract_delta_cache_count_cap",
+                        snapshot.contract_delta_cache_count_cap,
+                    ),
+                    (
+                        "contract_delta_cache_count_cap_evictions_total",
+                        snapshot.contract_delta_cache_count_cap_evictions_total,
+                    ),
+                    (
+                        "contract_delta_cache_byte_budget_evictions_total",
+                        snapshot.contract_delta_cache_byte_budget_evictions_total,
+                    ),
                 ] {
                     obj.insert(name.to_string(), serde_json::json!(value));
                 }
@@ -2950,6 +2998,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "lattice_probe_improvements".to_string(),
                     serde_json::json!(snapshot.lattice_probe_improvements),
+                );
+                obj.insert(
+                    "lattice_probe_misses".to_string(),
+                    serde_json::json!(snapshot.lattice_probe_misses),
                 );
                 // Version-gate refusal counters (#5156): same hand-mirror
                 // footgun as the gauges above — a new `RouterSnapshotInfo`
@@ -4526,15 +4578,18 @@ mod tests {
     /// value under another field's key fails too.
     ///
     /// This covers the counters the COLLECTOR needs, which is NOT the whole
-    /// set the snapshot carries: `_residuals_refused`,
-    /// `_pairs_refused_last_refit`, `_entries_displaced` and
-    /// `_den_below_two_refits` are dashboard-only by choice. The first three
-    /// describe table SATURATION, which is read while looking at one node's
-    /// peer-detail page rather than aggregated across the fleet, and the
-    /// fourth is derivable from the two that are exported here
-    /// (`_estimable_refits` minus the refits that could act). If a fleet-wide
-    /// question ever needs one of them, add it to the mirrored block above and
-    /// to this list together.
+    /// set the snapshot carries. `_residuals_refused`,
+    /// `_pairs_refused_last_refit` and `_entries_displaced` describe table
+    /// SATURATION on one node; they are not exported, and no dashboard page
+    /// shows them since the peer page stopped carrying model diagnostics
+    /// (#5794), so they are read only from the snapshot itself.
+    /// `_den_below_two_refits` is shown on `/routing` and is derivable from
+    /// the two exported here (`_estimable_refits` minus the refits that could
+    /// act). If a fleet-wide question ever needs one of them, add it to the
+    /// mirrored block above and to this list together.
+    /// `route_events_discarded_unlocated` (route events the router discarded
+    /// for a peer with no location) is likewise not exported: it is a
+    /// should-be-zero invariant counter read on one node's `/routing` page.
     #[test]
     fn router_snapshot_json_includes_contract_term_activation() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -4606,6 +4661,18 @@ mod tests {
         info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
         info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
         info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
+        info.contract_summary_cache_entries = Some(117);
+        info.contract_summary_cache_bytes = Some(118);
+        info.contract_summary_cache_budget_bytes = Some(119);
+        info.contract_summary_cache_count_cap = Some(120);
+        info.contract_summary_cache_count_cap_evictions_total = Some(121);
+        info.contract_summary_cache_byte_budget_evictions_total = Some(122);
+        info.contract_delta_cache_entries = Some(123);
+        info.contract_delta_cache_bytes = Some(124);
+        info.contract_delta_cache_budget_bytes = Some(125);
+        info.contract_delta_cache_count_cap = Some(126);
+        info.contract_delta_cache_count_cap_evictions_total = Some(127);
+        info.contract_delta_cache_byte_budget_evictions_total = Some(128);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("contract_exec_summarize_fast_hits_total", 101),
@@ -4624,6 +4691,18 @@ mod tests {
             ("contract_exec_delta_reload_hits_last_snapshot", 114),
             ("contract_exec_delta_wasm_calls_last_snapshot", 115),
             ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
+            ("contract_summary_cache_entries", 117),
+            ("contract_summary_cache_bytes", 118),
+            ("contract_summary_cache_budget_bytes", 119),
+            ("contract_summary_cache_count_cap", 120),
+            ("contract_summary_cache_count_cap_evictions_total", 121),
+            ("contract_summary_cache_byte_budget_evictions_total", 122),
+            ("contract_delta_cache_entries", 123),
+            ("contract_delta_cache_bytes", 124),
+            ("contract_delta_cache_budget_bytes", 125),
+            ("contract_delta_cache_count_cap", 126),
+            ("contract_delta_cache_count_cap_evictions_total", 127),
+            ("contract_delta_cache_byte_budget_evictions_total", 128),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -4665,6 +4744,7 @@ mod tests {
         info.lattice_predecessor_distance = Some(0.07);
         info.lattice_probes_issued = Some(31);
         info.lattice_probe_improvements = Some(17);
+        info.lattice_probe_misses = Some(19);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosted_contracts_count", 5u64),
@@ -4680,6 +4760,7 @@ mod tests {
             ("subscribe_hint_acted_failed", 26),
             ("lattice_probes_issued", 31),
             ("lattice_probe_improvements", 17),
+            ("lattice_probe_misses", 19),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

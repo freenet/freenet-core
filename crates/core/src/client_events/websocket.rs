@@ -1,6 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -37,6 +39,16 @@ pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
 /// interval that prevents most idle timeouts while not creating excessive
 /// overhead.
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Most bytes one read syscall on a client WebSocket takes, and so the most
+/// tungstenite zero-fills before each read attempt (see `configure_upgrade`).
+/// 16 KiB holds any ordinary request in one read; larger frames just take more
+/// reads into a buffer already reserved at their full length.
+const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Largest client WebSocket message, and frame, the node accepts (see
+/// `configure_upgrade`).
+const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 /// Per-client rate limiter for delegate operations.
 ///
@@ -191,7 +203,8 @@ use freenet_stdlib::{
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
 use headers::Header;
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
+use tokio_stream::StreamMap;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -1294,11 +1307,28 @@ async fn websocket_commands(
         }
     };
 
-    // 100MB limit: WASM contract uploads can be very large and the default
-    // ~64KB would reject them. Streaming chunks individual responses but the
-    // initial PUT still arrives as a single WebSocket message.
-    ws.max_message_size(100 * 1024 * 1024)
-        .on_upgrade(on_upgrade)
+    configure_upgrade(ws).on_upgrade(on_upgrade)
+}
+
+/// Transport limits for a client WebSocket. Shared with the end-to-end tests so
+/// they exercise the shipped configuration.
+fn configure_upgrade(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    // 100MB limit: WASM contract uploads can be very large and tungstenite's
+    // defaults (64 MiB per message, 16 MiB per frame) would reject them.
+    // Streaming chunks individual responses but the initial PUT still arrives
+    // as a single WebSocket message, and browsers send a message as ONE frame,
+    // so the frame limit has to match the message limit or any PUT over
+    // 16 MiB is refused and the connection reset.
+    //
+    // Read buffer: tungstenite's `FrameCodec::read_in` zero-fills the read
+    // buffer up to `read_buffer_size` before EVERY read attempt, including
+    // ones that return WouldBlock, so the 128 KiB default cost a 128 KiB memset
+    // per poll of the connection (2.5% of node CPU on a hosted peer, #5795).
+    // The setting only caps how much one read syscall takes: a frame's full
+    // length is still reserved up front, so large messages are unaffected.
+    ws.max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
+        .max_frame_size(WEBSOCKET_MAX_MESSAGE_SIZE)
+        .read_buffer_size(WEBSOCKET_READ_BUFFER_SIZE)
 }
 
 /// Send a synthetic Disconnect to the node so subscription cleanup always runs.
@@ -1368,8 +1398,9 @@ async fn websocket_interface(
     if let (Some(ctx), Some(dir)) = (user_context.as_ref(), activity_secrets_dir.as_ref()) {
         stamp_activity(dir, ctx);
     }
-    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    // Subscription notification receivers for this connection. Owned by this
+    // task alone (no lock) and polled event-driven from the select! below.
+    let mut listeners = SubscriptionListeners::default();
 
     // ReassemblyBuffer evicts incomplete streams after STREAM_TTL (60s) via
     // evict_stale(), called on every receive_chunk(). Concurrent streams are
@@ -1443,36 +1474,17 @@ async fn websocket_interface(
     ping_interval.tick().await;
 
     loop {
-        let contract_updates_cp = contract_updates.clone();
-        let listeners_task = async move {
-            loop {
-                let mut lock = contract_updates_cp.lock().await;
-                let active_listeners = &mut *lock;
-                for _ in 0..active_listeners.len() {
-                    if let Some((key, mut listener)) = active_listeners.pop_front() {
-                        match listener.try_recv() {
-                            Ok(r) => {
-                                active_listeners.push_back((key, listener));
-                                return Ok::<_, anyhow::Error>(r);
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                active_listeners.push_back((key, listener));
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                tracing::debug!(contract = %key, "listener removed");
-                            }
-                        }
-                    }
-                }
-                std::mem::drop(lock);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
         // IMPORTANT: Only cancellation-safe futures (recv, next, tick) go inside the
         // select futures below. Processing functions (process_client_request,
         // process_host_response) run in branch handlers AFTER the select resolves,
-        // so they cannot be cancelled by other branches.
+        // so they cannot be cancelled by other branches. `listeners.next()` is
+        // cancel-safe too: it only polls `mpsc::Receiver::poll_recv`, which never
+        // loses a message when the future is dropped before completing.
+        //
+        // Every branch is event-driven (woken by its own waker), so an idle
+        // connection does not wake at all between pings. Do NOT reintroduce a
+        // timer-polled branch here: each loop pass re-polls `client_stream`, and
+        // every such poll costs a read-buffer memset in tungstenite (#5795).
         //
         // NOTE: Do NOT add `biased;` here. Biased select polls branches in declaration
         // order, which starves host responses, subscription notifications, and pings
@@ -1544,18 +1556,15 @@ async fn websocket_interface(
                 };
                 if let Some(NewSubscription { key, callback }) = msg {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
-                    let active_listeners = &mut *contract_updates.lock().await;
-                    active_listeners.push_back((key, callback));
+                    listeners.insert(key, callback);
                 }
             }
-            response = listeners_task => {
-                let response = match response {
-                    Ok(r) => r,
-                    Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
-                        return Err(err);
-                    }
-                };
+            // Guarded so an empty map (whose `next()` resolves to `None` at once)
+            // is not polled. When the last listener closes, `next()` yields
+            // `None`, the pattern does not match, and select! just disables this
+            // branch for the current pass: a closed listener never ends the
+            // connection.
+            Some(response) = listeners.next(), if !listeners.is_empty() => {
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
@@ -1737,6 +1746,80 @@ struct NewSubscription {
     /// delegate app-message routing #3275, a delegate key). Logging only.
     key: String,
     callback: mpsc::Receiver<HostResult>,
+}
+
+/// The subscription notification receivers of one WebSocket connection.
+///
+/// Polled as a single event-driven stream from the connection's select! loop,
+/// so a notification wakes the connection task directly instead of waiting for
+/// a timer poll. Entries are keyed by a per-connection counter rather than by
+/// their label, because one connection may hold several receivers for the same
+/// contract (each subscribe request gets its own channel) and every one of them
+/// must keep delivering. A receiver whose sender is gone is dropped from the
+/// map once its buffered messages have been delivered.
+#[derive(Default)]
+struct SubscriptionListeners {
+    next_id: u64,
+    streams: StreamMap<u64, SubscriptionListener>,
+}
+
+impl SubscriptionListeners {
+    fn insert(&mut self, label: String, rx: mpsc::Receiver<HostResult>) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let replaced = self.streams.insert(id, SubscriptionListener { label, rx });
+        // A u64 counter cannot wrap within a connection's lifetime, so an id is
+        // never reused and no live listener is ever replaced.
+        debug_assert!(replaced.is_none(), "listener id {id} reused");
+    }
+
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Next notification from any listener; `None` once no listener is left.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe: it only polls `mpsc::Receiver::poll_recv`, so dropping the
+    /// future before it completes loses no message.
+    async fn next(&mut self) -> Option<HostResult> {
+        self.streams
+            .next()
+            .await
+            .map(|(_, notification)| notification)
+    }
+}
+
+/// One subscription's notification receiver, as a stream that logs its own
+/// removal (the map drops an ended stream without telling its owner).
+///
+/// `poll_next` must stay a pure passthrough to `mpsc::Receiver::poll_recv`,
+/// which is what registers the waker. Do not add buffering, `try_recv`, or an
+/// early `Pending` here: the old 10 ms timer poll masked any such lost wake-up,
+/// and nothing does now, so the bug would be a notification that silently
+/// waits for the next unrelated wake (up to the 30 s ping).
+struct SubscriptionListener {
+    label: String,
+    rx: mpsc::Receiver<HostResult>,
+}
+
+impl futures::Stream for SubscriptionListener {
+    type Item = HostResult;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<HostResult>> {
+        let this = self.get_mut();
+        let polled = this.rx.poll_recv(cx);
+        if let Poll::Ready(None) = polled {
+            tracing::debug!(contract = %this.label, "listener removed");
+        }
+        polled
+    }
 }
 
 struct ConnectionState {
@@ -4638,6 +4721,416 @@ mod tests {
             body.contains("req.extensions_mut().insert(connection_scope);"),
             "the classified scope must be injected as a request extension so the \
              upgrade path can move it into the connection task"
+        );
+    }
+
+    // ---- Event-driven subscription delivery (#5795) ------------------------
+
+    /// A notification tagged so tests can tell deliveries apart.
+    fn tagged_notification(tag: &str) -> HostResult {
+        Err(ErrorKind::Unhandled {
+            cause: tag.to_string().into(),
+        }
+        .into())
+    }
+
+    fn notification_tag(notification: &HostResult) -> String {
+        match notification {
+            Err(err) => err.to_string(),
+            Ok(resp) => panic!("expected a tagged notification, got Ok({resp})"),
+        }
+    }
+
+    /// Counts wake-ups, so a test can tell whether a send woke the parked poll.
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The property the 10 ms polling loop lacked: a notification sent to a
+    /// parked listener poll WAKES it. The old code's `try_recv` registered no
+    /// waker, so delivery waited for its `sleep(10ms)` to fire, and that timer
+    /// woke every idle connection ~100x/s.
+    ///
+    /// The wake count carries the weight here, not timing: a version of
+    /// `SubscriptionListener::poll_next` that checks the receiver without
+    /// registering the waker leaves the count at zero and fails this test.
+    #[test]
+    fn notification_wakes_a_parked_listener_poll() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx, rx) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx);
+
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut next = std::pin::pin!(listeners.next());
+
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        tx.try_send(tagged_notification("first"))
+            .expect("channel has room");
+        assert!(
+            wakes.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a send must wake the parked listener poll, not wait for a timer"
+        );
+        match next.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(n)) => assert!(notification_tag(&n).contains("first")),
+            other @ (Poll::Ready(None) | Poll::Pending) => {
+                panic!("expected the notification, got {other:?}")
+            }
+        }
+    }
+
+    /// A listener whose sender is gone still delivers what it buffered, in
+    /// order, then drops out of the map. The others keep delivering, and only
+    /// once every listener is gone does `next()` report `None` (which the
+    /// connection loop treats as "disable this branch", not "disconnect").
+    #[test]
+    fn closed_listener_drains_then_is_removed_without_affecting_others() {
+        let mut listeners = SubscriptionListeners::default();
+        assert!(listeners.is_empty());
+        assert!(
+            matches!(listeners.next().now_or_never(), Some(None)),
+            "an empty map resolves to None at once, which is why the select! \
+             branch is guarded by `!listeners.is_empty()`"
+        );
+
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx_a);
+        listeners.insert("contract-b".to_string(), rx_b);
+
+        tx_a.try_send(tagged_notification("a-first")).unwrap();
+        tx_a.try_send(tagged_notification("a-second")).unwrap();
+        drop(tx_a);
+
+        let mut a_seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            a_seen.push(notification_tag(&n));
+        }
+        assert_eq!(a_seen.len(), 2, "both buffered notifications delivered");
+        assert!(a_seen[0].contains("a-first") && a_seen[1].contains("a-second"));
+        assert_eq!(listeners.len(), 1, "the closed listener is removed");
+
+        // The surviving listener is unaffected.
+        tx_b.try_send(tagged_notification("b-first")).unwrap();
+        match listeners.next().now_or_never() {
+            Some(Some(n)) => assert!(notification_tag(&n).contains("b-first")),
+            other => panic!("expected b's notification, got {other:?}"),
+        }
+
+        drop(tx_b);
+        assert!(matches!(listeners.next().now_or_never(), Some(None)));
+        assert!(listeners.is_empty());
+    }
+
+    /// The old `VecDeque` held one entry per subscribe request, so two
+    /// subscriptions on the same contract from one connection both delivered.
+    /// Keying the map by the label would silently replace the first.
+    #[test]
+    fn listeners_with_the_same_label_all_deliver() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx_1, rx_1) = mpsc::channel(4);
+        let (tx_2, rx_2) = mpsc::channel(4);
+        listeners.insert("same-contract".to_string(), rx_1);
+        listeners.insert("same-contract".to_string(), rx_2);
+        assert_eq!(listeners.len(), 2);
+
+        tx_1.try_send(tagged_notification("from-one")).unwrap();
+        tx_2.try_send(tagged_notification("from-two")).unwrap();
+
+        let mut seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            seen.push(notification_tag(&n));
+        }
+        seen.sort();
+        assert_eq!(
+            seen.len(),
+            2,
+            "both same-label listeners delivered: {seen:?}"
+        );
+        assert!(seen[0].contains("from-one") && seen[1].contains("from-two"));
+    }
+
+    type TestWsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Per-step deadline for the real-socket tests below.
+    const WS_STEP: Duration = Duration::from_secs(10);
+
+    /// A real axum WebSocket served with the shipped `configure_upgrade`, in
+    /// front of a fake node that assigns an id, hands the connection's callback
+    /// sender to the test, and forwards every client request to the test.
+    struct WsHarness {
+        client: TestWsClient,
+        client_id: ClientId,
+        callbacks: mpsc::UnboundedSender<HostCallbackResult>,
+        forwarded: mpsc::UnboundedReceiver<ClientRequest<'static>>,
+    }
+
+    async fn start_ws_harness() -> WsHarness {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use tokio::sync::oneshot;
+
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        let (callbacks_tx, callbacks_rx) =
+            oneshot::channel::<(ClientId, mpsc::UnboundedSender<HostCallbackResult>)>();
+        let (forwarded_tx, forwarded) = mpsc::unbounded_channel::<ClientRequest<'static>>();
+        tokio::spawn(async move {
+            let mut callbacks_tx = Some(callbacks_tx);
+            while let Some(conn) = req_rx.recv().await {
+                match conn {
+                    ClientConnection::NewConnection { callbacks, .. } => {
+                        let id = ClientId::next();
+                        callbacks
+                            .send(HostCallbackResult::NewId { id })
+                            .expect("connection under test is waiting for its id");
+                        if let Some(tx) = callbacks_tx.take() {
+                            tx.send((id, callbacks))
+                                .expect("test is waiting for the callbacks");
+                        }
+                    }
+                    ClientConnection::Request { req, .. } => {
+                        // The test may have finished reading; nothing to do then.
+                        drop(forwarded_tx.send(*req));
+                    }
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            configure_upgrade(ws).on_upgrade(move |socket| async move {
+                // The interface's own return value is not under test.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        false,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Serving ends with the test; its result is teardown noise.
+            drop(axum::serve(listener, app).await);
+        });
+
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let (client_id, callbacks) = tokio::time::timeout(WS_STEP, callbacks_rx)
+            .await
+            .expect("timed out waiting for the connection")
+            .expect("backend hands over the callbacks");
+        WsHarness {
+            client,
+            client_id,
+            callbacks,
+            forwarded,
+        }
+    }
+
+    impl WsHarness {
+        /// Hand the connection a new subscription receiver, as the node does.
+        fn subscribe(&self, label: &str) -> mpsc::Sender<HostResult> {
+            let (tx, rx) = mpsc::channel(4);
+            self.callbacks
+                .send(HostCallbackResult::SubscriptionChannel {
+                    key: label.to_string(),
+                    id: self.client_id,
+                    callback: rx,
+                })
+                .expect("connection task is alive");
+            tx
+        }
+
+        /// The tag of the next notification the client receives.
+        async fn next_notification(&mut self) -> String {
+            tokio::time::timeout(WS_STEP, async {
+                loop {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only binary frames carry notifications; pings and every other frame kind are skipped"
+                    )]
+                    match self
+                        .client
+                        .next()
+                        .await
+                        .expect("connection open")
+                        .expect("ws frame")
+                    {
+                        tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                            let decoded: HostResult =
+                                bincode::deserialize(&bytes).expect("native notification frame");
+                            return notification_tag(&decoded);
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                            panic!("connection closed unexpectedly: {frame:?}")
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for a notification")
+        }
+
+        /// Send an `Authenticate` carrying `token_len` bytes as ONE frame and
+        /// assert the node receives it intact.
+        async fn assert_large_frame_arrives(&mut self, token_len: usize) {
+            let big_token = "t".repeat(token_len);
+            let frame = bincode::serialize(&ClientRequest::Authenticate {
+                token: big_token.clone(),
+            })
+            .unwrap();
+            self.client
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    frame.into(),
+                ))
+                .await
+                .expect("send large frame");
+            match tokio::time::timeout(WS_STEP, self.forwarded.recv())
+                .await
+                .expect("timed out waiting for the large request")
+            {
+                Some(ClientRequest::Authenticate { token }) => {
+                    assert_eq!(token.len(), big_token.len());
+                    assert!(token == big_token, "large frame arrived corrupted");
+                }
+                other => panic!("expected the large Authenticate request, got {other:?}"),
+            }
+        }
+    }
+
+    /// End to end over a real WebSocket, with the shipped upgrade
+    /// configuration: a subscription that arrives while the connection loop is
+    /// parked is delivered; a listener closing does not end the connection;
+    /// a later subscription on the same connection still delivers; and a
+    /// multi-MiB client frame, many times `WEBSOCKET_READ_BUFFER_SIZE`, arrives
+    /// intact.
+    ///
+    /// This test is not the guard for the wake-up property: other branches
+    /// waking the loop can mask a listener that registers no waker, so
+    /// `notification_wakes_a_parked_listener_poll` carries that.
+    #[tokio::test]
+    async fn websocket_delivers_subscription_notifications_end_to_end() {
+        // Captures the connection task's own `listener removed` event. This is
+        // a current-thread runtime, so the spawned connection task is polled
+        // on this thread and the thread-local capture sees it.
+        let (logs, _log_guard) = crate::util::test_log_capture::install();
+        let mut h = start_ws_harness().await;
+
+        // 1. A subscription arriving while the loop is parked (no listeners
+        //    yet) is picked up, and its notifications arrive in order.
+        let sub = h.subscribe("contract-e2e-first");
+        sub.send(tagged_notification("e2e-first")).await.unwrap();
+        sub.send(tagged_notification("e2e-second")).await.unwrap();
+        assert!(h.next_notification().await.contains("e2e-first"));
+        assert!(h.next_notification().await.contains("e2e-second"));
+
+        // 2. The listener closes. Wait until the connection task has actually
+        //    seen it close: the `listener removed` event is emitted inside the
+        //    same poll in which `next()` then yields `None` to the select!
+        //    branch, so once it is logged the branch has already made its
+        //    decision. The connection must have survived that decision: a new
+        //    subscription still delivers. (A branch that ended the connection
+        //    on `None` would have dropped the callback receiver, and
+        //    `subscribe` would panic.)
+        drop(sub);
+        tokio::time::timeout(WS_STEP, async {
+            loop {
+                let seen = logs.lock().unwrap().iter().any(|line| {
+                    line.contains("listener removed") && line.contains("contract-e2e-first")
+                });
+                if seen {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection task never observed the listener closing");
+        let sub2 = h.subscribe("contract-e2e-first");
+        sub2.send(tagged_notification("e2e-after-close"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("e2e-after-close"));
+
+        // 3. A multi-MiB client frame arrives intact through the 16 KiB reads.
+        h.assert_large_frame_arrives(4 * 1024 * 1024).await;
+    }
+
+    /// Browsers send each WebSocket message as a single frame, so a PUT larger
+    /// than tungstenite's 16 MiB default frame limit must still be accepted:
+    /// without `max_frame_size` matching `max_message_size`, this frame resets
+    /// the connection.
+    #[tokio::test]
+    async fn websocket_accepts_a_single_frame_over_the_default_frame_limit() {
+        const TUNGSTENITE_DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
+        let size = 20 * 1024 * 1024;
+        assert!(size > TUNGSTENITE_DEFAULT_MAX_FRAME && size < WEBSOCKET_MAX_MESSAGE_SIZE);
+        let mut h = start_ws_harness().await;
+        h.assert_large_frame_arrives(size).await;
+    }
+
+    /// A client that goes away while it holds a subscription: the connection
+    /// task tells the node (synthetic `Disconnect`, which is what runs the
+    /// node-side subscription cleanup) and drops its listener receivers, so the
+    /// node's notification senders observe the channel closed.
+    #[tokio::test]
+    async fn client_disconnect_drops_listeners_and_notifies_the_node() {
+        let mut h = start_ws_harness().await;
+        let sub = h.subscribe("contract-disconnect");
+        // Prove the listener is live in the connection's map first.
+        sub.send(tagged_notification("before-disconnect"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("before-disconnect"));
+
+        h.client.close(None).await.expect("client close");
+
+        tokio::time::timeout(WS_STEP, sub.closed())
+            .await
+            .expect("listener receiver not dropped after client disconnect");
+        let disconnect_seen = tokio::time::timeout(WS_STEP, async {
+            while let Some(req) = h.forwarded.recv().await {
+                if matches!(req, ClientRequest::Disconnect { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for the Disconnect");
+        assert!(
+            disconnect_seen,
+            "the node must be told the client disconnected"
         );
     }
 }

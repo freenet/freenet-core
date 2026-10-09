@@ -3,8 +3,8 @@
 //!
 //! # Why this exists
 //!
-//! Every question about which failure predictor is better — the legacy blend,
-//! the residual correction, or a design not yet written — is ultimately a
+//! Every question about which failure predictor is better — the hierarchical
+//! estimator, the isotonic baseline, or a design not yet written — is ultimately a
 //! question about real traffic, and a synthetic harness can only answer it for
 //! the structure it was built to contain. The router's inputs are small: one
 //! [`RouteEvent`](super::RouteEvent) per observed outcome. Recording that
@@ -54,10 +54,11 @@
 //! originator's loopback relay, SUBSCRIBE at relays and at the originator
 //! itself (a SUBSCRIBE originator routes directly). The line holds every
 //! candidate the router scored (the `consider_n_closest_peers` distance window,
-//! in distance order), BOTH models' estimates for each — the legacy stack as
-//! routing would act on it with the hierarchical flag off, and the hierarchical
-//! estimator as routing would act on it with the flag on (legacy fallback for
-//! any stage it cannot yet estimate, flagged per stage in
+//! in distance order), BOTH models' estimates for each — the isotonic fallback
+//! as routing would act on it under `FREENET_ROUTING_FALLBACK_ISOTONIC`
+//! (recorded as `legacy`, the name it had while the legacy stack existed), and
+//! the hierarchical estimator as routing acts on it by default (the isotonic
+//! fallback for any stage it cannot yet estimate, flagged per stage in
 //! `hierarchical_stages`) — each candidate's rank under each model, and which
 //! candidates the router actually returned (`selected_position`, 0 = first
 //! choice). `acting_model` says which of the two routed. The record is captured
@@ -143,20 +144,19 @@
 //! window, interleaved scenarios, against `main` at the merge base):
 //! - Candidate logging off, or only the dataset on: no measurable difference
 //!   from `main`, and no recorder mutex is taken (pinned by a test).
-//! - A CAPTURED decision costs about +35% under the router READ lock while
-//!   legacy routes, but about 8x while the hierarchical estimator routes
-//!   (about 45 to 370 µs), because the legacy stack's per-candidate Renegade
-//!   queries then run only for the log. An uncaptured decision costs nothing
-//!   measurable under that lock.
+//! - A CAPTURED decision cost about 8x an uncaptured one under the router READ
+//!   lock while the hierarchical estimator routed (about 45 to 370 µs), almost
+//!   all of it the legacy stack's per-candidate Renegade queries, which then
+//!   ran only for the log. An uncaptured decision costs nothing measurable
+//!   under that lock. Those figures predate #4485's removal of the legacy
+//!   stack: the logged model is now the isotonic fallback, a few
+//!   interpolations per candidate, so a capture should cost far less. It has
+//!   not been re-measured.
 //! - So at rate `r` the added read-lock time averages about `r` times the
-//!   captured cost: on a hierarchical-routed node about +35% per decision at
-//!   `0.05` but about +7% at `0.01`. **Soaks on a node that routes
-//!   hierarchically should use a rate of 0.01 or less**, which since the
-//!   default flip means every node that has not been given an explicit
-//!   `FREENET_ROUTING_HIERARCHICAL=0`. `0.05` is tolerable only on a node
-//!   explicitly pinned to the legacy stack. This condition used to read "with
-//!   `FREENET_ROUTING_HIERARCHICAL` on", which an operator who had set nothing
-//!   would correctly read as not applying to them; unset is now on.
+//!   captured cost. Until it is re-measured, keep the rate the Renegade-era
+//!   figures called for: **0.01 or less** on a node routing hierarchically,
+//!   which is every node that has not set `FREENET_ROUTING_FALLBACK_ISOTONIC`
+//!   (about +7% per decision at `0.01` then, and +35% at `0.05`).
 //! - Building a record takes about 6 µs after the lock is released, serialising
 //!   it about 23 µs on the writer thread; a line is about 16 KB.
 //! - While capture is active, route records sent under the router WRITE lock
@@ -319,13 +319,12 @@ const MARKER_RESERVE: u64 = 512;
 
 /// The single clock every record is stamped with.
 ///
-/// Host wall clock, deliberately not `TimeSource`: the predictor this data
-/// exists to replay derives its own time feature from the router's wall clock,
-/// which in production is the ring's `InstantTimeSrc` and so the host wall
-/// clock, so a replay needs records on that same clock. If the router's clock
-/// is ever made overridable outside tests, this must follow it. Route events
-/// and peer snapshots MUST share this function, or they stop joining the
-/// moment either side's clock is changed.
+/// Host wall clock, deliberately not `TimeSource`: the records are joined
+/// offline against node logs, telemetry and each other, all of which carry
+/// host time. (The Renegade predictor this data was first recorded for also
+/// read the host wall clock; it was removed in #4485.) Route events and peer
+/// snapshots MUST share this function, or they stop joining the moment either
+/// side's clock is changed.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -358,46 +357,59 @@ pub(crate) enum RouteSource {
     Relay,
 }
 
-/// What every failure layer forecast for an event, before ingesting it.
+/// What the forecasts for an event were, before ingesting it.
+///
+/// Until #4485 removed the legacy routing stack this also carried `blended`
+/// (the fixed-weight Renegade blend), `corrected` (the residual correction)
+/// and the correction's `lambda` and `n_eff`. Records written by earlier builds
+/// still have them; the `*_legacy` timing fields below changed meaning at the
+/// same point (see their docs).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub(crate) struct FailureForecasts {
     /// The global isotonic distance curve.
     pub global: f64,
     /// The global curve with the per-peer EWMA adjustment.
     pub adjusted: f64,
-    /// The legacy fixed-weight blend of `adjusted` with Renegade.
-    pub blended: f64,
-    /// The residual correction composed on the global curve.
-    pub corrected: f64,
-    /// Shrinkage applied to the correction, when one was formed.
-    pub lambda: Option<f64>,
-    /// Effective evidence behind the correction, when one was formed.
-    pub n_eff: Option<f64>,
-    /// The hierarchical empirical-Bayes estimator (#4485), once it has a curve.
+    /// The hierarchical empirical-Bayes estimator (#4485), once it has a
+    /// curve: the failure probability routing acts on.
     ///
-    /// The estimator is computed unconditionally on a recording node, so this
-    /// field's MEANING changed when the contract-level term landed: from that
-    /// release on it is the forecast WITH the term, on every recording node,
-    /// whatever `FREENET_ROUTING_HIERARCHICAL` is set to. The without-term
-    /// baseline is therefore not obtainable from data recorded after it, and
-    /// any comparison across that boundary must replay rather than read the
-    /// two directly.
+    /// This field's MEANING changed when the contract-level term landed
+    /// (#5702): from that release on it is the forecast WITH the term, on
+    /// every recording node. The without-term baseline is therefore not
+    /// obtainable from data recorded after it, and any comparison across that
+    /// boundary must replay rather than read the two directly.
     pub hierarchical: Option<f64>,
     /// FLOORED AT 1 ms: every `log_response_time_*` field is `ln(max(t, 0.001))`,
     /// while routing acts on the unfloored value and `time_to_response_start_s`
     /// is recorded raw. Floor `time_to_response_start_s` the same way before any
     /// log-scale scoring against these, or a 0 s outcome becomes `-inf`.
     ///
-    /// `ln(seconds)` to response start the legacy stack would act on (including
-    /// the residual correction when that flag is on), forecast for every event
-    /// whether or not it turns out to be timed, so timing can be scored offline
-    /// on the timed subset. `None` without a timing estimate, and recorded only
-    /// while the hierarchical estimator is computed.
+    /// `ln(seconds)` to response start of the isotonic estimate with the
+    /// per-peer EWMA, the one a timing stage without a hierarchical curve falls
+    /// back to, forecast for every event whether or not it turns out to be
+    /// timed, so timing can be scored offline on the timed subset. `None`
+    /// without a timing estimate. Named `legacy` because it is what remains of
+    /// the legacy stack.
+    ///
+    /// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141),
+    /// as did `log_transfer_speed_legacy` and `RoutingModel::Legacy`: builds
+    /// before it recorded the Renegade blend here (and the residual correction
+    /// when that flag was on). An offline reader spanning that release must
+    /// split on the node's version.
     pub log_response_time_legacy: Option<f64>,
     /// The same forecast from the hierarchical estimator: `ln E[T]`, the value
     /// routing would act on, not the log-scale location.
     pub log_response_time_hierarchical: Option<f64>,
-    /// `ln(bytes/s)` of the transfer speed the legacy stack would act on.
+    /// `ln(bytes/s)` of the isotonic transfer speed a transfer stage without a
+    /// hierarchical curve falls back to, as routing uses it: FLOORED at
+    /// `DEGENERATE_SPEED_FLOOR_BPS` (1e-6 B/s), so it is never below
+    /// `ln(1e-6)` (about -13.8), and that value means the estimator itself
+    /// said zero or nearly so.
+    /// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141)
+    /// in two ways: earlier builds recorded the Renegade blend here (see
+    /// `log_response_time_legacy`), and recorded the speed unfloored, with no
+    /// value at all where it was zero. Offline readers must split on the
+    /// node's version.
     pub log_transfer_speed_legacy: Option<f64>,
     /// `ln(bytes/s)` of the hierarchical estimator's effective speed (so that
     /// `bytes / speed` is its expected transfer time).
@@ -445,7 +457,13 @@ pub(crate) struct PeerAttributes {
     pub bytes_received: Option<u64>,
 }
 
-/// Which estimator stack routing acted on for a decision.
+/// Which estimator routing acted on for a decision.
+///
+/// `Legacy` is the isotonic fallback (`FREENET_ROUTING_FALLBACK_ISOTONIC`).
+/// MEANING CHANGED at the release carrying #5681 (the first after 0.2.141):
+/// before it, `Legacy` was the legacy stack (the isotonic estimate blended
+/// with Renegade). The serialized name is kept so offline readers of earlier
+/// recordings keep working, and they must split on the node's version.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RoutingModel {
@@ -475,7 +493,7 @@ pub(crate) struct ModelEstimate {
 }
 
 /// Which stages the hierarchical estimator supplied itself for a candidate;
-/// a `false` stage in its [`ModelEstimate`] is the legacy fallback.
+/// a `false` stage in its [`ModelEstimate`] is the isotonic fallback.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct HierarchicalStages {
     pub failure: bool,
@@ -1733,7 +1751,7 @@ pub(crate) fn parse_candidate_rate(value: Option<&str>) -> f64 {
     let Some(raw) = value else {
         return 0.0;
     };
-    if super::parse_routing_flag(Some(raw)) {
+    if super::parse_routing_flag(Some(std::ffi::OsStr::new(raw))) == super::RoutingFlag::On {
         return 1.0;
     }
     match raw.trim().parse::<f64>() {
@@ -2001,10 +2019,6 @@ mod tests {
             forecasts: Some(FailureForecasts {
                 global: 0.1,
                 adjusted: 0.2,
-                blended: 0.15,
-                corrected: 0.12,
-                lambda: Some(0.5),
-                n_eff: Some(4.0),
                 hierarchical: Some(0.11),
                 log_response_time_legacy: Some(-1.5),
                 log_response_time_hierarchical: None,
@@ -2067,7 +2081,11 @@ mod tests {
         assert_eq!(lines[1]["source"], "relay");
         assert_eq!(lines[1]["peer"], "00000000000000aa");
         assert_eq!(lines[1]["outcome"], "failure");
-        assert_eq!(lines[1]["forecasts"]["corrected"], 0.12);
+        assert_eq!(lines[1]["forecasts"]["adjusted"], 0.2);
+        assert!(
+            lines[1]["forecasts"]["blended"].is_null(),
+            "the Renegade blend was removed with the legacy stack (#4485)"
+        );
         assert_eq!(lines[1]["forecasts"]["hierarchical"], 0.11);
         assert_eq!(lines[1]["forecasts"]["log_response_time_legacy"], -1.5);
         assert_eq!(lines[1]["forecasts"]["log_transfer_speed_legacy"], 9.0);
@@ -3366,11 +3384,9 @@ mod tests {
     }
 
     /// Decision lines must never be able to stop the route recording they
-    /// enrich — nor, through `is_recording`, the hierarchical estimator that is
-    /// computed only while the recorder records.
+    /// enrich.
     #[test]
     fn a_spent_decision_budget_stops_only_decision_capture() {
-        let _flag_off = super::super::force_hierarchical_routing(false);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routing.jsonl");
         // A small file and an unlimited configured decision budget: the
@@ -3405,10 +3421,6 @@ mod tests {
         assert!(
             dataset.is_recording(),
             "route recording goes on after the decision budget is spent"
-        );
-        assert!(
-            super::super::hierarchical_computed(Some(&dataset)),
-            "and so does the hierarchical estimator on a flag-off node"
         );
         assert!(!dataset.is_capturing_decisions());
         assert_eq!(

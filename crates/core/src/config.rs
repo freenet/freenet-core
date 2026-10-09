@@ -4709,6 +4709,53 @@ impl GlobalSimulationTime {
 std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCE_NOOP_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCED_NOOP_GATE_CONNECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: treat every remote as running a release at or above
+/// `UNTRACKED_ACK_NOOP_MIN_VERSION` (#5795), so the receive-side "do not ack
+/// a capable peer's NoOps" gate is ON even though simulated peers all report
+/// the current, pre-floor crate version.
+///
+/// Thread-local, like [`SimulationTransportOpt`], so concurrent tests do not
+/// interfere: it applies to connections CREATED on the calling thread while
+/// enabled (the decision is fixed in `PeerConnection::new`). Honoured only in
+/// `test` / `testing` builds; a release binary ignores it. For a whole-suite
+/// local run, `FREENET_TEST_FORCE_NOOP_GATE=1` enables it on every thread.
+pub struct SimulationForceNoopGate;
+
+impl SimulationForceNoopGate {
+    /// Force the gate on for connections created on this thread.
+    pub fn enable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(true));
+    }
+
+    /// Stop forcing the gate on this thread.
+    pub fn disable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(false));
+    }
+
+    /// Number of connections created on this thread with the gate forced on,
+    /// so a test can prove the override actually reached the transport.
+    pub fn forced_connection_count() -> u64 {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.get())
+    }
+
+    /// Record one connection created with the gate forced on.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn record_forced_connection() {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Whether the gate is forced on for this thread.
+    pub fn is_enabled() -> bool {
+        static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.get())
+            || *FROM_ENV.get_or_init(|| {
+                std::env::var("FREENET_TEST_FORCE_NOOP_GATE").is_ok_and(|v| v == "1")
+            })
+    }
 }
 
 /// Opt-in transport timer optimization for large-scale simulations.
@@ -4787,6 +4834,7 @@ std::thread_local! {
     /// rather than inferred from the total (#5510).
     static GLOBAL_DELTA_FAILURE_RESYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out legs skipped because the peer's cached summary already matched
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
     static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4803,6 +4851,7 @@ std::thread_local! {
     static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4909,12 +4958,14 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
         GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
@@ -5133,10 +5184,11 @@ impl GlobalTestMetrics {
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.get())
     }
 
-    /// Records that a delta was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = true.
-    pub fn record_delta_send() {
+    /// Records that a delta of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = true.
+    pub fn record_delta_send(payload_bytes: usize) {
         GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of delta sends since last reset.
@@ -5144,15 +5196,26 @@ impl GlobalTestMetrics {
         GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
-    /// Records that full state was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = false.
-    pub fn record_full_state_send() {
+    /// Payload bytes of every delta counted by [`Self::delta_sends`].
+    pub fn delta_send_bytes() -> u64 {
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.get())
+    }
+
+    /// Records that a full state of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = false.
+    pub fn record_full_state_send(payload_bytes: usize) {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
+    }
+
+    /// Payload bytes of every full state counted by [`Self::full_state_sends`].
+    pub fn full_state_send_bytes() -> u64 {
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.get())
     }
 
     pub fn record_pending_op_insert() {

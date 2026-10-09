@@ -121,9 +121,10 @@ pub mod dev_tool {
         testing_impl::{
             ChurnConfig, ContractDistribution, ControlledEventChain, ControlledSimulationResult,
             ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
-            NetworkPeer, NodeLabel, OperationStats, OperationSummary, PeerMessage, PeerStatus,
-            PutOperationStats, RunningNode, ScheduledOperation, SimNetwork, SimOperation,
-            TurmoilConfig, TurmoilResult, UpdateOperationStats, check_convergence_from_logs,
+            FinalStateHandle, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
+            PeerMessage, PeerStatus, PutOperationStats, RunningNode, ScheduledOperation,
+            SimNetwork, SimOperation, TurmoilConfig, TurmoilResult, UpdateOperationStats,
+            check_convergence_from_logs, check_convergence_from_logs_and_state,
             run_turmoil_simulation,
         },
     };

@@ -5,7 +5,7 @@
 The Ring module implements Freenet's Distributed Hash Table (DHT) with small-world network properties. It provides:
 
 - **Location-based routing** - Peers and contracts positioned on a 1D circular ring [0, 1]
-- **Small-world topology** - High clustering with low average path length
+- **Small-world topology** - Kleinberg 1/d connection distribution for short greedy routes
 - **Self-organizing connections** - Automatic neighbor discovery and maintenance
 - **Performance-aware routing** - Learns from routing history to optimize peer selection
 
@@ -157,9 +157,51 @@ score = (1 - failure_probability) × (1 / latency) × transfer_rate
 
 ## Small-World Properties
 
-### Accept-Only-at-Terminus Rule
+### Kleinberg 1/d Topology
 
-The key insight that creates small-world structure:
+Greedy routing on a ring finds short paths when each peer's connection distances follow
+Kleinberg's 1/d distribution. That distribution is uniform in log-distance: each decade of
+ring distance (0.001-0.01, 0.01-0.1, ...) should hold roughly the same share of a peer's
+connections, out to the maximum ring distance of 0.5. Freenet builds this explicitly by analyzing each peer's existing
+connection distances in log-distance space:
+
+| Mechanism | What it does | Code |
+|-----------|--------------|------|
+| Gap-based targeting | New outbound CONNECTs target the center of the largest gap in log-distance coverage | `small_world_rand::gap_target`, `gap_target_directional` |
+| Directional coverage | Steady-state targeting, swaps and pruning analyze clockwise and counter-clockwise half-rings independently | `gap_target_directional`, `largest_gap_size_directional`, `removal_gap_directional` |
+| Random Kleinberg samples | When several targets are requested at once (below `min_connections`), `sample_targets` alternates gap targets with random 1/d samples to discover peers via different routes; single steady-state additions are pure gap targets | `small_world_rand::kleinberg_target`, `TopologyManager::sample_targets` |
+| Kleinberg gap score | Inbound candidates are scored by how much they fill a gap in log-distance coverage | `small_world_rand::kleinberg_score`, `ConnectionManager::should_accept` |
+| Topology swaps | At steady state, a connection may be replaced by one targeting the largest gap, with probability proportional to how far that gap exceeds the expected `ln(k)/k` | `TopologyManager::maybe_swap_connection` |
+| Protected pruning | Peers whose removal would open a gap more than 2x the expected size are excluded from composite-score pruning and from swaps. A fallback drops the lowest-topology-value peer when every removal candidate is protected, or when over `max_connections` and composite pruning finds no candidate | `TopologyManager::select_connections_to_remove`, `TOPOLOGY_PROTECTION_THRESHOLD` |
+
+In addition, peers configured with `max_connections` of at least 25 (production uses 200)
+maintain their nearest ring neighbor on each side (the nearest-neighbor lattice): a new
+nearest neighbor is admitted even at capacity (up to a small over-max allowance), lattice
+edges are excluded from score-based pruning and swaps, and a periodic route-to-self probe
+keeps discovering closer neighbors. Once a probe on each side has found nothing closer than the
+current nearest neighbor, the probe sleeps until a nearest-neighbor distance changes, apart from
+a few re-checks (`ring::lattice_probe_timing`). Each probe keeps whatever it connected to, so a
+converged peer adds a few non-lattice links per lattice change rather than one per probe.
+
+**Acceptance:**
+- At `max_connections` → reject (except new nearest-neighbor lattice edges)
+- Below `min_connections`: always accept below 3 open connections; above that, accept with
+  probability `floor + gap_score`, where the floor slides from 0.9 down to 0.3 as the peer
+  approaches `min_connections`
+- At/above `min_connections`: the gap score is fed to the `ConnectionEvaluator`, which accepts
+  a candidate only if it beats the other candidates seen in a recent time window
+
+**Code reference:** `crates/core/src/topology.rs` (module docs, `adjust_topology`),
+`crates/core/src/topology/small_world_rand.rs`, `crates/core/src/ring/connection_manager.rs`
+(`should_accept`)
+
+### Where CONNECT Requests Are Accepted
+
+A CONNECT request is greedily routed toward its target location. A relay accepts when it
+cannot forward to a peer closer to the target (the terminus); a relay within 0.05 of the
+target may also accept probabilistically while still forwarding. If the terminus declines
+(for example because the joiner is already connected there, or it is at capacity), the
+request routes uphill, bounded by an uphill budget, and a farther peer may accept.
 
 ```mermaid
 flowchart TD
@@ -173,7 +215,9 @@ flowchart TD
     style Accept fill:#d4edda,stroke:#28a745
 ```
 
-**Result:** Connections naturally form between nearby peers without explicit radius checks.
+This ensures the new connection lands near the target the joiner chose, rather than at the
+gateway or an early relay. It does not by itself produce a small-world distribution: the
+distance distribution comes from target selection and the acceptance gap score above.
 
 **Example:**
 ```
@@ -183,23 +227,10 @@ Joiner (0.5) sends request toward location 0.3
 ├─ Node B (0.4) [can route to 0.35] → FORWARDS
 └─ Node C (0.35) [no closer peer] → ACCEPTS ✓
 
-Result: Joiner connects to Node C (distance = 0.15)
+Result: Joiner connects to Node C, near its chosen target 0.3
 ```
 
-**Code reference:** `crates/core/src/operations/connect.rs:13-72`
-
-### Why Small-World Works
-
-The topology achieves:
-
-1. **High clustering** - Most connections are local (nearby on ring)
-2. **Low diameter** - Few long-range links enable O(log n) path lengths
-3. **Robustness** - No single point of failure
-
-**Connection distribution:**
-- Very local (distance < 0.1): Many connections from terminus rule
-- Local (0.1-0.3): Moderate connections
-- Long-range (> 0.3): Rare but critical for short paths
+**Code reference:** `crates/core/src/operations/connect.rs` (module docs, `RelayState::step`)
 
 ## Bootstrap Process
 
@@ -228,15 +259,21 @@ sequenceDiagram
 2. **NAT discovery** - First relay observes external address
 3. **Connection establishment** - Acceptor at terminus connects
 
-**Early phase (0-4 connections):**
-- Target own location repeatedly
-- Creates local neighborhood
+**Target selection in `join_ring_request`** (gateway joins, cached-peer reconnects, the
+startup loop):
+- Fewer than 3 connections: target own location, with jitter after consecutive failures
+- 3+ connections: target the center of the largest gap in log-distance coverage
+  (`small_world_rand::gap_target`)
 
-**Later phase (4+ connections):**
-- Density-based targeting
-- Optimize for request patterns
+**Target selection by ring maintenance** (`TopologyManager::adjust_topology`):
+- Fewer than 5 connections (and below `min_connections`): own location, then evenly
+  spaced ring locations
+- Otherwise: directional gap targets, alternating with random Kleinberg 1/d samples when
+  several targets are requested at once
 
-**Code reference:** `crates/core/src/operations/connect.rs:74-90`
+**Code reference:** `crates/core/src/operations/connect.rs` (`join_ring_request`),
+`crates/core/src/topology.rs` (`adjust_topology`, `sample_targets`,
+`bootstrap_target_locations`)
 
 ## Hosting and Subscriptions
 

@@ -286,6 +286,15 @@ main {
   color: var(--text-secondary);
   font-family: var(--font-mono);
 }
+.card-link {
+  font-size: 0.8rem;
+  color: var(--accent-primary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.card-link:hover {
+  text-decoration: underline;
+}
 .status-row {
   display: flex;
   align-items: center;

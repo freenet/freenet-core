@@ -359,9 +359,12 @@ impl NeighborHostingManager {
             NeighborHostingMessage::HostingStateRequest => {
                 let mut contracts: Vec<ContractInstanceId> =
                     self.my_contracts.iter().map(|r| *r.key()).collect();
-                // Sort for deterministic message order (DashSet iteration is non-deterministic)
-                // ContractInstanceId doesn't impl Ord, so sort by string representation
-                contracts.sort_by_key(|a| a.to_string());
+                // Sort for deterministic message order (DashSet iteration is non-deterministic).
+                // ContractInstanceId doesn't impl Ord, so compare raw bytes. Do NOT sort by
+                // `to_string()`: that base58-encodes per comparison (~O(n log n) encodes per
+                // request) and was ~40% of CPU on a peer hosting ~6,200 contracts. Ids are
+                // unique, so an unstable sort is still deterministic.
+                contracts.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
                 debug!(
                     peer = %from,
@@ -754,6 +757,59 @@ mod tests {
         } else {
             panic!("Expected HostingStateResponse");
         }
+    }
+
+    /// The `HostingStateResponse` contract list must be in ascending id-byte order
+    /// regardless of insertion order (the backing `DashSet` iterates
+    /// non-deterministically), so the message is deterministic. Ids are chosen so
+    /// byte order differs from insertion order.
+    #[test]
+    fn test_hosting_state_response_is_sorted_by_id_bytes() {
+        let neighbor = make_pub_key(1);
+        let seeds: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let key_for = |s: u8| {
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new([s; 32]),
+                CodeHash::new([s ^ 0xff; 32]),
+            )
+        };
+
+        let respond = |order: &[u8]| -> Vec<ContractInstanceId> {
+            let manager = NeighborHostingManager::new();
+            for &s in order {
+                manager.on_contract_hosted(&key_for(s));
+            }
+            match manager
+                .handle_message(&neighbor, NeighborHostingMessage::HostingStateRequest)
+                .response
+            {
+                Some(NeighborHostingMessage::HostingStateResponse { contracts }) => contracts,
+                other => panic!("Expected HostingStateResponse, got {other:?}"),
+            }
+        };
+
+        let mut expected: Vec<ContractInstanceId> = seeds
+            .iter()
+            .map(|&s| ContractInstanceId::new([s; 32]))
+            .collect();
+        expected.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let insertion_order: Vec<ContractInstanceId> = seeds
+            .iter()
+            .map(|&s| ContractInstanceId::new([s; 32]))
+            .collect();
+        assert_ne!(
+            insertion_order, expected,
+            "test ids must not already be in byte order"
+        );
+
+        let mut reversed = seeds.clone();
+        reversed.reverse();
+        let a = respond(&seeds);
+        let b = respond(&reversed);
+        assert_eq!(a, expected, "response must be in ascending id-byte order");
+        assert_eq!(a, b, "response must not depend on insertion order");
     }
 
     #[test]

@@ -765,6 +765,52 @@ fn shrinkage_limits_no_data_to_pool_and_lots_of_data_to_cell_mean() {
     );
 }
 
+/// `residual_steps` repeats `residual`'s arithmetic for the dashboard; it must
+/// not drift from it. After the peer step, a query in a band the peer has no
+/// record in only adds the band level's prior variance, so `after_peer` plus
+/// `tau2_cell` IS routing's residual there: for a well-known peer, a thinly
+/// known one, and a peer with no record.
+#[test]
+fn residual_steps_match_the_residual_routing_reads() {
+    let _guard = GlobalRng::seed_guard(0x4485_d71f);
+    let mut level = Level::new(None);
+    // Bands 0..6 recorded for every peer; band 7 for none.
+    for slot in 0..30 {
+        let effect = 0.4 * normal();
+        for band in 0..7 {
+            for _ in 0..10 {
+                level.add(Some(slot), band, 1.0, effect + 0.2 * normal());
+            }
+        }
+    }
+    // A thinly known peer: two observations.
+    level.add(Some(30), 0, 1.0, 0.9);
+    level.add(Some(30), 1, 1.0, 1.1);
+    level.recount_squares();
+    level.components = level.compute_components();
+    let tau2_cell = level.components.expect("components exist").tau2_cell;
+    let mut weights = Vec::new();
+    for slot in [Some(3), Some(30), None, Some(31)] {
+        let steps = level.residual_steps(slot, 0.0).expect("steps");
+        let routed = level.residual(slot, 7, 0.0).expect("residual");
+        assert!(
+            (steps.after_peer.mean - routed.mean).abs() < 1e-12,
+            "{slot:?}: mean {} vs {}",
+            steps.after_peer.mean,
+            routed.mean
+        );
+        assert!(
+            (steps.after_peer.variance + tau2_cell - routed.variance).abs() < 1e-12,
+            "{slot:?}: variance {} + {tau2_cell} vs {}",
+            steps.after_peer.variance,
+            routed.variance
+        );
+        weights.push(steps.peer_weight);
+    }
+    assert!(weights[0] > weights[1] && weights[1] > 0.0, "{weights:?}");
+    assert_eq!((weights[2], weights[3]), (0.0, 0.0), "no record, no weight");
+}
+
 // ---------------------------------------------------------------------------
 // Stage
 // ---------------------------------------------------------------------------
@@ -1578,6 +1624,70 @@ fn an_unknown_peer_carries_a_timing_penalty() {
     assert!(
         unknown > known,
         "an unseen peer must be priced slower than a typical known one: {unknown} vs {known}"
+    );
+}
+
+/// An estimator with warm stages and real between-peer differences, for the
+/// dashboard-explanation tests.
+fn trained_routing() -> (HierarchicalRouting, Vec<PeerKeyLocation>) {
+    let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+    let mut routing = HierarchicalRouting::new(200);
+    for i in 0..1_500 {
+        let p = GlobalRng::random_range(0..peers.len());
+        let distance = uniform() * 0.5;
+        let outcome = if uniform() < 0.05 + 0.03 * p as f64 {
+            RoutingOutcome {
+                success: false,
+                time_to_response_start_secs: None,
+                transfer_speed_bps: None,
+            }
+        } else {
+            let seconds = ((0.1f64).ln() + distance + 0.2 * p as f64 + 0.3 * normal()).exp();
+            timed(Some(seconds), Some(1e5 / seconds))
+        };
+        routing.observe_at(
+            &peers[p],
+            Location::new(uniform()),
+            distance,
+            &outcome,
+            i as f64 / 100.0,
+        );
+    }
+    (routing, peers)
+}
+
+/// The dashboard's distance curve for a peer with no record is the failure
+/// estimate routing would make for one, the timing curves follow the curves'
+/// directions, and a peer with a record gets its own curve.
+#[test]
+fn peer_curves_follow_the_estimate() {
+    let _guard = GlobalRng::seed_guard(0x4485_c0e5);
+    let (routing, peers) = trained_routing();
+    let now = 15.0;
+    let stranger = PeerKeyLocation::random();
+    let [failure, response, transfer] = routing.peer_curves(None, now);
+    assert_eq!(failure.len(), 51);
+    for &(distance, value) in &failure {
+        let estimate = routing
+            .estimate(&stranger, Location::new(0.9), distance, now)
+            .failure_probability
+            .expect("warm");
+        assert_eq!(value, estimate, "at distance {distance}");
+    }
+    assert!(!response.is_empty() && !transfer.is_empty());
+    assert!(
+        response.windows(2).all(|pair| pair[1].1 >= pair[0].1),
+        "response time must not fall with distance"
+    );
+    assert!(
+        transfer.windows(2).all(|pair| pair[1].1 <= pair[0].1),
+        "transfer speed must not rise with distance"
+    );
+    let [own_failure, own_response, _] = routing.peer_curves(Some(&peers[11]), now);
+    assert_ne!(
+        (own_failure, own_response),
+        (failure, response),
+        "a peer with a record must get its own curve"
     );
 }
 
@@ -4615,8 +4725,7 @@ fn add_event_threads_a_repeated_contract_through_the_contract_term() {
     use crate::router::{RouteEvent, RouteOutcome, Router};
 
     let _guard = GlobalRng::seed_guard(0x4485_c012);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let mut router = Router::new(&[]);
     let peers: Vec<PeerKeyLocation> = (0..24).map(|_| PeerKeyLocation::random()).collect();
     let contracts: Vec<Location> = (0..16).map(|i| Location::new(i as f64 / 16.0)).collect();
@@ -4665,11 +4774,11 @@ fn add_event_threads_a_repeated_contract_through_the_contract_term() {
     // between the two contracts is the shared effect; they share a band.
     let unseen = Location::new(0.36);
     assert_eq!(band_of(dead.as_f64()), band_of(unseen.as_f64()));
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let failure_for = |contract: Location| {
         router
             .hierarchical
-            .estimate(&peers[20], contract, 0.05, clock.estimator_hours)
+            .estimate(&peers[20], contract, 0.05, clock)
             .failure_ranking
             .expect("the failure stage predicts after 1,200 events")
     };
@@ -4863,20 +4972,18 @@ fn ranking_probability_preserves_order_above_one_and_never_goes_negative() {
 
 /// End to end for finding 6 of the 2026-09-17 review: the healthiest peers on
 /// untimed traffic have a negative unbounded failure forecast, and the cost
-/// the dashboard and the routing dataset read must still be a number the
-/// dashboard can print. Before the fix the ranking value carried the DOWNWARD
+/// the routing dataset and telemetry record must still be a non-negative
+/// finite number. Before the fix the ranking value carried the DOWNWARD
 /// overshoot at the same slope, so the no-timing cost branch
-/// (`failure * 3.0`) went negative and `fmt_prediction_time` printed "N/A"
-/// for exactly the best peers.
+/// (`failure * 3.0`) went negative for exactly the best peers (and the
+/// dashboard of the time printed it as "N/A").
 #[test]
-fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
+fn a_negative_unbounded_forecast_still_yields_a_non_negative_cost() {
     use crate::node::network_status::OpType;
     use crate::router::{RouteEvent, RouteOutcome, Router};
-    use crate::server::fmt_prediction_time_for_tests as fmt_prediction_time;
 
     let _guard = GlobalRng::seed_guard(0x4485_c00c);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let target = Location::new(0.5);
     // A peer near the target, whose own record is at FAR distances where the
     // curve is high. Its peer-level residual is then far below the curve at
@@ -4924,14 +5031,14 @@ fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
             });
         }
     }
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let distance = target
         .distance(clean.location().expect("a random peer has a location"))
         .as_f64();
     let unbounded = router
         .hierarchical
         .failure
-        .predict(&clean, target.as_f64(), distance, clock.estimator_hours)
+        .predict(&clean, target.as_f64(), distance, clock)
         .expect("the failure stage predicts after 400 events")
         .unbounded;
     assert!(
@@ -4944,14 +5051,8 @@ fn a_negative_unbounded_forecast_still_yields_a_printable_cost() {
         .expect("prediction after warm-up");
     assert_eq!(prediction.failure_probability, 0.0);
     assert!(
-        prediction.expected_total_time >= 0.0,
-        "expected total time must not be negative: {}",
-        prediction.expected_total_time
-    );
-    assert_ne!(
-        fmt_prediction_time(prediction.expected_total_time),
-        "N/A",
-        "the dashboard must be able to print the cost: {}",
+        prediction.expected_total_time >= 0.0 && prediction.expected_total_time.is_finite(),
+        "expected total time must be a non-negative finite cost: {}",
         prediction.expected_total_time
     );
 }
@@ -5014,8 +5115,7 @@ fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
     use crate::router::{RouteEvent, RouteOutcome, Router};
 
     let _guard = GlobalRng::seed_guard(0x4485_c009);
-    let _correction = crate::router::force_residual_correction(false);
-    let _hierarchical = crate::router::force_hierarchical_routing(true);
+    let _fallback_off = crate::router::force_isotonic_fallback(false);
     let (estimator, worse, better, dead, _, _) = clamped_pair();
     let mut router = Router::new(&[]);
     // Untimed traffic only, so no stage has timing and the cost is the
@@ -5033,7 +5133,7 @@ fn routing_cost_ranks_peers_whose_forecasts_clamp_at_one() {
         });
     }
     router.hierarchical = estimator;
-    let clock = router.prediction_clock();
+    let clock = router.estimator_clock.hours();
     let predict = |peer: &PeerKeyLocation| {
         router
             .predict_routing_outcome_at(peer, dead, clock)
@@ -5400,4 +5500,61 @@ fn neither_bound_call_site_may_charge_a_peer_more_than_its_own_residual() {
         "REFIT SITE: an effect opposing peer 0's residuals must remove \
          nothing: with the term {applied}, control {control}, effect {effect}"
     );
+}
+
+/// A peer's offset is measured from the all-peers level, not from the curve:
+/// when the window as a whole sits off the curve, an unknown peer still reads
+/// as exactly 0 (it is predicted from distance alone) and a known peer reads
+/// as its difference from everyone else.
+#[test]
+fn peer_offset_is_measured_from_distance_alone_not_from_the_curve() {
+    let _guard = GlobalRng::seed_guard(0x4485_0ff5);
+    let mut stage: Stage<u32> = Stage::new(Target::LogResponseTime, 64);
+    for i in 0..400u32 {
+        let distance = (i % 50) as f64 / 100.0;
+        observe(
+            &mut stage,
+            &(i % 7),
+            (i % 13) as f64 / 13.0,
+            distance,
+            distance,
+            0.0,
+        );
+    }
+    assert!(stage.curve.is_some(), "the stage needs a curve");
+    // Replace the predicting level with one whose whole window sits 1.5 above
+    // the curve, and whose peer 3 sits a further 0.8 above everyone else.
+    let selected = stage.selected();
+    let slot = stage.peers.lookup(&3).expect("peer 3 has a slot");
+    let level = &mut stage.levels[selected];
+    *level = Level::new(level.horizon_hours);
+    for peer_slot in 0..7 {
+        for band in 0..BANDS {
+            for _ in 0..20 {
+                let shift = if peer_slot == slot { 0.8 } else { 0.0 };
+                level.add(Some(peer_slot), band, 1.0, 1.5 + shift + 0.2 * normal());
+            }
+        }
+    }
+    level.recount_squares();
+    level.components = level.compute_components();
+    let root = level.residual(None, 0, 0.0).expect("components exist").mean;
+    assert!(
+        root > 1.0,
+        "the all-peers level must sit off the curve: {root}"
+    );
+
+    let unknown = stage.peer_offset(&99, 0.0).expect("a warm stage reports");
+    assert_eq!(
+        (unknown.offset, unknown.evidence, unknown.weight),
+        (0.0, 0.0, 0.0),
+        "an unknown peer is on the distance-alone line even when the window is not on the curve"
+    );
+    let known = stage.peer_offset(&3, 0.0).expect("a warm stage reports");
+    assert!(
+        (known.offset - 0.8).abs() < 0.2 && known.weight > 0.5,
+        "peer 3's offset is its difference from the other peers: {known:?}"
+    );
+    let other = stage.peer_offset(&1, 0.0).expect("a warm stage reports");
+    assert!(other.offset.abs() < 0.3, "{other:?}");
 }

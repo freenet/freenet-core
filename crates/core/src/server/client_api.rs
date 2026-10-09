@@ -283,6 +283,7 @@ impl HttpClientApi {
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
             )
+            .route("/routing", axum::routing::get(home_page::routing))
             .route(
                 "/contract/{key}",
                 axum::routing::get(home_page::contract_detail),

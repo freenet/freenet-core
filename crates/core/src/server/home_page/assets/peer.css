@@ -26,14 +26,6 @@ a.header-title {
   font-size: 1rem;
   margin: 0 0.15rem;
 }
-.header-addr {
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  color: var(--text-secondary);
-  background: var(--bg-tertiary);
-  padding: 0.1rem 0.45rem;
-  border-radius: 4px;
-}
 .info-grid {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -66,12 +58,20 @@ a.header-title {
   display: block;
   width: 100%;
   max-width: 600px;
+  height: auto;
 }
 /* Small-multiple accuracy charts: fixed width so the three sit side by side
    in the flex row and wrap on narrow viewports (overridden global width:100%). */
+.accuracy-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
 .accuracy-chart {
   display: block;
-  width: 260px;
+  overflow: visible;
+  width: 340px;
   max-width: 100%;
   height: auto;
   flex: 0 0 auto;
@@ -80,43 +80,6 @@ a.header-title {
   font-family: var(--font-mono);
   font-size: 10px;
   fill: var(--text-muted);
-}
-.chart-legend {
-  display: flex;
-  gap: 1rem;
-  margin-bottom: 0.75rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-}
-.chart-key {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-}
-.chart-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
-}
-.chart-dot-actual {
-  background: var(--text-muted);
-  opacity: 0.55;
-}
-.chart-dot-global {
-  background: var(--accent-primary);
-}
-.chart-dot-peer {
-  background: #8b5cf6;
-}
-.chart-dot-loc {
-  background: #fbbf24;
-}
-.chart-dot-ext {
-  background: transparent;
-  border: 2px dashed var(--accent-primary);
-  width: 8px;
-  height: 8px;
 }
 /* Tabs */
 .tab-group {
@@ -190,4 +153,377 @@ a.header-title {
   color: var(--text-muted);
   font-size: 0.8rem;
   font-family: var(--font-mono);
+}
+
+/* What one chart's window holds, under the chart. */
+.chart-note {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin: -0.2rem 0 0.8rem;
+}
+/* One-line caption under a card heading. */
+.caption {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin: -0.25rem 0 0.6rem;
+}
+.more {
+  font-size: 0.85rem;
+  margin: 0.25rem 0 1rem;
+}
+.more a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+.more a:hover {
+  text-decoration: underline;
+}
+details.diag summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+details.diag .info-grid {
+  margin-top: 0.6rem;
+}
+
+/* ── Peer page (peer_detail.rs) ── */
+.peer-head {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+}
+.peer-head .who {
+  flex: 1;
+  min-width: 0;
+}
+.peer-head .addr {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1.05rem;
+  word-break: break-all;
+}
+.peer-head .addr code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.facts b {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+.mini-ring {
+  flex: 0 0 auto;
+  width: 170px;
+  height: auto;
+}
+.mini-ring text {
+  font: 15px var(--font-mono);
+  fill: var(--text-secondary);
+}
+.mini-ring .ring {
+  fill: none;
+  stroke: var(--border-color);
+  stroke-width: 2;
+}
+.mini-ring .ring-you {
+  fill: var(--text-secondary);
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+.tile {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+}
+.tile .k {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+.tile .v {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1.6rem;
+  margin: 0.15rem 0 0.1rem;
+  color: var(--text-primary);
+}
+.tile .v small {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.tile .s {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+.tile .s .cmp {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.learning {
+  margin-bottom: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border-left: 2px solid var(--accent-primary);
+  background: var(--bg-secondary);
+  border-radius: 0 6px 6px 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.chart-title {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin: 0.6rem 0 0.2rem;
+}
+.chart-title .unit {
+  text-transform: none;
+}
+.legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.4rem;
+}
+.legend-row i {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 0.35rem;
+}
+.sw-dot-peer {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+}
+.sw-dot-other {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--chart-dot);
+  opacity: 0.85;
+}
+.sw-line-net {
+  width: 16px;
+  height: 0;
+  border-top: 2px dashed var(--text-secondary);
+}
+.sw-line-solid {
+  width: 16px;
+  height: 0;
+  border-top: 2px solid var(--accent-primary);
+}
+.sw-line-dash {
+  width: 16px;
+  height: 0;
+  border-top: 2px dashed var(--accent-primary);
+  opacity: 0.6;
+}
+.sw-line-peer {
+  width: 16px;
+  height: 0;
+  border-top: 2px solid var(--accent-primary);
+}
+svg.mchart {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+svg.mchart .ax {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+svg.mchart .grid {
+  stroke: var(--border-color);
+  stroke-width: 1;
+}
+svg.mchart text {
+  font: 10px var(--font-mono);
+  fill: var(--text-muted);
+}
+svg.mchart text.dl {
+  font-size: 10.5px;
+  fill: var(--text-secondary);
+}
+svg.mchart .baseline {
+  stroke: var(--text-secondary);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+/* Other peers' dots: a step lighter than secondary text on the dark ground,
+   where --text-secondary at reduced opacity all but disappeared. */
+:root {
+  --chart-dot: #b8babe;
+}
+[data-theme='light'] {
+  --chart-dot: var(--text-secondary);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --chart-dot: var(--text-secondary);
+  }
+}
+svg.mchart .dot-other {
+  fill: var(--chart-dot);
+  opacity: 0.85;
+}
+svg.mchart .dot-other.hollow {
+  fill: var(--bg-primary);
+  stroke: var(--chart-dot);
+  stroke-width: 1.2;
+}
+.dot-this.hollow {
+  fill: var(--bg-primary);
+  stroke: var(--accent-primary);
+  stroke-width: 2.5;
+}
+svg.mchart .tick-this {
+  stroke: var(--accent-primary);
+  stroke-width: 1;
+}
+svg.mchart .dots-faint {
+  fill: none;
+  stroke: var(--chart-dot);
+  stroke-width: 3.6;
+  stroke-linecap: round;
+  opacity: 0.6;
+}
+.dot-this {
+  fill: var(--accent-primary);
+  stroke: var(--bg-primary);
+  stroke-width: 1.5;
+}
+svg.mchart text.halo {
+  paint-order: stroke;
+  stroke: var(--bg-primary);
+  stroke-width: 3px;
+}
+svg.mchart text.this-label {
+  font-weight: 600;
+  fill: var(--text-primary);
+  paint-order: stroke;
+  stroke: var(--bg-primary);
+  stroke-width: 4px;
+}
+svg.mchart .line-net {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+}
+svg.mchart .line-peer {
+  fill: none;
+  stroke: var(--accent-primary);
+  stroke-width: 2;
+}
+.empty-box {
+  padding: 0.8rem;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+.acc-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+.acc-facts {
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+}
+.acc-facts p {
+  margin: 0.1rem 0 0.6rem;
+}
+.acc-facts b {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+/* Charts with text along an axis are rendered at two widths; show the one that
+   fits, so axis labels stay legible on a phone instead of scaling down. */
+.w-narrow {
+  display: none;
+}
+@media (max-width: 640px) {
+  .w-wide {
+    display: none;
+  }
+  .w-narrow {
+    display: block;
+  }
+  .tiles,
+  .acc-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mini-ring {
+    width: 140px;
+  }
+  .peer-head {
+    gap: 0.5rem;
+  }
+  .peer-head .addr {
+    font-size: 0.9rem;
+  }
+  /* One row, never an orphan row. */
+  .tab-bar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  .accuracy-chart {
+    width: 100%;
+    max-width: 340px;
+  }
+  /* Label above value: two columns left the values a word wide. */
+  .info-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.1rem;
+  }
+  .info-grid .info-value {
+    margin-bottom: 0.5rem;
+    overflow-wrap: anywhere;
+  }
+}
+/* All five tabs fit a phone's row, so none hides behind a sideways scroll. */
+@media (max-width: 400px) {
+  .tab-bar {
+    justify-content: space-between;
+  }
+  .tab-label {
+    font-size: 0.64rem;
+    letter-spacing: 0;
+    padding: 0.4rem 0.15rem;
+    gap: 0.2rem;
+  }
+  .tab-count {
+    font-size: 0.58rem;
+    padding: 0.05rem 0.2rem;
+    min-width: 0;
+  }
 }

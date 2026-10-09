@@ -3,29 +3,29 @@
 //! # Why this file exists
 //!
 //! Until this module was written, nothing in `crates/core/tests/` or anywhere
-//! else had ever ROUTED with the hierarchical estimator enabled.
-//! `FREENET_ROUTING_HIERARCHICAL` and [`force_hierarchical_routing`] appeared
-//! only in `crates/core/src/router.rs` and its own unit tests, so the estimator
-//! had been exercised by unit tests and by offline replay of recorded gateway
-//! data, and by nothing that carries a packet. The repo's
+//! else had ever ROUTED with the hierarchical estimator enabled: it had been
+//! exercised by unit tests and by offline replay of recorded gateway data, and
+//! by nothing that carries a packet. The repo's
 //! `.claude/rules/test-philosophy.md` asks a routing change to assert
-//! simulation health metrics; the promotion gate for flipping the flag on by
+//! simulation health metrics; the promotion gate for making the estimator the
 //! default (`routing-soak-gate/PLAN-v2.md` section 6, added 2026-09-17) turns
-//! that into a condition: at least one simulation case must route with the flag
-//! enabled over a workload with REPEATED contracts, asserting GET and subscribe
-//! success rates and subscription-tree formation.
+//! that into a condition: at least one simulation case must route with the
+//! estimator over a workload with REPEATED contracts, asserting GET and
+//! subscribe success rates and subscription-tree formation.
 //!
-//! This module is that case, run as an A/B: the SAME workload and seed with the
-//! estimator ON and OFF, so the assertion is a comparison rather than an
-//! absolute threshold picked from one run.
+//! This module is that case, run as an A/B: the SAME workload and seed routed
+//! by the hierarchical estimator (ON) and by the isotonic fallback (OFF, the
+//! path `FREENET_ROUTING_FALLBACK_ISOTONIC` selects; the legacy stack this
+//! compared against originally was removed in #4485), so the assertion is a
+//! comparison rather than an absolute threshold picked from one run.
 //!
 //! # Why it lives in the lib rather than `crates/core/tests/`
 //!
-//! Three things it needs are `pub(crate)`: [`force_hierarchical_routing`],
+//! Three things it needs are `pub(crate)`: [`super::force_isotonic_fallback`],
 //! [`super::RouterSnapshotInfo`] (which carries the contract-term counters), and
-//! `ControlledSimulationResult::node_rings`. More importantly, the flag's test
-//! override is a THREAD-LOCAL, and the flag's production path is a process-wide
-//! `OnceLock` over an environment variable. An integration test could only set
+//! `ControlledSimulationResult::node_rings`. More importantly, the switch's test
+//! override is a THREAD-LOCAL, and the switch's production path is a
+//! process-wide `OnceLock` over an environment variable. An integration test could only set
 //! the env var, which fixes one value for the whole process and so cannot run
 //! both arms. That is the cross-test-interference shape
 //! `.claude/rules/testing.md` warns about, benign under `nextest`'s
@@ -35,14 +35,25 @@
 //! all.
 //!
 //! That thread-local is load-bearing, so a change that moves node execution off
-//! the calling thread must FAIL here rather than silently measure the OFF arm
-//! twice. The assertion that achieves it is `off.failure_events == 0` in
-//! [`assert_seed`], NOT the `nodes_routing_hierarchically` counter beside it:
-//! the counter is read on this thread and so is a readback of the thread-local
-//! itself, while `failure_events` is estimator state written by whatever thread
-//! ran the node. Section 1 of [`assert_seed`] spells out why the difference
-//! matters, and it matters more since the process default became ON, because a
-//! fall-through now lands on the estimator rather than off it.
+//! the calling thread must FAIL here rather than silently measure one arm
+//! twice. What achieves it is router state written by whatever thread ran the
+//! node, NOT the `nodes_routing_hierarchically` counter, which is read on this
+//! thread and so is a readback of the thread-local itself. Section 1 of
+//! [`assert_seed`] spells out why the difference matters. Two such counts are
+//! asserted:
+//!
+//! - what `isotonic_fallback_enabled()` returned on each route event a router
+//!   learned (`Router::events_by_fallback_switch_for_test`). Every node learns
+//!   events in this workload, so this guard can fire today: the OFF arm must
+//!   see the switch on for every event. That is the real guard. The matching
+//!   ON-arm check (never on) is much weaker: a node that lost its override
+//!   falls through to the process default, which IS the ON setting, so it
+//!   catches only a fallback switched on in the process environment.
+//! - which path each prediction took (`Router::predictions_by_model_for_test`).
+//!   This one still holds vacuously, because no router in this workload reaches
+//!   prediction-based routing at all (#5789). The event guard shows the
+//!   override reached the threads that learn; it does not show that routing
+//!   acted on it, which only predictions can.
 //!
 //! The module is named `sim_e2e_tests` for a mechanical reason: CI's simulation
 //! job selects in-crate simulation tests with
@@ -212,11 +223,23 @@ struct ArmMetrics {
     /// Contracts held in the failure stage's contract table, summed.
     contracts_tracked: u64,
     /// Events in the failure stage's window, summed. Zero means the estimator
-    /// was not being computed at all.
+    /// learned nothing. It learns in both arms: the isotonic fallback routes
+    /// without it, but it keeps learning so switching back finds it warm.
     failure_events: u64,
-    /// Nodes reporting `hierarchical_routing_enabled`. Proves the thread-local
-    /// override reached the routers.
+    /// Nodes whose snapshot does not report `isotonic_fallback_enabled`. A
+    /// readback of this thread's override, NOT proof that it reached the
+    /// routers; the prediction counts below are that.
     nodes_routing_hierarchically: u64,
+    /// Predictions the routers made on each path, summed over nodes. Router
+    /// state, so it says which path the nodes actually routed on.
+    isotonic_predictions: u64,
+    hierarchical_predictions: u64,
+    /// Route events the routers learned, by whether the isotonic fallback
+    /// switch read on or off on the thread that learned them, summed over
+    /// nodes. Router state, like the prediction counts, but non-zero at this
+    /// workload's size (#5789).
+    events_with_fallback_off: u64,
+    events_with_fallback_on: u64,
     nodes_total: u64,
 }
 
@@ -479,16 +502,17 @@ fn reset_simulation_state(seed: u64) {
     crate::test_utils::reset_global_node_index();
 }
 
-/// Run one arm: the whole workload with the estimator forced on or off.
+/// Run one arm: the whole workload routed by the hierarchical estimator, or by
+/// the isotonic fallback.
 ///
 /// `tag` distinguishes the callers. Lib tests run on parallel threads, the
 /// simulation registries are keyed by network NAME, and two tests running the
 /// same seed and arm would otherwise share one key and read each other's nodes.
 fn run_arm(tag: &str, seed: u64, hierarchical: bool) -> ArmMetrics {
     // The override is a thread-local and Turmoil drives every simulated node on
-    // THIS thread, so it reaches all of them. `nodes_routing_hierarchically`
-    // below is the check that this is still true.
-    let _flag = super::force_hierarchical_routing(hierarchical);
+    // THIS thread, so it reaches all of them. The per-model prediction counts
+    // checked in `assert_seed` are what prove that this is still true.
+    let _flag = super::force_isotonic_fallback(!hierarchical);
     // Both arms must start from identical thread-local state, or they are not
     // the same network with one flag flipped.
     reset_simulation_state(seed);
@@ -670,8 +694,14 @@ fn collect_metrics(
         let Some(ring) = result.node_rings.get(label) else {
             continue;
         };
+        let (isotonic, hierarchical) = ring.router.read().predictions_by_model_for_test();
+        metrics.isotonic_predictions += isotonic;
+        metrics.hierarchical_predictions += hierarchical;
+        let (fallback_off, fallback_on) = ring.router.read().events_by_fallback_switch_for_test();
+        metrics.events_with_fallback_off += fallback_off;
+        metrics.events_with_fallback_on += fallback_on;
         let snapshot = ring.router.read().snapshot();
-        if snapshot.hierarchical_routing_enabled {
+        if !snapshot.isotonic_fallback_enabled {
             metrics.nodes_routing_hierarchically += 1;
         }
         metrics.contract_estimable_refits += snapshot.hierarchical_contract_estimable_refits;
@@ -694,7 +724,8 @@ fn collect_metrics(
          twin_get {}/{} ({:.3}) net_ok {} \
          subscribe {}/{} ({:.3}) raw_subscribe_events {} \
          sub_edges {} hosting_edges {} first_success {:?}ms after {} terminals \
-         route ok/fail {}/{} | hierarchical nodes {}/{} failure_events {} contracts {} \
+         route ok/fail {}/{} | hierarchical nodes {}/{} predictions isotonic {} \
+         hierarchical {} events fallback off/on {}/{} failure_events {} contracts {} \
          estimable_refits {} den<2 {} effects {} offsets {} qualifying_max {} tau2 {:?}",
         metrics.replicated_get_ok,
         metrics.replicated_get_total,
@@ -718,6 +749,10 @@ fn collect_metrics(
         metrics.route_failures,
         metrics.nodes_routing_hierarchically,
         metrics.nodes_total,
+        metrics.isotonic_predictions,
+        metrics.hierarchical_predictions,
+        metrics.events_with_fallback_off,
+        metrics.events_with_fallback_on,
         metrics.failure_events,
         metrics.contracts_tracked,
         metrics.contract_estimable_refits,
@@ -776,23 +811,29 @@ fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
     //
     // `nodes_routing_hierarchically` ALONE cannot establish that, and it is
     // important not to believe it does. It comes from `Router::snapshot()`,
-    // which evaluates `hierarchical_routing_enabled()` at call time, and under
-    // `cfg(test)` that reads the CALLING thread's `TEST_HIERARCHICAL_OVERRIDE`.
+    // which evaluates `isotonic_fallback_enabled()` at call time, and under
+    // `cfg(test)` that reads the CALLING thread's `TEST_ISOTONIC_FALLBACK`.
     // `collect_metrics` runs on the test thread inside `run_arm`'s guard
     // scope, so that counter is a readback of the thread-local this thread just
     // set, multiplied by the node count. It says nothing about the threads the
     // routers actually ran on. If turmoil ever polls host futures off the
     // calling thread, those routers fall through to the PROCESS default, which
-    // is now ON, and both arms would route hierarchically while both of those
-    // assertions still passed: permanently green, comparing ON against ON.
+    // is hierarchical, and both arms would route hierarchically while both of
+    // those assertions still passed: permanently green, comparing ON against ON.
     //
-    // `failure_events` is what closes that hole, because it crosses threads.
-    // It reads `hierarchical[0].window_events`, estimator state populated by
-    // `add_event` on whichever thread ran it. With the flag off and no
-    // `FREENET_ROUTING_DATASET` the estimator is never fed at all (see
-    // `hierarchical_computed`), so the OFF arm must show exactly zero. If the
-    // OFF arm's routers silently fell through to the process default, this is
-    // the assertion that fails.
+    // Router state closes that hole, because it crosses threads: it is
+    // written on whichever thread ran the node. Two counts of it are checked.
+    // The per-event switch count fires TODAY: every router learns route
+    // events, and each event records what `isotonic_fallback_enabled()`
+    // returned on the thread that learned it. If the OFF arm's routers fell
+    // through to the process default, they would record the switch OFF and
+    // the assertion below fails. That OFF-arm check is the guard; the ON-arm
+    // twin cannot see a lost override (the default it falls through to is
+    // the ON setting) and only catches the switch set in the process env.
+    // The per-model prediction counts are the
+    // second check, and the one that shows routing itself took each arm's
+    // path, but they hold vacuously until the workload makes predictions at
+    // all (#5789, see below).
     // ---------------------------------------------------------------
     assert!(
         on.nodes_total > 0,
@@ -811,18 +852,59 @@ fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
         off.nodes_routing_hierarchically
     );
     assert!(
+        off.events_with_fallback_on > 0 && off.events_with_fallback_off == 0,
+        "seed {seed:x}: the OFF arm's routers learned {} route events with the isotonic \
+         fallback switch on and {} with it off. Every one must see it on, or some node ran \
+         on a thread that did not carry the override and fell through to the process \
+         default (hierarchical), which makes this an ON-vs-ON comparison.",
+        off.events_with_fallback_on,
+        off.events_with_fallback_off
+    );
+    assert!(
+        on.events_with_fallback_off > 0 && on.events_with_fallback_on == 0,
+        "seed {seed:x}: the ON arm's routers learned {} route events with the isotonic \
+         fallback switch off and {} with it on. None may see it on: is \
+         FREENET_ROUTING_FALLBACK_ISOTONIC set in this process's environment? (This check \
+         cannot detect an ON node that lost its override; the OFF-arm check does that.)",
+        on.events_with_fallback_off,
+        on.events_with_fallback_on
+    );
+    assert!(
         on.failure_events > 0,
         "seed {seed:x}: the estimator routed but its failure stage learned nothing, so \
          nothing it forecast was informed by this run"
     );
+    // KNOWN GAP (#5789): at this workload's size no router reaches the 50-event
+    // gate between distance-only and prediction-based routing (about 25 route
+    // events per node), so both arms route by distance alone and the two
+    // exclusivity checks below hold vacuously. Measured when the comparison was
+    // moved onto the isotonic fallback: 0 predictions on either path in every
+    // seed. It was the same on the build this test was written for, where the
+    // ON arm computed the estimator but never routed on it. Until the workload
+    // crosses the gate this case pins network health, the contract table and
+    // (through the per-event switch count above) that each arm's override
+    // reached its routers, not routing on the estimator; it says so in its
+    // output rather than in an assertion that would have to be red.
+    if on.hierarchical_predictions == 0 || off.isotonic_predictions == 0 {
+        eprintln!(
+            "[ab] seed {seed:x}: NO PREDICTION-BASED ROUTING (on: {} hierarchical, off: {} \
+             isotonic predictions): both arms routed by distance alone (#5789)",
+            on.hierarchical_predictions, off.isotonic_predictions
+        );
+    }
     assert_eq!(
-        off.failure_events, 0,
-        "seed {seed:x}: the OFF arm's failure stage ingested {} events, so its routers were \
-         computing the hierarchical estimator. Either the estimator is being fed with the \
-         flag off, or the OFF arm's nodes ran on a thread that did not carry the override \
-         and fell through to the process default (which is ON). Both make this an ON-vs-ON \
-         comparison that every other assertion here would pass.",
-        off.failure_events
+        on.isotonic_predictions, 0,
+        "seed {seed:x}: the ON arm made {} predictions on the isotonic fallback, so some of \
+         its nodes did not carry the override",
+        on.isotonic_predictions
+    );
+    assert_eq!(
+        off.hierarchical_predictions, 0,
+        "seed {seed:x}: the OFF arm made {} hierarchical predictions, so its nodes ran on a \
+         thread that did not carry the override and fell through to the process default \
+         (hierarchical). That makes this an ON-vs-ON comparison that every other assertion \
+         here would pass.",
+        off.hierarchical_predictions
     );
 
     // ---------------------------------------------------------------
@@ -942,7 +1024,8 @@ fn assert_seed(seed: u64, off: &ArmMetrics, on: &ArmMetrics) {
     );
     assert!(
         failures.is_empty(),
-        "seed {seed:x}: hierarchical routing is worse than legacy beyond the noise margin:\n{}",
+        "seed {seed:x}: hierarchical routing is worse than the isotonic fallback beyond the \
+         noise margin:\n{}",
         failures.join("\n")
     );
 

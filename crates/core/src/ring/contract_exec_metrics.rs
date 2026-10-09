@@ -127,7 +127,10 @@
 //! is 6 with one slot of headroom) and land in a `tracing::info!` line that
 //! survives `release_max_level_info` for local `journalctl` reading.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::util::byte_bounded_lru::{ByteLruGaugeSnapshot, ByteLruGauges};
 
 /// Cumulative lifetime counts of contract-exec WASM invocations and the cache
 /// hits that elided them. See the module docs for the partition and cost.
@@ -160,6 +163,24 @@ pub(crate) struct ContractExecMetrics {
     /// WASM `get_state_delta` ran from a call site with no cache in front of it
     /// (the per-subscriber local client-notification fan-out).
     delta_wasm_uncached: AtomicU64,
+    /// Occupancy of the executor's summary cache (entries, counted bytes, byte
+    /// budget, lifetime evictions). The hit/miss arms above say WHETHER the
+    /// cache covered the load; these say WHY not — a `summarize_wasm_calls`
+    /// rate that tracks demand rather than state changes, with `bytes` pinned at
+    /// `budget_bytes` and `evictions_total` climbing, is the byte budget binding.
+    /// Not part of the hit/miss partition and not windowed by
+    /// [`ContractExecSnapshot::window_deltas`]: three are gauges.
+    summary_cache: Arc<ByteLruGauges>,
+    /// The delta cache's twin of `summary_cache`.
+    delta_cache: Arc<ByteLruGauges>,
+}
+
+/// Point-in-time occupancy of the executor's summary and delta caches; see
+/// `ContractExecMetrics::summary_cache`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FastPathCacheSnapshot {
+    pub summary: ByteLruGaugeSnapshot,
+    pub delta: ByteLruGaugeSnapshot,
 }
 
 /// A point-in-time read of [`ContractExecMetrics`] for telemetry emission.
@@ -273,6 +294,24 @@ impl ContractExecMetrics {
     #[inline]
     pub(crate) fn record_delta_wasm_uncached(&self) {
         self.delta_wasm_uncached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The gauges the executor's summary cache publishes into.
+    pub(crate) fn summary_cache_gauges(&self) -> &Arc<ByteLruGauges> {
+        &self.summary_cache
+    }
+
+    /// The gauges the executor's delta cache publishes into.
+    pub(crate) fn delta_cache_gauges(&self) -> &Arc<ByteLruGauges> {
+        &self.delta_cache
+    }
+
+    /// Read the summary/delta cache occupancy gauges for telemetry.
+    pub(crate) fn fast_path_cache_snapshot(&self) -> FastPathCacheSnapshot {
+        FastPathCacheSnapshot {
+            summary: self.summary_cache.snapshot(),
+            delta: self.delta_cache.snapshot(),
+        }
     }
 
     /// Read all counters for telemetry.

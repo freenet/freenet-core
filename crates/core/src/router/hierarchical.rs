@@ -2,22 +2,21 @@
 //!
 //! # Why this exists
 //!
-//! The legacy prediction stack composes three independently-motivated pieces:
+//! The legacy prediction stack composed three independently-motivated pieces:
 //! a global isotonic distance curve fitted over the last 500 events, a per-peer
 //! EWMA offset (alpha 0.1), and a Renegade k-NN prediction blended in with a
-//! fixed weight that ramps to 50%. None of the weights is derived from how much
-//! evidence stands behind each piece, so a peer seen twice is corrected as
-//! confidently as a peer seen two thousand times, and the 50% blend applies
-//! whether Renegade is right or wrong for this network.
+//! fixed weight that ramps to 50%. None of the weights was derived from how much
+//! evidence stood behind each piece, so a peer seen twice was corrected as
+//! confidently as a peer seen two thousand times, and the 50% blend applied
+//! whether Renegade was right or wrong for this network.
 //!
 //! This estimator replaces all of that with one model whose every weight is
-//! estimated from the data. It is the intended REPLACEMENT for the legacy stack
-//! (Renegade, the per-peer EWMA, the fixed blend and the residual correction),
-//! which is removed in a later PR. Until then both stacks exist: this one
-//! routes by default, `FREENET_ROUTING_HIERARCHICAL=0` (or any other value that
-//! resolves off) puts a node back on the legacy stack, and on such a node this
-//! estimator is computed at all only while the routing dataset is being
-//! recorded.
+//! estimated from the data. After a gateway soak with it routing, the legacy
+//! stack (Renegade, the fixed blend and the residual correction) was removed,
+//! and this is the estimator routing acts on for every stage that has a curve.
+//! The isotonic estimator, per-peer EWMA included, survives only as the 50-event
+//! gate and as the fallback for a timing stage without a curve yet (see
+//! `Router::predict_routing_outcome_at`).
 //!
 //! # Provenance, and what has changed since
 //!
@@ -289,7 +288,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use super::routing_predictor::RoutingOutcome;
 use crate::ring::{Location, PeerKeyLocation};
 
 /// Events the prior curve and the hierarchy are fitted over.
@@ -315,7 +313,7 @@ const EAGER_REFIT_BELOW: usize = 100;
 /// Minimum points before the failure curve is fitted: the legacy isotonic
 /// estimator's own `MIN_POINTS_FOR_REGRESSION`. A failure curve is clamped to
 /// `[0, 1]`, so a sparse one cannot produce an out-of-range estimate.
-const MIN_CURVE_POINTS_FAILURE: usize = 5;
+pub(crate) const MIN_CURVE_POINTS_FAILURE: usize = 5;
 
 /// Minimum points before a log-scale (timing, speed) curve is fitted.
 ///
@@ -326,7 +324,7 @@ const MIN_CURVE_POINTS_FAILURE: usize = 5;
 /// variance roughly 25 degrees of freedom, which is where its own relative
 /// error falls below 30%. Five points, the failure floor, would allow a factor
 /// of two.
-const MIN_CURVE_POINTS_LOG: usize = 30;
+pub(crate) const MIN_CURVE_POINTS_LOG: usize = 30;
 
 /// Log-scale predictions are clamped to the observed target range widened by
 /// this much on each side: a factor of two beyond anything the window has seen.
@@ -1051,6 +1049,73 @@ impl Level {
             variance: state.1.max(0.0),
         })
     }
+
+    /// The first two steps of [`Self::residual`], for the dashboard: the
+    /// posterior after the root and after the peer, with the peer node's
+    /// evidence (Kish effective sample size) and the shrinkage weight its own
+    /// mean received (`0` where the level had nothing to add).
+    ///
+    /// `residual` is left exactly as it is because routing reads it. This
+    /// repeats its arithmetic step for step; the dashboard's prediction lines
+    /// built from it are pinned against routing's own predictions
+    /// (`router::tests::routing_curves_are_what_routing_predicts`).
+    fn residual_steps(&self, slot: Option<usize>, now: f64) -> Option<ResidualSteps> {
+        let components = self.components?;
+        let scale = self.scale(now);
+        let step = |(mu, v): (f64, f64), node: Option<(f64, f64)>, tau2: f64| match node {
+            Some((mean, noise)) if tau2 > 0.0 => {
+                let prior = tau2 + v;
+                let b = prior / (prior + noise);
+                ((mu + b * (mean - mu), b * noise), b)
+            }
+            _ => ((mu, v + tau2), 0.0),
+        };
+
+        let mut state = (0.0, 0.0);
+        let root = self.root;
+        if root.n * scale > NODE_MIN {
+            let n2 = root.n * root.n;
+            let mean = root.mean();
+            let noise = components.sigma2 * root.mean_variance_factor()
+                + components.tau2_peer * self.sq_peers.max(0.0) / n2
+                + components.tau2_cell * self.sq_cells.max(0.0) / n2;
+            let tau2_root = (mean * mean - noise).max(0.0);
+            state = step(state, Some((mean, noise)), tau2_root).0;
+        }
+        let after_root = state;
+
+        let node = slot.and_then(|slot| self.nodes.get(slot));
+        let peer_node = node.filter(|node| node.peer.n * scale > NODE_MIN && node.peer.w2 > 0.0);
+        let peer = peer_node.map(|node| {
+            let peer = node.peer;
+            let noise = components.tau2_cell * node.sq_cells.max(0.0) / (peer.n * peer.n)
+                + components.sigma2 * peer.mean_variance_factor();
+            (peer.mean(), noise)
+        });
+        let (after_peer, peer_weight) = step(state, peer, components.tau2_peer);
+
+        let posterior = |(mean, variance): (f64, f64)| Posterior {
+            mean,
+            variance: variance.max(0.0),
+        };
+        (after_peer.0.is_finite() && after_peer.1.is_finite()).then(|| ResidualSteps {
+            after_root: posterior(after_root),
+            after_peer: posterior(after_peer),
+            peer_weight,
+            peer_evidence: peer_node.map_or(0.0, |node| node.peer.effective_n()),
+        })
+    }
+}
+
+/// The residual posterior after the root and after the peer, with the peer
+/// node's evidence and the weight its mean received. See
+/// [`Level::residual_steps`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ResidualSteps {
+    after_root: Posterior,
+    after_peer: Posterior,
+    peer_weight: f64,
+    peer_evidence: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2949,6 +3014,72 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         }
     }
 
+    /// The forecast for `peer`, or for a peer the stage holds no record of,
+    /// across distance `[0, 0.5]` on the stage's own scale, for a contract in
+    /// a ring band the peer has no record in and with the contract term left
+    /// out: `(distance, value, spread)` per sample. Empty until the stage has a
+    /// curve. For the dashboard's distance charts.
+    pub(crate) fn peer_curve(
+        &self,
+        peer: Option<&K>,
+        now: f64,
+        samples: usize,
+    ) -> Vec<(f64, f64, f64)> {
+        if self.curve.is_none() || samples == 0 {
+            return Vec::new();
+        }
+        let now = self.effective_time(now);
+        let level = self.selected();
+        let slot = peer.and_then(|peer| self.peers.lookup(peer));
+        // After the peer level, plus the band level's prior variance: what a
+        // query in a band the peer has no record in descends through, so the
+        // curve is what `predict` returns there (and, for `None`, what it
+        // returns for any peer with no record), bound included.
+        let posterior = self.levels[level]
+            .residual_steps(slot, now)
+            .map(|steps| steps.after_peer)
+            .map(|after_peer| Posterior {
+                mean: after_peer.mean,
+                variance: after_peer.variance
+                    + self.levels[level].components.map_or(0.0, |c| c.tau2_cell),
+            });
+        let sigma2 = self.levels[level].components.map_or(0.0, |c| c.sigma2);
+        (0..=samples)
+            .filter_map(|index| {
+                let distance = 0.5 * index as f64 / samples as f64;
+                let prior = self.prior(distance)?;
+                let value = self.bound(prior + posterior.map_or(0.0, |p| p.mean));
+                let spread = match self.target {
+                    Target::Failure => 0.0,
+                    Target::LogResponseTime | Target::LogTransferSpeed => {
+                        posterior.map_or(0.0, |p| p.variance) + sigma2
+                    }
+                };
+                (value.is_finite() && spread.is_finite()).then_some((distance, value, spread))
+            })
+            .collect()
+    }
+
+    /// What the stage has learned about `peer` relative to distance alone. See
+    /// [`PeerOffset`]. `None` until the stage has a curve and its first
+    /// variance components, when there is nothing for any peer to differ from.
+    ///
+    /// A peer the stage holds no record of (never seen, or evicted) gets
+    /// `Some` with offset, evidence and weight all exactly 0: routing predicts
+    /// it from distance alone, so it sits on that line rather than being
+    /// missing from it. `O(1)`: a hash lookup and the selected horizon's
+    /// arithmetic, the same work as [`Self::peer_curve`] minus the sampling.
+    pub(crate) fn peer_offset(&self, peer: &K, now: f64) -> Option<PeerOffset> {
+        self.curve.as_ref()?;
+        let now = self.effective_time(now);
+        let steps = self.levels[self.selected()].residual_steps(self.peers.lookup(peer), now)?;
+        Some(PeerOffset {
+            offset: steps.after_peer.mean - steps.after_root.mean,
+            evidence: steps.peer_evidence,
+            weight: steps.peer_weight,
+        })
+    }
+
     pub(crate) fn diagnostics(&self) -> StageDiagnostics {
         StageDiagnostics {
             window_events: self.sorted.len() + self.fresh.len(),
@@ -3018,6 +3149,91 @@ impl<K: Hash + Eq + Clone> Stage<K> {
 // ---------------------------------------------------------------------------
 // The router's three stages
 // ---------------------------------------------------------------------------
+
+/// A routing event outcome, in the form the stages learn it.
+pub(crate) struct RoutingOutcome {
+    /// Whether the request succeeded.
+    pub success: bool,
+    /// Time to response start (only for timed successes).
+    pub time_to_response_start_secs: Option<f64>,
+    /// Transfer speed in bytes/second (only for timed successes with payload).
+    pub transfer_speed_bps: Option<f64>,
+}
+
+impl RoutingOutcome {
+    /// The outcome of a router `RouteOutcome`, and its failure value.
+    pub fn from_route_outcome(outcome: &super::RouteOutcome) -> (Self, f64) {
+        match outcome {
+            super::RouteOutcome::Success {
+                time_to_response_start,
+                payload_size,
+                payload_transfer_time,
+            } => {
+                let transfer_time_secs = payload_transfer_time.as_secs_f64();
+                let speed = if transfer_time_secs > 0.0 {
+                    Some(*payload_size as f64 / transfer_time_secs)
+                } else {
+                    None // avoid Inf from zero-duration transfer
+                };
+                (
+                    RoutingOutcome {
+                        success: true,
+                        time_to_response_start_secs: Some(time_to_response_start.as_secs_f64()),
+                        transfer_speed_bps: speed,
+                    },
+                    0.0,
+                )
+            }
+            super::RouteOutcome::SuccessUntimed => (
+                RoutingOutcome {
+                    success: true,
+                    time_to_response_start_secs: None,
+                    transfer_speed_bps: None,
+                },
+                0.0,
+            ),
+            super::RouteOutcome::Failure => (
+                RoutingOutcome {
+                    success: false,
+                    time_to_response_start_secs: None,
+                    transfer_speed_bps: None,
+                },
+                1.0,
+            ),
+        }
+    }
+}
+
+/// One stage's learned difference between a peer and distance alone, for the
+/// dashboard.
+///
+/// "Distance alone" is what the stage predicts for a peer it holds no record
+/// of: the distance curve plus the all-peers level, which is
+/// [`HierarchicalRouting::peer_curves`]`(None, ..)`. `offset` is how far this
+/// peer's own level moved the posterior from there, so it is constant across
+/// distance and a peer predicted from distance alone has an offset of exactly
+/// 0. Band effects and the failure stage's contract term are left out, as they
+/// are from the peer curves.
+///
+/// It is the learned TYPICAL difference, not the ratio of two predictions:
+/// for the timing stages routing predicts an expectation,
+/// `exp(mu +- spread / 2)`, and a peer's record narrows its posterior variance
+/// as well as moving its mean, and the stage's output bound can clip either
+/// prediction. What routing actually predicts is
+/// [`HierarchicalRouting::peer_curves`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PeerOffset {
+    /// On the stage's own scale: a probability difference for failure, a
+    /// natural-log difference for the timing stages (so `exp(offset)` is the
+    /// factor on the median response time or transfer speed).
+    pub offset: f64,
+    /// Kish effective sample size behind this peer's own mean.
+    pub evidence: f64,
+    /// Share of the peer's own mean the estimate adopted, in `[0, 1)`. Below
+    /// one half, distance alone still outweighs the peer's own record. Zero
+    /// for every peer while the stage measures no spread between peers.
+    pub weight: f64,
+}
 
 /// What the estimator forecast for an event before learning it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -3357,6 +3573,68 @@ impl HierarchicalRouting {
                 .map(|f| self.transfer_speed.bound(f.value - f.spread / 2.0).exp())
                 .filter(|speed| speed.is_finite() && *speed > 0.0),
         }
+    }
+
+    /// Distance curves in router units (probability, seconds, bytes/s) for
+    /// `peer`, or for a peer with no record when `None`, for a contract in a
+    /// band the peer has no record in and with the failure stage's contract
+    /// term left out (so the failure curve is not what [`Self::estimate`]
+    /// returns for any one contract): `[failure, response time, transfer
+    /// speed]`. Converted to router units the way [`Self::estimate`] converts,
+    /// so the timing curves are exactly its estimate there. See
+    /// [`Stage::peer_curve`].
+    pub(crate) fn peer_curves(
+        &self,
+        peer: Option<&PeerKeyLocation>,
+        time: f64,
+    ) -> [Vec<(f64, f64)>; 3] {
+        self.peer_curves_sampled(peer, time, 50)
+    }
+
+    /// [`Self::peer_curves`] at `samples + 1` evenly spaced distances.
+    pub(crate) fn peer_curves_sampled(
+        &self,
+        peer: Option<&PeerKeyLocation>,
+        time: f64,
+        samples: usize,
+    ) -> [Vec<(f64, f64)>; 3] {
+        [
+            self.failure
+                .peer_curve(peer, time, samples)
+                .into_iter()
+                .map(|(distance, value, _)| (distance, value))
+                .collect(),
+            self.response_time
+                .peer_curve(peer, time, samples)
+                .into_iter()
+                .filter_map(|(distance, value, spread)| {
+                    let seconds = self.response_time.bound(value + spread / 2.0).exp();
+                    seconds.is_finite().then_some((distance, seconds))
+                })
+                .collect(),
+            self.transfer_speed
+                .peer_curve(peer, time, samples)
+                .into_iter()
+                .filter_map(|(distance, value, spread)| {
+                    let speed = self.transfer_speed.bound(value - spread / 2.0).exp();
+                    (speed.is_finite() && speed > 0.0).then_some((distance, speed))
+                })
+                .collect(),
+        ]
+    }
+
+    /// [`Stage::peer_offset`] for every stage, at estimator time `time`
+    /// (hours): `[failure, response time, transfer speed]`.
+    pub(crate) fn peer_offsets(
+        &self,
+        peer: &PeerKeyLocation,
+        time: f64,
+    ) -> [Option<PeerOffset>; 3] {
+        [
+            self.failure.peer_offset(peer, time),
+            self.response_time.peer_offset(peer, time),
+            self.transfer_speed.peer_offset(peer, time),
+        ]
     }
 
     pub(crate) fn diagnostics(&self) -> [StageDiagnostics; 3] {
