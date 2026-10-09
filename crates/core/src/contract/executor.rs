@@ -2642,6 +2642,11 @@ mod tests {
                 "CONTRACT_NODE_BYTES",
                 "compile-time size bound on one hierarchical-router struct",
             ),
+            (
+                "MIN_FREE_BYTES",
+                "free-DISK threshold the state directory must have before the node stages \
+                 a release (#5791), not memory",
+            ),
         ];
 
         // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.
