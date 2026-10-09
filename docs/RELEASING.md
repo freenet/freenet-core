@@ -709,17 +709,31 @@ covers this).
 
 `[package.metadata.freenet] min-compatible-version` in `crates/core/Cargo.toml`
 is the oldest peer version a node will connect to. The check runs in both
-directions, so once a release carries a higher floor, its nodes refuse older
-peers whichever side dials. `release.yml` ships the committed value unchanged.
-Raising it is a deliberate change in its own reviewed PR, never a side effect
-of a release. (`scripts/release.sh` still rewrites it; see #5833.)
+directions. It is a different mechanism from the wire-gated feature floors
+above: it refuses the connection outright, rather than deciding which message
+variants a peer can receive.
 
-Raise it only to cut off versions that cannot rejoin by themselves, for
-example 0.2.120 and 0.2.121, which cannot detect updates (#5221). Keep it at
-or below the oldest version that can still auto-update, so peers that are
-merely lagging keep connecting until they update. Peers still on older
-releases keep accepting the refused versions until they update, so the
-refusal reaches the whole network only as the release spreads.
+`release.yml` ships the committed value unchanged, so raising it is its own
+reviewed PR, never a side effect of a release. (`scripts/release.sh` still
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
+major.minor as the package and no higher than the package version. The
+handshake carries only the patch component.
+
+Raise it only to cut off versions that cannot rejoin by themselves, such as
+0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first
+release after the broken ones, and no higher.
+
+Before raising it:
+
+- **Count what it cuts.** It is a single threshold, so it also refuses every
+  older release. Count the peers below the new value in telemetry.
+- **Tell the affected operators.** Announce the change to their operators
+  with the release. A refused node updates itself only once it has no
+  connections left, through its supervisor's `freenet update`. Until then, its
+  operator has to run `freenet update` by hand.
+- **Expect a gradual effect.** Peers still on older releases keep accepting
+  the refused versions until they update, so the refusal reaches the whole
+  network only as the release spreads.
 
 ## Rollback
 

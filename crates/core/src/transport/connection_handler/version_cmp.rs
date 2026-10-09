@@ -510,6 +510,9 @@ mod tests {
     /// Only the refusal is pinned against fixed versions: raising the floor
     /// further later is legitimate, so the accepting half is stated against
     /// whatever floor this build ships, not against 0.2.122.
+    ///
+    /// This exercises this build's comparison logic only. That the handshake
+    /// sites act on a refusal is not covered here (#5835).
     #[test]
     fn shipped_floor_refuses_releases_that_cannot_auto_update() {
         for stranded in ["0.2.120", "0.2.121"] {

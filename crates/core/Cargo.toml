@@ -17,8 +17,8 @@ readme = "README.md"
 #
 # 0.2.122: 0.2.120 and 0.2.121 cannot detect updates themselves (they parse
 # the raw "v"-prefixed release tag as semver and drop every update, #5221,
-# fixed in 0.2.122 by #5225), so they stay on those versions indefinitely.
-# Every later version can auto-update.
+# fixed in 0.2.122 by #5225). 0.2.122 is the first release after them. The
+# floor is a single threshold, so it also refuses every older release.
 min-compatible-version = "0.2.122"
 
 [package.metadata.binstall]
