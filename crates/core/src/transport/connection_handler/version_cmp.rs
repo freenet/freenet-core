@@ -504,6 +504,34 @@ mod tests {
         );
     }
 
+    /// 0.2.120 and 0.2.121 cannot auto-update (#5221), so the shipped floor
+    /// must refuse them. Both advertised min_compatible 0.2.64.
+    ///
+    /// Only the refusal is pinned against fixed versions: raising the floor
+    /// further later is legitimate, so the accepting half is stated against
+    /// whatever floor this build ships, not against 0.2.122.
+    #[test]
+    fn shipped_floor_refuses_releases_that_cannot_auto_update() {
+        for stranded in ["0.2.120", "0.2.121"] {
+            let remote = encode_new_format(stranded, "0.2.64");
+            assert!(
+                is_compatible(&PROTOC_VERSION, &remote).is_err(),
+                "{stranded} cannot auto-update (#5221) and must be refused, \
+                 but the shipped floor {MIN_COMPATIBLE_VERSION} accepts it"
+            );
+            assert!(
+                remote_requires_newer_than_us(&remote, &PROTOC_VERSION),
+                "a refused {stranded} peer must be told it is below our floor"
+            );
+        }
+
+        let at_floor = encode_new_format(MIN_COMPATIBLE_VERSION, MIN_COMPATIBLE_VERSION);
+        assert!(
+            is_compatible(&PROTOC_VERSION, &at_floor).is_ok(),
+            "a peer exactly at the shipped floor {MIN_COMPATIBLE_VERSION} must be accepted"
+        );
+    }
+
     /// parse_semver with adversarial/malformed input.
     #[test]
     fn test_parse_semver_malformed() {
