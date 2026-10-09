@@ -337,6 +337,7 @@ async fn run_network_node_with_signals(
         jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
         version_mismatch_generation,
     };
+    use commands::update::stage_latest_release;
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
 
@@ -522,6 +523,10 @@ async fn run_network_node_with_signals(
             return;
         }
 
+        // A release staged for an update this binary already is (#5790) has
+        // served its purpose, however the update was applied.
+        commands::update::discard_stale_staged(build_info::VERSION);
+
         // --- Startup update check (#3864) ---
         //
         // Ask GitHub directly, once at boot, whether a newer release exists.
@@ -593,6 +598,7 @@ async fn run_network_node_with_signals(
                     new_version = %new_version,
                     "Startup check: newer version on GitHub, triggering auto-update"
                 );
+                stage_latest_release(build_info::VERSION).await;
                 #[allow(clippy::let_underscore_must_use)]
                 let _ = update_tx.send(new_version);
                 return;
@@ -683,6 +689,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Urgent update confirmed on GitHub, triggering immediate auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -744,6 +751,7 @@ async fn run_network_node_with_signals(
                                         new_version = %new_version,
                                         "Update confirmed on GitHub after stagger, triggering auto-update"
                                     );
+                                    stage_latest_release(build_info::VERSION).await;
                                     #[allow(clippy::let_underscore_must_use)]
                                     let _ = update_tx.send(new_version);
                                     return;
@@ -817,6 +825,7 @@ async fn run_network_node_with_signals(
                             "Isolated with version mismatch >6h — forcing exit for auto-update"
                         );
                         clear_version_mismatch();
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send("unknown (hard timeout)".to_string());
                         return;
@@ -838,6 +847,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -858,6 +868,7 @@ async fn run_network_node_with_signals(
                                      trusting gateway version signal, exiting for auto-update"
                                 );
                                 clear_version_mismatch();
+                                stage_latest_release(build_info::VERSION).await;
                                 #[allow(clippy::let_underscore_must_use)]
                                 let _ = update_tx.send("unknown (gateway mismatch)".to_string());
                                 return;
@@ -974,6 +985,7 @@ async fn run_network_node_with_signals(
                                 new_version = %new_version,
                                 "Periodic re-poll: newer version on GitHub, triggering auto-update"
                             );
+                            stage_latest_release(build_info::VERSION).await;
                             #[allow(clippy::let_underscore_must_use)]
                             let _ = update_tx.send(new_version);
                             return;
@@ -2766,6 +2778,64 @@ mod tests {
             guard_body.contains("tracing::warn!"),
             "the dirty-build auto-update-disabled branch must log at warn! so it \
              is operator-visible (#4580)"
+        );
+    }
+
+    /// #5790: every exit for auto-update must first download the release while
+    /// the node is still running. A trigger that sends without staging hands
+    /// the download back to systemd's `ExecStopPost`, whose `TimeoutStopSec`
+    /// kills it on a slow link, and the node restart-loops on the old version.
+    /// The sends stay inline (the canary pins them), so this checks each one
+    /// is directly preceded by the staging call.
+    #[test]
+    fn every_update_trigger_downloads_before_exiting() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module not found")
+            .0;
+        let statements: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("#["))
+            .collect();
+        // Every send, in whatever form, so a trigger spelled differently from
+        // the `let _ =` form cannot slip past the check below.
+        let all_sends = production.matches(concat!("update_tx", ".send(")).count();
+        let mut sends = 0;
+        for (i, stmt) in statements.iter().enumerate() {
+            if stmt.starts_with(concat!("let _ = update_tx", ".send(")) {
+                sends += 1;
+                assert_eq!(
+                    i.checked_sub(1).map(|p| statements[p]),
+                    Some("stage_latest_release(build_info::VERSION).await;"),
+                    "update trigger `{stmt}` must call stage_latest_release first (#5790)"
+                );
+            }
+        }
+        assert_eq!(
+            sends, 7,
+            "expected the 7 update trigger sites in freenet.rs"
+        );
+        // Stale staged releases are cleared once auto-update is known to be on,
+        // before the startup check can stage a new one.
+        let cleanup = production
+            .find("commands::update::discard_stale_staged(build_info::VERSION);")
+            .expect("the update task must clear stale staged releases (#5790)");
+        let disabled_return = production
+            .find("std::future::pending::<()>().await;")
+            .expect("auto-update-disabled branch not found");
+        let startup_check = production
+            .find("let startup_attempt = commands::auto_update::claim_update_attempt();")
+            .expect("startup update check not found");
+        assert!(
+            disabled_return < cleanup && cleanup < startup_check,
+            "discard_stale_staged must run after the auto-update-disabled return and \
+             before the startup check"
+        );
+        assert_eq!(
+            all_sends, sends,
+            "every send on update_tx must use the checked `let _ =` trigger form"
         );
     }
 

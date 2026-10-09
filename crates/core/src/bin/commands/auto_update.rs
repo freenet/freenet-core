@@ -257,7 +257,7 @@ where
 }
 
 /// [`parse_retry_after_at`] against the live wall clock.
-fn parse_retry_after<F>(header: F) -> Option<Duration>
+pub(crate) fn parse_retry_after<F>(header: F) -> Option<Duration>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -711,12 +711,14 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
     // in #5102 silently turned a 10s worst case into 4 x 10s = 40s.
     //
     // That matters because of where this runs. `freenet update` is invoked from
-    // systemd's `ExecStopPost` on every non-0/43 exit, inside `TimeoutStopSec=45`
-    // — a budget the unit's own comment already allocates (30s drain + 15s
-    // headroom for teardown). A 40s probe would leave ~5s for the asset fetch,
-    // download, checksum, signature verify and `replace_binary`, moving the
-    // SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent window
-    // #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
+    // systemd's `ExecStopPost` on every non-0/43 exit, and that phase gets its
+    // own `TimeoutStopSec=45` timer (on an exit 42 the node's drain has already
+    // happened, before the process exited). The probe shares it with the asset
+    // list, the cache re-check and the install itself; since #5790 the archives
+    // normally come from the node's staged download, but when that failed they
+    // are still fetched here. A 40s probe would leave ~5s for all of it, moving
+    // the SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent
+    // window #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
     // chosen against this same number, back when the probe was one request;
     // nothing re-derived it at 4x.
     //
@@ -1613,7 +1615,7 @@ pub(crate) fn record_github_cooldown_at(
 }
 
 /// Live-clock, live-state-dir variant of [`record_github_cooldown_at`].
-fn record_github_cooldown(retry_after: Option<Duration>) {
+pub(crate) fn record_github_cooldown(retry_after: Option<Duration>) {
     if let Some(dir) = state_dir() {
         record_github_cooldown_at(&dir, retry_after, now_unix());
     }
@@ -4255,9 +4257,9 @@ mod tests {
     fn probe_chain_deadline_does_not_widen_the_stop_phase_budget() {
         // The follow must not make the probe's worst case any longer than the
         // single request it replaced. `freenet update` runs from ExecStopPost
-        // inside TimeoutStopSec=45, which the unit already spends on the 30s
-        // drain plus teardown headroom; a probe that grew to 4x would push the
-        // SIGKILL from mid-probe into mid-install.
+        // inside its own TimeoutStopSec=45, which the probe shares with the
+        // rest of the install; a probe that grew to 4x would push the SIGKILL
+        // from mid-probe into mid-install.
         assert_eq!(
             PROBE_CHAIN_TIMEOUT, PROBE_REQUEST_TIMEOUT,
             "the chain deadline must equal the per-request timeout, so following \
@@ -4279,7 +4281,9 @@ mod tests {
         // and what actually matters, is that every HTTP client on this path is
         // bounded by SOMETHING — so a stalled connection can never hang until
         // systemd SIGKILLs the updater mid-install.
-        let update_src = include_str!("update.rs");
+        // `update/staged.rs` too (#5790): the installer reads its cache, and its
+        // downloader shares the update path's clients' obligations.
+        let update_src = concat!(include_str!("update.rs"), include_str!("update/staged.rs"));
         let clients = update_src.matches("reqwest::Client::builder()").count();
         let bounded =
             update_src.matches(".timeout(").count() + update_src.matches(".read_timeout(").count();

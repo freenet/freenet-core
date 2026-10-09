@@ -822,6 +822,16 @@ caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
 
+**Neither gate runs on a slow link.** #5790 (an update download killed by
+systemd's `TimeoutStopSec`, then an exit-42 restart loop) never showed on CI
+because runners download the release in seconds. Since #5790 the node
+downloads the release before it exits 42. Once the previous release does
+that, Gate B requires its download to finish (`MARKER_STAGE_DONE`) and
+`freenet update` to install from it (`MARKER_INSTALLED_STAGED`), so a staging
+path that silently falls back to the stop-phase download is caught; it then
+installs once more with no staged download, so the installer's own download
+path stays covered. What no gate can show is the time budget itself.
+
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag
 `releases/latest` actually resolves to, so a fetch or normaliser that returns
