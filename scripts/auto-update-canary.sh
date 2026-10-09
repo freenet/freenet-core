@@ -107,13 +107,16 @@ MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build
 MARKER_DISABLED='Auto-update is DISABLED'
 # update/staged.rs -- #5790: before exiting 42 the node downloads the release,
-# so `freenet update` only installs it. Both INFO. A previous release that logs
-# STARTED stages, and from then on Gate B requires DONE: a staging that silently
-# fails falls back to downloading inside systemd's TimeoutStopSec, which is the
-# #5790 restart loop on a slow link -- and CI's fast network would never show it.
-# Self-arming on STARTED, so releases that predate staging pass unchanged.
-MARKER_STAGE_STARTED='Downloading the update before exiting'
+# so `freenet update` only installs it. STARTED is logged (INFO) before staging
+# can decide anything, so a previous release that logs it HAS staging, and from
+# then on Gate B requires DONE (INFO) from the node and INSTALLED_STAGED (an
+# unconditional stderr line) from `freenet update`. A staging that silently
+# skips, fails, or is ignored by the installer falls back to downloading inside
+# systemd's TimeoutStopSec -- the #5790 restart loop on a slow link, which CI's
+# fast network would never show. Releases that predate staging pass unchanged.
+MARKER_STAGE_STARTED='Preparing the update before exiting'
 MARKER_STAGE_DONE='Update downloaded and verified'
+MARKER_INSTALLED_STAGED='from the update downloaded in advance.'
 # freenet.rs -- detection succeeded and an update was requested. There are
 # FIVE such sites and one REFUSAL that shares the phrase:
 # Cited by PHRASE, never by line number. The six that were here were all low
@@ -2022,7 +2025,8 @@ cmd_selfupdate() {
 
   if [ "$NODE_EXIT" != "42" ]; then
     if log_has "$work/logs" "$MARKER_STAGE_STARTED" && ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
-      fail "v$prev_version decided to update and was still downloading v$expected_version in advance (#5790) when the canary's deadline stopped it (exit $NODE_EXIT). That is a slow or failing GitHub asset download on this runner, not a node that refused to update; re-run the job."
+      fail "v$prev_version decided to update but was still in its pre-exit download of v$expected_version (#5790) when the canary's deadline stopped it (exit $NODE_EXIT). Either GitHub's asset download was slow or failing on this runner (re-run), or the staging code hangs (if it recurs, read the staging lines below). It is not a node that refused to update."
+      log_lines "$work/logs" "the update" | head -8 >&2
       return 1
     fi
     fail "expected the node to exit 42 (update requested) but it exited $NODE_EXIT. The supervisor contract is what applies the update; without exit 42 the fleet never restarts onto the new binary."
@@ -2033,10 +2037,16 @@ cmd_selfupdate() {
   # staging still exits 42 and the installer below still works here, on a fast
   # runner -- so without this, a broken staging path ships green and every
   # slow-link node is back in the TimeoutStopSec restart loop.
+  local staging_armed=0
   if log_has "$work/logs" "$MARKER_STAGE_STARTED"; then
+    staging_armed=1
     if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
-      fail "v$prev_version started downloading v$expected_version before exiting 42 (#5790) but never finished: the installer will download it inside systemd's TimeoutStopSec instead, which loops on slow links. The node's staging lines follow."
-      log_lines "$work/logs" "the update in advance" | head -5 >&2
+      if log_has "$work/logs" "GitHub rate-limited"; then
+        fail "v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
+      else
+        fail "v$prev_version prepared to download v$expected_version before exiting 42 (#5790) but did not finish: the installer will download it inside systemd's TimeoutStopSec instead, which loops on slow links. On a runner that can reach GitHub this is a staging bug. The node's staging lines follow."
+      fi
+      log_lines "$work/logs" "the update" | head -8 >&2
       return 1
     fi
     log "OK: v$prev_version downloaded and verified v$expected_version before exiting 42 (#5790)."
@@ -2063,9 +2073,19 @@ cmd_selfupdate() {
     # shellcheck disable=SC2031  # deliberate, as for HOME above: this subshell
     # sets its own copy; nothing outside it reads the change.
     export TMPDIR="$work/tmp"
-    "$work/bin/freenet" update --quiet
+    # stderr kept for the #5790 check below, and replayed either way.
+    "$work/bin/freenet" update --quiet 2>"$work/update.err"
   ); then
+    cat "$work/update.err" >&2
     fail "\`freenet update\` failed -- the node asked for an update and the installer could not apply it."
+    return 1
+  fi
+  cat "$work/update.err" >&2
+
+  # #5790: the node's download is only worth anything if the installer uses it.
+  # A grep of the file, not a pipe (see the SIGPIPE note on log_has).
+  if [ "$staging_armed" -eq 1 ] && ! grep -aqF -- "$MARKER_INSTALLED_STAGED" "$work/update.err"; then
+    fail "v$prev_version downloaded v$expected_version before exiting 42, but \`freenet update\` did not install from that download (#5790): it fetched the release again, which on a slow link is killed by systemd's TimeoutStopSec. Its output is above."
     return 1
   fi
 

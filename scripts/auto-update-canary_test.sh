@@ -2546,22 +2546,28 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
-# The #5790 staging markers, pinned to their emitting `tracing::info!` calls in
-# update/staged.rs (whitespace stripped, so a rustfmt reflow cannot disarm it).
-# Gate B self-arms on STARTED and then requires DONE; rewording either in the
-# source would silently disarm it (STARTED) or fail every release (DONE). INFO
-# for the usual reason: release builds compile out anything below.
+# The #5790 staging markers, pinned to their emitting calls (whitespace
+# stripped, so a rustfmt reflow cannot disarm them): STARTED and DONE must
+# directly follow `tracing::info!(` -- below INFO they are compiled out of
+# release builds -- and INSTALLED_STAGED is an unconditional `eprintln!` in
+# update.rs. Gate B arms on STARTED and then requires the other two; rewording
+# any of them in the source silently disarms it or fails every release.
 STAGED_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/update/staged.rs"
+UPDATE_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/update.rs"
 staged_flat="$(tr -d '[:space:]' < "$STAGED_SRC" 2>/dev/null)"
+update_flat="$(tr -d '[:space:]' < "$UPDATE_SRC" 2>/dev/null)"
 for pin in \
-    "tracing::info!(tag=%tag,\"${MARKER_STAGE_STARTED//[[:space:]]/}" \
-    "elapsed_secs=started.elapsed().as_secs(),\"${MARKER_STAGE_DONE//[[:space:]]/}"; do
-    if [[ "$staged_flat" == *"$pin"* ]]; then
-        echo "ok   - source pin: staging marker emitted at INFO: ${pin%%,*}..."
+    "staged|tracing::info!(\"${MARKER_STAGE_STARTED//[[:space:]]/}" \
+    "staged|tracing::info!(\"${MARKER_STAGE_DONE//[[:space:]]/}" \
+    "update|eprintln!(\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}"; do
+    file="${pin%%|*}" needle="${pin#*|}"
+    if [[ "$file" == staged ]]; then flat="$staged_flat"; else flat="$update_flat"; fi
+    if [[ "$flat" == *"$needle"* ]]; then
+        echo "ok   - source pin: #5790 marker emitted by $needle..."
     else
-        echo "FAIL - source pin: update/staged.rs no longer emits '$pin' (whitespace stripped)." >&2
-        echo "       Gate B's #5790 staging check greps the node log for MARKER_STAGE_STARTED and" >&2
-        echo "       MARKER_STAGE_DONE; change the markers in auto-update-canary.sh together with the source." >&2
+        echo "FAIL - source pin: $file.rs no longer emits '$needle' (whitespace stripped)." >&2
+        echo "       Gate B's #5790 staging check greps for MARKER_STAGE_STARTED, MARKER_STAGE_DONE" >&2
+        echo "       and MARKER_INSTALLED_STAGED; change them in auto-update-canary.sh with the source." >&2
         FAILURES=$((FAILURES + 1))
     fi
 done

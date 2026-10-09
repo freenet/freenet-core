@@ -2817,6 +2817,22 @@ mod tests {
             sends, 7,
             "expected the 7 update trigger sites in freenet.rs"
         );
+        // Stale staged releases are cleared once auto-update is known to be on,
+        // before the startup check can stage a new one.
+        let cleanup = production
+            .find("commands::update::discard_stale_staged(build_info::VERSION);")
+            .expect("the update task must clear stale staged releases (#5790)");
+        let disabled_return = production
+            .find("std::future::pending::<()>().await;")
+            .expect("auto-update-disabled branch not found");
+        let startup_check = production
+            .find("let startup_attempt = commands::auto_update::claim_update_attempt();")
+            .expect("startup update check not found");
+        assert!(
+            disabled_return < cleanup && cleanup < startup_check,
+            "discard_stale_staged must run after the auto-update-disabled return and \
+             before the startup check"
+        );
         assert_eq!(
             all_sends, sends,
             "every send on update_tx must use the checked `let _ =` trigger form"

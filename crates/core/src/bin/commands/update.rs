@@ -685,9 +685,12 @@ impl UpdateCommand {
         let (checksums, freenet_archive_path, staged_fdev) =
             match staged::load(release, self.quiet).await {
                 Some(staged) => {
-                    if !self.quiet {
-                        println!("Using the update downloaded in advance.");
-                    }
+                    // Not gated on --quiet: one line per update, and the
+                    // release canary's evidence that the cache is used.
+                    eprintln!(
+                        "Installing {} from the update downloaded in advance.",
+                        release.tag_name
+                    );
                     (
                         Some(staged.checksums),
                         staged.freenet_archive,
@@ -4111,7 +4114,9 @@ done
         let installed_arm =
             &installed_arm[..installed_arm.find('}').unwrap_or(installed_arm.len())];
         assert!(
-            installed_arm.contains("super::rollback::clear_install_failures();"),
+            installed_arm.lines().any(|l| l
+                .trim()
+                .starts_with("super::rollback::clear_install_failures();")),
             "the Installed outcome must clear the install-failure gate"
         );
         // The deterministic-verification Err arm records a failure.
