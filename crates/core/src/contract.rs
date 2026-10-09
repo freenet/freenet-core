@@ -6830,11 +6830,14 @@ mod tests {
     /// same defeat one syntax over, and a guard that catches only the variant
     /// you thought of is a search with a blind spot.
     ///
-    /// Known limits, both of which fail in the LOUD direction. It is not a Rust
-    /// lexer, so a `//` inside a string literal starts a "comment" and the rest
-    /// of that line is dropped; and Rust block comments nest, which this does
-    /// not model. Either can only REMOVE text a pin looks for, turning a pin
-    /// red rather than green — never the reverse.
+    /// Known limits. It is not a Rust lexer, so a `//` inside a string literal
+    /// starts a "comment" and the rest of that line is dropped; and Rust block
+    /// comments nest, which this does not model. Either only REMOVES text. For
+    /// a pin that requires text to be PRESENT that fails loud (red). For a pin
+    /// that requires text to be ABSENT, such as the spawned-body check in
+    /// `every_delegate_run_is_reached_from_the_serial_loop`, removed text can
+    /// hide a needle or a brace and fail quiet (green). Neither shape occurs in
+    /// the scanned code today.
     pub(crate) fn strip_comments(src: &str) -> String {
         enum S {
             Code,
@@ -7126,15 +7129,35 @@ mod tests {
             }
             cursor = name_end;
             // Only a CALL spawns anything. A mention of the name in a type, a
-            // path or a binding spawns no task and has no body to scan.
-            if bytes.get(name_end) != Some(&b'(') {
+            // path or a binding spawns no task and has no body to scan. A
+            // turbofish (`spawn::<T>(`) is still a call: step over it to the
+            // paren, or `GlobalExecutor::spawn::<_>(async move { .. })` would
+            // be skipped entirely.
+            let mut paren = name_end;
+            if code[name_end..].starts_with("::<") {
+                let mut depth = 0usize;
+                for (off, b) in bytes[name_end + 2..].iter().enumerate() {
+                    match b {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                paren = name_end + 2 + off + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if bytes.get(paren) != Some(&b'(') {
                 continue;
             }
             let ident = &code[start..name_end];
             // A call to a function DEFINED IN THE SCANNED TEXT is not itself a
             // spawn: whatever it spawns is written inside its own body, which
             // this same loop reaches and scans where it is written
-            // (`spawn_capability_prompt`, #5730, is the first). Three
+            // (`spawn_capability_prompt`, #5730, is the first). Four
             // conditions keep that from becoming a hole:
             //
             //  * The call is UNQUALIFIED. `other::spawn_x(` or `obj.spawn_x(`
@@ -7143,62 +7166,87 @@ mod tests {
             //    local `fn spawn`.
             //  * The local declaration HAS A BODY. A trait method declared
             //    here with `;` has its body somewhere this scan never reads.
+            //  * The helper does NOT TAKE A FUTURE OR CLOSURE: its signature
+            //    names no `Future` and no `Fn`. A helper that does is a spawn
+            //    by another name, so it falls through to the literal-block rule
+            //    below, exactly like `GlobalExecutor::spawn(`. Otherwise
+            //    `let fut = async move { .. }; spawn_detached(fut);` would
+            //    scan only `(fut)` here and `{ f.await }` in the helper. A
+            //    type alias hiding `Future` defeats this; none exists in the
+            //    scanned text.
             //  * The call's ARGUMENTS are still scanned, as a body of their
-            //    own. A helper taking a future (`spawn_detached(async move {
-            //    .. })`) runs that block off the loop, and its own body shows
-            //    only `f.await`.
+            //    own, so nothing written inline in the call is hidden.
             //
             // A helper that fails any of these reaches the panic below.
             let before = code[..start].trim_end();
             // A DECLARATION (`fn spawn_x(`) is not a call and spawns nothing.
-            if before.ends_with("fn")
-                && !before[..before.len() - 2]
-                    .as_bytes()
-                    .last()
-                    .copied()
-                    .is_some_and(is_ident)
+            if let Some(head) = before.strip_suffix("fn")
+                && !head.bytes().last().is_some_and(is_ident)
             {
                 continue;
             }
-            let qualified = before.ends_with(|c: char| c == ':' || c == '.');
-            let has_local_body = || {
+            let qualified = before.ends_with([':', '.']);
+            let exemptible_local_helper = || {
                 [format!("fn {ident}("), format!("fn {ident}<")]
                     .iter()
                     .filter_map(|decl| code.find(decl.as_str()))
                     .any(|at| {
                         let rest = &code[at..];
-                        match (rest.find('{'), rest.find(';')) {
-                            (Some(open), Some(semi)) => open < semi,
-                            (Some(_), None) => true,
-                            _ => false,
-                        }
+                        let signature_end = match (rest.find('{'), rest.find(';')) {
+                            (Some(open), Some(semi)) if open < semi => open,
+                            (Some(open), None) => open,
+                            _ => return false,
+                        };
+                        let signature = &rest[..signature_end];
+                        !signature.contains("Future") && !signature.contains("Fn")
                     })
             };
-            if !qualified && has_local_body() {
+            if !qualified && exemptible_local_helper() {
+                // Paren matching that steps over string and char literals, so
+                // a `)` inside one cannot close the span early and drop the
+                // rest of the arguments from the scan.
                 let mut depth = 0usize;
                 let mut close = None;
-                for (off, b) in bytes[name_end..].iter().enumerate() {
-                    match b {
+                let mut k = paren;
+                while k < bytes.len() {
+                    match bytes[k] {
+                        b'"' => {
+                            k += 1;
+                            while k < bytes.len() && bytes[k] != b'"' {
+                                if bytes[k] == b'\\' {
+                                    k += 1;
+                                }
+                                k += 1;
+                            }
+                        }
+                        b'\''
+                            if bytes.get(k + 2) == Some(&b'\'')
+                                || (bytes.get(k + 1) == Some(&b'\\')
+                                    && bytes.get(k + 3) == Some(&b'\'')) =>
+                        {
+                            k += if bytes[k + 1] == b'\\' { 3 } else { 2 };
+                        }
                         b'(' => depth += 1,
                         b')' => {
                             depth -= 1;
                             if depth == 0 {
-                                close = Some(name_end + off);
+                                close = Some(k);
                                 break;
                             }
                         }
                         _ => {}
                     }
+                    k += 1;
                 }
                 let close = close.unwrap_or_else(|| {
                     panic!("`{ident}` at byte {start} opens an argument list that is never closed")
                 });
-                out.push(&code[name_end..=close]);
+                out.push(&code[paren..=close]);
                 cursor = close + 1;
                 continue;
             }
 
-            let mut i = skip_ws(code, name_end + 1);
+            let mut i = skip_ws(code, paren + 1);
             if let Some(next) = eat_kw(code, i, "async") {
                 i = skip_ws(code, next);
             }
@@ -7371,17 +7419,53 @@ mod tests {
         let _ = spawned_bodies(code);
     }
 
-    /// A block handed TO a local helper runs off the loop too, and the
-    /// helper's own body shows only `f.await`. The arguments must be scanned.
+    /// A helper that TAKES A FUTURE is a spawn by another name: a block handed
+    /// to it runs off the loop, and its own body shows only `f.await`. It is
+    /// held to the literal-block rule, so the block is scanned...
     #[test]
-    fn a_block_handed_to_a_local_helper_is_scanned() {
+    fn a_block_handed_to_a_future_taking_helper_is_scanned() {
         let code = "fn caller() { spawn_detached(async move { NEEDLE }); } \
-                    fn spawn_detached(f: F) { GlobalExecutor::spawn(async move { f.await }); }";
+                    fn spawn_detached(f: impl Future<Output = ()>) { \
+                    GlobalExecutor::spawn(async move { f.await }); }";
         let bodies = spawned_bodies(code);
         assert!(
             bodies.iter().any(|b| b.contains("NEEDLE")),
             "the block passed to the helper must be scanned, got {bodies:?}"
         );
+    }
+
+    /// ...and a PREBUILT future handed to it panics, as it does for
+    /// `GlobalExecutor::spawn(fut)`. Exempting the helper would scan only
+    /// `(fut)` at the call and `{ f.await }` in the helper.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_prebuilt_future_handed_to_a_future_taking_helper_panics() {
+        let code = "fn caller() { let fut = async move { NEEDLE }; spawn_detached(fut); } \
+                    fn spawn_detached<F: Future>(f: F) { \
+                    GlobalExecutor::spawn(async move { f.await }); }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// A non-future helper's arguments are scanned whole: a `)` inside a
+    /// string literal must not end the span early.
+    #[test]
+    fn a_local_helper_s_arguments_are_scanned_past_a_paren_in_a_string() {
+        let code = "fn caller() { spawn_note(\":)\", { NEEDLE }); } \
+                    fn spawn_note(a: &str, b: u8) { }";
+        let bodies = spawned_bodies(code);
+        assert!(
+            bodies.iter().any(|b| b.contains("NEEDLE")),
+            "the argument after the string must be scanned, got {bodies:?}"
+        );
+    }
+
+    /// A turbofish call is still a call.
+    #[test]
+    fn the_spawn_scan_sees_a_turbofish_call() {
+        let code = "fn f() { GlobalExecutor::spawn::<_>(async move { NEEDLE }); }";
+        let bodies = spawned_bodies(code);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("NEEDLE"));
     }
 
     /// The second audit defeat, and the subtler one: it uses a RECOGNISED spawn
@@ -7562,8 +7646,16 @@ mod tests {
              fetch, the export) and the scan found none — it is measuring \
              nothing, so a delegate run inside a spawned task would pass"
         );
+        // The allowed callers are needles too: `spawn(async move {
+        // this.dispatch_delegate_request(req).await })` would otherwise pass
+        // all three checks, because check 2 attributes the chokepoint call to
+        // the allowed function and the spawned body names neither needle.
+        let allowed_calls: Vec<String> = allowed.iter().map(|a| format!("{a}(")).collect();
         for body in &spawned {
-            for needle in [chokepoint, ".execute_delegate_request("] {
+            for needle in [chokepoint, ".execute_delegate_request("]
+                .into_iter()
+                .chain(allowed_calls.iter().map(String::as_str))
+            {
                 assert!(
                     !body.contains(needle),
                     "`{needle}` appears inside a SPAWNED task body. Whatever \
