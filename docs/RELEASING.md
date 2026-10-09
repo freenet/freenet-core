@@ -717,7 +717,8 @@ variants a peer can receive.
 reviewed PR, never a side effect of a release. (`scripts/release.sh` still
 rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
 major.minor as the package and no higher than the package version. The
-handshake carries only the patch component.
+handshake carries only the patch component. A minor or major version bump
+therefore has to reset the floor in the same PR, or the build fails.
 
 Raise it only to cut off versions that cannot rejoin by themselves, such as
 0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first
@@ -728,9 +729,11 @@ Before raising it:
 - **Count what it cuts.** It is a single threshold, so it also refuses every
   older release. Count the peers below the new value in telemetry.
 - **Tell the affected operators.** Announce the change to their operators
-  with the release. A refused node updates itself only once it has no
-  connections left, through its supervisor's `freenet update`. Until then, its
-  operator has to run `freenet update` by hand.
+  with the release. A refused node whose update check works starts a normal
+  auto-update. A node that cannot detect updates (0.2.120/0.2.121) updates
+  itself only once it has no connections left, through its supervisor's
+  `freenet update`. Until then, its operator has to run `freenet update` by
+  hand.
 - **Expect a gradual effect.** Peers still on older releases keep accepting
   the refused versions until they update, so the refusal reaches the whole
   network only as the release spreads.
