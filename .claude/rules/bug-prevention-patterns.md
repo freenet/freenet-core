@@ -841,9 +841,12 @@ new cap was flat. Its siblings in `contract::executor::declared_cache_ceiling`
 term that does not move and has no reason to think it should.
 
 **How it surfaced, which is the useful part.** The flat cap was ALSO missing from
-`declared_cache_ceiling` — and `ring::hosting::cache::resident_overhead_budget_for`
-derives the hosting budget as a *residual* from that sum, so hosting had been
-treating 64 MiB already committed to parks as free. Adding the term turned
+`declared_cache_ceiling` — and at the time `ring::hosting::cache::resident_overhead_budget_for`
+derived the hosting budget as a *residual* from that sum, so hosting had been
+treating 64 MiB already committed to parks as free. (Since #5647 the hosting
+budget is its own share of the memory limit and the sum is test-only; the
+aggregate-safety tests are now the only thing that sees a missing term, which
+makes the discovery guard below more important, not less.) Adding the term turned
 `cache_byte_budgets_are_aggregate_safe` red immediately: a 1 GiB VPS with 4
 workers declared **566,231,032 bytes against a 536,870,912 half-limit**. The
 over-commit was real from the day the cap shipped and unobservable until the
@@ -855,7 +858,7 @@ Audit questions for any new byte budget:
 - **Does it scale with the host?** If it is a bare `const`, name the smallest
   supported host and check the aggregate still fits there.
 - **Is it in the aggregate?** A budget outside `declared_cache_ceiling` is
-  memory some other consumer believes is free.
+  memory the aggregate-safety tests never see.
 - **Can the guard on that aggregate FAIL for a budget nobody added to it?** If it
   validates a hardcoded list, it catches removal and not addition — see below.
 

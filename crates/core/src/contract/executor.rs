@@ -1594,12 +1594,15 @@ pub(crate) fn declared_cache_ceiling_terms(
     // The delegate park registry's node-wide retention cap (#5544 S4). One per
     // node, so NOT multiplied by the pool.
     //
-    // Missing from this sum until the #5554 follow-up, which matters because
-    // `ring::hosting::cache::resident_overhead_budget_for` derives the hosting
-    // budget as a RESIDUAL from this figure: hosting was treating 64 MiB
-    // already committed to parked delegates as available to it. That is
-    // #5268's defect 3 in a new term — the reason this function was promoted
-    // out of the test module in the first place.
+    // Missing from this sum until the #5554 follow-up. At the time
+    // `ring::hosting::cache::resident_overhead_budget_for` derived the hosting
+    // budget as a RESIDUAL from this figure, so hosting was treating 64 MiB
+    // already committed to parked delegates as available to it. Since #5647
+    // the hosting budget is its own share of the memory limit, so a missing
+    // term no longer over-grants hosting directly; it is memory the
+    // aggregate-safety tests (`cache_byte_budgets_are_aggregate_safe` here and
+    // `declared_caches_plus_hosting_budget_leave_room_for_the_runtime` in
+    // `ring::hosting::cache`) never see.
     let parked = crate::contract::delegate_park::parked_budget_for(memory_limit);
 
     vec![
@@ -2144,8 +2147,8 @@ mod tests {
                 POOL * per_executor,
                 "`{label}` is PER-EXECUTOR, so the aggregate must count \
                  `pool_size` of them. Declaring one copy of a budget the node \
-                 commits {POOL} times is #5268's defect 3, and hosting derives \
-                 its residual from this sum"
+                 commits {POOL} times is #5268's defect 3, and it hides memory \
+                 from the aggregate-safety checks"
             );
         }
 
@@ -2155,10 +2158,9 @@ mod tests {
         // stays green. The direction is what makes that worth an assertion
         // rather than a note -- the margin tests are inequalities, and
         // UNDER-declaring satisfies an inequality more easily, so the failure
-        // is a silent over-grant of resident overhead against memory already
-        // committed. That is the `resident_overhead_budget_for` residual
-        // hazard this whole change is about, arriving through the guard built
-        // for it.
+        // is memory the aggregate-safety checks silently stop counting. That
+        // is the hazard this whole change is about, arriving through the guard
+        // built for it.
         assert_eq!(
             value(&terms, "SOURCE_CODE_CACHE_MAX_BYTES"),
             2 * SOURCE_CODE_CACHE_MAX_BYTES as usize,
@@ -2190,8 +2192,8 @@ mod tests {
         );
 
         // ...and the node-wide ones must NOT be multiplied. Over-declaring
-        // starves hosting's residual instead of over-granting it: wrong in the
-        // safe direction, still wrong, and silent either way.
+        // makes the aggregate-safety checks fail on hosts that actually fit:
+        // wrong in the safe direction, still wrong.
         for (label, node_wide) in [
             (
                 "budget_for_ram",
@@ -2252,7 +2254,7 @@ mod tests {
             margin > 0,
             "the aggregate now fits EXACTLY, with no headroom at all on a 1 GiB \
              host. The next budget added to `declared_cache_ceiling` puts it \
-             over, and hosting derives its residual from this sum"
+             over"
         );
         println!(
             "1 GiB / 4 workers: declared {total}, half-limit {half}, margin {margin} bytes ({:.2}%)",
@@ -2280,9 +2282,12 @@ mod tests {
     /// new one is added here at the same time it is added there" — which is an
     /// honour-system requirement written as though it were a check. A ninth
     /// budget (`MAX_PARKED_BYTES`, #5544) was added, was not summed, and the
-    /// guard had no way to fail: `resident_overhead_budget_for` derives the
-    /// hosting budget as a residual from this figure, so hosting was treating
-    /// 64 MiB already committed to parked delegates as free.
+    /// guard had no way to fail. At the time `resident_overhead_budget_for`
+    /// derived the hosting budget as a residual from this figure, so hosting
+    /// was treating 64 MiB already committed to parked delegates as free.
+    /// (Since #5647 that budget is its own share of the memory limit, and this
+    /// sum is test-only; a missing term is now memory the aggregate-safety
+    /// tests never see.)
     ///
     /// So this DISCOVERS budgets instead of listing them. Anything it finds is
     /// either in the sum, or in `NOT_SUMMED` with a reason — an exclusion
@@ -2480,7 +2485,9 @@ mod tests {
             ),
             (
                 "resident_overhead_budget_for",
-                "the CONSUMER of this aggregate; summing it would be circular",
+                "the hosting budget: its own share of the memory limit since #5647, \
+                 compared against this aggregate by the hosting-side safety test \
+                 rather than summed into it",
             ),
             // FOUND BY WIDENING THE TYPE PREDICATE TO `u64`, which is the
             // point: this name existed for releases and this guard could not
@@ -2493,12 +2500,13 @@ mod tests {
             // was a decision anybody had written down. A guard that cannot see
             // a name cannot be said to have excluded it.
             //
-            // Consumer-side hosting terms. `resident_overhead_budget_for` and
-            // the hosting state-byte budget CONSUME this aggregate; summing
-            // their own constants here would be circular.
+            // Hosting-side terms. `resident_overhead_budget_for` and the hosting
+            // state-byte budget are budgets of their own that the hosting-side
+            // safety test adds to this aggregate; summing their constants here
+            // would count them twice.
             (
                 "MIN_RESIDENT_OVERHEAD_BUDGET_BYTES",
-                "floor inside resident_overhead_budget_for, the consumer of this sum",
+                "floor inside resident_overhead_budget_for, a hosting-side budget",
             ),
             (
                 "MIN_DEFAULT_HOSTING_BUDGET_BYTES",
@@ -2552,13 +2560,6 @@ mod tests {
                 "STANDALONE_DELEGATE_STORE_BYTES",
                 "conformance runtime-oracle harness store size, not a node budget",
             ),
-            (
-                "BASELINE_MEMORY_RESERVATION_BYTES",
-                "reserved BY resident_overhead_budget_for on the consumer side: it is \
-                 subtracted from total RAM to leave headroom for everything NOT declared \
-                 here. Summing it into the declaration would double-count it against the \
-                 residual it exists to protect",
-            ),
         ];
 
         // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.
@@ -2582,8 +2583,8 @@ mod tests {
 
         // A LABEL WITH A ZEROED VALUE IS THE NEXT VERSION OF THE SAME HOLE.
         // Keeping `("parked_budget_for", 0)` would satisfy every membership
-        // check above while contributing nothing to the aggregate hosting
-        // derives its residual from, so require each term to be non-zero on a
+        // check above while contributing nothing to the aggregate the safety
+        // tests compare against memory, so require each term to be non-zero on a
         // representative host. The one legitimate zero is written down rather
         // than tolerated by a `>= 0`.
         const LEGITIMATELY_ZERO: &[(&str, &str)] = &[(
@@ -2723,10 +2724,9 @@ mod tests {
                 NOT_SUMMED.iter().any(|(n, _)| n == name),
                 "`{name}` looks like a node memory budget and is neither summed \
                  by `declared_cache_ceiling` nor listed in NOT_SUMMED. \
-                 `resident_overhead_budget_for` derives the hosting budget as a \
-                 RESIDUAL from that sum, so a budget missing from it is memory \
-                 hosting believes is free. Add it to the sum, or add it to \
-                 NOT_SUMMED with the reason it does not belong."
+                 A budget missing from that sum is memory the aggregate-safety \
+                 tests never see. Add it to the sum, or add it to NOT_SUMMED \
+                 with the reason it does not belong."
             );
         }
 

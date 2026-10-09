@@ -1396,8 +1396,9 @@ pub(super) struct DelegateResume {
     /// RE-RUN on the loop before their responses can be built.
     pub upserts: Vec<ResolvedUpsert>,
     /// Upserts the off-loop task never resolved — it panicked, was cancelled,
-    /// or ran out of budget. `(contract, is_put)`, turned into failure
-    /// responses by the resume handler so the delegate is told.
+    /// or ran out of budget. Each carries its `UpsertId` and the delegate's
+    /// context, and is turned into a failure response by the resume handler so
+    /// the delegate is told.
     pub unresolved_upserts: Vec<OwedUpsert>,
     /// Delegate GET/SUBSCRIBE operations whose network work finished off-loop
     /// (#5542), turned into inbound responses on the loop.
@@ -2283,7 +2284,7 @@ mod tests {
         upserts: &[PendingUpsert],
         fetch_allowance: usize,
     ) -> usize {
-        super::task_bytes(prompts, upserts, ByteCount::new(fetch_allowance)).get()
+        super::task_bytes(prompts, upserts, &[], ByteCount::new(fetch_allowance)).get()
     }
     fn request_bytes(req: &DelegateRequest<'static>) -> usize {
         super::request_bytes(req).get()
@@ -3385,7 +3386,7 @@ mod tests {
     /// fix was verified by making it fail", and this was the one fix with no
     /// falsification behind it: reverting both `unwrap_or_else(|e|
     /// e.into_inner())` calls in `deliver` left the whole suite green, because
-    /// nothing anywhere poisoned either mutex. A universal claim in the
+    /// nothing anywhere poisoned any of the sink mutexes. A universal claim in the
     /// description of a change about ornamental guards, with one guard under it
     /// that had only ever been watched to pass.
     ///
@@ -3398,9 +3399,13 @@ mod tests {
     /// computing an argument reads as ordinary. Together they abort the
     /// process, because a panic in `Drop` during unwinding is not recoverable.
     ///
-    /// FALSIFY by restoring `.lock().unwrap()` on either sink in `deliver`:
-    /// this test panics inside `Drop` instead of delivering. Verified by doing
-    /// exactly that, on both lines independently.
+    /// ALL THREE SINKS are poisoned: the answers, the related fetches, and the
+    /// network contract ops (#5542 added the third, in #5615). Poison-tolerance
+    /// is a property of the whole `Drop` path, so a test that covered only the
+    /// first two would leave the third free to regress to `.unwrap()`.
+    ///
+    /// FALSIFY by restoring `.lock().unwrap()` on any one of the three sinks
+    /// in `deliver`: this test panics inside `Drop` instead of delivering.
     #[tokio::test]
     async fn a_poisoned_sink_lock_still_delivers_from_drop() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3435,10 +3440,21 @@ mod tests {
             "the fetches sink must be poisoned BY A PANIC, or this test is \
              exercising an ordinary lock"
         );
+        let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        let poison_net_ops = std::sync::Arc::clone(&net_ops);
+        let poisoned_net_ops = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poison_net_ops.lock().unwrap();
+            panic!("off-loop task died while holding the contract-ops sink");
+        }));
         assert!(
-            answers.lock().is_err() && fetches.lock().is_err(),
-            "both sinks must actually be POISONED, or this test proves nothing \
-             about the poisoned path"
+            poisoned_net_ops.is_err(),
+            "the contract-ops sink must be poisoned BY A PANIC, or this test is \
+             exercising an ordinary lock"
+        );
+        assert!(
+            answers.lock().is_err() && fetches.lock().is_err() && net_ops.lock().is_err(),
+            "all three sinks must actually be POISONED, or this test proves \
+             nothing about the poisoned path"
         );
 
         // The guard drops on the panic path, exactly as it does when the
@@ -3451,6 +3467,8 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
+            Vec::new(),
+            net_ops,
         ));
 
         let resume = rx.try_recv().expect(
@@ -4237,7 +4255,8 @@ mod tests {
         const N: usize = 32 * 1024;
         let mut op = net_op(9, ContractOpKind::Get);
         op.context = DelegateContext::new(vec![0u8; N]);
-        let charged = task_bytes(&[], &[], std::slice::from_ref(&op));
+        let charged =
+            super::task_bytes(&[], &[], std::slice::from_ref(&op), ByteCount::default()).get();
         assert!(
             charged >= 2 * N,
             "a pending network op retains its context TWICE — once in the \
@@ -4419,6 +4438,8 @@ mod tests {
             ],
             answers,
             fetches.clone(),
+            Vec::new(),
+            Default::default(),
         );
         // Exactly ONE of the pair resolves.
         fetches.lock().unwrap().push(ResolvedUpsert {

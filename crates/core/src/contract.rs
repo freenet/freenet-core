@@ -10956,7 +10956,7 @@ mod hol_4391_tests {
         .await;
 
         assert_eq!(
-            runs, 0,
+            runs, None,
             "this test is only meaningful while the resume is actually DROPPED; \
              a non-zero run count means it was absorbed and the early return \
              never ran"
@@ -11583,6 +11583,8 @@ mod hol_4391_tests {
             inbound_so_far: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
+            node_wide_duty: false,
+            self_heal_fetches_started: 0,
         }
     }
 
@@ -12100,6 +12102,8 @@ mod hol_4391_tests {
                 )],
                 upserts: Vec::new(),
                 unresolved_upserts: Vec::new(),
+                contract_ops: Vec::new(),
+                unresolved_contract_ops: Vec::new(),
             },
         )
         .await;
