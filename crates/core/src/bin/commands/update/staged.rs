@@ -24,6 +24,7 @@
 //! on disk, so a node on an older release still downloads in `ExecStopPost`.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -172,17 +173,37 @@ fn tag_dir(root: &Path, tag: &str) -> Result<PathBuf> {
 /// still keep a cache that two processes wrote from being installed wrong.
 struct CacheLock {
     _file: fs::File,
+    path: PathBuf,
+}
+
+/// Lock files this process holds. A record lock does not exclude this
+/// process's own other callers, and closing a second descriptor for the file
+/// would silently release it, so in-process exclusion is enforced here.
+static HELD_LOCKS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // Poisoning cannot leave this list wrong: every critical section is a
+        // single push or retain.
+        let mut held = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|p| p != &self.path);
+    }
 }
 
 fn try_lock(root: &Path) -> std::io::Result<Option<CacheLock>> {
     if let Some(parent) = root.parent() {
         fs::create_dir_all(parent)?;
     }
+    let path = root.with_extension("lock");
+    let mut held = HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if held.contains(&path) {
+        return Ok(None);
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(root.with_extension("lock"))?;
+        .open(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -203,7 +224,8 @@ fn try_lock(root: &Path) -> std::io::Result<Option<CacheLock>> {
             };
         }
     }
-    Ok(Some(CacheLock { _file: file }))
+    held.push(path.clone());
+    Ok(Some(CacheLock { _file: file, path }))
 }
 
 /// Remove every staged release except `keep`, so the cache never holds more
@@ -416,12 +438,10 @@ async fn stage_into(
             return Staging::Skipped;
         }
     };
+    // A tag that passes this is a semver version, so `tag_dir` will accept it;
+    // `stage_release_at` checks again regardless.
     if !should_stage(&tag, current_version, blocked) {
         tracing::info!(tag = %tag, "No newer installable release to download in advance");
-        return Staging::Skipped;
-    }
-    if tag_dir(root, &tag).is_err() {
-        tracing::warn!(tag = %tag, "Release tag is not a plain name; the update will be downloaded after exit");
         return Staging::Skipped;
     }
     let _lock = match try_lock(root) {
@@ -455,9 +475,12 @@ async fn stage_into(
             Staging::Staged
         }
         StageOutcome::Failed(e) => {
-            // A rate limit is NOT recorded as a cooldown here: the updater
-            // that runs next would honour it and refuse to install at all, so
-            // the exit would buy nothing. Left alone, it can still try.
+            // A rate limit on the asset downloads is NOT recorded as a
+            // cooldown: the updater that runs next would honour it and refuse
+            // to install at all, so the exit would buy nothing. (The tag
+            // lookup above does record one when the redirect itself is
+            // limited, as every caller of it does; the updater's own probe of
+            // the same endpoint would hit that limit anyway.)
             tracing::warn!(
                 tag = %tag,
                 error = %format!("{e:#}"),
@@ -788,8 +811,13 @@ async fn load_at(
     };
     tracing::warn!(error = %format!("{rejected:#}"), tag = %release.tag_name, "Discarding the staged update; downloading instead");
     // Not gated on --quiet: this install now takes the slow path #5790 exists
-    // to avoid, which an operator (and the release canary) should see.
-    eprintln!("Discarding the update downloaded in advance ({rejected:#}); downloading it again.");
+    // to avoid, which an operator (and the release canary) should see. Not
+    // `eprintln!`, which panics if stderr is closed.
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(
+        std::io::stderr(),
+        "Discarding the update downloaded in advance ({rejected:#}); downloading it again."
+    );
     discard_at(root);
     drop(lock);
     None
@@ -893,10 +921,25 @@ mod tests {
         (sk, vk)
     }
 
+    /// A fresh cache root inside its own temporary directory, so the lock
+    /// file `try_lock` puts beside it is cleaned up with it.
+    fn test_root() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(CACHE_DIR);
+        (tmp, root)
+    }
+
+    /// A local port nothing listens on, so the live-manifest re-check fails
+    /// at once and offline.
+    fn refused_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/")
+    }
+
     fn release_listing(names: &[&str]) -> Release {
-        // Port 9 (discard) refuses at once, so the live-manifest re-check
-        // fails fast and offline instead of resolving a real host.
-        release_listing_at("http://127.0.0.1:9/", names)
+        release_listing_at(&refused_url(), names)
     }
 
     fn release_listing_at(url_prefix: &str, names: &[&str]) -> Release {
@@ -963,16 +1006,16 @@ mod tests {
             &[(&freenet, b"freenet bytes"), (&fdev, b"fdev bytes")],
         );
 
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         // A previously staged release must not linger next to the new one.
-        fs::create_dir_all(root.path().join("v0.0.1")).unwrap();
-        stage_release_at(root.path(), &server.url_str("/"), TAG, &verify)
+        fs::create_dir_all(root.as_path().join("v0.0.1")).unwrap();
+        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &verify)
             .await
             .expect("staging should succeed");
-        assert!(!root.path().join("v0.0.1").exists());
+        assert!(!root.as_path().join("v0.0.1").exists());
 
         let signed = release_listing(&[MANIFEST, SIGNATURE, &freenet, &fdev]);
-        let staged = load_at(root.path(), &signed, &verify)
+        let staged = load_at(root.as_path(), &signed, &verify)
             .await
             .expect("a signed cache should verify");
         assert_eq!(fs::read(&staged.freenet_archive).unwrap(), b"freenet bytes");
@@ -986,8 +1029,8 @@ mod tests {
         );
 
         // Deleting the staged signature must not downgrade to unsigned.
-        fs::remove_file(root.path().join(TAG).join(SIGNATURE)).unwrap();
-        assert!(load_at(root.path(), &signed, &verify).await.is_none());
+        fs::remove_file(root.as_path().join(TAG).join(SIGNATURE)).unwrap();
+        assert!(load_at(root.as_path(), &signed, &verify).await.is_none());
     }
 
     #[tokio::test]
@@ -997,9 +1040,9 @@ mod tests {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         for _ in 0..2 {
-            stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+            stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
                 .await
                 .unwrap();
         }
@@ -1010,12 +1053,12 @@ mod tests {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
-        let root = tempfile::tempdir().unwrap();
-        stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        let (_tmp, root) = test_root();
+        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .unwrap();
         let release = release_listing(&[MANIFEST, &freenet]);
-        let staged = load_at(root.path(), &release, &unsigned).await.unwrap();
+        let staged = load_at(root.as_path(), &release, &unsigned).await.unwrap();
         assert!(staged.fdev_archive.is_none());
     }
 
@@ -1029,14 +1072,14 @@ mod tests {
             Expectation::matching(request::method_path("GET", asset_path(&fdev)))
                 .respond_with(status_code(503)),
         );
-        let root = tempfile::tempdir().unwrap();
-        let err = stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        let (_tmp, root) = test_root();
+        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .expect_err("a transient fdev failure should fail the attempt");
         assert!(worth_retrying(&err), "a 503 should be retried, got {err:#}");
         // ...but the freenet archive is already usable by the updater.
         let release = release_listing(&[MANIFEST, &freenet]);
-        let staged = load_at(root.path(), &release, &unsigned)
+        let staged = load_at(root.as_path(), &release, &unsigned)
             .await
             .expect("the manifest is written once freenet verifies");
         assert!(staged.fdev_archive.is_none());
@@ -1143,8 +1186,8 @@ mod tests {
             Expectation::matching(request::method_path("GET", asset_path(MANIFEST)))
                 .respond_with(status_code(429).append_header("retry-after", "120")),
         );
-        let root = tempfile::tempdir().unwrap();
-        let err = stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        let (_tmp, root) = test_root();
+        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .unwrap_err();
         let limited = err
@@ -1158,7 +1201,7 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/asset"))
                 .respond_with(status_code(403)),
         );
-        let err = download_resumable(&archive.url_str("/asset"), &root.path().join("a.part"))
+        let err = download_resumable(&archive.url_str("/asset"), &root.as_path().join("a.part"))
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<GithubRateLimitedError>().is_some());
@@ -1170,8 +1213,8 @@ mod tests {
         let manifest = manifest_for(&[(&freenet, b"good bytes")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"tampered!!")]);
 
-        let root = tempfile::tempdir().unwrap();
-        let err = stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        let (_tmp, root) = test_root();
+        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .expect_err("a checksum mismatch must fail staging");
         assert!(
@@ -1182,12 +1225,12 @@ mod tests {
             !worth_retrying(&err),
             "a bad release must not be downloaded again and again"
         );
-        let dir = root.path().join(TAG);
+        let dir = root.as_path().join(TAG);
         assert!(!dir.join(format!("{freenet}.part")).exists());
         assert!(!dir.join(&freenet).exists());
         // No manifest either, so the updater sees no staged release at all.
         let release = release_listing(&[MANIFEST, &freenet]);
-        assert!(load_at(root.path(), &release, &unsigned).await.is_none());
+        assert!(load_at(root.as_path(), &release, &unsigned).await.is_none());
     }
 
     #[tokio::test]
@@ -1217,12 +1260,12 @@ mod tests {
             .times(1)
             .respond_with(status_code(200).body("current upload")),
         );
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(TAG);
+        let (_tmp, root) = test_root();
+        let dir = root.as_path().join(TAG);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{freenet}.part")), b"old").unwrap();
 
-        stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .unwrap();
         assert_eq!(fs::read(dir.join(&freenet)).unwrap(), b"current upload");
@@ -1233,10 +1276,11 @@ mod tests {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[]);
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         // A file where the tag directory should be.
-        fs::write(root.path().join(TAG), b"").unwrap();
-        let err = stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.as_path().join(TAG), b"").unwrap();
+        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<CacheIoError>().is_some(), "got: {err:#}");
@@ -1250,8 +1294,8 @@ mod tests {
             Expectation::matching(request::method_path("GET", asset_path(MANIFEST)))
                 .respond_with(status_code(404)),
         );
-        let root = tempfile::tempdir().unwrap();
-        let err = stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+        let (_tmp, root) = test_root();
+        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<AssetMissing>().is_some(), "got: {err:#}");
@@ -1269,8 +1313,8 @@ mod tests {
                 Expectation::matching(request::method_path("GET", asset_path(&fdev)))
                     .respond_with(fdev_response),
             );
-            let root = tempfile::tempdir().unwrap();
-            stage_release_at(root.path(), &server.url_str("/"), TAG, &unsigned)
+            let (_tmp, root) = test_root();
+            stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
                 .await
                 .expect("fdev that cannot be staged is left to the updater");
         }
@@ -1289,8 +1333,8 @@ mod tests {
     #[tokio::test]
     async fn tampered_cache_is_discarded_and_not_installed() {
         let freenet = freenet_asset_name();
-        let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join(CACHE_DIR);
+        let (_tmp, root) = test_root();
+        let cache = root.as_path().join(CACHE_DIR);
         let manifest = manifest_for(&[(&freenet, b"genuine")]);
         write_staged(
             &cache,
@@ -1312,10 +1356,10 @@ mod tests {
             super::super::verify_manifest_signature_with(m, s, &vk, false, true)
         };
         let freenet = freenet_asset_name();
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         write_staged(
-            root.path(),
+            root.as_path(),
             &[
                 (MANIFEST, manifest.as_bytes()),
                 (SIGNATURE, &[7u8; 64]),
@@ -1323,7 +1367,7 @@ mod tests {
             ],
         );
         let signed = release_listing(&[MANIFEST, SIGNATURE, &freenet]);
-        assert!(load_at(root.path(), &signed, &verify).await.is_none());
+        assert!(load_at(root.as_path(), &signed, &verify).await.is_none());
     }
 
     #[tokio::test]
@@ -1336,22 +1380,26 @@ mod tests {
         ];
 
         // Another tag's cache is never used...
-        let root = tempfile::tempdir().unwrap();
-        write_staged(root.path(), &files);
+        let (_tmp, root) = test_root();
+        write_staged(root.as_path(), &files);
         let mut newer = release_listing(&[MANIFEST, &freenet]);
         newer.tag_name = "v10.0.0".to_string();
-        assert!(load_at(root.path(), &newer, &unsigned).await.is_none());
+        assert!(load_at(root.as_path(), &newer, &unsigned).await.is_none());
         // ...while the matching tag loads, so the miss above is the tag.
         let matching = release_listing(&[MANIFEST, &freenet]);
-        assert!(load_at(root.path(), &matching, &unsigned).await.is_some());
+        assert!(
+            load_at(root.as_path(), &matching, &unsigned)
+                .await
+                .is_some()
+        );
 
         // A release the network path would refuse, the cache refuses too.
         for listing in [vec![freenet.as_str()], vec![MANIFEST]] {
-            let root = tempfile::tempdir().unwrap();
-            write_staged(root.path(), &files);
+            let (_tmp, root) = test_root();
+            write_staged(root.as_path(), &files);
             let release = release_listing(&listing);
             assert!(
-                load_at(root.path(), &release, &unsigned).await.is_none(),
+                load_at(root.as_path(), &release, &unsigned).await.is_none(),
                 "listing {listing:?} must not install from the cache"
             );
         }
@@ -1367,17 +1415,17 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/m/SHA256SUMS.txt"))
                 .respond_with(status_code(200).body(live_manifest)),
         );
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         write_staged(
-            root.path(),
+            root.as_path(),
             &[
                 (MANIFEST, staged_manifest.as_bytes()),
                 (&freenet, b"first upload"),
             ],
         );
         let release = release_listing_at(&server.url_str("/m/"), &[MANIFEST, &freenet]);
-        assert!(load_at(root.path(), &release, &unsigned).await.is_none());
-        assert!(!root.path().join(TAG).exists());
+        assert!(load_at(root.as_path(), &release, &unsigned).await.is_none());
+        assert!(!root.as_path().join(TAG).exists());
     }
 
     #[tokio::test]
@@ -1389,23 +1437,23 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/m/SHA256SUMS.txt"))
                 .respond_with(status_code(502)),
         );
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         write_staged(
-            root.path(),
+            root.as_path(),
             &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
         );
         let release = release_listing_at(&server.url_str("/m/"), &[MANIFEST, &freenet]);
-        assert!(load_at(root.path(), &release, &unsigned).await.is_some());
+        assert!(load_at(root.as_path(), &release, &unsigned).await.is_some());
     }
 
     #[tokio::test]
     async fn unverifiable_fdev_is_left_to_the_network() {
         let freenet = freenet_asset_name();
         let fdev = fdev_asset_name();
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         let manifest = manifest_for(&[(&freenet, b"archive"), (&fdev, b"fdev")]);
         write_staged(
-            root.path(),
+            root.as_path(),
             &[
                 (MANIFEST, manifest.as_bytes()),
                 (&freenet, b"archive"),
@@ -1413,7 +1461,7 @@ mod tests {
             ],
         );
         let release = release_listing(&[MANIFEST, &freenet, &fdev]);
-        let staged = load_at(root.path(), &release, &unsigned)
+        let staged = load_at(root.as_path(), &release, &unsigned)
             .await
             .expect("a bad fdev must not reject the freenet archive");
         assert!(staged.fdev_archive.is_none());
@@ -1478,25 +1526,26 @@ mod tests {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         let outcome = stage_into_with(
-            root.path(),
+            root.as_path(),
             &server,
             Ok(TAG.into()),
-            Some(u64::MAX),
+            // Exactly the threshold is enough.
+            Some(MIN_FREE_BYTES),
             &|_| false,
         )
         .await;
         assert_eq!(outcome, Staging::Staged);
         let release = release_listing(&[MANIFEST, &freenet]);
-        assert!(load_at(root.path(), &release, &unsigned).await.is_some());
+        assert!(load_at(root.as_path(), &release, &unsigned).await.is_some());
     }
 
     #[tokio::test]
     async fn stage_into_skips_without_downloading() {
         // No expectations: any request to this server fails the test.
         let server = Server::run();
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         let none = |_: &str| false;
         type Case<'a> = (
             &'a str,
@@ -1504,7 +1553,7 @@ mod tests {
             Option<u64>,
             &'a dyn Fn(&str) -> bool,
         );
-        let cases: [Case<'_>; 5] = [
+        let cases: [Case<'_>; 4] = [
             ("low disk", Ok(TAG.into()), Some(MIN_FREE_BYTES - 1), &none),
             (
                 "tag lookup failed",
@@ -1514,10 +1563,9 @@ mod tests {
             ),
             ("not newer", Ok("v9.9.8".into()), None, &none),
             ("blocked", Ok(TAG.into()), None, &|v| v == "9.9.9"),
-            ("unsafe tag", Ok("v9.9.9/../x".into()), None, &none),
         ];
         for (case, tag, free, blocked) in cases {
-            let outcome = stage_into_with(root.path(), &server, tag, free, blocked).await;
+            let outcome = stage_into_with(root.as_path(), &server, tag, free, blocked).await;
             assert_eq!(outcome, Staging::Skipped, "{case}");
         }
     }
@@ -1572,13 +1620,13 @@ mod tests {
 
     #[test]
     fn stale_staged_releases_are_removed_at_startup() {
-        let root = tempfile::tempdir().unwrap();
+        let (_tmp, root) = test_root();
         for tag in ["v0.2.140", "v0.2.141", "v0.2.142", "junk"] {
-            fs::create_dir_all(root.path().join(tag)).unwrap();
+            fs::create_dir_all(root.as_path().join(tag)).unwrap();
         }
-        fs::create_dir_all(root.path().join("v0.2.143")).unwrap();
-        discard_stale_at(root.path(), "0.2.141", |v| v == "0.2.143");
-        let mut left: Vec<_> = fs::read_dir(root.path())
+        fs::create_dir_all(root.as_path().join("v0.2.143")).unwrap();
+        discard_stale_at(root.as_path(), "0.2.141", |v| v == "0.2.143");
+        let mut left: Vec<_> = fs::read_dir(root.as_path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
@@ -1586,15 +1634,35 @@ mod tests {
         assert_eq!(left, ["v0.2.142"]);
     }
 
-    /// A record lock only excludes OTHER processes, so the holder here is a
-    /// forked child. Between fork and _exit it makes only async-signal-safe
-    /// calls (open, fcntl, read, write), as a fork of a threaded process must.
+    /// Another process holds the cache lock: staging must skip without
+    /// downloading, and the lock must be free once that process exits. The
+    /// holder is a forked child that, between fork and _exit, makes only
+    /// async-signal-safe calls (as a fork of a threaded process must), and
+    /// kills itself with alarm(2) if this test dies before releasing it.
     #[tokio::test]
     #[cfg(unix)]
     async fn cache_lock_excludes_another_process() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(CACHE_DIR);
+
+        /// Releases and reaps the child however the test ends.
+        struct Child {
+            pid: libc::pid_t,
+            release: libc::c_int,
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // SAFETY: closing our write end lets the child's read return,
+                // and we reap only our own child.
+                unsafe {
+                    libc::close(self.release);
+                    let mut status = 0;
+                    libc::waitpid(self.pid, &mut status, 0);
+                }
+            }
+        }
+
+        let (_tmp, root) = test_root();
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
         let path =
             std::ffi::CString::new(root.with_extension("lock").as_os_str().as_bytes()).unwrap();
         let (mut ready, mut release) = ([0i32; 2], [0i32; 2]);
@@ -1611,6 +1679,9 @@ mod tests {
             // SAFETY: async-signal-safe calls only, on a NUL-terminated path
             // and descriptors created before the fork; `_exit` never returns.
             unsafe {
+                libc::alarm(60);
+                libc::close(ready[0]);
+                libc::close(release[1]);
                 let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
                 let mut request: libc::flock = std::mem::zeroed();
                 request.l_type = libc::F_WRLCK as _;
@@ -1619,17 +1690,30 @@ mod tests {
                     fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
                 )];
                 libc::write(ready[1], locked.as_ptr().cast(), 1);
+                // Returns on the parent's write or close (EOF).
                 let mut go = [0u8];
                 libc::read(release[0], go.as_mut_ptr().cast(), 1);
                 libc::_exit(0);
             }
         }
+        // SAFETY: closing the ends only the child uses.
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        let child = Child {
+            pid,
+            release: release[1],
+        };
         let mut locked = [0u8];
         assert_eq!(
             // SAFETY: reading one byte into a one-byte buffer.
             unsafe { libc::read(ready[0], locked.as_mut_ptr().cast(), 1) },
-            1
+            1,
+            "the child exited without reporting"
         );
+        // SAFETY: our read end, no longer needed.
+        unsafe { libc::close(ready[0]) };
         assert_eq!(locked[0], 1, "the child could not take the lock");
 
         assert!(
@@ -1640,19 +1724,159 @@ mod tests {
         let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
         assert_eq!(outcome, Staging::Skipped);
 
-        // SAFETY: writing one byte, then reaping our own child.
-        unsafe {
-            libc::write(release[1], [1u8].as_ptr().cast(), 1);
-            let mut status = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            for fd in ready.into_iter().chain(release) {
-                libc::close(fd);
-            }
-        }
+        drop(child);
         assert!(
             try_lock(&root).unwrap().is_some(),
             "the lock must be free once its holder exits"
         );
+    }
+
+    #[test]
+    fn cache_lock_excludes_this_process_too() {
+        let (_tmp, root) = test_root();
+        let held = try_lock(&root).unwrap().expect("first lock");
+        assert!(
+            try_lock(&root).unwrap().is_none(),
+            "a second holder in the same process must be refused"
+        );
+        drop(held);
+        assert!(try_lock(&root).unwrap().is_some());
+    }
+
+    /// `stage_into` must hold the lock for the whole download, not just take
+    /// it: binding it to `_` would release it at once.
+    #[test]
+    fn stage_into_holds_the_lock_while_downloading() {
+        let src = include_str!("staged.rs");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let start = production.find("async fn stage_into(").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.lines()
+                .any(|l| l.trim().starts_with("let _lock = match try_lock(root) {")),
+            "stage_into must keep its lock guard alive"
+        );
+        assert!(
+            !production.contains(concat!("record_github", "_cooldown")),
+            "staging must not record a cooldown the updater would then obey"
+        );
+    }
+
+    // Real time: these talk to local sockets, which a paused clock would
+    // time out before they answer.
+    #[tokio::test]
+    async fn stage_into_reports_failure_and_timeout() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        server.expect(
+            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
+                .respond_with(status_code(500)),
+        );
+        let (_tmp, root) = test_root();
+        let none = |_: &str| false;
+        let outcome = stage_into(
+            &root,
+            &server.url_str("/"),
+            "9.9.8",
+            None,
+            async { Ok(TAG.to_string()) },
+            none,
+            &unsigned,
+            &[],
+            STAGE_DEADLINE,
+        )
+        .await;
+        assert_eq!(outcome, Staging::Failed);
+
+        let never = Server::run();
+        never.expect(
+            Expectation::matching(any())
+                .times(..)
+                .respond_with(delay_and_then(Duration::from_secs(3600), status_code(200))),
+        );
+        let outcome = stage_into(
+            &root,
+            &never.url_str("/"),
+            "9.9.8",
+            None,
+            async { Ok(TAG.to_string()) },
+            none,
+            &unsigned,
+            &[],
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(outcome, Staging::TimedOut);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn failed_write_removes_the_partial_and_is_not_retried() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/asset"))
+                .respond_with(status_code(200).body(vec![7u8; 64 * 1024])),
+        );
+        let (_tmp, root) = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let part = root.join("asset.part");
+        // Every write to /dev/full fails with ENOSPC, as a full disk would.
+        std::os::unix::fs::symlink("/dev/full", &part).unwrap();
+        let err = download_resumable(&server.url_str("/asset"), &part)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<CacheIoError>().is_some(), "got: {err:#}");
+        assert!(!worth_retrying(&err));
+        assert!(
+            part.symlink_metadata().is_err(),
+            "the partial must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_survives_a_redirect_to_the_asset_host() {
+        // Real downloads are a 302 from github.com to the asset CDN; the range
+        // request must reach the server that has the bytes.
+        let body: &'static [u8] = b"0123456789abcdefghij";
+        let cdn = Server::run();
+        cdn.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", "/blob"),
+                request::headers(contains(("range", "bytes=10-"))),
+            ])
+            .respond_with(
+                status_code(206)
+                    .append_header("content-range", "bytes 10-19/20")
+                    .body(&body[10..]),
+            ),
+        );
+        let github = Server::run();
+        github.expect(
+            Expectation::matching(request::method_path("GET", "/asset"))
+                .respond_with(status_code(302).append_header("location", cdn.url_str("/blob"))),
+        );
+        let (_tmp, root) = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let part = root.join("asset.part");
+        fs::write(&part, &body[..10]).unwrap();
+        assert!(
+            download_resumable(&github.url_str("/asset"), &part)
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs::read(&part).unwrap(), body);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn free_space_is_known_on_unix() {
+        let (tmp, _) = test_root();
+        assert!(free_bytes(tmp.path()).is_some_and(|b| b > 0));
     }
 
     #[tokio::test]
@@ -1684,27 +1908,28 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn gives_up_after_the_last_retry_with_jittered_waits() {
-        let mut calls = 0;
-        let started = tokio::time::Instant::now();
+        let mut attempts = Vec::new();
         let result = stage_with_retries(
             || {
-                calls += 1;
+                attempts.push(tokio::time::Instant::now());
                 async { anyhow::bail!("down") }
             },
             &STAGE_RETRY_DELAYS,
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(calls, STAGE_RETRY_DELAYS.len() + 1);
-        let nominal: Duration = STAGE_RETRY_DELAYS.iter().sum();
-        let waited = started.elapsed();
+        assert_eq!(attempts.len(), STAGE_RETRY_DELAYS.len() + 1);
+        let gaps: Vec<Duration> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
+        for (gap, nominal) in gaps.iter().zip(STAGE_RETRY_DELAYS) {
+            assert!(
+                *gap >= nominal.mul_f64(0.8) && *gap <= nominal.mul_f64(1.2),
+                "a wait must stay within ±20% of {nominal:?}, took {gap:?}"
+            );
+        }
         assert!(
-            waited >= nominal.mul_f64(0.8) && waited <= nominal.mul_f64(1.2),
-            "waits must stay within ±20% of {nominal:?}, took {waited:?}"
+            gaps.iter().zip(STAGE_RETRY_DELAYS).any(|(g, n)| *g != n),
+            "retry waits must be jittered, got exactly {gaps:?}"
         );
-        // Five independent uniform draws never land exactly on the nominal sum,
-        // so equality means the jitter is gone.
-        assert_ne!(waited, nominal, "retry waits must be jittered");
     }
 
     #[tokio::test(start_paused = true)]

@@ -707,6 +707,115 @@ else
     bad "Gate B booted the node $boots time(s) for a genuine #5221 parse failure, expected exactly 1. Retrying a real assertion failure lets an INTERMITTENT fault produce a passing attempt, and Gate B then reports a broken release healthy -- a flaky pass on the post-publish gate, which is worse than no gate at all."
 fi
 
+# ---------------------------------------------------------------------------
+# 9. Gate B's #5790 staging checks, driven end to end.
+#
+#    The markers are source-pinned in auto-update-canary_test.sh; these cases
+#    pin what Gate B DOES with them. The fake previous release logs a trigger,
+#    exits 42, and then answers `update` the way the real installer does: it
+#    reports installing from the staged download only when one exists (and
+#    INSTALL_FROM_CACHE says it would use it), and "installs" by flipping the
+#    version it reports.
+# ---------------------------------------------------------------------------
+make_fake_prev() {
+    # make_fake_prev <path> <node-log-lines> <install-from-cache:0|1>
+    local path="$1" lines="$2" use_cache="$3" stages=0
+    [[ "$lines" == *"Update downloaded and verified"* ]] && stages=1
+    cat > "$path" <<FAKE
+#!/usr/bin/env bash
+ver_file="\$0.version"
+case "\${1:-}" in
+    --version)
+        echo "Freenet version: \$(cat "\$ver_file" 2>/dev/null || echo 0.2.121) (deadbeefcafe)"
+        exit 0 ;;
+    update)
+        if [ -d "\$HOME/.local/state/freenet/staged_update" ] && [ "$use_cache" = 1 ]; then
+            echo "Installing v0.2.122 from the update downloaded in advance." >&2
+        fi
+        echo 0.2.122 > "\$ver_file"
+        exit 0 ;;
+esac
+logdir=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        --log-dir) logdir="\$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "\$logdir"
+printf '%s\n' "2026-08-08T02:00:00.000000Z  $CHECK_LINE" "$lines" >> "\$logdir/freenet.2026-08-08-02.log"
+if [ "$stages" = 1 ]; then
+    mkdir -p "\$HOME/.local/state/freenet/staged_update/v0.2.122"
+fi
+exit 42
+FAKE
+    chmod +x "$path"
+}
+
+expect_rc() {
+    # expect_rc <actual> <expected> <ok-message> <failure-explanation>
+    if [[ "$1" == "$2" ]]; then ok "$3"; else bad "Gate B returned $1, expected $2: $4"; fi
+}
+
+gate_b_rc_for() {
+    # gate_b_rc_for <node-log-lines> <install-from-cache:0|1> -- echoes Gate B's rc.
+    local work="$CANARY_WORKDIR/selfupdate" rc=0
+    rm -rf "$work"
+    mkdir -p "$work/bin"
+    make_fake_prev "$work/bin/freenet" "$1" "$2"
+    (
+        curl() { :; }
+        tar()  { :; }
+        CANARY_LATEST_CONFIRMATIONS=1
+        resolve_expected_latest() { printf '0.2.122'; }
+        cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
+    ) || rc=$?
+    echo "$rc"
+}
+
+STAGE_PREP='INFO freenet::commands::update::staged: Preparing the update before exiting (#5790)'
+STAGE_DL='INFO freenet::commands::update::staged: Downloading the update before exiting, so the restart only has to install it tag=v0.2.122'
+STAGE_DONE='INFO freenet::commands::update::staged: Update downloaded and verified; exiting to install it (v0.2.122, 3s)'
+STAGE_LIMITED='WARN freenet::commands::update::staged: Could not download the update in advance; exiting anyway, the updater will download what is missing tag=v0.2.122 error=GitHub rate-limited this IP'
+STAGE_FAILED='WARN freenet::commands::update::staged: Could not download the update in advance; exiting anyway, the updater will download what is missing tag=v0.2.122 error=Download failed: 500'
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_DONE" 1)"
+expect_rc "$rc" 0 "Gate B passes a release that staged and installed from the staged download" \
+    "for a previous release that staged and installed from its download; expected 0. A gate that cannot go green blocks every release."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_DONE" 0)"
+expect_rc "$rc" 1 "Gate B fails when the installer ignores the staged download" \
+    "when \`freenet update\` re-downloaded instead of using the staged copy; expected 1. That is the #5790 loop on slow links, invisible on a fast runner."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_FAILED" 1)"
+expect_rc "$rc" 1 "Gate B fails when staging started but did not finish" \
+    "for a staging that failed; expected 1."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP" 1)"
+expect_rc "$rc" 1 "Gate B fails when staging prepared but skipped (no silent pass)" \
+    "for a release that prepared to stage and never downloaded; expected 1. A skip regression would otherwise read as a release that predates staging."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_LIMITED" 1)"
+expect_rc "$rc" "$EXIT_UNVERIFIED_ENVIRONMENTAL" "Gate B calls a rate-limited staging environmental ($EXIT_UNVERIFIED_ENVIRONMENTAL), not a fault" \
+    "for a rate-limited staging; expected $EXIT_UNVERIFIED_ENVIRONMENTAL, or the dev room is told auto-update is broken."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE" 1)"
+expect_rc "$rc" 0 "Gate B still passes a previous release that predates staging" \
+    "for a previous release without staging; expected 0."
+
 CANARY_ATTEMPTS="$SAVED_ATTEMPTS"
 CANARY_RETRY_SLEEP="$SAVED_SLEEP"
 CANARY_OUTCOME_WAIT_SECS="$SAVED_OUTCOME"

@@ -691,8 +691,11 @@ impl UpdateCommand {
             match staged::load(release, self.quiet).await {
                 Some(staged) => {
                     // Not gated on --quiet: one line per update, and the
-                    // release canary's evidence that the cache is used.
-                    eprintln!(
+                    // release canary's evidence that the cache is used. Not
+                    // `eprintln!`, which panics if stderr is closed.
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = writeln!(
+                        io::stderr(),
                         "Installing {} from the update downloaded in advance.",
                         release.tag_name
                     );

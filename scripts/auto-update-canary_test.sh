@@ -2547,27 +2547,37 @@ else
 fi
 
 # The #5790 staging markers, pinned to their emitting calls (whitespace
-# stripped, so a rustfmt reflow cannot disarm them): STARTED and DONE must
-# directly follow `tracing::info!(` -- below INFO they are compiled out of
-# release builds -- and INSTALLED_STAGED is an unconditional `eprintln!` in
-# update.rs. Gate B arms on STARTED and then requires the other two; rewording
-# any of them in the source silently disarms it or fails every release.
-STAGED_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/update/staged.rs"
-UPDATE_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/update.rs"
-staged_flat="$(tr -d '[:space:]' < "$STAGED_SRC" 2>/dev/null)"
-update_flat="$(tr -d '[:space:]' < "$UPDATE_SRC" 2>/dev/null)"
+# stripped, so a rustfmt reflow cannot disarm them, and `//` lines dropped
+# first, so a commented-out call does not count): STARTED, DOWNLOADING and DONE
+# must directly follow `tracing::info!(` -- below INFO they are compiled out of
+# release builds -- and INSTALLED_STAGED is an unconditional stderr write in
+# update.rs. RATE_LIMITED is GithubRateLimitedError's Display. Gate B arms on
+# STARTED and then requires the others; rewording one in the source silently
+# disarms it or fails every release. When rewording, keep the OLD string
+# accepted in auto-update-canary.sh for one release: Gate B reads the PREVIOUS
+# release's output.
+code_flat() { sed '/^[[:space:]]*\/\//d' "$1" 2>/dev/null | tr -d '[:space:]'; }
+staged_flat="$(code_flat "$SCRIPT_DIR/../crates/core/src/bin/commands/update/staged.rs")"
+update_flat="$(code_flat "$SCRIPT_DIR/../crates/core/src/bin/commands/update.rs")"
+au_flat="$(code_flat "$AU_SRC")"
 for pin in \
     "staged|tracing::info!(\"${MARKER_STAGE_STARTED//[[:space:]]/}" \
+    "staged|tracing::info!(tag=%tag,\"${MARKER_STAGE_DOWNLOADING//[[:space:]]/}" \
     "staged|tracing::info!(\"${MARKER_STAGE_DONE//[[:space:]]/}" \
-    "update|eprintln!(\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}"; do
+    "update|writeln!(io::stderr(),\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}" \
+    "auto_update|\"${MARKER_RATE_LIMITED//[[:space:]]/}"; do
     file="${pin%%|*}" needle="${pin#*|}"
-    if [[ "$file" == staged ]]; then flat="$staged_flat"; else flat="$update_flat"; fi
+    case "$file" in
+        staged) flat="$staged_flat" ;;
+        update) flat="$update_flat" ;;
+        *) flat="$au_flat" ;;
+    esac
     if [[ "$flat" == *"$needle"* ]]; then
         echo "ok   - source pin: #5790 marker emitted by $needle..."
     else
-        echo "FAIL - source pin: $file.rs no longer emits '$needle' (whitespace stripped)." >&2
-        echo "       Gate B's #5790 staging check greps for MARKER_STAGE_STARTED, MARKER_STAGE_DONE" >&2
-        echo "       and MARKER_INSTALLED_STAGED; change them in auto-update-canary.sh with the source." >&2
+        echo "FAIL - source pin: $file.rs no longer emits '$needle' (whitespace stripped, comments dropped)." >&2
+        echo "       Gate B's #5790 staging check greps for it. Change the marker in auto-update-canary.sh" >&2
+        echo "       with the source, keeping the old string accepted for one release." >&2
         FAILURES=$((FAILURES + 1))
     fi
 done

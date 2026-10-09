@@ -114,9 +114,17 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # skips, fails, or is ignored by the installer falls back to downloading inside
 # systemd's TimeoutStopSec -- the #5790 restart loop on a slow link, which CI's
 # fast network would never show. Releases that predate staging pass unchanged.
+#
+# These are matched against the PREVIOUS release's output by THIS script, so a
+# reword in the source cannot simply be mirrored here: keep accepting the old
+# string for one release, or Gate B is disarmed (STARTED) or fails a healthy
+# release (DONE, INSTALLED_STAGED) until the reworded binary is the previous one.
 MARKER_STAGE_STARTED='Preparing the update before exiting'
+MARKER_STAGE_DOWNLOADING='Downloading the update before exiting'
 MARKER_STAGE_DONE='Update downloaded and verified'
 MARKER_INSTALLED_STAGED='from the update downloaded in advance.'
+# auto_update.rs -- GithubRateLimitedError's Display, inside a staging failure.
+MARKER_RATE_LIMITED='GitHub rate-limited this IP'
 # freenet.rs -- detection succeeded and an update was requested. There are
 # FIVE such sites and one REFUSAL that shares the phrase:
 # Cited by PHRASE, never by line number. The six that were here were all low
@@ -1777,6 +1785,8 @@ cmd_selfupdate() {
     return 1
   fi
   chmod +x "$work/bin/freenet"
+  # Kept for the #5790 second install, which needs the previous binary again.
+  cp "$work/bin/freenet" "$work/prev-freenet"
 
   local starting
   starting="$("$work/bin/freenet" --version | head -1)"
@@ -2024,7 +2034,10 @@ cmd_selfupdate() {
   fi
 
   if [ "$NODE_EXIT" != "42" ]; then
-    if log_has "$work/logs" "$MARKER_STAGE_STARTED" && ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
+    # Only when the download actually began: STARTED alone is logged before
+    # staging decides anything. Still a hard failure, because a staging hang
+    # is a real bug and a slow runner looks the same from here.
+    if log_has "$work/logs" "$MARKER_STAGE_DOWNLOADING" && ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
       fail "v$prev_version decided to update but was still in its pre-exit download of v$expected_version (#5790) when the canary's deadline stopped it (exit $NODE_EXIT). Either GitHub's asset download was slow or failing on this runner (re-run), or the staging code hangs (if it recurs, read the staging lines below). It is not a node that refused to update."
       log_lines "$work/logs" "the update" | head -8 >&2
       return 1
@@ -2041,8 +2054,10 @@ cmd_selfupdate() {
   if log_has "$work/logs" "$MARKER_STAGE_STARTED"; then
     staging_armed=1
     if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
-      if log_has "$work/logs" "GitHub rate-limited"; then
-        fail "v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
+      if log_has "$work/logs" "$MARKER_RATE_LIMITED"; then
+        fail "UNVERIFIED: v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
+        log_lines "$work/logs" "the update" | head -8 >&2
+        return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
       else
         fail "v$prev_version prepared to download v$expected_version before exiting 42 (#5790) but did not finish: the installer will download it inside systemd's TimeoutStopSec instead, which loops on slow links. On a runner that can reach GitHub this is a staging bug. The node's staging lines follow."
       fi
@@ -2097,6 +2112,33 @@ cmd_selfupdate() {
   if [ "$(printf '%s' "$final" | awk '{print $3}')" != "$expected_version" ]; then
     fail "self-update did NOT land on v$expected_version. Started at '$starting', ended at '$final'. A node on the previous release will not reach this one on its own."
     return 1
+  fi
+
+  # #5790: with staging armed, the install above came from the node's download,
+  # so the installer's OWN download path -- what every node whose staging
+  # skipped or failed still depends on -- would go unexercised by any gate.
+  # Install once more from the previous binary with a fresh HOME, which has no
+  # staged download, so that path is still proven end to end.
+  if [ "$staging_armed" -eq 1 ]; then
+    log "--- once more without the staged download, so the installer's own download path is exercised too ---"
+    local fb="$work/fallback"
+    mkdir -p "$fb/bin" "$fb/home" "$fb/tmp"
+    cp "$work/prev-freenet" "$fb/bin/freenet"
+    if ! HOME="$fb/home" TMPDIR="$fb/tmp" \
+        "$fb/bin/freenet" update --quiet 2>"$work/update-fallback.err"; then
+      cat "$work/update-fallback.err" >&2
+      fail "\`freenet update\` without a staged download failed: v$prev_version's own download path cannot install v$expected_version, and every node whose pre-exit download skipped or failed relies on it."
+      return 1
+    fi
+    cat "$work/update-fallback.err" >&2
+    if grep -aqF -- "$MARKER_INSTALLED_STAGED" "$work/update-fallback.err"; then
+      fail "the no-staging install reported installing from a staged download it cannot have had (#5790) -- the fallback path was not exercised."
+      return 1
+    fi
+    if [ "$("$fb/bin/freenet" --version | head -1 | awk '{print $3}')" != "$expected_version" ]; then
+      fail "\`freenet update\` without a staged download did NOT land on v$expected_version."
+      return 1
+    fi
   fi
 
   log "OK: v$prev_version -> v$expected_version end-to-end (detect, exit 42, install)."
