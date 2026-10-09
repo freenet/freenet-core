@@ -44,9 +44,24 @@ rm -rf "$RUN_DIR"
 # The getter must join through a gateway that did not receive the PUTs, or the
 # GET can be answered by the node that just stored them. Resolved from the
 # public index so a rotated address or key does not silently stale this script.
-INDEX_KEY_URL="${NETCHECK_GETTER_KEY_URL:-https://freenet.org/keys/public.vega.gw.pem}"
-GETTER_HOST="${NETCHECK_GETTER_HOST:-vega.locut.us}"
-GETTER_PORT="${NETCHECK_GETTER_PORT:-31337}"
+# The getter MUST be a different gateway from the one the PUTs go through
+# (GATEWAY_WS above, ws://127.0.0.1:7509 = gw1 on network port 31337). A GET
+# answered by the node that just stored the PUT proves transfer, not
+# findability — see the --gateway-spec doc in crates/netcheck/src/main.rs.
+#
+# So this is gw2 on 31338, not gw1. An earlier revision of this change pointed
+# it at gw1 and would have made the nightly check VACUOUS: same gateway for PUT
+# and GET, always passing, testing nothing.
+#
+# Honest limitation: gw2 is a separate PROCESS but the same HOST as gw1, where
+# the retired AWS gateway was a separate host entirely. The documented invariant
+# ("a gateway OTHER than the one the PUTs go through") still holds, but this is
+# a weaker check than before — it no longer crosses a machine or a network. That
+# is a consequence of consolidating both gateways onto one box; if an off-host
+# gateway ever exists again, point this at it.
+INDEX_KEY_URL="${NETCHECK_GETTER_KEY_URL:-https://freenet.org/keys/public.gw2.pem}"
+GETTER_HOST="${NETCHECK_GETTER_HOST:-gw2.freenet.org}"
+GETTER_PORT="${NETCHECK_GETTER_PORT:-31338}"
 getter_ip=$(getent hosts "$GETTER_HOST" | awk '{print $1}' | head -1)
 getter_key=$(curl -fsS --max-time 30 "$INDEX_KEY_URL" | tr -d '[:space:]')
 if [ -z "$getter_ip" ] || [ -z "$getter_key" ]; then

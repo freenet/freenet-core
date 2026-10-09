@@ -123,7 +123,7 @@ DHT implementation with small-world routing:
 - **Location-based routing** – Peers and contracts positioned on 1D ring [0, 1]
 - **Connection management** – Maintains 25-200 peer connections
 - **Performance-aware routing** – Learns from routing history to optimize peer selection
-- **Small-world topology** – Accept-only-at-terminus creates local connections naturally
+- **Small-world topology** – Kleinberg 1/d connection distribution, built by targeting and accepting connections that fill gaps in log-distance coverage
 
 Key abstractions:
 - `Location` – Ring position calculated from IP hash (peers) or contract key hash

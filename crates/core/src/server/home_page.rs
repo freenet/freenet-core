@@ -5,9 +5,12 @@
 
 mod assets;
 mod cards;
+mod charts;
+mod contract_detail;
 mod estimator;
 mod favicon;
 mod peer_detail;
+mod routing;
 
 use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
@@ -22,8 +25,10 @@ use cards::{
     build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
     build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
+use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
+use routing::routing_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
@@ -103,9 +108,37 @@ pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoRespons
     Html(peer_detail_html(&address))
 }
 
-fn homepage_html() -> String {
-    let snap = network_status::get_snapshot();
+/// Handler for `GET /routing` — the network-wide routing model page.
+pub(super) async fn routing() -> impl IntoResponse {
+    Html(routing_html())
+}
 
+/// Per-contract detail page (#5369). Accepts either the full `ContractKey`
+/// encoding or the `ContractInstanceId`, because the dashboard's own cards key
+/// on different ones and an operator pasting either should land somewhere.
+pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoResponse {
+    Html(contract_detail_html(&key))
+}
+
+fn homepage_html() -> String {
+    homepage_html_for(network_status::get_snapshot())
+}
+
+/// Renders the homepage from an explicit snapshot rather than reading the
+/// process-global `network_status` state directly. Split out so tests can
+/// pass a known snapshot (including `None`) instead of relying on nothing
+/// else in the same `cargo test` process having touched the global — see
+/// #5732. `network_status::init` overwrites its `OnceLock`'s contents in
+/// place on every call (it does not leak state from one initializer to the
+/// next), but it does stamp a fresh `started_at`, and `get_snapshot()`'s
+/// health computation treats `open_connections == 0 && elapsed_secs > 60`
+/// as `Trouble`. So if some other test (e.g. in `operations::connect` or
+/// `ring::connection_manager`) calls `network_status::init` and then more
+/// than 60 real seconds pass before a test reads `homepage_html()`'s global
+/// snapshot, the rendered title silently changes — an order/timing
+/// dependency `homepage_html()`'s old single-source-of-truth read could not
+/// be isolated from.
+fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>) -> String {
     let (version, uptime) = match &snap {
         Some(s) => (s.version.as_str(), format_duration(s.elapsed_secs)),
         None => ("?", "0s".to_string()),
@@ -193,18 +226,21 @@ mod tests {
         build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
         format_last_evaluated,
     };
+    use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
-        build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
-        failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+        ChartUnit, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, failure_chart_y_max,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
+    use crate::conformance::property::Severity;
+    use crate::conformance::status::{
+        CheckedContract, MergeCheckStatus, MergeCheckView, MergeFinding,
+    };
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
     };
-    use crate::router::AdjustmentMode;
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
@@ -222,7 +258,7 @@ mod tests {
             contracts: Vec::new(),
             op_stats: OpStatsSnapshot::default(),
             nat_stats: NatStatsSnapshot::default(),
-            gateway_only: false,
+            gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
@@ -249,10 +285,7 @@ mod tests {
     /// tested) makes the rule's edge cases explicit and guards against the JS
     /// drifting from the intended behaviour. It lives in the test module (not as
     /// production code) because the production decision is made in JS, not in the
-    /// server-side render — and keeping it inside the single `#[cfg(test)]`
-    /// boundary preserves the source-scrape pin invariant relied on by
-    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
-    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    /// server-side render.
     ///
     /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
     /// still holding a cached homepage emitted by an old binary while a newer
@@ -545,12 +578,25 @@ mod tests {
         snap.open_connections = 3;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-good"), "healthy banner missing");
-        assert!(html.contains("Node is healthy"));
+        // Superseded by #5370: the banner no longer declares the node healthy.
+        // Four live v0.2.128 peers showed "Node is healthy" while answering
+        // between 1.3% and 89% of their GETs, because the four inputs behind
+        // the verdict are all connectivity and none of them can see whether
+        // the node serves reads. The banner now states the connection count,
+        // which is a fact, and the measured GET rate carries the rest.
+        assert!(
+            html.contains("Connected to 3 peers"),
+            "the healthy state must still state its connection count, got: {html}"
+        );
+        assert!(
+            !html.contains("Node is healthy"),
+            "the verdict must not come back, got: {html}"
+        );
 
         // Degraded
         let mut snap = base_snapshot();
         snap.health = HealthLevel::Degraded;
-        snap.gateway_only = true;
+        snap.gateway_only_persisting = true;
         snap.open_connections = 1;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-degraded"), "degraded banner missing");
@@ -570,6 +616,20 @@ mod tests {
         assert!(html.contains("health-trouble"), "trouble banner missing");
     }
 
+    /// dashboard.js reopens only `main details[id]` after it swaps `<main>`,
+    /// so a `<details>` without an id snaps shut on every refresh.
+    pub(super) fn assert_every_details_has_an_id(html: &str) {
+        // The embedded dashboard.js mentions `<details>` in a comment.
+        let html = match (html.find("<script>"), html.rfind("</script>")) {
+            (Some(start), Some(end)) => format!("{}{}", &html[..start], &html[end..]),
+            _ => html.to_string(),
+        };
+        for (at, _) in html.match_indices("<details") {
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains(" id=\""), "{tag} has no id");
+        }
+    }
+
     #[test]
     fn failures_demoted_when_connected() {
         let mut snap = base_snapshot();
@@ -585,6 +645,7 @@ mod tests {
             html.contains("diagnostics-muted"),
             "failures should be demoted when connected"
         );
+        assert_every_details_has_an_id(&html);
         assert!(
             !html.contains(r#"class="diagnostics""#),
             "should not use prominent diagnostics style"
@@ -1005,11 +1066,16 @@ mod tests {
     fn homepage_renders_dynamic_title() {
         // The rendered page must carry the derived title, not a static
         // placeholder — the JS refresh path re-reads it from `doc.title`.
-        let html = homepage_html();
+        //
+        // Pass `None` explicitly rather than going through `homepage_html()`
+        // (which reads the process-global `network_status` snapshot) — see
+        // `homepage_html_for`'s doc comment for why that global made this
+        // test order/timing-dependent (#5732).
+        let html = homepage_html_for(None);
         assert!(
             html.contains("<title>\u{26A1} Dashboard</title>"),
-            "no snapshot exists in the unit-test process, so the homepage \
-             must render the 'trying to connect' title, got: {html}"
+            "with no snapshot, the homepage must render the 'trying to \
+             connect' title, got: {html}"
         );
     }
 
@@ -1181,48 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[], None);
-        assert!(svg.contains("collecting data"));
-        assert!(svg.contains("<svg"));
-    }
-
-    #[test]
-    fn reliability_chart_renders_points_and_brier() {
-        // Well-separated: low predicted -> success, high predicted -> failure.
-        let pairs: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
-            .collect();
-        let svg = build_reliability_chart(&pairs, Some(0.042));
-        assert!(svg.contains("Failure (calibration)"));
-        assert!(svg.contains("Brier 0.042"));
-        assert!(svg.contains("n=20"));
-        assert!(svg.contains("<circle"), "bins should render as points");
-    }
-
-    #[test]
-    fn reliability_chart_filters_nonfinite() {
-        let pairs = vec![
-            (0.5, 0.0),
-            (f64::NAN, 1.0),
-            (0.3, f64::NAN),
-            (f64::INFINITY, 0.0),
-            (0.7, 1.0),
-        ];
-        // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs, None);
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
-    fn reliability_chart_boundary_values_no_panic() {
-        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
     fn regression_chart_sparse_is_placeholder() {
         // Fewer than 2 valid (positive, finite) points -> placeholder.
         let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
@@ -1241,7 +1265,10 @@ mod tests {
             .collect();
         let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
         assert!(svg.contains("Response time"));
-        assert!(svg.contains("median err"));
+        assert!(
+            svg.contains("typically within &#215;1.1 · last 20"),
+            "the headline is the typical miss factor, as on the peer page: {svg}"
+        );
         assert!(svg.contains("<circle"));
         assert!(
             svg.contains("ms"),
@@ -1312,44 +1339,18 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(
-            build_renegade_accuracy_panel(&[], None, &[], &[]),
-            String::new()
-        );
+        assert_eq!(build_accuracy_panel(&[], &[]), String::new());
     }
 
     #[test]
-    fn accuracy_panel_renders_all_three_models() {
-        let failure: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+    fn accuracy_panel_renders_both_timing_models() {
+        let response: Vec<(f64, f64)> = (1..=20)
+            .map(|i| (i as f64 * 0.01, i as f64 * 0.01))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
-        assert!(svg.contains("Prediction Accuracy"));
-        assert!(svg.contains("Failure (calibration)"));
-        // Timing models have no data yet -> their placeholders still appear.
-        assert!(svg.contains("Response time"));
-        assert!(svg.contains("Transfer speed"));
-    }
-
-    #[test]
-    fn fmt_prediction_time_sentinel_values() {
-        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
-        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_time(-1.0), "N/A");
-        assert_eq!(fmt_prediction_time(0.0), "0.000s");
-        assert_eq!(fmt_prediction_time(1.5), "1.500s");
-        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
-        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
-    }
-
-    #[test]
-    fn fmt_prediction_speed_sentinel_values() {
-        assert_eq!(fmt_prediction_speed(0.0), "N/A");
-        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+        let svg = build_accuracy_panel(&response, &[]);
+        assert!(svg.contains("Response time") && svg.contains("<circle"));
+        // The transfer model has no data yet, so its placeholder still appears.
+        assert!(svg.contains("Transfer speed") && svg.contains("collecting data"));
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1363,12 +1364,11 @@ mod tests {
     fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
+            ChartUnit::Seconds,
+            560.0,
             &[],
             &[],
             (0.0, 0.0),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0",
             "auto",
             "No timed responses have been observed from this peer yet.",
@@ -1395,66 +1395,21 @@ mod tests {
         let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "no data",
         );
         assert!(html.contains("<svg"), "should render an SVG, got: {html}");
-        assert!(
-            html.contains("<circle"),
-            "raw observations should render as scatter circles, got: {html}"
+        assert_eq!(
+            html.matches("h0").count(),
+            4,
+            "each raw observation renders as a scatter dot, got: {html}"
         );
-    }
-
-    /// Regression: the per-tab "Outcomes vs Distance" panel must call
-    /// `build_estimator_chart_or_placeholder` for all three
-    /// prediction-component slots (Failure Probability, Response Time,
-    /// Transfer Rate). Hiding empty slots previously masked the
-    /// driver data-collection regression for months — keeping every
-    /// slot visible makes future regressions detectable on sight.
-    /// Source-scrape rather than HTML-grep because the visible-when-empty
-    /// behaviour depends on a router_snapshot being present, and the
-    /// `home_page.rs::tests` module does not have a snapshot fixture
-    /// builder.
-    #[test]
-    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
-        let src = include_str!("home_page/peer_detail.rs");
-        let prod = src;
-        for title in [
-            "Failure Probability",
-            "Response Time (s)",
-            "Transfer Rate (B/s)",
-        ] {
-            // Find the helper call site and walk forward up to 200 bytes
-            // for the title literal. Whitespace-tolerant so rustfmt
-            // doesn't churn this pin.
-            let mut found = false;
-            let mut cursor = 0;
-            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
-                let abs = cursor + call;
-                let tail_end = (abs + 400).min(prod.len());
-                let needle = format!("\"{title}\"");
-                if prod[abs..tail_end].contains(&needle) {
-                    found = true;
-                    break;
-                }
-                cursor = abs + 1;
-            }
-            assert!(
-                found,
-                "peer-detail panel builder must call \
-                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
-                 always visible. Without this every prediction-component \
-                 slot can silently disappear when its estimator has no \
-                 data — the original regression."
-            );
-        }
     }
 
     #[test]
@@ -1462,12 +1417,11 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "should not see this",
@@ -1481,11 +1435,18 @@ mod tests {
 
     #[test]
     fn failure_chart_y_max_zooms_to_twice_right_edge() {
-        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
-        // the line sits around mid-height instead of hugging y=0.
+        // Monotonic, tiny failure curve: right edge is 0.04 → twice that is
+        // 0.08, rounded up to 0.10 for round ticks, so the line sits below
+        // mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
-        let y_max = failure_chart_y_max(&curve, None);
-        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+        let y_max = failure_chart_y_max(&curve);
+        assert!((y_max - 0.10).abs() < 1e-9, "expected 0.10, got {y_max}");
+        // Twice the right edge already on a round step stays put.
+        let on_step = failure_chart_y_max(&[(0.0, 0.0), (0.5, 0.025)]);
+        assert!(
+            (on_step - 0.05).abs() < 1e-9,
+            "expected 0.05, got {on_step}"
+        );
     }
 
     #[test]
@@ -1493,28 +1454,16 @@ mod tests {
         // No failures observed (all-zero curve) → keep the original 0..1 axis
         // rather than collapsing to a degenerate zero-height range.
         let curve = vec![(0.0, 0.0), (0.5, 0.0)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
         // An empty curve also falls back to the full range.
-        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+        assert_eq!(failure_chart_y_max(&[]), 1.0);
     }
 
     #[test]
     fn failure_chart_y_max_capped_at_one() {
         // A large right edge would give 2x > 1; a probability axis can't exceed 1.
         let curve = vec![(0.0, 0.2), (0.5, 0.7)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
-    }
-
-    #[test]
-    fn failure_chart_y_max_accounts_for_peer_adjustment() {
-        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
-        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
-        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
-        let up = failure_chart_y_max(&curve, Some(0.03));
-        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
-        // A downward adjustment must not shrink the axis below the global edge.
-        let down = failure_chart_y_max(&curve, Some(-0.01));
-        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
     }
 
     #[test]
@@ -1523,18 +1472,19 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
         );
         assert!(
-            html.contains(">Distance<"),
-            "estimator chart must label its x-axis 'Distance', got: {html}"
+            html.contains(
+                ">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)<"
+            ),
+            "estimator chart must label its x-axis as the peer page does, got: {html}"
         );
     }
 
@@ -1546,23 +1496,41 @@ mod tests {
         let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.01",
         );
         assert!(
-            html.contains(">0.0050<"),
+            html.contains(">0.50%<"),
             "middle y-tick must remain readable at a small range, got: {html}"
         );
         assert!(
-            html.contains(">0.0100<"),
+            html.contains(">1.00%<"),
             "top y-tick must remain readable at a small range, got: {html}"
         );
+    }
+
+    #[test]
+    fn estimator_failure_axis_ticks_land_on_round_percentages() {
+        // Twice a right edge of 8.15% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.04), (0.5, 0.0815)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0",
+            &failure_chart_y_max(&curve).to_string(),
+        );
+        for tick in [">0%<", ">10%<", ">20%<"] {
+            assert!(html.contains(tick), "missing tick {tick}: {html}");
+        }
     }
 
     #[test]
@@ -1570,47 +1538,25 @@ mod tests {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top
         // edge) instead of vanishing, so failures stay visible on the
-        // low-probability peers the zoom targets. The fitted curve renders as a
-        // <path>, so every <circle> here is a scatter dot.
+        // low-probability peers the zoom targets. The scatter is one path of
+        // zero-length `h0` segments, one per dot; the curve has none.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.08",
         );
-        let circles = html.matches("<circle").count();
+        let dots = html.matches("h0").count();
         assert!(
-            circles >= 3,
-            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+            dots >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {dots}: {html}"
         );
-    }
-
-    #[test]
-    fn peer_detail_links_renegade_to_repo() {
-        // The "Renegade" label on the Routing Model card links to the project repo.
-        let src = include_str!("home_page/peer_detail.rs");
-        assert!(
-            src.contains(r#"href="https://github.com/sanity/renegade""#),
-            "the Renegade label must link to https://github.com/sanity/renegade"
-        );
-    }
-
-    #[test]
-    fn fmt_prediction_prob_sentinel_values() {
-        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
-        assert_eq!(fmt_prediction_prob(1.1), "N/A");
-        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
-        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
-        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
     }
 
     fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
@@ -1663,6 +1609,15 @@ mod tests {
             html.contains("data-sort=\"2048\""),
             "recv bytes cell must carry raw byte count for sorting"
         );
+    }
+
+    /// The network-wide routing page is reachable from the home dashboard,
+    /// even on a node with no peers yet (the status card always renders once
+    /// the node is up; the peers card does not).
+    #[test]
+    fn status_card_links_to_the_routing_page() {
+        let html = build_status_card(&Some(base_snapshot()));
+        assert!(html.contains(r#"href="/routing""#), "{html}");
     }
 
     #[test]
@@ -1939,8 +1894,18 @@ mod tests {
         // must NOT be lost when we add the button — that tooltip is
         // still useful for hover-only users (e.g. read-only screenshots).
         // Likewise, <code>{short}</code> must stay outside the button so
-        // the abbreviated key keeps its monospace styling without a
-        // hover state on the contract text itself.
+        // the abbreviated key keeps its monospace styling.
+        //
+        // Amended for #5369: the <code> is now wrapped in an <a> to the
+        // per-contract detail page, so it no longer DIRECTLY precedes the
+        // button. That is a deliberate reversal of one clause of the
+        // original intent, which asked for no hover state on the contract
+        // text — written when there was nowhere for the key to link TO.
+        // Now there is, and a link on the key is how the page is reached.
+        // What still holds, and is what these assertions protect, is that
+        // <code> stays OUTSIDE the copy button: nesting it would make the
+        // key text a click target for "copy" rather than for "open", and
+        // would put the monospace styling inside a button's hover state.
         use crate::node::network_status::ContractSnapshot;
         let mut snap = base_snapshot();
         snap.open_connections = 1;
@@ -1962,15 +1927,23 @@ mod tests {
             html.contains("<code>DEAD...</code>"),
             "the abbreviated key must stay as a plain <code> sibling of the button, got: {html}"
         );
-        // Lock in the simplified markup: the <code> element is a sibling
-        // of the button, NOT wrapped inside it.
+        // Lock in the markup: the <code> element is a sibling of the
+        // button, NOT wrapped inside it.
         assert!(
             !html.contains("class=\"copy-key\" data-copy=\"DEADBEEF\" title=\"Copy contract key\" aria-label=\"Copy contract key\">⧉</button><code>"),
             "<code> must come BEFORE the copy button"
         );
         assert!(
-            html.contains("</code><button type=\"button\" class=\"copy-key\""),
-            "<code> must directly precede the <button> sibling, got: {html}"
+            html.contains("</code></a><button type=\"button\" class=\"copy-key\""),
+            "<code> must sit inside the detail link and directly precede the \
+             copy button, got: {html}"
+        );
+        // The link must target the detail page with the FULL key, not the
+        // abbreviation — the abbreviation is ambiguous and the page looks up
+        // by full key or instance id.
+        assert!(
+            html.contains("href=\"/contract/DEADBEEF\""),
+            "the key must link to its detail page by full key, got: {html}"
         );
     }
 
@@ -2511,12 +2484,61 @@ mod tests {
         );
         assert!(
             html.contains("64.0 MB / 256.0 MB"),
-            "RAM used/budget tile — got:\n{html}"
+            "contract-state used/budget tile — got:\n{html}"
         );
-        // Non-zero recently-read evictions are the miscalibration alarm: colored.
+        // This tile was labelled "RAM used" until 2026-09 and it is not RAM: it
+        // is tracked contract STATE bytes against a ceiling on that state. An
+        // operator read it as resident memory and reported a 4 GB node "near
+        // full" while the process was using under 1 GB.
+        //
+        // Assert the whole label ELEMENT, not the phrase: the tooltip on this
+        // same tile contains "contract state" in prose, so an unanchored
+        // `contains` would survive deleting the label itself.
         assert!(
-            html.contains("var(--danger"),
-            "recently-read eviction count should be highlighted — got:\n{html}"
+            html.contains(r#"<div class="g-norm-label">Contract state</div>"#),
+            "state tile must be labelled as contract state, not memory — got:\n{html}"
+        );
+        // Pin the INVARIANT, not one spelling of its violation: any memory word
+        // in this label re-creates the confusion, not just the string that
+        // shipped. (`.claude/rules/browser-assets.md` rule 2.)
+        for banned in [
+            "RAM used",
+            "Memory used",
+            "Mem used",
+            "RSS used",
+            "RAM",
+            "RSS",
+        ] {
+            assert!(
+                !html.contains(&format!(">{banned}<")),
+                "the state tile must not be labelled {banned:?}: it measures contract \
+                 state bytes, not the node's resident memory — got:\n{html}"
+            );
+        }
+        // The tooltip is the load-bearing half of the fix — the label says what
+        // the number is, the tooltip says what it is NOT. Dropping `title=` from
+        // the tile passed every test before this assertion existed.
+        assert!(
+            html.contains("Contract STATE bytes, not the node's resident memory"),
+            "the state tile must carry its corrective tooltip — got:\n{html}"
+        );
+        // The tooltip must not restate the RAM-scaled DEFAULT as if it were the
+        // only path: `budget_bytes` is "the RAM-scaled default, or the operator
+        // override", further tightened to min(RAM, disk). An operator running
+        // --max-hosting-storage would otherwise read a confident falsehood inside
+        // the tooltip whose whole purpose is to stop a misreading of this tile.
+        assert!(
+            html.contains("max-hosting-storage") && html.contains("disk budget"),
+            "the state tooltip must name the operator override and the disk-budget \
+             floor, not just the RAM-scaled default — got:\n{html}"
+        );
+        // A non-zero "evicted w/ demand" count is NOT coloured. It is a
+        // lifetime counter that any node running at its ceiling accumulates,
+        // so colouring it on `> 0` kept the tile red on a healthy peer. (This
+        // fixture has a non-zero count; the assertion used to demand red.)
+        assert!(
+            !html.contains("var(--danger") && !html.contains("var(--warn"),
+            "a lifetime eviction count must not be styled as an alarm — got:\n{html}"
         );
         // The next-to-evict badge attaches to the first eligible row.
         let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
@@ -2894,11 +2916,16 @@ mod tests {
         // The explanatory paragraph must name the pressures that can actually
         // trigger a sweep. It used to claim the floor was "min(RAM budget,
         // disk budget)", and this assertion pinned that wording — which is how
-        // the claim outlived the two axes added since: the count-derived
-        // resident-overhead ceiling (#5325, the one that binds first on a
-        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
-        // phrasing, so adding a fifth fails here instead of going unnoticed.
-        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+        // the claim outlived the two axes added since: the contract-memory
+        // ceiling (#5325, counted since #5647) and cost pressure (#4861). Pin
+        // the axes, not the phrasing, so adding a fifth fails here instead of
+        // going unnoticed.
+        for axis in [
+            "state bytes",
+            "disk",
+            "memory hosted contracts hold",
+            "update work",
+        ] {
             assert!(
                 html.contains(axis),
                 "explanatory paragraph must name the {axis:?} eviction pressure \
@@ -2907,16 +2934,13 @@ mod tests {
         }
     }
 
-    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
-    /// not as bytes.
+    /// The resident-overhead axis (#5325, #5647) renders as MEMORY in bytes.
     ///
-    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
-    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
-    /// memory. It is not measured, and what it constrains is a number of
-    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
-    /// statement was "520 of 524 contract slots used".
+    /// Before #5647 it rendered as contract SLOTS, because the figure was
+    /// `contract_count * 1 MiB`, a count wearing memory units. It is now the
+    /// counted bytes hosted contracts hold in RAM, so bytes are the honest unit.
     #[test]
-    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
+    fn hosting_card_renders_memory_axis_as_bytes() {
         use crate::node::network_status::HostingSnapshot;
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
@@ -2925,29 +2949,26 @@ mod tests {
             contract_count: 30,
             contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
-            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
-            contract_slot_budget: 100,
+            resident_overhead_bytes: 30 * 1024 * 1024,
             resident_overhead_evictions_total: 7,
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Contract slots used") && html.contains("30 / 100"),
-            "slot axis must render as counts — got:\n{html}"
+            html.contains("Contract memory") && html.contains("30.0 MB / 100.0 MB"),
+            "memory axis must render as bytes — got:\n{html}"
         );
         assert!(
-            html.contains(">70<"),
-            "slots free = budget(100) - used(30) — got:\n{html}"
+            html.contains(">70.0 MB<"),
+            "memory headroom = budget(100 MB) - used(30 MB) — got:\n{html}"
         );
         assert!(
             html.contains(">7<"),
-            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+            "memory-pressure eviction counter renders the snapshot value — got:\n{html}"
         );
-        // The byte framing must be gone: it is what made this read as RAM.
         assert!(
-            !html.contains("Resident overhead (est.)")
-                && !html.contains("Resident overhead budget"),
-            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+            !html.contains("Contract slots used") && !html.contains("Slots free"),
+            "the slot tiles are gone: there is no per-contract constant to divide by — got:\n{html}"
         );
     }
 
@@ -2955,7 +2976,7 @@ mod tests {
     /// closest to binding.
     ///
     /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
-    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// the disk budget, 99.2% of the contract-memory ceiling. All three rendered
     /// as identical muted tiles, so the only number that mattered was
     /// indistinguishable from the two with room to spare.
     #[test]
@@ -2966,9 +2987,10 @@ mod tests {
             // State bytes: 34% used.
             budget_bytes: 1000,
             used_bytes: 340,
-            // Slots: 99% used — this is the binding axis.
+            // Contract memory: 99% used — this is the binding axis.
             contract_count: 99,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 99,
             // Disk: 1% used.
             disk_total_bytes: Some(10),
             disk_budget_bytes: Some(1000),
@@ -2977,18 +2999,332 @@ mod tests {
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Closest limit:") && html.contains("contract slots"),
+            html.contains("Closest limit:") && html.contains("contract memory"),
             "the binding axis must be named — got:\n{html}"
         );
         assert!(
-            html.contains("99 of 100"),
+            html.contains("99 B of 100 B"),
             "the binding axis detail must show its own units — got:\n{html}"
         );
-        // At 99% it must be flagged, not left in the same muted grey as an
-        // axis with room to spare.
+        // Naming it is the whole signal. It is NOT coloured: a contract-memory ceiling
+        // is a cache ceiling and 99% is where a busy node is supposed to sit
+        // (this test used to assert red here, which is the false alarm
+        // `hosting_card_full_cache_axis_is_not_an_alarm` now pins against).
+        let strips = binding_strips(&html);
         assert!(
-            html.contains("var(--danger"),
-            "a near-full binding axis must be coloured — got:\n{html}"
+            !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+            "a nearly-full cache axis is normal and must not be coloured — got:\n{strips}"
+        );
+    }
+
+    /// The "Closest limit" strips only, so a colour assertion cannot be
+    /// satisfied (or tripped) by some other tile on the card.
+    fn binding_strips(html: &str) -> &str {
+        let start = html
+            .find(r#"<div class="hz-binding""#)
+            .expect("the card must render a closest-limit strip");
+        let len = html[start..]
+            .find(r#"<div class="g-verdict-row">"#)
+            .expect("the tiles follow the strip");
+        &html[start..start + len]
+    }
+
+    /// A full cache is the steady state, not an alarm.
+    ///
+    /// Reported from a live peer: "Closest limit: contract memory — 508 of 508
+    /// (100%)" over a solid red bar. Nothing was wrong. A cache is supposed to
+    /// be full: the sweep trims back to the budget and stops, so a busy node
+    /// sits at or around N of N for as long as it stays busy. The strip
+    /// coloured purely on utilisation and so was red on every peer doing the
+    /// most useful work. Same for contract state, which nova's own peer showed
+    /// at "1023.9 MB of 1.0 GB (100%)".
+    #[test]
+    fn hosting_card_full_cache_axis_is_not_an_alarm() {
+        use crate::node::network_status::HostingSnapshot;
+        for (label, hosting) in [
+            (
+                "slots exactly full",
+                HostingSnapshot {
+                    budget_bytes: 1000,
+                    used_bytes: 100,
+                    contract_count: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 508,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+            (
+                "state a hair under full",
+                HostingSnapshot {
+                    budget_bytes: 1_000_000,
+                    used_bytes: 999_900,
+                    contract_count: 5,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 5,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = hosting;
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("(100%)"),
+                "{label}: fixture must render at 100% — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+                "{label}: a full cache axis must render neutral — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("var(--text-muted"),
+                "{label}: the bar must still be drawn, in the neutral tone — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("Full is normal here"),
+                "{label}: a full bar must say in words that full is normal — got:\n{strips}"
+            );
+        }
+    }
+
+    /// Below the point where a reader would wonder, the strip says nothing extra.
+    #[test]
+    fn hosting_card_cache_axis_with_room_carries_no_note() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 500,
+            contract_count: 5,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 5,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("hz-binding-note"),
+            "a half-full cache needs no explanation — got:\n{html}"
+        );
+    }
+
+    /// "Full is normal" is only said of a bar that prints as full. At 76% the
+    /// bar visibly has room and the sentence would be false.
+    #[test]
+    fn hosting_card_does_not_call_a_part_full_cache_full() {
+        use crate::node::network_status::HostingSnapshot;
+        for count in [76, 99] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: count,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(&format!("({count}%)")) && !strips.contains("hz-binding-note"),
+                "a cache at {count}% is neither full nor over and needs no note — got:\n{strips}"
+            );
+        }
+    }
+
+    /// OVER a cache ceiling is not an alarm either. It is the eviction sweep's
+    /// trigger, and on the slot axis a busy node spends much of its time a few
+    /// contracts over: the sweep only fires after ~2.5 minutes over, trims to
+    /// exactly N, and the next arrival puts it over again. At the 128-slot
+    /// floor a single extra contract prints as 101%, so colouring "over" would
+    /// keep the smallest peers amber in normal operation. It is described in
+    /// words, never coloured.
+    #[test]
+    fn hosting_card_over_budget_cache_axis_is_explained_not_coloured() {
+        use crate::node::network_status::HostingSnapshot;
+        for (count, budget, printed) in [
+            // One over at a small budget.
+            (129, 128, "129 B of 128 B (101%)"),
+            // One over on a bigger node: prints as 100%, but the detail text
+            // says 509 B of 508 B, so the note must say "over" and not "full".
+            (509, 508, "509 B of 508 B (100%)"),
+            // Well over.
+            (120, 100, "120 B of 100 B (120%)"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                resident_overhead_budget_bytes: budget,
+                resident_overhead_bytes: count,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(printed),
+                "fixture must render as {printed} — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--warn") && !strips.contains("var(--danger"),
+                "{printed}: an over-budget cache axis must not be coloured — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("A little over is normal") && !strips.contains("Full is normal"),
+                "{printed}: over must be described as over, not as full — got:\n{strips}"
+            );
+        }
+
+        // The state-byte axis has its own wording: crossing it evicts at once.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("how eviction is triggered")
+                && !strips.contains("var(--warn")
+                && !strips.contains("var(--danger"),
+            "an over-budget state axis is explained, not coloured — got:\n{strips}"
+        );
+    }
+
+    /// Disk is not a cache: filling it refuses writes, so it keeps the
+    /// utilisation thresholds the cache axes lost.
+    #[test]
+    fn hosting_card_disk_axis_still_warns_as_it_fills() {
+        use crate::node::network_status::HostingSnapshot;
+        for (used, shown, colour, other) in [
+            (740, "(74%)", "var(--text-muted", "var(--warn"),
+            (750, "(75%)", "var(--warn", "var(--danger"),
+            (899, "(90%)", "var(--danger", "var(--warn"),
+            (1100, "(110%)", "var(--danger", "var(--warn"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 10,
+                contract_count: 1,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: 1,
+                disk_total_bytes: Some(used),
+                disk_budget_bytes: Some(1000),
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("<strong>disk</strong>") && strips.contains(shown),
+                "disk at {used}/1000 must be the closest limit at {shown} — got:\n{strips}"
+            );
+            assert!(
+                strips.contains(colour) && !strips.contains(other),
+                "disk at {shown} must be {colour} — got:\n{strips}"
+            );
+        }
+    }
+
+    /// A full cache must not hide a disk that is genuinely running out.
+    ///
+    /// The strip names the single highest-utilisation axis. Before full cache
+    /// axes went neutral that was harmless, since whichever axis won was red
+    /// anyway. Now a contract-memory ceiling at its normal 100% would outrank a disk at
+    /// 95% and the one real warning on the card would disappear behind a grey
+    /// bar, so any other axis in a warning state gets its own strip.
+    #[test]
+    fn hosting_card_full_cache_does_not_hide_a_disk_warning() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 508,
+            resident_overhead_budget_bytes: 508,
+            resident_overhead_bytes: 508,
+            disk_total_bytes: Some(950),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract memory</strong>"),
+            "the highest-utilisation axis is still the closest — got:\n{strips}"
+        );
+        assert!(
+            strips.contains("Also near its limit: <strong>disk</strong>")
+                && strips.contains("var(--danger"),
+            "a disk at 95% must get its own red strip — got:\n{strips}"
+        );
+        assert!(
+            !strips.contains("<strong>contract state</strong>"),
+            "an axis with room to spare gets no strip — got:\n{strips}"
+        );
+        assert_eq!(
+            strips.matches(r#"class="hz-binding""#).count(),
+            2,
+            "exactly the closest axis plus the one in a warning state — got:\n{strips}"
+        );
+
+        // A disk that is itself over its limit, behind a cache that is further
+        // over, must not be introduced as merely "near" its limit.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 130,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 130,
+            disk_total_bytes: Some(1200),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract memory</strong>")
+                && strips.contains("Also over its limit: <strong>disk</strong>")
+                && strips.contains("new writes are being refused"),
+            "a disk over its limit must say so — got:\n{strips}"
+        );
+
+        // Exactly full is already refusing writes. "Refused once this is full"
+        // would describe the present as the future.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 1,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
+            disk_total_bytes: Some(1000),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("(100%)")
+                && strips.contains("new writes are being refused")
+                && !strips.contains("once this is full"),
+            "a disk exactly at its limit is refusing writes now — got:\n{strips}"
         );
     }
 
@@ -3003,7 +3339,8 @@ mod tests {
             used_bytes: 900,
             // Slots only 10%.
             contract_count: 10,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 10,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3013,7 +3350,7 @@ mod tests {
             "state bytes at 90% must outrank slots at 10% — got:\n{html}"
         );
         assert!(
-            !html.contains("Closest limit: <strong>contract slots"),
+            !html.contains("Closest limit: <strong>contract memory"),
             "the slack axis must not be reported as closest — got:\n{html}"
         );
     }
@@ -3074,7 +3411,8 @@ mod tests {
             used_bytes: 100,
             contract_count: 5,
             // A slot budget of 0 means "not configured", NOT "no slots left".
-            contract_slot_budget: 0,
+            resident_overhead_budget_bytes: 0,
+            resident_overhead_bytes: 5,
             // Disk tracker unseeded.
             disk_total_bytes: None,
             disk_budget_bytes: None,
@@ -3087,8 +3425,1944 @@ mod tests {
             "the one configured axis must be reported — got:\n{html}"
         );
         assert!(
-            !html.contains("contract slots</strong>"),
+            !html.contains("contract memory</strong>"),
             "an unconfigured axis must not be ranked at all — got:\n{html}"
+        );
+    }
+
+    // ─── Normal states must not be styled as alarms ────────────────────
+    //
+    // Each of these pins a state that every healthy node passes through, or
+    // rests in, and that the dashboard used to present in warning colours.
+    // SCOPE: they assert emitted markup and stylesheet text. They do not load
+    // a browser, so they cannot see a colour applied by some other rule.
+
+    /// A node that has just joined is connected only to a gateway. That is
+    /// the first step of joining, not a firewall fault.
+    #[test]
+    fn status_card_does_not_diagnose_a_firewall_while_still_joining() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only_persisting = false;
+        snap.health = HealthLevel::Connecting;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("health-connecting"),
+            "a node still joining is shown as connecting — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Firewall likely blocking"),
+            "gateway-only within the joining grace is not a firewall diagnosis — got:\n{html}"
+        );
+        assert!(
+            !html.contains("health-degraded") && !html.contains("Only connected to gateways"),
+            "no degraded banner while still joining — got:\n{html}"
+        );
+
+        // Once it has persisted, the warning is real and must still appear.
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only_persisting = true;
+        snap.health = HealthLevel::Degraded;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Firewall likely blocking")
+                && html.contains("Only connected to gateways"),
+            "a persisting gateway-only state must still warn — got:\n{html}"
+        );
+    }
+
+    /// One failed hole-punch is not a blocked port. Single attempts fail
+    /// routinely; the verdict needs a sample.
+    #[test]
+    fn nat_line_gives_no_verdict_on_a_handful_of_attempts() {
+        use crate::node::network_status::NAT_MIN_ATTEMPTS_FOR_VERDICT;
+        let card = |attempts: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.health = HealthLevel::Healthy;
+            snap.nat_stats.attempts = attempts;
+            snap.nat_stats.successes = 0;
+            snap.nat_stats.recent_attempts = attempts;
+            snap.nat_stats.recent_successes = 0;
+            build_status_card(&Some(snap))
+        };
+
+        for attempts in [1, NAT_MIN_ATTEMPTS_FOR_VERDICT - 1] {
+            let html = card(attempts);
+            assert!(
+                html.contains(&format!("0/{attempts} successful")),
+                "the counts are facts and must still be shown — got:\n{html}"
+            );
+            for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+                assert!(
+                    !html.contains(alarm),
+                    "{attempts} failed attempt(s) must not render {alarm:?} — got:\n{html}"
+                );
+            }
+        }
+
+        let html = card(NAT_MIN_ATTEMPTS_FOR_VERDICT);
+        for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+            assert!(
+                html.contains(alarm),
+                "every attempt failing over a real sample must still render {alarm:?} — got:\n{html}"
+            );
+        }
+    }
+
+    /// The favicon's dark red is the NAT-specific "blocked" verdict, so it
+    /// shares the verdict's sample floor.
+    ///
+    /// What this does NOT change, deliberately: a NAT failure recorded while
+    /// the node has no connections also lands in `failures`, and with zero
+    /// connections any failure still drives the plain-red favicon and the
+    /// warning title. That is the existing "cannot connect and here is why"
+    /// path, not a verdict on the port, so the fixture includes the failure
+    /// entry production would have alongside the NAT count.
+    #[test]
+    fn favicon_gives_no_nat_verdict_on_one_attempt() {
+        let one_failed_attempt = || {
+            let mut snap = base_snapshot();
+            snap.nat_stats.attempts = 1;
+            snap.nat_stats.successes = 0;
+            snap.failures.push(FailureSnapshot {
+                address: "1.2.3.4:1234".parse::<SocketAddr>().unwrap(),
+                reason_html: "NAT traversal failed".to_string(),
+            });
+            snap
+        };
+        let uri = build_favicon_data_uri(&Some(one_failed_attempt()));
+        assert!(
+            !uri.contains("%238b0000"),
+            "one failed NAT attempt must not be the dark-red 'blocked' verdict — got: {uri}"
+        );
+        assert!(
+            uri.contains("%23f44336"),
+            "with no connections, the recorded failure still shows as a failure — got: {uri}"
+        );
+        assert_eq!(
+            build_dashboard_title(&Some(one_failed_attempt())),
+            "\u{26A0} Dashboard",
+            "with no connections, a recorded failure still warns in the title"
+        );
+
+        // Once connected, neither a single failed attempt nor its failure
+        // entry colours anything.
+        let mut snap = one_failed_attempt();
+        snap.open_connections = 2;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(
+            uri.contains("%230abab5"),
+            "connected wins over a single failed NAT attempt — got: {uri}"
+        );
+    }
+
+    /// The declarations of one top-level rule in the dashboard stylesheet.
+    /// Anchored at the start of a line so a selector that merely CONTAINS
+    /// `selector` (`[data-theme='light'] .op-fail`) is not mistaken for it, and
+    /// a missing rule fails loudly rather than matching something else.
+    fn css_rule(selector: &str) -> &'static str {
+        let css = include_str!("home_page/assets/style.css");
+        let open = format!("\n{selector} {{");
+        let start = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("style.css has no top-level `{selector}` rule"))
+            + open.len();
+        let len = css[start..].find('}').expect("rule is closed");
+        &css[start..start + len]
+    }
+
+    /// Colours the dashboard uses to mean "something is wrong".
+    const ALARM_COLOURS: [&str; 7] = [
+        "#f87171", "#dc2626", "#ff6b6b", "#b3261e", "#ff8a3d", "--danger", "--warn",
+    ];
+
+    /// The operations card's failure count is mostly requests the network
+    /// could not route, is non-zero on every healthy node, and rendered a red
+    /// "0" on a node with none. The cross identifies it; red mis-describes it.
+    #[test]
+    fn operation_failure_count_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".op-fail");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.op-fail` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
+        let css = include_str!("home_page/assets/style.css");
+        assert!(
+            !css.contains("[data-theme='light'] .op-fail"),
+            "no per-theme override may put the alarm colour back on `.op-fail`"
+        );
+    }
+
+    /// "Next to evict" marks a position in an ordering and is present on any
+    /// node hosting anything, including one far under budget.
+    #[test]
+    fn next_to_evict_badge_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".hz-next");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.hz-next` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
+    }
+
+    // ─── Long-table filter controls ────────────────────────────────
+    //
+    // SCOPE WARNING: these tests assert the emitted MARKUP only. They do not
+    // execute `dashboard.js`, have no DOM, and cannot tell you whether the
+    // filter actually filters, whether the collapse collapses, or whether
+    // either survives the 5s `<main>` swap. A green run here is compatible
+    // with the feature being completely broken in a browser. The behaviour is
+    // covered by driving a real node with Playwright; see the PR.
+
+    // ─── GET success rate (#5370) ───────────────────────────────────────
+
+    /// The banner must not call the node healthy.
+    ///
+    /// It did, on four connectivity inputs that say nothing about whether the
+    /// node can serve reads: four live v0.2.128 peers displayed "Node is
+    /// healthy" while answering between 1.3% and 89% of their GETs. A verdict
+    /// is an assertion, and unsupported assertions are what this page keeps
+    /// getting wrong. The connection COUNT is a fact and stays.
+    #[test]
+    fn status_card_states_connections_instead_of_declaring_health() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 5;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            !html.contains("is healthy"),
+            "the banner must not declare the node healthy — got:\n{html}"
+        );
+        assert!(
+            html.contains("Connected to 5 peers"),
+            "the connection count is a fact and must survive — got:\n{html}"
+        );
+    }
+
+    /// A percentage over a handful of requests is theatre.
+    ///
+    /// Peers issue only a few GETs an hour, so a fresh node sits at a tiny
+    /// denominator for a long time. At two requests one outcome moves the
+    /// figure fifty points, which looks like a measurement and is not.
+    #[test]
+    fn get_success_rate_refuses_to_rate_a_tiny_sample() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 600;
+        snap.op_stats.gets = (1, 1);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("too few to rate"),
+            "a 2-request sample must not be rendered as a percentage — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains("50%"),
+            "and specifically not as 50% — got:\n{html}"
+        );
+        assert!(
+            html.contains("1 of 2"),
+            "the counts are still worth showing — got:\n{html}"
+        );
+        assert!(
+            html.contains("does not by itself"),
+            "the caveat must appear even when there is no rate to qualify — \
+             got:\n{html}"
+        );
+    }
+
+    /// The number the whole change exists to surface.
+    ///
+    /// The production gateway in #5370 answered 2 of 153 GETs and displayed
+    /// "Node is healthy". It must now read 1%.
+    #[test]
+    fn get_success_rate_reports_the_measured_share() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 12;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600 * 5;
+        snap.op_stats.gets = (2, 151);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("1% answered"),
+            "2 of 153 is 1% and must be shown as such — got:\n{html}"
+        );
+        assert!(
+            html.contains("2 of 153"),
+            "the sample size must accompany the percentage, so the reader can \
+             tell 1% of 153 from 1% of 3 — got:\n{html}"
+        );
+        assert!(
+            html.contains("since start"),
+            "the figure is lifetime, not a recent window, and must say so — \
+             got:\n{html}"
+        );
+    }
+
+    /// Rounding must never assert something that did not happen.
+    ///
+    /// `{:.0}` alone renders 199/200 as "100%" and 1/200 as "0%". Both are
+    /// false in the way this panel exists to prevent: "100% answered" when a
+    /// request failed is the same unearned absolute as "Node is healthy" was,
+    /// and an operator who reads 100% stops looking.
+    ///
+    /// 100% and 0% are therefore reserved for the cases that earn them, and
+    /// the bands beside them say which side of the boundary they are on
+    /// instead of rounding across it.
+    #[test]
+    fn answered_share_never_rounds_across_an_absolute() {
+        let render = |ok: u32, total: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 4;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600;
+            snap.op_stats.gets = (ok, total - ok);
+            build_status_card(&Some(snap))
+        };
+
+        // A single failure must not render as a perfect score.
+        let near_perfect = render(199, 200);
+        assert!(
+            near_perfect.contains("&gt;99% answered") || near_perfect.contains(">99% answered"),
+            "199 of 200 must not claim 100% — got:\n{near_perfect}"
+        );
+        assert!(
+            !near_perfect.contains("100% answered"),
+            "199 of 200 rounds to 100 and must be caught — got:\n{near_perfect}"
+        );
+
+        // A single success must not render as total failure.
+        let near_zero = render(1, 200);
+        assert!(
+            near_zero.contains("&lt;1% answered") || near_zero.contains("<1% answered"),
+            "1 of 200 must not claim 0% — got:\n{near_zero}"
+        );
+
+        // The absolutes are still available when genuinely earned.
+        let perfect = render(50, 50);
+        assert!(
+            perfect.contains("100% answered"),
+            "50 of 50 really is 100% — got:\n{perfect}"
+        );
+        let zero = render(0, 50);
+        assert!(
+            zero.contains("0% answered"),
+            "0 of 50 really is 0% — got:\n{zero}"
+        );
+
+        // Exactly at MIN_SAMPLE. The gate is `total < MIN_SAMPLE`, so 20 must
+        // take the rate branch — the one boundary value the other cases do not
+        // pin, and an off-by-one here would silently withhold the number from
+        // every node sitting at the threshold.
+        let at_min = render(10, 20);
+        assert!(
+            at_min.contains("50% answered"),
+            "20 requests is exactly the minimum sample, so it must be rated — \
+             got:\n{at_min}"
+        );
+        assert!(
+            !at_min.contains("too few to rate"),
+            "and must not be refused — got:\n{at_min}"
+        );
+        let below_min = render(9, 19);
+        assert!(
+            below_min.contains("too few to rate"),
+            "19 requests is below the minimum and must be refused — \
+             got:\n{below_min}"
+        );
+
+        // And an ordinary value is unaffected: the 1.3% gateway from #5370.
+        let gateway = render(2, 153);
+        assert!(
+            gateway.contains("1% answered"),
+            "2 of 153 is 1.3%, which rounds honestly to 1% — got:\n{gateway}"
+        );
+    }
+
+    /// The caveat must be UNCONDITIONAL, at every rate.
+    ///
+    /// An unanswered GET is frequently the network failing to route rather
+    /// than this node failing to serve — dead-ends dominate the not-found
+    /// mode. Without the caveat, "GET requests 1% answered" invites the
+    /// operator to conclude their own node is broken and report it, and the
+    /// support burden would be built out of our own phrasing.
+    ///
+    /// Showing it only when the number looks bad would be a threshold in
+    /// disguise, and picking that threshold is precisely the judgement this
+    /// panel exists to avoid. So it is pinned at a healthy rate too: if a
+    /// future change makes it conditional, this fails.
+    #[test]
+    fn get_success_caveat_is_shown_at_every_rate() {
+        // Includes the total == 0 branch. Review noted it was the one case
+        // the caveat's own test never exercised — and it is the state a
+        // freshly-started node sits in, so it is the branch most operators
+        // see first.
+        for (ok, failed, label) in [
+            (2u32, 151u32, "very low"),
+            (150, 3, "very high"),
+            (0, 0, "no requests yet"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.open_connections = 6;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600 * 4;
+            snap.op_stats.gets = (ok, failed);
+            let html = build_status_card(&Some(snap));
+            assert!(
+                html.contains("could not route"),
+                "the caveat must appear at a {label} rate too, or it becomes a \
+                 threshold in disguise — got:\n{html}"
+            );
+        }
+    }
+
+    /// The rate must not be styled as a verdict.
+    ///
+    /// Colouring it green or red would reintroduce through CSS exactly the
+    /// judgement the change removed from the markup — and the threshold for
+    /// that colour is the number nobody could justify picking, which is why
+    /// the verdict went in the first place.
+    #[test]
+    fn get_success_rate_carries_no_pass_fail_styling() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 4;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600;
+        snap.op_stats.gets = (10, 90);
+        let html = build_status_card(&Some(snap));
+
+        let line_start = html
+            .find("get-success-rate")
+            .expect("the rate line must be rendered");
+        let line = &html[line_start..html[line_start..].find("</p>").unwrap() + line_start];
+        for verdict_class in [
+            "health-good",
+            "health-trouble",
+            "health-degraded",
+            "op-ok",
+            "op-fail",
+        ] {
+            assert!(
+                !line.contains(verdict_class),
+                "the rate line must not carry the pass/fail class \
+                 `{verdict_class}` — got:\n{line}"
+            );
+        }
+    }
+
+    // ─── Contract detail page (#5369) ───────────────────────────────────
+
+    /// A key that reaches this page came straight out of a URL path, so it is
+    /// attacker-controlled text rendered into HTML.
+    ///
+    /// The not-found branch is the dangerous one: it echoes the key back
+    /// verbatim to say what was not found, and it is reachable by ANYONE who
+    /// can load the page with any path at all — no node state required. An
+    /// unescaped echo there is a reflected-XSS hole on the operator's own
+    /// dashboard, which is the origin that also serves every locally-hosted
+    /// app.
+    #[test]
+    fn contract_detail_escapes_a_key_from_the_url() {
+        let payload = "<script>alert(1)</script>";
+        let html = contract_detail_html_from(&None, payload, false, None);
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "an unescaped key from the URL is reflected XSS — got:\n{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)"),
+            "the key should still be shown, escaped, so the operator can see \
+             what was not found — got:\n{html}"
+        );
+    }
+
+    /// Absence on this node is not absence from the network, and the page must
+    /// not imply otherwise.
+    ///
+    /// A node holds what demand routed to it; it has no directory and cannot
+    /// know whether a contract exists elsewhere. "Not found" phrased as a
+    /// global fact would be the same class of falsehood as the eviction card
+    /// describing a ranking the code does not implement.
+    #[test]
+    fn contract_not_found_is_scoped_to_this_node() {
+        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY", false, None);
+        assert!(
+            html.contains("Contract Not Found"),
+            "expected the not-found page — got:\n{html}"
+        );
+        assert!(
+            html.contains("THIS node"),
+            "the page must scope its claim to this node rather than implying \
+             the contract is absent from the network — got:\n{html}"
+        );
+    }
+
+    /// `ContractKey::to_string()` and `ContractKey::id().to_string()` produce
+    /// the SAME string, and this pins it against a real key rather than a
+    /// fixture that assumes it.
+    ///
+    /// This exists because the opposite belief is written down in this
+    /// codebase and has now misled three separate readers. The rustdoc on
+    /// `ContractSnapshot::instance_id` says it is "Distinct from `key_full`
+    /// which carries the full ContractKey encoding (instance id + parameters /
+    /// code-hash bookkeeping)". That is wrong: `impl Display for ContractKey`
+    /// delegates to `self.instance`, and `id()` returns `&self.instance`, so
+    /// the code-hash half never reaches either string.
+    ///
+    /// The consequences of believing otherwise are concrete. Two reviews of
+    /// the contract detail page independently reported a blocking bug — that a
+    /// hosted-only contract cannot be joined to governance, because
+    /// `HostedContractEntry` carries no `instance_id` field — and I acted on it
+    /// once, adding a "cannot be cross-referenced" branch for a case that does
+    /// not exist. The join works precisely because these two strings are the
+    /// same.
+    ///
+    /// If a future stdlib gives `ContractKey` a Display that includes the code
+    /// hash, this fails, and the detail page's governance lookup genuinely
+    /// does need the separate id.
+    #[test]
+    fn contract_key_display_equals_its_instance_id() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        assert_eq!(
+            key.to_string(),
+            key.id().to_string(),
+            "the dashboard joins hosting/subscription records (keyed by \
+             key.to_string()) against governance records (keyed by \
+             key.id().to_string()); if these ever diverge the contract detail \
+             page silently stops finding governance data"
+        );
+    }
+
+    /// The subscribed path — the one the page exists for — rendered end to
+    /// end.
+    ///
+    /// Every other test here drives `subscribed == None` (no snapshot, an
+    /// unknown key, or a hosted-only contract), so the Subscription card's
+    /// actual logic was unexercised: the freshness pill, the in-use flag, the
+    /// never-vs-ago branch on `last_updated_secs`, and the Identity card's
+    /// instance-id row, which only renders when a subscription supplies one.
+    /// Review caught that the primary lookup path had no coverage while four
+    /// secondary paths did.
+    #[test]
+    fn contract_detail_renders_the_subscribed_path() {
+        use crate::node::network_status::ContractSnapshot;
+
+        // Slice to the Subscription card before asserting. The page embeds the
+        // whole stylesheet inline, so `html.contains("fresh-ok")` is true of
+        // every render — the CSS defines `.fresh-ok` whether or not the pill
+        // is emitted. The first version of this test asserted against the full
+        // document and passed vacuously on the positive case; only the
+        // negative case ("stale must NOT contain fresh-ok") exposed it.
+        fn subscription_panel(html: &str) -> String {
+            let start = html
+                .find("<h2>Subscription</h2>")
+                .expect("the Subscription card must be rendered");
+            let end = html[start..]
+                .find("<h2>Hosting</h2>")
+                .map(|i| start + i)
+                .unwrap_or(html.len());
+            html[start..end].to_string()
+        }
+
+        let base = |is_fresh: bool, in_use: bool, last: Option<u64>| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 3;
+            snap.contracts = vec![ContractSnapshot {
+                key_short: "SUBB...".to_string(),
+                key_full: "SUBBED1".to_string(),
+                instance_id: "SUBBED1".to_string(),
+                subscribed_secs: 3600,
+                last_updated_secs: last,
+                is_receiving_updates: is_fresh,
+                in_use,
+            }];
+            contract_detail_html_from(&Some(snap), "SUBBED1", false, None)
+        };
+
+        // Fresh, in use, updated recently.
+        let fresh_html = base(true, true, Some(30));
+        let fresh = subscription_panel(&fresh_html);
+        assert!(
+            fresh.contains("fresh-ok") && fresh.contains("receiving updates"),
+            "a contract in the update mesh must show the fresh pill — \
+             got:\n{fresh}"
+        );
+        assert!(
+            fresh.contains("30s ago"),
+            "a known last-update time must be rendered as an age — got:\n{fresh}"
+        );
+        assert!(
+            fresh_html.contains("Instance id"),
+            "the instance-id row renders only when a subscription supplies \
+             one, and this is that case — got:\n{fresh}"
+        );
+
+        // Not receiving updates, not pinned by demand, never updated.
+        let stale_html = base(false, false, None);
+        let stale = subscription_panel(&stale_html);
+        assert!(
+            stale.contains("fresh-stale") && stale.contains("not receiving updates"),
+            "a contract outside the update mesh must NOT show as fresh — \
+             serving a stale copy is the failure invariant 1 forbids, so the \
+             page must not imply freshness it does not have. got:\n{stale}"
+        );
+        assert!(
+            stale.contains("never"),
+            "an absent last-update must read as 'never', not as an age of \
+             zero — got:\n{stale}"
+        );
+        // The two states must be distinguishable, or the pill is decoration.
+        assert!(
+            fresh.contains("fresh-ok") && !stale.contains("fresh-ok"),
+            "the freshness pill must differ between the two states"
+        );
+    }
+
+    /// The abbreviating branch, which nothing else reaches.
+    ///
+    /// `abbreviate()` only runs when a contract has neither a subscription nor
+    /// a hosting record but DOES have a governance one — an Evicted, Banned or
+    /// WouldEvict contract this node no longer holds. That is a real and
+    /// expected state, and every other test supplies a short `key_short` from
+    /// a subscription or hosting entry instead, so the truncation arithmetic
+    /// was never executed.
+    ///
+    /// The multi-byte case is the reason the function uses `.chars()` rather
+    /// than byte slicing: a `&key[..12]` regression would panic on a
+    /// non-ASCII boundary rather than fail politely. Contract keys are base58
+    /// today, so this is defensive — which is exactly why it needs a test
+    /// rather than a reader's confidence.
+    #[test]
+    fn contract_detail_abbreviates_a_long_governance_only_key() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let gov_only = |key: &str| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.governance.contracts = vec![ContractGovernanceEntry {
+                instance_id: key.to_string(),
+                instance_id_short: key.to_string(),
+                state: GovernanceStateSnapshot::Banned,
+                cost_used: 9.0,
+                benefit_score: 0.1,
+                log_ratio: Some(-2.0),
+                age_secs: 120,
+                last_transition_secs_ago: 30,
+                history: Vec::new(),
+            }];
+            contract_detail_html_from(&Some(snap), key, false, None)
+        };
+
+        // 44 base58 characters, the real shape of a contract key.
+        let long = "7WSdxLxjPvKgGZBqDpRuPMuoprnQBmXtnkHkDpTPTdcJ";
+        let html = gov_only(long);
+        assert!(
+            html.contains("7WSdxLxjPvKg…"),
+            "a governance-only contract has no short form to borrow, so the \
+             page must abbreviate the key itself — got:\n{html}"
+        );
+        assert!(
+            html.contains(long),
+            "and must still show the full key, which is what the copy button \
+             and the filter search on — got:\n{html}"
+        );
+
+        // Exactly at the boundary: 12 chars must NOT be truncated.
+        let twelve = "123456789012";
+        let at_boundary = gov_only(twelve);
+        assert!(
+            !at_boundary.contains("123456789012…"),
+            "a key exactly at the cap is not longer than the cap, so it must \
+             not gain an ellipsis — got:\n{at_boundary}"
+        );
+
+        // Multi-byte, to pin that truncation counts CHARACTERS not bytes. A
+        // byte-slicing regression panics here rather than returning something
+        // wrong, which is the failure mode worth catching early.
+        let wide = "ααααααααααααααα";
+        let multibyte = gov_only(wide);
+        let expected: String = "α".repeat(12);
+        assert!(
+            multibyte.contains(&format!("{expected}…")),
+            "a multi-byte key must abbreviate to 12 CHARACTERS, not 12 bytes. \
+             The first version of this assertion was `contains(\"…\")` behind \
+             an `||`, which is true either way — byte slicing yields 6 of \
+             these 2-byte chars and sailed through it. Counting the characters \
+             is what distinguishes the two — got:\n{multibyte}"
+        );
+    }
+
+    /// A hosted-only contract CAN be cross-referenced against governance,
+    /// and this pins the non-obvious reason why.
+    ///
+    /// `HostedContractEntry` carries no `instance_id` field, and governance is
+    /// keyed by `ContractInstanceId`, so the join looks impossible. It is not:
+    /// `impl Display for ContractKey` delegates to `self.instance` and
+    /// `ContractKey::id()` returns `&self.instance`, so `key.to_string()` and
+    /// `key.id().to_string()` are THE SAME STRING. The requested key is always
+    /// a valid governance lookup value.
+    ///
+    /// This needs a test because the rustdoc on `ContractSnapshot::instance_id`
+    /// asserts the opposite — "Distinct from `key_full` which carries the full
+    /// ContractKey encoding" — which is wrong, and reading it caused a wrong
+    /// turn on this page: a "cannot be cross-referenced" branch was added for
+    /// a case that does not exist. If the stdlib ever makes the two encodings
+    /// genuinely differ, this fails and says where to look.
+    #[test]
+    fn hosted_only_contract_still_joins_to_governance() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let key = "HOSTEDONLYKEY";
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        // Hosted, with NO subscription entry to supply an instance id.
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        // Governance knows it under the same string, because that string IS
+        // the instance id.
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: key.to_string(),
+            instance_id_short: key.to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 3.0,
+            benefit_score: 1.0,
+            log_ratio: Some(-0.4),
+            age_secs: 600,
+            last_transition_secs_ago: 60,
+            history: Vec::new(),
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), key, false, None);
+        assert!(
+            html.contains("Borderline"),
+            "a hosted-only contract must still show its governance state — \
+             the requested key is a valid instance id. got:\n{html}"
+        );
+        assert!(
+            !html.contains("Not flagged by the governance manager"),
+            "and must not report it as unflagged when a record was found — \
+             got:\n{html}"
+        );
+    }
+
+    /// Governance history must show the NEWEST transitions.
+    ///
+    /// `GovernanceSnapshot::history` is documented as "newest last", so a
+    /// plain `.take(10)` renders the ten OLDEST and hides everything recent —
+    /// exactly inverted from what someone opening the page wants. The bug is
+    /// invisible until a contract accumulates more than ten transitions, which
+    /// is why it needs a test rather than a look.
+    #[test]
+    fn contract_detail_shows_the_newest_governance_transitions() {
+        use crate::node::network_status::{
+            ContractGovernanceEntry, GovernanceStateSnapshot, GovernanceTransitionEntry,
+            GovernanceTransitionReasonSnapshot,
+        };
+
+        // 14 transitions, oldest first, distinguishable by their age.
+        let history: Vec<GovernanceTransitionEntry> = (0..14)
+            .map(|i| GovernanceTransitionEntry {
+                secs_ago: (14 - i) * 60,
+                from: GovernanceStateSnapshot::Normal,
+                to: GovernanceStateSnapshot::Borderline,
+                reason: GovernanceTransitionReasonSnapshot::ThresholdCrossed,
+            })
+            .collect();
+        let oldest_secs = history[0].secs_ago;
+        let newest_secs = history[13].secs_ago;
+
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: "GOVKEY1".to_string(),
+            instance_id_short: "GOVKEY1".to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 1.0,
+            benefit_score: 2.0,
+            log_ratio: Some(0.5),
+            age_secs: 900,
+            last_transition_secs_ago: newest_secs,
+            history,
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), "GOVKEY1", false, None);
+        let newest = format_duration(newest_secs);
+        let oldest = format_duration(oldest_secs);
+        assert!(
+            html.contains(&format!("{newest} ago")),
+            "the most recent transition ({newest} ago) must be shown — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains(&format!("{oldest} ago")),
+            "the oldest transition ({oldest} ago) must have been dropped by \
+             the cap, not the newest — got:\n{html}"
+        );
+    }
+
+    /// The hosting panel must NOT imply it is showing the eviction ranking.
+    ///
+    /// Invariant 3 ranks by local subscriptions, then downstream subscribers,
+    /// then recency. Only recency is in the snapshot; the two counts that
+    /// OUTRANK it are computed during the sweep and are unavailable here. A
+    /// panel that showed recency alone, unqualified, would read as "this is
+    /// why the contract is kept" — which is exactly the falsehood PR #5371
+    /// removed from the eviction card, reintroduced on a new page.
+    #[test]
+    fn contract_detail_says_the_eviction_ranking_is_not_shown() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: "TESTKEY1".to_string(),
+            key_short: "TESTKEY1".to_string(),
+            size_bytes: 4096,
+            read_count: 3,
+            recency_seq: 42,
+            eviction_eligible: true,
+        }];
+        let html = contract_detail_html_from(&Some(snap), "TESTKEY1", false, None);
+        assert!(
+            html.contains("not shown"),
+            "the hosting panel must say the ranking keys are missing — \
+             got:\n{html}"
+        );
+        assert!(
+            html.contains("5372"),
+            "and point at the issue tracking them, so the gap is followable \
+             rather than a dead end — got:\n{html}"
+        );
+    }
+
+    // ─── Merge-law card (#5397) ──────────────────────────────────────────
+
+    /// Extracts the Merge laws card. The whole stylesheet is inlined into
+    /// every render, so a bare `html.contains("fresh-ok")` is true whether or
+    /// not this card actually used that class — see `subscription_panel`
+    /// above, which exists for the identical reason.
+    fn merge_panel(html: &str) -> String {
+        let start = html
+            .find("<h2>Merge laws</h2>")
+            .expect("the Merge laws card must be rendered");
+        let end = html[start..]
+            .find("<h2>Governance</h2>")
+            .map(|i| start + i)
+            .unwrap_or(html.len());
+        html[start..end].to_string()
+    }
+
+    /// One checked-contract record, the shape `conformance::status` stores.
+    ///
+    /// Built through `CheckedContract::new` + `note_finding`, the only route
+    /// production has and — since `findings` became private — the only route
+    /// anything has. A struct literal here would let a test construct a record
+    /// production could not, which is precisely what hid `record`'s
+    /// un-deduplicating insert arm.
+    ///
+    /// Note what `note_finding` does to `findings` on the way in: it inserts at the
+    /// FRONT and drops a property already present. So the record comes back with the
+    /// list reversed and any duplicate property gone — the signature reads like "these
+    /// findings, in this order" and it is not. Today's callers assert presence, not
+    /// order; do not write an order-dependent assertion against this helper without
+    /// reading that.
+    fn checked_record(
+        contract: freenet_stdlib::prelude::ContractInstanceId,
+        verdicts: usize,
+        inconclusive: usize,
+        findings: Vec<MergeFinding>,
+    ) -> CheckedContract {
+        // The timestamp is overwritten by `record` with the tick's publish time,
+        // exactly as `status::checked_contracts` does in production.
+        let mut record = CheckedContract::new(
+            contract,
+            verdicts,
+            inconclusive,
+            tokio::time::Instant::now(),
+        );
+        for finding in findings {
+            record.note_finding(finding);
+        }
+        record
+    }
+
+    /// What the page reads: one contract's record plus the node-wide numbers.
+    ///
+    /// Goes through `MergeCheckStatus::view_for`, the same call the wrapper
+    /// makes, rather than building a `MergeCheckView` by hand — a hand-built
+    /// view would let a test assert about a record the real lookup would never
+    /// have returned.
+    fn merge_view(
+        status: &MergeCheckStatus,
+        contract: &freenet_stdlib::prelude::ContractInstanceId,
+    ) -> MergeCheckView {
+        status.view_for(Some(contract), tokio::time::Instant::now())
+    }
+
+    /// Text with the markup stripped, so "no digit in the visible content"
+    /// assertions aren't defeated by the `2` in every `<h2>` tag.
+    fn visible_text(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A hosted-only contract: the cheapest fixture that reaches any card at
+    /// all. A key with no subscription, hosting, or governance record
+    /// short-circuits to the "not found" page before the Merge laws card (or
+    /// any other card) ever renders.
+    fn hosted_snap(key: &str) -> NetworkStatusSnapshot {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        snap
+    }
+
+    /// State 1: merge-law checking is not running on this node at all.
+    ///
+    /// Must say so plainly, and must render NO count at all — not even a
+    /// zero. A rendered "0" here would read as "0 violations found", which is
+    /// indistinguishable from a clean bill of health and is exactly the
+    /// conflation `conformance::status`'s module doc exists to prevent.
+    #[test]
+    fn merge_card_reports_checking_disabled_with_no_digits() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([1u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, false, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.to_ascii_lowercase().contains("not enabled"),
+            "must say plainly that checking is off — got:\n{panel}"
+        );
+        assert!(
+            panel.to_ascii_lowercase().contains("default"),
+            "must say this is the default state, not a fault — got:\n{panel}"
+        );
+        assert!(
+            !visible_text(&panel).chars().any(|c| c.is_ascii_digit()),
+            "no digit may appear in the VISIBLE text when checking is off — \
+             a rendered count (even a zero) would read as a clean result \
+             rather than as unmeasured. got:\n{panel}"
+        );
+    }
+
+    /// State 2a: checking is running, but this contract falls outside the
+    /// bounded recently-checked window.
+    ///
+    /// Must NOT be read as clean — the window is bounded, so absence here is
+    /// absence of knowledge, not a clean bill of health.
+    #[test]
+    fn merge_card_reports_not_recently_checked_as_unknown_not_clean() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([2u8; 32]);
+        let key = key_id.to_string();
+        // A DIFFERENT contract was checked; this one was not.
+        let other = ContractInstanceId::new([9u8; 32]);
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(other, 5, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "must say the contract fell outside the checked window — \
+             got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "must not claim a clean result for a contract the checker never \
+             looked at — got:\n{panel}"
+        );
+    }
+
+    /// State 2b: checking is running, but has not published its first tick
+    /// yet (`snapshot()` is still `None`).
+    ///
+    /// This must render the same "not checked recently" message as 2a, not
+    /// "not enabled" — the checker IS on, it simply has nothing to report
+    /// yet. Conflating this with "off" would misreport a starting node as one
+    /// with checking disabled.
+    #[test]
+    fn merge_card_reports_not_checked_before_first_publish() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([3u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "before the first tick publishes, the honest answer is 'on, \
+             nothing established yet', which must read the same as the \
+             bounded-window case above — got:\n{panel}"
+        );
+        assert!(
+            !panel.to_ascii_lowercase().contains("not enabled"),
+            "must not be conflated with checking being off — got:\n{panel}"
+        );
+    }
+
+    /// State 3: checked, no findings for this contract.
+    ///
+    /// Must say plainly that no violation was found AND show how many cases
+    /// ran, so the reader can judge whether a clean result reflects a
+    /// meaningful sample or barely having looked.
+    #[test]
+    fn merge_card_reports_clean_result_with_case_count() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([4u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 250, 4, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a clean, checked contract must say so plainly — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("250 reached a verdict"),
+            "must show how many of THIS contract's cases reached a verdict, so a \
+             clean result can be judged for how meaningful it is — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("4 inconclusive"),
+            "must show this contract's inconclusive count too: a contract with one \
+             verdict and 199 inconclusive cases must not render like one with 200 \
+             verdicts — got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "the fleet-wide unjudged note must NOT appear when the count is \
+             zero — got:\n{panel}"
+        );
+    }
+
+    /// A converging idempotence finding must not read the same as a
+    /// non-convergent one.
+    ///
+    /// Severity cannot separate them — since #5462 both are `Severity::Violation`,
+    /// deliberately — so the panel has to read `settling`. For a whole review round
+    /// `MergeFinding` carried that field while the only code that tells an operator
+    /// what a row means ignored it, and the field's own rustdoc said to consult it.
+    /// A test asserting the field is populated would have passed throughout; this
+    /// asserts what the operator actually sees.
+    #[test]
+    fn the_panel_separates_a_settling_finding_from_a_non_convergent_one() {
+        use crate::conformance::property::IdempotenceSettling;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let rendered = |settling| {
+            let key_id = ContractInstanceId::new([7u8; 32]);
+            let key = key_id.to_string();
+            let mut status = MergeCheckStatus::default();
+            status.record(
+                [checked_record(
+                    key_id,
+                    40,
+                    0,
+                    vec![MergeFinding {
+                        contract: key_id,
+                        property: "state_idempotence",
+                        severity: Severity::Violation,
+                        settling,
+                        would_remove: true,
+                    }],
+                )],
+                1,
+                0,
+                tokio::time::Instant::now(),
+            );
+            let snap = hosted_snap(&key);
+            let view = merge_view(&status, &key_id);
+            let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+            merge_panel(&html)
+        };
+
+        let settled = rendered(Some(IdempotenceSettling::SettledAfter(1)));
+        let never = rendered(Some(IdempotenceSettling::NeverSettled));
+
+        assert_ne!(
+            settled, never,
+            "a contract that converges after one rewrite and one that never settles \
+             must not render identically — that is the misreading #5462 exists to \
+             prevent:\nsettled:\n{settled}\nnever:\n{never}"
+        );
+        assert!(
+            settled.contains("converges"),
+            "the settling case must say so in words the operator reads:\n{settled}"
+        );
+    }
+
+    /// State 4: checked, with findings — the state the whole card exists for.
+    ///
+    /// Each finding must show its property, and a `Violation` must read as
+    /// visibly more serious than a `Diagnostic`: the former is removal-eligible
+    /// under enforcement, the latter is legal but wasteful. A panel that only
+    /// printed the bare enum name would satisfy "shows severity" without making
+    /// the distinction an operator actually needs.
+    ///
+    /// This asserted the panel said "cannot converge" until #5462. That stopped
+    /// being true of every `Violation`: `state_idempotence` now reports a
+    /// canonicalizing contract, which breaks idempotence and still converges. The
+    /// assertion is retargeted rather than dropped, because the property it
+    /// guards — an explanation rather than a bare enum name — is unchanged.
+    #[test]
+    fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([5u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                40,
+                0,
+                vec![
+                    MergeFinding {
+                        contract: key_id,
+                        property: "state_commutativity",
+                        severity: Severity::Violation,
+                        settling: None,
+                        would_remove: true,
+                    },
+                    MergeFinding {
+                        contract: key_id,
+                        property: "self_delta_empty",
+                        severity: Severity::Diagnostic,
+                        settling: None,
+                        would_remove: false,
+                    },
+                ],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("state_commutativity") && panel.contains("self_delta_empty"),
+            "both findings for this contract must be listed — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("removal-eligible"),
+            "a Violation must be explained, not just labelled with the bare \
+             enum name — got:\n{panel}"
+        );
+        // The negative half, and the reason it is needed: `merge_panel` slices the
+        // WHOLE card, so the legend explaining the pill is inside the string this
+        // assertion inspects. Checking only that the new wording is present passed
+        // happily while the legend two lines below still explained it with the old
+        // claim — the page contradicting itself, in a commit titled "stop the
+        // strings lying".
+        assert!(
+            !panel.contains("cannot converge"),
+            "the card still claims every Violation cannot converge; since #5462 a \
+             settling idempotence finding converges and is still a Violation — \
+             got:\n{panel}"
+        );
+        assert!(
+            panel.contains("legal but wasteful"),
+            "a Diagnostic must be visibly distinguished from a Violation, \
+             not merely a different word for the same thing — got:\n{panel}"
+        );
+    }
+
+    /// The fleet-wide "could not judge" count must be surfaced when non-zero,
+    /// independent of this contract's own state — it is information the
+    /// operator needs regardless of which contract's page they are viewing.
+    #[test]
+    fn merge_card_surfaces_contracts_without_verdict_fleet_wide() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([6u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 400, 0, vec![])],
+            10,
+            3,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains('3'),
+            "the unjudged count must be surfaced when non-zero — \
+             got:\n{panel}"
+        );
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "must be phrased as an inability to judge, not folded silently \
+             into the clean result above it — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("most recent tick"),
+            "the unjudged count is a per-TICK number and must be phrased as one. \
+             The earlier wording ('on this node') read as a standing property of \
+             the peer — got:\n{panel}"
+        );
+    }
+
+    /// #5403 H1: a contract with a finding must never render the green pill,
+    /// however many other contracts have been checked since.
+    ///
+    /// The two-window version kept a 256-entry checked list and a 64-entry
+    /// findings list. `merge_law_card` picked its branch from the first and
+    /// read the second, so a contract inside one and evicted from the other
+    /// rendered "no merge-law violation was found for this contract" — for a
+    /// contract the checker had positively found violating. Worse, that was
+    /// the steady state: a re-detected finding was deduplicated rather than
+    /// moved to the front, so the contract caught on every tick was the one
+    /// likeliest to lose its finding while its checked entry was refreshed.
+    ///
+    /// A hundred intervening contracts is well past the old findings cap and
+    /// well short of the checked cap, which is exactly the gap the bug lived
+    /// in. This test fails against the two-list code.
+    #[test]
+    fn merge_card_keeps_a_finding_after_the_old_findings_cap_would_have_evicted_it() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([7u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                12,
+                0,
+                vec![MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    settling: None,
+                    would_remove: true,
+                }],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        for i in 0..100u8 {
+            let other = ContractInstanceId::new([100u8.wrapping_add(i); 32]);
+            status.record(
+                [checked_record(
+                    other,
+                    3,
+                    0,
+                    vec![MergeFinding {
+                        contract: other,
+                        property: "state_idempotence",
+                        severity: Severity::Violation,
+                        settling: None,
+                        would_remove: true,
+                    }],
+                )],
+                1,
+                0,
+                tokio::time::Instant::now(),
+            );
+        }
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a contract the checker FOUND violating rendered a clean result \
+             because later contracts pushed its finding out of a separately \
+             capped list — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("state_commutativity"),
+            "the finding must still be listed while the contract is still in \
+             the checked window — got:\n{panel}"
+        );
+    }
+
+    /// #5403 H1, at the surface an operator reads: the card shows one row per
+    /// broken law, not one per violating case.
+    ///
+    /// Driven end to end through the production assembly — a real probe of the
+    /// deliberately-defective fixture contract, then `status::checked_contracts`,
+    /// `MergeCheckStatus::record`, `view_for`, and the real page function. Every
+    /// other merge-card test above hand-builds a `CheckedContract`, so none of them
+    /// could see a defect in the code that BUILDS one; three review rounds each
+    /// found a defect on that path and no test failed.
+    ///
+    /// Mode 6 (NEVER_SETTLES) breaks two merge laws on most generated cases, and one
+    /// probe returns thirteen findings across those two. Before the fix the card
+    /// rendered thirteen rows, eleven of them byte-identical duplicates, which then
+    /// persisted for the record's whole residency in the window because later ticks
+    /// deduplicate AGAINST them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_card_renders_one_row_per_broken_law_from_a_real_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Keep in sync with the mode constants in
+        // `tests/test-contract-conformance/src/lib.rs`.
+        const NEVER_SETTLES: u8 = 6;
+
+        let (id, report, findings) =
+            crate::conformance::shadow::probe_fixture_contract(NEVER_SETTLES).await?;
+        let distinct: std::collections::BTreeSet<&str> = findings
+            .iter()
+            .map(|f| f.violation.property.as_str())
+            .collect();
+        assert!(
+            findings.len() > distinct.len() && distinct.len() > 1,
+            "the probe returned {} findings across {} properties, so this test can \
+             no longer tell one row per LAW from one row per CASE",
+            findings.len(),
+            distinct.len()
+        );
+
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            crate::conformance::status::checked_contracts(&report.judged, &findings),
+            report.judged.len(),
+            report.without_verdict,
+            tokio::time::Instant::now(),
+        );
+
+        let key = id.to_string();
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        let rows = panel.matches("<tr><td>").count();
+        assert_eq!(
+            rows,
+            distinct.len(),
+            "the card rendered {rows} finding rows for {} broken laws — a single \
+             broken law repeated across a probe's cases becomes a wall of identical \
+             rows. got:\n{panel}",
+            distinct.len()
+        );
+        for property in &distinct {
+            assert_eq!(
+                panel.matches(property).count(),
+                1,
+                "{property} appears more than once on the card:\n{panel}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A checker that has stopped publishing must say so, not present its last
+    /// tick as a current result.
+    ///
+    /// `status::publish` is reached from two places in `capture::run_writer`, and
+    /// a peer can stop reaching either indefinitely while the old snapshot
+    /// stands: the probe task can panic, a probe can hang so `in_flight` never
+    /// clears and no further tick starts, or the writer task can be gone. A peer
+    /// whose probe has been dead for a week would otherwise keep serving that
+    /// week-old "no violation found" with nothing on the page to say when it was
+    /// established.
+    #[test]
+    fn merge_card_reports_a_frozen_checker_rather_than_a_current_clean_result() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([8u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 30, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        // A week later. `view_for` takes `now` so the staleness branch does not
+        // need a week of wall clock to reach.
+        let a_week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let view = status.view_for(Some(&key_id), tokio::time::Instant::now() + a_week);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not published"),
+            "a week-old snapshot rendered as a current result, with nothing on \
+             the card saying when the checker last ran — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("Last checker tick"),
+            "every state with a snapshot must show how old that snapshot is — \
+             got:\n{panel}"
+        );
+    }
+
+    /// #5403 M1: a contract the checker has FOUND VIOLATING must not render as one
+    /// this node has never heard of.
+    ///
+    /// The page short-circuited to `contract_not_found.html` — "This node knows
+    /// nothing about &lt;key&gt;" — whenever the contract was absent from the
+    /// subscribed, hosted and governance sections of the snapshot, and threw the
+    /// already-computed merge view away. Those three empty and a merge record present
+    /// is not a corner: the checked window holds ~32 hours while the hosting cache
+    /// evicts under budget pressure well inside that, and
+    /// `network_status::get_snapshot()` returning `None` empties all three at once.
+    /// So the state the page denied all knowledge of is exactly the state where it
+    /// had the most alarming thing to say.
+    #[test]
+    fn a_contract_absent_from_the_snapshot_but_found_violating_is_not_reported_unknown() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([21u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                8,
+                0,
+                vec![MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    settling: None,
+                    would_remove: true,
+                }],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        let view = merge_view(&status, &key_id);
+
+        // No snapshot at all: the harshest form of the case, and one a live node
+        // reaches whenever `get_snapshot()` returns None.
+        let html = contract_detail_html_from(&None, &key, true, Some(&view));
+        assert!(
+            !html.contains("knows nothing about"),
+            "the page denied all knowledge of a contract it had positively found \
+             violating a merge law — got:\n{html}"
+        );
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("state_commutativity"),
+            "the finding must still be shown when the contract is absent from the \
+             snapshot's other sections — got:\n{panel}"
+        );
+    }
+
+    /// The not-found page must still be reachable, or the fix above would simply
+    /// have deleted a state.
+    ///
+    /// A key nothing knows anything about — no snapshot entry AND no merge record —
+    /// is genuinely unknown and must say so, rather than rendering an empty detail
+    /// page that reads as a contract with nothing wrong with it.
+    #[test]
+    fn a_contract_nothing_knows_about_is_still_reported_unknown() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([22u8; 32]);
+        let other = ContractInstanceId::new([23u8; 32]);
+        let key = key_id.to_string();
+        // The checker HAS published, and has a record — for a different contract.
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(other, 5, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        let view = merge_view(&status, &key_id);
+        assert!(
+            view.contract.is_none(),
+            "this test only means something while the requested contract has no record"
+        );
+
+        let html = contract_detail_html_from(&None, &key, true, Some(&view));
+        assert!(
+            html.contains("knows nothing about"),
+            "a genuinely unknown contract stopped being reported as unknown, so the \
+             merge-record exemption swallowed the not-found state entirely — \
+             got:\n{html}"
+        );
+    }
+
+    /// #5403 M2: "when was THIS contract last checked?" must be answered with this
+    /// contract's own record, not with the node's most recent tick.
+    ///
+    /// The card put node-wide `published_secs_ago` in the same info-grid as the
+    /// per-contract case counts, immediately beside "No merge-law violation was found
+    /// for this contract the last time it was checked". The checker probes at most two
+    /// contracts per fifteen-minute tick against a window holding 256, so a contract
+    /// judged twenty hours ago rendered as checked three minutes ago — a confident
+    /// freshness claim about a stale result. It is the same misattribution the PR had
+    /// already fixed one row up for the COUNTS; see `status::judged_last_tick`.
+    #[test]
+    fn merge_card_ages_this_contract_from_its_own_record_not_the_last_node_tick() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([24u8; 32]);
+        let key = key_id.to_string();
+        let judged_at = tokio::time::Instant::now();
+        // Added rather than subtracted: `Instant` is monotonic from boot, so
+        // `now - 20h` panics on a host that has been up for less than that.
+        let twenty_hours = std::time::Duration::from_secs(20 * 60 * 60);
+
+        let mut status = MergeCheckStatus::default();
+        status.record([checked_record(key_id, 12, 0, vec![])], 1, 0, judged_at);
+        // Twenty hours of ticks that never touched this contract. The node is
+        // perfectly healthy; the record is not fresh.
+        status.record([], 2, 0, judged_at + twenty_hours);
+
+        let snap = hosted_snap(&key);
+        let view = status.view_for(Some(&key_id), judged_at + twenty_hours);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("This contract last checked"),
+            "the card gives no per-contract age at all, so the only age on it is the \
+             node's — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("20h"),
+            "a contract judged twenty hours ago is rendered as checked at the node's \
+             most recent tick, beside a sentence about what was found 'the last time \
+             it was checked' — got:\n{panel}"
+        );
+        // And the node-wide number is still there, still labelled as node-wide.
+        assert!(
+            panel.contains("Last checker tick"),
+            "the node-wide tick age must remain: a frozen checker is a different \
+             fault from a stale record, and the card has to be able to show both — \
+             got:\n{panel}"
+        );
+    }
+
+    /// The value rendered against one `info-label` in the merge card.
+    ///
+    /// Both ages sit in the same `info-grid` and both end in " ago", so a
+    /// `panel.contains("5m")` cannot tell which of them it matched — and the whole
+    /// question these two tests ask is which clock answered which label.
+    fn info_value(panel: &str, label: &str) -> String {
+        let anchor = format!(r#">{label}</div><div class="info-value">"#);
+        let start = panel
+            .find(&anchor)
+            .unwrap_or_else(|| panic!("the card renders no `{label}` row:\n{panel}"))
+            + anchor.len();
+        let end = panel[start..]
+            .find("</div>")
+            .expect("an info-value must be closed");
+        panel[start..start + end].to_string()
+    }
+
+    /// #5403 L3: re-checking a contract must refresh its per-contract age.
+    ///
+    /// `MergeCheckStatus::record` stamps `checked_at` in BOTH of its arms. Confining
+    /// that assignment to the insert (`None`) arm compiles, and the test above cannot
+    /// see it: that test records the contract ONCE, so it only ever drives the insert
+    /// arm. A contract the checker looks at every tick would then render with the age
+    /// of the first time it was ever seen, growing without bound while the checker
+    /// was in fact judging it every fifteen minutes — M2's mirror image (there the
+    /// per-contract age was too fresh; here it would be too stale), and the same
+    /// fault of the card answering one question with another clock.
+    #[test]
+    fn re_checking_a_contract_refreshes_its_per_contract_age() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([26u8; 32]);
+        let key = key_id.to_string();
+        let first_seen = tokio::time::Instant::now();
+        let twenty_hours = std::time::Duration::from_secs(20 * 60 * 60);
+        let five_minutes = std::time::Duration::from_secs(5 * 60);
+
+        let mut status = MergeCheckStatus::default();
+        // First sight: the insert arm.
+        status.record([checked_record(key_id, 12, 0, vec![])], 1, 0, first_seen);
+        // Twenty hours later the checker comes back to the SAME contract: the merge
+        // arm, which is the arm nothing covered.
+        status.record(
+            [checked_record(key_id, 3, 0, vec![])],
+            1,
+            0,
+            first_seen + twenty_hours,
+        );
+
+        let snap = hosted_snap(&key);
+        let view = status.view_for(Some(&key_id), first_seen + twenty_hours + five_minutes);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        let per_contract = info_value(&panel, "This contract last checked");
+        let node_wide = info_value(&panel, "Last checker tick");
+        assert_eq!(
+            per_contract, node_wide,
+            "the contract was re-checked by the most recent tick, so its own age and \
+             the node's must agree. They do not, which means the merge arm left \
+             `checked_at` at first sight: a contract judged every tick renders as one \
+             last looked at hours or days ago — got {per_contract:?} against \
+             {node_wide:?} in:\n{panel}"
+        );
+        assert!(
+            !per_contract.contains("20h"),
+            "the re-checked contract is aged from when it was FIRST seen, not from \
+             the tick that last judged it — got {per_contract:?} in:\n{panel}"
+        );
+        // The accumulation the merge arm also owns, so this test fails loudly rather
+        // than vacuously if a refactor stops merging records at all.
+        assert!(
+            panel.contains("15 reached a verdict"),
+            "the two ticks' case counts did not accumulate, so the merge arm did not \
+             run and this test proves nothing about it — got:\n{panel}"
+        );
+    }
+
+    /// #5403 L2: a contract with no record must still show how old the snapshot is.
+    ///
+    /// The card's own doc says every state that has a snapshot renders when that
+    /// snapshot was published. The no-record branch did not: the publish age reached
+    /// it only through the staleness note, which fires at three missed ticks. Below
+    /// that threshold — a checker that died fourteen minutes ago — "this contract has
+    /// not been checked recently" carried no age at all, and a busy checker that has
+    /// simply not got round to this contract rendered identically to one that had
+    /// stopped. That is the same absence-reads-as-fine conflation this subsystem
+    /// exists to stop, in the one state where the page has nothing else to say.
+    #[test]
+    fn a_contract_with_no_record_still_shows_how_old_the_snapshot_is() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([27u8; 32]);
+        let other = ContractInstanceId::new([28u8; 32]);
+        let key = key_id.to_string();
+        let published = tokio::time::Instant::now();
+
+        // The checker HAS published — for a different contract, so the requested one
+        // has no record.
+        let mut status = MergeCheckStatus::default();
+        status.record([checked_record(other, 5, 0, vec![])], 1, 0, published);
+
+        // Well inside `STALE_AFTER` (45 minutes), so the staleness note does NOT
+        // fire and cannot supply the age on this branch's behalf. That is the whole
+        // window the branch was blind in.
+        let view = status.view_for(
+            Some(&key_id),
+            published + std::time::Duration::from_secs(840),
+        );
+        assert!(
+            view.contract.is_none() && !view.stale,
+            "this test only means anything for a fresh snapshot with no record for \
+             the requested contract"
+        );
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("has not been checked recently"),
+            "this test must be reading the no-record branch — got:\n{panel}"
+        );
+        assert_eq!(
+            info_value(&panel, "Last checker tick"),
+            "14m ago",
+            "the no-record state renders no snapshot age, so an operator cannot tell \
+             a busy checker that has not reached this contract from one that stopped \
+             fourteen minutes ago — got:\n{panel}"
+        );
+    }
+
+    /// #5403 M4: the unjudged count's explanation must name what it actually counts.
+    ///
+    /// It was explained as "every case it tried was inconclusive, or related state
+    /// exceeded its budget", which names the two rarest entries on the list
+    /// `shadow::ShadowReport::without_verdict` accumulates. That list also holds: no
+    /// contract store, an empty corpus, code that would not resolve, an oracle that
+    /// would not build, setup that exhausted the time budget before one case ran, a
+    /// dead probe task, and `awaiting_samples` — for most of which ZERO cases were
+    /// tried, and on a warming-up peer `awaiting_samples` dominates outright. An
+    /// operator reading the old sentence would go looking for contracts whose cases
+    /// were all inconclusive and find none.
+    #[test]
+    fn merge_card_explains_the_unjudged_count_by_what_it_counts() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([25u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 40, 0, vec![])],
+            1,
+            4,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("no samples collected"),
+            "the dominant cause on a warming-up peer — focus picked a contract the \
+             sampler holds nothing for — is not named at all — got:\n{panel}"
+        );
+        assert!(
+            !panel.contains("every case it tried was inconclusive"),
+            "the explanation still asserts that every unjudged contract ran cases, \
+             which is false for most of them and for all of the common ones — \
+             got:\n{panel}"
+        );
+    }
+
+    /// #5403 L6: every property name these card tests plant must be one the checker
+    /// can actually emit.
+    ///
+    /// `merge_card_lists_findings_with_severity_and_removal_distinguished` asserted on
+    /// `self_delta_size`, which `ConformanceProperty::as_str` cannot produce — the
+    /// real name is `self_delta_empty`. The test was internally consistent (it planted
+    /// the string and then found it), so it passed while asserting about a card state
+    /// no node will ever render, and the property it claimed to cover — that a
+    /// Diagnostic renders distinguishably from a Violation — was never exercised
+    /// against a real Diagnostic property at all.
+    ///
+    /// Fixing the one literal would leave the class open, so this reads every
+    /// `MergeFinding` property literal planted in this file and checks it against
+    /// `ConformanceProperty::ALL`. A future fixture invented out of thin air fails
+    /// here instead of quietly testing nothing.
+    ///
+    /// Nothing in this doc comment may spell the scrape's needle, or the scrape finds
+    /// its own prose — which it did on the first run, and failed loudly rather than
+    /// silently, because an unreal name is exactly what it rejects.
+    #[test]
+    fn merge_card_fixtures_only_use_property_names_the_checker_can_emit() {
+        use crate::conformance::property::ConformanceProperty;
+
+        let real: std::collections::BTreeSet<&str> = ConformanceProperty::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+
+        let src = include_str!("home_page.rs");
+        let needle = "property: \"";
+        let mut planted: Vec<&str> = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = src[from..].find(needle) {
+            let start = from + found + needle.len();
+            let end = start
+                + src[start..]
+                    .find('"')
+                    .expect("an unterminated string literal in this file's own source");
+            planted.push(&src[start..end]);
+            from = end;
+        }
+
+        assert!(
+            !planted.is_empty(),
+            "no `property: \"…\"` fixture was found in this file, so this test has \
+             stopped reading what it claims to read — the fixtures were probably \
+             renamed or moved, and it is now vacuous"
+        );
+        for name in &planted {
+            assert!(
+                real.contains(name),
+                "the merge-card fixtures plant `{name}`, which no \
+                 ConformanceProperty produces. A card test built on a name the \
+                 checker cannot emit asserts about a state no node will ever render. \
+                 Real names: {real:?}"
+            );
+        }
+    }
+
+    /// The Playwright fixture's markup must stay in step with what the server
+    /// actually emits.
+    ///
+    /// `dashboard-table-filter.spec.ts` builds its own filter controls and
+    /// table, because BOTH cards that carry them short-circuit to an empty
+    /// variant when they have no rows — and the Playwright harness node is a
+    /// single isolated peer with neither peers nor subscribed contracts, so on
+    /// CI the real controls are never on the page. That was found the hard
+    /// way: an earlier version of the spec asserted the controls were
+    /// unconditional and failed in CI.
+    ///
+    /// A hand-built fixture is only safe while it matches reality, so this
+    /// test pins every hook the spec selects on. If you change the markup in
+    /// `table_filter_controls`, this fails and tells you to change the spec
+    /// too — which is the whole point, because the spec would otherwise keep
+    /// passing against markup the server no longer produces.
+    #[test]
+    fn filter_fixture_markup_matches_table_filter_controls() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+
+        // Every selector `dashboard-table-filter.spec.ts` depends on. Keep
+        // this list and the spec's `fixtureCardHtml` in lockstep.
+        for hook in [
+            r#"class="table-filter""#,
+            r#"data-filter-for="#,
+            r#"class="tf-input""#,
+            r#"type="search""#,
+            r#"class="tf-status""#,
+            r#"class="tf-toggle""#,
+            r#"aria-expanded="false""#,
+            r#"class="table-wrap""#,
+            r#"class="sortable""#,
+            r#"data-table-id="#,
+            r#"data-sort-type="#,
+        ] {
+            assert!(
+                html.contains(hook),
+                "the Playwright fixture selects on `{hook}`, which the server \
+                 no longer emits. Update `fixtureCardHtml` in \
+                 crates/core/tests/playwright/tests/dashboard-table-filter.spec.ts \
+                 to match, or the spec will pass against markup that does not \
+                 exist — got:\n{html}"
+            );
+        }
+    }
+
+    /// Both long tables must carry filter controls wired to their own table.
+    ///
+    /// The peers table rendered 210 rows on a production gateway — 70% of an
+    /// 11,780px page — with no way to locate a single row.
+    #[test]
+    fn long_tables_render_filter_controls_bound_to_their_table() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let peers_html = build_peers_card(&Some(snap));
+        assert!(
+            peers_html.contains(r#"data-filter-for="peers""#),
+            "peers filter must target the peers table — got:\n{peers_html}"
+        );
+        assert!(
+            peers_html.contains(r#"data-table-id="peers""#),
+            "the targeted table id must exist on the page — got:\n{peers_html}"
+        );
+
+        let mut snap2 = base_snapshot();
+        snap2.open_connections = 2;
+        snap2.contracts = vec![crate::node::network_status::ContractSnapshot {
+            key_short: "AAA1...".to_string(),
+            key_full: "AAA123XYZ".to_string(),
+            instance_id: "AAA123XYZ".to_string(),
+            subscribed_secs: 100,
+            last_updated_secs: Some(5),
+            is_receiving_updates: true,
+            in_use: true,
+        }];
+        let contracts_html = build_contracts_card(&Some(snap2));
+        assert!(
+            contracts_html.contains(r#"data-filter-for="contracts""#),
+            "contracts filter must target the contracts table — got:\n{contracts_html}"
+        );
+    }
+
+    /// The controls must be reachable without a mouse and announce changes.
+    ///
+    /// The status line updates as you type, so it needs a live region or a
+    /// screen-reader user gets no feedback that the table changed under them.
+    #[test]
+    fn filter_controls_are_labelled_and_announced() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains(r#"aria-label="Filter peers""#),
+            "the input needs an accessible name — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"aria-live="polite""#),
+            "the row-count status must be announced as it changes — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"aria-expanded="false""#),
+            "the collapse toggle must expose its state — got:\n{html}"
+        );
+    }
+
+    /// The toggle ships hidden.
+    ///
+    /// It is the JS that decides whether there is anything to collapse; a
+    /// toggle visible before that decision would flash on every refresh, and
+    /// on a small node would offer to expand a table that is already whole.
+    #[test]
+    fn filter_toggle_starts_hidden_for_the_js_to_reveal() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains(r#"class="tf-toggle" hidden"#),
+            "the toggle must start hidden — got:\n{html}"
         );
     }
 

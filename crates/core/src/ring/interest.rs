@@ -54,7 +54,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -64,7 +64,12 @@ use tokio::time::Instant;
 
 use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, OutcomeEvidence};
 use crate::transport::TransportPublicKey;
+use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::util::time_source::TimeSource;
+
+mod peer_records;
+use peer_records::ContractPeers;
+pub use peer_records::PeerInterest;
 
 /// Interval between interest heartbeat messages sent to each peer.
 /// Each heartbeat sends a full `Interests { hashes }` message which refreshes
@@ -83,6 +88,199 @@ pub const INTEREST_SWEEP_INTERVAL: Duration = Duration::from_secs(60); // 1 minu
 /// broadcast-target sources are symmetrically bounded (#3798 Gap 2).
 pub(crate) const MAX_INTERESTED_PEERS_PER_CONTRACT: usize = 512;
 
+/// How long a contract must stay neither hosted nor in use before
+/// [`InterestManager::reconcile_with_hosting`] drops its neighbour records
+/// (#5780). Two hosting-sweep intervals (60s each): long enough for an
+/// in-flight registration, a GET/PUT re-host or a spawned unsubscribe to land,
+/// and measured as elapsed time so stalled-then-burst sweep ticks cannot
+/// collapse it.
+pub(crate) const RECONCILE_MIN_UNUSED_AGE: Duration = Duration::from_secs(120);
+
+/// Most tracked contracts one reconcile pass examines (#5780). The per-key
+/// checks take hosting-manager locks, so a pass examines at most this many, in
+/// key order from where the previous pass stopped. Collecting and sorting the
+/// tracked ids is still proportional to the whole tracked set (32 bytes per
+/// contract, a small fraction of the records being cleaned up).
+pub(crate) const MAX_RECONCILE_KEYS_PER_PASS: usize = 4096;
+
+/// Fixed bytes charged for one neighbour's interest record, excluding its
+/// summary bytes (counted separately by [`InterestManager::resident_bytes_for`]).
+///
+/// Derived from the stored types: the `interested_peers` map entry
+/// (`PeerKey` + `PeerInterest`), the matching `peer_contracts` reverse-index
+/// entry (`ContractKey`), and one hash-table control word for each. A small
+/// floor from the types, so a contract with many summaryless records still
+/// costs something; allocator slack is not included.
+pub(crate) const PEER_INTEREST_ENTRY_BYTES: u64 = (std::mem::size_of::<PeerKey>()
+    + std::mem::size_of::<PeerInterest>()
+    + std::mem::size_of::<ContractKey>()
+    + 2 * std::mem::size_of::<u64>()) as u64;
+
+/// Whether storing `summary` as `peer`'s neighbour summary would exceed a
+/// bound (#5647, #5781): the legal maximum, the contract's distinct bytes
+/// going over [`contract_summary_cap`], or the node-wide distinct
+/// neighbour-summary bytes going over `node_budget`. Bytes this contract
+/// already holds add nothing, so they are never refused.
+fn summary_over_bound(
+    peers: &ContractPeers,
+    peer: &PeerKey,
+    summary: &StateSummary<'_>,
+    node_budget: u64,
+) -> bool {
+    let bytes = summary.as_ref();
+    if bytes.len() > crate::wasm_runtime::MAX_STATE_SIZE {
+        return true;
+    }
+    if peers.holds_bytes(bytes) {
+        return false;
+    }
+    peers.projected_summary_bytes(peer, bytes) > peers.summary_cap()
+        || peers.projected_node_neighbour_bytes(peer, bytes) > node_budget
+}
+
+/// Most repetitions of the per-peer share pass in one sweep (#5781). Each
+/// repetition that changes anything clears at least one summary, so this only
+/// bounds the work of an adversarial set of holders; whatever is left over is
+/// trimmed by the next sweep.
+const MAX_SHARE_PASSES: usize = 8;
+
+/// One summary charged to a peer: `(charge, allocation, contract)`. The
+/// `Weak` keeps the allocation's address from being reused while the share
+/// pass compares it, without keeping the bytes alive.
+type ChargedSummary = (u64, std::sync::Weak<StateSummary<'static>>, ContractKey);
+
+/// Drop one peer's largest charges until its total is within `share_bytes`
+/// (#5781). `held` lists `(charge, identity, contract)` as collected; `clear`
+/// drops that exact summary if the peer still holds it.
+///
+/// The counted bytes leave the total whether or not `clear` dropped them: a
+/// summary that vanished or was replaced between collection and now is no
+/// longer held either, so keeping it in the total would trim the peer below
+/// its share. Returns the summaries cleared, their bytes, and the total after.
+fn trim_peer_to_share<I>(
+    mut total: u64,
+    mut held: Vec<(u64, I, ContractKey)>,
+    share_bytes: u64,
+    mut clear: impl FnMut(&ContractKey, I) -> bool,
+) -> (u64, u64, u64) {
+    // Largest first, contract key as the tiebreak, so the fewest summaries
+    // are dropped.
+    held.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.2.id().as_bytes().cmp(b.2.id().as_bytes()))
+    });
+    let (mut cleared, mut bytes) = (0u64, 0u64);
+    for (len, ptr, contract) in held {
+        if total <= share_bytes {
+            break;
+        }
+        if clear(&contract, ptr) {
+            cleared += 1;
+            bytes = bytes.saturating_add(len);
+        }
+        total = total.saturating_sub(len);
+    }
+    (cleared, bytes, total)
+}
+
+/// Bytes held for one contract's neighbour records (#5647):
+/// [`PEER_INTEREST_ENTRY_BYTES`] per record plus each DISTINCT summary once,
+/// since identical summaries from several neighbours share one allocation
+/// (#5786).
+fn records_resident_bytes(peers: &ContractPeers) -> u64 {
+    (peers.len() as u64)
+        .saturating_mul(PEER_INTEREST_ENTRY_BYTES)
+        .saturating_add(peers.held_summary_bytes())
+}
+
+/// Most distinct neighbour-summary bytes a contract may hold when this node
+/// has not yet seen its own summary of it (#5647, #5781): 128 KiB.
+///
+/// The largest summaries known on the network are River rooms at about 33 KB,
+/// so this holds about four distinct versions of one. Our own summary's
+/// length is recorded whenever a path has it (the anti-entropy `Summaries`
+/// exchange, a delivery, a digest match), after which
+/// [`RELATIVE_SUMMARY_FACTOR`] applies instead.
+pub(crate) const FALLBACK_CONTRACT_SUMMARY_CAP: u64 = 128 * 1024;
+
+/// A contract may hold distinct neighbour summaries totalling at most this
+/// many times the length of this node's own summary of it, plus
+/// [`RELATIVE_SUMMARY_SLACK`] (#5647, #5781). Neighbours in sync with us send
+/// our bytes, which are stored once; four times ours leaves room for several
+/// peers on other versions.
+pub(crate) const RELATIVE_SUMMARY_FACTOR: u64 = 4;
+
+/// Absolute slack added to the relative cap, so a contract whose own summary
+/// is tiny or empty still accepts a peer's modestly larger one.
+pub(crate) const RELATIVE_SUMMARY_SLACK: u64 = 64 * 1024;
+
+/// The hosting budget divided by this is the most summary bytes one peer may
+/// make this node hold on its own (#5781), across the contracts this node
+/// hosts: summaries that no other neighbour also sent and that are not our
+/// own. At the default 256 MiB budget of a 2 GiB node that is 4 MiB. A
+/// second line of defence behind the per-contract cap: it limits how much of
+/// many contracts' caps one identity can fill.
+pub(crate) const PEER_SUMMARY_SHARE_DIVISOR: u64 = 64;
+
+/// The hosting resident budget divided by this is the most distinct
+/// neighbour-summary bytes the whole node may hold (#5781), enforced when a
+/// summary is written. Our own summary's bytes are not counted and never
+/// refused. Summaries can therefore take at most a quarter of the resident
+/// budget, so no neighbour or group of neighbours can force a contract's
+/// eviction through the summaries they send: what they send beyond this is
+/// refused, and the cost to them is full-state sends. At the 64 MiB floor
+/// budget this is 16 MiB; at a 2 GiB node's 256 MiB, 64 MiB.
+pub(crate) const NEIGHBOUR_SUMMARY_BUDGET_DIVISOR: u64 = 4;
+
+/// Most distinct neighbour-summary bytes one contract may hold (#5647,
+/// #5781): [`RELATIVE_SUMMARY_FACTOR`] times our own summary's length plus
+/// [`RELATIVE_SUMMARY_SLACK`] when that length is known, otherwise
+/// [`FALLBACK_CONTRACT_SUMMARY_CAP`]; never above
+/// [`crate::wasm_runtime::MAX_STATE_SIZE`].
+///
+/// This bound does not depend on who sent the summaries, so identities
+/// acting together cannot exceed it. Summing it over the hosted contracts
+/// bounds what neighbours can make the node hold relative to its own
+/// summaries.
+pub(crate) fn contract_summary_cap(own_summary_len: Option<usize>) -> u64 {
+    let cap = match own_summary_len {
+        Some(own) => (own as u64)
+            .saturating_mul(RELATIVE_SUMMARY_FACTOR)
+            .saturating_add(RELATIVE_SUMMARY_SLACK),
+        None => FALLBACK_CONTRACT_SUMMARY_CAP,
+    };
+    cap.min(crate::wasm_runtime::MAX_STATE_SIZE as u64)
+}
+
+/// Whether `source` stores this node's OWN summary as the peer's: after a
+/// delivery we know the peer holds what we sent, and a digest match proves
+/// the bytes are ours. Such bytes are limited only by `MAX_STATE_SIZE`.
+fn source_is_our_summary(source: SummaryPopulationSource) -> bool {
+    match source {
+        SummaryPopulationSource::Delivery | SummaryPopulationSource::DigestAgreement => true,
+        SummaryPopulationSource::InterestSummary
+        | SummaryPopulationSource::InboundBroadcast
+        | SummaryPopulationSource::ResyncResponse
+        | SummaryPopulationSource::Unknown => false,
+    }
+}
+
+/// Totals from one [`InterestManager::enforce_summary_bounds`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SummaryBoundTrim {
+    /// Hosted contracts over their [`contract_summary_cap`].
+    pub contracts_over_cap: usize,
+    /// Peers over their share.
+    pub peers_over_share: usize,
+    /// Distinct summaries dropped by the node-wide trim.
+    pub node_budget_drops: usize,
+    /// Summaries dropped (records cleared) by any bound.
+    pub summaries_cleared: u64,
+    /// Bytes of those drops: a summary's length for the per-contract and
+    /// node-wide trims, the dropping peer's charge for the per-peer trim.
+    pub bytes_cleared: u64,
+}
+
 /// Grace period before removing a disconnected peer's interests.
 ///
 /// When a peer disconnects, we defer interest removal for this duration instead of
@@ -95,7 +293,13 @@ pub const INTEREST_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(90);
 use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
-/// Maximum number of entries in the delta memoization cache.
+/// COUNT target for the delta memoization cache.
+///
+/// This is a coverage target, NOT the RAM bound: the cache's values are
+/// contract-produced `StateDelta`s, so 1024 entries is an unbounded number of
+/// BYTES (a delta may reach `MAX_STATE_SIZE`, 50 MiB, making the count-only
+/// worst case ~51 GiB). [`INTEREST_DELTA_CACHE_MAX_BYTES`] and the
+/// [`ByteBoundedLruCache`] backstop are what bound RAM; see #4805.
 ///
 // TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
 // the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
@@ -105,6 +309,99 @@ use crate::config::GlobalRng;
 // worst-case load, and summaries are memoized outside WASM so byte keys stay
 // stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
+
+// ============================================================================
+// Delta-cache byte backstop (#4805)
+//
+// `DELTA_CACHE_SIZE` bounds the ENTRY COUNT. It does not bound RAM, because
+// every value is a contract-produced `StateDelta` whose size the contract
+// chooses (up to `wasm_runtime::MAX_STATE_SIZE` = 50 MiB). A contract emitting
+// large deltas could therefore pin ~51 GiB in this one cache — the #4565
+// OOM class, and the code-style rule that per-key collections influenced by
+// external actors MUST be size-bounded. #4804 fixed the identical shape in the
+// executor's summary/delta caches; this applies the same primitive
+// (`util::byte_bounded_lru::ByteBoundedLruCache`) here.
+//
+// Both bounds are kept, and whichever binds first evicts:
+//   - COUNT (coverage): the pre-existing 1024-entry target, unchanged.
+//   - BYTES (safety): a hard ceiling on retained bytes, independent of how
+//     large the contract makes its deltas.
+//
+// Under pressure the cache EVICTS (LRU); it never refuses to serve. A miss is
+// always safe: `compute_delta` and `peer_summary_has_pending_state` fall back
+// to a `GetDeltaQuery` contract round-trip on the live state, and if even that
+// fails `summary_indicates_stale_peer` treats the peer as STALE
+// (`delta_indicates_change.unwrap_or(true)`), which heals with full state.
+// So eviction can cost work — never freshness, and never a silently-missed
+// divergence.
+// ============================================================================
+
+/// Fraction of "the memory the node may use" that sizes the delta cache's byte
+/// budget. Half the share the executor's SUMMARY cache takes (`/64`) because,
+/// unlike the executor's caches, there is exactly ONE `InterestManager` per
+/// node rather than one per pool worker, and this cache is pure memoization
+/// with a safe miss path.
+const INTEREST_DELTA_CACHE_RAM_DIVISOR: usize = 128;
+
+/// Floor for the delta-cache byte budget (4 MiB).
+///
+/// Sized so the byte bound never degrades the small-entry case on a small node:
+/// at the [`crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES`] (512 B)
+/// per-entry floor, 4 MiB holds
+/// ~8192 entries — 8x the [`DELTA_CACHE_SIZE`] count target. That matters
+/// because the entries this cache most needs to keep are the EMPTY deltas that
+/// record "this peer is converged"; losing those is what re-arms the #4857
+/// summarize storm. Below this the count target would stop binding even for
+/// empty deltas, so 4 MiB is the point at which the byte bound is still purely
+/// a backstop.
+const INTEREST_DELTA_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the delta-cache byte budget (16 MiB).
+///
+/// Sized against what the cache is FOR rather than picked round:
+/// `DELTA_CACHE_SIZE` (1024) × 16 KiB. 16 KiB is the per-entry size at which
+/// the COUNT target and the BYTE budget bind at the same moment, so for deltas
+/// up to that size behaviour is exactly what it was before this bound existed
+/// — full 1024-entry coverage — and bytes bind only above it. 16 KiB is a
+/// generous allowance for a DELTA specifically: the measured mean FULL-STATE
+/// broadcast payload on this fleet is ~60-95 KiB (see
+/// [`MISSING_SUMMARY_SIZE_BUCKETS`]), and a delta is the diff against that
+/// state, not the state.
+///
+/// This is deliberately NOT sized to the worst case a contract can produce
+/// (50 MiB × 1024): that number is the vector being closed, not a working-set
+/// requirement.
+const INTEREST_DELTA_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring
+/// the executor's `SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES`.
+const INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Byte budget for the interest manager's delta cache, scaled to the memory the
+/// node may use (host RAM, or a smaller cgroup limit when containerized).
+///
+/// Node-wide, not per-executor: there is one `InterestManager` per node, so
+/// unlike the executor's caches this figure is NOT multiplied by the pool size.
+pub(crate) fn interest_delta_cache_budget_bytes() -> usize {
+    interest_delta_budget_for(
+        crate::wasm_runtime::read_total_ram_bytes()
+            .unwrap_or(INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES),
+    )
+}
+
+/// Pure sizing math behind [`interest_delta_cache_budget_bytes`], split out so
+/// the aggregate-commitment tests can ask what a hypothetical host would get
+/// instead of depending on the test machine's own RAM.
+///
+/// Resolved budgets: 512 MiB host → 4 MiB (floor); 1 GiB → 8 MiB; 2 GiB (the
+/// shipped `MemoryMax=2G`, which most peers report) → 16 MiB; anything larger →
+/// 16 MiB (ceiling).
+pub(crate) fn interest_delta_budget_for(total_ram: usize) -> usize {
+    (total_ram / INTEREST_DELTA_CACHE_RAM_DIVISOR).clamp(
+        INTEREST_DELTA_CACHE_MIN_BYTES,
+        INTEREST_DELTA_CACHE_MAX_BYTES,
+    )
+}
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
 /// the same contract (issue #4857).
@@ -123,7 +420,7 @@ const DELTA_CACHE_SIZE: usize = 1024;
 ///
 /// `pub(crate)` so the UPDATE queue-full retry (#4857 P2) can size its own
 /// tokio-clock liveness backstop to exactly one reservation window — see
-/// `operations::update::op_ctx_task::resend_queue_full_resync_request`.
+/// `operations::update::op_ctx_task::resend_dropped_broadcast_resync_request`.
 pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on the number of (contract, peer) entries in the queue-full
@@ -149,7 +446,7 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 /// head of its set every round and starve the tail permanently. The cap is well
 /// above `max_connections`, so that is not the expected regime; the
 /// randomisation is what makes it a slow cycle rather than a silent hole if it
-/// ever is. See [`InterestManager::summary_window_start`].
+/// ever is. See [`InterestManager::begin_summary_window`].
 ///
 /// #5238 widened the tracked population from the full-bytes minority to every
 /// connected peer. That does not change the conclusion — 4096 still clears
@@ -237,7 +534,7 @@ impl Drop for ResyncRetrySlot {
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
 /// broadcast tasks from accumulating when the contract handler is slow.
-const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const BROADCAST_CH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Identifies a peer for interest tracking purposes.
 ///
@@ -289,10 +586,17 @@ pub enum SummaryMissingReason {
     /// A delta we sent failed to apply on the peer, so our cached summary for
     /// them was provably wrong.
     ClearedByDeltaApplyFailure,
+
+    /// The peer sent a summary that would take the contract over
+    /// [`contract_summary_cap`], or held more summary bytes on its own than
+    /// its share (#5647, #5781), so we stopped
+    /// holding its summary for this contract. Appended last so existing
+    /// telemetry positions do not move.
+    ClearedOverSizeBound,
 }
 
 impl SummaryMissingReason {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     /// Every reason, in telemetry field order.
     pub const ALL: [SummaryMissingReason; Self::COUNT] = [
@@ -300,6 +604,7 @@ impl SummaryMissingReason {
         SummaryMissingReason::ClearedByNoneReport,
         SummaryMissingReason::ClearedByResync,
         SummaryMissingReason::ClearedByDeltaApplyFailure,
+        SummaryMissingReason::ClearedOverSizeBound,
     ];
 
     /// Dense index into a per-reason counter array.
@@ -309,6 +614,7 @@ impl SummaryMissingReason {
             SummaryMissingReason::ClearedByNoneReport => 1,
             SummaryMissingReason::ClearedByResync => 2,
             SummaryMissingReason::ClearedByDeltaApplyFailure => 3,
+            SummaryMissingReason::ClearedOverSizeBound => 4,
         }
     }
 
@@ -319,6 +625,7 @@ impl SummaryMissingReason {
             SummaryMissingReason::ClearedByNoneReport => "none_report",
             SummaryMissingReason::ClearedByResync => "resync",
             SummaryMissingReason::ClearedByDeltaApplyFailure => "delta_apply_failed",
+            SummaryMissingReason::ClearedOverSizeBound => "over_size_bound",
         }
     }
 }
@@ -450,15 +757,21 @@ pub(crate) enum SummaryPopulationOutcome {
     RefreshedKnown,
     CreatedUntracked,
     RejectedAtCap,
+    /// The summary was larger than [`crate::wasm_runtime::MAX_STATE_SIZE`]. A
+    /// summary describes a state and no legal state is larger, so it is not
+    /// stored, and an existing record keeps its previous summary (#5647).
+    /// Appended last so existing telemetry positions do not move.
+    RejectedOversized,
 }
 
 impl SummaryPopulationOutcome {
-    pub(crate) const COUNT: usize = 4;
+    pub(crate) const COUNT: usize = 5;
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::FilledMissing,
         Self::RefreshedKnown,
         Self::CreatedUntracked,
         Self::RejectedAtCap,
+        Self::RejectedOversized,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -471,6 +784,7 @@ impl SummaryPopulationOutcome {
             Self::RefreshedKnown => "refreshed_known",
             Self::CreatedUntracked => "created_untracked",
             Self::RejectedAtCap => "rejected_at_cap",
+            Self::RejectedOversized => "rejected_oversized",
         }
     }
 }
@@ -671,90 +985,6 @@ impl InterestLifecycleMetrics {
     }
 }
 
-/// Tracking information for a peer's interest in a specific contract.
-#[derive(Clone, Debug)]
-pub struct PeerInterest {
-    /// The peer's current state summary. None if interested but has no state yet.
-    pub summary: Option<StateSummary<'static>>,
-
-    /// Why [`Self::summary`] is absent. Stale (and unread) whenever `summary`
-    /// is `Some` — always read it via [`Self::summary_missing_reason`], which
-    /// returns `None` in that case rather than a misleading last-clear cause.
-    summary_absence: SummaryMissingReason,
-
-    /// Diagnostic-only provenance for the current NeverPopulated epoch.
-    never_populated_origin: NeverPopulatedOrigin,
-
-    /// Start time and send-attempt count for that epoch.
-    never_populated_since: Instant,
-    never_populated_send_starts: u32,
-
-    /// When this interest entry was last refreshed.
-    /// Used for TTL-based expiration.
-    pub last_refreshed: Instant,
-
-    /// Whether this peer is our upstream in the subscription tree.
-    /// Internal routing hint, not exposed to protocol.
-    pub is_upstream: bool,
-}
-
-impl PeerInterest {
-    /// Create a new peer interest entry with the given timestamp.
-    ///
-    /// A `None` summary here is [`SummaryMissingReason::NeverPopulated`] by
-    /// construction — this is the only constructor, so an entry cannot come
-    /// into existence summaryless without carrying that tag.
-    pub fn new(summary: Option<StateSummary<'static>>, is_upstream: bool, now: Instant) -> Self {
-        Self {
-            summary,
-            summary_absence: SummaryMissingReason::NeverPopulated,
-            never_populated_origin: NeverPopulatedOrigin::New { recreated: false },
-            never_populated_since: now,
-            never_populated_send_starts: 0,
-            last_refreshed: now,
-            is_upstream,
-        }
-    }
-
-    /// Refresh the TTL timestamp with the given current time.
-    pub fn refresh(&mut self, now: Instant) {
-        self.last_refreshed = now;
-    }
-
-    /// Check if this interest has expired relative to the given current time.
-    pub fn is_expired_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_refreshed) > INTEREST_TTL
-    }
-
-    /// Why this peer has no cached summary, or `None` when one IS cached.
-    pub fn summary_missing_reason(&self) -> Option<SummaryMissingReason> {
-        self.summary.is_none().then_some(self.summary_absence)
-    }
-
-    /// Cache a summary for this peer and refresh TTL.
-    pub fn set_summary(&mut self, summary: StateSummary<'static>, now: Instant) {
-        self.summary = Some(summary);
-        self.refresh(now);
-    }
-
-    /// Drop the cached summary, recording why, and refresh TTL.
-    ///
-    /// Taking `reason` by value (rather than accepting an `Option` summary) is
-    /// deliberate: it makes an untagged clear unrepresentable, so a future
-    /// clear site cannot silently land in the `NeverPopulated` bucket and
-    /// mis-aim the next fix.
-    pub fn clear_summary(&mut self, reason: SummaryMissingReason, now: Instant) {
-        self.summary = None;
-        self.summary_absence = reason;
-        if reason == SummaryMissingReason::NeverPopulated {
-            self.never_populated_origin = NeverPopulatedOrigin::New { recreated: false };
-            self.never_populated_since = now;
-            self.never_populated_send_starts = 0;
-        }
-        self.refresh(now);
-    }
-}
-
 /// Tracks local reasons for interest in a contract.
 ///
 /// A peer can be interested for multiple reasons. We only deregister interest
@@ -823,6 +1053,15 @@ struct DeltaCacheKey {
     contract: ContractKey,
     peer_summary_hash: u64,
     our_summary_hash: u64,
+}
+
+/// Payload size of a cached delta, for the delta cache's byte accounting.
+///
+/// Declared as a free `fn` (not a closure) because
+/// [`ByteBoundedLruCache::new`] takes a `fn(&V) -> usize` and the signature
+/// must match `V = StateDelta<'static>` exactly.
+fn delta_payload_len(delta: &StateDelta<'static>) -> usize {
+    delta.as_ref().len()
 }
 
 /// Hash bytes to u64 for cache key construction.
@@ -1047,6 +1286,29 @@ pub(crate) fn summary_indicates_stale_peer(
     delta_indicates_change.unwrap_or(true)
 }
 
+/// What one [`InterestManager::reconcile_with_hosting`] pass changed (#5780).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ReconcileOutcome {
+    /// Contracts whose stale local-hosting flag this pass cleared. The caller
+    /// retracts their co-host advertisement, as an eviction would have.
+    pub hosting_flags_cleared: Vec<ContractKey>,
+    /// The subset of `hosting_flags_cleared` whose local interest ended with
+    /// the flag. The caller tells neighbours.
+    pub interest_lost: Vec<ContractKey>,
+    /// Contracts past the wait that are neither hosted nor in use and hold no
+    /// lease of this node's own. The caller retracts any co-host advertisement
+    /// still standing for them (a no-op if there is none). Reported every
+    /// pass. A contract whose lease is live is skipped, records and all,
+    /// until the lease lapses (it is renewed only for demand, so within one
+    /// lease period). Advertised contracts are examined whether or not they
+    /// have records, so the retraction does not depend on how the lease ended.
+    pub advertisements_to_retract: Vec<ContractKey>,
+    /// Contracts whose neighbour records were all dropped.
+    pub contracts_dropped: usize,
+    /// Neighbour records dropped across those contracts.
+    pub records_dropped: usize,
+}
+
 /// Manages interest tracking and delta computation for all contracts.
 ///
 /// This is the central data structure for the delta-based synchronization system.
@@ -1061,8 +1323,11 @@ pub(crate) fn summary_indicates_stale_peer(
 /// `operations/subscribe.rs` for the sync point.
 pub struct InterestManager<T: TimeSource> {
     /// Track interested peers and their summaries for each contract.
-    /// Key: ContractKey, Value: Map of PeerKey -> PeerInterest
-    interested_peers: DashMap<ContractKey, HashMap<PeerKey, PeerInterest>>,
+    /// Key: ContractKey, Value: the PeerKey -> PeerInterest records, with each
+    /// distinct summary among them stored once (#5786, see [`ContractPeers`]).
+    /// Every summary write goes through a `ContractPeers` method, under this
+    /// map's shard guard, so the shared-summary table needs no lock of its own.
+    interested_peers: DashMap<ContractKey, ContractPeers>,
 
     /// Reverse index: which contracts is each peer interested in?
     /// Enables O(1) cleanup when a peer disconnects instead of O(contracts) scan.
@@ -1073,7 +1338,12 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Cache for memoizing delta computations.
     /// Avoids recomputing the same delta for multiple peers with identical summaries.
-    delta_cache: Mutex<LruCache<DeltaCacheKey, StateDelta<'static>>>,
+    ///
+    /// Bounded by BOTH a count target ([`DELTA_CACHE_SIZE`]) and a hard byte
+    /// budget ([`interest_delta_cache_budget_bytes`]) — the values are
+    /// contract-produced `StateDelta`s, so the count alone bounds no amount of
+    /// RAM (#4805). See the byte-backstop comment near [`DELTA_CACHE_SIZE`].
+    delta_cache: Mutex<ByteBoundedLruCache<DeltaCacheKey, StateDelta<'static>>>,
 
     /// Fast hash index for connection-time discovery.
     /// Maps u32 hash of contract ID -> list of ContractKeys (handles collisions).
@@ -1117,6 +1387,12 @@ pub struct InterestManager<T: TimeSource> {
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
+    /// Records discarded by `record_summary_cursor`'s advance check: a stale,
+    /// duplicate, or boundary-straddling window that would have mis-charged the
+    /// cycle. Diagnostic only, and a non-zero value is expected under
+    /// concurrency rather than a fault.
+    summary_cursor_rejections: AtomicUsize,
+
     /// Rotation cursor for the bounded periodic summary reply (#5155, extended
     /// to the digest form by #5238), keyed by the peer's stable transport
     /// public key.
@@ -1125,7 +1401,7 @@ pub struct InterestManager<T: TimeSource> {
     /// the peer's identity — a NATed peer that resumes on a new source port is
     /// the same peer with the same hosted set, and keying by address threw its
     /// cursor away on every reconnect. That is not a lost optimisation: with no
-    /// cursor, [`Self::summary_window_start`] re-draws a RANDOM offset, so
+    /// cursor, [`Self::begin_summary_window`] re-draws a RANDOM offset, so
     /// coverage degrades from a contiguous `ceil(n / limit)` tiling to
     /// coupon-collector — about `(n / limit) * H_(n / limit)` rounds, ~90
     /// minutes rather than ~40 at n = 450 and the 5-minute heartbeat. The
@@ -1161,7 +1437,11 @@ pub struct InterestManager<T: TimeSource> {
     /// and never touched it — and #5238 ended that, because the cost the window
     /// really bounds is the per-entry summarize call, which the digest form
     /// pays in full.
-    summary_window_cursor: Mutex<LruCache<PeerKey, ContractInstanceId>>,
+    ///
+    /// Carries a per-cycle entry COUNT alongside the id (#5181). Without it the
+    /// resume index alone had to answer "is this a cycle boundary", and it
+    /// cannot: see [`SummaryCursor`].
+    summary_window_cursor: Mutex<LruCache<PeerKey, SummaryCursor>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
@@ -1175,6 +1455,28 @@ pub struct InterestManager<T: TimeSource> {
     /// Bounded diagnostic-only state used to distinguish first, recreated,
     /// in-flight duplicate, and sequential missing-summary sends.
     missing_summary_history: Mutex<LruCache<(ContractKey, PeerKey), MissingPairHistory>>,
+
+    /// When [`Self::reconcile_with_hosting`] first saw each contract neither
+    /// hosted nor in use (#5780). A contract is cleaned up only once it has
+    /// stayed that way for [`RECONCILE_MIN_UNUSED_AGE`], measured on the time
+    /// source, so a burst of sweep ticks cannot shorten the wait. An entry is
+    /// removed when a pass sees the contract hosted or in use, when any local
+    /// interest in it is added or removed (so a re-host and re-eviction
+    /// between two passes restarts the wait), when its records are dropped,
+    /// and when it is no longer tracked; so it never holds more keys than the
+    /// tracked set.
+    ///
+    /// No guard on this map is held while calling out of it: every access is
+    /// one statement, so the local-interest mutators can reset an entry
+    /// without a lock-order cycle.
+    reconcile_candidates: DashMap<ContractKey, Instant>,
+    /// The last contract the previous reconcile pass examined, in contract-id
+    /// order (#5780). The next pass resumes after it, so coverage does not
+    /// depend on map iteration order or on how many keys came and went.
+    reconcile_cursor: Mutex<Option<ContractKey>>,
+    /// Contracts whose neighbour records reconciliation has dropped since
+    /// startup (#5780).
+    reconcile_contracts_dropped_total: AtomicU64,
     /// Per-key entries are updated through DashMap's shard-local `entry()`
     /// API, so same-key increment/decrement stays atomic. The total-size
     /// bound checked in `begin_active_attempt` is a soft diagnostic cap (not
@@ -1184,6 +1486,18 @@ pub struct InterestManager<T: TimeSource> {
     /// concurrent racers, not fixed at one).
     missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
+    /// Distinct neighbour-summary bytes held across all contracts, excluding
+    /// our own summaries' allocations (#5781). Shared with every
+    /// `ContractPeers`, which keeps its contribution exact.
+    neighbour_summary_bytes: std::sync::Arc<AtomicU64>,
+    /// Most bytes `neighbour_summary_bytes` may reach through a write
+    /// (#5781): a quarter of the hosting resident budget, installed by
+    /// `Ring`. `u64::MAX` until installed.
+    neighbour_summary_budget: AtomicU64,
+    /// Summaries dropped by [`Self::enforce_summary_bounds`] (#5781).
+    summary_bound_trims: AtomicU64,
+    /// Distinct bytes those drops freed.
+    summary_bound_trimmed_bytes: AtomicU64,
 
     /// SHADOW MODE. Counts (contract, peer) edges whose repairs keep failing to
     /// converge — the observable signature of a contract whose merge is not
@@ -1222,8 +1536,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             interested_peers: DashMap::new(),
             peer_contracts: DashMap::new(),
             local_interests: DashMap::new(),
-            delta_cache: Mutex::new(LruCache::new(
+            delta_cache: Mutex::new(ByteBoundedLruCache::new(
                 NonZeroUsize::new(DELTA_CACHE_SIZE).expect("DELTA_CACHE_SIZE must be > 0"),
+                interest_delta_cache_budget_bytes(),
+                delta_payload_len,
             )),
             contract_hash_index: DashMap::new(),
             time_source,
@@ -1238,16 +1554,24 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
+            summary_cursor_rejections: AtomicUsize::new(0),
             summary_window_cursor: Mutex::new(LruCache::new(
                 NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
                     .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
             )),
+            reconcile_candidates: DashMap::new(),
+            reconcile_cursor: Mutex::new(None),
+            reconcile_contracts_dropped_total: AtomicU64::new(0),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
                     .expect("MISSING_SUMMARY_HISTORY_SIZE must be > 0"),
             )),
             missing_summary_active: DashMap::new(),
             interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
+            neighbour_summary_bytes: std::sync::Arc::new(AtomicU64::new(0)),
+            neighbour_summary_budget: AtomicU64::new(u64::MAX),
+            summary_bound_trims: AtomicU64::new(0),
+            summary_bound_trimmed_bytes: AtomicU64::new(0),
             futile_repair: FutileRepairDetector::new(),
         }
     }
@@ -1303,7 +1627,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(peers) = self.interested_peers.get(contract)
             && let Some(interest) = peers.get(peer)
         {
-            if let Some(summary) = interest.summary.clone() {
+            if let Some(summary) = interest.summary().cloned() {
                 return PeerSummaryForBroadcast::Known(summary);
             }
             let reason = interest.summary_missing_reason();
@@ -1320,7 +1644,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(mut peers) = self.interested_peers.get_mut(contract)
             && let Some(interest) = peers.get_mut(peer)
         {
-            if let Some(summary) = interest.summary.clone() {
+            if let Some(summary) = interest.summary().cloned() {
                 return PeerSummaryForBroadcast::Known(summary);
             }
             let reason = interest.summary_missing_reason();
@@ -1739,6 +2063,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         is_upstream: bool,
         source: InterestRegistrationSource,
     ) -> bool {
+        if is_upstream {
+            // A subscribe through this upstream is starting (#5782): restart
+            // reconciliation's wait so the records it is about to use (the
+            // upstream record among them) are not dropped while it fetches.
+            self.reset_reconcile_wait(contract);
+        }
         let now = self.time_source.now();
         // Hold the `interested_peers` shard guard across `peer_contracts`
         // insertion and `index_contract_hash` to keep the three writes
@@ -1747,8 +2077,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // we're about to re-index, leaving a zombie entry).
         // This intentionally undoes the PR #4129 `significant_drop_tightening`
         // change for these four sites — see PR notes.
-        let mut entry = self.interested_peers.entry(*contract).or_default();
+        let mut entry = self
+            .interested_peers
+            .entry(*contract)
+            .or_insert_with(|| ContractPeers::with_counter(self.neighbour_summary_bytes.clone()));
         let is_new = !entry.contains_key(&peer);
+        // A summary over the contract's bound is dropped and counted; the
+        // interest itself is still recorded, as if the peer had sent no
+        // summary (#5647, #5781). A registration replaces the whole record,
+        // so any summary it held is gone either way, as when an oversized
+        // upsert clears it.
+        let node_budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
+        let refused = summary
+            .as_ref()
+            .is_some_and(|s| summary_over_bound(&entry, &peer, s, node_budget));
+        let summary = if refused { None } else { summary };
 
         // Cap distinct interested peers per contract to bound an adversarial
         // broadcast-amplification vector (#3798 Gap 2). Reject BEFORE the
@@ -1769,6 +2112,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             );
             return false;
         }
+        if refused {
+            self.count_oversized(SummaryPopulationSource::Unknown);
+        }
 
         if is_new {
             let counters = if summary.is_some() {
@@ -1779,15 +2125,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             counters[source.index()].fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut interest = PeerInterest::new(summary, is_upstream, now);
-        if interest.summary.is_none() {
+        let mut never_populated_origin = None;
+        if summary.is_none() {
             if let Some(previous) = entry.get(&peer) {
-                if previous.summary.is_some() {
-                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteKnown;
+                if previous.summary().is_some() {
+                    never_populated_origin = Some(NeverPopulatedOrigin::OverwriteKnown);
                     self.interest_lifecycle_metrics.registration_overwrite_known[source.index()]
                         .fetch_add(1, Ordering::Relaxed);
                 } else {
-                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteMissing;
+                    never_populated_origin = Some(NeverPopulatedOrigin::OverwriteMissing);
                     self.interest_lifecycle_metrics
                         .registration_overwrite_missing[source.index()]
                     .fetch_add(1, Ordering::Relaxed);
@@ -1801,16 +2147,25 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .filter(|(_, removed_at)| {
                         now.saturating_duration_since(*removed_at) <= INTEREST_TTL
                     });
-                interest.never_populated_origin = NeverPopulatedOrigin::New {
+                never_populated_origin = Some(NeverPopulatedOrigin::New {
                     recreated: recreated.is_some(),
-                };
+                });
                 if let Some((cause, _)) = recreated {
                     self.interest_lifecycle_metrics.recreated_after_removal[cause.index()]
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        entry.insert(peer.clone(), interest);
+        // Replaces any existing record and releases its shared summary.
+        let interest = entry.insert(peer.clone(), summary, is_upstream, now);
+        if let Some(origin) = never_populated_origin {
+            interest.never_populated_origin = origin;
+        }
+        if refused {
+            // Tag why the record has no summary, so telemetry and lifecycle
+            // correlation do not read it as never populated.
+            entry.clear_summary(&peer, SummaryMissingReason::ClearedOverSizeBound, now);
+        }
 
         // Maintain reverse index for O(1) peer disconnect cleanup
         self.peer_contracts
@@ -1838,7 +2193,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         cause: InterestRemovalCause,
     ) -> bool {
+        self.remove_peer_interest_if(contract, peer, cause, || true)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::remove_peer_interest_for`], but `allowed` is evaluated while
+    /// holding the contract's `interested_peers` shard guard, and nothing is
+    /// removed when it returns false. Returns `None` when `allowed` refused,
+    /// otherwise `Some(removed)` (`Some(false)` if the record or the contract
+    /// was already gone). `allowed` may read `reconcile_candidates` but must
+    /// not take any other `interested_peers` guard. Reconciliation passes a check
+    /// that its wait has not restarted (#5782): `refresh_peer_interest_with_upstream`
+    /// restarts the wait before it takes this guard, so either the check sees
+    /// the restart, or the refresh finds the record gone and its caller
+    /// registers a new one.
+    fn remove_peer_interest_if(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        cause: InterestRemovalCause,
+        allowed: impl FnOnce() -> bool,
+    ) -> Option<bool> {
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            if !allowed() {
+                return None;
+            }
             let removed_interest = entry.remove(peer);
             let removed = removed_interest.is_some();
 
@@ -1885,9 +2264,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 self.cleanup_contract_if_no_interest(contract);
             }
 
-            removed
+            Some(removed)
         } else {
-            false
+            Some(false)
         }
     }
 
@@ -1900,10 +2279,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-            if let Some(interest) = entry.get_mut(peer) {
-                interest.set_summary(summary, now);
+            if !entry.contains_key(peer) {
+                return;
             }
+            if summary_over_bound(
+                &entry,
+                peer,
+                &summary,
+                self.neighbour_summary_budget.load(Ordering::Relaxed),
+            ) {
+                // Not stored (#5647): the record stays and its TTL is
+                // refreshed, but the peer's previous summary is dropped too,
+                // since it no longer describes what the peer holds.
+                entry.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now);
+                self.count_oversized(SummaryPopulationSource::Unknown);
+                return;
+            }
+            entry.set_summary(peer, summary, now);
         }
+    }
+
+    /// Count one refused oversized summary under `source` (#5647).
+    fn count_oversized(&self, source: SummaryPopulationSource) {
+        self.interest_lifecycle_metrics.population[source.index()]
+            [SummaryPopulationOutcome::RejectedOversized.index()]
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Drop a peer's cached summary for a contract, recording why.
@@ -1925,9 +2325,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-            if let Some(interest) = entry.get_mut(peer) {
-                interest.clear_summary(reason, now);
-            }
+            entry.clear_summary(peer, reason, now);
         }
     }
 
@@ -1947,7 +2345,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// The insert respects [`MAX_INTERESTED_PEERS_PER_CONTRACT`] (returns
     /// `false` at cap with no side writes, same shape as
-    /// [`Self::register_peer_interest`]) and creates the entry with
+    /// [`Self::register_peer_interest`]), returns `false` without storing for a
+    /// summary over `MAX_STATE_SIZE` (#5647), and creates the entry with
     /// `is_upstream = false`. It does NOT touch the demand counters
     /// (`downstream_subscriber_count` / `local_client_count`) that feed
     /// eviction's demand ranking — an upserted entry is summary bookkeeping
@@ -1959,8 +2358,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         summary: StateSummary<'static>,
     ) -> bool {
-        self.upsert_peer_summary_from(contract, peer, summary, SummaryPopulationSource::Unknown)
-            != SummaryPopulationOutcome::RejectedAtCap
+        !matches!(
+            self.upsert_peer_summary_from(
+                contract,
+                peer,
+                summary,
+                SummaryPopulationSource::Unknown
+            ),
+            SummaryPopulationOutcome::RejectedAtCap | SummaryPopulationOutcome::RejectedOversized
+        )
     }
 
     pub(crate) fn upsert_peer_summary_from(
@@ -1970,19 +2376,88 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         summary: StateSummary<'static>,
         source: SummaryPopulationSource,
     ) -> SummaryPopulationOutcome {
+        self.upsert_peer_summary_bounded(contract, peer, summary, source, None)
+    }
+
+    /// [`Self::upsert_peer_summary_from`] with this node's own summary of the
+    /// same contract, when the caller has it (#5647, #5781). Its length is
+    /// recorded so the contract's cap ([`contract_summary_cap`]) is relative
+    /// to it on every later path, and a peer reporting exactly our bytes is
+    /// recorded as holding our summary.
+    ///
+    /// A summary that would take the contract's distinct summary bytes over
+    /// its cap is not stored and is counted as
+    /// [`SummaryPopulationOutcome::RejectedOversized`]. An existing record
+    /// stays, its TTL is refreshed and its previous summary is dropped
+    /// ([`SummaryMissingReason::ClearedOverSizeBound`]), so the peer is not
+    /// aged out and no stale summary is kept; no record is created for an
+    /// untracked peer. Our own summary (a delivery, a digest match, or bytes
+    /// equal to `ours`) is limited only by `MAX_STATE_SIZE`; any excess it
+    /// causes is trimmed from other summaries by the next
+    /// [`Self::enforce_summary_bounds`].
+    pub(crate) fn upsert_peer_summary_bounded(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        summary: StateSummary<'static>,
+        source: SummaryPopulationSource,
+        ours: Option<&StateSummary<'_>>,
+    ) -> SummaryPopulationOutcome {
         let now = self.time_source.now();
+        let is_ours =
+            source_is_our_summary(source) || ours.is_some_and(|o| o.as_ref() == summary.as_ref());
         // Hold the `interested_peers` shard guard across the `peer_contracts`
         // and hash-index writes — same #4129/#4171 discipline as
         // `register_peer_interest`, preventing a concurrent remover from
         // leaving a zombie reverse-index entry.
-        let mut entry = self.interested_peers.entry(*contract).or_default();
-        if let Some(interest) = entry.get_mut(peer) {
-            let outcome = if interest.summary.is_some() {
+        let mut entry = self
+            .interested_peers
+            .entry(*contract)
+            .or_insert_with(|| ContractPeers::with_counter(self.neighbour_summary_bytes.clone()));
+        if let Some(ours) = ours {
+            entry.note_own_summary(ours.as_ref());
+        }
+        // Authoritative when the bytes were just shown to be ours (a digest
+        // match, or equal to the summary we computed); a delivery may complete
+        // after our summary has moved on.
+        let authoritative = matches!(source, SummaryPopulationSource::DigestAgreement)
+            || ours.is_some_and(|o| o.as_ref() == summary.as_ref());
+        let node_budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
+        let over = if is_ours {
+            let bytes = summary.as_ref();
+            // A delivery that will not be recorded as our own summary (ours
+            // has moved on since) is counted like a neighbour's, so it must
+            // fit the node-wide budget (#5781).
+            let counted = !authoritative
+                && !entry.delivery_marks_ours()
+                && !entry.is_own_bytes(bytes)
+                && !entry.holds_bytes(bytes);
+            bytes.len() > crate::wasm_runtime::MAX_STATE_SIZE
+                || (counted && entry.projected_node_neighbour_bytes(peer, bytes) > node_budget)
+        } else {
+            summary_over_bound(&entry, peer, &summary, node_budget)
+        };
+        if over {
+            entry.clear_summary(peer, SummaryMissingReason::ClearedOverSizeBound, now);
+            if entry.is_empty() {
+                // Created just now for an untracked peer; leave nothing behind.
+                drop(entry);
+                self.interested_peers
+                    .remove_if(contract, |_, v| v.is_empty());
+            }
+            self.count_oversized(source);
+            return SummaryPopulationOutcome::RejectedOversized;
+        }
+        if entry.contains_key(peer) {
+            let had_summary = entry.set_summary(peer, summary, now) == Some(true);
+            if is_ours {
+                entry.note_own_summary_held_by(peer, authoritative);
+            }
+            let outcome = if had_summary {
                 SummaryPopulationOutcome::RefreshedKnown
             } else {
                 SummaryPopulationOutcome::FilledMissing
             };
-            interest.set_summary(summary, now);
             self.missing_summary_history
                 .lock()
                 .pop(&(*contract, peer.clone()));
@@ -2009,7 +2484,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return outcome;
         }
-        entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
+        entry.insert(peer.clone(), Some(summary), false, now);
+        if is_ours {
+            entry.note_own_summary_held_by(peer, authoritative);
+        }
         self.peer_contracts
             .entry(peer.clone())
             .or_default()
@@ -2078,12 +2556,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// Returns `true` if an entry existed and was updated, `false` if there was
     /// nothing to refresh (the caller should then register).
+    ///
+    /// When `is_upstream`, it restarts reconciliation's wait BEFORE taking the
+    /// shard guard (#5782), so a pass removing this record either sees the
+    /// restart or has already removed it, and then this returns `false`. A
+    /// non-upstream refresh does not restart the wait.
     pub fn refresh_peer_interest_with_upstream(
         &self,
         contract: &ContractKey,
         peer: &PeerKey,
         is_upstream: bool,
     ) -> bool {
+        if is_upstream {
+            // As in `register_peer_interest_from` (#5782).
+            self.reset_reconcile_wait(contract);
+        }
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
@@ -2137,7 +2624,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ) -> Option<StateSummary<'static>> {
         self.interested_peers
             .get(contract)
-            .and_then(|entry| entry.get(peer).and_then(|i| i.summary.clone()))
+            .and_then(|entry| entry.get(peer).and_then(|i| i.summary().cloned()))
     }
 
     /// Whether we hold a cached summary for `peer` on `contract`, WITHOUT
@@ -2151,7 +2638,267 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     pub fn has_peer_summary(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         self.interested_peers
             .get(contract)
-            .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary.is_some()))
+            .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary().is_some()))
+    }
+
+    /// Bytes of neighbour summaries stored for `contract`, counting each
+    /// distinct summary once, read under one shard guard (#5786).
+    ///
+    /// This is the figure a per-contract memory charge for neighbour summaries
+    /// should use (#5779): identical summaries from many neighbours share one
+    /// allocation, so summing each record's summary length would overcount.
+    /// Excludes the fixed per-record overhead.
+    pub(crate) fn distinct_summary_bytes_for(&self, contract: &ContractKey) -> u64 {
+        self.interested_peers
+            .get(contract)
+            .map_or(0, |entry| entry.held_summary_bytes())
+    }
+
+    /// Apply the two bounds on neighbour summaries to the contracts this node
+    /// hosts (#5647, #5781). Run by `Ring::sweep_expired_hosting` before each
+    /// hosting sweep (every 60 s), so the hosting cache never charges bytes
+    /// beyond them.
+    ///
+    /// 1. **Per contract:** a hosted contract holding more distinct summary
+    ///    bytes than [`contract_summary_cap`] has its largest summaries (not
+    ///    our own) dropped until it fits. Independent of who sent them, so
+    ///    identities acting together cannot get past it. Upserts already
+    ///    refuse a summary that would exceed it; this pass catches a cap that
+    ///    shrank because our own summary did.
+    /// 2. **Per peer:** each peer is charged, across hosted contracts, every
+    ///    summary it holds that is not our own, split evenly among the peers
+    ///    holding the same bytes (rounded up). A peer charged more than
+    ///    `share_bytes` has its largest charges dropped. Peers sending the
+    ///    same bytes together split the charge but do not escape it.
+    /// 3. **Node-wide:** while the counted neighbour-summary bytes of the
+    ///    hosted contracts exceed the budget (writes can overshoot it:
+    ///    concurrent writers, an old own summary moving into the counted set,
+    ///    a budget that shrank), the largest counted summaries of hosted
+    ///    contracts are dropped, never our own, in a fixed order (size,
+    ///    contract key, bytes). So what the hosting cache charges for
+    ///    neighbour summaries is within the budget again after every sweep.
+    ///    The write-time check is stricter: it counts every contract,
+    ///    including non-hosted ones until #5782's reconciliation drops them.
+    ///
+    /// Records stay in every case; the cost to the peer is full-state sends
+    /// for those contracts until it reports a summary that fits. Contracts
+    /// this node does not host are left to #5782's reconciliation. The hosted
+    /// keys are collected first and `is_hosted` is called with no shard guard
+    /// held, so this never holds an `interested_peers` guard while taking a
+    /// hosting lock (the hosting cache takes them in the other order).
+    pub(crate) fn enforce_summary_bounds(
+        &self,
+        share_bytes: u64,
+        is_hosted: impl Fn(&ContractKey) -> bool,
+    ) -> SummaryBoundTrim {
+        let now = self.time_source.now();
+        let mut trim = SummaryBoundTrim::default();
+        let mut keys: Vec<ContractKey> = self.interested_peers.iter().map(|e| *e.key()).collect();
+        keys.retain(|key| is_hosted(key));
+        // Deterministic order (simulation tests replay it).
+        keys.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+        // 1. Per contract.
+        for key in &keys {
+            if let Some(mut entry) = self.interested_peers.get_mut(key) {
+                let (cleared, bytes) = entry.trim_to_cap(now);
+                if cleared > 0 {
+                    trim.contracts_over_cap += 1;
+                    trim.summaries_cleared += cleared;
+                    trim.bytes_cleared = trim.bytes_cleared.saturating_add(bytes);
+                }
+            }
+        }
+
+        // 2. Per peer. Clearing one holder of a shared summary moves its
+        // charge onto the remaining holders, who may then be over their own
+        // share, so the pass repeats with fresh charges until no peer is over
+        // (or `MAX_SHARE_PASSES`, after which the next sweep continues).
+        let mut peers_over: HashSet<PeerKey> = HashSet::new();
+        for _ in 0..MAX_SHARE_PASSES {
+            let mut by_peer: std::collections::HashMap<PeerKey, (u64, Vec<ChargedSummary>)> =
+                std::collections::HashMap::new();
+            for key in &keys {
+                if let Some(entry) = self.interested_peers.get(key) {
+                    for (peer, charge, identity) in entry.charged_summaries() {
+                        let held = by_peer.entry(peer).or_default();
+                        held.0 = held.0.saturating_add(charge);
+                        held.1.push((charge, identity, *key));
+                    }
+                }
+            }
+            let mut over: Vec<_> = by_peer
+                .into_iter()
+                .filter(|(_, (total, _))| *total > share_bytes)
+                .collect();
+            if over.is_empty() {
+                break;
+            }
+            over.sort_by(|a, b| a.0.0.as_bytes().cmp(b.0.0.as_bytes()));
+            let mut cleared_this_pass = 0;
+            for (peer, (total, held)) in over {
+                peers_over.insert(peer.clone());
+                let (cleared, bytes, total) =
+                    trim_peer_to_share(total, held, share_bytes, |contract, identity| {
+                        self.interested_peers
+                            .get_mut(contract)
+                            .is_some_and(|mut entry| {
+                                // Only the exact summary that was counted (the
+                                // same allocation); a newer one is judged on a
+                                // later pass.
+                                entry
+                                    .get(&peer)
+                                    .and_then(|r| r.summary())
+                                    .is_some_and(|s| std::ptr::eq(s, identity.as_ptr()))
+                                    && entry.clear_summary(
+                                        &peer,
+                                        SummaryMissingReason::ClearedOverSizeBound,
+                                        now,
+                                    )
+                            })
+                    });
+                cleared_this_pass += cleared;
+                trim.summaries_cleared += cleared;
+                trim.bytes_cleared = trim.bytes_cleared.saturating_add(bytes);
+                // debug!, not warn!: a peer that keeps resending would log
+                // every sweep. The counters below carry the signal in release
+                // builds.
+                tracing::debug!(
+                    peer = ?peer,
+                    share_bytes,
+                    held_after = total,
+                    "a peer held more neighbour-summary bytes than its share; dropped \
+                     its largest summaries (#5781)"
+                );
+            }
+            if cleared_this_pass == 0 {
+                break;
+            }
+        }
+        trim.peers_over_share = peers_over.len();
+        // 3. Node-wide, over hosted contracts: what the hosting cache charges.
+        let budget = self.neighbour_summary_budget.load(Ordering::Relaxed);
+        let mut hosted_counted: u64 = keys
+            .iter()
+            .filter_map(|key| self.interested_peers.get(key).map(|e| e.counted_bytes()))
+            .sum();
+        if hosted_counted > budget {
+            let mut counted: Vec<(ContractKey, std::sync::Arc<StateSummary<'static>>)> = Vec::new();
+            for key in &keys {
+                if let Some(entry) = self.interested_peers.get(key) {
+                    for summary in entry.counted_summaries() {
+                        counted.push((*key, summary));
+                    }
+                }
+            }
+            counted.sort_by(|(ka, a), (kb, b)| {
+                let (a, b): (&[u8], &[u8]) = (a.as_ref().as_ref(), b.as_ref().as_ref());
+                b.len()
+                    .cmp(&a.len())
+                    .then_with(|| ka.id().as_bytes().cmp(kb.id().as_bytes()))
+                    .then_with(|| a.cmp(b))
+            });
+            for (key, victim) in counted {
+                if hosted_counted <= budget {
+                    break;
+                }
+                if let Some(mut entry) = self.interested_peers.get_mut(&key) {
+                    let before = entry.counted_bytes();
+                    let cleared = entry.clear_allocation(&victim, now);
+                    hosted_counted =
+                        hosted_counted.saturating_sub(before.saturating_sub(entry.counted_bytes()));
+                    if cleared > 0 {
+                        trim.node_budget_drops += 1;
+                        trim.summaries_cleared += cleared;
+                        trim.bytes_cleared = trim
+                            .bytes_cleared
+                            .saturating_add(victim.as_ref().as_ref().len() as u64);
+                    }
+                }
+            }
+        }
+
+        self.summary_bound_trims
+            .fetch_add(trim.summaries_cleared, Ordering::Relaxed);
+        self.summary_bound_trimmed_bytes
+            .fetch_add(trim.bytes_cleared, Ordering::Relaxed);
+        trim
+    }
+
+    /// Record this node's own summary of `contract` for an existing record set
+    /// (#5781), so its summary cap is relative to it, when the caller computed
+    /// ours but has no peer summary to store. Creates nothing.
+    pub(crate) fn note_own_summary(&self, contract: &ContractKey, ours: &StateSummary<'_>) {
+        if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            entry.note_own_summary(ours.as_ref());
+        }
+    }
+
+    /// Install the node-wide neighbour-summary budget (#5781). `Ring` calls
+    /// this with a quarter of the hosting resident budget when it attaches
+    /// and on every hosting sweep.
+    pub(crate) fn set_neighbour_summary_budget(&self, budget: u64) {
+        self.neighbour_summary_budget
+            .store(budget, Ordering::Relaxed);
+    }
+
+    /// The installed node-wide neighbour-summary budget (#5781).
+    pub(crate) fn neighbour_summary_budget(&self) -> u64 {
+        self.neighbour_summary_budget.load(Ordering::Relaxed)
+    }
+
+    /// Distinct neighbour-summary bytes held across all contracts, excluding
+    /// our own summaries (#5781).
+    pub(crate) fn neighbour_summary_bytes(&self) -> u64 {
+        self.neighbour_summary_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Summaries and bytes dropped by [`Self::enforce_summary_bounds`] since
+    /// startup, for telemetry (#5781).
+    pub(crate) fn summary_bound_trim_totals(&self) -> (u64, u64) {
+        (
+            self.summary_bound_trims.load(Ordering::Relaxed),
+            self.summary_bound_trimmed_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Bytes this node holds to track neighbours' interest in `contract`: a
+    /// fixed per-record charge ([`PEER_INTEREST_ENTRY_BYTES`]) for every
+    /// neighbour record, plus each distinct cached summary once
+    /// ([`Self::distinct_summary_bytes_for`]) (#5647). N neighbours that sent
+    /// identical summaries cost one summary's bytes plus N record charges.
+    ///
+    /// This is the part of hosting a contract that varies with the contract and
+    /// with how many neighbours follow it, so the hosting cache charges it to
+    /// the contract instead of a uniform per-contract estimate. It reads the
+    /// canonical `interested_peers` map, so it cannot drift from what is held.
+    /// The record count and the summary bytes are two reads, so a record
+    /// added or removed between them can make one call off by that record;
+    /// the hosting cache samples this once per 60s sweep, so that is within
+    /// the staleness it already accepts.
+    pub fn resident_bytes_for(&self, contract: &ContractKey) -> u64 {
+        let records = self
+            .interested_peers
+            .get(contract)
+            .map_or(0, |peers| peers.len() as u64);
+        if records == 0 {
+            return 0;
+        }
+        records
+            .saturating_mul(PEER_INTEREST_ENTRY_BYTES)
+            .saturating_add(self.distinct_summary_bytes_for(contract))
+    }
+
+    /// [`Self::resident_bytes_for`] summed over EVERY contract with neighbour
+    /// records, hosted or not (#5647). Exported as telemetry beside the hosting
+    /// cache's charged figure: the difference is what the node holds for
+    /// contracts it does not host, which #5782's reconciliation keeps small.
+    /// Walks every record, so it is read on the telemetry cadence only.
+    pub fn total_resident_bytes(&self) -> u64 {
+        self.interested_peers
+            .iter()
+            .map(|peers| records_resident_bytes(peers.value()))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Check if enough time has elapsed to send a proactive summary notification
@@ -2413,6 +3160,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// [`Self::register_local_hosting`] applies so the method is not a
     /// PR #4129–shaped race footgun.
     pub fn register_local_interest(&self, contract: &ContractKey) -> &Self {
+        self.reset_reconcile_wait(contract);
         let entry = self.local_interests.entry(*contract).or_default();
         self.index_contract_hash(contract);
         drop(entry);
@@ -2422,6 +3170,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Register that we're hosting a contract locally.
     /// Returns true if this caused us to become interested (wasn't interested before).
     pub fn register_local_hosting(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
         // Hold the `local_interests` shard guard across `index_contract_hash`
         // so a concurrent `remove_local_client` / `unregister_local_hosting`
         // for the last reason cannot run its cleanup (unindex no-op) before
@@ -2437,14 +3186,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Unregister that we're hosting a contract locally.
     /// Returns true if this caused us to lose interest (no other reasons remain).
     pub fn unregister_local_hosting(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
+        self.clear_local_hosting_flag(contract)
+    }
+
+    /// The body of [`Self::unregister_local_hosting`] without restarting
+    /// reconciliation's wait, for reconciliation's own flag clear: restarting
+    /// the wait there would read as a concurrent change and stop the pass
+    /// dropping the records it just made eligible (#5782).
+    fn clear_local_hosting_flag(&self, contract: &ContractKey) -> bool {
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
             entry.hosting = false;
             let lost_interest = !entry.is_interested();
             if lost_interest {
                 drop(entry);
-                self.local_interests.remove(contract);
+                // Remove only if still uninterested: a concurrent add_* between
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2455,6 +3221,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Add a local client subscription.
     /// Returns true if this caused us to become interested.
     pub fn add_local_client(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
         // Same lock-across-index discipline as `register_local_hosting`:
         // hold the `local_interests` shard guard across
         // `index_contract_hash` to prevent a concurrent
@@ -2469,13 +3236,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Remove a local client subscription.
     /// Returns true if this caused us to lose interest.
     pub fn remove_local_client(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
             let lost_interest = entry.remove_client();
             if lost_interest {
                 drop(entry);
-                self.local_interests.remove(contract);
+                // Remove only if still uninterested: a concurrent add_* between
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2486,6 +3262,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Add a downstream subscriber.
     /// Returns true if this caused us to become interested.
     pub fn add_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
         // Same lock-across-index discipline as `register_local_hosting`.
         let mut entry = self.local_interests.entry(*contract).or_default();
         let became_interested = entry.add_downstream();
@@ -2497,13 +3274,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Remove a downstream subscriber.
     /// Returns true if this caused us to lose interest.
     pub fn remove_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+        self.reset_reconcile_wait(contract);
         if let Some(mut entry) = self.local_interests.get_mut(contract) {
             let lost_interest = entry.remove_downstream();
             if lost_interest {
                 drop(entry);
-                self.local_interests.remove(contract);
+                // Remove only if still uninterested: a concurrent add_* between
+                // dropping the guard and here must not be deleted, and then
+                // interest was not lost, so report false and the caller sends
+                // no retraction (#5780).
+                let removed = self
+                    .local_interests
+                    .remove_if(contract, |_, v| !v.is_interested())
+                    .is_some();
                 // Clean up hash index if no interest remains
                 self.cleanup_contract_if_no_interest(contract);
+                return removed;
             }
             lost_interest
         } else {
@@ -2549,10 +3335,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Get or create local interest entry, returning mutable reference.
+    /// Every call, a read included, restarts reconciliation's wait (#5782),
+    /// so polling it keeps the contract's records from being dropped; use
+    /// [`Self::has_local_interest`] to read.
     pub fn with_local_interest<F, R>(&self, contract: &ContractKey, f: F) -> R
     where
         F: FnOnce(&mut LocalInterest) -> R,
     {
+        self.reset_reconcile_wait(contract);
         let mut entry = self.local_interests.entry(*contract).or_default();
         f(entry.value_mut())
     }
@@ -2593,7 +3383,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         if let Some(entry) = self.local_interests.get(contract) {
             if !entry.is_interested() {
                 drop(entry);
-                self.local_interests.remove(contract);
+                // Conditional: a concurrent add_* after the guard drop must not
+                // be deleted (#5780).
+                self.local_interests
+                    .remove_if(contract, |_, v| !v.is_interested());
             }
         }
     }
@@ -2606,20 +3399,23 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let mut expired = Vec::new();
 
         // Collect and sort contracts for deterministic iteration order
-        let mut contracts: Vec<_> = self
+        let mut contracts: Vec<(ContractKey, Vec<PeerKey>)> = self
             .interested_peers
             .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
+            .map(|entry| {
+                let expired_peers = entry
+                    .value()
+                    .iter()
+                    .filter(|(_, interest)| interest.is_expired_at(now))
+                    .map(|(peer, _)| peer.clone())
+                    .collect();
+                (*entry.key(), expired_peers)
+            })
             .collect();
         contracts.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-        for (contract, peers_map) in contracts {
-            // Collect and sort peers for deterministic iteration order
-            let mut peers_to_remove: Vec<PeerKey> = peers_map
-                .iter()
-                .filter(|(_, interest)| interest.is_expired_at(now))
-                .map(|(peer, _)| peer.clone())
-                .collect();
+        for (contract, mut peers_to_remove) in contracts {
+            // Sort peers for deterministic iteration order
             peers_to_remove.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
             for peer in peers_to_remove {
@@ -2731,6 +3527,200 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Restart the reconciliation wait for `contract` (#5780): any change in
+    /// local interest, or an upstream registration, means it was hosted or
+    /// used after a pass last looked. Called before the caller takes any other
+    /// guard. Lock order: a reconciliation pass reads `reconcile_candidates`
+    /// while holding an `interested_peers` shard guard
+    /// ([`Self::remove_peer_interest_if`]), so no code may hold a
+    /// `reconcile_candidates` guard while taking an `interested_peers` one.
+    fn reset_reconcile_wait(&self, contract: &ContractKey) {
+        self.reconcile_candidates.remove(contract);
+    }
+
+    /// Contracts from which reconciliation has dropped neighbour records since
+    /// startup (#5780), counting a contract once per pass that dropped any of
+    /// its records, including a pass cut short by a re-host.
+    pub(crate) fn reconcile_contracts_dropped_total(&self) -> u64 {
+        self.reconcile_contracts_dropped_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Drop neighbour interest records for contracts this node neither hosts
+    /// nor uses (#5780). Run by the ring's 60s hosting sweep, which supplies
+    /// the hosting facts as closures.
+    ///
+    /// Each pass examines up to [`MAX_RECONCILE_KEYS_PER_PASS`] tracked
+    /// contracts, in contract-id order from where the previous pass stopped.
+    /// It records when each was first seen neither hosted nor in use. Once
+    /// that has lasted [`RECONCILE_MIN_UNUSED_AGE`] with no change in local
+    /// interest, it clears a stale local-hosting flag (reported in
+    /// [`ReconcileOutcome::hosting_flags_cleared`]), reports the contract for
+    /// advertisement retraction on every such pass, and, if nothing else keeps
+    /// a local interest in the contract (a local client or delegate, a
+    /// downstream subscriber), drops every neighbour record. That also
+    /// unindexes the contract, so the heartbeat stops advertising it. A
+    /// contract this node holds its own lease toward (`holds_lease`) is left
+    /// alone, flag, records and advertisement, until the lease lapses.
+    ///
+    /// The tracked set is the contracts with interest records or local
+    /// interest plus `advertised` (this node's co-host advertisements), so an
+    /// advertisement with nothing else left to keep its contract tracked is
+    /// still retracted, however the lease or the records ended.
+    ///
+    /// Why level-triggered: neighbour records used to outlive eviction because
+    /// the contract stayed in `contract_hash_index` while any record existed,
+    /// so our heartbeat kept advertising it and neighbours kept refreshing the
+    /// records. Several paths create records without a hosting check, so a
+    /// cleanup run only when interest ends can be undone by a registration
+    /// already in flight. Re-checking every pass, waiting out
+    /// [`RECONCILE_MIN_UNUSED_AGE`], and re-checking hosted, in-use, local
+    /// interest and this node's own lease before each record is dropped covers
+    /// those paths; the record's removal also re-checks, under its shard
+    /// guard, that the wait has not restarted. Hosting and use are read
+    /// through closures, so they are not atomic with a concurrent re-host; a
+    /// neighbour registration that lands after its record is dropped is
+    /// restored by the next heartbeat (as non-upstream) or renewal.
+    /// A re-host that lands while the stale flag is being cleared is caught by
+    /// a check after the clear, which puts the flag back and reports nothing.
+    pub(crate) fn reconcile_with_hosting(
+        &self,
+        advertised: &[ContractKey],
+        is_hosted: impl Fn(&ContractKey) -> bool,
+        in_use: impl Fn(&ContractKey) -> bool,
+        holds_lease: impl Fn(&ContractKey) -> bool,
+    ) -> ReconcileOutcome {
+        let mut outcome = ReconcileOutcome::default();
+        let now = self.time_source.now();
+        let by_id = |a: &ContractKey, b: &ContractKey| a.id().as_bytes().cmp(b.id().as_bytes());
+
+        let mut tracked: Vec<ContractKey> = self
+            .interested_peers
+            .iter()
+            .map(|e| *e.key())
+            .chain(self.local_interests.iter().map(|e| *e.key()))
+            .chain(advertised.iter().copied())
+            .collect();
+        // Deduplicated by instance id, so which of two same-id keys survives
+        // is unspecified: keys in the outcome identify a contract by id only
+        // (retraction, interest change, unindex) and must not be used to load
+        // code.
+        tracked.sort_unstable_by(by_id);
+        tracked.dedup_by(|a, b| a.id() == b.id());
+
+        // Forget contracts that are no longer tracked at all.
+        let untracked: Vec<ContractKey> = self
+            .reconcile_candidates
+            .iter()
+            .map(|e| *e.key())
+            .filter(|key| tracked.binary_search_by(|t| by_id(t, key)).is_err())
+            .collect();
+        for key in &untracked {
+            self.reconcile_candidates.remove(key);
+        }
+
+        // Resume after the last contract the previous pass examined, wrapping.
+        let start = match *self.reconcile_cursor.lock() {
+            Some(last) => tracked.partition_point(|t| by_id(t, &last).is_le()),
+            None => 0,
+        };
+        let window: Vec<ContractKey> = tracked[start..]
+            .iter()
+            .chain(tracked[..start].iter())
+            .take(MAX_RECONCILE_KEYS_PER_PASS)
+            .copied()
+            .collect();
+        *self.reconcile_cursor.lock() = window.last().copied();
+
+        for key in window {
+            if is_hosted(&key) || in_use(&key) {
+                self.reconcile_candidates.remove(&key);
+                continue;
+            }
+            let first_seen = *self.reconcile_candidates.entry(key).or_insert(now);
+            if now.saturating_duration_since(first_seen) < RECONCILE_MIN_UNUSED_AGE {
+                continue;
+            }
+            if holds_lease(&key) {
+                // This node's own lease is live (#5782): a subscribe may still
+                // be fetching the body, it needs the upstream record and the
+                // interest it announced, and the retraction would refuse. The
+                // lease is not demand and is renewed only for demand, so it
+                // lapses within one lease period; the contract is handled on
+                // the first pass after that.
+                continue;
+            }
+            let flagged = self
+                .local_interests
+                .get(&key)
+                .is_some_and(|entry| entry.hosting);
+            if flagged && !is_hosted(&key) {
+                let lost = self.clear_local_hosting_flag(&key);
+                if is_hosted(&key) {
+                    // Re-hosted between the check and the clear: put the flag
+                    // back and report nothing (#5782).
+                    self.register_local_hosting(&key);
+                } else {
+                    outcome.hosting_flags_cleared.push(key);
+                    if lost {
+                        outcome.interest_lost.push(key);
+                    }
+                }
+            }
+            // No hosting re-check here: the retraction re-checks hosting, use
+            // and lease itself, after removing the advertisement entry.
+            outcome.advertisements_to_retract.push(key);
+            let peers: Vec<PeerKey> = match self.interested_peers.get(&key) {
+                Some(entry) => entry.keys().cloned().collect(),
+                None => {
+                    self.reconcile_candidates.remove(&key);
+                    continue;
+                }
+            };
+            let mut dropped = 0;
+            for peer in peers {
+                // Checked per record, so local interest (a client, delegate or
+                // downstream subscriber), a re-host, a lease, or anything that
+                // restarted the wait (an upstream registration by a subscribe
+                // starting) that lands mid-loop stops the drop.
+                // `has_local_interest` backstops a local-interest writer that
+                // does not restart the wait; every current one does.
+                if self.has_local_interest(&key)
+                    || is_hosted(&key)
+                    || in_use(&key)
+                    || holds_lease(&key)
+                {
+                    break;
+                }
+                // The wait check runs under the record's shard guard, so a
+                // subscribe refreshing this very record cannot slip between
+                // the check and the removal.
+                let wait_unchanged =
+                    || self.reconcile_candidates.get(&key).map(|seen| *seen) == Some(first_seen);
+                match self.remove_peer_interest_if(
+                    &key,
+                    &peer,
+                    InterestRemovalCause::Eviction,
+                    wait_unchanged,
+                ) {
+                    None => break,
+                    Some(true) => dropped += 1,
+                    Some(false) => {}
+                }
+            }
+            if dropped > 0 {
+                outcome.contracts_dropped += 1;
+                outcome.records_dropped += dropped;
+                self.reconcile_contracts_dropped_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if !self.interested_peers.contains_key(&key) {
+                self.reconcile_candidates.remove(&key);
+            }
+        }
+        outcome
+    }
+
     /// Clean up hash index for a contract if there's no remaining interest.
     /// Called after removing peer or local interest.
     fn cleanup_contract_if_no_interest(&self, contract: &ContractKey) {
@@ -2764,6 +3754,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         hashes
     }
 
+    /// Contracts that have at least one neighbour record, sorted (#5780 sim
+    /// assertions).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn contracts_with_peer_records(&self) -> Vec<ContractKey> {
+        let mut keys: Vec<ContractKey> = self.interested_peers.iter().map(|e| *e.key()).collect();
+        keys.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        keys
+    }
+
     /// Get contracts we're interested in that match the given hashes.
     pub fn get_matching_contracts(&self, hashes: &[u32]) -> Vec<ContractKey> {
         let hash_set: std::collections::HashSet<u32> = hashes.iter().copied().collect();
@@ -2795,8 +3794,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Mid-cycle this resumes immediately after the last contract SENT to that
     /// peer, which is what makes successive windows contiguous in id space
     /// (see [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the
-    /// cursor evicted or lost, or the previous window ending on the highest id
-    /// — the next cycle starts at a RANDOM offset rather than at 0.
+    /// cursor evicted or lost, or the cycle genuinely COMPLETED — the next
+    /// cycle starts at a RANDOM offset rather than at 0.
+    ///
+    /// A window ending on the highest id is NOT a boundary. It has wrapped,
+    /// and the next window continues at index 0. Reading it as a boundary was
+    /// #5181; an earlier version of this very paragraph asserted the opposite.
     ///
     /// A fixed restart at 0 is the failure this codebase has already rejected
     /// twice, for the same reason each time: see the rotations in
@@ -2813,9 +3816,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///   #5338; see [`Self::summary_window_cursor`].)
     /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
     ///   so the peer influences where the cursor lands. Advertising a single
-    ///   high-id contract parks the cursor at the end, and the following full
-    ///   round would restart at 0 — repeat, and everything past the first
-    ///   window is never advertised.
+    ///   high-id contract parks the cursor at the end, and with a FIXED
+    ///   restart the following full round would begin at 0 — repeat, and
+    ///   everything past the first window is never advertised. (That
+    ///   alternation no longer ends our cycle at all: completion is measured
+    ///   against [`SummaryCursor::cycle_len`], a length the peer cannot move.)
     ///
     /// Randomising the boundary costs nothing in the ordinary case: a cycle
     /// beginning at any offset still advances contiguously and still covers
@@ -2824,44 +3829,388 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// covered first every time.
     ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
-    pub(crate) fn summary_window_start(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
+    ///
+    /// # Whether a cycle has ENDED is the count's job, not the index's
+    ///
+    /// A window ending exactly on the highest id has WRAPPED, not finished, and
+    /// must be followed by index 0 to stay contiguous. Deciding that from the
+    /// resume index alone cannot distinguish the two, which was #5181; the
+    /// cursor carries a per-cycle count for it. See [`SummaryCursor`].
+    ///
+    /// # Drawing a boundary PUBLISHES it, under the same lock hold
+    ///
+    /// Replies are separate tasks and each awaits a storage hit per contract,
+    /// so two `Interests` from one peer straddling a boundary is routine. If
+    /// the origin were drawn without being published, both would see no cursor,
+    /// draw DIFFERENT origins, and have both entry counts charged to one cycle
+    /// for two non-contiguous windows — the count running ahead of the ground
+    /// covered, which is #5181's own failure class. Drawing and publishing
+    /// together makes the second racer resume from the same origin.
+    ///
+    /// `GlobalRng` is thread-local (`THREAD_RNG` / `THREAD_SEED` are
+    /// `thread_local!`), so drawing under the lock cannot deadlock.
+    ///
+    /// # Anti-steering
+    ///
+    /// Before the fix, every round whose resume ran off the end re-randomised.
+    /// That defeated steering — but only as a side effect of the bug, since it
+    /// also re-randomised mid-cycle, and restoring the coverage bound removes
+    /// it. The replacement must therefore not hand the peer a NEW lever, and
+    /// the obvious version of this fix did: comparing the cycle count against
+    /// the current `sorted.len()` lets a peer end our cycle whenever it likes,
+    /// since it chooses `sorted`. That would be a deterministic, permanent
+    /// starvation replacing a random, self-correcting one — worse than #5181.
+    /// Completion is measured against [`SummaryCursor::cycle_len`], the length
+    /// captured when the cycle began, so a peer cannot end our cycle on demand
+    /// by shrinking what it advertises;
+    /// `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` asserts it.
+    ///
+    /// ## The redraw at completion is load-bearing, not decoration
+    ///
+    /// The frame guard in [`Self::record_summary_cursor`] cannot be the whole
+    /// defence, and no record-level check can be. A record is validated by its
+    /// circular advance within `sorted` — and `sorted` is the PEER's set, so a
+    /// well-formed advance of `k` positions inside a set the peer composed is
+    /// an arbitrary jump across the ground the cycle is sweeping. The record is
+    /// not even dishonest: the peer really did receive those entries. The
+    /// steering happens HERE, when an id is resolved against a set the peer
+    /// chose, not there.
+    ///
+    /// What bounds it is that a completed cycle draws a fresh random origin,
+    /// which periodically destroys any position the peer has arranged. Removing
+    /// that in favour of a contiguous boundary — to deliver a tighter revisit
+    /// bound — reopens the steering: a peer alternating two sets of the SAME
+    /// size (so no frame-based guard can fire at all) pinned every round of one
+    /// set to the same window, starving a genuinely shared contract, with zero
+    /// rejections logged.
+    /// `probe_same_size_recomposition_pins_the_window` is that attack.
+    ///
+    /// Measured over the four candidate boundary rules, coverage of the
+    /// attacked set under that probe was: contiguous 15/16, contiguous with a
+    /// reset to the cycle origin 15/16, a position cursor advanced by each
+    /// round's fair share of id space 9/16 (which also loses coverage against
+    /// an HONEST peer, because `cycle_len` says how many entries there are and
+    /// not how they are spread, and the peer picks the spread), and the random
+    /// redraw 16/16. Contiguity and anti-steering are in direct tension and the
+    /// redraw is what currently pays for the second.
+    ///
+    /// The cost is the revisit bound. Because each cycle starts somewhere new,
+    /// a contract covered early in one cycle and late in the next waits up to
+    /// `2 * ceil(len / limit) - 1` rounds, not `ceil(len / limit)`; measured at
+    /// `len = 200`, `limit = 64` (so `ceil` is 4), six 12-cycle runs gave
+    /// worst-case gaps of 6, 7, 7, 7, 6 and 7.
+    /// `the_revisit_gap_spans_at_most_two_cycles` pins the honest figure. Do
+    /// not quote the single-cycle `ceil(len / limit)` as a revisit bound: that
+    /// is the WITHIN-cycle coverage bound, and the two are different claims.
+    ///
+    /// Delivering `ceil(len / limit)` needs a cursor whose position is not
+    /// resolved through the peer's set at all — a positional (geometric) notion
+    /// of completion, which would additionally make a staleness bound stateable
+    /// under churn: #5313. That is the right fix and it is a design change, not
+    /// a guard.
+    pub(crate) fn begin_summary_window(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
-        let after = { self.summary_window_cursor.lock().peek(peer).copied() };
-        let resumed = after.map(|after| first_index_after(sorted, &after));
-        match resumed {
-            // Mid-cycle: continue exactly where the last reply stopped.
-            Some(start) if start < sorted.len() => start,
-            // Cycle boundary (cursor absent, or exhausted past the end).
-            _ => crate::config::GlobalRng::random_range(0..sorted.len()),
+        let mut cursors = self.summary_window_cursor.lock();
+        let resume = cursors.peek(peer).and_then(|cursor| {
+            // A run of rejected records means the cursor is not being driven by
+            // well-formed rounds, so resuming from it would re-send the same
+            // window forever. Fall back to a boundary instead of wedging.
+            if cursor.cycle_complete()
+                || cursor.consecutive_rejections >= MAX_CONSECUTIVE_CURSOR_REJECTIONS
+            {
+                None
+            } else {
+                // Resume immediately after the last entry sent, WRAPPING past
+                // the end of the set rather than reading the end as a boundary.
+                // The `% len` is what #5181 was missing.
+                Some(first_index_after(sorted, &cursor.last_sent) % sorted.len())
+            }
+        });
+        match resume {
+            Some(start) => start,
+            // Cycle boundary: no cursor (first reply, restart, LRU eviction),
+            // the cycle completed, or the escape above. Draw AND publish
+            // together.
+            None => {
+                let origin = crate::config::GlobalRng::random_range(0..sorted.len());
+                cursors.put(peer.clone(), SummaryCursor::starting_at(sorted, origin));
+                origin
+            }
         }
     }
 
-    /// Record the contract id of the last entry actually included in `peer`'s
-    /// periodic summary reply, so the next reply resumes after it.
+    /// Record the entries actually included in `peer`'s periodic summary reply,
+    /// so the next reply resumes after them and the cycle count tracks the
+    /// ground covered.
     ///
     /// Takes what was SENT, not what was selected: the byte budget can cut a
     /// window short, and advancing past entries we dropped would skip them
     /// until the rotation wrapped all the way round.
-    pub(crate) fn record_summary_cursor(&self, peer: &PeerKey, last_sent: ContractInstanceId) {
-        self.summary_window_cursor
-            .lock()
-            .put(peer.clone(), last_sent);
+    ///
+    /// `sorted` must be the SAME snapshot the window was built from. That is
+    /// what makes the check below exact under churn: the window is chosen by
+    /// index in that snapshot starting at the resume position, so an insertion
+    /// since the previous round shifts both positions together.
+    ///
+    /// # A record must advance the cycle by exactly what it sent
+    ///
+    /// A slow reply carrying an earlier window could otherwise record last,
+    /// both double-charging the cycle AND rewinding `last_sent` so the rotation
+    /// re-sent covered ground. A record is accepted only when it moves by
+    /// exactly the number of entries it sent, measured CIRCULARLY from the
+    /// previous position.
+    ///
+    /// No well-formed round is ever rejected, and that is an identity rather
+    /// than a case list: a round resuming at `prev_pos` and sending `k`
+    /// contiguous entries ends at `(prev_pos + k - 1) % len`, so the recorded
+    /// position is `(prev_pos + k) % len` and the circular advance is `k % len`
+    /// — which is `k` when `k < len` and `0` when `k == len`, both equal to
+    /// `entries_sent % len`.
+    ///
+    /// Three traps, each of which a coverage assertion passes under, so each is
+    /// pinned by its own test:
+    ///
+    /// - **Circular, not linear.** A legitimate window wraps past the highest
+    ///   id, so its last entry can sort BELOW the previous one; a linear test
+    ///   calls that a rewind.
+    /// - **Relative to the previous position, not the origin.** A window that
+    ///   crosses the origin lands a SHORT distance after it, so measuring from
+    ///   the origin makes the crossing round look like the largest rewind of
+    ///   the cycle. Rejecting it parks the cursor and the rotation WEDGES
+    ///   permanently — strictly worse than the staleness this stops.
+    /// - **Bounded above by one window is not enough on its own.** Forward
+    ///   distance alone cannot separate a short hop from a long rewind, since
+    ///   every rewind is forward the long way round. Requiring the exact
+    ///   distance is what separates them.
+    ///
+    /// There is deliberately no first-record exemption. It is unnecessary
+    /// because [`SummaryCursor::starting_at`] publishes the origin's
+    /// PREDECESSOR, so `first_index_after` resolves it back to the origin and
+    /// the first round's advance is exactly `k`. It would also be actively
+    /// wrong: a reply that read the OLD cycle and landed after another reply
+    /// took the boundary would meet it on the freshly published cursor and
+    /// overwrite the just-drawn origin with a stale id.
+    pub(crate) fn record_summary_cursor(
+        &self,
+        peer: &PeerKey,
+        last_sent: ContractInstanceId,
+        entries_sent: usize,
+        sorted: &[ContractKey],
+    ) {
+        let len = sorted.len();
+        if len == 0 || entries_sent == 0 {
+            return;
+        }
+        debug_assert!(
+            entries_sent <= len,
+            "a round cannot send more entries than the set holds: \
+             rotation_window_indices caps the window at limit.min(len)"
+        );
+        let new_pos = first_index_after(sorted, &last_sent) % len;
+        let mut cursors = self.summary_window_cursor.lock();
+        let updated = match cursors.peek(peer) {
+            Some(prev)
+                if len < prev.cycle_len
+                    && (entries_sent >= len || len.saturating_mul(2) < prev.cycle_len) =>
+            {
+                // A round built against a SMALLER set than the cycle's own
+                // frame. Its last id is not a position in this cycle's ground,
+                // and applying it would drag `last_sent` to wherever the
+                // smaller set happens to end.
+                //
+                // That is the peer's lever: `sorted` is the intersection with
+                // the hashes IT advertised, so alternating a one-hash
+                // `Interests` with a full one would otherwise pull the cursor
+                // to that one hash every other round and stall the full
+                // rotation short of the set. Charging the rejection means the
+                // escape below still fires, so a set that has genuinely shrunk
+                // redraws within a bounded number of rounds instead of wedging.
+                //
+                // # Why not `len < cycle_len` alone
+                //
+                // Both sides of the intersection churn — interest entries
+                // expire on a 20-minute TTL and are swept every minute — so a
+                // set one or two elements below the frame is ORDINARY, not
+                // adversarial, and rejecting it costs real bandwidth for no
+                // coverage. A rejected round parks the cursor, so the NEXT
+                // round re-sends a byte-identical window: measured on a
+                // 200-contract set losing one element on alternate rounds, the
+                // bare form took 6 rounds and 3 rejections to cover the set
+                // where this one takes 4 and none. Anti-entropy bandwidth is
+                // the scarce resource here (#5153), so a 50% surcharge on
+                // ordinary churn is not a cheap safety margin.
+                // `an_ordinary_shrink_is_not_rejected` pins the churn case.
+                //
+                // The two clauses are the cases the ADVANCE check below cannot
+                // police, and neither implies the other:
+                //
+                // - `entries_sent >= len` — the round covered the WHOLE set, so
+                //   it wrapped to where it started: its circular advance is `0`
+                //   and `entries_sent % len` is `0` too, and ANY last id the
+                //   peer arranges passes. That is the vacuous case, and it is
+                //   reachable at any size (a 150-of-200 set sent whole).
+                // - `len * 2 < prev.cycle_len` — a MATERIAL shrink. Below that
+                //   the advance check is not vacuous, but it is still measured
+                //   in the peer's own index space, and a well-formed advance of
+                //   `k` positions inside a set the peer composed is an
+                //   arbitrary jump across the ground the cycle is sweeping. The
+                //   check proves the round is internally consistent; it says
+                //   nothing about where the cursor LANDS.
+                //   `probe_peer_pins_window_with_a_set_larger_than_the_limit`
+                //   and `probe_budget_cut_round_bypasses_the_frame_guard` are
+                //   that attack at two different sizes.
+                //
+                // Neither clause is a general defence against a peer-composed
+                // set — nothing checked here can be, because `sorted` is the
+                // coordinate system the record is expressed in. What bounds the
+                // residue is the RANDOM REDRAW at cycle completion in
+                // [`Self::begin_summary_window`], which periodically destroys
+                // any position the peer has arranged. See its rustdoc.
+                self.summary_cursor_rejections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rejections = prev.consecutive_rejections.saturating_add(1);
+                tracing::debug!(
+                    ?peer,
+                    set_len = len,
+                    entries_sent,
+                    cycle_len = prev.cycle_len,
+                    consecutive = rejections,
+                    "ignored a summary-rotation record from a smaller set than the cycle frame"
+                );
+                let mut framed = *prev;
+                framed.consecutive_rejections = rejections;
+                cursors.put(peer.clone(), framed);
+                return;
+            }
+            Some(prev) => {
+                let prev_pos = first_index_after(sorted, &prev.last_sent) % len;
+                let advance = (new_pos + len - prev_pos) % len;
+                if advance != entries_sent % len {
+                    // Not well-formed against the current cycle: a stale or
+                    // duplicate window, or one that straddled a boundary
+                    // another reply already took. Discard it — the published
+                    // origin survives, and the ground this reply sent is simply
+                    // re-sent later, having never been charged.
+                    self.summary_cursor_rejections
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rejections = prev.consecutive_rejections.saturating_add(1);
+                    // Visible in the field, not only to tests: a RUN of these
+                    // means the cursor is not being driven by well-formed
+                    // rounds, and the only other symptom is that this peer
+                    // quietly stops converging on most contracts.
+                    tracing::debug!(
+                        ?peer,
+                        advance,
+                        entries_sent,
+                        set_len = len,
+                        consecutive = rejections,
+                        "discarded a summary-rotation record that did not advance the cycle"
+                    );
+                    let mut wedged = *prev;
+                    wedged.consecutive_rejections = rejections;
+                    cursors.put(peer.clone(), wedged);
+                    return;
+                }
+                SummaryCursor {
+                    last_sent,
+                    advertised_in_cycle: prev.advertised_in_cycle.saturating_add(entries_sent),
+                    cycle_len: prev.cycle_len,
+                    consecutive_rejections: 0,
+                }
+            }
+            // Evicted between drawing the window and recording it. Nothing to
+            // check against, so start a fresh cycle rather than discarding a
+            // round's progress.
+            None => SummaryCursor {
+                last_sent,
+                advertised_in_cycle: entries_sent,
+                cycle_len: len,
+                consecutive_rejections: 0,
+            },
+        };
+        cursors.put(peer.clone(), updated);
     }
 
-    /// Test accessor for the stored cursor.
+    /// Records discarded by [`Self::record_summary_cursor`]'s advance check.
+    /// Diagnostic only; a non-zero value is expected under concurrency.
+    #[cfg(test)]
+    pub(crate) fn summary_cursor_rejections(&self) -> usize {
+        self.summary_cursor_rejections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test accessor for the id the cursor resumes after.
     #[cfg(test)]
     pub(crate) fn peek_summary_cursor(&self, peer: &PeerKey) -> Option<ContractInstanceId> {
+        self.summary_window_cursor
+            .lock()
+            .peek(peer)
+            .map(|c| c.last_sent)
+    }
+
+    /// Test accessor for the whole cursor, including the cycle count.
+    #[cfg(test)]
+    pub(crate) fn peek_summary_cursor_state(&self, peer: &PeerKey) -> Option<SummaryCursor> {
         self.summary_window_cursor.lock().peek(peer).copied()
+    }
+
+    /// Seed a cursor as the BOUNDARY would: a cycle beginning at `origin` with
+    /// nothing yet sent.
+    ///
+    /// Goes through the same [`SummaryCursor::starting_at`] the boundary uses,
+    /// so a test cannot pin the code to a state production never produces.
+    #[cfg(test)]
+    pub(crate) fn seed_summary_cursor_at_origin(
+        &self,
+        peer: &PeerKey,
+        sorted: &[ContractKey],
+        origin: usize,
+    ) {
+        self.summary_window_cursor
+            .lock()
+            .put(peer.clone(), SummaryCursor::starting_at(sorted, origin));
+    }
+
+    /// Seed a mid-cycle cursor directly: the last entry sent was `last_sent`,
+    /// with `advertised` entries covered so far this cycle.
+    ///
+    /// Prefer [`Self::seed_summary_cursor_at_origin`] where the test means "a
+    /// cycle just began". This one exists for tests that need a specific resume
+    /// POSITION, and its `advertised` must be a count a contiguous cycle could
+    /// actually have reached, or the test is pinning an unreachable state.
+    #[cfg(test)]
+    pub(crate) fn seed_summary_cursor(
+        &self,
+        peer: &PeerKey,
+        last_sent: ContractInstanceId,
+        advertised: usize,
+        cycle_len: usize,
+    ) {
+        self.summary_window_cursor.lock().put(
+            peer.clone(),
+            SummaryCursor {
+                last_sent,
+                advertised_in_cycle: advertised,
+                cycle_len,
+                consecutive_rejections: 0,
+            },
+        );
     }
 }
 
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which [`InterestManager::summary_window_start`] reads as the end of a
-/// cycle and answers with a fresh random offset.
+/// end.
+///
+/// That return is AMBIGUOUS and must not be read as "the cycle ended": it
+/// means either a cursor genuinely past the end or one sitting on the highest
+/// id, which is a mid-cycle wrap. [`InterestManager::begin_summary_window`]
+/// takes it modulo the set size and asks
+/// [`SummaryCursor::cycle_complete`] about the cycle instead. Conflating the
+/// two was #5181.
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
 /// over ids rather than a stored offset, it behaves correctly when the set
@@ -2880,6 +4229,109 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 /// only thing that makes bounding the reply defensible in the first place.
 pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstanceId) -> usize {
     sorted.partition_point(|c| c.id().as_bytes() <= after.as_bytes())
+}
+
+/// One peer's position in the rotation, plus how much of the CURRENT cycle it
+/// has already been told about.
+///
+/// The count exists because the resume index cannot answer "is this a cycle
+/// boundary" on its own, and #5181 was what happened when it was asked to.
+/// [`first_index_after`] returns `sorted.len()` for two different situations:
+///
+/// - the cursor is genuinely past the end of the set — a real boundary;
+/// - the cursor sits ON the highest id in the set — a mid-cycle WRAP, and
+///   precisely the wrap [`rotation_window_indices`]'s coverage argument needs,
+///   since a window ending at index `len - 1` must be followed by index 0.
+///
+/// Reading the second as the first drew a fresh random origin partway through a
+/// cycle, breaking the contiguity `ceil(len / limit)` depends on. It fires on
+/// about `1 / limit` of cycles independently of set size, so the bound #5155
+/// justifies bounding the reply with was overstated in shipped code.
+///
+/// # The count is not approximate in the safe direction
+///
+/// It can UNDER-run a cycle, ending it early and leaving an arc unadvertised
+/// for an extra cycle. Three ways, none of them defects to be fixed here:
+///
+/// - two concurrent replies cut at different lengths by the byte budget carry
+///   different last ids, so the shorter is not recognised as ground the longer
+///   already covered;
+/// - contract CHURN — an id inserted into already-swept ground is
+///   indistinguishable from one that was advertised;
+/// - the peer chooses `sorted` (it is the intersection with the hashes IT
+///   advertised), so it chooses the length the count is compared against. See
+///   [`InterestManager::begin_summary_window`] for the anti-steering limit that
+///   leaves open.
+///
+/// The `ceil(len / limit)` bound therefore holds for a set STABLE across the
+/// cycle. Under churn there is no round bound, and asserting one anyway is what
+/// #5181 was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SummaryCursor {
+    /// Contract id of the last entry actually SENT to this peer.
+    last_sent: ContractInstanceId,
+    /// Entries sent so far in the current cycle.
+    advertised_in_cycle: usize,
+    /// Size of the shared set when this cycle BEGAN, and the target
+    /// `advertised_in_cycle` is measured against.
+    ///
+    /// Deliberately not the CURRENT `sorted.len()`. The peer chooses `sorted`
+    /// — it is the intersection with the hashes it advertised — so comparing
+    /// against the current length lets it end our cycle whenever it likes by
+    /// advertising a single hash, which re-seeds the rotation from an id it
+    /// picked. Measured against the length the cycle started with, a
+    /// one-element round contributes one entry towards a target it cannot
+    /// move, and the cycle still completes on our terms.
+    ///
+    /// Under genuine churn this is approximate in both directions: a set that
+    /// grew completes the cycle early (an arc waits an extra cycle), one that
+    /// shrank completes it late. Both are bounded by one cycle, unlike the
+    /// unbounded starvation the peer-controlled version allows.
+    cycle_len: usize,
+    /// Consecutive records rejected by the advance check.
+    ///
+    /// Bounds a rejection wedge. A record that never advances leaves the
+    /// cursor untouched, so if some caller-side defect made every record
+    /// ill-formed the same window would be re-sent forever and every other
+    /// contract starved for the process lifetime — strictly worse than the
+    /// staleness the check exists to stop, and exactly the unbounded-exemption
+    /// shape `.claude/rules/ring.md` warns about. After
+    /// [`MAX_CONSECUTIVE_CURSOR_REJECTIONS`] the next window is treated as a
+    /// boundary, degrading to a fresh random origin rather than to silence.
+    consecutive_rejections: u8,
+}
+
+/// Rejected records tolerated before [`InterestManager::begin_summary_window`]
+/// gives up on the current cycle and redraws.
+///
+/// Small on purpose: legitimate rejections are racy (a duplicate or a
+/// boundary-straddling reply) and self-correcting, so a run of three says the
+/// cursor is not being driven by well-formed rounds at all.
+const MAX_CONSECUTIVE_CURSOR_REJECTIONS: u8 = 3;
+
+impl SummaryCursor {
+    /// A cursor that resumes the next window AT `origin`, beginning a cycle
+    /// measured against the current set size.
+    ///
+    /// Stores the origin's PREDECESSOR, because the stored id names the last
+    /// entry sent and [`first_index_after`] resolves it to the next one. That
+    /// is what makes a freshly-drawn boundary readable by a second concurrent
+    /// reply as "resume at `origin`" rather than as "no cursor, draw your own".
+    fn starting_at(sorted: &[ContractKey], origin: usize) -> Self {
+        debug_assert!(!sorted.is_empty(), "an empty set has no origin");
+        let predecessor = sorted[(origin + sorted.len() - 1) % sorted.len()];
+        Self {
+            last_sent: *predecessor.id(),
+            advertised_in_cycle: 0,
+            cycle_len: sorted.len(),
+            consecutive_rejections: 0,
+        }
+    }
+
+    /// Whether this cycle has covered the ground it set out to cover.
+    fn cycle_complete(&self) -> bool {
+        self.advertised_in_cycle >= self.cycle_len
+    }
 }
 
 /// Indices of the next rotation window: up to `limit` entries beginning at
@@ -3447,6 +4899,341 @@ mod tests {
         (manager, time_source)
     }
 
+    // ---- #5786: identical neighbour summaries are stored once ----
+
+    const SHARED_BYTES: [u8; 64] = [1; 64];
+    const UNIQUE_BYTES: [u8; 64] = [2; 64];
+
+    /// Distinct summaries stored for `contract` (0 when it has no records).
+    fn distinct_summaries(manager: &TestInterestManager, contract: &ContractKey) -> usize {
+        manager
+            .interested_peers
+            .get(contract)
+            .map_or(0, |entry| entry.distinct_summaries())
+    }
+
+    /// Every contract's shared-summary table matches its records exactly.
+    fn assert_summary_tables_consistent(manager: &TestInterestManager) {
+        let mut neighbour_bytes = 0;
+        for entry in &manager.interested_peers {
+            entry.value().assert_consistent();
+            neighbour_bytes += entry.value().neighbour_bytes();
+        }
+        // #5781: the node-wide counter is exact after every change.
+        assert_eq!(
+            manager.neighbour_summary_bytes(),
+            neighbour_bytes,
+            "node-wide neighbour-summary counter drifted"
+        );
+    }
+
+    /// A contract where witness `w` holds SHARED_BYTES and two other peers
+    /// hold SHARED_BYTES (`shared`) and UNIQUE_BYTES (`unique`). Removing or
+    /// clearing `shared` and `unique` while `w` stays must leave exactly one
+    /// stored summary; a path that forgets to release leaves two.
+    fn summary_sharing_fixture(
+        manager: &TestInterestManager,
+    ) -> (ContractKey, PeerKey, PeerKey, PeerKey) {
+        let contract = make_contract_key(1);
+        let (w, shared, unique) = (make_peer_key(1), make_peer_key(2), make_peer_key(3));
+        for peer in [&w, &shared] {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                peer,
+                StateSummary::from(SHARED_BYTES.to_vec())
+            ));
+        }
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(manager, &contract), 2);
+        assert_summary_tables_consistent(manager);
+        (contract, w, shared, unique)
+    }
+
+    /// After a path removed or cleared `shared` and `unique`, only the
+    /// witness's summary is stored, once.
+    fn assert_only_witness_summary_left(
+        manager: &TestInterestManager,
+        contract: &ContractKey,
+        w: &PeerKey,
+    ) {
+        assert_summary_tables_consistent(manager);
+        assert_eq!(
+            distinct_summaries(manager, contract),
+            1,
+            "a released summary is still stored"
+        );
+        assert_eq!(
+            manager.get_peer_summary(contract, w).map(|s| s.to_vec()),
+            Some(SHARED_BYTES.to_vec()),
+            "the witness must keep its summary"
+        );
+    }
+
+    #[test]
+    fn identical_neighbour_summaries_are_stored_once() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let other = make_contract_key(2);
+        let peers: Vec<PeerKey> = (0..10).map(make_peer_key).collect();
+        for peer in &peers {
+            manager.register_peer_interest(
+                &contract,
+                peer.clone(),
+                Some(StateSummary::from(vec![7u8; 1000])),
+                false,
+            );
+        }
+        // The same bytes under another contract are stored for that contract.
+        assert!(manager.upsert_peer_summary(
+            &other,
+            &peers[0],
+            StateSummary::from(vec![7u8; 1000])
+        ));
+
+        assert_eq!(distinct_summaries(&manager, &contract), 1);
+        assert_eq!(
+            manager.distinct_summary_bytes_for(&contract),
+            1000,
+            "ten identical summaries must cost one copy"
+        );
+        assert_eq!(manager.distinct_summary_bytes_for(&make_contract_key(9)), 0);
+        let entry = manager
+            .interested_peers
+            .get(&contract)
+            .expect("records exist");
+        let first = entry[&peers[0]].summary().expect("summary held");
+        for peer in &peers[1..] {
+            assert!(
+                std::ptr::eq(first, entry[peer].summary().expect("summary held")),
+                "identical summaries must share one allocation"
+            );
+        }
+        drop(entry);
+        assert_eq!(distinct_summaries(&manager, &other), 1);
+
+        // Different bytes are stored separately.
+        manager.update_peer_summary(&contract, &peers[1], StateSummary::from(vec![8u8; 10]));
+        manager.update_peer_summary(&contract, &peers[2], StateSummary::from(vec![9u8; 10]));
+        assert_eq!(distinct_summaries(&manager, &contract), 3);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peers[1])
+                .map(|s| s.to_vec()),
+            Some(vec![8u8; 10])
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    #[test]
+    fn replacing_summaries_keeps_shared_storage_exact() {
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+
+        // Replace with the same bytes, through each write path.
+        manager.update_peer_summary(
+            &contract,
+            &shared,
+            StateSummary::from(SHARED_BYTES.to_vec()),
+        );
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(&manager, &contract), 2);
+        assert_summary_tables_consistent(&manager);
+
+        // Replace with different bytes: `unique` moves onto the shared bytes,
+        // so UNIQUE_BYTES has no holder left.
+        manager.update_peer_summary(
+            &contract,
+            &unique,
+            StateSummary::from(SHARED_BYTES.to_vec()),
+        );
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // And off them again via upsert.
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &shared,
+            StateSummary::from(UNIQUE_BYTES.to_vec())
+        ));
+        assert_eq!(distinct_summaries(&manager, &contract), 2);
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// A second upsert on a populated record is reported and counted as
+    /// `RefreshedKnown`, with the same bytes and with different bytes.
+    #[test]
+    fn upsert_on_a_populated_record_reports_refreshed_known() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let source = SummaryPopulationSource::Unknown;
+        let count = |outcome: SummaryPopulationOutcome| {
+            manager.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .load(Ordering::Relaxed)
+        };
+        let upsert = |bytes: &[u8]| {
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                StateSummary::from(bytes.to_vec()),
+                source,
+            )
+        };
+
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::CreatedUntracked);
+        assert_eq!(upsert(&[1; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 1);
+        assert_eq!(upsert(&[2; 8]), SummaryPopulationOutcome::RefreshedKnown);
+        assert_eq!(count(SummaryPopulationOutcome::RefreshedKnown), 2);
+        assert_eq!(count(SummaryPopulationOutcome::FilledMissing), 0);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.to_vec()),
+            Some(vec![2; 8])
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    #[test]
+    fn clearing_or_reregistering_releases_the_summary() {
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.clear_peer_summary(&contract, &shared, SummaryMissingReason::ClearedByResync);
+        manager.clear_peer_summary(
+            &contract,
+            &unique,
+            SummaryMissingReason::ClearedByDeltaApplyFailure,
+        );
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // A re-registration without a summary overwrites the record and must
+        // release what it held.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.register_peer_interest(&contract, shared, None, false);
+        manager.register_peer_interest(&contract, unique, None, true);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+    }
+
+    #[test]
+    fn every_removal_path_releases_stored_summaries() {
+        // Single removal.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        assert!(manager.remove_peer_interest(&contract, &shared));
+        assert!(manager.remove_peer_interest(&contract, &unique));
+        assert_only_witness_summary_left(&manager, &contract, &w);
+        assert!(manager.remove_peer_interest(&contract, &w));
+        assert!(manager.interested_peers.is_empty());
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+
+        // Peer disconnect, immediate and deferred.
+        let (manager, time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        assert_eq!(manager.remove_all_peer_interests(&shared), 1);
+        manager.schedule_deferred_removal(&unique);
+        time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD + Duration::from_secs(1));
+        assert_eq!(manager.execute_pending_removals(), 1);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // TTL expiry: only the witness was refreshed.
+        let (manager, time) = make_manager();
+        let (contract, w, _shared, _unique) = summary_sharing_fixture(&manager);
+        time.advance_time(INTEREST_TTL);
+        assert!(manager.refresh_peer_interest(&contract, &w));
+        time.advance_time(Duration::from_secs(1));
+        assert_eq!(manager.sweep_expired_interests().len(), 2);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+
+        // Eviction of an in-use contract's downstream subscribers.
+        let (manager, _time) = make_manager();
+        let (contract, w, shared, unique) = summary_sharing_fixture(&manager);
+        manager.remove_evicted_in_use(&contract, &[shared, unique], 0);
+        assert_only_witness_summary_left(&manager, &contract, &w);
+    }
+
+    /// #5782's reconcile drop removes records one at a time and can stop part
+    /// way; the records it leaves must still match the stored summaries, and
+    /// a full drop leaves nothing.
+    #[test]
+    fn reconcile_drop_releases_stored_summaries() {
+        let (manager, time) = make_manager();
+        let (contract, _w, _shared, _unique) = summary_sharing_fixture(&manager);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Report the contract as in use from the second record on, so the
+        // pass drops exactly one record and stops.
+        let checks = std::cell::Cell::new(0u32);
+        let in_use_after_first = |_: &ContractKey| {
+            checks.set(checks.get() + 1);
+            // Call 1 is the window check, call 2 the first record's check.
+            checks.get() > 2
+        };
+        let partial = manager.reconcile_with_hosting(&[], no, in_use_after_first, no);
+        assert_eq!(partial.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 2);
+        assert_summary_tables_consistent(&manager);
+
+        // A full drop on the next pass leaves no records and no summaries.
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let done = manager.reconcile_with_hosting(&[], no, no, no);
+        assert_eq!(done.records_dropped, 2);
+        assert_eq!(distinct_summaries(&manager, &contract), 0);
+        assert!(manager.interested_peers.is_empty());
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+    }
+
+    /// A local-client refcount taken with a FULL `ContractKey` is released by an
+    /// instance-only key, and the hash index is cleaned up with it.
+    ///
+    /// This is the property `contract.rs`'s delegate-subscribe interest hold
+    /// relies on (#5542): a subscribe whose body fetch timed out has no code
+    /// blob, so the code hash is unavailable at release time and the release
+    /// runs against `ContractKey::from_id_and_code(id, CodeHash::new([0; 32]))`.
+    /// It holds because `ContractKey`'s `Hash`/`Eq` are instance-only
+    /// (freenet-stdlib `contract_interface/key.rs`) and `contract_hash` reads
+    /// `id().as_bytes()`.
+    ///
+    /// Pinned HERE rather than trusted, because it is a property of a
+    /// DEPENDENCY. If freenet-stdlib ever folds the code hash into
+    /// `ContractKey`'s equality, that release silently stops matching and the
+    /// leak returns with no other signal.
+    #[test]
+    fn an_instance_only_key_releases_interest_taken_with_the_full_key() {
+        let (manager, _time) = make_manager();
+        let full = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        let instance_only = ContractKey::from_id_and_code(*full.id(), CodeHash::new([0u8; 32]));
+
+        assert!(manager.add_local_client(&full));
+        assert!(manager.has_local_interest(&full));
+        assert!(
+            manager.lookup_by_hash(contract_hash(&full)).contains(&full),
+            "the acquisition must have indexed the contract"
+        );
+
+        assert!(
+            manager.remove_local_client(&instance_only),
+            "releasing with an instance-only key must drop the last interest"
+        );
+        assert!(!manager.has_local_interest(&full));
+        assert!(
+            manager.lookup_by_hash(contract_hash(&full)).is_empty(),
+            "cleanup_contract_if_no_interest must have unindexed it too"
+        );
+    }
+
     /// Wiring pin for the SHADOW-MODE futile-repair detector's attempt
     /// lifetime.
     ///
@@ -3508,6 +5295,1945 @@ mod tests {
         assert_eq!(
             snap.futile, 1,
             "teardown must be scoped to the departing peer, not to the contract"
+        );
+    }
+
+    /// #5780: all three local-interest loss paths remove the entry only if it
+    /// is still uninterested, and report whether they removed it, so a
+    /// concurrent add is neither deleted nor followed by a false retraction.
+    #[test]
+    fn local_interest_loss_paths_remove_conditionally_and_report_it() {
+        const FULL: &str = include_str!("interest.rs");
+        let prod = &FULL[..FULL.find("\nmod tests {").expect("test module")];
+        // The body of one method, comment lines and whitespace removed, so a
+        // reflow cannot break the pin and a commented-out line cannot satisfy
+        // it.
+        let body = |sig: &str| -> String {
+            let at = prod
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` not found"));
+            let end = at + prod[at..].find("\n    }\n").expect("method end");
+            prod[at..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let conditional = concat!(
+            "self.local_interests.remove_if(contract,",
+            "|_,v|!v.is_interested())"
+        );
+        for sig in [
+            "    fn clear_local_hosting_flag(",
+            "    pub fn remove_local_client(",
+            "    pub fn remove_downstream_subscriber(",
+        ] {
+            let code = body(sig);
+            assert!(
+                code.contains(concat!(
+                    "letremoved=",
+                    "self.local_interests.remove_if(contract,"
+                )) && code.contains(conditional)
+                    && code.contains(concat!(
+                        ".is_some();",
+                        "self.cleanup_contract_if_no_interest(contract);returnremoved;"
+                    )),
+                "{sig} must remove conditionally and report whether it removed"
+            );
+            assert!(
+                !code.contains(concat!("self.local_interests.remove(", "contract)")),
+                "{sig} removes unconditionally"
+            );
+        }
+        let unregister = body("    pub fn unregister_local_hosting(");
+        assert!(
+            unregister.contains(concat!(
+                "self.reset_reconcile_wait(contract);",
+                "self.clear_local_hosting_flag(contract)"
+            )),
+            "unregister_local_hosting must restart the wait, then clear the flag"
+        );
+        let cleanup = body("    pub fn cleanup_local_interest(");
+        assert!(
+            cleanup.contains(conditional),
+            "cleanup_local_interest must remove conditionally"
+        );
+        assert!(!cleanup.contains(concat!("self.local_interests.remove(", "contract)")));
+    }
+
+    /// #5780 regression: a contract this node no longer hosts or uses keeps
+    /// neighbour records indefinitely, because the records keep it indexed and
+    /// advertised. Reconciliation drops them once the contract has stayed
+    /// unhosted and unused for `RECONCILE_MIN_UNUSED_AGE`, and unindexes it.
+    #[test]
+    fn reconcile_drops_records_of_an_unhosted_unused_contract_after_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        let b = make_peer_key(2);
+        // The shape eviction leaves: records exist, no local interest.
+        manager.register_local_hosting(&contract);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        assert!(manager.upsert_peer_summary(&contract, &b, StateSummary::from(vec![1u8; 64])));
+        assert!(
+            manager.unregister_local_hosting(&contract),
+            "local interest ends"
+        );
+        assert!(
+            manager
+                .get_all_interest_hashes()
+                .contains(&contract_hash(&contract))
+        );
+
+        let no = |_: &ContractKey| false;
+        let first = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(
+            first,
+            ReconcileOutcome::default(),
+            "first sighting must not act"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false),
+            ReconcileOutcome::default()
+        );
+        assert!(manager.get_peer_interest(&contract, &a).is_some());
+
+        time.advance_time(Duration::from_secs(1));
+        let done = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(done.contracts_dropped, 1);
+        assert_eq!(done.records_dropped, 2);
+        assert!(manager.get_peer_interest(&contract, &a).is_none());
+        assert!(manager.get_peer_interest(&contract, &b).is_none());
+        assert!(!manager.get_contracts_for_peer(&a).contains(&contract));
+        assert!(
+            !manager
+                .get_all_interest_hashes()
+                .contains(&contract_hash(&contract)),
+            "a dropped contract must stop being advertised"
+        );
+    }
+
+    /// Review finding (#5782): the hosting sweep's interval fires missed ticks
+    /// back to back after a stall, so the wait must be elapsed time, not a
+    /// count of passes. Many passes with no time passing drop nothing.
+    #[test]
+    fn reconcile_burst_of_passes_without_elapsed_time_drops_nothing() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream = make_peer_key(1);
+        manager.register_peer_interest(&contract, upstream.clone(), None, true);
+        let no = |_: &ContractKey| false;
+        for _ in 0..10 {
+            assert_eq!(
+                manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false),
+                ReconcileOutcome::default()
+            );
+        }
+        assert!(manager.get_peer_interest(&contract, &upstream).is_some());
+    }
+
+    /// Review finding: with fewer tracked contracts than the per-pass cap, the
+    /// window must wrap to the front. Without the wrap, a pass that starts at
+    /// offset k never examines the first k contracts, so they are cleaned up
+    /// only on passes that start at 0.
+    #[test]
+    fn reconcile_window_examines_every_contract_when_they_fit() {
+        let (manager, time) = make_manager();
+        let a = make_peer_key(1);
+        let contracts: Vec<_> = (1..=5).map(make_contract_key).collect();
+        for c in &contracts {
+            manager.register_peer_interest(c, a.clone(), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        // Start mid-way through the key order, so the pass has to wrap.
+        *manager.reconcile_cursor.lock() = Some(contracts[2]);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(outcome.contracts_dropped, contracts.len());
+        for c in &contracts {
+            assert!(manager.get_peer_interest(c, &a).is_none());
+        }
+    }
+
+    /// Seeing the contract hosted (or in use) resets the wait: a contract that
+    /// goes unhosted again must wait the full age again.
+    #[test]
+    fn reconcile_rehost_resets_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2);
+        let hosted = |k: &ContractKey| *k == contract;
+        manager.reconcile_with_hosting(&[], hosted, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE / 2 + Duration::from_secs(1));
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert!(
+            manager.get_peer_interest(&contract, &a).is_some(),
+            "unhosted again for less than the full age: kept"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert!(manager.get_peer_interest(&contract, &a).is_none());
+    }
+
+    /// Records of a contract that is in use (local client or downstream
+    /// subscriber) or held by other local interest (a delegate) are kept
+    /// however long it stays unhosted.
+    #[test]
+    fn reconcile_keeps_records_while_in_use_or_locally_interested() {
+        let (manager, time) = make_manager();
+        let in_use_key = make_contract_key(1);
+        let delegate_key = make_contract_key(2);
+        let a = make_peer_key(1);
+        manager.register_peer_interest(&in_use_key, a.clone(), None, true);
+        manager.register_peer_interest(&delegate_key, a.clone(), None, false);
+        manager.add_local_client(&delegate_key);
+        let in_use = |k: &ContractKey| *k == in_use_key;
+        let no = |_: &ContractKey| false;
+        for _ in 0..3 {
+            manager.reconcile_with_hosting(&[], no, in_use, |_: &ContractKey| false);
+            time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        }
+        let upstream = manager.get_peer_interest(&in_use_key, &a).expect("kept");
+        assert!(
+            upstream.is_upstream,
+            "the upstream record survives for unsubscribe"
+        );
+        assert!(manager.get_peer_interest(&delegate_key, &a).is_some());
+    }
+
+    /// The upstream record of a contract that is neither hosted nor in use is
+    /// dropped after the wait too: `send_unsubscribe_upstream` runs as soon as
+    /// the last subscriber goes, so two minutes later the record has no use.
+    #[test]
+    fn reconcile_drops_a_stale_upstream_record_after_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream = make_peer_key(1);
+        manager.register_peer_interest(&contract, upstream.clone(), None, true);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(outcome.records_dropped, 1);
+        assert!(manager.get_peer_interest(&contract, &upstream).is_none());
+    }
+
+    /// A contract flagged as locally hosted that the hosting cache no longer
+    /// holds loses the flag after the wait, and then its records.
+    #[test]
+    fn reconcile_unregisters_a_stale_hosting_flag_then_drops_records() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_local_hosting(&contract);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(outcome.hosting_flags_cleared, vec![contract]);
+        assert_eq!(outcome.interest_lost, vec![contract]);
+        assert_eq!(outcome.records_dropped, 1);
+        assert!(!manager.has_local_interest(&contract));
+        assert!(manager.get_peer_interest(&contract, &a).is_none());
+    }
+
+    /// The candidate map forgets contracts that are no longer tracked, so it
+    /// cannot outgrow the tracked set.
+    #[test]
+    fn reconcile_candidates_forget_untracked_contracts() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(manager.reconcile_candidates.len(), 1);
+        assert!(manager.remove_peer_interest(&contract, &a));
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert!(manager.reconcile_candidates.is_empty());
+    }
+
+    /// A re-host and re-eviction between two
+    /// passes is invisible to the passes themselves, so the wait must restart
+    /// on any change in local interest. Otherwise records are dropped seconds
+    /// after the latest eviction.
+    #[test]
+    fn reconcile_wait_restarts_when_local_interest_changes_between_passes() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(10));
+        // Hosted and evicted again between passes; no pass sees it hosted.
+        manager.register_local_hosting(&contract);
+        manager.unregister_local_hosting(&contract);
+        time.advance_time(Duration::from_secs(10));
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert!(
+            manager.get_peer_interest(&contract, &a).is_some(),
+            "10s after the latest eviction: kept"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert!(manager.get_peer_interest(&contract, &a).is_none());
+    }
+
+    /// A stale hosting flag is cleared even when a local client (or delegate)
+    /// keeps the contract interesting. It is reported for retraction of the
+    /// co-host advertisement, but not as lost interest, and the records stay.
+    #[test]
+    fn reconcile_clears_a_stale_flag_but_keeps_records_for_a_local_client() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_peer_key(1);
+        manager.register_local_hosting(&contract);
+        manager.add_local_client(&contract);
+        manager.register_peer_interest(&contract, a.clone(), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(outcome.hosting_flags_cleared, vec![contract]);
+        assert!(outcome.interest_lost.is_empty());
+        assert_eq!(outcome.records_dropped, 0);
+        assert!(
+            !manager
+                .local_interests
+                .get(&contract)
+                .expect("kept")
+                .hosting
+        );
+        assert!(manager.has_local_interest(&contract));
+        assert!(manager.get_peer_interest(&contract, &a).is_some());
+    }
+
+    /// A re-host that lands while a pass is dropping a contract's records
+    /// stops the drop at the next record.
+    #[test]
+    fn reconcile_stops_dropping_when_the_contract_is_rehosted_mid_loop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Calls: the window check, then one per record. Hosted from the
+        // third call on, so exactly one record is dropped.
+        let calls = std::cell::Cell::new(0);
+        let rehosted = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let outcome = manager.reconcile_with_hosting(&[], rehosted, no, |_: &ContractKey| false);
+        assert_eq!(outcome.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 3);
+    }
+
+    /// A local client that appears while a pass is dropping a contract's
+    /// records stops the drop at the next record.
+    #[test]
+    fn reconcile_stops_dropping_when_local_interest_appears_mid_loop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `in_use` is called once in the window check and then once per record.
+        // A client subscribes during the first record's check; adding it
+        // restarts the wait, which that record's next check sees, so nothing
+        // is dropped.
+        let calls = std::cell::Cell::new(0);
+        let client_arrives = |k: &ContractKey| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                manager.add_local_client(k);
+            }
+            false
+        };
+        let outcome =
+            manager.reconcile_with_hosting(&[], no, client_arrives, |_: &ContractKey| false);
+        assert_eq!(outcome.records_dropped, 0);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 4);
+    }
+
+    /// A re-host between the window check and the flag clear keeps the flag:
+    /// the flag is cleared only if the contract is still unhosted right then.
+    #[test]
+    fn reconcile_keeps_the_flag_of_a_contract_rehosted_before_the_clear() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Unhosted at the window check, hosted from the next check on.
+        let calls = std::cell::Cell::new(0);
+        let rehosted = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 2
+        };
+        let outcome = manager.reconcile_with_hosting(&[], rehosted, no, |_: &ContractKey| false);
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("kept")
+                .hosting
+        );
+    }
+
+    /// A re-host that lands between the
+    /// "still unhosted" check and the flag clear must not leave a hosted
+    /// contract without its flag. The flag is put back and nothing is
+    /// reported as cleared or lost (the advertisement retraction this pass
+    /// still reports re-checks hosting and leaves it alone).
+    #[test]
+    fn reconcile_restores_a_flag_cleared_under_a_concurrent_rehost() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // Calls: the window check, the check before the clear, the check
+        // after it. Hosted only by the third.
+        let calls = std::cell::Cell::new(0);
+        let rehosted_during_clear = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let outcome =
+            manager.reconcile_with_hosting(&[], rehosted_during_clear, no, |_: &ContractKey| false);
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(outcome.interest_lost.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("restored")
+                .hosting
+        );
+    }
+    /// The same restore when a local client keeps the entry, so clearing the
+    /// flag did not end local interest.
+    #[test]
+    fn reconcile_restores_a_flag_cleared_under_a_rehost_with_a_local_client() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        manager.add_local_client(&contract);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let calls = std::cell::Cell::new(0);
+        let rehosted_during_clear = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let outcome =
+            manager.reconcile_with_hosting(&[], rehosted_during_clear, no, |_: &ContractKey| false);
+        assert_eq!(
+            calls.get(),
+            3,
+            "window check, check before the clear, check after"
+        );
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("kept")
+                .hosting
+        );
+        assert!(manager.has_local_interest(&contract));
+    }
+
+    /// Every pass reports each contract past the wait that is neither hosted
+    /// nor in use for advertisement retraction (#5782), including one whose
+    /// records a local client keeps. The caller's retraction refuses while
+    /// this node's own lease is live, so reporting every pass is what retracts
+    /// an advertisement once that lease lapses.
+    #[test]
+    fn reconcile_reports_advertisements_to_retract_every_pass() {
+        let (manager, time) = make_manager();
+        let unhosted = make_contract_key(1);
+        let hosted = make_contract_key(2);
+        let watched = make_contract_key(3);
+        for c in [&unhosted, &hosted, &watched] {
+            manager.register_peer_interest(c, make_peer_key(1), None, true);
+        }
+        manager.add_local_client(&watched);
+        let is_hosted = |k: &ContractKey| *k == hosted;
+        let no = |_: &ContractKey| false;
+        let first = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
+        assert!(
+            first.advertisements_to_retract.is_empty(),
+            "not past the wait"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let mut expected = vec![watched];
+        let second = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
+        // `unhosted` was dropped this pass; `watched` stays tracked.
+        assert!(second.advertisements_to_retract.contains(&unhosted));
+        assert!(second.advertisements_to_retract.contains(&watched));
+        assert!(!second.advertisements_to_retract.contains(&hosted));
+        let third = manager.reconcile_with_hosting(&[], is_hosted, no, |_: &ContractKey| false);
+        expected.sort_unstable_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        assert_eq!(third.advertisements_to_retract, expected, "reported again");
+    }
+
+    /// While this node's own lease is live a contract keeps its records (a
+    /// subscribe still fetching the body needs the upstream one) and is not
+    /// reported for retraction; once the lease lapses the next pass reports
+    /// it and drops the records (#5782).
+    #[test]
+    fn reconcile_keeps_records_while_an_own_lease_is_live() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, true);
+        manager.register_peer_interest(&contract, make_peer_key(2), None, false);
+        let no = |_: &ContractKey| false;
+        let lease = std::cell::Cell::new(true);
+        let holds_lease = |_: &ContractKey| lease.get();
+        manager.reconcile_with_hosting(&[], no, no, holds_lease);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let live = manager.reconcile_with_hosting(&[], no, no, holds_lease);
+        assert!(live.advertisements_to_retract.is_empty(), "lease live");
+        assert_eq!(live.records_dropped, 0, "lease live");
+        assert_eq!(manager.get_interested_peers(&contract).len(), 2);
+        lease.set(false);
+        let lapsed = manager.reconcile_with_hosting(&[], no, no, holds_lease);
+        assert_eq!(lapsed.advertisements_to_retract, vec![contract]);
+        assert_eq!(lapsed.records_dropped, 2);
+    }
+
+    /// A subscribe refreshing a record already in the pass's snapshot as its
+    /// upstream restarts the wait, and the drop stops, so the refreshed
+    /// upstream record survives (#5782). The removal's wait check is the only
+    /// one in the loop, so this fails without it; that it runs under the
+    /// shard guard is pinned by `remove_checks_the_wait_under_the_shard_guard`
+    /// (a single-threaded test cannot interleave inside the guard).
+    #[test]
+    fn reconcile_stops_dropping_when_the_wait_restarts_mid_loop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `in_use` calls: the window check, then one per record. The first
+        // record is refreshed as upstream during its own check.
+        let calls = std::cell::Cell::new(0);
+        let refreshed = std::cell::Cell::new(false);
+        let upstream_refreshes = |k: &ContractKey| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                let peers = manager.get_interested_peers(k);
+                refreshed.set(manager.refresh_peer_interest_with_upstream(k, &peers[0].0, true));
+            }
+            false
+        };
+        let outcome = manager.reconcile_with_hosting(&[], no, upstream_refreshes, no);
+        assert!(refreshed.get(), "the refresh found the record");
+        assert_eq!(outcome.records_dropped, 0);
+        let peers = manager.get_interested_peers(&contract);
+        assert_eq!(peers.len(), 4);
+        assert!(peers.iter().any(|(_, interest)| interest.is_upstream));
+    }
+
+    /// `remove_peer_interest_if` leaves the record and every index untouched
+    /// when `allowed` refuses, and reports an absent record as `Some(false)`.
+    #[test]
+    fn remove_peer_interest_if_refused_leaves_the_record() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        manager.register_peer_interest(&contract, peer.clone(), None, true);
+        let refused = manager.remove_peer_interest_if(
+            &contract,
+            &peer,
+            InterestRemovalCause::Eviction,
+            || false,
+        );
+        assert_eq!(refused, None);
+        assert!(manager.get_peer_interest(&contract, &peer).is_some());
+        assert_eq!(manager.get_interested_peers(&contract).len(), 1);
+        let absent = manager.remove_peer_interest_if(
+            &contract,
+            &make_peer_key(2),
+            InterestRemovalCause::Eviction,
+            || true,
+        );
+        assert_eq!(absent, Some(false));
+    }
+
+    /// The race argument behind reconciliation's removal (#5782) is an
+    /// ordering: the removal evaluates `allowed` after taking the contract's
+    /// shard guard and before removing, the upstream refresh restarts the
+    /// wait before taking that guard, and the pass passes its wait check as
+    /// `allowed`. Code lines only.
+    #[test]
+    fn remove_checks_the_wait_under_the_shard_guard() {
+        const FULL: &str = include_str!("interest.rs");
+        let prod = &FULL[..FULL.find("\nmod tests {").expect("test module")];
+        let body = |sig: &str| -> String {
+            let at = prod
+                .find(sig)
+                .unwrap_or_else(|| panic!("`{sig}` not found"));
+            let end = at + prod[at..].find("\n    }\n").expect("method end");
+            prod[at..end]
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let remove = body("    fn remove_peer_interest_if(");
+        assert!(remove.contains(concat!(
+            "ifletSome(mutentry)=self.interested_peers.get_mut(contract){",
+            "if!allowed(){returnNone;}letremoved_interest=entry.remove(peer);"
+        )));
+        let refresh = body("    pub fn refresh_peer_interest_with_upstream(");
+        let reset = refresh
+            .find("self.reset_reconcile_wait(contract);")
+            .expect("reset");
+        let guard = refresh
+            .find("self.interested_peers.get_mut(contract)")
+            .expect("guard");
+        assert!(
+            reset < guard,
+            "the refresh must restart the wait before the guard"
+        );
+        let pass = body("    pub(crate) fn reconcile_with_hosting(");
+        assert!(pass.contains(concat!(
+            "matchself.remove_peer_interest_if(&key,&peer,",
+            "InterestRemovalCause::Eviction,wait_unchanged,){None=>break,"
+        )));
+        assert!(pass.contains(concat!(
+            "letwait_unchanged=||self.reconcile_candidates.get(&key)",
+            ".map(|seen|*seen)==Some(first_seen);"
+        )));
+    }
+
+    /// `unregister_local_hosting` restarts the wait (every caller other than
+    /// reconciliation itself, e.g. the eviction loops, goes through it).
+    #[test]
+    fn unregister_local_hosting_restarts_the_wait() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE - Duration::from_secs(10));
+        manager.unregister_local_hosting(&contract);
+        time.advance_time(Duration::from_secs(10));
+        let outcome = manager.reconcile_with_hosting(&[], no, no, no);
+        assert_eq!(outcome.records_dropped, 0, "the wait restarted");
+    }
+
+    /// Local interest added without restarting the wait (no current writer
+    /// does that, so the test writes the entry directly) still stops a drop
+    /// at the next record.
+    #[test]
+    fn reconcile_stops_dropping_for_local_interest_that_skips_the_wait_reset() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `in_use` calls: the window check, then one per record, after that
+        // record's local-interest check. Interest appears during the first
+        // record's check, so that record is dropped and the second stops.
+        let calls = std::cell::Cell::new(0);
+        let interest_appears = |k: &ContractKey| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                manager
+                    .local_interests
+                    .entry(*k)
+                    .or_default()
+                    .local_client_count = 1;
+            }
+            false
+        };
+        let outcome = manager.reconcile_with_hosting(&[], no, interest_appears, no);
+        assert_eq!(outcome.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 3);
+    }
+
+    /// A lease that appears while a pass is dropping a contract's records
+    /// (a subscribe finalizing) stops the drop at the next record.
+    #[test]
+    fn reconcile_stops_dropping_when_a_lease_appears_mid_loop() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        for i in 1..=4 {
+            manager.register_peer_interest(&contract, make_peer_key(i), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // `holds_lease` calls: the check before the flag clear, then one per
+        // record. Held from the third call on, so exactly one record is
+        // dropped.
+        let calls = std::cell::Cell::new(0);
+        let lease_arrives = |_: &ContractKey| {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        let outcome = manager.reconcile_with_hosting(&[], no, no, lease_arrives);
+        assert_eq!(outcome.records_dropped, 1);
+        assert_eq!(manager.get_interested_peers(&contract).len(), 3);
+    }
+
+    /// An advertised contract with no interest record and no local interest is
+    /// still examined (#5782): once it is past the wait, unhosted, unused and
+    /// unleased it is reported for retraction. Before, such a contract was
+    /// untracked, so an advertisement left after its records went (for
+    /// example by an upstream unsubscribe) stood until restart.
+    #[test]
+    fn reconcile_reports_an_advertised_contract_with_no_records() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let advertised = [contract];
+        let no = |_: &ContractKey| false;
+        let lease = std::cell::Cell::new(true);
+        let holds_lease = |_: &ContractKey| lease.get();
+        let first = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert!(
+            first.advertisements_to_retract.is_empty(),
+            "not past the wait"
+        );
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let leased = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert!(leased.advertisements_to_retract.is_empty(), "lease live");
+        lease.set(false);
+        let lapsed = manager.reconcile_with_hosting(&advertised, no, no, holds_lease);
+        assert_eq!(lapsed.advertisements_to_retract, vec![contract]);
+        let hosted = manager.reconcile_with_hosting(&advertised, |_: &ContractKey| true, no, no);
+        assert!(hosted.advertisements_to_retract.is_empty(), "hosted");
+    }
+
+    /// A leased contract keeps its stale hosting flag too: clearing it would
+    /// tell neighbours interest ended while a subscribe is still forming.
+    #[test]
+    fn reconcile_keeps_the_flag_of_a_leased_contract() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_local_hosting(&contract);
+        let no = |_: &ContractKey| false;
+        let yes = |_: &ContractKey| true;
+        manager.reconcile_with_hosting(&[], no, no, yes);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, yes);
+        assert!(outcome.hosting_flags_cleared.is_empty());
+        assert!(outcome.interest_lost.is_empty());
+        assert!(
+            manager
+                .local_interests
+                .get(&contract)
+                .expect("kept")
+                .hosting
+        );
+    }
+
+    /// Only an upstream registration restarts the wait: a neighbour's
+    /// non-upstream record arriving after the wait does not keep the
+    /// contract's records.
+    #[test]
+    fn reconcile_wait_does_not_restart_for_a_non_upstream_registration() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, no);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.register_peer_interest(&contract, make_peer_key(2), None, false);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, no);
+        assert_eq!(outcome.records_dropped, 2, "the wait did not restart");
+    }
+
+    /// A subscribe registering its upstream restarts the wait, so the records
+    /// it is about to use are not dropped while it fetches the body.
+    #[test]
+    fn reconcile_wait_restarts_when_an_upstream_is_registered() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        manager.register_peer_interest(&contract, make_peer_key(1), None, false);
+        let no = |_: &ContractKey| false;
+        manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        manager.register_peer_interest(&contract, make_peer_key(2), None, true);
+        let outcome = manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        assert_eq!(outcome.records_dropped, 0, "the wait restarted");
+        assert!(
+            manager
+                .get_peer_interest(&contract, &make_peer_key(2))
+                .is_some()
+        );
+    }
+
+    /// With more tracked contracts than one
+    /// pass examines, coverage must not depend on map iteration order or on
+    /// keys coming and going. The cursor is a contract id, so every contract
+    /// is reached within ceil(n / MAX) passes even while others are added.
+    #[test]
+    fn reconcile_reaches_every_contract_beyond_one_window_despite_churn() {
+        let (manager, time) = make_manager();
+        let a = make_peer_key(1);
+        let n = MAX_RECONCILE_KEYS_PER_PASS * 2 + 7;
+        let contracts: Vec<_> = (0..n as u32).map(make_unique_contract_key).collect();
+        for c in &contracts {
+            manager.register_peer_interest(c, a.clone(), None, false);
+        }
+        let no = |_: &ContractKey| false;
+        let passes = n.div_ceil(MAX_RECONCILE_KEYS_PER_PASS);
+        // First sighting of every contract, with new contracts arriving.
+        for i in 0..passes {
+            manager.register_peer_interest(
+                &make_unique_contract_key(1_000_000 + i as u32),
+                a.clone(),
+                None,
+                false,
+            );
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        }
+        time.advance_time(RECONCILE_MIN_UNUSED_AGE);
+        // The original contracts plus the newcomers fit in one more round.
+        for _ in 0..=passes {
+            manager.reconcile_with_hosting(&[], no, no, |_: &ContractKey| false);
+        }
+        for c in &contracts {
+            assert!(
+                manager.get_peer_interest(c, &a).is_none(),
+                "{c} never reached"
+            );
+        }
+    }
+
+    /// #5647: the hosting cache charges each contract what the interest manager
+    /// actually holds for it, so the figure must follow summary bytes exactly as
+    /// they are stored, replaced and removed, and must not leak across contracts.
+    #[test]
+    fn resident_bytes_for_tracks_stored_summary_bytes() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let other = make_contract_key(2);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+
+        assert_eq!(manager.resident_bytes_for(&contract), 0);
+
+        assert!(manager.upsert_peer_summary(&contract, &a, StateSummary::from(vec![0u8; 1000])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            PEER_INTEREST_ENTRY_BYTES + 1000
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &b, StateSummary::from(vec![0u8; 300])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 1300
+        );
+
+        // Replacing a summary charges the new size, not the sum of both.
+        assert!(manager.upsert_peer_summary(&contract, &a, StateSummary::from(vec![0u8; 10])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 310
+        );
+
+        // Another contract's records are not charged here.
+        assert!(manager.upsert_peer_summary(&other, &a, StateSummary::from(vec![0u8; 5000])));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 310
+        );
+
+        assert!(manager.remove_peer_interest(&contract, &b));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            PEER_INTEREST_ENTRY_BYTES + 10
+        );
+    }
+
+    /// #5647 with #5786: N neighbours that sent identical summaries are charged
+    /// one summary's bytes plus N record charges, and the shared summary stops
+    /// being charged only when its last holder changes or leaves.
+    #[test]
+    fn resident_bytes_for_charges_identical_summaries_once() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peers: Vec<PeerKey> = (1..=20).map(make_unique_peer_key).collect();
+        let summary = vec![9u8; 33_000];
+
+        for peer in &peers {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                peer,
+                StateSummary::from(summary.clone())
+            ));
+        }
+        assert_eq!(manager.distinct_summary_bytes_for(&contract), 33_000);
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 20 * PEER_INTEREST_ENTRY_BYTES,
+            "20 identical summaries are one summary's bytes plus 20 record charges"
+        );
+
+        // One neighbour moves to a different version: two distinct summaries.
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peers[0],
+            StateSummary::from(vec![1u8; 500])
+        ));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 500 + 20 * PEER_INTEREST_ENTRY_BYTES
+        );
+
+        // The shared summary is charged until its last holder leaves.
+        for peer in &peers[1..19] {
+            assert!(manager.remove_peer_interest(&contract, peer));
+        }
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            33_000 + 500 + 2 * PEER_INTEREST_ENTRY_BYTES
+        );
+        assert!(manager.remove_peer_interest(&contract, &peers[19]));
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            500 + PEER_INTEREST_ENTRY_BYTES
+        );
+        assert_eq!(
+            manager.total_resident_bytes(),
+            manager.resident_bytes_for(&contract)
+        );
+    }
+
+    fn oversized_count(manager: &TestInterestManager, source: SummaryPopulationSource) -> u64 {
+        manager.interest_lifecycle_metrics.population[source.index()]
+            [SummaryPopulationOutcome::RejectedOversized.index()]
+        .load(Ordering::Relaxed)
+    }
+
+    fn all_hosted(_: &ContractKey) -> bool {
+        true
+    }
+
+    /// #5647, #5781: a contract's distinct neighbour-summary bytes are capped
+    /// at four times our own summary plus 64 KiB when ours is known, and at
+    /// 128 KiB when it is not; never above the legal maximum.
+    #[test]
+    fn contract_summary_cap_follows_our_summary() {
+        use crate::wasm_runtime::MAX_STATE_SIZE;
+        assert_eq!(contract_summary_cap(None), FALLBACK_CONTRACT_SUMMARY_CAP);
+        assert_eq!(contract_summary_cap(None), 128 * 1024);
+        // A River room: ~33 KB of our own allows ~196 KB of distinct summaries.
+        assert_eq!(contract_summary_cap(Some(33_000)), 4 * 33_000 + 64 * 1024);
+        assert_eq!(contract_summary_cap(Some(0)), 64 * 1024);
+        assert_eq!(
+            contract_summary_cap(Some(MAX_STATE_SIZE)),
+            MAX_STATE_SIZE as u64
+        );
+    }
+
+    /// The per-record charge used in `resident_bytes_for` is the size the PR
+    /// description states for it. If the stored types change size, update
+    /// the description too.
+    #[test]
+    fn peer_interest_entry_bytes_is_160() {
+        assert_eq!(PEER_INTEREST_ENTRY_BYTES, 160);
+    }
+
+    /// #5647, #5781: an oversized summary is not stored and is counted. An
+    /// untracked peer gets no record (and no empty contract entry is left
+    /// behind); a tracked peer keeps its record, has its TTL refreshed, and
+    /// loses its previous summary, tagged `ClearedOverSizeBound`.
+    #[test]
+    fn oversized_summary_is_refused_and_the_record_keeps_its_ttl() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let cap = FALLBACK_CONTRACT_SUMMARY_CAP as usize;
+        let over = || StateSummary::from(vec![0u8; cap + 1]);
+
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                over(),
+                SummaryPopulationSource::InboundBroadcast
+            ),
+            SummaryPopulationOutcome::RejectedOversized
+        );
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+        assert_eq!(manager.resident_bytes_for(&contract), 0);
+        assert!(
+            manager.contracts_with_peer_records().is_empty(),
+            "a refused upsert for an untracked peer leaves no contract entry"
+        );
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::InboundBroadcast),
+            1
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![7u8; 10])));
+        time.advance_time(Duration::from_secs(600));
+        let now = time.now();
+        assert!(!manager.upsert_peer_summary(&contract, &peer, over()));
+        let record = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("the record stays");
+        assert!(record.summary().is_none(), "no bytes retained");
+        assert_eq!(
+            record.summary_missing_reason(),
+            Some(SummaryMissingReason::ClearedOverSizeBound)
+        );
+        assert_eq!(record.last_refreshed, now, "the TTL is refreshed");
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::Unknown),
+            1
+        );
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            PEER_INTEREST_ENTRY_BYTES
+        );
+
+        // A summary exactly at the cap is stored.
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![0u8; cap])));
+    }
+
+    /// #5647: `update_peer_summary` and `register_peer_interest` treat a
+    /// summary over the contract's cap the same way: not stored, counted,
+    /// record kept (or, for a registration, created without a summary) with
+    /// a fresh TTL.
+    #[test]
+    fn oversized_summary_is_handled_the_same_by_update_and_register() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        let over = || StateSummary::from(vec![0u8; FALLBACK_CONTRACT_SUMMARY_CAP as usize + 1]);
+
+        assert!(manager.upsert_peer_summary(&contract, &a, StateSummary::from(vec![7u8; 10])));
+        time.advance_time(Duration::from_secs(600));
+        let now = time.now();
+        manager.update_peer_summary(&contract, &a, over());
+        let record = manager
+            .get_peer_interest(&contract, &a)
+            .expect("record stays");
+        assert!(record.summary().is_none());
+        assert_eq!(
+            record.summary_missing_reason(),
+            Some(SummaryMissingReason::ClearedOverSizeBound)
+        );
+        assert_eq!(record.last_refreshed, now);
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::Unknown),
+            1
+        );
+
+        manager.update_peer_summary(&contract, &a, StateSummary::from(vec![8u8; 12]));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &a)
+                .map(|s| s.as_ref().len()),
+            Some(12),
+            "a legal update is still stored"
+        );
+
+        assert!(manager.register_peer_interest(&contract, b.clone(), Some(over()), false));
+        let record = manager
+            .get_peer_interest(&contract, &b)
+            .expect("registered");
+        assert!(record.summary().is_none());
+        assert_eq!(
+            record.summary_missing_reason(),
+            Some(SummaryMissingReason::ClearedOverSizeBound),
+            "a refused registration is tagged, not read as never populated"
+        );
+        assert_eq!(record.last_refreshed, now);
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::Unknown),
+            2
+        );
+        assert_eq!(
+            manager.resident_bytes_for(&contract),
+            2 * PEER_INTEREST_ENTRY_BYTES + 12
+        );
+    }
+
+    /// #5781: once our own summary's length is known (here from the
+    /// `Summaries` exchange), the contract's cap is relative to it on EVERY
+    /// path, including an inbound broadcast's sender summary, which has no
+    /// summary of ours at hand. Our own bytes are limited only by the legal
+    /// maximum.
+    #[test]
+    fn contract_cap_is_relative_to_our_summary_on_every_path() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        let c = make_unique_peer_key(3);
+        let ours = StateSummary::from(vec![5u8; 1_000]);
+        let cap = contract_summary_cap(Some(1_000)) as usize; // 69,536
+
+        // The Summaries exchange: our 1,000 bytes, the peer's 30,000.
+        assert_eq!(
+            manager.upsert_peer_summary_bounded(
+                &contract,
+                &a,
+                StateSummary::from(vec![1u8; 30_000]),
+                SummaryPopulationSource::InterestSummary,
+                Some(&ours),
+            ),
+            SummaryPopulationOutcome::CreatedUntracked
+        );
+        // An inbound broadcast's 50,000 bytes would fit the 128 KiB fallback
+        // but take the contract to 80,000 > 69,536: refused.
+        assert!(30_000 + 50_000 > cap && 50_000 < FALLBACK_CONTRACT_SUMMARY_CAP as usize);
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &b,
+                StateSummary::from(vec![2u8; 50_000]),
+                SummaryPopulationSource::InboundBroadcast,
+            ),
+            SummaryPopulationOutcome::RejectedOversized
+        );
+        // Bytes another neighbour already sent add nothing, so they fit.
+        assert!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &b,
+                StateSummary::from(vec![1u8; 30_000]),
+                SummaryPopulationSource::ResyncResponse,
+            ) != SummaryPopulationOutcome::RejectedOversized
+        );
+        assert_eq!(manager.distinct_summary_bytes_for(&contract), 30_000);
+
+        // Our own 2 MiB summary, recorded as delivered to a peer.
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &c,
+                StateSummary::from(vec![3u8; 2 * 1024 * 1024]),
+                SummaryPopulationSource::Delivery,
+            ),
+            SummaryPopulationOutcome::CreatedUntracked
+        );
+    }
+
+    /// #5781 per-contract cap: identities acting together cannot get past it.
+    /// Five identities sending the same 128 KiB summary hold it once; any
+    /// further distinct summary is refused, whoever sends it.
+    #[test]
+    fn colluding_identities_cannot_exceed_the_contract_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let cap = FALLBACK_CONTRACT_SUMMARY_CAP as usize;
+        for i in 1..=5 {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                &make_unique_peer_key(i),
+                StateSummary::from(vec![9u8; cap])
+            ));
+        }
+        for i in 6..=10 {
+            assert!(!manager.upsert_peer_summary(
+                &contract,
+                &make_unique_peer_key(i),
+                StateSummary::from(vec![i as u8; 1_000])
+            ));
+        }
+        assert_eq!(manager.distinct_summary_bytes_for(&contract), cap as u64);
+        assert!(
+            manager.resident_bytes_for(&contract) <= cap as u64 + 10 * PEER_INTEREST_ENTRY_BYTES
+        );
+    }
+
+    /// #5781: the sweep trims a hosted contract back to its cap when the cap
+    /// shrinks (our own summary got smaller), dropping the largest summaries
+    /// that are not ours, and the per-peer share never charges a peer for
+    /// holding our own bytes.
+    #[test]
+    fn sweep_trims_to_a_shrunken_cap_and_never_charges_our_own_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        let d = make_unique_peer_key(4);
+
+        // Our 5,000-byte summary delivered to A: cap 85,536.
+        assert!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &a,
+                StateSummary::from(vec![5u8; 5_000]),
+                SummaryPopulationSource::Delivery,
+            ) == SummaryPopulationOutcome::CreatedUntracked
+        );
+        assert!(manager.upsert_peer_summary(&contract, &b, StateSummary::from(vec![6u8; 64_000])));
+        // Our summary shrinks to 1,000 bytes, and D reports exactly those:
+        // cap 69,536, held 5,000 + 64,000 + 1,000 = 70,000.
+        let ours = StateSummary::from(vec![7u8; 1_000]);
+        assert_eq!(
+            manager.upsert_peer_summary_bounded(
+                &contract,
+                &d,
+                ours.clone(),
+                SummaryPopulationSource::InterestSummary,
+                Some(&ours),
+            ),
+            SummaryPopulationOutcome::CreatedUntracked
+        );
+        assert_eq!(manager.distinct_summary_bytes_for(&contract), 70_000);
+
+        // Not hosted: left alone (reconciliation handles those).
+        assert_eq!(
+            manager.enforce_summary_bounds(u64::MAX, |_| false),
+            SummaryBoundTrim::default()
+        );
+
+        // Share 500: A holds 5,000 bytes nobody else sent (our OLD summary,
+        // now just a neighbour's), D holds only our current 1,000 bytes,
+        // which must not be charged to it.
+        let trim = manager.enforce_summary_bounds(500, all_hosted);
+        assert_eq!(trim.contracts_over_cap, 1);
+        assert_eq!(trim.peers_over_share, 1);
+        assert_eq!(trim.summaries_cleared, 2);
+        assert_eq!(trim.bytes_cleared, 64_000 + 5_000);
+        assert!(
+            manager.get_peer_summary(&contract, &b).is_none(),
+            "largest dropped by the cap"
+        );
+        assert!(
+            manager.get_peer_summary(&contract, &a).is_none(),
+            "A over its share"
+        );
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &d)
+                .map(|s| s.as_ref().len()),
+            Some(1_000),
+            "our own bytes are neither capped nor charged to D"
+        );
+        assert_eq!(manager.summary_bound_trim_totals(), (2, 69_000));
+        for peer in [&a, &b, &d] {
+            assert!(
+                manager.get_peer_interest(&contract, peer).is_some(),
+                "records stay"
+            );
+        }
+    }
+
+    /// #5781 (Codex P2): a summary that vanished or changed between the
+    /// share pass's collection and its clear is skipped, and its bytes leave
+    /// the running total anyway, so the peer is not trimmed below its share.
+    #[test]
+    fn share_trim_skips_a_changed_summary_without_over_trimming() {
+        let c = |seed| make_contract_key(seed);
+        let held = vec![(100, 1, c(1)), (50, 2, c(2)), (40, 3, c(3))];
+        let mut attempted = Vec::new();
+        // The 100-byte summary on contract 1 changed before the clear.
+        let (cleared, bytes, total) = trim_peer_to_share(190, held, 100, |contract, ptr| {
+            attempted.push(ptr);
+            *contract != c(1)
+        });
+        assert_eq!(
+            attempted,
+            vec![1],
+            "190 - 100 = 90 is within the share: stop"
+        );
+        assert_eq!((cleared, bytes, total), (0, 0, 90));
+    }
+
+    /// #5781: when the cap shrinks and our own summary is the largest held,
+    /// the trim drops the largest summaries that are NOT ours.
+    #[test]
+    fn cap_trim_never_drops_our_own_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        // Our 120,000-byte summary delivered to peer 1: cap 545,536.
+        manager.upsert_peer_summary_from(
+            &contract,
+            &peer(1),
+            StateSummary::from(vec![1u8; 120_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        for i in 2..=5u32 {
+            assert!(manager.upsert_peer_summary(
+                &contract,
+                &peer(i),
+                StateSummary::from(vec![i as u8; 90_000])
+            ));
+        }
+        // Our summary becomes 130,000 bytes and peer 6 reports exactly them:
+        // cap 585,536, held 120,000 + 360,000 + 130,000 = 610,000.
+        let ours = StateSummary::from(vec![6u8; 130_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(6),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(trim.contracts_over_cap, 1);
+        assert_eq!(
+            trim.bytes_cleared, 120_000,
+            "our old bytes, now a neighbour's, go"
+        );
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer(6))
+                .map(|s| s.as_ref().len()),
+            Some(130_000),
+            "our current summary is kept although it is the largest"
+        );
+    }
+
+    /// #5781 node-wide budget: distinct neighbour-summary bytes across all
+    /// contracts never exceed it, whoever sends them; bytes already held and
+    /// our own summary are never refused, and our own bytes are not counted.
+    #[test]
+    fn node_wide_neighbour_summary_budget_is_enforced_at_write_time() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        let mut admitted = 0;
+        for i in 0..20u32 {
+            let contract = make_contract_key(i as u8);
+            for n in 0..3u32 {
+                let peer = make_unique_peer_key(i * 10 + n);
+                // Distinct per peer and contract, 10,000 bytes each.
+                let bytes = vec![(i * 3 + n) as u8; 10_000];
+                if manager.upsert_peer_summary(&contract, &peer, StateSummary::from(bytes)) {
+                    admitted += 1;
+                }
+                assert!(manager.neighbour_summary_bytes() <= 100_000);
+            }
+        }
+        assert_eq!(admitted, 10, "exactly the budget's worth was admitted");
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+        assert_summary_tables_consistent(&manager);
+
+        // Bytes a contract already holds add nothing and are accepted.
+        let full = make_contract_key(0);
+        let held = manager
+            .get_peer_summary(&full, &make_unique_peer_key(0))
+            .expect("first summary was admitted");
+        assert!(manager.upsert_peer_summary(&full, &make_unique_peer_key(99), held));
+        // Our own summary is never refused and not counted.
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &make_contract_key(50),
+                &make_unique_peer_key(98),
+                StateSummary::from(vec![7u8; 50_000]),
+                SummaryPopulationSource::DigestAgreement,
+            ),
+            SummaryPopulationOutcome::CreatedUntracked
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: reporting our summary again with a neighbour's different bytes
+    /// keeps the record of which allocation is ours, so the in-sync
+    /// neighbour holding it stays uncharged and its bytes survive the bounds.
+    #[test]
+    fn our_marked_summary_survives_a_different_neighbour_report() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let a = make_unique_peer_key(1);
+        let d = make_unique_peer_key(4);
+        let ours = StateSummary::from(vec![7u8; 30_000]);
+        // D reports exactly our bytes: marked as ours.
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &d,
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        // A reports something else in the next exchange, with the same ours.
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &a,
+            StateSummary::from(vec![1u8; 20_000]),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        assert_eq!(
+            manager.neighbour_summary_bytes(),
+            20_000,
+            "our bytes are not counted"
+        );
+        // A share of 1 byte: anything charged would be dropped.
+        let trim = manager.enforce_summary_bounds(1, all_hosted);
+        assert_eq!(trim.summaries_cleared, 1, "only A's summary");
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &d)
+                .map(|s| s.as_ref().len()),
+            Some(30_000)
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: when a contract is over its cap (it shrank), bytes it already
+    /// holds are still accepted from another peer: they add nothing.
+    #[test]
+    fn bytes_already_held_are_accepted_when_over_the_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(1),
+            StateSummary::from(vec![1u8; 100_000])
+        ));
+        // Our 1,000-byte summary shrinks the cap to 69,536 < 101,000 held.
+        let ours = StateSummary::from(vec![2u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(2),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(3),
+            StateSummary::from(vec![1u8; 100_000])
+        ));
+        assert!(!manager.upsert_peer_summary(
+            &contract,
+            &peer(4),
+            StateSummary::from(vec![3u8; 10])
+        ));
+    }
+
+    /// #5781: a delivery that completes after our summary has moved on (a
+    /// different length from the one recorded) does not rewind our recorded
+    /// summary, so the cap stays sized from the current one.
+    #[test]
+    fn late_delivery_does_not_rewind_our_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let ours = StateSummary::from(vec![1u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        // An older, 2,000-byte summary of ours finishes delivering.
+        manager.upsert_peer_summary_from(
+            &contract,
+            &peer(2),
+            StateSummary::from(vec![2u8; 2_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        // Cap from our 1,000 bytes: 69,536. Held 3,000; a 68,000-byte summary
+        // would make 71,000. Rewound to 2,000 bytes the cap would be 73,536.
+        assert!(!manager.upsert_peer_summary(
+            &contract,
+            &peer(3),
+            StateSummary::from(vec![3u8; 68_000])
+        ));
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: the cap trim chooses among equal-size summaries by their bytes,
+    /// so every node and run drops the same one.
+    #[test]
+    fn cap_trim_breaks_size_ties_by_bytes() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(1),
+            StateSummary::from(vec![9u8; 40_000])
+        ));
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(2),
+            StateSummary::from(vec![3u8; 40_000])
+        ));
+        // Cap shrinks to 4 * 1,000 + 65,536 = 69,536 < 81,000 held.
+        let ours = StateSummary::from(vec![5u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(3),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(trim.bytes_cleared, 40_000);
+        assert!(
+            manager.get_peer_summary(&contract, &peer(2)).is_none(),
+            "the lexicographically smaller of two equal-size summaries goes"
+        );
+        assert!(manager.get_peer_summary(&contract, &peer(1)).is_some());
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: peers sending identical bytes split each summary's charge, so
+    /// together they still use up their shares rather than escaping them.
+    #[test]
+    fn colluders_sending_identical_bytes_split_but_use_their_shares() {
+        let (manager, _time) = make_manager();
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        for i in 1..=10u8 {
+            let c = make_contract_key(i);
+            let bytes = vec![i; 50_000];
+            assert!(manager.upsert_peer_summary(&c, &a, StateSummary::from(bytes.clone())));
+            assert!(manager.upsert_peer_summary(&c, &b, StateSummary::from(bytes)));
+        }
+        // Each is charged 25,000 per contract, 250,000 in all, against 100,000.
+        let trim = manager.enforce_summary_bounds(100_000, all_hosted);
+        assert_eq!(trim.peers_over_share, 2);
+        // Each drops its six largest charges (all 25,000; contract-key order)
+        // and keeps four: 100,000. Charged in full (50,000) it would keep two;
+        // charged only for bytes nobody else sent, all ten.
+        for peer in [&a, &b] {
+            let kept = (1..=10u8)
+                .filter(|i| {
+                    manager
+                        .get_peer_summary(&make_contract_key(*i), peer)
+                        .is_some()
+                })
+                .count();
+            assert_eq!(kept, 4);
+        }
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781 node-wide trim: when the counter is over the budget (here the
+    /// budget shrank), the sweep drops the largest counted summaries until it
+    /// fits, never our own, and an honest summary gets in again afterwards.
+    #[test]
+    fn node_wide_trim_restores_the_budget_and_readmits_honest_summaries() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        let peer = make_unique_peer_key;
+        let c = make_contract_key;
+        // Our own 30,000-byte summary, held by peer 1 on contract 1.
+        let ours = StateSummary::from(vec![9u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &c(1),
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        for (i, len) in [(2u8, 60_000usize), (3, 40_000)] {
+            assert!(manager.upsert_peer_summary(
+                &c(i),
+                &peer(i as u32),
+                StateSummary::from(vec![i; len])
+            ));
+        }
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+        // An honest newcomer does not fit.
+        assert!(!manager.upsert_peer_summary(
+            &c(4),
+            &peer(4),
+            StateSummary::from(vec![4u8; 10_000])
+        ));
+
+        manager.set_neighbour_summary_budget(50_000);
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(
+            trim.node_budget_drops, 1,
+            "the 60,000-byte summary goes first"
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 40_000);
+        assert!(manager.get_peer_summary(&c(2), &peer(2)).is_none());
+        assert_eq!(
+            manager
+                .get_peer_summary(&c(1), &peer(1))
+                .map(|s| s.as_ref().len()),
+            Some(30_000),
+            "our own summary is never trimmed"
+        );
+        // Room again for the honest newcomer.
+        assert!(manager.upsert_peer_summary(
+            &c(4),
+            &peer(4),
+            StateSummary::from(vec![4u8; 10_000])
+        ));
+        assert_summary_tables_consistent(&manager);
+
+        // A budget of 0 clears every counted summary; ours stays.
+        manager.set_neighbour_summary_budget(0);
+        manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+        assert!(manager.get_peer_summary(&c(1), &peer(1)).is_some());
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: the node-wide trim covers hosted contracts only, matching what
+    /// the hosting cache charges: a non-hosted contract's summaries are left
+    /// to #5782's reconciliation, and do not make the trim drop hosted ones.
+    #[test]
+    fn node_wide_trim_walks_hosted_contracts_only() {
+        let (manager, _time) = make_manager();
+        let hosted = make_contract_key(1);
+        let not_hosted = make_contract_key(2);
+        let peer = make_unique_peer_key;
+        assert!(manager.upsert_peer_summary(
+            &hosted,
+            &peer(1),
+            StateSummary::from(vec![1u8; 30_000])
+        ));
+        assert!(manager.upsert_peer_summary(
+            &not_hosted,
+            &peer(2),
+            StateSummary::from(vec![2u8; 60_000])
+        ));
+        manager.set_neighbour_summary_budget(40_000);
+        let trim = manager.enforce_summary_bounds(u64::MAX, |k| *k == hosted);
+        assert_eq!(trim, SummaryBoundTrim::default());
+        assert!(manager.get_peer_summary(&hosted, &peer(1)).is_some());
+        assert!(manager.get_peer_summary(&not_hosted, &peer(2)).is_some());
+    }
+
+    /// #5781 (Codex P2): dropping one holder of a shared summary moves its
+    /// whole charge onto the other holder; the share pass repeats so that
+    /// holder is not left over its share.
+    #[test]
+    fn share_pass_repeats_when_a_drop_shifts_a_charge() {
+        let (manager, _time) = make_manager();
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        let c1 = make_contract_key(1);
+        let c2 = make_contract_key(2);
+        let shared = vec![1u8; 120_000];
+        assert!(manager.upsert_peer_summary(&c1, &a, StateSummary::from(shared.clone())));
+        assert!(manager.upsert_peer_summary(&c1, &b, StateSummary::from(shared)));
+        assert!(manager.upsert_peer_summary(&c2, &a, StateSummary::from(vec![2u8; 10_000])));
+        // A is charged 60,000 + 10,000, B 60,000, against a 65,000 share. A
+        // drops its share of the 120,000-byte summary; B then holds it alone.
+        let trim = manager.enforce_summary_bounds(65_000, all_hosted);
+        assert_eq!(trim.peers_over_share, 2);
+        assert!(manager.get_peer_summary(&c1, &a).is_none());
+        assert!(
+            manager.get_peer_summary(&c1, &b).is_none(),
+            "B, now charged 120,000, must be trimmed in the same sweep"
+        );
+        assert!(manager.get_peer_summary(&c2, &a).is_some());
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781 (Codex P2): our own summary recorded without a peer summary to
+    /// store (a `Summaries` entry with none) still sizes the contract's cap.
+    #[test]
+    fn our_summary_recorded_without_a_peer_summary_sizes_the_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key(1);
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer,
+            StateSummary::from(vec![1u8; 100_000])
+        ));
+        // Ours is 1,000 bytes: cap 69,536.
+        manager.note_own_summary(&contract, &StateSummary::from(vec![2u8; 1_000]));
+        let trim = manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert_eq!(trim.contracts_over_cap, 1);
+        assert!(manager.get_peer_summary(&contract, &peer).is_none());
+        // Nothing is created for a contract without records.
+        manager.note_own_summary(&make_contract_key(9), &StateSummary::from(vec![0u8; 10]));
+        assert_eq!(manager.contracts_with_peer_records().len(), 1);
+    }
+
+    /// #5781: when our summary changes, the bytes that were ours become a
+    /// neighbour's and are counted without passing the write-time check; the
+    /// node-wide trim brings the counter back under the budget.
+    #[test]
+    fn node_wide_trim_covers_our_old_summary_becoming_counted() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(60_000);
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let old_ours = StateSummary::from(vec![1u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            old_ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&old_ours),
+        );
+        assert!(manager.upsert_peer_summary(
+            &contract,
+            &peer(2),
+            StateSummary::from(vec![2u8; 50_000])
+        ));
+        assert_eq!(manager.neighbour_summary_bytes(), 50_000);
+        // Our summary moves on; peer 3 reports the new bytes.
+        let new_ours = StateSummary::from(vec![3u8; 20_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(3),
+            new_ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&new_ours),
+        );
+        assert_eq!(
+            manager.neighbour_summary_bytes(),
+            80_000,
+            "the old bytes now count"
+        );
+        manager.enforce_summary_bounds(u64::MAX, all_hosted);
+        assert!(manager.neighbour_summary_bytes() <= 60_000);
+        assert!(
+            manager.get_peer_summary(&contract, &peer(2)).is_none(),
+            "largest goes"
+        );
+        assert!(
+            manager.get_peer_summary(&contract, &peer(3)).is_some(),
+            "ours stays"
+        );
+        assert_summary_tables_consistent(&manager);
+    }
+
+    /// #5781: a delivery that will not be recorded as our own summary (ours
+    /// has moved on) is counted, so it must fit the node-wide budget.
+    #[test]
+    fn late_delivery_must_fit_the_node_budget() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key;
+        let ours = StateSummary::from(vec![1u8; 1_000]);
+        manager.upsert_peer_summary_bounded(
+            &contract,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        manager.set_neighbour_summary_budget(5_000);
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer(2),
+                StateSummary::from(vec![2u8; 6_000]),
+                SummaryPopulationSource::Delivery,
+            ),
+            SummaryPopulationOutcome::RejectedOversized
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+    }
+
+    /// #5781: a registration whose summary would take the node over its
+    /// budget records the interest without the summary, tagged and counted.
+    #[test]
+    fn register_over_the_node_budget_is_refused() {
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(10_000);
+        let contract = make_contract_key(1);
+        let peer = make_unique_peer_key(1);
+        assert!(manager.register_peer_interest(
+            &contract,
+            peer.clone(),
+            Some(StateSummary::from(vec![1u8; 20_000])),
+            false
+        ));
+        let record = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("registered");
+        assert!(record.summary().is_none());
+        assert_eq!(
+            record.summary_missing_reason(),
+            Some(SummaryMissingReason::ClearedOverSizeBound)
+        );
+        assert_eq!(
+            oversized_count(&manager, SummaryPopulationSource::Unknown),
+            1
+        );
+        assert_eq!(manager.neighbour_summary_bytes(), 0);
+    }
+
+    /// #5781: the node-wide projection frees a replaced summary only when the
+    /// replacing peer was its sole holder and it is not our own.
+    #[test]
+    fn node_budget_projection_frees_only_a_sole_held_neighbour_summary() {
+        let peer = make_unique_peer_key;
+        // Sole holder replacing near the budget: admitted.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        let c = make_contract_key(1);
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![2u8; 40_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![3u8; 60_000])));
+        assert_eq!(manager.neighbour_summary_bytes(), 100_000);
+
+        // Shared holder: the old bytes stay held by the other peer, so
+        // nothing is freed and the replacement does not fit.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(100_000);
+        assert!(manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![1u8; 60_000])));
+        assert!(manager.upsert_peer_summary(&c, &peer(3), StateSummary::from(vec![2u8; 40_000])));
+        assert!(!manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![3u8; 60_000])));
+
+        // Own summary: it was never counted, so replacing it frees nothing.
+        let (manager, _time) = make_manager();
+        manager.set_neighbour_summary_budget(99_000);
+        let ours = StateSummary::from(vec![9u8; 30_000]);
+        manager.upsert_peer_summary_bounded(
+            &c,
+            &peer(1),
+            ours.clone(),
+            SummaryPopulationSource::InterestSummary,
+            Some(&ours),
+        );
+        assert!(manager.upsert_peer_summary(&c, &peer(2), StateSummary::from(vec![2u8; 40_000])));
+        let other = make_contract_key(2);
+        assert!(manager.upsert_peer_summary(
+            &other,
+            &peer(3),
+            StateSummary::from(vec![4u8; 30_000])
+        ));
+        assert_eq!(manager.neighbour_summary_bytes(), 70_000);
+        assert!(!manager.upsert_peer_summary(&c, &peer(1), StateSummary::from(vec![5u8; 30_000])));
+    }
+
+    /// #5781: one peer may hold at most its share of summary bytes that no
+    /// other neighbour also sent. Over it, its largest such summaries are
+    /// dropped until it fits; summaries shared with another neighbour, and
+    /// other peers' summaries, are untouched.
+    #[test]
+    fn peer_over_its_summary_share_loses_its_largest_unshared_summaries() {
+        let (manager, _time) = make_manager();
+        let flooder = make_unique_peer_key(1);
+        let honest = make_unique_peer_key(2);
+        let contracts: Vec<ContractKey> = (1..=10).map(make_contract_key).collect();
+
+        // The flooder sends distinct summaries of 10..=100 KB; the honest peer
+        // sends a 5 KB summary on each contract.
+        for (i, c) in contracts.iter().enumerate() {
+            let len = (i + 1) * 10_000;
+            assert!(manager.upsert_peer_summary(
+                c,
+                &flooder,
+                StateSummary::from(vec![i as u8 + 1; len])
+            ));
+            assert!(manager.upsert_peer_summary(
+                c,
+                &honest,
+                StateSummary::from(vec![200u8; 5_000])
+            ));
+        }
+        // On contract 0 the flooder's summary becomes the honest peer's bytes,
+        // so it is shared and counted against neither.
+        assert!(manager.upsert_peer_summary(
+            &contracts[0],
+            &flooder,
+            StateSummary::from(vec![200u8; 5_000])
+        ));
+
+        // The 5 KB summary on contract 0 is held by both peers, so each is
+        // charged half: 2.5 KB. 93 KB sits between 92.5 KB and 95 KB, so the
+        // result depends on the shared summary being split rather than
+        // charged in full: in full it would leave 95 KB and drop a seventh.
+        let share = 93_000;
+        let trim = manager.enforce_summary_bounds(share, all_hosted);
+        // Unshared flooder bytes: 20 KB + ... + 100 KB = 540 KB. Dropping the
+        // 100, 90, ..., 50 KB summaries leaves 20 + 30 + 40 = 90 KB.
+        assert_eq!(trim.contracts_over_cap, 0);
+        assert_eq!(trim.peers_over_share, 1);
+        assert_eq!(trim.summaries_cleared, 6);
+        assert_eq!(trim.bytes_cleared, 450_000);
+        for (i, c) in contracts.iter().enumerate() {
+            let kept = manager
+                .get_peer_summary(c, &flooder)
+                .map(|s| s.as_ref().len());
+            let expected = match i {
+                0 => Some(5_000),
+                1..=3 => Some((i + 1) * 10_000),
+                _ => None,
+            };
+            assert_eq!(kept, expected, "flooder summary on contract {i}");
+            assert!(
+                manager.get_peer_interest(c, &flooder).is_some(),
+                "records stay"
+            );
+            assert_eq!(
+                manager
+                    .get_peer_summary(c, &honest)
+                    .map(|s| s.as_ref().len()),
+                Some(5_000),
+                "the honest peer is untouched"
+            );
+        }
+        assert_eq!(manager.summary_bound_trim_totals(), (6, 450_000));
+
+        // Within its share now: a second pass changes nothing.
+        assert_eq!(
+            manager.enforce_summary_bounds(share, all_hosted),
+            SummaryBoundTrim::default()
+        );
+    }
+
+    /// #5647: the node-wide total counts every contract's records, hosted or
+    /// not, with the same per-record formula as `resident_bytes_for`, so the
+    /// two can be compared in telemetry.
+    #[test]
+    fn total_resident_bytes_sums_every_contract() {
+        let (manager, _time) = make_manager();
+        let one = make_contract_key(1);
+        let two = make_contract_key(2);
+        let a = make_unique_peer_key(1);
+        let b = make_unique_peer_key(2);
+        assert_eq!(manager.total_resident_bytes(), 0);
+
+        assert!(manager.upsert_peer_summary(&one, &a, StateSummary::from(vec![0u8; 100])));
+        assert!(manager.upsert_peer_summary(&one, &b, StateSummary::from(vec![0u8; 20])));
+        assert!(manager.register_peer_interest(&two, a.clone(), None, false));
+        assert_eq!(
+            manager.total_resident_bytes(),
+            manager.resident_bytes_for(&one) + manager.resident_bytes_for(&two)
+        );
+        assert_eq!(
+            manager.total_resident_bytes(),
+            3 * PEER_INTEREST_ENTRY_BYTES + 120
+        );
+
+        assert!(manager.remove_peer_interest(&one, &a));
+        assert_eq!(
+            manager.total_resident_bytes(),
+            2 * PEER_INTEREST_ENTRY_BYTES + 20
         );
     }
 
@@ -4832,6 +8558,203 @@ mod tests {
         );
     }
 
+    /// Tests for the delta cache's BYTE bound (#4805).
+    ///
+    /// The pre-fix cache was a plain `LruCache` capped at
+    /// [`DELTA_CACHE_SIZE`] entries. Since every value is a contract-produced
+    /// `StateDelta` (up to `MAX_STATE_SIZE`, 50 MiB), that count bounded no
+    /// amount of RAM: 1024 entries is ~51 GiB in the worst case.
+    mod delta_cache_byte_bound {
+        use super::*;
+        use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+        /// P1 regression, mirroring #4804's
+        /// `byte_budget_bounds_ram_for_large_values` at the `InterestManager`
+        /// level: a contract emitting LARGE deltas must not be able to pin
+        /// arbitrary RAM here while staying far under the entry-count cap.
+        ///
+        /// The primary assertion is deliberately computed from figures the
+        /// TEST owns (`retained entries × the delta size it inserted`), not
+        /// from the cache's own byte accounting, so it does not check the fix
+        /// against itself. It is red against the pre-fix `LruCache`
+        /// (64 entries × 1 MiB = 64 MiB retained, vs. a 16 MiB ceiling) and
+        /// green with the byte backstop.
+        #[test]
+        fn large_deltas_stay_within_the_byte_budget() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            const DELTA_BYTES: usize = 1024 * 1024; // 1 MiB per delta
+            // 64 MiB of deltas — 4x the widest budget any host resolves to —
+            // while the ENTRY COUNT stays far below the count cap, so only a
+            // byte bound can stop this.
+            const INSERTS: usize = 64;
+            const _: () = assert!(INSERTS < DELTA_CACHE_SIZE);
+
+            let budget = interest_delta_cache_budget_bytes();
+            assert!(
+                budget <= INTEREST_DELTA_CACHE_MAX_BYTES,
+                "budget {budget} must never exceed the documented ceiling \
+                 {INTEREST_DELTA_CACHE_MAX_BYTES}"
+            );
+            assert!(
+                INSERTS * DELTA_BYTES > budget,
+                "precondition: the test must insert MORE bytes ({}) than the \
+                 budget ({budget}) or it cannot observe eviction",
+                INSERTS * DELTA_BYTES
+            );
+
+            for i in 0..INSERTS {
+                // A distinct peer-summary per insert, exactly as fan-out
+                // produces (the cache key carries the peer's summary hash).
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(vec![0u8; DELTA_BYTES]),
+                );
+
+                // Independent bound: entries retained × the size WE inserted.
+                let retained = manager.delta_cache.lock().len();
+                assert!(
+                    retained * DELTA_BYTES <= budget,
+                    "after {} inserts the cache retains {retained} × {DELTA_BYTES} B = {} B, \
+                     which must stay within the {budget} B budget",
+                    i + 1,
+                    retained * DELTA_BYTES
+                );
+            }
+
+            let retained = manager.delta_cache.lock().len();
+            assert!(
+                retained < INSERTS,
+                "eviction must have occurred: {retained} of {INSERTS} inserts retained"
+            );
+            // Secondary: the cache's own accounting agrees.
+            assert!(
+                manager.delta_cache.lock().total_bytes() <= budget,
+                "accounted total {} must stay within the {budget} B budget",
+                manager.delta_cache.lock().total_bytes()
+            );
+        }
+
+        /// The byte bound must not degrade the SMALL-delta case it is a
+        /// backstop for. Empty deltas are the entries that matter most here —
+        /// they are the memoized "this peer is converged" verdicts whose loss
+        /// re-arms the #4857 summarize storm — so the floor budget has to keep
+        /// the COUNT target binding for them on every host.
+        #[test]
+        fn count_target_still_binds_for_small_deltas() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            for i in 0..DELTA_CACHE_SIZE {
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(Vec::<u8>::new()),
+                );
+            }
+
+            assert_eq!(
+                manager.delta_cache.lock().len(),
+                DELTA_CACHE_SIZE,
+                "a full count-cap worth of EMPTY deltas must all be retained; \
+                 the byte budget is a backstop, not a coverage limit"
+            );
+        }
+
+        /// A single delta larger than the whole budget is not cached at all
+        /// (`ByteBoundedLruCache::put`'s skip-oversized guard) — retaining one
+        /// would break the hard cap, and `StateDelta` is contract-controlled.
+        ///
+        /// The behavioural consequence, stated so it is not rediscovered as a
+        /// bug: `compute_delta` caches even an oversized delta on purpose, so
+        /// `cached_staleness_verdict` can answer "peer is stale" without a
+        /// WASM probe. For a delta above the budget that memoization is gone
+        /// and the staleness path falls back to the contract round-trip
+        /// (bounded per message by `MAX_STALENESS_PROBES_PER_SUMMARIES`).
+        /// That costs work in exactly the abusive case this bound exists for,
+        /// and costs no correctness: a miss never reports "converged".
+        #[test]
+        fn a_single_oversized_delta_is_not_cached() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+            let peer_summary = vec![1u8; 8];
+
+            let oversized = interest_delta_cache_budget_bytes() + 1;
+            manager.cache_delta(
+                &contract,
+                &peer_summary,
+                &our_summary,
+                StateDelta::from(vec![0u8; oversized]),
+            );
+
+            assert!(
+                manager
+                    .get_cached_delta(&contract, &peer_summary, &our_summary)
+                    .is_none(),
+                "a delta larger than the whole budget must not be retained"
+            );
+            assert_eq!(
+                manager.delta_cache.lock().total_bytes(),
+                0,
+                "refusing the oversized entry must leave the byte total at zero"
+            );
+        }
+
+        /// The resolved budget at the host shapes that actually ship, so a
+        /// future edit to the divisor or the clamps has to state its effect
+        /// here rather than moving them silently.
+        #[test]
+        fn budget_resolves_as_documented_across_host_shapes() {
+            const MIB: usize = 1024 * 1024;
+            for (label, ram, expected) in [
+                (
+                    "128 MiB container",
+                    128 * MIB,
+                    INTEREST_DELTA_CACHE_MIN_BYTES,
+                ),
+                ("512 MiB host", 512 * MIB, 4 * MIB),
+                ("1 GiB host (the OS-query fallback)", 1024 * MIB, 8 * MIB),
+                ("2 GiB peer (shipped MemoryMax=2G)", 2048 * MIB, 16 * MIB),
+                (
+                    "7600 MiB gateway",
+                    7600 * MIB,
+                    INTEREST_DELTA_CACHE_MAX_BYTES,
+                ),
+            ] {
+                assert_eq!(
+                    interest_delta_budget_for(ram),
+                    expected,
+                    "{label}: budget must resolve to {expected} bytes"
+                );
+            }
+        }
+
+        /// The floor is what keeps the byte bound a BACKSTOP rather than a
+        /// coverage limit: at the per-entry overhead floor it must still hold
+        /// more than the count target, so no host ever loses empty-delta
+        /// coverage to bytes. Pins the arithmetic behind
+        /// `count_target_still_binds_for_small_deltas` at the SMALLEST budget,
+        /// which the test machine's own RAM may not produce.
+        #[test]
+        fn floor_budget_holds_more_than_the_count_target() {
+            let entries_at_floor = INTEREST_DELTA_CACHE_MIN_BYTES / CACHE_ENTRY_OVERHEAD_BYTES;
+            assert!(
+                entries_at_floor >= DELTA_CACHE_SIZE,
+                "the floor budget holds {entries_at_floor} minimum-weight entries, which \
+                 must be at least the {DELTA_CACHE_SIZE}-entry count target"
+            );
+        }
+    }
+
     #[test]
     fn test_sweep_expired_interests() {
         let (manager, time) = make_manager();
@@ -5632,7 +9555,7 @@ mod tests {
             "upsert on an existing entry must not clobber the upstream flag"
         );
         assert_eq!(
-            interest.summary.map(|s| s.as_ref().to_vec()),
+            interest.summary().map(|s| s.as_ref().to_vec()),
             Some(vec![5u8])
         );
     }
@@ -6067,7 +9990,7 @@ mod tests {
         manager.register_peer_interest(&contract, upstream.clone(), Some(summary.clone()), true);
         let before = manager.get_peer_interest(&contract, &upstream).unwrap();
         assert!(before.is_upstream);
-        assert_eq!(before.summary.as_ref(), Some(&summary));
+        assert_eq!(before.summary(), Some(&summary));
 
         // FIXED handler path: an existing entry is refreshed, not
         // re-registered. Refresh preserves is_upstream AND the cached summary.
@@ -6079,7 +10002,7 @@ mod tests {
              still find the upstream"
         );
         assert_eq!(
-            after_refresh.summary.as_ref(),
+            after_refresh.summary(),
             Some(&summary),
             "refresh must preserve the cached delta-sync summary"
         );
@@ -6108,7 +10031,7 @@ mod tests {
              true -> false"
         );
         assert!(
-            clobbered.summary.is_none(),
+            clobbered.summary().is_none(),
             "documents the clobber: a bare register(false) wipes the cached summary"
         );
         assert!(
@@ -7574,37 +11497,38 @@ mod tests {
 
         assert_eq!(mgr.peek_summary_cursor(&peer), None);
 
-        mgr.record_summary_cursor(&peer, *sorted[2].id());
+        mgr.seed_summary_cursor(&peer, *sorted[2].id(), 1, sorted.len());
         assert_eq!(mgr.peek_summary_cursor(&peer), Some(*sorted[2].id()));
         assert_eq!(
-            mgr.summary_window_start(&peer, &sorted),
+            mgr.begin_summary_window(&peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
         // Cursors are per peer: one peer's progress must not advance another's.
         let other = make_peer_key(2);
-        mgr.record_summary_cursor(&other, *sorted[6].id());
-        assert_eq!(mgr.summary_window_start(&peer, &sorted), 3);
-        assert_eq!(mgr.summary_window_start(&other, &sorted), 7);
+        mgr.seed_summary_cursor(&other, *sorted[6].id(), 1, sorted.len());
+        assert_eq!(mgr.begin_summary_window(&peer, &sorted), 3);
+        assert_eq!(mgr.begin_summary_window(&other, &sorted), 7);
 
         // An empty shared set has no valid offset; it must not panic or draw.
-        assert_eq!(mgr.summary_window_start(&peer, &[]), 0);
+        assert_eq!(mgr.begin_summary_window(&peer, &[]), 0);
     }
 
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
     ///
     /// A boundary is reached with no cursor (first reply, our own restart, LRU
-    /// eviction, a peer reconnecting on a new port) or with a cursor already at
-    /// the highest id. Restarting at 0 every time would re-send the head of the
-    /// set and starve the tail for any peer that keeps returning to a boundary,
-    /// which is the failure `emit_stale_peer_syncs` and the `SummaryDigests`
-    /// arm both already rotate to avoid.
+    /// eviction) or once a cycle has genuinely completed. Restarting at 0 every
+    /// time would re-send the head of the set and starve the tail for any peer
+    /// that keeps returning to a boundary, which is the failure
+    /// `emit_stale_peer_syncs` and the `SummaryDigests` arm both already rotate
+    /// to avoid.
     ///
-    /// The peer influences this: `sorted` is the intersection with the hash
-    /// list it advertised, so advertising one high-id contract parks the cursor
-    /// at the end. With a fixed restart that alternation pins the window to the
-    /// head forever; with a random one it cannot.
+    /// Note what this test does NOT claim any more: a cursor sitting on the
+    /// highest id is a mid-cycle WRAP, not a boundary. That case moved to
+    /// `a_window_ending_on_the_highest_id_wraps_instead_of_re_randomising`,
+    /// where it is asserted to be deterministic. Reading it as a boundary was
+    /// #5181.
     #[test]
     fn summary_window_start_randomises_the_cycle_boundary() {
         let (mgr, _clock) = make_manager();
@@ -7614,7 +11538,7 @@ mod tests {
         let mut seen = HashSet::new();
         for i in 0..40u32 {
             let peer = make_unique_peer_key(9200 + i);
-            let start = mgr.summary_window_start(&peer, &sorted);
+            let start = mgr.begin_summary_window(&peer, &sorted);
             assert!(start < sorted.len(), "start {start} out of range");
             seen.insert(start);
         }
@@ -7624,21 +11548,755 @@ mod tests {
              draws over 64 contracts all landed on {seen:?}"
         );
 
-        // Cursor at the highest id: also a boundary, also randomised.
+        // A COMPLETED cycle is the other boundary, and is also randomised.
         let peer = make_unique_peer_key(9300);
-        let mut seen_wrapped = HashSet::new();
+        let mut seen_completed = HashSet::new();
         for _ in 0..40 {
-            mgr.record_summary_cursor(&peer, *sorted[sorted.len() - 1].id());
-            seen_wrapped.insert(mgr.summary_window_start(&peer, &sorted));
+            // A whole cycle's worth of entries covered: genuinely finished.
+            mgr.seed_summary_cursor(
+                &peer,
+                *sorted[sorted.len() - 1].id(),
+                sorted.len(),
+                sorted.len(),
+            );
+            seen_completed.insert(mgr.begin_summary_window(&peer, &sorted));
         }
         assert!(
-            seen_wrapped.iter().all(|s| *s < sorted.len()),
-            "wrapped start out of range"
+            seen_completed.iter().all(|s| *s < sorted.len()),
+            "completed-cycle start out of range"
         );
         assert!(
-            seen_wrapped.len() > 1,
-            "a cursor at the end of the set must restart at a random offset, \
-             not deterministically at 0 — got {seen_wrapped:?}"
+            seen_completed.len() > 1,
+            "a COMPLETED cycle must restart at a random offset, not \
+             deterministically at 0 — got {seen_completed:?}"
+        );
+    }
+
+    /// #5181 regression: a window ending exactly on the highest id has WRAPPED,
+    /// not finished, so the next window must continue at index 0.
+    ///
+    /// `first_index_after` returns `sorted.len()` both for a cursor genuinely
+    /// past the end and for one sitting ON the last id. The pre-fix code read
+    /// the second as a cycle boundary and drew a fresh random origin partway
+    /// through a cycle, breaking the contiguity `ceil(len / limit)` depends on.
+    ///
+    /// Constructed directly over several set sizes rather than waiting for the
+    /// ~1-in-`limit` chance that produced the original flake.
+    #[test]
+    fn a_window_ending_on_the_highest_id_wraps_instead_of_re_randomising() {
+        let (mgr, _clock) = make_manager();
+
+        for len in [2usize, 3, 5, 8, 16, 33, 64] {
+            let sorted = sorted_keys(0..len as u32);
+            let peer = make_unique_peer_key(9400 + len as u32);
+
+            // Mid-cycle by construction: one entry covered out of `len`, and
+            // the cursor parked on the highest id in the set.
+            mgr.seed_summary_cursor(&peer, *sorted[len - 1].id(), 1, len);
+
+            // Deterministic: assert over repeats so a lucky random draw of 0
+            // cannot be mistaken for a correct wrap.
+            for _ in 0..8 {
+                assert_eq!(
+                    mgr.begin_summary_window(&peer, &sorted),
+                    0,
+                    "len={len}: a cursor on the highest id is a mid-cycle WRAP \
+                     and must resume at 0, not re-randomise (#5181)"
+                );
+            }
+        }
+    }
+
+    /// The real API, driven end to end, covers every contract from every
+    /// possible origin within `ceil(len / limit)` rounds.
+    ///
+    /// Drives `begin_summary_window` and `record_summary_cursor` rather than
+    /// the pure helpers. That matters: the pre-existing
+    /// `rotation_covers_every_contract_within_ceil_n_over_limit_rounds` stayed
+    /// green through this entire bug because it drives the helpers with a
+    /// test-local resume rule that wraps on its own, and the defect lived in
+    /// the resume decision BETWEEN them.
+    #[test]
+    fn the_real_api_covers_every_contract_from_every_origin() {
+        for (len, limit) in [(8usize, 3usize), (10, 5), (16, 4), (33, 8), (64, 64)] {
+            let sorted = sorted_keys(0..len as u32);
+            let rounds = len.div_ceil(limit);
+
+            for origin in 0..len {
+                let (mgr, _clock) = make_manager();
+                let peer = make_unique_peer_key(9500 + origin as u32);
+                mgr.seed_summary_cursor_at_origin(&peer, &sorted, origin);
+
+                let mut covered = HashSet::new();
+                for _ in 0..rounds {
+                    let start = mgr.begin_summary_window(&peer, &sorted);
+                    let window = rotation_window_indices(len, start, limit);
+                    assert!(!window.is_empty(), "empty window");
+                    for &i in &window {
+                        covered.insert(i);
+                    }
+                    let last = *sorted[*window.last().expect("non-empty")].id();
+                    mgr.record_summary_cursor(&peer, last, window.len(), &sorted);
+                }
+
+                assert_eq!(
+                    covered.len(),
+                    len,
+                    "len={len} limit={limit} origin={origin}: {} of {len} \
+                     contracts covered in {rounds} rounds",
+                    covered.len()
+                );
+            }
+        }
+    }
+
+    /// The boundary is ATOMIC: drawing an origin publishes it, so a second
+    /// reply that arrives before the first records resumes from the SAME
+    /// origin instead of drawing its own.
+    ///
+    /// Without this, two concurrent replies from one peer both see no cursor,
+    /// draw different origins, and have both entry counts charged to one cycle
+    /// for two non-contiguous windows — the count running ahead of the ground
+    /// covered, which is #5181's own failure class.
+    ///
+    /// Repeated so a coincidental agreement between two independent draws
+    /// (~1/len) cannot pass for the published-origin property.
+    #[test]
+    fn a_published_boundary_makes_a_second_reader_agree_on_the_origin() {
+        let sorted = sorted_keys(0..64);
+        for i in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer = make_unique_peer_key(9600 + i);
+            let first = mgr.begin_summary_window(&peer, &sorted);
+            let second = mgr.begin_summary_window(&peer, &sorted);
+            assert_eq!(
+                first, second,
+                "a second reader with no record in between must resume from the \
+                 PUBLISHED origin, not draw its own"
+            );
+        }
+    }
+
+    /// A record is accepted only when it advances the cycle by exactly the
+    /// number of entries it sent, measured circularly from the previous
+    /// position.
+    ///
+    /// Each case is one of the traps a coverage assertion passes under, so
+    /// none of them would be caught by the sweep above.
+    #[test]
+    fn records_must_advance_the_cycle_and_forward_is_circular() {
+        let sorted = sorted_keys(0..40);
+        let len = sorted.len();
+
+        // 1. A well-formed round is accepted and charged exactly.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(1);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 10);
+            mgr.record_summary_cursor(&peer, *sorted[13].id(), 4, &sorted);
+            let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(c.advertised_in_cycle, 4, "a well-formed round is charged");
+            assert_eq!(c.last_sent, *sorted[13].id());
+        }
+
+        // 2. CIRCULAR, not linear: a window that wraps past the highest id ends
+        // on an id that sorts BELOW the previous one. A linear test calls that
+        // a rewind and rejects a legitimate round.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(2);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 38);
+            // 4 entries from 38: 38, 39, 0, 1 -> last is index 1.
+            mgr.record_summary_cursor(&peer, *sorted[1].id(), 4, &sorted);
+            let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(
+                c.advertised_in_cycle, 4,
+                "a wrapping window is well-formed and must be accepted"
+            );
+        }
+
+        // 3. A whole-set round mid-cycle lands back on its own predecessor, so
+        // the circular advance is 0 — and `entries_sent % len` is also 0. It
+        // must be ACCEPTED. An `advance == 0` rejection wedges the cursor here.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(3);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 7);
+            mgr.record_summary_cursor(&peer, *sorted[6].id(), len, &sorted);
+            let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(
+                c.advertised_in_cycle, len,
+                "a whole-set round advances by len, which is 0 mod len, and \
+                 must be accepted rather than rejected as non-advancing"
+            );
+        }
+
+        // 4. A STALE record is discarded: it would both double-charge the cycle
+        // and rewind `last_sent` so covered ground is re-sent.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(4);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 0);
+            mgr.record_summary_cursor(&peer, *sorted[7].id(), 8, &sorted);
+            let before = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            // A slow reply carrying the FIRST window, recording second.
+            mgr.record_summary_cursor(&peer, *sorted[3].id(), 4, &sorted);
+            let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(
+                (after.last_sent, after.advertised_in_cycle, after.cycle_len),
+                (
+                    before.last_sent,
+                    before.advertised_in_cycle,
+                    before.cycle_len
+                ),
+                "a stale record must be discarded: charging it double-counts \
+                 the cycle AND rewinding re-sends ground already covered"
+            );
+            assert_eq!(
+                after.consecutive_rejections, 1,
+                "the discard must be counted, so a RUN of them can break the wedge"
+            );
+            assert_eq!(mgr.summary_cursor_rejections(), 1);
+        }
+
+        // 5. A DUPLICATE of the round just recorded covers no new distance and
+        // is discarded by the same rule — no separate special case needed.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(5);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 20);
+            mgr.record_summary_cursor(&peer, *sorted[23].id(), 4, &sorted);
+            let before = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            mgr.record_summary_cursor(&peer, *sorted[23].id(), 4, &sorted);
+            let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(
+                (after.last_sent, after.advertised_in_cycle),
+                (before.last_sent, before.advertised_in_cycle),
+                "a duplicate round must not be charged twice"
+            );
+        }
+
+        // 6. A single-entry set: every round is a whole-set round.
+        {
+            let solo = sorted_keys(0..1);
+            let (mgr, _clock) = make_manager();
+            let peer = make_peer_key(6);
+            mgr.seed_summary_cursor_at_origin(&peer, &solo, 0);
+            mgr.record_summary_cursor(&peer, *solo[0].id(), 1, &solo);
+            let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+            assert_eq!(c.advertised_in_cycle, 1, "len=1 must not wedge");
+            // ...and the completed cycle re-randomises (trivially, to 0).
+            assert_eq!(mgr.begin_summary_window(&peer, &solo), 0);
+        }
+    }
+
+    /// Churn inside the arc already swept must not read as a stale record.
+    ///
+    /// The window is built and the cursor recorded against the SAME snapshot
+    /// for one reply, and the window is chosen by index in that snapshot
+    /// starting at the resume position, so insertions shift both positions
+    /// together and the advance is still exactly the entry count.
+    #[test]
+    fn churn_inside_the_swept_arc_does_not_look_like_a_stale_record() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+
+        // Round one against a 20-contract set.
+        let first = sorted_keys(0..20);
+        mgr.seed_summary_cursor_at_origin(&peer, &first, 5);
+        let start = mgr.begin_summary_window(&peer, &first);
+        let window = rotation_window_indices(first.len(), start, 4);
+        let last = *first[*window.last().expect("non-empty")].id();
+        mgr.record_summary_cursor(&peer, last, window.len(), &first);
+        assert_eq!(mgr.summary_cursor_rejections(), 0);
+
+        // The set grows: ids interleave both below and above the cursor.
+        let grown = sorted_keys(0..40);
+        let start2 = mgr.begin_summary_window(&peer, &grown);
+        let window2 = rotation_window_indices(grown.len(), start2, 4);
+        let last2 = *grown[*window2.last().expect("non-empty")].id();
+        mgr.record_summary_cursor(&peer, last2, window2.len(), &grown);
+
+        assert_eq!(
+            mgr.summary_cursor_rejections(),
+            0,
+            "churn between rounds must not make a well-formed round look stale"
+        );
+        let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+        assert_eq!(c.last_sent, last2, "the round must have been recorded");
+    }
+
+    /// A peer that shrinks the shared set must NOT be able to pin our window.
+    ///
+    /// The peer chooses `sorted` — it is the intersection with the hashes it
+    /// advertised — so if cycle completion were measured against the CURRENT
+    /// length, alternating a single-hash `Interests` with a full one would end
+    /// our cycle on demand and re-seed the rotation from an id the peer picked.
+    /// Every full round would then begin at the same index and everything past
+    /// the first window would go unadvertised indefinitely.
+    ///
+    /// That is not a theoretical concern about a hostile peer: it is what the
+    /// first version of this fix did, and it was strictly WORSE than the #5181
+    /// bug it replaced. Pre-#5181 the same alternation hit a boundary and drew
+    /// a random offset, so coverage was coupon-collector but complete. Trading
+    /// a random, self-correcting failure for a deterministic, permanent one is
+    /// not a fix. Completion is measured against `SummaryCursor::cycle_len`,
+    /// captured when the cycle began, which the peer cannot move.
+    #[test]
+    fn a_peer_that_shrinks_the_shared_set_cannot_pin_the_window() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let full = sorted_keys(0..64);
+        let pinned = vec![full[63]];
+
+        let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            // The peer advertises just its highest-id contract.
+            let s1 = mgr.begin_summary_window(&peer, &pinned);
+            let w1 = rotation_window_indices(pinned.len(), s1, 64);
+            mgr.record_summary_cursor(
+                &peer,
+                *pinned[*w1.last().expect("non-empty")].id(),
+                w1.len(),
+                &pinned,
+            );
+
+            // Then the full set. The start must MOVE across rounds, and the
+            // union must eventually reach every contract.
+            let s2 = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s2);
+            let w2 = rotation_window_indices(full.len(), s2, 8);
+            for &i in &w2 {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(
+                &peer,
+                *full[*w2.last().expect("non-empty")].id(),
+                w2.len(),
+                &full,
+            );
+        }
+
+        assert!(
+            full_round_starts.len() > 1,
+            "a peer that alternates a one-hash Interests with a full one must \
+             not pin the full-round start: 20 rounds all began at {:?}",
+            full_round_starts
+        );
+        assert_eq!(
+            covered.len(),
+            full.len(),
+            "20 rounds of 8 must still cover all {} contracts; covered {}",
+            full.len(),
+            covered.len()
+        );
+        assert!(
+            mgr.summary_cursor_rejections() > 0,
+            "the one-hash rounds must be IGNORED by the frame guard rather than \
+             dragging the cursor; if none were, the guard is not firing and the \
+             coverage above is passing for some other reason"
+        );
+    }
+
+    /// An ORDINARY shrink — the shared set losing an element to churn — must
+    /// pass the frame guard.
+    ///
+    /// `sorted` is our interest index intersected with the hashes the peer
+    /// advertised, and both sides churn: interest entries carry a 20-minute TTL
+    /// and are swept every minute. A set one element below the cycle frame is
+    /// therefore routine, and the guard's earlier `len < cycle_len` form
+    /// rejected it outright.
+    ///
+    /// The cost of that was bandwidth, which is the scarce resource this whole
+    /// rotation exists to ration (#5153): a rejected round leaves the cursor
+    /// parked, so the NEXT round re-sends a byte-identical window. Measured
+    /// here, the un-narrowed guard needs 6 rounds and 3 rejections where the
+    /// narrowed one needs 4 and none — a 50% surcharge on ordinary churn, for
+    /// no coverage gain.
+    ///
+    /// Deliberately NOT an alternation between a full set and a tiny one: that
+    /// shape is `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` and
+    /// `probe_peer_pins_window_with_a_set_larger_than_the_limit`. The existing
+    /// churn test only ever GROWS the set (20 -> 40), which is why this bug had
+    /// no coverage.
+    #[test]
+    fn an_ordinary_shrink_is_not_rejected() {
+        const LEN: usize = 200;
+        const LIMIT: usize = 64;
+        const DROPPED: usize = 100;
+
+        let full = sorted_keys(0..LEN as u32);
+        // One contract drops out of the intersection on alternate rounds.
+        let dipped: Vec<ContractKey> = full
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != DROPPED)
+            .map(|(_, k)| *k)
+            .collect();
+        let always_present: HashSet<ContractInstanceId> = dipped.iter().map(|k| *k.id()).collect();
+
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+        let mut rounds = 0usize;
+        while !always_present.is_subset(&covered) && rounds < 20 {
+            let set: &[ContractKey] = if rounds % 2 == 1 { &dipped } else { &full };
+            let start = mgr.begin_summary_window(&peer, set);
+            let window = rotation_window_indices(set.len(), start, LIMIT);
+            assert!(!window.is_empty(), "empty window on round {rounds}");
+            for &i in &window {
+                covered.insert(*set[i].id());
+            }
+            let last = *set[*window.last().expect("non-empty")].id();
+            mgr.record_summary_cursor(&peer, last, window.len(), set);
+            rounds += 1;
+        }
+
+        assert_eq!(
+            rounds,
+            LEN.div_ceil(LIMIT),
+            "a set dipping by one element must still cover its {} stable \
+             contracts in ceil({LEN}/{LIMIT}) rounds; took {rounds}",
+            always_present.len(),
+        );
+        assert_eq!(
+            mgr.summary_cursor_rejections(),
+            0,
+            "ordinary churn must not be rejected: a rejected round parks the \
+             cursor and the next round re-sends a byte-identical window"
+        );
+    }
+
+    /// The peer must not be able to drive the rotation through the REJECTION
+    /// ESCAPE HATCH.
+    ///
+    /// The hatch exists for a caller-side defect that makes every record
+    /// ill-formed; after `MAX_CONSECUTIVE_CURSOR_REJECTIONS` it abandons the
+    /// cursor and draws a fresh random origin. A peer that can force rejections
+    /// on demand can therefore force a boundary on demand, and the boundary is
+    /// framed against whatever it is advertising AT THAT MOMENT — a one-hash
+    /// `Interests` gives a cycle of length one, which completes on its very
+    /// next round.
+    ///
+    /// That is survivable only because the boundary draws a RANDOM origin: the
+    /// peer gets to choose WHEN we re-originate, but not WHERE. If the boundary
+    /// ever becomes deterministic, this is a second door to the steering that
+    /// `a_peer_that_shrinks_the_shared_set_cannot_pin_the_window` closes, and
+    /// this test is what notices.
+    ///
+    /// The alternation is deliberately LONGER than that test's: one full round
+    /// per `MAX_CONSECUTIVE_CURSOR_REJECTIONS + 1` one-hash rounds, so the
+    /// hatch has room to fire between full rounds. The existing test alternates
+    /// one for one, so a full round always resets the count first and the hatch
+    /// is never reached.
+    #[test]
+    fn a_peer_cannot_drive_the_rotation_through_the_rejection_escape_hatch() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let full = sorted_keys(0..64);
+        let pinned = vec![full[63]];
+
+        let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            // Enough one-hash rounds to reach the hatch.
+            for _ in 0..=MAX_CONSECUTIVE_CURSOR_REJECTIONS {
+                let s = mgr.begin_summary_window(&peer, &pinned);
+                let w = rotation_window_indices(pinned.len(), s, LIMIT);
+                mgr.record_summary_cursor(
+                    &peer,
+                    *pinned[*w.last().expect("non-empty")].id(),
+                    w.len(),
+                    &pinned,
+                );
+            }
+
+            let s = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(
+                &peer,
+                *full[*w.last().expect("non-empty")].id(),
+                w.len(),
+                &full,
+            );
+        }
+
+        assert!(
+            full_round_starts.len() > 1,
+            "a peer that spends {} one-hash rounds between full ones must not \
+             pin the full-round start: 20 full rounds all began at {:?}",
+            MAX_CONSECUTIVE_CURSOR_REJECTIONS as usize + 1,
+            full_round_starts
+        );
+    }
+
+    /// A round covering the WHOLE of a set that is NOT a material shrink must
+    /// not move the cursor.
+    ///
+    /// The two clauses of the frame guard cover different cases and neither
+    /// implies the other; this pins the one the material-shrink clause misses.
+    /// A set at 136 of a 200 frame is well over half, so
+    /// `len * 2 < cycle_len` does not fire — but if the round sends the WHOLE
+    /// of it, the advance check below is VACUOUS: a full-set round wraps to
+    /// where it began, so its circular advance is `0` and `entries_sent % len`
+    /// is `0` too, and any last id the peer arranges passes. The window ends on
+    /// the entry cyclically BEFORE its start — the greatest advertised id at or
+    /// below the cursor — so by advertising exactly one low id the peer names
+    /// where `last_sent` lands.
+    ///
+    /// # What this test deliberately does NOT claim
+    ///
+    /// It asserts the record is not APPLIED, not that the peer is thereby
+    /// unable to pin the rotation. Measured: with this clause removed the
+    /// attack still fails to pin, because the accepted 136-entry round drives
+    /// the cycle to completion and the redraw scatters the origin (starts over
+    /// 20 rounds: 19 distinct values, coverage 200/200). The general defence is
+    /// the redraw — see [`InterestManager::begin_summary_window`]. What this
+    /// clause buys is narrower and still worth having: we do not apply a record
+    /// whose only check cannot fail. An end-to-end pin assertion here would be
+    /// claiming more than the mechanism delivers, and would pass for the wrong
+    /// reason.
+    #[test]
+    fn a_whole_set_round_is_rejected_even_when_the_shrink_is_not_material() {
+        const FRAME: usize = 200;
+        let full = sorted_keys(0..FRAME as u32);
+
+        // One id below the cursor, everything else above it: 136 of 200, so
+        // `len * 2 < cycle_len` is false (272 >= 200) and only the whole-set
+        // clause can catch this.
+        let attack: Vec<ContractKey> = std::iter::once(full[0])
+            .chain(full[65..].iter().copied())
+            .collect();
+        assert_eq!(attack.len(), 136);
+        assert!(
+            attack.len() * 2 >= FRAME,
+            "the point of this test is a shrink the material clause ignores"
+        );
+
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // One honest round, so there is a real cursor to drag.
+        let s = mgr.begin_summary_window(&peer, &full);
+        let w = rotation_window_indices(full.len(), s, 64);
+        mgr.record_summary_cursor(
+            &peer,
+            *full[*w.last().expect("non-empty")].id(),
+            w.len(),
+            &full,
+        );
+        let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+        // The whole advertised set in one round.
+        let sa = mgr.begin_summary_window(&peer, &attack);
+        let wa = rotation_window_indices(attack.len(), sa, FRAME);
+        assert_eq!(wa.len(), attack.len(), "the round must cover the whole set");
+        let last = *attack[*wa.last().expect("non-empty")].id();
+        assert_ne!(
+            last, before,
+            "the attack is only meaningful if the whole-set round ends on a \
+             DIFFERENT id than the cursor already holds"
+        );
+        mgr.record_summary_cursor(&peer, last, wa.len(), &attack);
+
+        assert_eq!(
+            mgr.peek_summary_cursor(&peer).expect("cursor"),
+            before,
+            "a round covering the whole of a smaller set must not move the \
+             cursor: its circular advance is 0 whatever last id it names, so \
+             the advance check cannot reject it"
+        );
+        assert!(
+            mgr.summary_cursor_rejections() > 0,
+            "the whole-set round must be counted as a rejection"
+        );
+    }
+
+    /// The HONEST revisit bound is two cycles, not one.
+    ///
+    /// This is the figure the rotation may be sold on, and it is weaker than
+    /// the within-cycle coverage bound it is easy to confuse it with. A cycle
+    /// covers a stable set in `ceil(len / limit)` rounds — that is
+    /// `rotation_covers_every_contract_within_ceil_n_over_limit_rounds`. But
+    /// each completed cycle draws a FRESH random origin (see
+    /// [`InterestManager::begin_summary_window`] for why that redraw is
+    /// load-bearing against steering), so a contract covered early in one cycle
+    /// and late in the next waits up to `2 * ceil(len / limit) - 1` rounds.
+    ///
+    /// Pinning the honest figure is the point. An earlier revision of this test
+    /// asserted the single-cycle bound and passed only because it ran exactly
+    /// ONE cycle; `the_real_api_covers_every_contract_from_every_origin` has
+    /// the same blind spot by construction. Tightening this to
+    /// `ceil(len / limit)` requires a cursor that is not resolved through the
+    /// peer's set at all (#5313) — until then, a test asserting the tighter
+    /// bound is asserting something the code does not do.
+    #[test]
+    fn the_revisit_gap_spans_at_most_two_cycles() {
+        for (len, limit) in [(200usize, 64usize), (40, 8), (33, 8), (17, 4)] {
+            let sorted = sorted_keys(0..len as u32);
+            let cycle = len.div_ceil(limit);
+            let bound = 2 * cycle - 1;
+            let rounds = cycle * 12;
+
+            for origin in [0usize, 1, len / 3, len / 2, len - 1] {
+                let (mgr, _clock) = make_manager();
+                let peer = make_unique_peer_key(9900 + origin as u32);
+                mgr.seed_summary_cursor_at_origin(&peer, &sorted, origin);
+
+                let mut last_seen: Vec<Option<usize>> = vec![None; len];
+                let mut worst = 0usize;
+                let mut worst_at = (0usize, 0usize);
+                for r in 0..rounds {
+                    let start = mgr.begin_summary_window(&peer, &sorted);
+                    let window = rotation_window_indices(len, start, limit);
+                    assert!(!window.is_empty(), "empty window");
+                    for &i in &window {
+                        if let Some(prev) = last_seen[i] {
+                            if r - prev > worst {
+                                worst = r - prev;
+                                worst_at = (i, r);
+                            }
+                        }
+                        last_seen[i] = Some(r);
+                    }
+                    let last = *sorted[*window.last().expect("non-empty")].id();
+                    mgr.record_summary_cursor(&peer, last, window.len(), &sorted);
+                }
+
+                assert!(
+                    last_seen.iter().all(Option::is_some),
+                    "len={len} limit={limit} origin={origin}: some contract was \
+                     never advertised in {rounds} rounds"
+                );
+                assert!(
+                    worst <= bound,
+                    "len={len} limit={limit} origin={origin}: contract {} went \
+                     {worst} rounds without being advertised (bound {bound}), \
+                     last at round {}",
+                    worst_at.0,
+                    worst_at.1
+                );
+            }
+        }
+    }
+
+    /// A cycle COMPLETES and then re-randomises, so the anti-starvation redraw
+    /// keeps firing.
+    ///
+    /// Pins `advertised_in_cycle` ACCUMULATING across rounds. Replacing the
+    /// `saturating_add` with a bare assignment leaves every other test in this
+    /// module green while cycles never complete for `limit < len`, so the
+    /// boundary redraw never fires again and tail starvation returns silently.
+    #[test]
+    fn a_cycle_completes_and_then_re_randomises() {
+        let sorted = sorted_keys(0..40);
+        let limit = 8usize;
+        let rounds = sorted.len().div_ceil(limit);
+
+        let mut second_cycle_starts = HashSet::new();
+        for i in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer = make_unique_peer_key(9700 + i);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 3);
+
+            for r in 0..rounds {
+                let start = mgr.begin_summary_window(&peer, &sorted);
+                let w = rotation_window_indices(sorted.len(), start, limit);
+                mgr.record_summary_cursor(
+                    &peer,
+                    *sorted[*w.last().expect("non-empty")].id(),
+                    w.len(),
+                    &sorted,
+                );
+                let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+                assert_eq!(
+                    c.advertised_in_cycle,
+                    (r + 1) * limit,
+                    "the count must ACCUMULATE across rounds, not be replaced"
+                );
+            }
+
+            // The cycle is now complete, so the next window is a boundary.
+            second_cycle_starts.insert(mgr.begin_summary_window(&peer, &sorted));
+        }
+
+        assert!(
+            second_cycle_starts.len() > 1,
+            "a completed cycle must draw a fresh random origin; 40 trials all \
+             restarted at {second_cycle_starts:?}"
+        );
+    }
+
+    /// A run of ill-formed records must degrade to a fresh random origin, not
+    /// to permanent silence.
+    ///
+    /// A rejected record leaves the cursor untouched, so without a bound a
+    /// caller-side defect that made every record ill-formed would re-send the
+    /// same window forever and starve every other contract for the process
+    /// lifetime — strictly worse than the staleness the check exists to stop.
+    #[test]
+    fn a_run_of_rejected_records_falls_back_to_a_boundary() {
+        let sorted = sorted_keys(0..64);
+        let mut starts = HashSet::new();
+        for i in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer = make_unique_peer_key(9800 + i);
+            mgr.seed_summary_cursor_at_origin(&peer, &sorted, 10);
+            let first = mgr.begin_summary_window(&peer, &sorted);
+
+            // Feed it records that can never be well-formed against the cycle.
+            for _ in 0..MAX_CONSECUTIVE_CURSOR_REJECTIONS {
+                mgr.record_summary_cursor(&peer, *sorted[30].id(), 1, &sorted);
+            }
+            assert_eq!(
+                mgr.summary_cursor_rejections(),
+                MAX_CONSECUTIVE_CURSOR_REJECTIONS as usize
+            );
+            starts.insert((first, mgr.begin_summary_window(&peer, &sorted)));
+        }
+        assert!(
+            starts.iter().any(|(a, b)| a != b),
+            "after {MAX_CONSECUTIVE_CURSOR_REJECTIONS} consecutive rejections \
+             the rotation must redraw rather than re-send the same window \
+             forever; every trial stayed put: {starts:?}"
+        );
+    }
+
+    /// A cursor evicted between drawing the window and recording it starts a
+    /// fresh cycle rather than discarding the round.
+    #[test]
+    fn a_record_with_no_cursor_starts_a_fresh_cycle() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let sorted = sorted_keys(0..16);
+
+        assert_eq!(mgr.peek_summary_cursor_state(&peer), None);
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 4, &sorted);
+        let c = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+        assert_eq!(c.advertised_in_cycle, 4);
+        assert_eq!(c.last_sent, *sorted[5].id());
+        assert_eq!(
+            mgr.summary_cursor_rejections(),
+            0,
+            "there is nothing to check a first record against"
+        );
+
+        // Degenerate inputs must be no-ops, not panics.
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 0, &sorted);
+        mgr.record_summary_cursor(&peer, *sorted[5].id(), 4, &[]);
+        assert_eq!(
+            mgr.peek_summary_cursor_state(&peer).expect("cursor"),
+            c,
+            "an empty round or an empty set must leave the cursor alone"
         );
     }
 
@@ -7652,9 +12310,24 @@ mod tests {
     #[test]
     fn summary_window_start_draws_its_offset_from_global_rng() {
         let src = include_str!("interest.rs");
+        // The needle must land in PRODUCTION code, not in this test's own
+        // source. When #5181 renamed the function, the old needle stopped
+        // matching anything above and silently resolved to the `.expect`
+        // string literal below it — the body then spanned this assertion,
+        // whose own text contains "GlobalRng::random_range", so the pin passed
+        // vacuously and a `random_range(..) -> 0` mutation stayed green. Guard
+        // against the whole class rather than the one spelling.
+        let test_mod_start = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not found");
         let at = src
-            .find("pub(crate) fn summary_window_start(")
-            .expect("summary_window_start not found");
+            .find("pub(crate) fn begin_summary_window(")
+            .expect("begin_summary_window not found — did it get renamed again?");
+        assert!(
+            at < test_mod_start,
+            "the pin's needle matched inside the test module, so it would \
+             assert against its own source rather than production code"
+        );
         let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
         let body = &src[at..body_end];
         assert!(
@@ -7663,6 +12336,319 @@ mod tests {
              fixed restart starves the tail of the set for any peer that keeps \
              returning to a boundary, and a non-GlobalRng source breaks \
              simulation determinism"
+        );
+    }
+
+    /// REVIEW PROBE: a peer that advertises a set LARGER than the window but
+    /// SMALLER than the cycle frame can drag `last_sent` wherever it likes,
+    /// because the frame guard now only fires when the round covered the WHOLE
+    /// shared set.
+    #[test]
+    fn probe_peer_pins_window_with_a_set_larger_than_the_limit() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let full = sorted_keys(0..64);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // 9 elements: one below the window we want to re-send, then the seven
+        // just after it, then the highest id. |S| = 9 > LIMIT = 8, so the
+        // narrowed frame guard does NOT fire.
+        let attack: Vec<ContractKey> = {
+            let mut v = vec![full[0]];
+            v.extend_from_slice(&full[8..15]);
+            v.push(full[63]);
+            v
+        };
+        assert_eq!(attack.len(), 9);
+
+        let mut full_round_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            full_round_starts.insert(s);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+
+            let sa = mgr.begin_summary_window(&peer, &attack);
+            let wa = rotation_window_indices(attack.len(), sa, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *attack[*wa.last().expect("ne")].id(),
+                wa.len(),
+                &attack,
+            );
+        }
+
+        eprintln!(
+            "PROBE: full_round_starts={:?} covered={} rejections={}",
+            full_round_starts,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert!(
+            full_round_starts.len() > 1,
+            "PINNED: 20 full rounds all began at {full_round_starts:?}"
+        );
+        assert_eq!(
+            covered.len(),
+            full.len(),
+            "STARVED: covered {} of 64",
+            covered.len()
+        );
+    }
+
+    /// REVIEW PROBE: same lever, but the peer shrinks to a set that is smaller
+    /// than the window and yet still not fully covered because the reply was
+    /// cut short by the byte/summarize budget (`entries_sent < len`).
+    #[test]
+    fn probe_budget_cut_round_bypasses_the_frame_guard() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(2);
+        let full = sorted_keys(0..64);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+
+        // Round one, full set, window of 8.
+        let s = mgr.begin_summary_window(&peer, &full);
+        let w = rotation_window_indices(full.len(), s, 8);
+        mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        let before = mgr.peek_summary_cursor(&peer).expect("cursor");
+
+        // Peer advertises a 3-element set; the reply is cut after 2 entries by
+        // the budget, so entries_sent (2) < len (3): guard does not fire.
+        let small = vec![full[0], full[9], full[10]];
+        let sa = mgr.begin_summary_window(&peer, &small);
+        let wa = rotation_window_indices(small.len(), sa, 8);
+        // Simulate a budget cut: send only the first 2 of the window.
+        let sent = &wa[..2];
+        mgr.record_summary_cursor(
+            &peer,
+            *small[*sent.last().expect("ne")].id(),
+            sent.len(),
+            &small,
+        );
+        let after = mgr.peek_summary_cursor(&peer).expect("cursor");
+        eprintln!(
+            "PROBE budget-cut: start_in_small={sa} window={wa:?} moved={} rejections={}",
+            before != after,
+            mgr.summary_cursor_rejections()
+        );
+        assert_eq!(
+            before, after,
+            "a budget-cut short round against a smaller set moved the cursor"
+        );
+    }
+
+    /// REVIEW PROBE 3: same-SIZE re-composition. The peer never shrinks the
+    /// set below the frame, so the frame guard cannot fire at all; it simply
+    /// advertises a DIFFERENT set of the same size on alternate rounds.
+    #[test]
+    fn probe_same_size_recomposition_pins_the_window() {
+        const LIMIT: usize = 8;
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(3);
+        let full = sorted_keys(0..64);
+
+        let set_a: Vec<ContractKey> = full[0..16].to_vec();
+        let set_b: Vec<ContractKey> = {
+            let mut v = full[0..8].to_vec();
+            v.extend_from_slice(&full[8..15]);
+            v.push(full[63]);
+            v
+        };
+        assert_eq!(set_a.len(), set_b.len());
+
+        mgr.seed_summary_cursor_at_origin(&peer, &set_a, 0);
+        let mut a_starts = HashSet::new();
+        let mut covered = HashSet::new();
+        for _ in 0..20 {
+            let s = mgr.begin_summary_window(&peer, &set_a);
+            a_starts.insert(s);
+            let w = rotation_window_indices(set_a.len(), s, LIMIT);
+            for &i in &w {
+                covered.insert(*set_a[i].id());
+            }
+            mgr.record_summary_cursor(&peer, *set_a[*w.last().expect("ne")].id(), w.len(), &set_a);
+
+            let sb = mgr.begin_summary_window(&peer, &set_b);
+            let wb = rotation_window_indices(set_b.len(), sb, LIMIT);
+            mgr.record_summary_cursor(
+                &peer,
+                *set_b[*wb.last().expect("ne")].id(),
+                wb.len(),
+                &set_b,
+            );
+        }
+        eprintln!(
+            "PROBE3: a_starts={:?} covered_of_set_a={} rejections={}",
+            a_starts,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert!(
+            a_starts.len() > 1,
+            "PROBE3 PINNED: all set_a rounds began at {a_starts:?}"
+        );
+    }
+
+    /// REVIEW PROBE 4: a shared set that shrinks PERMANENTLY below the frame.
+    /// `cycle_len` never re-frames downward. Is that benign?
+    #[test]
+    fn probe_permanent_shrink_leaves_a_stale_cycle_len() {
+        // Production shape: MAX_SUMMARY_ENTRIES_PER_MESSAGE = 128.
+        const LIMIT: usize = 128;
+        let full = sorted_keys(0..200);
+        let small: Vec<ContractKey> = full[0..40].to_vec();
+        let small_ids: HashSet<ContractInstanceId> = small.iter().map(|k| *k.id()).collect();
+
+        let (mgr, _c) = make_manager();
+        let peer = make_peer_key(4);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+        // Two rounds of 128 over 200: the cycle genuinely completes at 200.
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+        let before = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+
+        // CONTROL: an identically-driven cursor that starts life framed at 40.
+        let (ctl, _c2) = make_manager();
+        let cpeer = make_peer_key(5);
+        ctl.seed_summary_cursor_at_origin(&cpeer, &small, 0);
+
+        // The set drops to 40 and stays there.
+        let mut stale_entries = Vec::new();
+        let mut ctl_entries = Vec::new();
+        let mut stale_cov: Vec<usize> = Vec::new();
+        for _ in 0..50 {
+            let s = mgr.begin_summary_window(&peer, &small);
+            let w = rotation_window_indices(small.len(), s, LIMIT);
+            let cov: HashSet<ContractInstanceId> = w.iter().map(|&i| *small[i].id()).collect();
+            stale_cov.push(cov.len());
+            stale_entries.push(w.len());
+            mgr.record_summary_cursor(&peer, *small[*w.last().expect("ne")].id(), w.len(), &small);
+
+            let cs = ctl.begin_summary_window(&cpeer, &small);
+            let cw = rotation_window_indices(small.len(), cs, LIMIT);
+            ctl_entries.push(cw.len());
+            ctl.record_summary_cursor(
+                &cpeer,
+                *small[*cw.last().expect("ne")].id(),
+                cw.len(),
+                &small,
+            );
+        }
+        let after = mgr.peek_summary_cursor_state(&peer).expect("cursor");
+        eprintln!(
+            "RESIDUAL-A stale: cycle_len {}->{} advertised {}->{} last_sent_moved={} \
+             rejections={} entries/round={:?} coverage/round(min,max)=({},{})",
+            before.cycle_len,
+            after.cycle_len,
+            before.advertised_in_cycle,
+            after.advertised_in_cycle,
+            before.last_sent != after.last_sent,
+            mgr.summary_cursor_rejections(),
+            &stale_entries[..3],
+            stale_cov.iter().min().expect("ne"),
+            stale_cov.iter().max().expect("ne"),
+        );
+        let cc = ctl.peek_summary_cursor_state(&cpeer).expect("cursor");
+        eprintln!(
+            "RESIDUAL-A control: cycle_len={} advertised={} rejections={} entries/round={:?}",
+            cc.cycle_len,
+            cc.advertised_in_cycle,
+            ctl.summary_cursor_rejections(),
+            &ctl_entries[..3],
+        );
+
+        assert!(small_ids.len() == 40);
+        assert_eq!(
+            stale_cov.iter().copied().min().expect("ne"),
+            40,
+            "BENIGN-CLAIM-A: every round must still cover the whole shrunken set"
+        );
+        assert_eq!(
+            stale_entries, ctl_entries,
+            "BENIGN-CLAIM-B: a stale cycle_len must not cost extra entries vs a correctly-framed cursor"
+        );
+
+        // Recovery: the set grows back to 200.
+        let mut regrown = HashSet::new();
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, LIMIT);
+            for &i in &w {
+                regrown.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+        eprintln!(
+            "RESIDUAL-A recovery: covered {}/200 in 2 rounds",
+            regrown.len()
+        );
+        assert_eq!(
+            regrown.len(),
+            200,
+            "BENIGN-CLAIM-C: the rotation must resume on regrowth"
+        );
+    }
+
+    /// REVIEW PROBE 5: the same permanent shrink, but the reply is CUT by the
+    /// byte budget so `entries_sent < len` and the frame guard never fires.
+    #[test]
+    fn probe_permanent_shrink_with_a_budget_cut_latches_completion() {
+        let full = sorted_keys(0..200);
+        let small: Vec<ContractKey> = full[0..40].to_vec();
+        const CUT: usize = 20;
+
+        let (mgr, _c) = make_manager();
+        let peer = make_peer_key(6);
+        mgr.seed_summary_cursor_at_origin(&peer, &full, 0);
+        for _ in 0..2 {
+            let s = mgr.begin_summary_window(&peer, &full);
+            let w = rotation_window_indices(full.len(), s, 128);
+            mgr.record_summary_cursor(&peer, *full[*w.last().expect("ne")].id(), w.len(), &full);
+        }
+
+        let mut completions = 0usize;
+        let mut prev_adv = mgr
+            .peek_summary_cursor_state(&peer)
+            .expect("c")
+            .advertised_in_cycle;
+        let mut covered = HashSet::new();
+        for _ in 0..60 {
+            let s = mgr.begin_summary_window(&peer, &small);
+            let now = mgr.peek_summary_cursor_state(&peer).expect("c");
+            if now.advertised_in_cycle < prev_adv {
+                completions += 1;
+            }
+            let w = rotation_window_indices(small.len(), s, CUT);
+            for &i in &w {
+                covered.insert(i);
+            }
+            mgr.record_summary_cursor(&peer, *small[*w.last().expect("ne")].id(), w.len(), &small);
+            prev_adv = mgr
+                .peek_summary_cursor_state(&peer)
+                .expect("c")
+                .advertised_in_cycle;
+        }
+        let c = mgr.peek_summary_cursor_state(&peer).expect("c");
+        eprintln!(
+            "RESIDUAL-B: cycle_len={} advertised={} (never reset; 60 rounds x {CUT}) \
+             count_resets={completions} covered={}/40 rejections={}",
+            c.cycle_len,
+            c.advertised_in_cycle,
+            covered.len(),
+            mgr.summary_cursor_rejections()
+        );
+        assert_eq!(covered.len(), 40, "coverage must still be complete");
+        assert!(
+            completions > 0,
+            "OBSERVATION: the cycle count never resets again"
         );
     }
 }

@@ -21,28 +21,116 @@ Engine type alias    → engine.rs          (selected by feature flag)
 **All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
-### Delegate API Versioning (`wasm_runtime/delegate_api.rs`)
+### Delegate contract access (`wasm_runtime/native_api.rs`, `delegate_api.rs`)
 
 ```
-V1: Synchronous process() — delegates use request/response for contract access
-V2: Async host functions — delegates call contract methods directly:
-    - ctx.get_contract_state(id)       → read state (two-step: len + read)
-    - ctx.put_contract_state(id, data) → write state (bypasses validate_state)
-    - ctx.update_contract_state(id, data) → conditional write (requires existing state)
-    - ctx.subscribe_contract(id)       → register interest (delivery is TODO)
-    Backend implementation: func_wrap_async (wasmtime native async support)
-    Selected when state_store_db is configured on Runtime
-    NOTE: V2 PUT/UPDATE are local-only, bypass contract validation, and skip
-    hosting metadata. Network propagation is separate.
+A delegate reaches contract state through OUTBOUND MESSAGES:
+    GetContractRequest / PutContractRequest / UpdateContractRequest /
+    SubscribeContractRequest — served by the contract-handling loop through
+    the executor's normal path (the state_store chokepoints).
+The ONE host-function exception is read-only:
+    __frnt__delegate__get_contract_state(_len) — the state THIS NODE already
+    holds. ERR_CONTRACT_NOT_FOUND means "not held here", NOT "does not exist".
+    It never reaches the network.
+
+There is no "V2" delegate API. freenet-stdlib's DelegateWasmAPIVersion has one
+variant (V1). Core used to call delegates that imported contract host
+functions "V2"; that split, and the host functions that WROTE contract state
+(put/update_contract_state) or subscribed (subscribe_contract), were removed
+in #5637.
+
+DO NOT re-add a contract WRITE host function. The removed ones wrote the raw
+Storage, bypassing state_store.{store,update}, so every chokepoint side effect
+had to be copied by hand, and two omissions reached production (disk-budget
+gate #4683, network propagation #5479). Route writes through the message path.
+A module importing a removed name fails to instantiate; pinned by
+removed_delegate_contract_imports_are_refused_at_instantiation.
+```
+
+### Delegate manifests, lifecycle events and capability grants
+
+```
+A delegate built against an older stdlib cannot decode an InboundDelegateMsg
+variant added later: delivery fails with a decode error (pinned by
+a_delegate_without_a_manifest_cannot_decode_lifecycle). So:
+
+NEVER deliver a new inbound message kind to a delegate that did not ask for
+it. Ask = its embedded `freenet-manifest` section lists that kind
+(DelegateManifest::from_wasm, read at registration). Lifecycle (tag 10) is
+delivered only when the manifest lists the kind AND a bound app holds the
+user's Background grant; both are re-checked at delivery
+(contract::delegate_capabilities::delivery_params).
+
+A client may not send host-only inbound messages (Lifecycle, WakeupFired):
+dispatch_delegate_request refuses them before exclusion or queueing.
+
+Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
+connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
+"Freenet asks:") and raised off the contract loop. Unprompted runs
+(InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
+delegates without a manifest are untouched.
+
+Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
+declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at
+every fire (wakeup_check; a storage error skips that fire, never ends the schedule). Declared in the manifest ON PURPOSE: a host import
+fails instantiation on nodes without it, and a new OutboundDelegateMsg variant
+fails decoding of the whole outbound batch on older nodes; an unknown manifest
+field is ignored. DO NOT add a run-time request (import or outbound variant)
+without solving that. Bounds: effective_wakeups (60 s floor, 4 per delegate),
+one pending fire per (delegate, tag), and the SAME duty budget as lifecycle
+runs (one budget, not two). Not persisted: re-armed at node start after
+refresh_capability_manifests re-reads manifests from stored code (older nodes
+stored them without `wakeups`). A parked unprompted run is charged for its
+resumed legs too (handle_delegate_resume, #5748).
+
+Consent: wake-ups ride the existing Background grant (decided with the work's
+brief: "gate on the #5730 Background grant"); an app granted under the older
+card text gets periodic runs without a new prompt. Revoking stops them at the
+next fire.
+
+Old delegate versions: a re-keyed delegate's OLD key keeps its record, and so
+its wake-ups, while any app stays bound to it. Only an unregister by a bound
+app from a local connection removes a binding (the record goes with the last
+one); a CLI or remote unregister does not. An app that re-keys should
+unregister the old key from its own tab once its migration is done.
 ```
 
 ### WASM Call Modes
 
+All three guest entry points share ONE body, `call_typed_blocking` in
+`engine/wasmtime_engine.rs`. Delegates ran "sync, on the calling thread" until
+#5480; they no longer do, and nothing should reintroduce a per-entry-point copy.
+
 ```
-call_3i64()              — Sync, same thread (delegates V1)
-call_3i64_async_imports() — For modules with async host function imports (delegates V2)
-call_*_blocking()        — spawn_blocking + timeout (contracts)
+call_3i64()               — delegates
+call_2i64_blocking()      — contracts
+call_3i64_blocking()      — contracts
+        ↓ all three
+call_typed_blocking()     — spawn_blocking + wall-clock backstop + panic capture
 ```
+
+Two consequences for anything touching the delegate path:
+
+- **A delegate guest can outlive its call.** On the wall-clock-timeout path
+  `exec_inbound_with_env` returns while the guest is still running, because
+  `JoinHandle::abort()` cannot stop a `spawn_blocking` closure that has started.
+  Ask "is a guest still running", not "is its env still registered" — those are
+  different facts (`native_api::LIVE_DELEGATE_GUESTS`).
+- **During `process()`, delegate host functions run on a blocking-pool thread**,
+  so they find their env through a thread-local installed on THAT thread by
+  `GuestDelegateInstance`, not on the caller's.
+
+  Scope that to `process()` and no further. Buffer setup and instantiation —
+  `initiate_buffer`, `call_void`, `instantiate_and_init` — still enter the guest
+  with `block_on_async(func.call_async(...))` INLINE on the calling thread, with
+  no `execute_wasm_blocking` and no `GuestDelegateInstance`. That is why
+  `exec_inbound_with_env` still sets `CURRENT_DELEGATE_INSTANCE` on the calling
+  thread at all, as `DelegateEnvGuard`'s rustdoc explains. "Nothing
+  delegate-related runs on the calling thread" is false and would produce a wrong
+  call about exactly those paths.
+
+The pins `every_guest_entry_is_preceded_by_arm_epoch_deadline` and
+`blocking_paths_arm_epoch_inside_the_closure` enforce the single-body structure.
 
 ## WASM Execution Rules
 
@@ -194,7 +282,7 @@ State merging rules:
     checks deltas, but reports them at `Severity::Diagnostic` so the check
     can never justify removing a contract while the question is open.
     Whether any deployed contract actually relies on the unsafe pattern is
-    empirical and unanswered; `fdev conformance` against deployed WASM is
+    empirical and unanswered; `fdev verify-merge` against deployed WASM is
     how it gets answered. Do not treat either side as decided until it is.
   - Invalid merges should return error, not panic
 ```
@@ -287,10 +375,23 @@ MUST:
 
 - Off-loop deferral (#4391): there are now TWO entry points into the
   bridged upsert.
-  * The NON-deferrable path (`upsert_contract_state`, used by
-    delegate-driven PUTs and direct callers) keeps the INLINE
+  * The NON-deferrable path (`upsert_contract_state`) keeps the INLINE
     `start_sub_op_get` escalation described above — it awaits the
     network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+    Used by direct callers, and as a FALLBACK only: the delegate path
+    reaches it when there is no parking context (direct unit-test calls)
+    or when a park was refused at the node-wide cap. Falling back means
+    accepting the loop stall the deferral exists to remove, which is the
+    deliberate trade at that cap — losing a user's prompt or a delegate's
+    write would be worse.
+  * DELEGATE-DRIVEN PUTs AND UPDATEs USE THE DEFERRABLE PATH (#5544).
+    They used to be listed above as non-deferrable, and were: the delegate
+    arms called `upsert_contract_state` directly, so a related-contract
+    miss awaited a network GET on the serial loop for up to
+    RELATED_FETCH_TIMEOUT. That was one of the two stalls #5544 removes.
+    Past `MAX_DEFERRED_UPSERTS_PER_PARK` the excess REFUSES with
+    `MissingRelated` rather than falling back inline, because nothing caps
+    how many upserts one `process()` may emit.
   * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
     serial `contract_handling` loop) resolves related contracts
     LOCAL-ONLY first. On a local miss it does NOT await the network GET

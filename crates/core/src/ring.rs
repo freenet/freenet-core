@@ -25,14 +25,16 @@ use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
-    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, SubscribeResult,
-    SubscribedContractSnapshot,
+    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, HostingReason,
+    HostingReasonStats, SubscribeResult, SubscribedContractSnapshot,
 };
 
 use crate::message::TransactionType;
+use crate::operations::connect::op_ctx_task::ClientConnectKind;
 use crate::topology::TopologyAdjustment;
 use crate::topology::rate::Rate;
 use crate::tracing::{NetEventLog, NetEventRegister};
+use connection_manager::LatticeProbeMisses;
 
 use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
@@ -85,6 +87,7 @@ mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
@@ -208,6 +211,9 @@ const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
 const GOVERNANCE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 use connection_backoff::ConnectionBackoff;
+
+/// How often connected-peer attributes are written to the routing dataset.
+const ROUTING_DATASET_PEER_INTERVAL: Duration = Duration::from_secs(60);
 pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
 
@@ -229,10 +235,92 @@ struct ContractConnectState {
     last_attempt: Instant,
 }
 
+/// Outcome of [`Ring::add_connection_reporting`].
+///
+/// Exists because `add_connection`'s `bool` answers a different question than
+/// callers usually want: it reports the readiness-threshold crossing, and is
+/// `false` both for a rejected connection and for the ordinary successful add
+/// on an already-ready node. Instrumentation that counts promotions needs
+/// `added` (issue #4787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddConnectionOutcome {
+    /// The ring accepted the connection into the topology. `false` means it
+    /// was rejected — e.g. the `max_connections` cap.
+    pub added: bool,
+    /// Adding this connection crossed the readiness threshold.
+    pub just_became_ready: bool,
+}
+
+/// Per-cause counts of route failure labels (#5657). See
+/// [`Ring::route_failure_cause_counts`].
+#[derive(Default)]
+struct RouteFailureCauseCounts {
+    /// Ambiguous NotFounds dropped untrained (no proof the contract exists).
+    untrained_not_found: std::sync::atomic::AtomicU64,
+    not_found: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    send_failure: std::sync::atomic::AtomicU64,
+    /// The subset of `timeout` recorded as the originator of the operation,
+    /// excluding labels recorded while relaying other nodes' operations.
+    originator_timeout: std::sync::atomic::AtomicU64,
+}
+
+/// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
+/// Labels for peers beyond it are counted, not attributed.
+const TIMEOUT_LABEL_WINDOW_MAX_PEERS: usize = 4096;
+
+/// Timeout route labels per peer since the last router snapshot (#5657), for
+/// the chain-blame soak histogram on `RouterSnapshotInfo`. Bounded: at most
+/// [`TIMEOUT_LABEL_WINDOW_MAX_PEERS`] fixed-size entries, cleared every
+/// snapshot.
+#[derive(Default)]
+struct TimeoutLabelWindow {
+    per_peer: std::collections::HashMap<std::net::SocketAddr, u64>,
+    untracked: u64,
+}
+
+/// Histogram of one [`TimeoutLabelWindow`]:
+/// `(peers with 1, 2-3, 4-7, 8+ labels, max per peer, untracked labels)`.
+pub(crate) type TimeoutLabelHistogram = (u64, u64, u64, u64, u64, u64);
+
+impl TimeoutLabelWindow {
+    fn record(&mut self, addr: std::net::SocketAddr) {
+        if let Some(count) = self.per_peer.get_mut(&addr) {
+            *count += 1;
+        } else if self.per_peer.len() < TIMEOUT_LABEL_WINDOW_MAX_PEERS {
+            self.per_peer.insert(addr, 1);
+        } else {
+            self.untracked += 1;
+        }
+    }
+
+    fn take_histogram(&mut self) -> TimeoutLabelHistogram {
+        let (mut b1, mut b2, mut b4, mut b8, mut max) = (0, 0, 0, 0, 0);
+        for count in self.per_peer.values().copied() {
+            match count {
+                0 => {}
+                1 => b1 += 1,
+                2..=3 => b2 += 1,
+                4..=7 => b4 += 1,
+                _ => b8 += 1,
+            }
+            max = max.max(count);
+        }
+        let untracked = self.untracked;
+        *self = Self::default();
+        (b1, b2, b4, b8, max, untracked)
+    }
+}
+
 pub(crate) struct Ring {
     pub max_hops_to_live: usize,
     pub connection_manager: ConnectionManager,
     pub router: Arc<RwLock<Router>>,
+    /// Route failure labels fed to the router, by the attempt outcome that
+    /// produced them (#5657). Diagnostics only.
+    route_failure_causes: RouteFailureCauseCounts,
+    /// Timeout labels per peer since the last router snapshot (#5657).
+    timeout_label_window: parking_lot::Mutex<TimeoutLabelWindow>,
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
     /// Per-contract record of detected CRDT-invariant violations (e.g. a
@@ -318,6 +406,15 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node contract-exec WASM counters: how many `summarize_state` /
+    /// `get_state_delta` invocations this node actually ran, split from the
+    /// cache hits that elided them. Constructed once here and shared via `Arc`:
+    /// the executor increments it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it. Threading the `Arc` (rather
+    /// than a process-global) keeps the counters per-node so unit tests stay
+    /// isolated (#4488). See [`contract_exec_metrics`] for why an
+    /// undifferentiated span count could not answer the storm question.
+    contract_exec_metrics: Arc<contract_exec_metrics::ContractExecMetrics>,
     /// Per-node placement-migration activity counters (#4404 follow-up).
     /// Constructed once here and shared via `Arc`: the migration SEND site
     /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
@@ -626,9 +723,6 @@ impl Ring {
         // refits inline once its window has turned over (#4811). There is no periodic
         // refit task — `refit_router_periodically` was deleted with this change,
         // because polling was the only thing it did.
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-        crate::node::network_status::set_router(router.clone());
-
         // Interval for topology snapshot registration (1 second in test mode)
         // Registers subscription topology with the global registry for validation
         #[cfg(any(test, feature = "testing"))]
@@ -656,9 +750,27 @@ impl Ring {
             governance_config,
             time_source.clone(),
         ));
+        // Read before `connection_manager` is moved into the literal.
+        // The UPDATE limiter's per-sender budget is keyed by the
+        // immediate upstream hop, so its map is sized from this node's
+        // OWN connection cap rather than a hardcoded default.
+        let max_connections = connection_manager.max_connections;
+        // Built here, after the time source and the connection cap it depends
+        // on: the hierarchical routing estimator's horizons run on the ring's
+        // `InstantTimeSrc`, which reads tokio's clock (so they advance under a
+        // paused tokio runtime, but do NOT follow a hosting-only time override),
+        // and its peer tables are sized from this node's own `max_connections`.
+        let router = Arc::new(RwLock::new(
+            Router::new(&[])
+                .with_time_source(time_source.clone())
+                .with_max_connections(max_connections),
+        ));
+        crate::node::network_status::set_router(router.clone());
         let ring = Ring {
             max_hops_to_live,
             router,
+            route_failure_causes: RouteFailureCauseCounts::default(),
+            timeout_label_window: parking_lot::Mutex::new(TimeoutLabelWindow::default()),
             connection_manager,
             // Production passes the Ring's default `Arc<InstantTimeSrc>`
             // (wall clock). Simulation tests can inject a controllable clock via
@@ -675,7 +787,15 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
-                time_source.clone(),
+                // Production passes `None` and gets `time_source` (the real
+                // clock). The override exists so a test can decide the
+                // limiter's verdict instead of racing MIN_UPDATE_INTERVAL —
+                // see `NodeConfig::update_rate_limit_time_source_override`.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+                max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
@@ -704,6 +824,7 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            contract_exec_metrics: Arc::new(contract_exec_metrics::ContractExecMetrics::default()),
             // One placement-migration counter sink per node, shared with the
             // migration send/receive sites via the `Arc` (reached through
             // `op_manager.ring`). See the field docs.
@@ -815,6 +936,20 @@ impl Ring {
             )),
         );
 
+        // Peer-attribute snapshots for the opt-in routing dataset (#4485). Spawned
+        // only when an operator enabled recording, so a default node — and every
+        // simulation — runs no extra task and consumes no extra timer.
+        if let Some(dataset) = crate::router::dataset::global() {
+            task_monitor.register(
+                "record_routing_dataset_peers",
+                GlobalExecutor::spawn(Self::record_routing_dataset_peers(
+                    ring.clone(),
+                    dataset,
+                    ROUTING_DATASET_PEER_INTERVAL,
+                )),
+            );
+        }
+
         // Spawn periodic contract-directed CONNECT task.
         // When a peer is a "subscription root" (closest to contract among neighbors),
         // it sends CONNECTs toward the contract's ring location to merge disconnected
@@ -865,6 +1000,14 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+        // The hosting cache charges each hosted contract the neighbour-summary
+        // bytes the interest manager holds for it (#5647). Holding the
+        // `InterestManager` Arc directly creates no cycle: it references
+        // neither the ring nor the hosting manager.
+        let interest = op_manager.interest_manager.clone();
+        interest.set_neighbour_summary_budget(self.neighbour_summary_budget());
+        self.hosting_manager
+            .set_interest_bytes_provider(Arc::new(move |key| interest.resident_bytes_for(key)));
     }
 
     /// Shared per-node module-cache telemetry sink (#4440 / #4488). The
@@ -873,6 +1016,16 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node contract-exec WASM counters. Returns a BORROW, not an
+    /// `Arc` clone: the increment sites sit on the contract-handling loop's hot
+    /// path (tens of calls/sec per node), where an `Arc` refcount bump would be
+    /// a needless atomic RMW on top of the counter's own. The snapshot reader
+    /// borrows the same way on its 5-minute cadence.
+    #[inline]
+    pub(crate) fn contract_exec_metrics(&self) -> &contract_exec_metrics::ContractExecMetrics {
+        &self.contract_exec_metrics
     }
 
     /// Shared per-node placement-migration counter sink (#4404 follow-up). The
@@ -1279,6 +1432,7 @@ impl Ring {
                         &op_manager.to_event_listener,
                         &ring.live_tx_tracker,
                         &op_manager,
+                        ClientConnectKind::Standard,
                     )
                     .await
                 {
@@ -1680,6 +1834,95 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
+    /// Periodically record the attributes of every connected peer into the
+    /// routing dataset, keyed like its route events so the two join offline.
+    async fn record_routing_dataset_peers(
+        ring: Arc<Self>,
+        dataset: &'static crate::router::dataset::RoutingDataset,
+        interval_duration: Duration,
+    ) {
+        let shutdown = ring.shutdown_token();
+        let mut interval = tokio::time::interval(interval_duration);
+        loop {
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                break;
+            }
+            // Skip, never leave the loop: this task is registered with the
+            // background task monitor, and any monitored task exiting ends the
+            // node. A recorder that reached its byte cap must not take a
+            // gateway down with it.
+            if !dataset.is_recording() {
+                continue;
+            }
+            let peers = ring.routing_dataset_peer_attributes();
+            // The dataset's own clock, shared with route events so the two join.
+            dataset.record_peers(crate::router::dataset::now_ms(), peers);
+        }
+    }
+
+    /// Snapshot connected-peer attributes. Each lock is taken on its own and
+    /// released before the next, so this cannot participate in a lock-order
+    /// inversion; assembly happens afterwards with no lock held.
+    fn routing_dataset_peer_attributes(&self) -> Vec<crate::router::dataset::PeerAttributes> {
+        use crate::router::dataset::{PeerSnapshotInputs, peer_attributes};
+
+        let connections: Vec<(PeerKeyLocation, f64)> = self
+            .connection_manager
+            .get_connections_by_location()
+            .into_values()
+            .flatten()
+            .map(|connection| {
+                let connected_s = connection.duration_ms() as f64 / 1000.0;
+                (connection.location, connected_s)
+            })
+            .collect();
+        let addrs: Vec<SocketAddr> = connections
+            .iter()
+            .filter_map(|(peer, _)| peer.socket_addr())
+            .collect();
+        let gateways: Option<Vec<TransportPublicKey>> =
+            self.upgrade_op_manager().map(|op_manager| {
+                op_manager
+                    .configured_gateways
+                    .iter()
+                    .map(|gateway| gateway.pub_key().clone())
+                    .collect()
+            });
+        let versions: HashMap<SocketAddr, (u8, u8, u16)> = addrs
+            .iter()
+            .filter_map(|addr| {
+                self.connection_manager
+                    .remote_version(*addr)
+                    .map(|version| (*addr, version))
+            })
+            .collect();
+        let health: HashMap<SocketAddr, (u64, u64)> = {
+            let tracker = self.connection_manager.peer_health.lock();
+            addrs
+                .iter()
+                .filter_map(|addr| tracker.counts(addr).map(|counts| (*addr, counts)))
+                .collect()
+        };
+        let transfer: HashMap<SocketAddr, (u64, u64)> =
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .into_iter()
+                .map(|(addr, sent, received)| (addr, (sent, received)))
+                .collect();
+
+        peer_attributes(&PeerSnapshotInputs {
+            connections: &connections,
+            gateways: gateways.as_deref(),
+            versions: &versions,
+            health: &health,
+            transfer: &transfer,
+        })
+    }
+
     /// Periodically emit a router model snapshot as an EventKind::RouterSnapshot event.
     ///
     /// This captures the isotonic regression curves and model state, including the
@@ -1697,6 +1940,13 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // Same shape for the contract-exec WASM counters: the monotonic totals
+        // are emitted for collector-side differencing, and these loop-local
+        // previous values turn the four headline arms into per-window deltas so
+        // a SINGLE snapshot says whether this node's summarize/delta load was
+        // cache hits or real WASM work. Seeded from the current values so the
+        // first emitted window covers only elapsed-since-start work.
+        let mut prev_exec = ring.contract_exec_metrics.snapshot();
         // The diagnostic block is substantially wider than the ordinary
         // snapshot gauges. Its counters are lifetime-monotonic, so collecting
         // locally on every event but exporting one in six snapshots preserves
@@ -1735,6 +1985,18 @@ impl Ring {
             snapshot.open_fds = open_fds;
             snapshot.fd_soft_limit = fd_soft_limit;
 
+            // Chain-blame soak histogram (#5657). Hand-mirrored into
+            // `event_kind_to_json` like every field here (pinned by
+            // `router_snapshot_json_includes_timeout_label_histogram`).
+            let (peers_1, peers_2_3, peers_4_7, peers_8_plus, max_per_peer, untracked) =
+                ring.take_timeout_label_histogram();
+            snapshot.timeout_label_peers_1 = Some(peers_1);
+            snapshot.timeout_label_peers_2_3 = Some(peers_2_3);
+            snapshot.timeout_label_peers_4_7 = Some(peers_4_7);
+            snapshot.timeout_label_peers_8_plus = Some(peers_8_plus);
+            snapshot.timeout_label_max_per_peer = Some(max_per_peer);
+            snapshot.timeout_labels_untracked = Some(untracked);
+
             // Nearest-neighbor ring-lattice completeness + probe health (#4760),
             // mirrored from the home-page ring-stats provider (see
             // `node/p2p_impl.rs`) onto the central-telemetry snapshot cadence so
@@ -1754,6 +2016,7 @@ impl Ring {
             snapshot.lattice_predecessor_distance = lattice_predecessor;
             snapshot.lattice_probes_issued = Some(lattice_probes_issued);
             snapshot.lattice_probe_improvements = Some(lattice_probe_improvements);
+            snapshot.lattice_probe_misses = Some(cm.lattice_probe_miss_total());
 
             // Version-gate refusal counters (#5156): why
             // `supports_hash_first_summaries` / `supports_summary_first_put`
@@ -1836,6 +2099,35 @@ impl Ring {
             // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
             // the trigger is firing; runaway = floors/share miscalibrated.
             snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Resident-overhead pressure axis (#5325). These were computed and
+            // rendered on the node's own dashboard from the day the axis landed,
+            // but never mirrored here, so the collector could not see the SECOND
+            // eviction pressure at all: a node shedding purely under slot
+            // pressure reported a low state-byte occupancy and nothing else. Same
+            // hand-mirror footgun as the gauges above — pinned by
+            // `hosting_cache_stats_fields_are_all_mirrored`, which fails when a
+            // `HostingCacheStats` field has no reader in this block.
+            snapshot.hosting_resident_overhead_budget_bytes =
+                Some(hosting.resident_overhead_budget_bytes);
+            snapshot.hosting_resident_overhead_bytes = Some(hosting.resident_overhead_bytes);
+            snapshot.hosting_resident_overhead_evictions_total =
+                Some(hosting.resident_overhead_evictions_total);
+            snapshot.hosting_resident_overhead_evicted_charged_bytes_total =
+                Some(hosting.resident_overhead_evicted_charged_bytes_total);
+            // All neighbour-record bytes, hosted or not (#5647): compared with
+            // the hosted part of `hosting_resident_overhead_bytes`, the excess
+            // is what #5782's reconciliation has not yet freed.
+            snapshot.interest_resident_bytes_total = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.total_resident_bytes());
+            // Neighbour-summary bound trims and node-wide bytes (#5781).
+            if let Some(op) = ring.upgrade_op_manager() {
+                snapshot.interest_neighbour_summary_bytes =
+                    Some(op.interest_manager.neighbour_summary_bytes());
+                let (trims, bytes) = op.interest_manager.summary_bound_trim_totals();
+                snapshot.interest_summary_bound_trims_total = Some(trims);
+                snapshot.interest_summary_bound_trimmed_bytes_total = Some(bytes);
+            }
             // Local notification-delivery outcomes (#4681). PER-NODE counters
             // (see HostingManager), read once per snapshot — no per-event
             // stream. Read from the manager, not the stats snapshot, for the
@@ -1950,6 +2242,30 @@ impl Ring {
             if let Some((accepts, rejects)) = crate::node::network_status::connect_emit_counts() {
                 snapshot.connect_accepts_emitted = Some(accepts);
                 snapshot.connect_rejects_emitted = Some(rejects);
+            }
+
+            // Bootstrap-acceptance-churn counters (#4787): gateway-side
+            // transient registration/expiry/promotion totals plus
+            // joiner-side time-to-min-connections and startup retry count.
+            // Instrumentation only, no behavior change — see
+            // `network_status::BootstrapChurnStats`.
+            if let Some(b) = crate::node::network_status::bootstrap_churn_counts() {
+                snapshot.bootstrap_transient_registered = Some(b.transient_registered);
+                snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+                snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
+                snapshot.bootstrap_time_to_min_connections_secs =
+                    b.time_to_min_connections.map(|d| d.as_secs_f64());
+                // `Some(false)` (never bootstrapped) is a different fact from
+                // `None` (this build/collector doesn't report it) — see #4787
+                // finding 3.
+                snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
+                snapshot.bootstrap_startup_rounds_connect_issued_gateway =
+                    Some(b.startup_rounds_connect_issued_gateway);
+                snapshot.bootstrap_startup_rounds_connect_issued_routed =
+                    Some(b.startup_rounds_connect_issued_routed);
+                snapshot.bootstrap_startup_rounds_backoff_blocked =
+                    Some(b.startup_rounds_backoff_blocked);
+                snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
             }
 
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
@@ -2071,6 +2387,90 @@ impl Ring {
             snapshot.broadcast_stream_failures_total = Some(bs.streaming_failures_total);
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
+
+            // Contract-exec WASM counters: the split that makes a summarize rate
+            // interpretable. A high `fast_hits` rate with a low `wasm_calls` rate
+            // is a warm cache doing cheap work; the two converging means the
+            // change-detector has stopped covering the load and the storm class
+            // (#4473 / #4610 / #5040 / #5238) has re-armed.
+            //
+            // EVERY arm is windowed, not a chosen headline subset. Emitting some
+            // arms as a 5-minute delta and others as a lifetime total, under
+            // parallel names on one log line, invites reading them as comparable
+            // magnitudes — and the arm that would be understated that way is
+            // `delta_wasm_uncached`, the per-local-subscriber fan-out delta that
+            // has no cache in front of it at all and can dominate on a
+            // client-facing node. An overstated saving is worse than a missing
+            // one, because it terminates the investigation.
+            let ce = ring.contract_exec_metrics.snapshot();
+            let ce_d = ce.window_deltas(&mut prev_exec);
+            // Exhaustive destructure with no `..` rest pattern, on BOTH the
+            // lifetime snapshot and the window deltas. A 9th counter arm then
+            // fails to COMPILE here until it is exported, which is strictly
+            // stronger than the source-scrape pin below: a scrape that hardcodes
+            // today's eight names passes unchanged when a ninth is added, which
+            // is exactly how a counter ends up recorded but never exported.
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce;
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce_d;
+            snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_total = Some(ce.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_total = Some(ce.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_total = Some(ce.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_total = Some(ce.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_total = Some(ce.delta_wasm_uncached);
+            snapshot.contract_exec_summarize_fast_hits_last_snapshot =
+                Some(ce_d.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_last_snapshot =
+                Some(ce_d.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_last_snapshot =
+                Some(ce_d.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_last_snapshot =
+                Some(ce_d.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_last_snapshot = Some(ce_d.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_last_snapshot = Some(ce_d.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_last_snapshot = Some(ce_d.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_last_snapshot =
+                Some(ce_d.delta_wasm_uncached);
+
+            // Summary/delta fast-path cache occupancy: WHY the arms above miss
+            // when they do (byte budget binding vs. count target vs. churn).
+            let fpc = ring.contract_exec_metrics.fast_path_cache_snapshot();
+            snapshot.contract_summary_cache_entries = Some(fpc.summary.entries);
+            snapshot.contract_summary_cache_bytes = Some(fpc.summary.bytes);
+            snapshot.contract_summary_cache_budget_bytes = Some(fpc.summary.budget_bytes);
+            snapshot.contract_summary_cache_count_cap = Some(fpc.summary.count_cap);
+            snapshot.contract_summary_cache_count_cap_evictions_total =
+                Some(fpc.summary.count_cap_evictions_total);
+            snapshot.contract_summary_cache_byte_budget_evictions_total =
+                Some(fpc.summary.byte_budget_evictions_total);
+            snapshot.contract_delta_cache_entries = Some(fpc.delta.entries);
+            snapshot.contract_delta_cache_bytes = Some(fpc.delta.bytes);
+            snapshot.contract_delta_cache_budget_bytes = Some(fpc.delta.budget_bytes);
+            snapshot.contract_delta_cache_count_cap = Some(fpc.delta.count_cap);
+            snapshot.contract_delta_cache_count_cap_evictions_total =
+                Some(fpc.delta.count_cap_evictions_total);
+            snapshot.contract_delta_cache_byte_budget_evictions_total =
+                Some(fpc.delta.byte_budget_evictions_total);
 
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
@@ -2307,6 +2707,32 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                // The per-window arms are logged (not the lifetime totals) so a
+                // local operator reading `journalctl` gets the answer from ONE
+                // line, and ALL EIGHT are logged in the same unit — mixing
+                // 5-minute deltas with lifetime totals under parallel names
+                // would invite reading them as comparable magnitudes. `info!`
+                // survives `release_max_level_info`; `debug!` would not.
+                contract_exec_summarize_fast_hits_last_snapshot = ce_d.summarize_fast_hits,
+                contract_exec_summarize_reload_hits_last_snapshot = ce_d.summarize_reload_hits,
+                contract_exec_summarize_wasm_calls_last_snapshot = ce_d.summarize_wasm_calls,
+                contract_exec_summarize_wasm_uncached_last_snapshot = ce_d.summarize_wasm_uncached,
+                contract_exec_delta_fast_hits_last_snapshot = ce_d.delta_fast_hits,
+                contract_exec_delta_reload_hits_last_snapshot = ce_d.delta_reload_hits,
+                contract_exec_delta_wasm_calls_last_snapshot = ce_d.delta_wasm_calls,
+                contract_exec_delta_wasm_uncached_last_snapshot = ce_d.delta_wasm_uncached,
+                contract_summary_cache_entries = fpc.summary.entries,
+                contract_summary_cache_bytes = fpc.summary.bytes,
+                contract_summary_cache_budget_bytes = fpc.summary.budget_bytes,
+                contract_summary_cache_count_cap = fpc.summary.count_cap,
+                contract_summary_cache_count_cap_evictions_total = fpc.summary.count_cap_evictions_total,
+                contract_summary_cache_byte_budget_evictions_total = fpc.summary.byte_budget_evictions_total,
+                contract_delta_cache_entries = fpc.delta.entries,
+                contract_delta_cache_bytes = fpc.delta.bytes,
+                contract_delta_cache_budget_bytes = fpc.delta.budget_bytes,
+                contract_delta_cache_count_cap = fpc.delta.count_cap,
+                contract_delta_cache_count_cap_evictions_total = fpc.delta.count_cap_evictions_total,
+                contract_delta_cache_byte_budget_evictions_total = fpc.delta.byte_budget_evictions_total,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
@@ -3107,6 +3533,18 @@ impl Ring {
                 return;
             }
 
+            // Resident-overhead budget (#5325, #5647): the share of the node's
+            // memory limit hosted contracts may hold in RAM. Recomputed every
+            // tick so a cgroup limit changed at runtime is picked up, and
+            // BEFORE the sweep below, so the neighbour-summary budget it
+            // installs and the eviction it runs both use the current value.
+            // Falls back to 1 GiB in the rare case the RAM read itself fails.
+            let total_ram = crate::ring::hosting::total_ram_or_fallback(
+                crate::wasm_runtime::read_total_ram_bytes(),
+            );
+            ring.hosting_manager
+                .recompute_resident_overhead_budget(total_ram);
+
             // Sweep expired entries from GET subscription cache
             let crate::ring::hosting::HostingSweepResult {
                 expired,
@@ -3194,7 +3632,12 @@ impl Ring {
                     "Cleaned up expired hosting subscription from local state"
                 );
                 if let Some(op_manager) = &op_manager {
-                    if op_manager.interest_manager.unregister_local_hosting(&key) {
+                    // A GET/PUT may have re-hosted it since the eviction decision
+                    // (#5780); unregistering then would leave a hosted contract
+                    // outside anti-entropy (until a restart; see #5784).
+                    if !ring.is_hosting_contract(&key)
+                        && op_manager.interest_manager.unregister_local_hosting(&key)
+                    {
                         removed_contracts.push(key);
                     }
                     crate::operations::reclaim_evicted_contract(
@@ -3216,6 +3659,54 @@ impl Ring {
                     removed_contracts,
                 )
                 .await;
+            }
+
+            // Interest-record reconciliation (#5780): drop neighbour records for
+            // contracts this node has neither hosted nor used for
+            // `RECONCILE_MIN_UNUSED_AGE`. Dropped records reach neighbours
+            // through the next interest heartbeat, which is a full replace. A
+            // stale local-hosting flag cleared here has its co-host
+            // advertisement retracted, as an eviction would; neighbours are told
+            // the interest ended only if it did (a delegate or local client can
+            // keep it). Advertisements are retracted every pass for every
+            // contract past the wait that is unhosted, unused and holds no
+            // lease of this node's own, including advertised contracts with no
+            // records left, so it does not matter how a lease or the records
+            // ended. A contract whose lease is live is left alone until the
+            // lease, which is not demand, lapses unrenewed.
+            if let Some(op_manager) = &op_manager {
+                let outcome = op_manager.interest_manager.reconcile_with_hosting(
+                    &op_manager.neighbor_hosting.advertised_contract_keys(),
+                    |key| ring.is_hosting_contract(key),
+                    |key| ring.contract_in_use(key),
+                    |key| ring.is_subscribed(key),
+                );
+                for key in &outcome.advertisements_to_retract {
+                    crate::operations::retract_advertisement_for_evicted_contract(op_manager, key);
+                }
+                if !outcome.hosting_flags_cleared.is_empty() || outcome.contracts_dropped > 0 {
+                    tracing::info!(
+                        hosting_flags_cleared = outcome.hosting_flags_cleared.len(),
+                        contracts_dropped = outcome.contracts_dropped,
+                        records_dropped = outcome.records_dropped,
+                        "interest records reconciled with the hosted set"
+                    );
+                }
+                // Skip any contract that regained local interest since the pass,
+                // so this removal cannot follow a concurrent re-host's addition.
+                let interest_lost: Vec<ContractKey> = outcome
+                    .interest_lost
+                    .into_iter()
+                    .filter(|key| !op_manager.interest_manager.has_local_interest(key))
+                    .collect();
+                if !interest_lost.is_empty() {
+                    crate::operations::broadcast_change_interests(
+                        op_manager,
+                        Vec::new(),
+                        interest_lost,
+                    )
+                    .await;
+                }
             }
 
             // Retry pending reclamations queued by the two skip points
@@ -3289,33 +3780,6 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
-
-            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
-            // recomputed every tick so it tracks LIVE memory pressure rather than
-            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
-            // cgroup that gets tightened externally) re-derives a smaller budget
-            // on the next tick, and one that goes idle re-derives a larger one.
-            // All three reads are cheap (a `/proc` parse or a single syscall on
-            // every platform), so unlike the disk-usage walk above these run
-            // inline rather than on a blocking thread.
-            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
-            // that module) for the rare case the RAM read itself fails.
-            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
-                .map(|v| v as u64)
-                .unwrap_or(1024 * 1024 * 1024);
-            let pool_size = crate::config::runtime_pool_size().get();
-            let live_signals = match (
-                crate::wasm_runtime::read_own_rss_bytes(),
-                crate::wasm_runtime::read_available_memory_bytes(),
-            ) {
-                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
-                _ => None,
-            };
-            ring.hosting_manager.recompute_resident_overhead_budget(
-                total_ram,
-                pool_size,
-                live_signals,
-            );
         }
     }
 
@@ -3374,6 +3838,11 @@ impl Ring {
             // join/peer_ready progress signal (snapshot presence alone only
             // means the bind address is set — see `TopologySnapshot::connection_count`).
             snapshot.connection_count = ring.connection_manager.connection_count();
+            snapshot.orphan_interest_contracts = ring.orphan_interest_contract_count();
+            snapshot.stale_advertisements = ring.stale_advertisement_count();
+            snapshot.reconcile_contracts_dropped = ring
+                .upgrade_op_manager()
+                .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -3517,9 +3986,9 @@ impl Ring {
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
-    /// Install the operator-configurable share of live host-wide surplus
-    /// memory the resident-overhead (count-derived) eviction budget may claim
-    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    /// Install the operator-configurable share of the node's memory limit
+    /// that hosted contracts may hold in RAM (`--hosting-mem-share`, #5333,
+    /// #5647). Called once at startup; the 60s sweep's recompute reads it.
     pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
         self.hosting_manager
             .configure_resident_overhead_mem_share(mem_share);
@@ -3597,7 +4066,28 @@ impl Ring {
     /// (i.e., we just became ready to accept non-CONNECT operations).
     /// Returns `false` if the connection was rejected (e.g., capacity cap) or we
     /// were already ready.
+    ///
+    /// NOTE the two meanings of `false` collapsed here: callers that need to
+    /// know whether the connection was actually *added* — as opposed to
+    /// whether readiness was just crossed — must use
+    /// [`Ring::add_connection_reporting`]. Reading this `bool` as "added" is
+    /// wrong in both directions: it is `false` for the overwhelmingly common
+    /// successful add (we were already ready), and it is only ever `true` for
+    /// the single add that crosses the threshold.
     pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) -> bool {
+        self.add_connection_reporting(loc, peer, was_reserved)
+            .await
+            .just_became_ready
+    }
+
+    /// [`Ring::add_connection`], reporting whether the ring actually accepted
+    /// the connection as well as whether readiness was crossed.
+    pub async fn add_connection_reporting(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+    ) -> AddConnectionOutcome {
         tracing::info!(
             peer = %peer,
             peer_location = %loc,
@@ -3619,7 +4109,10 @@ impl Ring {
                 peer_location = %loc,
                 "Ring rejected connection - not updating caches or logging connection event"
             );
-            return false;
+            return AddConnectionOutcome {
+                added: false,
+                just_became_ready: false,
+            };
         }
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
@@ -3629,8 +4122,11 @@ impl Ring {
         self.refresh_density_request_cache();
 
         let is_ready = self.connection_manager.is_self_ready();
-        // Return true only if we just crossed the threshold
-        !was_ready && is_ready
+        AddConnectionOutcome {
+            added: true,
+            // Only report readiness if we just crossed the threshold.
+            just_became_ready: !was_ready && is_ready,
+        }
     }
 
     pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
@@ -3671,36 +4167,81 @@ impl Ring {
     /// Return the most optimal peer for hosting a given contract.
     ///
     /// This function only considers connected peers, not the node itself.
+    /// `log_as` says whether this selection is a routing decision for the
+    /// routing dataset's candidate log.
     #[inline]
     pub fn closest_potentially_hosting(
         &self,
+        log_as: crate::router::dataset::DecisionLog,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
+        let log = self.candidate_log_for(log_as);
+        // The router read lock is held across candidate gathering and
+        // selection, as before candidate logging existed; it is released
+        // before the dataset write and the debug trace.
         let router = self.router.read();
         let target = Location::from(contract_key);
-        let (peer, decision) = self
-            .connection_manager
-            .routing_with_telemetry(target, None, skip_list, &router);
+        self.connection_manager
+            .routing_with(target, None, skip_list, move |candidates| {
+                let (selected, decision, capture) = router.select_k_best_peers_capturing(
+                    candidates.iter(),
+                    target,
+                    1,
+                    log.as_ref().is_some_and(|(log, _)| log.capture),
+                    routes,
+                );
+                drop(router);
+                if let Some((log, op)) = log {
+                    log.record(
+                        op,
+                        target,
+                        &selected,
+                        matches!(
+                            decision.strategy,
+                            crate::router::RoutingStrategy::DistanceBased
+                        ),
+                        capture,
+                    );
+                }
+                let peer = selected.into_iter().next().cloned();
+                tracing::debug!(
+                    target_location = %target.as_f64(),
+                    strategy = ?decision.strategy,
+                    num_candidates = decision.candidates.len(),
+                    total_routing_events = decision.total_routing_events,
+                    selected = peer.is_some(),
+                    "routing_decision"
+                );
+                peer
+            })
+            .flatten()
+    }
 
-        if let Some(decision) = &decision {
-            tracing::debug!(
-                target_location = %target.as_f64(),
-                strategy = ?decision.strategy,
-                num_candidates = decision.candidates.len(),
-                total_routing_events = decision.total_routing_events,
-                selected = peer.is_some(),
-                "routing_decision"
-            );
+    /// The candidate log for a selection, and its op, when it is a routing
+    /// decision and logging is on. `Unlogged` consults nothing.
+    fn candidate_log_for(
+        &self,
+        log_as: crate::router::dataset::DecisionLog,
+    ) -> Option<(
+        crate::router::dataset::CandidateLog<'static>,
+        crate::node::network_status::OpType,
+    )> {
+        match log_as {
+            crate::router::dataset::DecisionLog::Joinable(op) => {
+                crate::router::dataset::candidate_log(|| self.time_source.now())
+                    .map(|log| (log, op))
+            }
+            crate::router::dataset::DecisionLog::Unlogged => None,
         }
-
-        peer
     }
 
     /// Get k best peers for hosting a contract, ranked by routing predictions.
     /// Accepts either &ContractKey or &ContractInstanceId (both implement From<&T> for Location).
     pub fn k_closest_potentially_hosting<K>(
         &self,
+        log_as: crate::router::dataset::DecisionLog,
         contract_id: &K,
         skip_list: impl Contains<std::net::SocketAddr> + Clone,
         k: usize,
@@ -3818,13 +4359,30 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let (selected, decision) = self.router.read().select_k_best_peers_with_telemetry(
+        let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
+        let log = self.candidate_log_for(log_as);
+        let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
             candidates.iter(),
             target_location,
             k,
+            log.as_ref().is_some_and(|(log, _)| log.capture),
+            routes,
         );
-        // `selected` borrows from `candidates`, not from the router guard, so
-        // the read lock is released here before the tracing/collect below.
+        // `selected` and `capture` borrow from `candidates`, not from the
+        // router guard, so the read lock is released at the end of the
+        // statement above, before the dataset write.
+        if let Some((log, op)) = log {
+            log.record(
+                op,
+                target_location,
+                &selected,
+                matches!(
+                    decision.strategy,
+                    crate::router::RoutingStrategy::DistanceBased
+                ),
+                capture,
+            );
+        }
 
         tracing::debug!(
             target_location = %target_location.as_f64(),
@@ -3847,6 +4405,21 @@ impl Ring {
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
+        self.report_route_outcome_to_health(&event);
+        self.router.write().add_event(event);
+    }
+
+    /// Everything [`Self::routing_finished`] does except feed the router: the
+    /// topology manager's outbound-request accounting and the `peer_health`
+    /// success or failure. `routing_finished` is exactly this plus
+    /// `Router::add_event`, so the two cannot drift.
+    ///
+    /// #5657 labels the ROUTER against the hop an attempt was actually
+    /// forwarded to. Peer health and topology keep their pre-#5657 inputs
+    /// unchanged (the originator's `current_target`, the same events, the same
+    /// conditions): changing them would change health-based eviction and the
+    /// request-density model, which #5657 does not set out to do.
+    pub(crate) fn report_route_outcome_to_health(&self, event: &crate::router::RouteEvent) {
         self.connection_manager
             .topology_manager
             .write()
@@ -3865,8 +4438,130 @@ impl Ring {
                 }
             }
         }
+    }
 
-        self.router.write().add_event(event);
+    /// Feed a route event to the routing model ONLY, bypassing the
+    /// `peer_health` and `topology_manager` side effects of
+    /// [`Self::routing_finished`].
+    ///
+    /// Two reasons, both load-bearing:
+    ///
+    /// 1. **Peer health is not routing success.** `PeerHealthTracker` evicts a
+    ///    connection at a 90 % failure rate over 10 events, or after 10 minutes
+    ///    with one failure and no success. A `NotFound` (the peer does not have
+    ///    this contract) or an end-to-end timeout (anywhere down the chain) says
+    ///    nothing about whether the connection to the first hop is healthy, and
+    ///    feeding them in would evict healthy peers, most exposed a gateway that
+    ///    fields many requests for absent contracts.
+    /// 2. **Determinism.** `PeerHealthTracker` stamps `std::time::Instant::now()`
+    ///    (a pre-existing TimeSource rule violation). An earlier iteration of
+    ///    the relay hooks routed relay events through `routing_finished` and
+    ///    broke the strict-determinism tests (`test_strict_determinism_*`,
+    ///    `test_direct_runner_determinism`, `test_thundering_herd_connect_storm`).
+    ///
+    /// `source` tags the event in the opt-in routing dataset (#5648): `Relay`
+    /// for an outcome a relay hop observed about its downstream peer,
+    /// `Originator` for one observed by the node that started the operation.
+    /// The model treats both identically.
+    pub(crate) fn record_route_event_router_only(
+        &self,
+        event: crate::router::RouteEvent,
+        source: crate::router::dataset::RouteSource,
+    ) {
+        use crate::router::dataset::RouteSource;
+        let mut router = self.router.write();
+        match source {
+            RouteSource::Originator => router.add_event(event),
+            RouteSource::Relay => router.add_relay_event(event),
+        }
+    }
+
+    /// Record a routing FAILURE label for one attempt. Router only; see
+    /// [`Self::record_route_event_router_only`]. The sole production sink of
+    /// [`crate::operations::route_attempt::RouteAttemptRecorder`]; `cause` is
+    /// counted in [`Self::route_failure_cause_counts`].
+    pub(crate) fn record_route_failure(
+        &self,
+        event: crate::router::RouteEvent,
+        cause: crate::operations::route_attempt::AttemptFailure,
+        source: crate::router::dataset::RouteSource,
+    ) {
+        use crate::operations::route_attempt::AttemptFailure;
+        debug_assert!(
+            matches!(event.outcome, crate::router::RouteOutcome::Failure),
+            "record_route_failure called with a non-failure outcome"
+        );
+        let counter = match cause {
+            AttemptFailure::NotFound => &self.route_failure_causes.not_found,
+            AttemptFailure::Timeout => &self.route_failure_causes.timeout,
+            AttemptFailure::SendFailure => &self.route_failure_causes.send_failure,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cause == AttemptFailure::Timeout
+            && matches!(source, crate::router::dataset::RouteSource::Originator)
+        {
+            self.route_failure_causes
+                .originator_timeout
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if cause == AttemptFailure::Timeout {
+            if let Some(addr) = event.peer.socket_addr() {
+                self.timeout_label_window.lock().record(addr);
+            }
+        }
+        self.record_route_event_router_only(event, source);
+    }
+
+    /// Count ambiguous `NotFound`s an operation dropped untrained (#5657).
+    /// Never trained on; lets a test prove NotFounds actually occurred.
+    pub(crate) fn record_untrained_not_founds(&self, count: u64) {
+        self.route_failure_causes
+            .untrained_not_found
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ambiguous `NotFound`s dropped untrained on this node (#5657).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn untrained_not_found_count(&self) -> u64 {
+        self.route_failure_causes
+            .untrained_not_found
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drain the per-peer timeout-label window into its histogram (#5657).
+    /// Called once per router snapshot, which is its only consumer: the
+    /// window is a drain, so no second reader (a local dashboard) can share
+    /// it without stealing labels from the telemetry export.
+    pub(crate) fn take_timeout_label_histogram(&self) -> TimeoutLabelHistogram {
+        self.timeout_label_window.lock().take_histogram()
+    }
+
+    /// These count only labels that went through the recorder. They do NOT
+    /// reconcile with `Router::outcome_totals().failures`: PUT relay's
+    /// downstream forwarding still labels its own failures through
+    /// `record_relay_route_event` (not yet migrated), and `LabelMode::Legacy`
+    /// restores `routing_finished` failure events that bypass them too.
+    ///
+    /// `(not_found, timeout, send_failure)` failure labels this node has fed
+    /// its router, by cause (#5657).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn route_failure_cause_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.route_failure_causes.not_found.load(Relaxed),
+            self.route_failure_causes.timeout.load(Relaxed),
+            self.route_failure_causes.send_failure.load(Relaxed),
+        )
+    }
+
+    /// Timeout failure labels this node recorded as the originator of an
+    /// operation: the subset of [`Self::route_failure_cause_counts`]'s timeouts
+    /// that excludes labels recorded while relaying (#5660).
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn originator_route_timeout_count(&self) -> u64 {
+        self.route_failure_causes
+            .originator_timeout
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ==================== Subscription Management (Lease-Based) ====================
@@ -4310,6 +5005,14 @@ impl Ring {
         self.hosting_manager.hosting_contracts_count()
     }
 
+    /// The same hosted set as [`Self::hosting_contracts_count`], partitioned by
+    /// WHY each contract is held, with state bytes per bucket. Backs the
+    /// `freenet.node.contracts.hosted{,.bytes}` OTel gauges. See
+    /// [`HostingReason`].
+    pub fn hosted_by_reason(&self) -> HostingReasonStats {
+        self.hosting_manager.hosted_by_reason()
+    }
+
     /// Number of active network subscription leases this node currently holds.
     ///
     /// Together with [`hosting_contracts_count`](Self::hosting_contracts_count)
@@ -4341,6 +5044,52 @@ impl Ring {
     pub fn active_demand_count(&self) -> Option<usize> {
         self.upgrade_op_manager()
             .map(|op_manager| op_manager.interest_manager.active_demand_count())
+    }
+
+    /// Number of contracts this node keeps neighbour records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Such records keep the contract indexed and advertised in the interest
+    /// heartbeat, so neighbours keep refreshing them; reconciliation removes
+    /// them. `None` if the `OpManager` is not attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn orphan_interest_contract_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .contracts_with_peer_records()
+                .into_iter()
+                .filter(|key| {
+                    !self.is_hosting_contract(key)
+                        && !self.contract_in_use(key)
+                        && !op_manager.interest_manager.has_local_interest(key)
+                })
+                .count()
+        })
+    }
+
+    /// Number of contracts this node still advertises to co-hosts although it
+    /// neither hosts nor uses them and holds no live lease toward them (#5782).
+    /// Such an advertisement keeps co-hosts sending updates for a copy this
+    /// node no longer holds. A live lease is excluded because the retraction
+    /// deliberately waits for it to lapse. `None` if the `OpManager` is not
+    /// attached (unmeasurable).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stale_advertisement_count(&self) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            let mut held: HashSet<ContractInstanceId> = self
+                .hosting_contract_keys()
+                .iter()
+                .chain(self.get_subscribed_contracts().iter())
+                .map(|key| *key.id())
+                .collect();
+            held.extend(self.hosting_manager.in_use_contract_ids());
+            op_manager
+                .neighbor_hosting
+                .advertised_contract_keys()
+                .iter()
+                .filter(|key| !held.contains(key.id()))
+                .count()
+        })
     }
 
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.
@@ -4588,8 +5337,7 @@ impl Ring {
             disk_total_bytes,
             disk_budget_bytes,
             resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
-            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
-            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_bytes: stats.resident_overhead_bytes,
             resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
@@ -5056,6 +5804,18 @@ impl Ring {
         self.hosting_manager.has_recent_local_client_access(key)
     }
 
+    /// The node-wide budget for distinct neighbour-summary bytes (#5781): a
+    /// fixed quarter of the hosting resident budget, enforced when a summary
+    /// is written and trimmed to at each sweep. It does not shrink with the
+    /// rest of the resident charge: at capacity, neighbour summaries (at most
+    /// this quarter) count as hosting cost and can trigger the ordinary
+    /// demand-ordered eviction of the lowest-ranked contracts, rather than
+    /// being wiped to make room.
+    fn neighbour_summary_budget(&self) -> u64 {
+        self.hosting_manager.resident_overhead_budget_bytes()
+            / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+    }
+
     /// Sweep for expired entries in the hosting cache.
     ///
     /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
@@ -5066,6 +5826,27 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
+        // Neighbour-summary bounds (#5781), BEFORE the hosting sweep re-reads
+        // the interest bytes it charges: each hosted contract's distinct
+        // summaries are capped relative to our own summary (independent of
+        // who sent them), and no single neighbour may make this node hold more
+        // than 1/PEER_SUMMARY_SHARE_DIVISOR of the hosting budget in summaries
+        // only it sent. Neighbours therefore cannot inflate the resident axis
+        // past those bounds to get other contracts evicted. Running it here,
+        // rather than on the interest manager's own timer, means the cache
+        // never charges bytes beyond them.
+        if let Some(op_manager) = self.upgrade_op_manager() {
+            // The node-wide neighbour-summary budget follows the resident
+            // budget, which the sweep task recomputes each tick.
+            op_manager
+                .interest_manager
+                .set_neighbour_summary_budget(self.neighbour_summary_budget());
+            let share = self.hosting_manager.resident_overhead_budget_bytes()
+                / crate::ring::interest::PEER_SUMMARY_SHARE_DIVISOR;
+            op_manager
+                .interest_manager
+                .enforce_summary_bounds(share, |key| self.is_hosting_contract(key));
+        }
         // Cost-aware eviction (#4861): feed the sweep the node's attributed
         // update-work cost so a zero-subscriber contract dominating CPU /
         // broadcast capacity is shed even while UNDER the byte budget (the
@@ -5253,33 +6034,35 @@ impl Ring {
         // are never gated on lattice completion (they supply the weak connectivity
         // that lets route-to-self converge from a cold start).
         //
-        // CONTINUOUS, DECAYING DISCOVERY — the probe NEVER stops. It keeps
-        // route-to-self probing even when both sides are filled, so a filled-but-
-        // LOOSE edge (holding a farther neighbor while the exact nearest is an
-        // unconnected peer) keeps tightening toward this peer's TRUE nearest ring
-        // neighbor. But the EFFORT DECAYS: the probability of finding a strictly-
-        // closer neighbor drops as the peer converges, so an unproductive probe
-        // (found nothing closer) backs the interval off exponentially toward
-        // tau_max, while any IMPROVEMENT (a side filled OR an edge tightened) or a
-        // LOST edge resets it to the aggressive tau0 and probes promptly. The
-        // interval floors at tau_max (a churn-tied maximum), so a fully-converged
-        // peer still re-checks periodically — decayed, but never silent. This
-        // replaces the earlier fill-only STOP-when-filled probe: relying on the
-        // passive per-side acceptance clause alone left ~half the ring's last-mile
-        // edges loose at the exact-nearest layer, so the tightening lattice is what
-        // pulls each peer onto its true ring neighbors. tau_max is the Chord
-        // half-life floor — it must comfortably exceed the churn interval so a
-        // dropped edge is re-formed well within a node's lifetime. The steady-state
-        // cost is one route-to-self CONNECT per peer roughly every tau_max.
-        #[cfg(not(test))]
-        const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
-        #[cfg(test)]
-        const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(1);
-        #[cfg(not(test))]
-        const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(300);
-        #[cfg(test)]
-        const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(8);
-
+        // DISCOVERY RUNS UNTIL THE LATTICE IS TIGHT, THEN SLEEPS UNTIL IT CHANGES
+        // (#5814). The probe keeps firing while it makes progress, including when
+        // both sides are filled, so a filled-but-LOOSE edge (holding a farther
+        // neighbor while the exact nearest is an unconnected peer) tightens toward
+        // this peer's TRUE nearest ring neighbor (#4760 review N1: relying on the
+        // passive per-side acceptance clause alone left ~half the last-mile edges
+        // loose). The interval backs off exponentially toward tau_max while
+        // nothing changes, and any change to a per-side nearest distance (a fill,
+        // a tighten, a lost side, or a widening when the nearest drops and a
+        // farther peer remains) resets it to tau0 and probes promptly.
+        //
+        // A probe whose acceptor is NOT a lattice edge (`is_per_side_nearest`) is
+        // a MISS: evidence that the acceptor's side is tight, since the probe
+        // aims at the nearest unconnected peer. Once both sides have missed since
+        // the last change, discovery SLEEPS: it wakes at once on any per-side
+        // distance change, and otherwise re-checks a few times (2h, 4h, 8h; or
+        // 10 min doubling, up to four times, if a closer peer was found but
+        // could not be connected) before sleeping until the lattice changes. It used to
+        // keep re-probing every tau_max forever, and every result it found was
+        // kept (below max_connections the far end usually accepts, and nothing
+        // prunes below max at low bandwidth), so a converged peer gained a
+        // non-lattice link per probe and degree climbed with uptime (live median
+        // 36 -> ~100 over 20h). A miss is evidence, not proof (the walk can stop
+        // short of the true nearest: a failed hole punch, a near-terminus relay,
+        // a recently-failed or rejected peer), which is why it re-checks; the
+        // re-checks are finite because each one keeps a link.
+        // Results are never dropped after connecting: the transport has no close
+        // message, so a dropped link would sit dead on the far end until its
+        // idle timeout. See `LatticeProbeScheduler`.
         /// How often to probe a gateway for version discovery (#3677).
         #[cfg(not(test))]
         const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(4 * 3600);
@@ -5291,32 +6074,33 @@ impl Ring {
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
 
-        // Shared exponential-backoff delay calculator for the lattice probe
-        // (code-style: use crate::util::backoff, don't hand-roll doubling). The
-        // interval is `delay(backoff_attempt) = tau0 * 2^attempt`, capped at
-        // tau_max.
-        let lattice_probe_backoff = crate::util::backoff::ExponentialBackoff::new(
-            LATTICE_PROBE_TAU0,
-            LATTICE_PROBE_TAU_MAX,
-        );
-
-        // Nearest-neighbor lattice discovery state (mechanism 2). Tracks the next
-        // route-to-self probe time, the current backoff attempt (0 = aggressive
-        // tau0; grows one step per fire, resets to 0 on an improvement or a lost
-        // edge), and the per-side nearest-neighbor DISTANCES observed at the
-        // previous tick — used to detect a fill OR a tighten (a distance that
-        // strictly decreased) as an improvement. Seeded to fire on the first
-        // eligible tick.
-        struct LatticeProbeState {
-            next_at: Instant,
-            backoff_attempt: u32,
-            last_sides: Option<LatticeSides>,
-        }
-        let mut lattice_probe = LatticeProbeState {
-            next_at: self.time_source.now(),
-            backoff_attempt: 0,
-            last_sides: None,
+        // Nearest-neighbor lattice discovery state (mechanism 2), seeded to fire
+        // on the first eligible tick. Production timing in
+        // `lattice_probe_timing`; shorter under test.
+        #[cfg(not(test))]
+        let probe_timing = lattice_probe_timing::production();
+        #[cfg(test)]
+        let probe_timing = LatticeProbeTiming {
+            probe: crate::util::backoff::ExponentialBackoff::new(
+                Duration::from_secs(1),
+                Duration::from_secs(8),
+            ),
+            recheck: crate::util::backoff::ExponentialBackoff::new(
+                Duration::from_secs(60),
+                Duration::from_secs(240),
+            ),
+            rechecks: lattice_probe_timing::RECHECKS,
+            retry: crate::util::backoff::ExponentialBackoff::new(
+                Duration::from_secs(20),
+                Duration::from_secs(160),
+            ),
+            retries: lattice_probe_timing::RETRIES,
         };
+        let mut lattice_probe = LatticeProbeScheduler::new(
+            self.time_source.now(),
+            self.connection_manager.lattice_probe_misses(),
+            probe_timing,
+        );
         let mut zero_connections_since: Option<Instant> = None;
         // Track whether we've ever had ring connections. Before the first
         // successful connection, use a shorter isolation escalation threshold
@@ -5576,6 +6360,7 @@ impl Ring {
             // Periodic peer health check: evict peers with sustained routing failures.
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
                 last_health_check = self.time_source.now();
+
                 let current_ring = self.connection_manager.connection_count();
                 let unhealthy = self
                     .connection_manager
@@ -5758,6 +6543,59 @@ impl Ring {
                 current_conn_count,
                 self.connection_manager.min_connections,
             );
+            // Nearest-neighbor lattice discovery (mechanism 2): inject a
+            // route-to-self probe target (own_location), gated by
+            // `LatticeProbeScheduler`, to fill or tighten each peer's
+            // successor/predecessor lattice slots. Queued into pending_conn_adds
+            // just before it is drained below, so the probe launches this tick
+            // and its results are usually in by the next tick's scheduler
+            // decision (late ones are fenced by the generation tag). No
+            // wire change: the probe is a plain CONNECT toward own_location whose
+            // bloom already excludes held peers, so it aims at the nearest
+            // UNCONNECTED peer, and the terminus installs the edge via the
+            // per-side clause in should_accept. The CONNECT driver classifies
+            // each acceptor (`record_lattice_probe_result`); a non-lattice one is
+            // the scheduler's evidence that a side is tight (see the discovery
+            // comment above).
+            if self.connection_manager.nn_lattice_active() {
+                if let Some(me) = self.connection_manager.get_stored_location() {
+                    let outcome = lattice_probe.tick_for(
+                        &self.connection_manager,
+                        self.time_source.now(),
+                        // Jitter against synchronized probe bursts across peers
+                        // that bootstrapped together.
+                        || {
+                            crate::config::GlobalRng::random_range(
+                                lattice_probe_timing::JITTER_LOW
+                                    ..=lattice_probe_timing::JITTER_HIGH,
+                            )
+                        },
+                    );
+                    if outcome.improved {
+                        self.connection_manager.record_lattice_probe_improvement();
+                    }
+                    if let Some(interval) = outcome.fired {
+                        self.connection_manager.record_lattice_probe_issued();
+                        pending_conn_adds.insert(me);
+                        tracing::debug!(
+                            generation = lattice_probe.generation(),
+                            interval_secs = interval.as_secs(),
+                            "lattice discovery: queued route-to-self probe"
+                        );
+                    }
+                }
+            }
+
+            // The route-to-self lattice probe is queued as own location (see the
+            // discovery block above); tag it, with the scheduler's current
+            // generation, so the CONNECT driver reports a result that is not a
+            // lattice edge as a probe miss for that generation (#5814). Only a
+            // bootstrap target (fewer than 5 connections) can share own location,
+            // and a miss reported for it is harmless.
+            let lattice_probe_target = self
+                .connection_manager
+                .get_stored_location()
+                .filter(|_| self.connection_manager.nn_lattice_active());
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if respect_backoff && self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
@@ -5791,6 +6629,13 @@ impl Ring {
                         &notifier,
                         &live_tx_tracker,
                         &op_manager,
+                        if lattice_probe_target == Some(ideal_location) {
+                            ClientConnectKind::LatticeProbe {
+                                generation: lattice_probe.generation(),
+                            }
+                        } else {
+                            ClientConnectKind::Standard
+                        },
                     )
                     .await
                     .map_err(|error| {
@@ -5988,87 +6833,6 @@ impl Ring {
                 TopologyAdjustment::NoChange => {}
             }
 
-            // Nearest-neighbor lattice discovery (mechanism 2): inject a
-            // route-to-self probe target (own_location), gated by exponential
-            // backoff, to FILL each peer's empty successor/predecessor lattice
-            // slots. Queued into pending_conn_adds so it is acquired next tick
-            // alongside long-link targets. No wire change: the probe is a plain
-            // CONNECT toward own_location whose bloom already excludes held peers,
-            // so it lands on the nearest UNCONNECTED peer and the terminus
-            // installs the edge via the per-side clause in should_accept.
-            //
-            // CONTINUOUS, DECAYING discovery: the probe keeps firing even when both
-            // sides are filled, so a filled-but-loose edge tightens toward the TRUE
-            // nearest. `lattice_probe_progress` classifies the change since the last
-            // tick — an improvement (a side filled OR an edge tightened) or a
-            // regression (a side lost) resets the cadence to the aggressive tau0 and
-            // probes promptly, while a plateau (nothing closer found) lets the
-            // interval grow geometrically toward tau_max. The probe never goes
-            // silent; the effort decays as the peer converges (see the module-level
-            // discovery comment above).
-            if self.connection_manager.nn_lattice_active() {
-                if let Some(me) = self.connection_manager.get_stored_location() {
-                    let probe_now = self.time_source.now();
-                    let succ = self.connection_manager.nearest_lattice_neighbor_dist(true);
-                    let pred = self.connection_manager.nearest_lattice_neighbor_dist(false);
-                    let curr = LatticeSides { succ, pred };
-                    let sides_held = u8::from(succ.is_some()) + u8::from(pred.is_some());
-
-                    // Classify the change since the previous tick: an IMPROVEMENT is
-                    // a side newly filled OR an already-held side whose nearest got
-                    // strictly closer (a successful tighten); a REGRESSION is a side
-                    // that was lost.
-                    let progress = lattice_probe_progress(lattice_probe.last_sides, curr);
-                    if progress.improved {
-                        self.connection_manager.record_lattice_probe_improvement();
-                    }
-
-                    // An improvement or a lost edge resets the cadence to the
-                    // aggressive tau0 and probes promptly: a lost edge is a routing
-                    // dead-end to re-fill NOW, and an improvement means progress is
-                    // being made, so keep tightening aggressively (there may be an
-                    // even-closer neighbor still to find). A plateau leaves the
-                    // growing backoff untouched (see the fire site below).
-                    if progress.improved || progress.regressed {
-                        lattice_probe.backoff_attempt = 0;
-                        lattice_probe.next_at = probe_now;
-                    }
-
-                    // CONTINUOUS discovery: no sides-based stop condition — the only
-                    // gate is timing. The probe keeps firing (decayed toward tau_max
-                    // on a plateau) so a converged peer still re-checks and a
-                    // filled-but-loose edge keeps tightening toward the true nearest.
-                    if probe_now >= lattice_probe.next_at {
-                        self.connection_manager.record_lattice_probe_issued();
-
-                        pending_conn_adds.insert(me);
-
-                        // +/-20% jitter to avoid synchronized probe bursts across
-                        // peers that bootstrapped together.
-                        let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
-                        let interval = lattice_probe_backoff.delay(lattice_probe.backoff_attempt);
-                        lattice_probe.next_at = probe_now + interval.mul_f64(jitter);
-                        // Grow the interval one step for the NEXT fire; an
-                        // improvement or a regression resets it back to 0 above.
-                        lattice_probe.backoff_attempt =
-                            lattice_probe.backoff_attempt.saturating_add(1);
-
-                        tracing::debug!(
-                            sides_held,
-                            succ_dist = ?succ,
-                            pred_dist = ?pred,
-                            backoff_attempt = lattice_probe.backoff_attempt,
-                            interval_secs = interval.as_secs(),
-                            "lattice discovery: queued route-to-self probe"
-                        );
-                    }
-                    // Record the observed per-side distances each tick (whether or
-                    // not we probed) so the next tick's progress check compares
-                    // against the latest reality.
-                    lattice_probe.last_sides = Some(curr);
-                }
-            }
-
             // Execute deferred swap drops: only drop as many peers as we
             // have headroom above min_connections to avoid undershooting.
             // Expire stale entries whose replacement never connected.
@@ -6203,6 +6967,7 @@ impl Ring {
         notifier: &EventLoopNotificationsSender,
         live_tx_tracker: &LiveTransactionTracker,
         op_manager: &Arc<OpManager>,
+        kind: ClientConnectKind,
     ) -> anyhow::Result<Option<Transaction>> {
         let current_connections = self.connection_manager.connection_count();
         let is_gateway = self.is_gateway;
@@ -6312,6 +7077,7 @@ impl Ring {
                 joiner_for_driver,
                 ideal_location,
                 None,
+                kind,
             )
             .await
             {
@@ -6349,6 +7115,11 @@ impl Ring {
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
         snapshot.connection_count = self.connection_manager.connection_count();
+        snapshot.orphan_interest_contracts = self.orphan_interest_contract_count();
+        snapshot.stale_advertisements = self.stale_advertisement_count();
+        snapshot.reconcile_contracts_dropped = self
+            .upgrade_op_manager()
+            .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
@@ -7188,6 +7959,115 @@ mod k_closest_source_tests {
         );
     }
 
+    /// #5780: the periodic hosting sweep must run the interest-record
+    /// reconciliation, or evicted contracts keep their neighbours' records and
+    /// stay advertised. Requires the call on a code line (not a comment), so a
+    /// commented-out call fails this pin.
+    #[test]
+    fn sweep_reconciles_interest_records_with_the_hosted_set() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Code only, whitespace removed: layout-proof, and a commented-out
+        // line cannot satisfy it.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for needle in [
+            // the call, with the hosting facts in the right order
+            concat!(
+                "interest_manager.reconcile_with_hosting(",
+                "&op_manager.neighbor_hosting.advertised_contract_keys(),",
+                "|key|ring.is_hosting_contract(key),|key|ring.contract_in_use(key),",
+                "|key|ring.is_subscribed(key),)"
+            ),
+            // every aged, unhosted, unused, lease-free contract has any
+            // standing advertisement retracted, every pass
+            concat!(
+                "forkeyin&outcome.advertisements_to_retract{crate::operations::",
+                "retract_advertisement_for_evicted_contract(op_manager,key);}"
+            ),
+            // neighbours are told only when interest actually ended, and still
+            // has not come back
+            concat!(
+                ".filter(|key|!op_manager.interest_manager.has_local_interest(key))",
+                ".collect();if!interest_lost.is_empty(){"
+            ),
+            concat!(
+                "crate::operations::broadcast_change_interests(op_manager,",
+                "Vec::new(),interest_lost,)"
+            ),
+            // the post-eviction unregister skips a re-hosted contract
+            concat!(
+                "if!ring.is_hosting_contract(&key)&&op_manager",
+                ".interest_manager.unregister_local_hosting(&key)"
+            ),
+        ] {
+            assert!(
+                code.contains(needle),
+                "sweep_get_subscription_cache must contain `{needle}` (#5780)"
+            );
+        }
+        // The retraction runs before the interest broadcast for the same pass.
+        let retract = code
+            .find("forkeyin&outcome.advertisements_to_retract{")
+            .expect("retraction loop");
+        let broadcast = code
+            .find("Vec::new(),interest_lost,)")
+            .expect("interest broadcast");
+        assert!(
+            retract < broadcast,
+            "retract before broadcasting lost interest"
+        );
+    }
+
+    /// #5647: the periodic hosting sweep must re-read the memory limit and
+    /// recompute the resident budget every tick, or a cgroup limit changed at
+    /// runtime is never picked up and the budget stays at its startup value.
+    /// Code only, whitespace removed, so a reflow cannot break it and a
+    /// commented-out call cannot satisfy it.
+    #[test]
+    fn sweep_recomputes_the_resident_budget_from_the_memory_limit() {
+        let body = extract_fn_body(
+            production_source(),
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Only the loop body runs every tick; a recompute before the loop
+        // would run once at startup.
+        let (_, loop_body) = body
+            .split_once("loop {")
+            .expect("sweep_get_subscription_cache must have its tick loop");
+        let code: String = loop_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = concat!(
+            "lettotal_ram=crate::ring::hosting::total_ram_or_fallback(",
+            "crate::wasm_runtime::read_total_ram_bytes(),);",
+            "ring.hosting_manager.recompute_resident_overhead_budget(total_ram);"
+        );
+        let recompute_at = code.find(needle).unwrap_or_else(|| {
+            panic!(
+                "sweep_get_subscription_cache must read the memory limit and recompute \
+                 the resident budget each tick (#5647)"
+            )
+        });
+        let sweep_at = code
+            .find("ring.sweep_expired_get_subscriptions()")
+            .expect("the tick must run the hosting sweep");
+        assert!(
+            recompute_at < sweep_at,
+            "the budget must be recomputed before the sweep uses it"
+        );
+    }
+
     /// PR #4734 Fix 1: the periodic hosting sweep must retract the local hosting
     /// advertisement for every contract it evicts, exactly like the GET/PUT
     /// host-formation paths (`cache_contract_locally` / the PUT relay store). An
@@ -7522,6 +8402,92 @@ mod k_closest_source_tests {
             }
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
+    }
+
+    /// The routing-dataset peer task is registered with the background task
+    /// monitor, and ANY monitored task exiting ends the node
+    /// (`p2p_impl.rs`, `wait_for_any_exit`). So its loop may leave only on
+    /// shutdown: a recorder that stops — at its byte cap, or on a write error —
+    /// must not take the gateway down. An earlier revision `break`ed there.
+    #[test]
+    fn routing_dataset_peer_task_exits_only_on_shutdown() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn record_routing_dataset_peers(");
+        let breaks = body.matches("break").count();
+        let returns = body.matches("return").count();
+        assert_eq!(
+            (breaks, returns),
+            (1, 0),
+            "record_routing_dataset_peers must leave its loop only on shutdown; \
+             any other exit ends the node"
+        );
+        let (before_break, _) = body.split_once("break").unwrap();
+        assert!(
+            before_break.contains("sleep_or_shutdown"),
+            "the single break must be the shutdown one"
+        );
+    }
+
+    /// Same mirror seam, for the contract-exec WASM counters. The export block
+    /// hand-copies each `ContractExecSnapshot` field into its `RouterSnapshotInfo`
+    /// twin, so a swap — feeding `..._wasm_calls_total` from `fast_hits`, say —
+    /// compiles cleanly and emits a plausible number that is measuring the
+    /// opposite thing.
+    ///
+    /// That failure mode is not hypothetical here: mistaking cache hits for WASM
+    /// work is the exact blindness these counters exist to remove, and an
+    /// overstated saving is worse than a missing one because it terminates the
+    /// investigation. Assert every assignment reads its own field.
+    /// Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn contract_exec_export_maps_each_field_to_its_own_counter() {
+        let src = production_source();
+        let block = extract_fn_body(src, "async fn emit_router_snapshot_telemetry(");
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let fields = [
+            "summarize_fast_hits",
+            "summarize_reload_hits",
+            "summarize_wasm_calls",
+            "summarize_wasm_uncached",
+            "delta_fast_hits",
+            "delta_reload_hits",
+            "delta_wasm_calls",
+            "delta_wasm_uncached",
+        ];
+        for field in fields {
+            // Every arm is exported in BOTH units. A lifetime total sitting on
+            // a line of otherwise-parallel `_last_snapshot` names reads as a
+            // comparable magnitude and understates nothing visibly — which is
+            // why the pin demands both rather than either.
+            for expected in [
+                format!("snapshot.contract_exec_{field}_total = Some(ce.{field});"),
+                format!("snapshot.contract_exec_{field}_last_snapshot = Some(ce_d.{field});"),
+            ] {
+                assert!(
+                    norm.contains(&expected),
+                    "mirror-seam: export must contain `{expected}` — a field swap here \
+                     silently reports one arm's count under another arm's name"
+                );
+            }
+        }
+
+        // The delta computation itself is NOT scraped: it is
+        // `ContractExecSnapshot::window_deltas`, one function whose field
+        // correspondence is structural and unit-tested by
+        // `each_field_differences_its_own_twin`. What must be pinned here is
+        // that the emitter uses it rather than re-deriving eight deltas by hand
+        // at the call site, which is where a cross-wiring hides.
+        assert!(
+            norm.contains("let ce_d = ce.window_deltas(&mut prev_exec);"),
+            "the emitter must delegate to ContractExecSnapshot::window_deltas, not \
+             hand-difference each arm at the call site"
+        );
+        assert!(
+            !norm.contains("window_delta(ce."),
+            "no hand-written per-arm window_delta call may remain — that is the \
+             shape in which one arm gets differenced against another's previous value"
+        );
     }
 }
 
@@ -8156,6 +9122,54 @@ mod deferred_swap_drop_tests {
     }
 }
 
+/// Production intervals of the route-to-self lattice probe (#4760, #5814),
+/// see [`LatticeProbeScheduler`]. Also used by the topology model test, so it
+/// exercises the real values.
+pub(crate) mod lattice_probe_timing {
+    use super::LatticeProbeTiming;
+    use crate::util::backoff::ExponentialBackoff;
+    use std::time::Duration;
+
+    /// Awake probe backoff: first interval.
+    pub(crate) const TAU0: Duration = Duration::from_secs(5);
+    /// Awake probe backoff: cap.
+    pub(crate) const TAU_MAX: Duration = Duration::from_secs(300);
+    /// First re-check after sleeping on a tight lattice. It outlasts the
+    /// recently-failed-address exclusion (`FAILED_ADDR_MAX_TTL`, 1h).
+    pub(crate) const RECHECK_MIN: Duration = Duration::from_secs(2 * 3600);
+    /// Re-checks per lattice state (2h, 4h, 8h). Each re-check of a tight
+    /// lattice keeps a non-lattice link or two, so they are finite: after the
+    /// last one, only a lattice change wakes discovery.
+    pub(crate) const RECHECKS: u32 = 3;
+    /// First re-check after a generation in which a closer peer was found but
+    /// could not be connected. It outlasts the first recently-failed-address
+    /// exclusion (`FAILED_ADDR_BASE_TTL`, 5 min).
+    pub(crate) const RETRY_MIN: Duration = Duration::from_secs(600);
+    /// Retries for such a peer (10, 20, 40, 80 min), not reset by lattice
+    /// changes, only by a sleep that runs its course without a failed hit: a
+    /// closer peer that is never reachable costs at most this many retries
+    /// between such clean sleeps, then the re-check ladder takes over.
+    pub(crate) const RETRIES: u32 = 4;
+    /// Bounds of the jitter multiplier on every interval, against synchronized
+    /// bursts across peers that bootstrapped together.
+    pub(crate) const JITTER_LOW: f64 = 0.8;
+    pub(crate) const JITTER_HIGH: f64 = 1.2;
+
+    /// The production timing.
+    pub(crate) fn production() -> LatticeProbeTiming {
+        let ladder = |min: Duration, rungs: u32| {
+            ExponentialBackoff::new(min, min * 2u32.pow(rungs.saturating_sub(1)))
+        };
+        LatticeProbeTiming {
+            probe: ExponentialBackoff::new(TAU0, TAU_MAX),
+            recheck: ladder(RECHECK_MIN, RECHECKS),
+            rechecks: RECHECKS,
+            retry: ladder(RETRY_MIN, RETRIES),
+            retries: RETRIES,
+        }
+    }
+}
+
 /// Source-grep pin test: lock down the set of bare `Instant::now()` call
 /// sites in this file so a future change can't silently reintroduce a
 /// wall-clock time read on the connection-maintenance path.
@@ -8194,26 +9208,27 @@ pub(crate) struct LatticeSides {
 }
 
 /// Classification of the lattice change between two consecutive maintenance
-/// ticks, for the CONTINUOUS discovery backoff.
+/// ticks, for the discovery backoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LatticeProbeProgress {
     /// A side was newly FILLED, or an already-held side's nearest neighbor got
     /// strictly CLOSER (a successful tighten). Resets the probe backoff to tau0.
     pub improved: bool,
-    /// A side was LOST (a held neighbor dropped, leaving the side empty). Resets
-    /// the backoff to tau0 and re-probes promptly to re-fill the dead-end.
+    /// A side was LOST (left empty) or WIDENED (its nearest dropped and a farther
+    /// neighbor remains). Either way a lattice edge is gone, so discovery wakes,
+    /// resets the backoff to tau0 and re-probes promptly.
     pub regressed: bool,
 }
 
 /// Classify the lattice change between the previous tick's per-side nearest
-/// distances (`prev`, `None` on the first observation) and this tick's (`curr`),
-/// for CONTINUOUS discovery. An IMPROVEMENT — a side newly filled OR an
-/// already-held side whose nearest got strictly closer — keeps the probe
-/// aggressive; a REGRESSION — a side lost — re-probes promptly; a plateau
-/// (neither) lets the backoff decay toward tau_max. This is the tighten-aware
-/// replacement for the old fill-only STOP-when-filled gate: a filled side is no
-/// longer a stop condition, only a plateau input, so the probe keeps tightening
-/// a loose edge toward the peer's TRUE nearest ring neighbor.
+/// distances (`prev`, `None` on the first observation) and this tick's (`curr`).
+/// An IMPROVEMENT (a side newly filled, or an already-held side whose nearest
+/// got strictly closer) keeps the probe aggressive; a REGRESSION (a side lost,
+/// or its nearest got farther) re-probes promptly; a plateau (neither) lets the
+/// backoff decay toward tau_max. A filled side is not a stop condition, so the
+/// probe keeps tightening a loose edge toward the peer's TRUE nearest ring
+/// neighbor; what stops it is a probe result that is not a lattice edge (see
+/// [`LatticeProbeScheduler`]).
 pub(crate) fn lattice_probe_progress(
     prev: Option<LatticeSides>,
     curr: LatticeSides,
@@ -8226,32 +9241,296 @@ pub(crate) fn lattice_probe_progress(
         };
     };
     // A side improved if it went empty -> held (a fill) or held -> strictly closer
-    // (a tighten). Distances are derived from fixed peer locations, so a side's
-    // nearest only changes when the connection set changes; a strict `<` is a real
-    // tighten, not float jitter.
+    // (a tighten), and regressed if it went held -> empty or held -> strictly
+    // farther. Distances are derived from fixed peer locations, so a side's
+    // nearest only changes when the connection set changes; a strict comparison
+    // is a real change, not float jitter.
     let side_improved = |p: Option<f64>, c: Option<f64>| match (p, c) {
         (None, Some(_)) => true,
         (Some(pd), Some(cd)) => cd < pd,
         _ => false,
     };
-    let side_regressed = |p: Option<f64>, c: Option<f64>| matches!((p, c), (Some(_), None));
+    let side_regressed = |p: Option<f64>, c: Option<f64>| match (p, c) {
+        (Some(_), None) => true,
+        (Some(pd), Some(cd)) => cd > pd,
+        _ => false,
+    };
     LatticeProbeProgress {
         improved: side_improved(prev.succ, curr.succ) || side_improved(prev.pred, curr.pred),
         regressed: side_regressed(prev.succ, curr.succ) || side_regressed(prev.pred, curr.pred),
     }
 }
 
+/// When the route-to-self lattice probe fires (mechanism 2, #4760, #5814).
+///
+/// While AWAKE the probe fires on an exponential backoff (tau0 doubling to
+/// tau_max). Any change to a per-side nearest distance
+/// ([`lattice_probe_progress`]: fill, tighten, loss or widening) starts a new
+/// GENERATION, resets the backoff to tau0 and probes promptly, so a loose or
+/// broken lattice is worked on at once.
+///
+/// A probe MISS on one side (an acceptor there that is not a lattice edge,
+/// recorded by the CONNECT driver through
+/// `ConnectionManager::record_lattice_probe_result` with the generation current
+/// when the probe was launched) is evidence that side is tight: the probe aims
+/// at the nearest unconnected peer, and it found nothing closer than the held
+/// nearest. A miss is evidence for the other side only if it lies farther out
+/// than that side's held nearest; otherwise the nearest unconnected peer may
+/// simply be on the tight side, so discovery keeps probing, outward past each
+/// kept miss, until BOTH sides have missed in the current generation. Misses
+/// from earlier generations (probes in flight across a change) do not count.
+///
+/// It then SLEEPS. A miss is evidence, not proof (the walk can stop short of
+/// the true nearest: a failed hole punch, a near-terminus relay accepting
+/// first, a recently-failed peer, or a closer peer that rejected the request),
+/// so a sleep re-checks (a new generation that needs fresh misses on both
+/// sides). Each re-check of a tight lattice keeps a link or two, so they are
+/// FINITE ([`lattice_probe_timing`]): a few per lattice state on the re-check
+/// ladder, after which only a lattice change wakes discovery. If a closer peer
+/// WAS found in the generation but could not be connected (a failed hole
+/// punch, or our own pre-flight refusal at the cap: a failed hit), the misses
+/// around it may just be the walk going past it, so the sleep uses the shorter
+/// retry ladder instead. Its count survives lattice changes (a closer peer that
+/// is never reachable is re-found after every change) and resets only when a
+/// sleep runs its full course without a failed hit; once it is used up, such
+/// sleeps fall back to the re-check ladder. A failed hit reported after a
+/// clean sleep began moves it onto the retry ladder, if that is sooner.
+///
+/// Before #5814 there was no sleep: a converged peer probed every tau_max and
+/// kept every non-lattice result, so degree grew with uptime.
+pub(crate) struct LatticeProbeScheduler {
+    timing: LatticeProbeTiming,
+    next_at: Instant,
+    backoff_attempt: u32,
+    last_sides: Option<LatticeSides>,
+    generation: u64,
+    sleep: Option<LatticeProbeSleep>,
+    recheck_attempt: u32,
+    retry_attempt: u32,
+}
+
+/// Intervals and ladder lengths of [`LatticeProbeScheduler`].
+pub(crate) struct LatticeProbeTiming {
+    /// Awake probe backoff.
+    pub probe: crate::util::backoff::ExponentialBackoff,
+    /// Re-check ladder after a clean sleep, and its number of rungs.
+    pub recheck: crate::util::backoff::ExponentialBackoff,
+    pub rechecks: u32,
+    /// Retry ladder after a failed hit, and its number of rungs.
+    pub retry: crate::util::backoff::ExponentialBackoff,
+    pub retries: u32,
+}
+
+/// A sleep of [`LatticeProbeScheduler`]: until when (`None`: until the
+/// lattice changes), and whether a failed hit has already been considered for
+/// it (it is on the retry ladder, or a late one did not shorten it).
+#[derive(Debug, Clone, Copy)]
+struct LatticeProbeSleep {
+    until: Option<Instant>,
+    saw_failed_hit: bool,
+}
+
+/// What one [`LatticeProbeScheduler::tick`] decided.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LatticeProbeTick {
+    /// A side filled or tightened since the previous tick (telemetry).
+    pub improved: bool,
+    /// `Some(interval until the next probe)` if a probe should be queued now.
+    pub fired: Option<Duration>,
+}
+
+impl LatticeProbeScheduler {
+    /// Awake, due to fire on the first tick at or after `now`. `misses` is the
+    /// peer's recorded probe evidence so far: the first generation starts above
+    /// it, so recorded evidence from an earlier scheduler never counts.
+    pub(crate) fn new(
+        now: Instant,
+        misses: LatticeProbeMisses,
+        timing: LatticeProbeTiming,
+    ) -> Self {
+        Self {
+            timing,
+            next_at: now,
+            backoff_attempt: 0,
+            last_sides: None,
+            generation: misses.succ.max(misses.pred).max(misses.failed_hit) + 1,
+            sleep: None,
+            recheck_attempt: 0,
+            retry_attempt: 0,
+        }
+    }
+
+    /// The current generation, to tag a probe with when it is issued.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Start a new generation and probe promptly.
+    fn restart(&mut self, now: Instant) {
+        self.generation += 1;
+        self.sleep = None;
+        self.backoff_attempt = 0;
+        self.next_at = now;
+    }
+
+    /// The next rung of the retry ladder, if any is left.
+    fn next_retry(&self, now: Instant, jitter: &mut impl FnMut() -> f64) -> Option<Instant> {
+        (self.retry_attempt < self.timing.retries).then(|| {
+            now + self
+                .timing
+                .retry
+                .delay(self.retry_attempt)
+                .mul_f64(jitter())
+        })
+    }
+
+    /// Go to sleep on a lattice that both sides' misses show tight.
+    fn fall_asleep(
+        &mut self,
+        now: Instant,
+        failed_hit: bool,
+        jitter: &mut impl FnMut() -> f64,
+    ) -> LatticeProbeSleep {
+        if failed_hit {
+            if let Some(until) = self.next_retry(now, jitter) {
+                self.retry_attempt += 1;
+                return LatticeProbeSleep {
+                    until: Some(until),
+                    saw_failed_hit: true,
+                };
+            }
+            // Retries used up: fall back to the ordinary re-checks, which also
+            // guard the other side against a false miss.
+        }
+        let until = self.next_recheck(now, jitter);
+        if until.is_some() {
+            self.recheck_attempt += 1;
+        }
+        LatticeProbeSleep {
+            until,
+            saw_failed_hit: failed_hit,
+        }
+    }
+
+    /// The next rung of the re-check ladder, if any is left.
+    fn next_recheck(&self, now: Instant, jitter: &mut impl FnMut() -> f64) -> Option<Instant> {
+        (self.recheck_attempt < self.timing.rechecks).then(|| {
+            now + self
+                .timing
+                .recheck
+                .delay(self.recheck_attempt)
+                .mul_f64(jitter())
+        })
+    }
+
+    /// One maintenance tick for the peer behind `cm`: reads its per-side
+    /// nearest distances and probe misses and calls [`Self::tick`].
+    pub(crate) fn tick_for(
+        &mut self,
+        cm: &ConnectionManager,
+        now: Instant,
+        jitter: impl FnMut() -> f64,
+    ) -> LatticeProbeTick {
+        let sides = LatticeSides {
+            succ: cm.nearest_lattice_neighbor_dist(true),
+            pred: cm.nearest_lattice_neighbor_dist(false),
+        };
+        self.tick(now, sides, cm.lattice_probe_misses(), jitter)
+    }
+
+    /// One maintenance tick. `sides` is this tick's per-side nearest distances,
+    /// `misses` the latest generations with probe evidence, `jitter` draws the
+    /// multiplier applied to a newly scheduled interval (e.g. 0.8..=1.2); it is
+    /// only called when an interval is scheduled or considered.
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        sides: LatticeSides,
+        misses: LatticeProbeMisses,
+        mut jitter: impl FnMut() -> f64,
+    ) -> LatticeProbeTick {
+        let progress = lattice_probe_progress(self.last_sides, sides);
+        self.last_sides = Some(sides);
+        if progress.improved || progress.regressed {
+            // The lattice changed: work on it promptly, there may be an even
+            // closer neighbor to find (or a lost edge to replace). A new
+            // lattice state gets its re-checks back; the retry count does not
+            // reset, since an unreachable closer peer is re-found after any
+            // change.
+            self.recheck_attempt = 0;
+            self.restart(now);
+        }
+        let tight = |g: u64| misses.succ >= g && misses.pred >= g;
+        if tight(self.generation) {
+            let failed_hit = misses.failed_hit >= self.generation;
+            match self.sleep {
+                Some(LatticeProbeSleep {
+                    until: Some(at),
+                    saw_failed_hit,
+                }) if now >= at => {
+                    // A sleep that ended with nothing in the way: whatever
+                    // blocked us is gone, so a later failed hit starts its
+                    // retry ladder afresh. (Reset when the sleep ENDS, not when
+                    // it begins: a failed hit can still arrive during it.)
+                    if !saw_failed_hit {
+                        self.retry_attempt = 0;
+                    }
+                    self.restart(now);
+                }
+                None => self.sleep = Some(self.fall_asleep(now, failed_hit, &mut jitter)),
+                // A failed hit reported after a clean sleep began, considered
+                // once: move onto the retry ladder if that is sooner. The clean
+                // rung it replaces was never slept, so it is given back.
+                Some(sleep) if failed_hit && !sleep.saw_failed_hit => {
+                    let mut sleep = LatticeProbeSleep {
+                        saw_failed_hit: true,
+                        ..sleep
+                    };
+                    if let Some(at) = self.next_retry(now, &mut jitter) {
+                        if sleep.until.is_none_or(|until| at < until) {
+                            if sleep.until.is_some() {
+                                self.recheck_attempt = self.recheck_attempt.saturating_sub(1);
+                            }
+                            self.retry_attempt += 1;
+                            sleep = LatticeProbeSleep {
+                                until: Some(at),
+                                saw_failed_hit: true,
+                            };
+                        }
+                    }
+                    self.sleep = Some(sleep);
+                }
+                Some(_) => {}
+            }
+        }
+        let asleep = tight(self.generation);
+        let fired = (!asleep && now >= self.next_at).then(|| {
+            let interval = self.timing.probe.delay(self.backoff_attempt);
+            self.next_at = now + interval.mul_f64(jitter());
+            self.backoff_attempt = self.backoff_attempt.saturating_add(1);
+            interval
+        });
+        LatticeProbeTick {
+            improved: progress.improved,
+            fired,
+        }
+    }
+}
+
 #[cfg(test)]
 mod lattice_probe_state_machine_tests {
-    use super::{LatticeSides, lattice_probe_progress};
+    use super::{
+        LatticeProbeMisses, LatticeProbeScheduler, LatticeProbeTiming, LatticeSides,
+        lattice_probe_progress,
+    };
     use crate::util::backoff::ExponentialBackoff;
     use std::time::Duration;
+    use tokio::time::Instant;
 
-    /// CONTINUOUS discovery has NO sides-based stop condition. A tick where both
-    /// sides are filled and UNCHANGED is a plateau (neither improved nor
-    /// regressed) — the backoff grows, but the probe still fires on timing, so
-    /// discovery never goes silent when both sides are filled. This is the
-    /// behavioral reversal of the old fill-only stop-when-filled gate.
+    /// Filled sides are not a stop condition. A tick where both sides are
+    /// filled and UNCHANGED is a plateau (neither improved nor regressed): the
+    /// backoff grows, and only probe misses (see the scheduler tests below) put
+    /// discovery to sleep.
     #[test]
     fn both_sides_filled_and_unchanged_is_a_plateau_not_a_stop() {
         let both = LatticeSides {
@@ -8300,11 +9579,12 @@ mod lattice_probe_state_machine_tests {
         assert!(!p.regressed);
     }
 
-    /// A lost side (held -> empty) is a regression; re-widening a held side (a
-    /// farther nearest, e.g. the closest dropped and a farther one remains) is NOT
-    /// an improvement.
+    /// A lost side (held -> empty) is a regression, and so is a widened side (a
+    /// farther nearest: the closest dropped and a farther one remains). At
+    /// production degree a side almost never empties, so widening is how a lost
+    /// lattice edge shows up, and it must wake sleeping discovery (#5814).
     #[test]
-    fn lost_side_is_a_regression_and_widening_is_not_improvement() {
+    fn lost_or_widened_side_is_a_regression() {
         let prev = LatticeSides {
             succ: Some(0.05),
             pred: Some(0.05),
@@ -8322,8 +9602,8 @@ mod lattice_probe_state_machine_tests {
         };
         let p2 = lattice_probe_progress(Some(prev), widened);
         assert!(
-            !p2.improved && !p2.regressed,
-            "a farther nearest on a still-held side is a plateau, not an improvement"
+            p2.regressed && !p2.improved,
+            "a farther nearest on a still-held side is a regression"
         );
     }
 
@@ -8347,12 +9627,10 @@ mod lattice_probe_state_machine_tests {
     }
 
     /// The probe backoff uses the shared `ExponentialBackoff` and DECAYS toward
-    /// tau_max on a plateau, never stopping. The maintenance loop grows the attempt
-    /// one step per fire and resets it to 0 on an improvement/regression; mirror
-    /// that rule here and assert the interval is always finite (the probe keeps
-    /// firing — continuous, never silent), monotonic, and floored at tau_max.
+    /// tau_max on a plateau: the interval is always finite, monotonic, and
+    /// floored at tau_max.
     #[test]
-    fn backoff_decays_to_tau_max_and_never_stops() {
+    fn backoff_decays_to_tau_max() {
         let tau0 = Duration::from_secs(5);
         let tau_max = Duration::from_secs(300);
         let backoff = ExponentialBackoff::new(tau0, tau_max);
@@ -8374,6 +9652,484 @@ mod lattice_probe_state_machine_tests {
 
         // An improvement or a lost edge resets the attempt to 0 -> aggressive tau0.
         assert_eq!(backoff.delay(0), tau0);
+    }
+
+    const BOTH: LatticeSides = LatticeSides {
+        succ: Some(0.01),
+        pred: Some(0.01),
+    };
+    const HOUR: u64 = 3600;
+
+    /// Test ladders: re-checks 1h, 2h, 4h; retries 10, 20, 40, 80 min.
+    fn timing() -> LatticeProbeTiming {
+        LatticeProbeTiming {
+            probe: ExponentialBackoff::new(Duration::from_secs(5), Duration::from_secs(300)),
+            recheck: ExponentialBackoff::new(
+                Duration::from_secs(HOUR),
+                Duration::from_secs(4 * HOUR),
+            ),
+            rechecks: 3,
+            retry: ExponentialBackoff::new(Duration::from_secs(600), Duration::from_secs(4800)),
+            retries: 4,
+        }
+    }
+
+    fn scheduler(start: Instant) -> LatticeProbeScheduler {
+        LatticeProbeScheduler::new(start, LatticeProbeMisses::default(), timing())
+    }
+
+    fn misses(succ: u64, pred: u64) -> LatticeProbeMisses {
+        LatticeProbeMisses {
+            succ,
+            pred,
+            failed_hit: 0,
+        }
+    }
+
+    fn failed(g: u64) -> LatticeProbeMisses {
+        LatticeProbeMisses {
+            succ: g,
+            pred: g,
+            failed_hit: g,
+        }
+    }
+
+    /// Ticks once a second over `(from, from + secs]` with unchanged sides;
+    /// `misses_for(generation)` gives the evidence the driver would have
+    /// recorded by then. Returns the seconds at which the probe fired.
+    fn run(
+        s: &mut LatticeProbeScheduler,
+        start: Instant,
+        from: u64,
+        secs: u64,
+        sides: LatticeSides,
+        misses_for: impl Fn(u64) -> LatticeProbeMisses,
+    ) -> Vec<u64> {
+        (from + 1..=from + secs)
+            .filter(|t| {
+                let m = misses_for(s.generation());
+                s.tick(start + Duration::from_secs(*t), sides, m, || 1.0)
+                    .fired
+                    .is_some()
+            })
+            .collect()
+    }
+
+    fn within(t: u64, at: u64) -> bool {
+        (at..at + 5).contains(&t)
+    }
+
+    /// Converged discovery sleeps (#5814): once BOTH sides have missed in the
+    /// current generation, the probe stops firing except for a finite ladder of
+    /// re-checks (each needing fresh misses), instead of re-firing every
+    /// tau_max and keeping a non-lattice link each time.
+    #[test]
+    fn misses_on_both_sides_sleep_with_finitely_many_rechecks() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        assert!(run(&mut s, start, 0, 600, BOTH, |_| misses(0, 0)).len() >= 4);
+        let fired = run(&mut s, start, 600, 48 * HOUR, BOTH, |g| misses(g, g));
+        assert_eq!(
+            fired.len(),
+            3,
+            "re-checks after 1h, 2h, 4h, then none: {fired:?}"
+        );
+        assert!(within(fired[0], 601 + HOUR), "{fired:?}");
+        assert!(within(fired[1], fired[0] + 1 + 2 * HOUR), "{fired:?}");
+        assert!(within(fired[2], fired[1] + 1 + 4 * HOUR), "{fired:?}");
+    }
+
+    /// A re-check starts a new generation, so the misses that put discovery to
+    /// sleep no longer count and it probes until both sides miss again.
+    #[test]
+    fn recheck_needs_fresh_misses() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let slept_in = s.generation();
+        run(&mut s, start, 60, 60, BOTH, |g| misses(g, g));
+        assert_eq!(s.generation(), slept_in);
+        // Only the old generation's misses: after the re-check it stays awake.
+        let fired = run(&mut s, start, 120, 3 * HOUR, BOTH, move |_| {
+            misses(slept_in, slept_in)
+        });
+        assert!(fired.len() >= 20, "awake after the re-check: {fired:?}");
+    }
+
+    /// One side's miss is evidence only for that side: the probe aims at the
+    /// nearest unconnected peer, which may simply be on the tight side, so the
+    /// other side must still be probed. Misses on the two sides may arrive on
+    /// different ticks.
+    #[test]
+    fn a_miss_on_one_side_keeps_probing() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        assert!(run(&mut s, start, 60, HOUR, BOTH, |g| misses(g, 0)).len() >= 10);
+        assert!(run(&mut s, start, 60 + HOUR, HOUR / 2, BOTH, |g| misses(g, g)).is_empty());
+    }
+
+    /// Misses recorded for an earlier generation (a probe issued before a
+    /// lattice change) are not evidence about the lattice after the change.
+    #[test]
+    fn misses_from_an_earlier_generation_do_not_count() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let before = s.generation();
+        let widened = LatticeSides {
+            succ: Some(0.02),
+            pred: Some(0.01),
+        };
+        run(&mut s, start, 60, 1, widened, |_| misses(0, 0));
+        assert!(s.generation() > before);
+        assert!(
+            run(&mut s, start, 61, 600, widened, move |_| misses(
+                before, before
+            ))
+            .len()
+                >= 4,
+            "stale misses must not put the new generation to sleep"
+        );
+    }
+
+    /// A closer peer found but not connected in this generation means the
+    /// misses around it may be the walk going past it: re-check on the retry
+    /// ladder (10 min), which climbs and is finite.
+    #[test]
+    fn failed_hits_use_a_finite_retry_ladder() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let fired = run(&mut s, start, 60, 12 * HOUR, BOTH, failed);
+        assert_eq!(
+            fired.len(),
+            4 + 3,
+            "retries after 10, 20, 40, 80 min, then the re-checks: {fired:?}"
+        );
+        assert!(within(fired[0], 61 + 600), "{fired:?}");
+        assert!(within(fired[1], fired[0] + 1 + 1200), "{fired:?}");
+        assert!(within(fired[2], fired[1] + 1 + 2400), "{fired:?}");
+        assert!(within(fired[3], fired[2] + 1 + 4800), "{fired:?}");
+    }
+
+    /// A lattice change gives the re-check ladder back its rungs but keeps the
+    /// retry count (an unreachable closer peer is re-found after any change); a
+    /// generation that sleeps clean resets the retry count.
+    #[test]
+    fn a_change_resets_rechecks_but_not_retries() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Two clean re-checks (1h, 2h)...
+        let fired = run(&mut s, start, 60, 3 * HOUR + 10, BOTH, |g| misses(g, g));
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        // ...then a change: the next clean sleep is back on the first rung.
+        let widened = LatticeSides {
+            succ: Some(0.02),
+            pred: Some(0.01),
+        };
+        let t = 3 * HOUR + 70;
+        run(&mut s, start, t, 1, widened, |_| misses(0, 0));
+        let fired = run(&mut s, start, t + 1, 2 * HOUR, widened, |g| misses(g, g));
+        assert!(within(fired[0], t + 2 + HOUR), "{fired:?}");
+        // Two failed-hit retries (10, 20 min), then asleep on the third rung
+        // (40 min) when the change comes...
+        let t = fired[0];
+        let fired = run(&mut s, start, t, 1900, widened, failed);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        // ...so the next failed hit gets the fourth rung (80 min), not 10 min.
+        let t = t + 1900;
+        run(&mut s, start, t, 1, BOTH, |_| misses(0, 0));
+        let fired = run(&mut s, start, t + 1, 2 * HOUR, BOTH, failed);
+        assert!(within(fired[0], t + 2 + 4800), "{fired:?}");
+    }
+
+    /// A failed hit reported after a clean sleep began shortens it to the
+    /// retry ladder; the clean rung it replaced is given back, and the retry
+    /// rung is used up.
+    #[test]
+    fn late_failed_hit_shortens_sleep() {
+        for later_failed in [false, true] {
+            let start = tokio::time::Instant::now();
+            let mut s = scheduler(start);
+            run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+            // Asleep on the 1h re-check...
+            assert!(run(&mut s, start, 60, 300, BOTH, |g| misses(g, g)).is_empty());
+            // ...then the failed hit from an in-flight probe of this generation.
+            let sleeping = s.generation();
+            let fired = run(&mut s, start, 360, 3 * HOUR, BOTH, move |g| {
+                if g == sleeping || later_failed {
+                    failed(g)
+                } else {
+                    misses(g, g)
+                }
+            });
+            assert!(within(fired[0], 361 + 600), "{fired:?}");
+            if later_failed {
+                // The retry rung was used: the next failed hit sleeps 20 min.
+                assert!(within(fired[1], fired[0] + 1 + 1200), "{fired:?}");
+            } else {
+                // The clean rung was given back: the next clean sleep is 1h.
+                assert!(within(fired[1], fired[0] + 1 + HOUR), "{fired:?}");
+            }
+        }
+    }
+
+    /// A failed hit reported late in a clean sleep, when the retry rung would
+    /// end after the sleep does, changes nothing: no later re-check, no rung
+    /// used up.
+    #[test]
+    fn late_failed_hit_never_extends_sleep() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Asleep on the 1h re-check from 61 (due at 3661)...
+        assert!(run(&mut s, start, 60, 3240, BOTH, |g| misses(g, g)).is_empty());
+        // ...a failed hit appears at 3301, when 10 more minutes would end
+        // after 3661: the re-check stays at 3661.
+        let fired = run(&mut s, start, 3300, 1200, BOTH, failed);
+        assert!(within(fired[0], 3661), "{fired:?}");
+        // The retry ladder was not used: the failed hit in the new generation
+        // sleeps 10 min, not 20.
+        assert!(within(fired[1], fired[0] + 1 + 600), "{fired:?}");
+    }
+
+    /// A failed hit in every generation, always reported late (after a clean
+    /// sleep began, as when a near-terminus relay's miss arrives before the
+    /// closer peer's hole punch fails), still uses up the retry ladder: a
+    /// closer peer that is never reachable costs at most `retries` retries,
+    /// then the re-check ladder, then nothing until the lattice changes.
+    #[test]
+    fn unreachable_closer_peer_costs_finitely_many_wakes() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Each generation sleeps clean on its first tick, and the failed hit
+        // for it shows up 30 s later.
+        let mut slept_at: std::collections::HashMap<u64, u64> = Default::default();
+        let mut fired = Vec::new();
+        for t in 61..61 + 48 * HOUR {
+            let g = s.generation();
+            let first = *slept_at.entry(g).or_insert(t);
+            let m = if t >= first + 30 {
+                failed(g)
+            } else {
+                misses(g, g)
+            };
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || 1.0)
+                .fired
+                .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        assert!(
+            fired.len() == 4 + 3,
+            "the retries and then the re-checks, nothing more: {fired:?}"
+        );
+    }
+
+    /// Once retries are used up, a failed hit falls back to the re-check
+    /// ladder rather than sleeping until a change, so the other side keeps
+    /// its guard against a false miss.
+    #[test]
+    fn exhausted_retries_fall_back_to_rechecks() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        let fired = run(&mut s, start, 60, 48 * HOUR, BOTH, failed);
+        assert_eq!(fired.len(), 4 + 3, "4 retries then 3 re-checks: {fired:?}");
+        let t = fired[3] + 1;
+        assert!(within(fired[4], t + HOUR), "{fired:?}");
+    }
+
+    /// A sleep that runs its course without a failed hit resets the retry
+    /// count: the next failed hit starts at 10 min again.
+    #[test]
+    fn clean_sleep_resets_retries() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+        // Two retries (10, 20 min), then the third sleep starts...
+        let fired = run(&mut s, start, 60, 1900, BOTH, failed);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        // ...a clean generation sleeps its full hour...
+        let t = 60 + 1900 + 2400 + 10;
+        run(&mut s, start, 1960, t - 1960, BOTH, |g| misses(g, g));
+        let fired = run(&mut s, start, t, 2 * HOUR, BOTH, |g| misses(g, g));
+        // ...and the failed hit after that is back on the first rung.
+        let t2 = fired[0];
+        let fired = run(&mut s, start, t2, HOUR, BOTH, failed);
+        assert!(within(fired[0], t2 + 1 + 600), "{fired:?}");
+    }
+
+    /// Awake, the probe backs off 5 s doubling to 300 s; a change while the
+    /// next probe is far off fires at once.
+    #[test]
+    fn awake_cadence_and_prompt_wake() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let fired = run(&mut s, start, 0, 1300, BOTH, |_| misses(0, 0));
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(&gaps[..7], &[5, 10, 20, 40, 80, 160, 300], "{fired:?}");
+        let widened = LatticeSides {
+            succ: Some(0.02),
+            pred: Some(0.01),
+        };
+        let tick = s.tick(
+            start + Duration::from_secs(1301),
+            widened,
+            misses(0, 0),
+            || 1.0,
+        );
+        assert!(tick.fired.is_some());
+    }
+
+    /// The jitter scales the awake backoff and the re-check sleeps.
+    #[test]
+    fn jitter_scales_awake_probes_and_rechecks() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let mut fired = Vec::new();
+        for t in 1..=3 * HOUR {
+            let g = s.generation();
+            let m = if t < 100 { misses(0, 0) } else { misses(g, g) };
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || 1.2)
+                .fired
+                .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(&gaps[..3], &[6, 12, 24], "{fired:?}");
+        // Asleep from 100 on the 1h rung, scaled by 1.2.
+        let wake = fired.iter().copied().find(|t| *t > 100).unwrap();
+        assert!(within(wake, 100 + 4320), "{fired:?}");
+    }
+
+    /// A late failed hit is considered once per sleep: if the retry rung it
+    /// draws would end after the clean sleep, a later, luckier draw does not
+    /// get to shorten the sleep after all.
+    #[test]
+    fn late_failed_hit_is_considered_once() {
+        let start = tokio::time::Instant::now();
+        let mut s = scheduler(start);
+        let draw = std::cell::Cell::new(1.0);
+        let mut fired = Vec::new();
+        for t in 1..=2 * HOUR {
+            let g = s.generation();
+            // Clean sleep from 61 (due 3661); the failed hit appears at 3000,
+            // first with a draw of 1.2 (3720, not sooner), then 0.8 (it would
+            // be 3481 if it were considered again).
+            let m = if t <= 60 {
+                misses(0, 0)
+            } else if t < 3000 {
+                misses(g, g)
+            } else {
+                failed(g)
+            };
+            draw.set(match t {
+                3000 => 1.2,
+                3001.. => 0.8,
+                _ => 1.0,
+            });
+            if s.tick(start + Duration::from_secs(t), BOTH, m, || draw.get())
+                .fired
+                .is_some()
+            {
+                fired.push(t);
+            }
+        }
+        let wake = fired.iter().copied().find(|t| *t > 61).unwrap();
+        assert!(within(wake, 3661), "{fired:?}");
+    }
+
+    /// A scheduler created on a peer with earlier evidence starts above it, so
+    /// that evidence cannot put it to sleep; each of the three records alone
+    /// sets the floor.
+    #[test]
+    fn new_scheduler_ignores_earlier_evidence() {
+        let start = tokio::time::Instant::now();
+        for (succ, pred, failed_hit) in [(20, 1, 1), (1, 20, 1), (1, 1, 20)] {
+            let earlier = LatticeProbeMisses {
+                succ,
+                pred,
+                failed_hit,
+            };
+            let mut s = LatticeProbeScheduler::new(start, earlier, timing());
+            assert_eq!(s.generation(), 21);
+            assert!(run(&mut s, start, 0, 600, BOTH, move |_| earlier).len() >= 4);
+        }
+    }
+
+    /// An asleep scheduler wakes immediately on any lattice change: a widened
+    /// side (lattice edge lost, farther neighbor remains), a lost side, or a
+    /// tighten. This includes a scheduler whose re-checks are used up.
+    #[test]
+    fn any_lattice_change_wakes_discovery() {
+        let changes = [
+            LatticeSides {
+                succ: Some(0.02),
+                pred: Some(0.01),
+            },
+            LatticeSides {
+                succ: None,
+                pred: Some(0.01),
+            },
+            LatticeSides {
+                succ: Some(0.005),
+                pred: Some(0.01),
+            },
+        ];
+        for changed in changes {
+            let start = tokio::time::Instant::now();
+            let mut s = scheduler(start);
+            run(&mut s, start, 0, 60, BOTH, |_| misses(0, 0));
+            // Past all three re-checks: asleep until something changes.
+            assert_eq!(
+                run(&mut s, start, 60, 12 * HOUR, BOTH, |g| misses(g, g)).len(),
+                3
+            );
+            assert!(
+                run(&mut s, start, 60 + 12 * HOUR, 24 * HOUR, BOTH, |g| misses(
+                    g, g
+                ))
+                .is_empty()
+            );
+            let gen_asleep = s.generation();
+            let woke = s.tick(
+                start + Duration::from_secs(37 * HOUR),
+                changed,
+                misses(gen_asleep, gen_asleep),
+                || 1.0,
+            );
+            assert_eq!(
+                woke.fired,
+                Some(Duration::from_secs(5)),
+                "{changed:?} must wake discovery at tau0"
+            );
+        }
+    }
+
+    /// The production ladders are finite and their first rungs outlast the
+    /// failed-address exclusions (checked against the exclusion values in
+    /// `connection_manager`), even at the low end of the jitter.
+    #[test]
+    fn production_ladders() {
+        use super::lattice_probe_timing as t;
+        let p = t::production();
+        assert_eq!(p.probe.delay(0), Duration::from_secs(5));
+        assert_eq!(p.probe.delay(20), Duration::from_secs(300));
+        assert_eq!(p.recheck.delay(0), Duration::from_secs(2 * HOUR));
+        assert_eq!(p.retry.delay(0), Duration::from_secs(600));
+        assert_eq!(p.recheck.delay(0), t::RECHECK_MIN);
+        assert_eq!(p.recheck.delay(t::RECHECKS - 1), t::RECHECK_MIN * 4);
+        assert_eq!(p.retry.delay(0), t::RETRY_MIN);
+        assert_eq!(p.retry.delay(t::RETRIES - 1), t::RETRY_MIN * 8);
+        assert_eq!((p.rechecks, p.retries), (t::RECHECKS, t::RETRIES));
+        assert_eq!((t::JITTER_LOW, t::JITTER_HIGH), (0.8, 1.2));
     }
 }
 
@@ -8907,6 +10663,398 @@ mod cost_pressure_seam_tests {
             freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
             freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
         )
+    }
+
+    /// A real `OpManager` whose ring has been attached the production way
+    /// (`Ring::attach_op_manager`), for the #5647/#5781 wiring tests.
+    async fn attached_op_manager(id: &str) -> std::sync::Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    fn wiring_key(seed: u32) -> freenet_stdlib::prelude::ContractKey {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let mut id = [7u8; 32];
+        id[..4].copy_from_slice(&seed.to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new([8u8; 32]))
+    }
+
+    /// #5647: `attach_op_manager` must install the interest-bytes provider, so
+    /// the hosting cache charges each hosted contract the neighbour-summary
+    /// bytes the REAL interest manager holds for it. Goes through the
+    /// production sweep entry (`Ring::sweep_expired_hosting`). Without the
+    /// provider the cache counts only its fixed per-entry bytes and the
+    /// resident axis would silently stop seeing summaries, with every other
+    /// test still green.
+    #[tokio::test]
+    async fn attach_op_manager_wires_interest_bytes_into_the_hosting_cache() {
+        use freenet_stdlib::prelude::StateSummary;
+        let op_manager = attached_op_manager("interest-bytes-wiring-5647").await;
+        let key = wiring_key(0);
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+        let neighbour =
+            crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone());
+        assert!(op_manager.interest_manager.upsert_peer_summary(
+            &key,
+            &neighbour,
+            StateSummary::from(vec![0u8; 4096]),
+        ));
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let held = op_manager.interest_manager.resident_bytes_for(&key);
+        assert!(held > 4096);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES + held,
+            "the hosting cache must charge the summary bytes the interest manager holds"
+        );
+    }
+
+    fn wiring_peer() -> crate::ring::PeerKey {
+        crate::ring::PeerKey::from(crate::transport::TransportKeypair::new().public().clone())
+    }
+
+    fn host_for_wiring(
+        op_manager: &crate::node::OpManager,
+        key: freenet_stdlib::prelude::ContractKey,
+    ) {
+        op_manager.ring.hosting_manager.record_contract_access(
+            key,
+            10,
+            crate::ring::hosting::AccessType::Get,
+            crate::ring::hosting::HostingCause::Other,
+        );
+        op_manager.interest_manager.register_local_hosting(&key);
+    }
+
+    /// #5781 review blocker, at the 64 MiB floor budget: identities acting
+    /// together, sending identical and distinct oversized summaries for 600
+    /// hosted contracts, cannot push the resident axis over budget, so they
+    /// cannot get any contract evicted. 600 contracts at the 128 KiB
+    /// per-contract cap would be 75 MiB; the node-wide budget (a quarter of
+    /// the resident budget, enforced at write time) is what keeps the total
+    /// under 64 MiB, and the counter never exceeds it.
+    #[tokio::test]
+    async fn colluding_peers_flooding_summaries_cannot_push_hosting_over_budget() {
+        use freenet_stdlib::prelude::StateSummary;
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-flood-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        // A 512 MiB limit at the default share: the 64 MiB floor budget.
+        hosting.configure_resident_overhead_mem_share(0.125);
+        let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
+        assert_eq!(budget, 64 * MIB);
+        let node_cap = budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR;
+        // What the sweep installs; installed here so the flood below is
+        // judged against the floor budget from the first write.
+        op_manager
+            .interest_manager
+            .set_neighbour_summary_budget(node_cap);
+
+        let im = &op_manager.interest_manager;
+        let colluders: Vec<_> = (0..8).map(|_| wiring_peer()).collect();
+        let hosted = 600u32;
+        let cap = crate::ring::interest::FALLBACK_CONTRACT_SUMMARY_CAP as usize;
+        for i in 0..hosted {
+            let key = wiring_key(i);
+            host_for_wiring(&op_manager, key);
+            for (n, peer) in colluders.iter().enumerate() {
+                // 1 MiB each, identical across identities: over the cap.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0u8; MIB as usize]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+                // Distinct per identity, each under the cap but together over it.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![n as u8 + 1; cap / 2]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+                // Identical and exactly at the cap: stored once if it fits.
+                im.upsert_peer_summary(&key, peer, StateSummary::from(vec![0xAA; cap]));
+                assert!(im.neighbour_summary_bytes() <= node_cap);
+            }
+        }
+        assert!(
+            im.neighbour_summary_bytes() > 0,
+            "the flood was partly admitted"
+        );
+        let mut with_summaries = 0;
+        for i in 0..hosted {
+            let held = im.distinct_summary_bytes_for(&wiring_key(i));
+            assert!(held <= cap as u64, "contract {i} holds {held} bytes");
+            if held > 0 {
+                with_summaries += 1;
+            }
+        }
+        assert!(with_summaries > 0 && with_summaries < hosted);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        let stats = hosting.hosting_cache_stats();
+        assert!(
+            stats.resident_overhead_bytes <= budget,
+            "the colluders pushed the resident axis to {} bytes against a {budget} budget",
+            stats.resident_overhead_bytes
+        );
+        assert_eq!(
+            stats.contract_count,
+            u64::from(hosted),
+            "nothing was evicted"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+    }
+
+    /// #5781: `Ring::attach_op_manager` installs the node-wide summary budget
+    /// at once (a real value, never 0 or the unset `u64::MAX`), and every
+    /// sweep re-installs it from the current resident budget.
+    #[tokio::test]
+    async fn neighbour_summary_budget_is_installed_at_attach_and_each_sweep() {
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-budget-install-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        let at_attach = im.neighbour_summary_budget();
+        assert_eq!(
+            at_attach,
+            hosting.resident_overhead_budget_bytes()
+                / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR
+        );
+        assert!(at_attach > 0 && at_attach < u64::MAX);
+
+        hosting.configure_resident_overhead_mem_share(0.125);
+        assert_eq!(
+            hosting.recompute_resident_overhead_budget(512 * MIB),
+            64 * MIB
+        );
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(im.neighbour_summary_budget(), 16 * MIB);
+    }
+
+    /// #5781: on a node at capacity the summary budget stays a quarter of the
+    /// resident budget and the sweep keeps the neighbours' summaries; it does
+    /// not wipe them to clear the breach. Relieving the breach is left to the
+    /// ordinary demand-ordered eviction once it has lasted the sustained
+    /// window (covered by the hosting-cache eviction tests; this sweep runs
+    /// before that window, so nothing is evicted yet).
+    #[tokio::test]
+    async fn a_node_at_capacity_keeps_its_neighbour_summaries() {
+        use freenet_stdlib::prelude::StateSummary;
+        const MIB: u64 = 1024 * 1024;
+        let op_manager = attached_op_manager("summary-at-capacity-5781").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let im = &op_manager.interest_manager;
+        hosting.configure_resident_overhead_mem_share(0.125);
+        let budget = hosting.recompute_resident_overhead_budget(512 * MIB);
+        assert_eq!(budget, 64 * MIB);
+        // Entries alone exceed the budget.
+        let hosted = (budget / crate::ring::hosting::HOSTED_ENTRY_BYTES) as u32 + 100;
+        for i in 0..hosted {
+            hosting.record_contract_access(
+                wiring_key(i),
+                10,
+                crate::ring::hosting::AccessType::Get,
+                crate::ring::hosting::HostingCause::Other,
+            );
+        }
+        for i in 0..50u32 {
+            let key = wiring_key(i);
+            im.register_local_hosting(&key);
+            assert!(im.upsert_peer_summary(
+                &key,
+                &wiring_peer(),
+                StateSummary::from(vec![i as u8; 10_000])
+            ));
+        }
+        let held = im.neighbour_summary_bytes();
+        assert_eq!(held, 50 * 10_000);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(
+            im.neighbour_summary_budget(),
+            budget / crate::ring::interest::NEIGHBOUR_SUMMARY_BUDGET_DIVISOR,
+            "the summary budget does not collapse at capacity"
+        );
+        assert_eq!(im.neighbour_summary_bytes(), held, "no summary was trimmed");
+        assert_eq!(im.summary_bound_trim_totals(), (0, 0));
+        let stats = hosting.hosting_cache_stats();
+        assert!(
+            stats.resident_overhead_bytes > budget,
+            "the node is over budget"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+    }
+
+    /// #5781 relative cap, end to end through the production sweep: a
+    /// neighbour's 100,000-byte summary fits the 128 KiB cap while our own
+    /// summary is unknown. Once a delivery records our own 1,000-byte summary
+    /// the cap is 69,536 bytes, and the next `Ring::sweep_expired_hosting`
+    /// drops the oversized summary before the hosting cache charges it.
+    #[tokio::test]
+    async fn relative_summary_cap_is_enforced_before_hosting_charges() {
+        use crate::ring::interest::SummaryPopulationSource;
+        use freenet_stdlib::prelude::StateSummary;
+        let op_manager = attached_op_manager("summary-relative-5781").await;
+        let key = wiring_key(0);
+        host_for_wiring(&op_manager, key);
+        let neighbour = wiring_peer();
+        let us_to = wiring_peer();
+        let im = &op_manager.interest_manager;
+
+        assert!(im.upsert_peer_summary(&key, &neighbour, StateSummary::from(vec![1u8; 100_000])));
+        im.upsert_peer_summary_from(
+            &key,
+            &us_to,
+            StateSummary::from(vec![2u8; 1_000]),
+            SummaryPopulationSource::Delivery,
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 101_000);
+
+        let _ = op_manager.ring.sweep_expired_hosting();
+        assert!(
+            im.get_peer_summary(&key, &neighbour).is_none(),
+            "the neighbour's summary is over 4 x ours + 64 KiB"
+        );
+        assert_eq!(im.distinct_summary_bytes_for(&key), 1_000);
+        assert_eq!(
+            op_manager
+                .ring
+                .hosting_manager
+                .hosting_cache_stats()
+                .resident_overhead_bytes,
+            crate::ring::hosting::HOSTED_ENTRY_BYTES
+                + 2 * crate::ring::interest::PEER_INTEREST_ENTRY_BYTES
+                + 1_000
+        );
+    }
+
+    /// `Ring::add_connection`'s `bool` reports the READINESS-threshold
+    /// crossing, not acceptance — it is `false` both when the ring rejects the
+    /// connection and (far more often) when the connection is added while the
+    /// node is already ready. #4787's promotion counter has to know which
+    /// happened, so `add_connection_reporting` splits the two. This pins that
+    /// split, because gating the counter on the plain `bool` — the obvious
+    /// reading of a function returning `false` on rejection — would silently
+    /// count almost no promotions at all.
+    #[tokio::test]
+    async fn add_connection_reporting_separates_added_from_readiness() {
+        let config_args = crate::config::ConfigArgs {
+            id: Some("add-conn-outcome-4787".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14101".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let max = ring.connection_manager.max_connections;
+        // Beyond max + LATTICE_OVERMAX_SLACK the ceiling is hard, so a margin
+        // past that guarantees we observe a rejection.
+        let attempts = max + super::connection_manager::LATTICE_OVERMAX_SLACK + 16;
+
+        let mut added = 0usize;
+        let mut ready_crossings = 0usize;
+        let mut added_without_readiness = 0usize;
+        let mut first_rejection: Option<usize> = None;
+        for i in 0..attempts {
+            let kp = crate::transport::TransportKeypair::new();
+            let addr: std::net::SocketAddr = format!("127.0.0.2:{}", 20000 + i as u16)
+                .parse()
+                .expect("addr");
+            let loc = super::Location::new((i as f64 + 0.5) / attempts as f64);
+            let outcome = ring
+                .add_connection_reporting(loc, super::PeerId::new(kp.public().clone(), addr), false)
+                .await;
+            if outcome.added {
+                added += 1;
+                if outcome.just_became_ready {
+                    ready_crossings += 1;
+                } else {
+                    added_without_readiness += 1;
+                }
+            } else {
+                first_rejection = Some(i);
+                break;
+            }
+        }
+
+        let rejected_at = first_rejection.expect(
+            "the ring must eventually reject an add at the connection ceiling — \
+             without a rejection this test cannot show `added` is meaningful",
+        );
+        assert!(
+            rejected_at >= max,
+            "rejection came at {rejected_at}, before max_connections={max}"
+        );
+        assert!(
+            added_without_readiness > 0,
+            "the overwhelming majority of accepted adds report \
+             just_became_ready=false; if this is 0 the test proves nothing"
+        );
+        assert!(
+            ready_crossings <= 1,
+            "readiness can be crossed at most once, got {ready_crossings}"
+        );
+        assert!(
+            added >= max,
+            "expected at least {max} accepted adds, got {added}"
+        );
     }
 
     /// Runs under `start_paused` so `tokio::time::Instant` — the clock behind
@@ -9482,4 +11630,765 @@ pub(crate) enum RingError {
     NoHostingPeers(ContractInstanceId),
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
+}
+
+#[cfg(test)]
+mod timeout_label_window_tests {
+    use super::{TIMEOUT_LABEL_WINDOW_MAX_PEERS, TimeoutLabelWindow};
+    use std::net::SocketAddr;
+
+    fn addr(i: usize) -> SocketAddr {
+        SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 4000))
+    }
+
+    #[test]
+    fn histogram_buckets_labels_per_peer_and_resets() {
+        let mut window = TimeoutLabelWindow::default();
+        // peer 0: 1 label, peer 1: 3, peer 2: 5, peer 3: 9
+        for (peer, labels) in [(0, 1), (1, 3), (2, 5), (3, 9)] {
+            for _ in 0..labels {
+                window.record(addr(peer));
+            }
+        }
+        assert_eq!(window.take_histogram(), (1, 1, 1, 1, 9, 0));
+        assert_eq!(
+            window.take_histogram(),
+            (0, 0, 0, 0, 0, 0),
+            "each snapshot window starts empty"
+        );
+    }
+
+    #[test]
+    fn window_is_bounded_and_counts_overflow() {
+        let mut window = TimeoutLabelWindow::default();
+        for i in 0..TIMEOUT_LABEL_WINDOW_MAX_PEERS + 10 {
+            window.record(addr(i));
+        }
+        // A tracked peer keeps counting past the cap.
+        window.record(addr(0));
+        assert_eq!(window.per_peer.len(), TIMEOUT_LABEL_WINDOW_MAX_PEERS);
+        let (b1, b2, _, _, max, untracked) = window.take_histogram();
+        assert_eq!(untracked, 10);
+        assert_eq!(b1 + b2, TIMEOUT_LABEL_WINDOW_MAX_PEERS as u64);
+        assert_eq!(max, 2);
+    }
+}
+
+#[cfg(test)]
+mod hosting_stats_mirror_source_tests {
+    //! Source-scrape pin: every `HostingCacheStats` field must be mirrored into
+    //! `RouterSnapshotInfo` by `emit_router_snapshot_telemetry`, INTO THE FIELD
+    //! THAT MATCHES IT.
+    //!
+    //! The telemetry path is hand-mirrored twice over (`HostingCacheStats` ->
+    //! `RouterSnapshotInfo` -> the OTLP JSON body), and nothing in the type
+    //! system connects the hops. The resident-overhead pressure axis (#5325)
+    //! was computed, rendered on the node's own dashboard, and dropped on the
+    //! floor at THIS step for its whole life: the collector could not see the
+    //! second eviction pressure at all, so a node evicting purely under slot
+    //! pressure looked idle in fleet telemetry.
+    //!
+    //! The pin asserts the WHOLE assignment, not merely that the field is read
+    //! somewhere in the function — the same shape as
+    //! `contract_exec_export_maps_each_field_to_its_own_counter`, and for the
+    //! same reason its doc gives: a swap "compiles cleanly and emits a plausible
+    //! number that is measuring the opposite thing". Here a swapped pair would
+    //! report every node as over its resident-overhead budget. A presence-only
+    //! check is also satisfied by `let _ = hosting.x;`, by an assignment into the
+    //! WRONG destination (which additionally clobbers a live gauge), and by a
+    //! field name left behind in a comment.
+    //!
+    //! It checks the FIRST hop only. The second hop (`RouterSnapshotInfo` ->
+    //! JSON) is guarded by the per-gauge pins in `tracing::telemetry`, including
+    //! `router_snapshot_json_includes_resident_overhead_gauges`; it has no
+    //! structural pin of its own, which is a known gap, not an oversight.
+
+    /// Fields whose destination is a key in the `NetworkEfficiencyV1` struct
+    /// literal rather than a `snapshot.hosting_*` assignment, with that key.
+    /// These are the histogram arms; their names are deliberately abbreviated at
+    /// the destination, so the mechanical `hosting_<field>` rule does not apply
+    /// and the expected statement has to be spelled out.
+    const STRUCT_LITERAL_DESTINATIONS: &[(&str, &str)] = &[
+        ("eviction_victim_counts", "vict_n"),
+        ("eviction_victim_bytes", "vict_b"),
+        ("hosting_begins", "host_begin"),
+        ("read_count_hist", "host_reads"),
+        ("genuine_access_recency", "host_recency"),
+    ];
+
+    /// Fields deliberately NOT mirrored to telemetry. Each entry needs a reason:
+    /// adding one is a decision to make a stat invisible to the collector, which
+    /// is exactly what this pin exists to stop happening by accident.
+    ///
+    /// Empty today, so `not_mirrored_exclusions_carry_a_reason` below cannot
+    /// currently fail. That is deliberate — it arms the escape hatch before
+    /// anyone uses it — but it means the test name overstates present coverage;
+    /// do not read it as evidence that anything was checked.
+    const DELIBERATELY_NOT_MIRRORED: &[(&str, &str)] = &[];
+
+    /// Every field on `HostingCacheStats`. An exact count, not a floor: the
+    /// scrape below can only under-count (a declaration shape it cannot parse),
+    /// and a floor set below the true count lets exactly that go unnoticed.
+    /// Adding a field means bumping this deliberately AND mirroring the field.
+    // 19 since #5647: `contract_slot_budget` was removed (no per-contract
+    // constant to divide by), the estimated field was renamed
+    // `resident_overhead_bytes`, and `resident_overhead_evicted_charged_bytes_total`
+    // was added.
+    const EXPECTED_HOSTING_CACHE_STATS_FIELDS: usize = 19;
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        // ring.rs has inline `#[cfg(test)]` annotations on individual `use`
+        // declarations near the top of the file, so a plain
+        // `find("#[cfg(test)]")` would cut the file off before the function we
+        // want to scrape. Anchor on the first *top-level* test module instead.
+        // Keep this comment: without it the next editor "simplifies" the anchor
+        // and the scrape silently starts returning the wrong region.
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    /// Body of the item starting at `signature_prefix`, brace-balanced. Bounding
+    /// to the item is load-bearing: an unbounded search over an 8000-line file
+    /// would match this module's own assertion strings and pass vacuously. (The
+    /// `production_source` cutoff makes that structurally impossible here too,
+    /// since this module sits past it — belt and braces.)
+    fn item_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("item must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    /// `body` with `//` comments removed and whitespace collapsed.
+    ///
+    /// Both halves are load-bearing. Comments must go because `str::contains`
+    /// over raw source cannot tell a statement from `// snapshot.hosting_x =
+    /// Some(hosting.x);`, so commenting a mirror out — what someone actually
+    /// does while debugging, which is precisely when the pin is the only thing
+    /// still watching — would otherwise keep it green. Whitespace must collapse
+    /// because rustfmt wraps these assignments across two lines.
+    ///
+    /// Stripping `//` inside a string literal would be wrong, but only in the
+    /// strict direction: it can make the pin fail spuriously, never pass
+    /// spuriously. There are no such literals in the scraped function today.
+    fn strip_comments_and_normalize(body: &str) -> String {
+        let uncommented: Vec<&str> = body
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect();
+        uncommented
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Field names declared on `HostingCacheStats`, in declaration order.
+    ///
+    /// Fails LOUDLY on any line it does not recognise rather than skipping it.
+    /// A scraper that silently drops an unparseable declaration fails OPEN: the
+    /// field is never checked for a mirror, which is the exact omission this
+    /// module exists to catch. `pub(crate)` is the shape that bit an earlier
+    /// draft — `HostingCacheStats` is itself `pub(crate)`, so a contributor
+    /// writing `pub(crate)` on a field is entirely natural.
+    fn hosting_cache_stats_fields() -> Vec<String> {
+        const CACHE_SRC: &str = include_str!("ring/hosting/cache.rs");
+        let body = item_body(CACHE_SRC, "pub(crate) struct HostingCacheStats {");
+        let mut fields = Vec::new();
+        for raw in body.lines() {
+            let mut line = raw.trim();
+            if line.is_empty() || line.starts_with("///") || line.starts_with("//") {
+                continue;
+            }
+            // An inline attribute (`#[doc(hidden)] pub x: u64,`) must not hide a
+            // field: strip the attribute and keep reading the same line.
+            while let Some(rest) = line.strip_prefix("#[") {
+                match rest.find(']') {
+                    Some(close) => line = rest[close + 1..].trim(),
+                    None => break,
+                }
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let decl = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unrecognised line in HostingCacheStats: {raw:?}. Every line in \
+                         that struct must be blank, a comment, an attribute, or a \
+                         `pub`/`pub(crate)` field declaration. If a new shape is \
+                         legitimate, teach this scraper about it — do NOT let it skip \
+                         the line, because an unscraped field is never checked for a \
+                         mirror, which is the omission this module exists to catch."
+                    )
+                });
+            let (name, _) = decl.split_once(':').unwrap_or_else(|| {
+                panic!("HostingCacheStats field declaration has no `:`: {raw:?}")
+            });
+            fields.push(name.trim().to_string());
+        }
+        assert_eq!(
+            fields.len(),
+            EXPECTED_HOSTING_CACHE_STATS_FIELDS,
+            "scraped {} HostingCacheStats fields, expected {}: {fields:?}. If you added \
+             or removed a field, bump EXPECTED_HOSTING_CACHE_STATS_FIELDS deliberately \
+             (and mirror the new field). If you did not, the scrape has gone wrong and \
+             this pin is measuring less than it claims — fix the scrape, do not relax \
+             the count.",
+            fields.len(),
+            EXPECTED_HOSTING_CACHE_STATS_FIELDS,
+        );
+        fields
+    }
+
+    /// The exact statement that must appear for `field`.
+    fn expected_mirror(field: &str) -> String {
+        match STRUCT_LITERAL_DESTINATIONS
+            .iter()
+            .find(|(name, _)| *name == field)
+        {
+            Some((_, key)) => format!("{key}: hosting.{field},"),
+            None => format!("snapshot.hosting_{field} = Some(hosting.{field});"),
+        }
+    }
+
+    #[test]
+    fn hosting_cache_stats_fields_are_all_mirrored() {
+        let body = item_body(
+            production_source(),
+            "async fn emit_router_snapshot_telemetry(",
+        );
+        let norm = strip_comments_and_normalize(body);
+
+        // The mirror reads every stat off one binding. Anchoring on it gives a
+        // directed failure if the read moves, instead of 19 confusing ones.
+        assert!(
+            norm.contains("let hosting = ring.hosting_manager.hosting_cache_stats();"),
+            "emit_router_snapshot_telemetry must bind the hosting stats as \
+             `hosting`; if that binding was renamed, update this pin's expected \
+             statements too — they all read through it."
+        );
+
+        let mut missing = Vec::new();
+        for field in hosting_cache_stats_fields() {
+            if DELIBERATELY_NOT_MIRRORED
+                .iter()
+                .any(|(name, _)| *name == field)
+            {
+                continue;
+            }
+            let expected = expected_mirror(&field);
+            if !norm.contains(&expected) {
+                missing.push(expected);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "HostingCacheStats fields not mirrored into RouterSnapshotInfo by \
+             emit_router_snapshot_telemetry. Expected statements not found: \
+             {missing:#?}\n\nEvery stat must reach `RouterSnapshotInfo` (and from \
+             there the OTLP body) into the field that matches it, or be listed in \
+             DELIBERATELY_NOT_MIRRORED with a reason. A stat that exists but is not \
+             exported is invisible to fleet telemetry — see #5325, where the \
+             resident-overhead eviction axis was dropped exactly here. A stat \
+             exported under the WRONG name is worse: it reads as a plausible number \
+             measuring the opposite thing."
+        );
+    }
+
+    /// The expected-statement table must actually describe the destinations, not
+    /// merely be self-consistent: every `STRUCT_LITERAL_DESTINATIONS` entry names
+    /// a real `HostingCacheStats` field. A stale entry here would silently excuse
+    /// a field from the mechanical rule without anyone noticing.
+    #[test]
+    fn struct_literal_destinations_name_real_fields() {
+        let fields = hosting_cache_stats_fields();
+        for (field, key) in STRUCT_LITERAL_DESTINATIONS {
+            assert!(
+                fields.iter().any(|f| f == field),
+                "STRUCT_LITERAL_DESTINATIONS names {field:?} (destination key \
+                 {key:?}), which is not a HostingCacheStats field. Remove the stale \
+                 entry — while it is here, a field by that name is exempt from the \
+                 mechanical `snapshot.hosting_<field>` rule for no reason."
+            );
+        }
+    }
+
+    /// The exclusion list is an escape hatch, so make using it deliberate: an
+    /// entry with no reason is the shape that turns this pin ornamental. Note
+    /// this cannot fail while the list is empty — see the const's doc.
+    #[test]
+    fn not_mirrored_exclusions_carry_a_reason() {
+        for (name, reason) in DELIBERATELY_NOT_MIRRORED {
+            assert!(
+                reason.len() > 20,
+                "DELIBERATELY_NOT_MIRRORED entry {name:?} needs a real reason, \
+                 got {reason:?}"
+            );
+        }
+    }
+
+    /// The two properties the scrape helpers must have, checked directly rather
+    /// than inferred from the pin passing: a commented-out mirror must not count,
+    /// and rustfmt's line wrapping must not stop a mirror counting.
+    #[test]
+    fn normalization_drops_comments_and_rejoins_wrapped_statements() {
+        let commented = "            // snapshot.hosting_x = Some(hosting.x);\n";
+        assert!(
+            !strip_comments_and_normalize(commented)
+                .contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a commented-out mirror must not satisfy the pin"
+        );
+
+        let wrapped = "            snapshot.hosting_x =\n                Some(hosting.x);\n";
+        assert!(
+            strip_comments_and_normalize(wrapped).contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a mirror rustfmt wrapped across two lines must still satisfy the pin"
+        );
+
+        let trailing = "            snapshot.hosting_x = Some(hosting.x); // why\n";
+        assert!(
+            strip_comments_and_normalize(trailing)
+                .contains("snapshot.hosting_x = Some(hosting.x);"),
+            "a trailing comment must not hide the statement in front of it"
+        );
+    }
+
+    /// Asserting the whole statement is what makes a transposition visible; a
+    /// presence-only check (`body.contains("hosting.<field>")`) would not see it,
+    /// and a swapped pair here would report every node as over its
+    /// resident-overhead budget. Checked directly so the property is evidenced
+    /// rather than asserted in a doc comment.
+    #[test]
+    fn expected_mirror_pins_the_destination_not_just_the_read() {
+        let e = expected_mirror("resident_overhead_budget_bytes");
+        assert_eq!(
+            e,
+            "snapshot.hosting_resident_overhead_budget_bytes = \
+             Some(hosting.resident_overhead_budget_bytes);"
+        );
+        // A transposed assignment does NOT contain the expected statement.
+        let transposed = "snapshot.hosting_resident_overhead_budget_bytes = \
+                          Some(hosting.resident_overhead_bytes);";
+        assert!(!transposed.contains(&e));
+        // Neither does a bare read, nor a read into the wrong destination.
+        assert!(!"let _ = hosting.resident_overhead_budget_bytes;".contains(&e));
+        assert!(
+            !"snapshot.hosting_current_bytes = Some(hosting.resident_overhead_budget_bytes);"
+                .contains(&e)
+        );
+        // The histogram arms keep their abbreviated destination keys.
+        assert_eq!(
+            expected_mirror("read_count_hist"),
+            "host_reads: hosting.read_count_hist,"
+        );
+    }
+}
+
+/// The ring's selection functions are where candidate logging is wired to the
+/// op that routed; the router- and writer-level tests cannot see a wrong op, a
+/// dropped `record` call or a probe that logs.
+#[cfg(test)]
+pub(crate) mod candidate_log_wiring_tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    use crate::node::network_status::OpType;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+    use crate::ring::{Location, PeerKeyLocation};
+    use crate::router::dataset::{self, DecisionLog, RoutingDataset, UncapturedReason};
+    use crate::router::{RouteEvent, RouteOutcome};
+
+    pub(crate) fn recorder() -> (Arc<RoutingDataset>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let recorder = RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+        (Arc::new(recorder), dir, path)
+    }
+
+    /// Every line up to and including a sentinel written last, so an extra
+    /// trailing line cannot be missed by reading too early.
+    pub(crate) fn lines_through_sentinel(
+        recorder: &RoutingDataset,
+        path: &std::path::Path,
+    ) -> Vec<serde_json::Value> {
+        const SENTINEL_T_MS: u64 = 424_242;
+        recorder.record_peers(SENTINEL_T_MS, Vec::new());
+        dataset::lines_eventually(path, |lines| {
+            lines
+                .iter()
+                .any(|line| line["kind"] == "peers" && line["t_ms"] == SENTINEL_T_MS)
+        })
+    }
+
+    /// Enough routing history that decisions are prediction-based.
+    fn warm_router(ring: &super::Ring, peers: &[PeerKeyLocation], contract: Location) {
+        let mut router = ring.router.write();
+        for i in 0..120 {
+            router.add_event(RouteEvent {
+                peer: peers[i % peers.len()].clone(),
+                contract_location: contract,
+                outcome: if i % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+    }
+
+    fn selected_at(line: &serde_json::Value, position: usize) -> String {
+        line["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["selected_position"] == position)
+            .unwrap_or_else(|| panic!("no candidate at position {position}: {line}"))["peer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn contract_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([0u8; 32]))
+    }
+
+    /// The peer page's per-peer eligible/chosen counts take only real routing
+    /// decisions, from both ring entry points; probes and pre-selections
+    /// (`DecisionLog::Unlogged`) leave them untouched.
+    #[tokio::test]
+    async fn only_routing_decisions_count_toward_per_peer_selection() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("selection-counts", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let none: Vec<SocketAddr> = Vec::new();
+        let totals = || {
+            let router = ring.router.read();
+            peers
+                .iter()
+                .fold((0u64, 0.0f64), |(eligible, chosen), peer| {
+                    let selection = router.peer_snapshot(peer).selection.unwrap_or_default();
+                    (eligible + selection.eligible, chosen + selection.chosen)
+                })
+        };
+
+        ring.k_closest_potentially_hosting(DecisionLog::Unlogged, key.id(), none.as_slice(), 2);
+        ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice());
+        assert_eq!(
+            totals(),
+            (0, 0.0),
+            "probes and pre-selections are not counted"
+        );
+
+        ring.closest_potentially_hosting(DecisionLog::Joinable(OpType::Put), &key, none.as_slice())
+            .expect("a peer is selected");
+        let (single, chosen) = totals();
+        assert!(
+            single >= 1 && chosen == 1.0,
+            "the single-peer entry point counts"
+        );
+
+        ring.k_closest_potentially_hosting(
+            DecisionLog::Joinable(OpType::Get),
+            key.id(),
+            none.as_slice(),
+            2,
+        );
+        let (both, chosen) = totals();
+        assert!(both > single, "the k-closest entry point counts");
+        assert_eq!(
+            chosen, 2.0,
+            "one first choice per decision, even with k = 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn ring_selections_log_only_routing_decisions_with_their_op() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-wiring", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        let contract = Location::from(&key);
+        warm_router(ring, &peers, contract);
+        let (recorder, _dir, path) = recorder();
+        let none: Vec<SocketAddr> = Vec::new();
+        let all: Vec<SocketAddr> = peers.iter().filter_map(|p| p.socket_addr()).collect();
+
+        let (subscribe, put, get) = {
+            let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+            // Probes and pre-selections log nothing.
+            assert_eq!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Unlogged,
+                    key.id(),
+                    none.as_slice(),
+                    2
+                )
+                .len(),
+                2
+            );
+            assert!(
+                ring.closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice())
+                    .is_some()
+            );
+            // A selection of nobody routes nowhere and logs nothing.
+            assert!(
+                ring.k_closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Get),
+                    key.id(),
+                    all.as_slice(),
+                    1
+                )
+                .is_empty()
+            );
+            let subscribe = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Subscribe),
+                key.id(),
+                none.as_slice(),
+                2,
+            );
+            let put = ring
+                .closest_potentially_hosting(
+                    DecisionLog::Joinable(OpType::Put),
+                    &key,
+                    none.as_slice(),
+                )
+                .unwrap();
+            let get = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            );
+            (subscribe, put, get)
+        };
+        let again = {
+            // Below rate 1 the test override never draws a capture: this GET
+            // decision is uncaptured. Tied costs are shuffled, so it may pick a
+            // different peer than the capture above; every peer is made a live
+            // GET capture first, so whichever it picks is closed.
+            for peer in &peers {
+                recorder.record_decision(live_capture(peer, OpType::Get, contract));
+            }
+            let _log = dataset::force_candidate_log(recorder.clone(), 0.5);
+            let again = ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                1,
+            );
+            assert_eq!(again.len(), 1);
+            dataset::record_bypass(
+                OpType::Subscribe,
+                contract,
+                &subscribe[0],
+                UncapturedReason::DirectedFirstHop,
+            );
+            again
+        };
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "start",
+                "decision",
+                "decision",
+                "decision",
+                // The live GET captures of every peer.
+                "decision",
+                "decision",
+                "decision",
+                "decision",
+                "decision",
+                "decision_uncaptured",
+                "decision_uncaptured",
+                "peers"
+            ],
+            "{lines:?}"
+        );
+
+        let (sub_line, put_line, get_line) = (&lines[1], &lines[2], &lines[3]);
+        assert_eq!(sub_line["op"], "SUBSCRIBE");
+        assert_eq!(sub_line["contract_location"], contract.as_f64());
+        assert_eq!(sub_line["k"], 2);
+        assert_eq!(sub_line["candidates_considered"], peers.len());
+        assert_eq!(selected_at(sub_line, 0), dataset::peer_hash(&subscribe[0]));
+        assert_eq!(selected_at(sub_line, 1), dataset::peer_hash(&subscribe[1]));
+
+        assert_eq!(put_line["op"], "PUT");
+        assert_eq!(put_line["k"], 1);
+        assert_eq!(selected_at(put_line, 0), dataset::peer_hash(&put));
+
+        assert_eq!(get_line["op"], "GET");
+        assert_eq!(selected_at(get_line, 0), dataset::peer_hash(&get[0]));
+
+        let (superseded, bypass) = (&lines[9], &lines[10]);
+        assert_eq!(superseded["op"], "GET");
+        assert_eq!(superseded["reason"], "sampled_out");
+        assert_eq!(
+            superseded["selected"],
+            serde_json::json!([dataset::peer_hash(&again[0])])
+        );
+        assert_eq!(bypass["op"], "SUBSCRIBE");
+        assert_eq!(bypass["reason"], "directed_first_hop");
+        assert_eq!(
+            bypass["selected"],
+            serde_json::json!([dataset::peer_hash(&subscribe[0])])
+        );
+    }
+
+    /// A router with too little history ranks by distance; the ring must say
+    /// so rather than blame sampling.
+    #[tokio::test]
+    async fn a_cold_router_decision_is_logged_as_distance_based() {
+        let (op_manager, _rx, _peers, _guards) = op_manager_with_peers("candidate-cold", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        let contract = Location::from(&key);
+        let (recorder, _dir, path) = recorder();
+        let none: Vec<SocketAddr> = Vec::new();
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let chosen = ring
+            .closest_potentially_hosting(DecisionLog::Unlogged, &key, none.as_slice())
+            .unwrap();
+        // Make the selection a live capture, so the uncaptured line is written.
+        recorder.record_decision(live_capture(&chosen, OpType::Put, contract));
+        let again = ring
+            .closest_potentially_hosting(DecisionLog::Joinable(OpType::Put), &key, none.as_slice())
+            .unwrap();
+        assert_eq!(again, chosen);
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["start", "decision", "decision_uncaptured", "peers"],
+            "{lines:?}"
+        );
+        assert_eq!(lines[2]["reason"], "distance_based");
+        assert_eq!(lines[2]["op"], "PUT");
+    }
+
+    /// Pacing must run on the ring's injected clock: under a paused runtime
+    /// only that clock moves, so a capture refused as paced is allowed again
+    /// once virtual time passes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_pacing_reads_the_injected_clock() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("candidate-paced", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        warm_router(ring, &peers, Location::from(&key));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        // A 40 KB budget released over an hour: the burst is 2.5 KB, less
+        // than one captured decision.
+        let recorder = Arc::new(
+            RoutingDataset::open_with_decisions(
+                &path,
+                dataset::DEFAULT_MAX_BYTES,
+                40_000,
+                3_600_000,
+            )
+            .unwrap(),
+        );
+        let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+        let none: Vec<SocketAddr> = Vec::new();
+        // Selecting every peer makes each call the same selection whatever
+        // order tied costs are shuffled into, so the second call's selections
+        // are live and its pacing is written as a line.
+        let get = || {
+            ring.k_closest_potentially_hosting(
+                DecisionLog::Joinable(OpType::Get),
+                key.id(),
+                none.as_slice(),
+                peers.len(),
+            )
+        };
+        let kinds = |lines: &[serde_json::Value]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l["kind"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Each call's line is awaited before the next call, so the lines pin
+        // which call was captured and which was paced.
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| kinds(lines) == ["start", "decision"]);
+        assert_eq!(get().len(), peers.len());
+        dataset::lines_eventually(&path, |lines| {
+            kinds(lines) == ["start", "decision", "decision_uncaptured"]
+        });
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(get().len(), peers.len());
+
+        let lines = lines_through_sentinel(&recorder, &path);
+        assert_eq!(
+            kinds(&lines),
+            [
+                "start",
+                "decision",
+                "decision_uncaptured",
+                "decision",
+                "peers"
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines[2]["reason"], "paced", "the second call is paced");
+    }
+
+    /// A captured decision for `peer` alone, as a warm router would write it.
+    pub(crate) fn live_capture(
+        peer: &PeerKeyLocation,
+        op: OpType,
+        contract: Location,
+    ) -> dataset::DecisionRecord {
+        dataset::DecisionCapture {
+            contract_location: contract,
+            acting_model: dataset::RoutingModel::Legacy,
+            prediction_fallback: false,
+            k: 1,
+            candidates_available: 1,
+            prior_failure_events: 0,
+            candidates: vec![dataset::CapturedCandidate {
+                peer,
+                legacy: None,
+                hierarchical: None,
+                hierarchical_stages: dataset::HierarchicalStages::default(),
+                selected_position: Some(0),
+            }],
+        }
+        .into_record(op, 1)
+    }
 }

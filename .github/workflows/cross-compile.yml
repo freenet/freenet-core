@@ -208,6 +208,19 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
 
+    # Gates the OIDC token behind the `release` environment; the federated
+    # credential in Entra is pinned to exactly this subject
+    # (repo:freenet/freenet-core:environment:release), so a job that does not
+    # declare it cannot obtain an Azure token and signing fails closed.
+    # A fork PR or an unrelated workflow cannot borrow the signing identity.
+    environment: release
+
+    # Required for OIDC federation to Azure. `contents: read` must be restated
+    # because naming any permission drops the rest to none.
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v7
 
@@ -231,6 +244,100 @@ jobs:
         run: |
           target/release/freenet.exe --version
           target/release/freenet.exe service --help
+
+      # --- Authenticode signing (Azure Artifact Signing) -------------------
+      # freenet.exe IS the Windows installer, uninstaller, tray, service
+      # wrapper and updater -- they are all the same self-contained binary
+      # (crates/core/src/bin/commands/setup_wizard/, service/, tray.rs), so
+      # signing it covers every one of those roles. fdev.exe is downloaded
+      # from the GitHub release by `installer::run_install`, so it must be
+      # signed as a release artifact too or the installer drops an unsigned
+      # binary next to a signed one.
+      #
+      # Signing runs AFTER the smoke test and BEFORE both upload-artifact
+      # steps, so the artifacts -- and therefore SHA256SUMS.txt, generated in
+      # the attach-to-release job after downloading them -- cover the SIGNED
+      # bytes. Do not move these steps.
+      #
+      # Gated to release tags and manual dispatch so routine main-push builds
+      # don't burn signing quota (Basic tier: 5,000 signatures/month).
+      #
+      # NOTE the gating SCOPE differs from build-macos-dmg: that job puts the
+      # same `if:` expression at JOB level, so it does not run at all on a main
+      # push. Here the condition is per-STEP, because build-x86_64-windows must
+      # still run on main pushes to produce artifacts -- which means the job,
+      # and therefore its `environment: release` declaration, is entered on
+      # every main push. That is currently harmless (the environment has no
+      # protection rules and no branch policy), but adding required reviewers
+      # to it would pause every Build and Cross-Compile run. See
+      # docs/RELEASING.md.
+      - name: Azure login (OIDC)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Bounded so a hung Azure endpoint surfaces in minutes instead of
+        # consuming the job's 60-minute budget, which during a release reads
+        # as "the build is stuck" rather than "Azure is down".
+        timeout-minutes: 10
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (Azure Artifact Signing)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Same reasoning as the login step above; this one also reaches the
+        # RFC3161 timestamp server, which is a second external dependency that
+        # can hang. Observed real duration is a few seconds per file plus
+        # tooling download, so 15 minutes is generous.
+        timeout-minutes: 15
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: freenetsigning
+          certificate-profile-name: freenet-public-trust
+          # files-folder + filter picks up anything else that lands in
+          # target\release and needs signing, without maintaining a list.
+          # recurse stays false so it does not descend into build/ and deps/
+          # and burn signature quota on intermediate artifacts.
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe,dll
+          files-folder-recurse: false
+          file-digest: SHA256
+          # Not optional: Artifact Signing certificates are short-lived
+          # (~3 days). Without a countersigned timestamp, every release binary
+          # stops validating almost immediately.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The gate. Runs on a real Windows machine and fails the build rather
+      # than shipping something unsigned -- this is what stands in for the
+      # Windows box the project doesn't have.
+      - name: Verify signatures
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          foreach ($f in @('target\release\freenet.exe','target\release\fdev.exe')) {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f => $($sig.Status) / $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "Unsigned or invalid: $f" }
+            if (-not $sig.TimeStamperCertificate) { throw "Missing timestamp: $f" }
+            # `Valid` only means "signed by SOMETHING that chains to a trusted
+            # root and is timestamped" -- it does not mean "signed by us". Both
+            # RELEASING.md and RELEASE_RECOVERY.md tell an operator to expect
+            # the subject below, which reads as though CI enforces it; without
+            # this line it did not.
+            #
+            # DO NOT "tighten" this to match the whole DN. The two tools that
+            # render this subject disagree on the state attribute: PowerShell
+            # emits `S=Texas` where osslsigncode emits `ST=Texas`. A full-string
+            # match looks more rigorous, passes every test you would think to
+            # write against one tool, and breaks against the other. Attribute
+            # order and extra attributes added on certificate reissue are the
+            # second and third reasons. Match the CN substring.
+            if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
+              throw "Unexpected signer for ${f}: expected a subject containing 'CN=Freenet Project Inc', got '$($sig.SignerCertificate.Subject)'. Either the Azure certificate profile was repointed, or the certificate was legitimately reissued under a new name. See docs/RELEASING.md, 'Windows code signing (Authenticode)', and scripts/RELEASE_RECOVERY.md, 'Step 3: Tag Created but GitHub Release Missing'. Do NOT delete this check to unblock a release."
+            }
+          }
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
@@ -917,11 +1024,24 @@ jobs:
   # own. The release is already public at that point, so the job is red and
   # notifies rather than blocking; the response is to ship a fix and/or roll
   # the fleet by hand, exactly as v0.2.120/v0.2.121 required.
+  #
+  # `releases/latest` lags an un-draft by tens of seconds (v0.2.136: 52s,
+  # v0.2.140: 39s), so the canary first waits, up to CANARY_LATEST_WAIT_SECS,
+  # for GitHub to report this tag as latest before it boots the old node
+  # (#5715). Without that the node was asked about a release GitHub was not
+  # serving yet and the gate went red on healthy releases.
   # -----------------------------------------------------------------------
   auto-update-selfupdate-canary:
     name: Auto-update self-update canary (previous release -> this one)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 -> 35 for the latest-release wait (#5715). Worst case is the previous
+    # release's download, the wait (budget plus one probe's overrun), every
+    # node attempt at CANARY_TIMEOUT_SECS with the retry sleeps, and the
+    # install. `release_canary_wiring_test.sh` computes that from the canary's
+    # own defaults and fails if this no longer holds it. A job killed by the
+    # timeout carries no classification and takes the loud path, which is safe
+    # but says nothing useful.
+    timeout-minutes: 35
     needs: attach-to-release
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -959,7 +1079,9 @@ jobs:
 
       # Exit 75 (EX_TEMPFAIL, EXIT_UNVERIFIED_ENVIRONMENTAL in the canary) means
       # the run was environmental -- the previous release's binary could not
-      # reach GitHub from this runner, or the ports were held -- so nothing was
+      # reach GitHub from this runner, the ports were held, or the runner could
+      # not connect to GitHub while waiting for it to serve this release as
+      # latest (#5715) -- so nothing was
       # learned about the updater in either direction. The step still FAILS on
       # it: unverified is not verified, and a green job here would be the
       # vacuous pass the canary exists to remove. What the classification buys
@@ -1043,15 +1165,17 @@ jobs:
           needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
         uses: ./.github/actions/river-dev-notify
         with:
-          # Names BOTH environmental causes rather than assuming the network
-          # one. Exit 75 covers two: the previous release's binary could not
-          # reach GitHub (and neither could the runner), or every attempt lost a
-          # port race on this host. An earlier version of this message asserted
+          # Names EVERY environmental cause rather than assuming the network
+          # one. Exit 75 covers three: the previous release's binary could not
+          # reach GitHub (and neither could the runner), every attempt lost a
+          # port race on this host, or the runner could not connect to GitHub
+          # while waiting for it to report this release as latest (#5715). An
+          # earlier version of this message asserted
           # the first, so a self-hosted runner with something holding the ports
           # sent the operator after DNS. The job log's `UNVERIFIED
           # (ENVIRONMENTAL)` line says which; this says what to do, which is the
           # same either way.
-          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: either the previous release's binary could not reach GitHub (and neither could the runner) or every attempt hit a port collision on the runner. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: the previous release's binary could not reach GitHub (and neither could the runner), every attempt hit a port collision on the runner, or the runner lost its connection to GitHub while waiting to confirm this release was being served as latest. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
@@ -1079,7 +1203,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). Exception: if the canary's log says GitHub never reported this release as latest, or reports a NEWER release, the canary node never ran and `freenet update` would not help either (it reads the same endpoint); fix which release GitHub marks latest. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

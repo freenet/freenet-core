@@ -10,6 +10,9 @@ use std::process::Command;
 
 use super::rollback;
 
+mod staged;
+pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
+
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
 #[cfg(target_os = "linux")]
@@ -106,6 +109,11 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///     updating from publishes a signature — i.e. after the signed floor is
 ///     established — otherwise nodes on the unsigned lineage brick their own
 ///     auto-update.
+///
+/// While this is false, update fetches must trust only the bundled webpki
+/// roots, so they fail behind TLS-intercepting proxies. Once it is true they
+/// may be able to opt in to the OS trust store via `freenet::util::os_trust`
+/// (see #5815 for what else that decision depends on).
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
 
 // Tripwire for the two-release rollout, checked at compile time so flipping
@@ -428,6 +436,8 @@ impl UpdateCommand {
             // target install to gate anymore — clear the per-version
             // install-failure counter too (#4073).
             super::rollback::clear_install_failures();
+            // Nothing to install, so nothing staged in advance (#5790) is useful.
+            staged::discard();
             // Exit with a distinct code so the service wrapper knows no update
             // was performed and can skip the unnecessary restart.
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
@@ -504,7 +514,12 @@ impl UpdateCommand {
         // deterministic-vs-transient distinction.
         let install_result = self.download_and_install(&latest, current_version).await;
         match &install_result {
-            Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures(),
+            Ok(InstallOutcome::Installed) => {
+                super::rollback::clear_install_failures();
+                // The staged copy (#5790) has served its purpose. Kept on any
+                // failure, so the next attempt need not download it again.
+                staged::discard();
+            }
             Ok(InstallOutcome::BundleSkipped {
                 verification_failure,
             }) => {
@@ -625,9 +640,8 @@ impl UpdateCommand {
         }
 
         let target = get_target_triple();
-        let extension = get_archive_extension();
-        let freenet_asset_name = format!("freenet-{}.{}", target, extension);
-        let fdev_asset_name = format!("fdev-{}.{}", target, extension);
+        let freenet_asset_name = staged::freenet_asset_name();
+        let fdev_asset_name = staged::fdev_asset_name();
 
         let freenet_asset = release
             .assets
@@ -666,18 +680,38 @@ impl UpdateCommand {
         // (the only site that calls `record_update_failure`), so it is a
         // retryable `OtherFailure` (-> `NoChange`), never a
         // `MAX_UPDATE_FAILURES` lockout.
-        let checksums = self.download_and_verify_checksums(release).await?;
-
+        //
+        // #5790: the node normally downloaded the release before it exited, so
+        // under systemd this runs inside `TimeoutStopSec` without a large
+        // download. `staged::load` holds the cached files to the same
+        // signature and checksum checks as a download, and returns `None`
+        // (falling back to downloading) for anything missing or wrong.
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-
-        // Download and install freenet
-        let freenet_archive_path = temp_dir.path().join(&freenet_asset_name);
-        download_file(
-            &freenet_asset.browser_download_url,
-            &freenet_archive_path,
-            self.quiet,
-        )
-        .await?;
+        let (checksums, freenet_archive_path, staged_fdev) =
+            match staged::load(release, self.quiet).await {
+                Some(staged) => {
+                    // Not gated on --quiet: one line per update, and the
+                    // release canary's evidence that the cache is used. Not
+                    // `eprintln!`, which panics if stderr is closed.
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = writeln!(
+                        io::stderr(),
+                        "Installing {} from the update downloaded in advance.",
+                        release.tag_name
+                    );
+                    (
+                        Some(staged.checksums),
+                        staged.freenet_archive,
+                        staged.fdev_archive,
+                    )
+                }
+                None => {
+                    let checksums = self.download_and_verify_checksums(release).await?;
+                    let path = temp_dir.path().join(&freenet_asset_name);
+                    download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
+                    (checksums, path, None)
+                }
+            };
 
         // Fail-closed checksum gate. A missing manifest, a missing entry
         // for our asset, or a hash mismatch all REFUSE the install. This
@@ -719,12 +753,20 @@ impl UpdateCommand {
         ) {
             Ok(prepared) => Some(prepared),
             Err(e) => {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: failed to snapshot known-good binary for crash-loop \
-                             rollback: {e}. Proceeding without rollback protection for this update."
-                    );
-                }
+                // NOT gated on `--quiet` (#5244). This is one of the two states
+                // where #4073's brick-safety machinery is silently OFF: the
+                // update is about to land with no rollback target, so a release
+                // that then crash-loops cannot be reverted. `--quiet` must mean
+                // "be less chatty", never "do not record safety events".
+                // Belt-and-braces alongside the subscriber installed in
+                // `freenet_main`, so this survives a later refactor that drops
+                // the subscriber. Matches `handle_post_stop`'s precedent above.
+                eprintln!(
+                    "Freenet: failed to snapshot the known-good binary for crash-loop \
+                     rollback: {e}. PROCEEDING WITHOUT ROLLBACK PROTECTION for this update — if \
+                     this version crash-loops it will NOT be auto-reverted. Check the \
+                     permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
                 None
             }
@@ -762,12 +804,15 @@ impl UpdateCommand {
                 &current_exe,
                 &meta,
             ) {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: installed the update but failed to arm crash-loop rollback \
-                         protection: {e}. If this version crash-loops it will NOT auto-roll-back."
-                    );
-                }
+                // NOT gated on `--quiet` — see the sibling above (#5244).
+                // The update HAS landed and the probation marker is absent, so
+                // the post-stop hook will find nothing to count and this
+                // version can crash-loop indefinitely without being reverted.
+                eprintln!(
+                    "Freenet: installed the update but FAILED TO ARM crash-loop rollback \
+                     protection: {e}. If this version crash-loops it will NOT be auto-reverted. \
+                     Check the permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to arm crash-loop rollback probation (#4073)");
             }
         }
@@ -779,9 +824,23 @@ impl UpdateCommand {
             );
         }
 
+        // Check if service file needs updating (for users who installed before v0.1.75).
+        // Before fdev (#5790): fdev may still need a download, and under
+        // systemd's `TimeoutStopSec` a slow one can be killed; the unit refresh
+        // must not depend on it finishing.
+        if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
+            if !self.quiet {
+                eprintln!(
+                    "Warning: Failed to update service file: {}. \
+                     Run 'freenet service install' to update manually.",
+                    e
+                );
+            }
+        }
+
         // Download and install fdev alongside freenet.
         // All fdev failures are non-fatal — a failed fdev update must never
-        // prevent the service file update or service restart that follows.
+        // prevent the service restart that follows.
         if let Some(fdev_asset) = fdev_asset {
             if !self.quiet {
                 println!("Downloading fdev...");
@@ -791,22 +850,12 @@ impl UpdateCommand {
                 &fdev_asset_name,
                 &checksums,
                 temp_dir.path(),
+                staged_fdev,
                 &current_exe,
             )
             .await;
         } else if !self.quiet {
             eprintln!("Warning: fdev not found in release assets. Skipping fdev update.");
-        }
-
-        // Check if service file needs updating (for users who installed before v0.1.75)
-        if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
-            if !self.quiet {
-                eprintln!(
-                    "Warning: Failed to update service file: {}. \
-                     Run 'freenet service install' to update manually.",
-                    e
-                );
-            }
         }
 
         // Automatically restart service if running
@@ -966,19 +1015,26 @@ impl UpdateCommand {
         asset_name: &str,
         checksums: &Option<Checksums>,
         temp_dir: &Path,
+        staged_archive: Option<PathBuf>,
         freenet_exe: &Path,
     ) {
-        let archive_path = temp_dir.join(asset_name);
-        if let Err(e) = download_file(&asset.browser_download_url, &archive_path, self.quiet).await
-        {
-            if !self.quiet {
-                eprintln!(
-                    "Warning: Failed to download fdev: {}. Skipping fdev update.",
-                    e
-                );
+        let archive_path = match staged_archive {
+            Some(path) => path,
+            None => {
+                let path = temp_dir.join(asset_name);
+                if let Err(e) = download_file(&asset.browser_download_url, &path, self.quiet).await
+                {
+                    if !self.quiet {
+                        eprintln!(
+                            "Warning: Failed to download fdev: {}. Skipping fdev update.",
+                            e
+                        );
+                    }
+                    return;
+                }
+                path
             }
-            return;
-        }
+        };
 
         // Fail-closed, like the freenet binary: never install fdev
         // unverified. Because fdev updates are best-effort (they must never
@@ -1403,6 +1459,23 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
 /// signature. Exceeding the cap is treated as a (retryable) download failure,
 /// never a lockout.
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
+    download_optional_bytes(url)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Download failed: {}", reqwest::StatusCode::NOT_FOUND))
+}
+
+/// [`download_bytes`], but a `404` is `Ok(None)` rather than an error. Used
+/// where an asset may legitimately be absent, such as `SHA256SUMS.txt.sig`
+/// when downloading by URL without the release's asset list (#5790).
+async fn download_optional_bytes(url: &str) -> Result<Option<Vec<u8>>> {
+    download_optional_bytes_within(url, MANIFEST_DOWNLOAD_TIMEOUT).await
+}
+
+/// [`download_optional_bytes`] with a caller-chosen total deadline.
+async fn download_optional_bytes_within(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<Vec<u8>>> {
     // Generous vs. any real manifest (a few hundred bytes) or signature (64
     // bytes), small enough to bound memory.
     const MAX_ASSET_BYTES: usize = 4 * 1024 * 1024;
@@ -1415,7 +1488,7 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         // transfer to protect. Unbounded, a half-open connection would hang until
         // systemd SIGKILLs the post-stop updater — the exact hazard the sibling
         // timeout on the asset-list fetch was added to prevent.
-        .timeout(MANIFEST_DOWNLOAD_TIMEOUT)
+        .timeout(timeout)
         .build()?;
 
     let response = client
@@ -1424,6 +1497,15 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         .await
         .context("Failed to download release asset")?;
 
+    // Typed, so a caller that retries (#5790's staging) can stop instead of
+    // knocking on a limit. Not recorded as a cooldown here: that is the
+    // caller's decision, and tests must not write the real state directory.
+    if super::auto_update::is_rate_limited_status(response.status()) {
+        return Err(rate_limited(&response).into());
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !response.status().is_success() {
         anyhow::bail!("Download failed: {}", response.status());
     }
@@ -1445,7 +1527,20 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf)
+    Ok(Some(buf))
+}
+
+/// The rate limit a `403`/`429` response carries, with any wait it asked for.
+fn rate_limited(response: &reqwest::Response) -> super::auto_update::GithubRateLimitedError {
+    super::auto_update::GithubRateLimitedError {
+        retry_after: super::auto_update::parse_retry_after(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        }),
+    }
 }
 
 /// Authenticate the raw bytes of `SHA256SUMS.txt` against the baked-in
@@ -4021,10 +4116,15 @@ done
             .expect("end of install-result match not found");
 
         // The Installed outcome clears the gate.
+        let (_, installed_arm) = matchbody
+            .split_once("Ok(InstallOutcome::Installed) => {")
+            .expect("Installed arm not found");
+        let installed_arm =
+            &installed_arm[..installed_arm.find('}').unwrap_or(installed_arm.len())];
         assert!(
-            matchbody.contains(
-                "Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures()"
-            ),
+            installed_arm.lines().any(|l| l
+                .trim()
+                .starts_with("super::rollback::clear_install_failures();")),
             "the Installed outcome must clear the install-failure gate"
         );
         // The deterministic-verification Err arm records a failure.
@@ -4086,6 +4186,75 @@ done
         // Must be a valid ed25519 point, or verification could never succeed.
         ed25519_dalek::VerifyingKey::from_bytes(&FREENET_RELEASE_PUBKEY)
             .expect("baked-in release public key must be a valid ed25519 point");
+    }
+
+    /// The container image verifies the release manifest at BUILD time, before
+    /// the node binary is ever in the image, so it cannot reuse
+    /// [`FREENET_RELEASE_PUBKEY`] and carries its own DER copy of the same key.
+    ///
+    /// Two copies of a key is exactly the shape that rots: rotating the signing
+    /// key and updating only this file would leave every image build failing
+    /// signature verification, with an error that points at the download rather
+    /// than at the stale key. Pin them together so the rotation fails here, in
+    /// CI, instead.
+    #[test]
+    fn release_pubkey_matches_docker_image_key() {
+        let der: &[u8] =
+            include_bytes!("../../../../../docker/freenet-node/release-signing-key.der");
+
+        // SubjectPublicKeyInfo for ed25519: a fixed 12-byte header (the
+        // AlgorithmIdentifier for id-Ed25519) followed by the raw 32-byte key.
+        // Stored as DER rather than PEM so this comparison is a plain byte
+        // check with no base64 dependency, and so `openssl pkeyutl -keyform
+        // DER` in the Dockerfile can read the very same file.
+        const ED25519_SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        assert_eq!(
+            der.len(),
+            ED25519_SPKI_PREFIX.len() + FREENET_RELEASE_PUBKEY.len(),
+            "docker release-signing-key.der must be an ed25519 SubjectPublicKeyInfo"
+        );
+        assert_eq!(
+            &der[..ED25519_SPKI_PREFIX.len()],
+            &ED25519_SPKI_PREFIX,
+            "docker release-signing-key.der must carry the ed25519 SPKI header"
+        );
+        assert_eq!(
+            &der[ED25519_SPKI_PREFIX.len()..],
+            FREENET_RELEASE_PUBKEY.as_slice(),
+            "docker/freenet-node/release-signing-key.der does not match the release \
+             key compiled into the node; a key rotation missed one of the two copies"
+        );
+    }
+
+    /// The container image verifies the release manifest at build time and
+    /// mirrors this crate's signing-transition policy: a signature that is
+    /// PRESENT must verify, an ABSENT one warns and proceeds. That mirroring is
+    /// a copy of a decision made here, so it rots the moment the decision
+    /// changes: flipping [`REQUIRE_RELEASE_SIGNATURE`] to `true` would leave the
+    /// Dockerfile silently permissive, building images from unsigned manifests
+    /// long after the node itself refused to.
+    #[test]
+    fn docker_image_signature_policy_matches_require_release_signature() {
+        let dockerfile = include_str!("../../../../../docker/freenet-node/Dockerfile");
+
+        let tolerates_absent_signature = dockerfile.contains("echo absent > /tmp/signature-status");
+        assert_eq!(
+            tolerates_absent_signature, !REQUIRE_RELEASE_SIGNATURE,
+            "docker/freenet-node/Dockerfile tolerates a missing release signature = {}, \
+             but REQUIRE_RELEASE_SIGNATURE = {}. When the signed floor is established \
+             and that constant flips, the Dockerfile's 404 branch must go with it.",
+            tolerates_absent_signature, REQUIRE_RELEASE_SIGNATURE
+        );
+
+        // The whole point of the branch split: only a 404 may skip verification.
+        // Any other status has to abort, or a rate limit or TLS blip produces an
+        // unverified image that exits 0 and looks identical to a verified one.
+        assert!(
+            dockerfile.contains("refusing to build an unverified image"),
+            "the Dockerfile must abort on a signature fetch failure that is not a 404"
+        );
     }
 
     #[test]

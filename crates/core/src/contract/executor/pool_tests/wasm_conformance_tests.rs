@@ -79,6 +79,14 @@ fn setup_mock() -> MockWasmRuntime {
         contract_store: InMemoryContractStore::new(),
         validate_overrides: std::collections::HashMap::new(),
         update_overrides: std::collections::HashMap::new(),
+        delegate_script: Default::default(),
+        delegate_calls: Default::default(),
+        delegate_contexts: Default::default(),
+        delegate_observations: Default::default(),
+        capabilities: None,
+        delegate_codes: Default::default(),
+        unregistered_delegates: Default::default(),
+        delegate_wrong_variant: Default::default(),
     }
 }
 

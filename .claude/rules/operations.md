@@ -6,13 +6,26 @@ paths:
 
 # Operations Module Rules
 
+> **Originator side effects after a task-per-tx migration.** A driver that
+> replaces a legacy terminal-reply handler must run the FULL side-effect
+> sequence, not a hand-inlined subset — the omitted call is silent (the op
+> reports success and every test stays green). #3851 and #4223 are the
+> precedents, the second costing ~37% of GETs through subscriber peers for
+> months. The pattern, the fix shape (`finalize_*` helper plus a
+> mutation-verified source pin) and the audit grep are in
+> `.claude/rules/bug-prevention-patterns.md` — read that row before migrating
+> an op.
+
 ## Execution Model
 
 Every operation runs as a task-per-transaction driver: each `Transaction`
 is owned and driven by a single spawned task; state lives in task
 locals. Drivers publish their own `HostResult` via `result_router_tx`
 and own routing/retry state in task locals. `OpManager` carries no
-per-op DashMaps.
+per-op state DashMaps; the only `Transaction`-keyed registries are the
+RAII-guarded handoffs between a client retry loop and its own
+originator-loopback relay (`stream_progress_registry`, `attempt_hop_registry`),
+whose entries are removed by the loop's guard on every exit.
 
 Driver entry points:
 
@@ -33,6 +46,108 @@ post-terminal stream-assembly failure as a retryable attempt failure
 (#4345) — post-terminal side effects that can fail retryably belong in
 such a wrapper, never inside the loop's Terminal arm (pinned by
 `drive_retry_loop_terminal_arm_does_not_call_advance`).
+
+## Route-outcome labelling (#5657)
+
+The router's failure model is only as good as its labels. Before #5657 a
+relay recorded a downstream `NotFound` as a success and originators recorded
+only their final success, so production routers saw ~0.5 % failures.
+
+```
+WHEN adding or changing a site where a GET/PUT/SUBSCRIBE attempt resolves
+(reply classified, timeout, send failure) on an originator or relay driver:
+  → Label non-success outcomes through the op's
+    `operations::route_attempt::RouteAttemptRecorder` (one per operation),
+    never a hand-inlined RouteEvent. Timeout / send failure / disconnect of
+    the attempted peer → Failure now; NotFound → Failure ONLY with existence
+    proof in the same op (`contract_exists()`), which requires state for the
+    requested contract, from a REMOTE contacted peer, that this node stored.
+    A SUBSCRIBE reply carries no state, so SUBSCRIBE NotFounds are never
+    trained. Without proof, `ambiguous_not_found_policy()` (default
+    Untrained: dropped).
+    A peer is labelled at most once per operation.
+  → A timeout is blamed on the recorded hop only if the hop had at least
+    half of the attempt (`route_attempt::hop_had_budget_share`), counted
+    from when the loopback relay's dispatch returned (`touch_hop`): a hop
+    reached near the deadline did not stall it, and an attempt whose
+    dispatch had not returned by the deadline blames nobody.
+  → A failed GET stream is labelled per `stream_failure_is_peer_caused`,
+    used by the client (claim and assembly), the relay's claim arm and the
+    test hook: every assembly failure (a cancellation does not record which
+    side ended it) and a claim timeout blame the hop; a claim waiter dropped
+    on this node does not. The relay's failures after a successful claim
+    label nothing, as before #5657.
+  → Never treat local evidence or later evidence as proof. This node's own
+    (possibly stale) copy, a local completion, or a terminal with no recorded
+    hop proves nothing about a remote peer. "The contract exists now" is not
+    "it existed when the NotFound was returned": a GET before a PUT gets
+    correct NotFounds from exactly the peers the PUT then stores at, so
+    labelling them from later evidence would train on correct answers. Naive
+    training on ambiguous NotFounds measurably degraded the model
+    (exp/estimator-bakeoff e26a92c1d).
+  → Blame or credit only the peer the request ACTUALLY went to. GET/PUT
+    originators send to their own loopback relay, which picks the real hop;
+    read it from the per-attempt `AttemptHopRegistry` slot (the loopback relay
+    fills it). No recorded hop → no event, success or failure. The driver's
+    `current_target` is a guess.
+  → A local callback drop (`NotificationError`), a disconnect of some other
+    peer, and an unexpected reply blame nobody — on originators AND relays.
+  → SUBSCRIBE renewals: the originator labels neither its timeouts (its
+    clamped renewal budget, not the peer) nor NotFounds (structural: the
+    renewer hosts the contract and sits in the visited bloom). A RELAY
+    forwarding a renewal still labels a timeout: it waited the full
+    OPERATION_TTL for its hop.
+  → Router labels are router-only (`Ring::record_route_failure`): a NotFound
+    or an end-to-end timeout is not a reason to evict a connection.
+  → Originator peer_health, topology and `NetEventLog::route_event` inputs are
+    EXACTLY main's: the same event against `current_target`, at the same sites
+    and conditions, hop-less successes included, in both label modes
+    (`route_attempt::report_originator_route_outcome`). Only the router label
+    uses the recorded hop. Never move a health input to the hop.
+  → The GET stream claim uses the recorded hop, falling back to
+    `current_target` only when none was recorded. This is delivery, not
+    labelling, so it does not follow the kill switch: with retry diversity
+    (#5660) the loopback relay's pick often differs from `current_target`, and
+    the stream is registered under the hop it actually came from.
+  → GET retry diversity (#5660): the peers that answered NotFound in this
+    operation are excluded from the originator-loopback relay's own
+    first-hop pick only, handed over through `AttemptHopRegistry`, and are
+    never carried in the forwarded visited bloom. A relay also answers
+    NotFound when its own downstream send fails or its connection drops, so a
+    whole-path exclusion could cut a single-host contract off behind one
+    flapping peer. If the exclusions leave no candidate, the relay ignores
+    them. Once the driver's own guesses run out (rings of three peers or
+    fewer), `advance` chooses each remaining attempt's first hop itself and
+    pins it for the loopback relay (`fallback_target`), so the router's
+    ranking cannot reorder the choice. Every connected peer that failed once
+    without answering NotFound gets its second attempt before any
+    never-asked peer is tried, earliest-asked first: so with two such peers
+    and one attempt left the earlier-asked one wins, and with two such peers
+    a never-asked peer, even one that connected late, can go unasked. The
+    relay honours the pin only while the peer passes `first_hop_candidate`
+    (connected and not transient; readiness is not enforced). A peer given
+    `FALLBACK_MAX_ASKS_PER_PEER` attempts is not chosen again and is
+    excluded from the relay's own pick, so after the guesses run out the
+    fallback re-asks each peer at most once. A local infra retry (a
+    callback dropped on this node, within `MAX_INFRA_RETRIES`) does not
+    count as an attempt on the peer; one beyond that budget does.
+  → Every router label carries its routing-dataset source (#5648): the
+    recorder passes its `AttemptOrigin` to the sink, and relay-observed
+    events (recorder relay labels, legacy relay `SuccessUntimed`,
+    `record_relay_route_event`) must reach `Router::add_relay_event`, never
+    `add_event`. `Ring::record_route_event_router_only` takes the source.
+  → Chain blame is accepted for router-only labels: an originator timeout is
+    labelled against the first hop although the stall may be further down
+    the chain. Watch it with the `timeout_label_*` router-snapshot histogram
+    (telemetry-only: the window is drained per snapshot, so no local
+    dashboard reads it).
+  → NOT YET MIGRATED: PUT relay's downstream forwarding still labels its own
+    send/timeout failures with `record_relay_route_event` (router-only too),
+    outside the recorder. Those failures are not in the per-cause counters.
+  → Kill switch: `FREENET_ROUTING_LEGACY_LABELS=1` restores the pre-#5657
+    labels exactly (`route_attempt::label_mode()`). Any label site outside
+    the recorder must branch on `recorder.mode()`.
+```
 
 ## Wire-variant dispatch
 

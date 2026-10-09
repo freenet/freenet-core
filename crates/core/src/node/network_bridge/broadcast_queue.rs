@@ -3345,10 +3345,10 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // Track delta vs full state sends for testing (PR #2763)
     if sent_delta {
         interest_manager.record_delta_send(state_size, payload_size);
-        crate::config::GlobalTestMetrics::record_delta_send();
+        crate::config::GlobalTestMetrics::record_delta_send(payload_size);
     } else {
         interest_manager.record_full_state_send();
-        crate::config::GlobalTestMetrics::record_full_state_send();
+        crate::config::GlobalTestMetrics::record_full_state_send(payload_size);
     }
 
     // Issue #3046: Refresh the peer's interest TTL on every successful send

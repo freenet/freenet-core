@@ -1,5 +1,9 @@
 pub(crate) mod backoff;
+pub(crate) mod byte_bounded_lru;
 pub mod deterministic_select;
+/// Internal to the `freenet` binary: not a stable API (it exposes reqwest types).
+#[doc(hidden)]
+pub mod os_trust;
 pub(crate) mod rate_limit_layer;
 /// Order-independent `tracing` capture for tests that assert on emitted events.
 /// Test-only: it registers process-global `tracing` state and must never be

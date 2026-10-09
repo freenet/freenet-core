@@ -2077,6 +2077,40 @@ fi
 # travel from the scripts into the prose.
 #
 # Pinned offline: this asserts the flag is present, not that the network agrees.
+# Scan the repository's TRACKED files, not everything on disk.
+#
+# `find "$SCRIPT_DIR/.."` walks whatever happens to be under the repo root, and
+# on a developer machine that includes nested git worktrees -- this checkout had
+# 115 of them under `.claude/worktrees/`, each a full copy of the tree. Every
+# scan below then saw ~115 stale `scripts/release.sh` and `RELEASE_RECOVERY.md`
+# files from older commits and reported them as drift, so BOTH the User-Agent
+# check and the enumeration check failed on a tree whose tracked files were
+# entirely correct. CI never saw it: a fresh checkout has no nested worktrees.
+#
+# That is worse than a missing check. AGENTS.md tells contributors to run these
+# scripts locally, and a check that is red on a healthy tree is one people learn
+# to skip -- the same alarm-fatigue failure that let `--disable-auto-update` sit
+# on `framework` for nine days.
+#
+# `git ls-files` is also the semantically right question: these assertions are
+# about what the REPOSITORY says, not about what is lying in the working
+# directory. The `find` fallback keeps the script usable outside a git checkout
+# (a release tarball), and excludes the same paths by name.
+repo_files() {
+    local root
+    root="$(cd "$SCRIPT_DIR/.." && pwd)"
+    if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        git -C "$root" ls-files -z -- "$@" 2>/dev/null \
+            | tr '\0' '\n' | sed "s|^|$root/|" | sort
+    else
+        local args=() pat
+        for pat in "$@"; do args+=(-o -name "$(basename "$pat")"); done
+        find "$root" -type f \( "${args[@]:1}" \) \
+            -not -path '*/.git/*' -not -path '*/target/*' \
+            -not -path '*/.claude/*' 2>/dev/null | sort
+    fi
+}
+
 # Logical lines, so a `\`-continued invocation whose `-A` sits on another line
 # is judged whole.
 UA_MISSING=""
@@ -2087,8 +2121,7 @@ UA_TOTAL=0
 # wrong-set class as the non-recursive script glob earlier in this file.
 UA_FILES=()
 while IFS= read -r _f; do UA_FILES+=("$_f"); done < <(
-    find "$SCRIPT_DIR/.." -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' -o -name '*.md' \) \
-        -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort
+    repo_files '*.yml' '*.yaml' '*.sh' '*.md'
 )
 for _f in "${UA_FILES[@]}"; do
     [[ -f "$_f" ]] || continue
@@ -2199,8 +2232,7 @@ while IFS= read -r _f; do
     elif [[ "$_n" -ge 3 ]]; then
         enum_copies+="$(basename "$_f"): contains $_n of the ${#CANON_ROWS[@]} enumeration rows"$'\n'
     fi
-done < <(find "$SCRIPT_DIR/.." -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) \
-            -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort)
+done < <(repo_files '*.sh' '*.md' '*.yml')
 
 if [[ "$canon_hits" -lt "${#CANON_ROWS[@]}" ]]; then
     fail "release.sh's canonical failure enumeration is incomplete ($canon_hits of ${#CANON_ROWS[@]} rows)" \
@@ -2680,6 +2712,69 @@ else
             "Same route assertion 3a closes for Gate A: the step still runs and" \
             "still reports, but it can no longer fail."
     fi
+fi
+
+# --- 6f. Gate B's job timeout still holds the canary's worst case ----------
+# #5715 added a wait for GitHub to serve the release before the node boots, on
+# top of the node attempts, and raised `timeout-minutes` to hold both. The two
+# live in different files and change for different reasons, so nothing kept
+# them in step. A job killed by its timeout carries no classification and
+# reports only "cancelled" -- a red release with no diagnosis.
+#
+# The budgets come from the canary's OWN defaults, sourced in a clean
+# environment so an exported CANARY_* in the caller cannot skew them. The
+# remaining terms are allowances. Only the first three are hard curl bounds in
+# auto-update-canary.sh; the last three are ESTIMATES, so this is a sanity bound
+# with margin, not a proof that the job can never time out:
+#   300  previous-release download (curl --max-time 300)
+#   OVERRUN of the latest-release wait past its budget. The deadline is
+#   checked between probes, so slow probes inside the budget are paid for by
+#   the budget itself; only the LAST iteration can run past it. That is the
+#   poll sleep (read from the defaults) plus:
+#   120  one probe: a retry may START just inside --retry-max-time 90 and then
+#        run its full --max-time 30
+#    30  the connect check that follows a failed probe (curl --max-time 30)
+#    30  the runner reachability probe after the node attempts (same bound)
+#   300  `freenet update` downloading and installing the new release. Estimate:
+#        update.rs bounds a STALLED transfer (30s idle), not a slow one.
+#   300  the second `freenet update` Gate B runs without a staged download once
+#        the previous release stages (#5790). Same estimate.
+#    60  checkout, previous-release lookup, runner overhead. Estimate.
+# shellcheck disable=SC2016  # the inner script expands in the child, on purpose
+canary_defaults="$(env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+    source "$1" >/dev/null 2>&1 || exit 1
+    echo "$CANARY_LATEST_WAIT_SECS $CANARY_LATEST_POLL_SECS $CANARY_ATTEMPTS $CANARY_TIMEOUT_SECS $CANARY_RETRY_SLEEP"
+' _ "$SCRIPT_DIR/auto-update-canary.sh")"
+gate_b_timeout_min="$(printf '%s\n' "$selfupdate_block" \
+    | sed -n 's/^    timeout-minutes:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -1)"
+read -r _wait _poll _attempts _timeout _sleep <<<"$canary_defaults"
+if [[ -z "$gate_b_timeout_min" || -z "${_sleep:-}" ]]; then
+    fail "could not read Gate B's timeout-minutes or the canary's default budgets" \
+        "timeout-minutes='${gate_b_timeout_min}' defaults='${canary_defaults}'" \
+        "Without both, the check below cannot say whether the job can finish."
+else
+    _worst=$(( 300 + _wait + _poll + 120 + 30 + _attempts * _timeout + (_attempts - 1) * _sleep + 30 + 300 + 300 + 60 ))
+    if [[ $(( gate_b_timeout_min * 60 )) -ge "$_worst" ]]; then
+        pass "Gate B's timeout-minutes ($gate_b_timeout_min) holds the canary's worst case (${_worst}s)"
+    else
+        fail "Gate B's timeout-minutes ($gate_b_timeout_min = $(( gate_b_timeout_min * 60 ))s) is below the canary's worst case (${_worst}s)" \
+            "wait=${_wait}s poll=${_poll}s attempts=${_attempts} x ${_timeout}s retry-sleep=${_sleep}s, plus fixed allowances." \
+            "Raise timeout-minutes, or shrink the budgets in auto-update-canary.sh."
+    fi
+fi
+# The check above reads the SCRIPT's defaults. A CANARY_* override set in the
+# workflow would bypass it silently, so refuse one outright: change the default
+# in auto-update-canary.sh instead, where this check can see it. Catches a step
+# or job `env:` key and an inline or `export` assignment in `run:`. A
+# workflow-level `env:` sits outside this job's block and is not seen.
+# A here-string, not `printf | grep -q`: under pipefail that form reads a
+# present match as absent (SIGPIPE; see bug-prevention-patterns.md).
+if grep -qE '^[[:space:]]+CANARY_[A-Z_]+:|CANARY_[A-Z_]+=' <<<"$selfupdate_block"; then
+    fail "Gate B's job sets a CANARY_* variable in cross-compile.yml" \
+        "The timeout check above computes the worst case from auto-update-canary.sh's" \
+        "defaults and cannot see a workflow override. Change the default in the script."
+else
+    pass "Gate B's job does not override the canary's budgets in the workflow"
 fi
 
 # --- 7. Gate B's job still exists -------------------------------------------

@@ -217,13 +217,25 @@ Handles race conditions when stream fragments arrive before their metadata messa
 2. **Metadata arrives first**: Operations calls `claim_or_wait()` when metadata arrives
 
 ```rust
+type StreamKey = (SocketAddr, StreamId);
+
+enum Slot {
+    Orphan(StreamHandle, Instant),            // stream arrived first
+    Waiter(oneshot::Sender<StreamHandle>),    // metadata arrived first
+}
+
 pub struct OrphanStreamRegistry {
-    // Streams awaiting metadata
-    orphan_streams: DashMap<StreamId, (StreamHandle, Instant)>,
-    // Waiters for streams that haven't arrived yet
-    stream_waiters: DashMap<StreamId, oneshot::Sender<StreamHandle>>,
+    // One slot per key: whichever side arrived first
+    slots: DashMap<StreamKey, Slot>,
+    // Dedup of claims (embedded metadata in fragment #1 vs separate message)
+    claimed_streams: DashMap<StreamKey, ()>,
 }
 ```
+
+Both sides share one map, and each does its check-and-insert under the key's
+entry lock. With separate orphan and waiter maps, a concurrent claim and
+registration could each miss the other and strand the stream until
+`STREAM_CLAIM_TIMEOUT` (#5731).
 
 **Key Constants:**
 - `ORPHAN_STREAM_TIMEOUT`: 60 seconds - unclaimed streams are garbage collected

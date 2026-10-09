@@ -227,12 +227,52 @@ impl Observation {
     }
 }
 
+/// What the executor hands to the capture writer.
+///
+/// Two kinds, because related-contract state reaches the executor by two unrelated
+/// routes and only one of them travels with a transition.
+///
+/// A contract that needs related state to UPDATE gets it pushed into `updates` as
+/// `UpdateData::RelatedState` by the executor's retry loop, so it arrives inside the
+/// transition itself. A contract that needs related state only to VALIDATE never
+/// produces that: the state is resolved separately in
+/// `fetch_related_for_validation_network`, after the transition has already been
+/// observed. Capturing only the first route left the second class permanently
+/// unjudgeable - every replayed case dead-ends at `Inconclusive::RelatedRequired`,
+/// which reads exactly like a clean result (#5376).
+#[derive(Debug)]
+pub(crate) enum CaptureMsg {
+    /// A `base + update -> result` step, the material a replay actually checks.
+    Transition(Box<Observation>),
+    /// Related-contract state resolved while VALIDATING a contract, carried on its
+    /// own because it arrives after the transition and belongs to no single update.
+    ///
+    /// Merged into a contract that is ALREADY tracked; it never creates a new entry.
+    /// Related state without any states of its own is not a corpus, and admitting it
+    /// would spend a tracking slot on something no case can be built from.
+    Related {
+        contract: ContractInstanceId,
+        related: Vec<(ContractInstanceId, Vec<u8>)>,
+    },
+}
+
+impl CaptureMsg {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            CaptureMsg::Transition(observation) => observation.queued_bytes(),
+            CaptureMsg::Related { related, .. } => {
+                related.iter().map(|(_, state)| state.len()).sum()
+            }
+        }
+    }
+}
+
 /// The executor's end of the capture path.
 ///
 /// Cloning is cheap; the executor holds one and does nothing else with it.
 #[derive(Clone)]
 pub struct CaptureHandle {
-    tx: mpsc::Sender<Observation>,
+    tx: mpsc::Sender<CaptureMsg>,
     dropped: Arc<AtomicU64>,
     /// Bytes admitted to the queue and not yet sampled.
     ///
@@ -268,11 +308,11 @@ impl CaptureHandle {
 
         match self.tx.try_reserve() {
             Ok(permit) => {
-                let observation = build();
+                let msg = CaptureMsg::Transition(Box::new(build()));
                 // Charge what was actually built, not the estimate.
                 self.queued_bytes
-                    .fetch_add(observation.queued_bytes(), Ordering::Relaxed);
-                permit.send(observation);
+                    .fetch_add(msg.queued_bytes(), Ordering::Relaxed);
+                permit.send(msg);
             }
             Err(_) => {
                 // Queue full or writer gone. Count it and carry on without paying
@@ -283,13 +323,48 @@ impl CaptureHandle {
         }
     }
 
+    /// Record related-contract state resolved during validation.
+    ///
+    /// Same discipline as [`observe_with`](Self::observe_with): refuse on bytes before
+    /// copying anything, `try_reserve` rather than await, drop and count rather than
+    /// block. Validation-time related state can be another contract's whole state, so
+    /// the measure-first ordering matters at least as much here.
+    ///
+    /// Only reached when a contract actually returns `RequestRelated` from
+    /// `validate_state`, which is rare - so this costs nothing on the ordinary path.
+    pub fn observe_related_with(
+        &self,
+        contract: ContractInstanceId,
+        size_hint: usize,
+        build: impl FnOnce() -> Vec<(ContractInstanceId, Vec<u8>)>,
+    ) {
+        let queued = self.queued_bytes.load(Ordering::Relaxed);
+        if size_hint > MAX_QUEUED_BYTES || queued.saturating_add(size_hint) > MAX_QUEUED_BYTES {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                let related = build();
+                let msg = CaptureMsg::Related { contract, related };
+                self.queued_bytes
+                    .fetch_add(msg.queued_bytes(), Ordering::Relaxed);
+                permit.send(msg);
+            }
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Offer an already-built observation. Never blocks, never fails visibly.
     ///
     /// Prefer [`observe_with`](Self::observe_with) from the merge path, where the
     /// copies are worth avoiding when the queue is full.
     pub fn observe(&self, observation: Observation) {
-        let bytes = observation.queued_bytes();
-        match self.tx.try_send(observation) {
+        let msg = CaptureMsg::Transition(Box::new(observation));
+        let bytes = msg.queued_bytes();
+        match self.tx.try_send(msg) {
             Ok(()) => {
                 self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
@@ -476,13 +551,25 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
         directory = %dir.display(),
         "conformance capture enabled: recording contract merges for offline replay"
     );
+    // Tell the dashboard checking is ON before any tick has run. Without this, the
+    // first interval renders as "not enabled", which is the one thing the panel must
+    // never say wrongly — absence and success must not look alike.
+    //
+    // Deliberately LAST: both fallible steps above (the runtime check and
+    // `create_dir_all`) have already returned by the time this runs, so the flag is
+    // never set for a capture that failed to start. Both the call and its position are
+    // covered by `the_page_reports_what_the_status_global_says_and_capture_start_sets_it`
+    // in `server::home_page::contract_detail`, which owns this process-global's one
+    // transition for the whole test binary — read its doc comment before adding a
+    // second caller of `mark_enabled` anywhere in the crate or its tests.
+    crate::conformance::status::mark_enabled();
     tokio::spawn(run_writer(dir, rx, dropped, queued_bytes));
     Ok(handle)
 }
 
 async fn run_writer(
     dir: PathBuf,
-    mut rx: mpsc::Receiver<Observation>,
+    mut rx: mpsc::Receiver<CaptureMsg>,
     dropped: Arc<AtomicU64>,
     queued_bytes: Arc<AtomicUsize>,
 ) {
@@ -570,6 +657,10 @@ async fn run_writer(
     // wide open. The default is now the pessimistic variant too, but seeding this
     // correctly is the fix; the default is only the backstop.
     let mut last_focus;
+    // Validation-resolved related state that arrived for a contract with no sampler
+    // entry, and was therefore discarded. Node-wide, because there is no per-contract
+    // place to put it — that is precisely the situation being counted.
+    let mut related_untracked = 0u64;
     let mut warmup_attempts = 0u32;
     // Focused contracts with no samples yet, carried across the probe so the finished
     // tick can report them rather than silently omitting them from `focused`.
@@ -589,11 +680,42 @@ async fn run_writer(
     loop {
         tokio::select! {
             received = rx.recv() => {
-                let Some(observation) = received else { break };
-                // Release the byte credit as the observation leaves the queue, so
-                // the budget measures what is actually in flight rather than
-                // everything ever admitted.
-                queued_bytes.fetch_sub(observation.queued_bytes(), Ordering::Relaxed);
+                let Some(msg) = received else { break };
+                // Release the byte credit as the message leaves the queue, so the
+                // budget measures what is actually in flight rather than everything
+                // ever admitted.
+                queued_bytes.fetch_sub(msg.queued_bytes(), Ordering::Relaxed);
+                let observation = match msg {
+                    CaptureMsg::Transition(observation) => *observation,
+                    CaptureMsg::Related { contract, related } => {
+                        match record_related(&mut samplers, &scope, contract, &related) {
+                            RelatedOutcome::Recorded => {}
+                            RelatedOutcome::OutOfFocus => continue,
+                            RelatedOutcome::Untracked => {
+                                // Counted, never silent. Reaching this means a contract
+                                // needed related state to VALIDATE before it had ever
+                                // been sampled — the fresh-PUT case — so its dependency
+                                // went uncaptured and a later replay of it cannot reach
+                                // a verdict. An empty related map must not be able to
+                                // mean "never needed any" when it means "thrown away".
+                                related_untracked += 1;
+                                continue;
+                            }
+                        }
+                        since_flush += 1;
+                        if since_flush >= FLUSH_EVERY_OBSERVATIONS {
+                            write_all(
+                                &dir,
+                                &samplers,
+                                dropped.load(Ordering::Relaxed),
+                                related_untracked,
+                            )
+                            .await;
+                            since_flush = 0;
+                        }
+                        continue;
+                    }
+                };
                 if let Some(evicted) = record(&mut samplers, &scope, observation) {
                     // Dropping the entry alone orphans the file: eviction fires on
                     // every rotation once the map is full, so the directory would
@@ -613,7 +735,13 @@ async fn run_writer(
                 }
                 since_flush += 1;
                 if since_flush >= FLUSH_EVERY_OBSERVATIONS {
-                    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                    write_all(
+                        &dir,
+                        &samplers,
+                        dropped.load(Ordering::Relaxed),
+                        related_untracked,
+                    )
+                    .await;
                     since_flush = 0;
                 }
             }
@@ -638,7 +766,13 @@ async fn run_writer(
                 last_focus = focus;
             }
             _ = flush.tick() => {
-                write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                write_all(
+                    &dir,
+                    &samplers,
+                    dropped.load(Ordering::Relaxed),
+                    related_untracked,
+                )
+                .await;
                 since_flush = 0;
             }
             // Only start a probe when none is in flight. A probe that overran its
@@ -676,7 +810,40 @@ async fn run_writer(
                         candidate_source = focus.source.as_str(),
                         focused = focus.selected.len(),
                         scope = scope.as_str(),
+                        // The two counts the dashboard is fed just below, under the
+                        // names the completed-probe line uses for them. Without these
+                        // a barren tick reported neither, so an operator comparing the
+                        // log against the per-contract page had nothing to compare on
+                        // the one tick shape where the page shows every focus contract
+                        // as unjudged. Zero and `awaiting_samples` are literally what
+                        // is published; when `work` is empty `select` returns
+                        // `focus.selected.len()` for the latter, so it also matches
+                        // `focused` on this line by construction.
+                        judged = 0,
+                        without_verdict = awaiting_samples,
                         "conformance shadow tick selected nothing to probe"
+                    );
+                    // Published too, with no records and nothing judged.
+                    //
+                    // This branch is the ordinary warm-up state — focus has picked
+                    // contracts but the sampler holds nothing for them yet — and it
+                    // used to return without publishing, leaving the PREVIOUS tick's
+                    // snapshot standing unchanged. Three of these in a row is 45
+                    // minutes, past `status::STALE_AFTER`, so a peer that had one
+                    // healthy tick and then went barren kept rendering that tick as a
+                    // current result with no age advancing and no stale note: the
+                    // frozen-checker failure the publish time was added to prevent,
+                    // reached by a path that never calls the thing carrying it.
+                    //
+                    // `awaiting_samples` is the honest unjudged count here. When
+                    // `work` is empty, `ShadowRunner::select` returns
+                    // `focus.selected.len()` for it, so it is every contract this tick
+                    // formed no opinion about — which is all of them.
+                    crate::conformance::status::publish(
+                        Vec::new(),
+                        0,
+                        awaiting_samples,
+                        tokio::time::Instant::now(),
                     );
                 } else {
                     let store = contract_store().cloned();
@@ -709,11 +876,14 @@ async fn run_writer(
                         continue;
                     }
                 };
-                // Focus picked these; they simply had nothing to check yet. Counted
-                // in both, so `focused` is the size of the focus set rather than the
-                // size of the subset that happened to have samples.
-                report.focused += awaiting_samples;
-                report.skipped_no_samples += awaiting_samples;
+                // Focus picked these; they simply had nothing to check yet. All three
+                // counters have to be told — see `shadow::count_awaiting_samples`,
+                // which is shared with the `probe_fixture_contract` test seam so a
+                // test cannot be fed a report production would never publish.
+                crate::conformance::shadow::count_awaiting_samples(
+                    &mut report,
+                    awaiting_samples,
+                );
                 shadow.record(&findings);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
@@ -742,18 +912,76 @@ async fn run_writer(
                     cases = report.cases,
                     inconclusive = report.inconclusive,
                     would_remove = report.would_remove,
+                    // Emitted beside the total, never instead of it. The
+                    // subset that CONVERGES is the part of `would_remove` an
+                    // enforcement gate must not read as removal-worthy, and a
+                    // counter that never leaves the process cannot inform the
+                    // decision it was collected for.
+                    would_remove_settled = report.would_remove_settled,
                     reported = report.reported,
                     skipped_no_code = report.skipped_no_code,
                     skipped_no_samples = report.skipped_no_samples,
                     timed_out = report.timed_out,
+                    // `judged`/`without_verdict` are narrower than `probed`: a focus
+                    // contract can be probed and run every case without forming an
+                    // opinion (every case `Inconclusive`). These are the numbers fed
+                    // to the dashboard below, so a reader comparing the log to the
+                    // per-contract page must see the same two counts here.
+                    judged = report.judged.len(),
+                    without_verdict = report.without_verdict,
                     "conformance shadow tick"
+                );
+
+                // Same numbers the line above reports, so the dashboard and the log
+                // cannot disagree about what happened. Published here rather than
+                // derived by a reader: a count re-computed at the call site is how
+                // this project has produced wrong metrics before.
+                //
+                // `report.judged` — not `last_focus.selected` — is what feeds
+                // `recently_checked`: focus selection only names candidates, and a
+                // selected contract can be skipped before probing (no code, no
+                // samples) or probed and never reach a verdict (every case
+                // `Inconclusive`). Feeding selection here would render an
+                // unjudged contract as "checked, no violation found", which is the
+                // exact conflation this subsystem exists to prevent. Likewise
+                // `report.without_verdict` — not `skipped_no_code +
+                // skipped_no_samples` — is the complement of `judged` over the
+                // focus set: it also counts a probed contract whose every case was
+                // inconclusive, which the skip counters never see.
+                //
+                // One record per judged contract, carrying that contract's own case
+                // counts AND its own findings — see `status::checked_contracts`. The
+                // first version of this kept the checked list and the findings list
+                // separate and capped them differently, so a contract inside one and
+                // evicted from the other rendered a green "no violation found" pill
+                // for a contract found violating.
+                //
+                // The publish TIME is carried too. A tick that selects no work now
+                // publishes as well, so barrenness is no longer a way to freeze the
+                // snapshot — but a peer can still stop reaching EITHER call site
+                // indefinitely while the previous one stands: the probe task can die
+                // (the `Err` arm above `continue`s), a probe can hang so `in_flight`
+                // never clears and no further tick starts, or this writer task can be
+                // gone entirely. Without an age on the snapshot, any of those keeps
+                // serving a week-old tick as a current clean result.
+                crate::conformance::status::publish(
+                    crate::conformance::status::checked_contracts(&report.judged, &findings),
+                    report.judged.len(),
+                    report.without_verdict,
+                    tokio::time::Instant::now(),
                 );
             }
         }
     }
 
     // Channel closed: the node is going away. Write what we have.
-    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+    write_all(
+        &dir,
+        &samplers,
+        dropped.load(Ordering::Relaxed),
+        related_untracked,
+    )
+    .await;
 }
 
 pub(crate) struct TrackedContract {
@@ -967,6 +1195,66 @@ fn wide_capture_requested() -> bool {
 /// delete a path the writer never wrote.
 pub(crate) fn bundle_path(dir: &Path, instance: &ContractInstanceId) -> PathBuf {
     dir.join(format!("{instance}.bundle"))
+}
+
+/// What became of a validation-resolved related-state message.
+///
+/// A bare `bool` was not enough, and the difference matters. Two things make
+/// `record_related` do nothing, and only one of them is benign:
+///
+/// - **out of focus** — expected, and the same rule `record` applies to transitions;
+/// - **untracked** — the contract has no sampler entry, so the state is discarded and
+///   the corpus will never be able to judge that contract.
+///
+/// The second is reachable on the ordinary path, not a corner: a fresh PUT runs
+/// `validate_state` — and therefore this capture — BEFORE any transition has been
+/// observed for that contract, so the textbook use of `RequestRelated` (a contract
+/// validating its initial state against another contract) lands here every time. If
+/// nothing counts it, an empty related map is again indistinguishable from one that
+/// was never needed, which is #5376 moved from "no call site" to "silent discard".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelatedOutcome {
+    /// Merged into the contract's sample.
+    Recorded,
+    /// The contract is not in focus; retained entries stop collecting, as for
+    /// transitions.
+    OutOfFocus,
+    /// No sampler entry exists, so there was nowhere to put it. Counted node-wide.
+    Untracked,
+}
+
+/// Fold validation-resolved related state into a contract already being tracked.
+///
+/// Deliberately does NOT create a tracked entry. Related state with no states of its
+/// own cannot produce a single case, so admitting it would spend one of
+/// `MAX_TRACKED_CONTRACTS` slots on something no replay can use — and on a peer at its
+/// cap that costs a contract that CAN be judged.
+///
+/// Scope is honoured the same way `record` honours it: an out-of-focus contract is
+/// retained but no longer collects, and that has to include this route or "sampling
+/// follows focus" would be true of transitions and quietly false of related state.
+#[must_use]
+pub(crate) fn record_related(
+    samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    scope: &SamplingScope,
+    contract: ContractInstanceId,
+    related: &[(ContractInstanceId, Vec<u8>)],
+) -> RelatedOutcome {
+    if !scope.admits(&contract) {
+        return RelatedOutcome::OutOfFocus;
+    }
+    let Some(tracked) = samplers.get_mut(&contract) else {
+        return RelatedOutcome::Untracked;
+    };
+    let (max_state, max_total) = related_budgets(tracked.sampler.config());
+    admit_related(
+        &mut tracked.related,
+        related,
+        &mut tracked.refused_related,
+        max_state,
+        max_total,
+    );
+    RelatedOutcome::Recorded
 }
 
 /// Fold one observation into the sampler map.
@@ -1208,14 +1496,26 @@ async fn write_all(
     dir: &Path,
     samplers: &HashMap<ContractInstanceId, TrackedContract>,
     dropped: u64,
+    related_untracked: u64,
 ) {
     for (instance, tracked) in samplers {
         let mut bundle = bundle_for(*instance, tracked);
         let refused = tracked.refused_related;
         bundle.note = Some(format!(
-            "captured by freenet {} ({} observation(s) dropped node-wide){}",
+            "captured by freenet {} ({} observation(s) dropped node-wide{}){}",
             env!("CARGO_PKG_VERSION"),
             dropped,
+            // Only mentioned when non-zero, so an ordinary note stays readable. It
+            // means a contract needed related state to VALIDATE before it had ever
+            // been sampled, so that dependency was never captured.
+            if related_untracked == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {related_untracked} validation-related message(s) discarded for \
+                     untracked contracts"
+                )
+            },
             // Carried INTO the corpus, not just logged. A replay reads the bundle
             // long after the node's logs have rotated, and "no related state" versus
             // "related state was refused" is the difference between a contract that
@@ -1364,11 +1664,300 @@ pub fn code_hash_of(key: &ContractKey) -> [u8; 32] {
 /// A source scrape rather than a behavioural test because the alternative is standing
 /// up a full executor to observe a `OnceLock` being set, which would test tokio more
 /// than it tests this.
+/// Source pin on the executor emitting validation-resolved related state.
+///
+/// No unit test reaches this call site: it lives in
+/// `fetch_related_for_validation_network`, which needs a runtime, a state store and a
+/// contract that actually returns `RequestRelated`. So the one thing a test CAN check
+/// is that the call is still there.
+///
+/// Worth pinning rather than trusting, because deleting it is silent in the worst way.
+/// Nothing fails, no counter moves, and no warning fires — the corpus simply stops
+/// carrying related state for the contracts that need it, and every replay of those
+/// contracts comes back `Inconclusive`, which reads exactly like a clean result. That
+/// is #5376, and it went unnoticed until a replay of the whole corpus showed 9 of 54
+/// contracts reaching no verdict on any of 2,474 cases.
+#[cfg(test)]
+mod validation_related_capture_pin {
+    /// Blank out string literals, preserving byte offsets.
+    ///
+    /// Brace counting over raw source is only correct while every brace inside a
+    /// string happens to balance. The function this pin slices already contains
+    /// `format!("contract requested {} related contracts, limit is {}", ..)` — two
+    /// opens and two closes, which nets to zero by luck rather than by construction.
+    /// One future error message carrying a lone `{` would silently move the region
+    /// boundary, and a pin whose region moves does not fail loudly; it starts checking
+    /// somewhere else.
+    ///
+    /// Offsets are preserved per BYTE, not per character: a blanked character emits as
+    /// many spaces as it occupied bytes. One space per CHAR was wrong, and silently so
+    /// — a single multi-byte character inside a string literal (an em-dash in an error
+    /// message would do it) shortens the scanned copy relative to the original and
+    /// shifts every offset after it. The slice is taken from the ORIGINAL using offsets
+    /// computed here, so drift truncates the pinned region rather than failing, and a
+    /// truncated region can pass vacuously.
+    ///
+    /// Raw strings (`r#"..."#`) are not handled; there are none in either sliced
+    /// function, and one appearing would make the pin fail rather than pass, which is
+    /// the safe direction.
+    fn blank_string_literals(src: &str) -> String {
+        /// One space per BYTE the character occupied, so offsets survive.
+        fn blank(out: &mut String, ch: char) {
+            for _ in 0..ch.len_utf8() {
+                out.push(' ');
+            }
+        }
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars();
+        let mut in_string = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' if in_string => {
+                    blank(&mut out, ch);
+                    if let Some(escaped) = chars.next() {
+                        blank(&mut out, escaped);
+                    }
+                }
+                '"' => {
+                    in_string = !in_string;
+                    blank(&mut out, ch);
+                }
+                _ if in_string => blank(&mut out, ch),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    /// Slice `fetch_related_for_validation_network`'s body by counting braces to its
+    /// own closing one.
+    ///
+    /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
+    /// anchor silently widens when the following item is not the shape assumed, and a
+    /// widened region here would swallow unrelated executor code and pass vacuously.
+    fn fetch_related_body() -> &'static str {
+        let src = include_str!("../contract/executor/runtime/contract_ops.rs");
+        let start = src
+            .find("async fn fetch_related_for_validation_network(")
+            .expect("fetch_related_for_validation_network not found in contract_ops.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("function has no body");
+        // Count on the blanked copy, slice the original.
+        let scan = blank_string_literals(after);
+        let mut depth = 0usize;
+        for (offset, ch) in scan[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fetch_related_for_validation_network's body is not brace-balanced");
+    }
+
+    /// Whole-line comments stripped: the block above this call site names
+    /// `observe_related_with` in prose, and a pin that its own explanation can satisfy
+    /// is not a pin.
+    fn code_only() -> String {
+        fetch_related_body()
+            .lines()
+            .map(|line| match line.find("//") {
+                // Trailing comments too, not just whole-line ones: a pin satisfied by
+                // `let _ = 0; // capture.observe_related_with(..)` is matching text
+                // that never runs, which is exactly the regression it exists to catch.
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Slice `executor_impl.rs`'s `fetch_related_for_validation` — the PRODUCTION
+    /// implementation.
+    ///
+    /// There are two functions resolving validation-scoped related state. This one is
+    /// reached from `bridged_upsert_contract_state_inner`, which is what a network peer
+    /// runs; the one in `contract_ops.rs` is reached only from `run_local_node`, i.e.
+    /// `OperationMode::Local`. The first version of this fix instrumented the local one
+    /// alone and pinned only that, so the pin passed while the production path stayed
+    /// blind — a green test guarding the wrong function.
+    fn production_fetch_related_body() -> &'static str {
+        let src = include_str!("../contract/executor/runtime/executor_impl.rs");
+        let start = src
+            .find("    async fn fetch_related_for_validation(")
+            .expect("fetch_related_for_validation not found in executor_impl.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("function has no body");
+        let scan = blank_string_literals(after);
+        let mut depth = 0usize;
+        for (offset, ch) in scan[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fetch_related_for_validation's body is not brace-balanced");
+    }
+
+    fn production_code_only() -> String {
+        production_fetch_related_body()
+            .lines()
+            .map(|line| match line.find("//") {
+                // Trailing comments too, not just whole-line ones: a pin satisfied by
+                // `let _ = 0; // capture.observe_related_with(..)` is matching text
+                // that never runs, which is exactly the regression it exists to catch.
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The PRODUCTION path must capture. This is the one that matters.
+    #[test]
+    fn the_production_executor_captures_validation_resolved_related_state() {
+        let body = production_code_only();
+        assert!(
+            body.contains("observe_related_with("),
+            "`fetch_related_for_validation` in executor_impl.rs no longer hands \
+             validation-resolved related state to capture. This is the implementation a \
+             NETWORK peer runs, so without it contracts whose validity depends on \
+             another contract are unjudgeable on every real capture — and the \
+             local-mode pin below would still pass, which is how this shipped wrong \
+             the first time"
+        );
+    }
+
+    /// Deliberately NOT pinned: that the call precedes `related_map` being consumed.
+    ///
+    /// The borrow checker already enforces it — moving the call after the conversion
+    /// does not compile, because the map is moved. The only reordering that DOES
+    /// compile clones the map first, which leaves capture working correctly while a
+    /// textual pin fires anyway. A pin whose sole reachable failure is a false positive
+    /// is worse than none: it eventually trips on a legitimate refactor and gets
+    /// deleted wholesale, taking the pin below with it. Established by mutation, not
+    /// assumed.
+    #[test]
+    fn the_executor_captures_validation_resolved_related_state() {
+        let body = code_only();
+        assert!(
+            body.contains("observe_related_with("),
+            "the executor no longer hands validation-resolved related state to \
+             capture, so contracts whose VALIDITY depends on another contract go back \
+             to being unjudgeable — and an unjudgeable contract reads as a clean one"
+        );
+    }
+}
+
+/// Guard against doc comments drifting onto the wrong item.
+///
+/// This module has had SEVEN doc blocks land on the wrong item, always by the same
+/// mechanism: a new item is inserted immediately before an existing `///` line, so the
+/// existing doc silently adopts the newcomer and the original item is left undocumented.
+/// It compiles, rustfmt is happy, `cargo doc` renders it without complaint, and the
+/// rendered text confidently describes something it is not attached to.
+///
+/// Care has demonstrably not worked — several of those instances happened in the same
+/// commit that was fixing an earlier one. So this pins the pairings mechanically.
+///
+/// A pairing here is a promise, not a description: if you deliberately move one of
+/// these, update the pin in the same commit and the failure message will tell the next
+/// person why it existed.
+#[cfg(test)]
+mod doc_attachment_pin {
+    /// The first line of a doc block, and the item that block must be attached to.
+    ///
+    /// Deliberately only covers items whose docs have actually drifted, rather than
+    /// every item in the file: a pin nobody can read is a pin nobody maintains.
+    const PAIRINGS: &[(&str, &str)] = &[
+        (
+            "/// Fold validation-resolved related state into a contract already being tracked.",
+            "pub(crate) fn record_related",
+        ),
+        (
+            "/// What became of a validation-resolved related-state message.",
+            "pub(crate) enum RelatedOutcome",
+        ),
+        (
+            "/// Fold one observation into the sampler map.",
+            "pub(crate) fn record",
+        ),
+        (
+            "/// Related state a contract offered and capture would not keep.",
+            "pub(crate) struct RelatedRefusals",
+        ),
+        (
+            "/// Offer an observation, building it only if there is somewhere to put it.",
+            "pub fn observe_with",
+        ),
+        (
+            "/// Record related-contract state resolved during validation.",
+            "pub fn observe_related_with",
+        ),
+    ];
+
+    #[test]
+    fn every_doc_block_is_attached_to_the_item_it_describes() {
+        let src = include_str!("capture.rs");
+        for (doc, item) in PAIRINGS {
+            let at = src.find(doc).unwrap_or_else(|| {
+                panic!("doc line not found, so this pin no longer checks anything: {doc}")
+            });
+            // Walk forward past the rest of the doc block; the first non-doc,
+            // non-attribute line must be the promised item.
+            let mut rest = src[at..].lines();
+            rest.next();
+            let landed = rest
+                .find(|line| {
+                    let t = line.trim_start();
+                    !t.starts_with("///") && !t.starts_with("#[") && !t.is_empty()
+                })
+                .unwrap_or("<end of file>");
+            assert!(
+                landed.trim_start().starts_with(item),
+                "doc block {doc:?} is attached to {landed:?}, not to {item:?}. An item \
+                 was inserted between the doc and what it describes, so the doc now \
+                 documents the wrong thing and the original item has none."
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod contract_store_registration_pin {
-    /// Slice `get_runtime_stores`' body, from its signature to the next item. A
-    /// missing anchor panics rather than silently widening the region to the rest of
-    /// the file, which is how a source pin quietly stops testing anything.
+    /// Strip whole-line comments, so a comment naming the call cannot stand in for the
+    /// call.
+    ///
+    /// Both regions this module slices have a multi-line comment sitting directly on
+    /// top of the call being pinned, explaining the registration in prose. Neither
+    /// comment happens to spell the identifier today, which is the only reason these
+    /// pins work — one ordinary reword ("`set_contract_store` is a no-op when capture
+    /// is off") disarms them with nothing failing. That is not hypothetical: the pin
+    /// on `fdev`'s report was defeated by exactly such a comment, added by the same
+    /// commit, and `probe_wiring_pins::run_writer_code_only` in this file records the
+    /// same thing happening to the one-probe-at-a-time pin.
+    ///
+    /// Whole-line only: a real call's identifier cannot sit on a line whose
+    /// `trim_start()` begins with `//`, so this can produce a false FAILURE but never
+    /// a false pass.
+    fn code_only(body: &str) -> String {
+        body.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Slice `get_runtime_stores`' body by counting braces to its own closing one.
     ///
     /// The first version of this ended the region at the next `pub(crate) fn` / `fn`
@@ -1439,7 +2028,7 @@ mod contract_store_registration_pin {
     /// the registration going away, because no unit test builds a `Ring`.
     #[test]
     fn the_ring_registers_its_hosted_contracts_for_conformance() {
-        let body = ring_new_body();
+        let body = code_only(ring_new_body());
         assert!(
             body.contains("set_hosted_contracts_source("),
             "the ring no longer tells conformance how to list hosted contracts, so \
@@ -1454,7 +2043,7 @@ mod contract_store_registration_pin {
     /// past teardown - and in the simulation harness, one per simulated peer.
     #[test]
     fn the_hosted_contracts_source_holds_only_a_weak_reference() {
-        let body = ring_new_body();
+        let body = code_only(ring_new_body());
         let start = body
             .find("set_hosted_contracts_source(")
             .expect("registration missing; the sibling pin covers that");
@@ -1468,7 +2057,7 @@ mod contract_store_registration_pin {
 
     #[test]
     fn the_executor_registers_the_contract_store_for_conformance() {
-        let body = get_runtime_stores_body();
+        let body = code_only(get_runtime_stores_body());
         assert!(
             body.contains("set_contract_store("),
             "the executor no longer registers its contract store with conformance, so \
@@ -1620,18 +2209,49 @@ mod probe_wiring_pins {
     /// `focused=1, skipped_no_samples=0`, which reads as "one contract, fully checked".
     /// Warm-up is the normal state now that focus draws from the hosted set rather than
     /// from what was already sampled, so this hid the common case.
+    ///
+    /// Only the DELEGATION and its arguments are pinned here. The three counters used
+    /// to be open-coded in `run_writer`, which is why this pin had to name each of
+    /// them and why the `probe_fixture_contract` seam could silently apply none of
+    /// them; they now live in `shadow::count_awaiting_samples`, whose behaviour is
+    /// tested directly in `shadow`'s own test module rather than scraped. What no test
+    /// but a source pin can see is whether `run_writer` still CALLS it, and with what.
     #[test]
     fn contracts_awaiting_samples_are_counted_in_the_tick() {
         let body = run_writer_code_only();
-        assert!(
-            body.contains("report.focused += awaiting_samples"),
-            "focus contracts still awaiting samples no longer count toward `focused`, \
-             so a warming-up focus set reports as a smaller, fully-checked one"
+        // Positional, and scoped to the call's own argument list — see
+        // `count_awaiting_samples_args`. Passing the tick's report but a literal `0`
+        // for the count type-checks, folds nothing in, and renders as a warming-up
+        // focus set that was fully judged.
+        let args = count_awaiting_samples_args();
+        assert_eq!(
+            args[0], "&mut report",
+            "the warming-up counters are folded into something other than THIS tick's \
+             report, so the numbers the dashboard is fed below describe a different \
+             object than the one the log line reports"
         );
-        assert!(
-            body.contains("report.skipped_no_samples += awaiting_samples"),
-            "focus contracts still awaiting samples are no longer reported as skipped"
+        assert_eq!(
+            args[1], "awaiting_samples",
+            "the warming-up count passed to `count_awaiting_samples` is no longer \
+             `awaiting_samples`, so the focus contracts that had nothing to check yet \
+             are dropped from the tick's counts and a warming-up focus set reports as \
+             a smaller, fully-checked one"
         );
+        // Not re-inlined alongside the call: two places that both adjust these
+        // counters is how the writer and the seam came to disagree in the first
+        // place, and a double-count reads as a plausible number.
+        for open_coded in [
+            "report.focused +=",
+            "report.skipped_no_samples +=",
+            "report.without_verdict +=",
+        ] {
+            assert!(
+                !body.contains(open_coded),
+                "`{open_coded}` is open-coded in run_writer again alongside \
+                 `count_awaiting_samples`, so the warm-up contracts are counted twice \
+                 — or, worse, the helper's own version has drifted from it"
+            );
+        }
     }
 
     #[test]
@@ -1643,6 +2263,383 @@ mod probe_wiring_pins {
              flight, so a probe that overran its interval would have another stacked \
              on top of it — unbounded concurrent WASM execution from a job whose \
              entire justification is that it is bounded"
+        );
+    }
+
+    /// How many places in `run_writer` call `status::publish`, and in what order.
+    ///
+    /// 0. the barren tick — `work.is_empty()`, the warm-up state. Publishes nothing
+    ///    but a fresh timestamp, so the snapshot ages instead of the previous tick
+    ///    standing as a current result.
+    /// 1. the completed probe — the tick that actually establishes something.
+    ///
+    /// Pinned as a COUNT because `publish_call_args` selects positionally: adding a
+    /// third call site would otherwise repoint every pin below at a different call
+    /// without any of them failing, which is the half-inert-pin failure this file has
+    /// already shipped twice. A new call site must land here deliberately.
+    const PUBLISH_CALL_SITES: usize = 2;
+
+    /// Index of the completed-probe publish in source order — see
+    /// [`PUBLISH_CALL_SITES`].
+    const PROBE_PUBLISH: usize = 1;
+
+    /// Index of the barren-tick publish in source order.
+    const BARREN_PUBLISH: usize = 0;
+
+    /// Every `status::publish` call site in `run_writer`, in source order.
+    fn publish_call_sites() -> Vec<usize> {
+        let body = run_writer_code_only();
+        let anchor = "status::publish(";
+        let mut at = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = body[from..].find(anchor) {
+            at.push(from + found + anchor.len());
+            from += found + anchor.len();
+        }
+        // Checked BEFORE the count, and against an anchor the qualified spelling
+        // cannot influence. `PUBLISH_CALL_SITES` is hand-written and the search
+        // anchor is `status::publish(`, so a third call site reached through a `use`
+        // import — `publish(...)`, or `st::publish(...)` — is invisible to BOTH: the
+        // count matches, every positional pin stays green, and all four are asserting
+        // about a set that no longer contains the call they name. Two errors that
+        // cancel, which is the shape `.claude/rules/bug-prevention-patterns.md` names
+        // under "the count must not be derived from the marker it audits".
+        //
+        // `publish(` also matches inside `status::publish(`, so equality here says
+        // exactly "every call spelled `publish(` is the qualified one". It is a
+        // PREFIX match, so it over-counts a `something.publish(` or a `republish(`
+        // — which fails safe, naming a discrepancy that is not one — and it is blind
+        // to a `use … as` rename, which both counters miss together.
+        let any_spelling = body.matches("publish(").count();
+        assert_eq!(
+            any_spelling,
+            at.len(),
+            "run_writer calls `publish(` {any_spelling} times but only {} of them are \
+             spelled `status::publish(`. A call reached through a `use` import is \
+             invisible to this anchor AND to PUBLISH_CALL_SITES, so the positional \
+             pins below would keep passing while asserting about the wrong set. \
+             Spell it `status::publish(` at every call site",
+            at.len()
+        );
+        assert_eq!(
+            at.len(),
+            PUBLISH_CALL_SITES,
+            "run_writer calls status::publish {} times, not {PUBLISH_CALL_SITES}. \
+             `publish_call_args` selects positionally, so the pins below are now \
+             asserting about a different call than the one they name — decide which \
+             index each pin means and update PUBLISH_CALL_SITES deliberately",
+            at.len()
+        );
+        at
+    }
+
+    /// The arguments of ONE `status::publish` call, in order.
+    ///
+    /// Bounded to the call itself rather than to all of `run_writer`, and that bound
+    /// is the whole point of the helper. The previous pins asserted
+    /// `body.contains("report.without_verdict")` over the entire function body, which
+    /// is satisfied by `report.without_verdict += awaiting_samples` sixty lines
+    /// earlier and by the `tracing::info!` field — both independent of the publish
+    /// call, so replacing the third argument with `0` left the pin green. Positional,
+    /// because the sibling pin could not see a SWAP either: passing `report.probed`
+    /// where `report.judged.len()` belongs kept every assertion happy.
+    fn publish_call_args(nth: usize) -> Vec<String> {
+        let body = run_writer_code_only();
+        let start = publish_call_sites()[nth];
+        let args = call_args_at(&body, start, &format!("status::publish call {nth}"));
+        assert_eq!(
+            args.len(),
+            4,
+            "status::publish's argument list changed shape, so the positional pins \
+             below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The arguments of the call whose opening paren ends at `start`, in order.
+    ///
+    /// Shared by every argument-scoped pin in this module, because the bound is the
+    /// whole point. A free-floating `body.contains("some_arg,")` is satisfied by any
+    /// other occurrence of that text anywhere in `run_writer` — a `tracing` field, a
+    /// nearby assignment, a sibling call — so it cannot see a wrong argument at the
+    /// call it names. `label` names the call in the panic below, which is the only
+    /// diagnostic a reader gets when an anchor stops landing on a call.
+    fn call_args_at(body: &str, start: usize, label: &str) -> Vec<String> {
+        // Split on TOP-LEVEL commas only: an argument may itself be a call with its
+        // own comma-separated arguments.
+        let mut depth = 0usize;
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for ch in body[start..].chars() {
+            match ch {
+                '(' | '[' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => break,
+                // A `]` at depth zero cannot be balanced by anything inside this
+                // argument list, so the slice is not the call it claims to be — the
+                // anchor moved, or the call is not brace-balanced. Diagnosed rather
+                // than left to `depth -= 1` panicking with `attempt to subtract with
+                // overflow`, which names arithmetic and sends the next reader nowhere
+                // near the anchor that actually broke.
+                ']' if depth == 0 => panic!(
+                    "unbalanced `]` while slicing {label}'s arguments: the anchor no \
+                     longer lands on that call's opening paren, so nothing below is \
+                     asserting about it. parsed so far: {args:?} + {current:?}"
+                ),
+                ')' | ']' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            args.push(current.trim().to_string());
+        }
+        args
+    }
+
+    /// The arguments of `run_writer`'s sole `count_awaiting_samples` call, in order.
+    ///
+    /// Bounded to the call for the same reason `publish_call_args` is. The three
+    /// unscoped `body.contains` this replaced could not see the call's arguments at
+    /// all: `"awaiting_samples,"` occurs three times in `run_writer` — the barren
+    /// tick's `without_verdict` log field, the barren publish's third argument, and
+    /// this call — so that conjunct was satisfied whatever this call was passed, and
+    /// `count_awaiting_samples(&mut report, 0)` left the pin green (mutation-verified).
+    fn count_awaiting_samples_args() -> Vec<String> {
+        let body = run_writer_code_only();
+        let anchor = "count_awaiting_samples(";
+        // EXACTLY one call, checked before `find` so both directions are diagnosed.
+        // Zero means the completed-probe arm no longer folds the warming-up focus
+        // contracts into the tick's counts at all, so a warming-up focus set reports
+        // as a smaller, fully-checked one and the dashboard's unjudged total silently
+        // omits them. Two means the writer adjusts these counters twice, which is the
+        // double-count the sibling open-coding assertions below exist to forbid — and
+        // a double-count reads as a plausible number.
+        let calls = body.matches(anchor).count();
+        assert_eq!(
+            calls, 1,
+            "run_writer calls `count_awaiting_samples` {calls} times, not once. Zero \
+             drops the warming-up focus contracts from the tick's counts; more than \
+             one folds them in twice"
+        );
+        let start = body.find(anchor).expect("checked just above") + anchor.len();
+        let args = call_args_at(&body, start, "count_awaiting_samples");
+        assert_eq!(
+            args.len(),
+            2,
+            "count_awaiting_samples's argument list changed shape, so the positional \
+             pins below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The dashboard's checked window must be fed the contracts that actually reached
+    /// a verdict, never focus SELECTION — with each contract's own findings attached.
+    ///
+    /// The #5403 review defect: `status::publish` was fed `last_focus.selected`, so a
+    /// contract focus merely picked — including one skipped before probing (no code,
+    /// no samples) or probed and left with every case `Inconclusive` — rendered on
+    /// the per-contract page as "checked, no violation found". `report.judged` is
+    /// populated only when at least one case reached `Holds` or `Violated`
+    /// (`shadow::probe_one`), so feeding it here is what makes "recently checked"
+    /// mean "we formed an opinion" rather than "focus looked this way".
+    ///
+    /// `checked_contracts` is what attaches each contract's findings to ITS record.
+    /// Feeding the judged ids alone would restore the two-window split whose eviction
+    /// mismatch was H1: a contract inside the checked window and outside the findings
+    /// window renders clean while violating.
+    #[test]
+    fn dashboard_checked_window_is_fed_judged_contracts_with_their_findings() {
+        let body = run_writer_code_only();
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert!(
+            args[0].contains("checked_contracts(&report.judged, &findings)"),
+            "the first argument no longer builds per-contract records from the judged \
+             contracts AND their findings, so either an unjudged contract renders as \
+             checked, or findings live in a window that can evict independently of \
+             the contract they belong to (#5403 H1). got: {}",
+            args[0]
+        );
+        // TWO guards, because each sees what the other cannot.
+        //
+        // The whole-body one below catches selection MATERIALISED FIRST. Every check
+        // scoped to an argument sees only the argument EXPRESSION, so building the
+        // record set from selection anywhere upstream — into a local, or straight
+        // over `report.judged`, which keeps `args[0]` byte-identical — leaves all four
+        // positional pins green while the checked window is fed selection anyway
+        // (mutation-verified). It costs nothing to keep: `last_focus.selected` appears
+        // in `run_writer` only inside a comment, which `run_writer_code_only` strips,
+        // so there is no false-positive surface here.
+        //
+        // Matched against a whitespace-STRIPPED body, and that is load-bearing rather
+        // than tidiness. The guard this restores named the contiguous spelling
+        // `last_focus.selected.iter().copied()`; `cargo fmt` breaks a chain that long
+        // across five lines, so the `report.judged` overwrite this was mutation-tested
+        // against stayed GREEN under the restored guard until it was normalised — a
+        // rustfmt reflow, not even an edit, disarmed it. Named on the RECEIVER too:
+        // the chained spelling is one of several ways to write the same
+        // materialisation, and `last_focus.selected` is the part that must not be
+        // read at all.
+        let whitespace_free: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !whitespace_free.contains("last_focus.selected"),
+            "run_writer reads focus SELECTION out of `last_focus`. Wherever the read \
+             happens, that is the one thing the checked window must not be built \
+             from: a selected contract can be skipped before probing (no code, no \
+             samples) or probed and never reach a verdict, and it would render on the \
+             per-contract page as 'checked, no violation found'"
+        );
+        // The per-call-site loop catches what the whole-body guard cannot NAME. That
+        // guard can only speak about the `last_focus` binding: in the barren branch
+        // the in-scope binding is `focus`, so a future edit feeding selection into the
+        // barren publish would write `focus.selected…` and go unseen — and no
+        // whole-body guard can name `focus.selected`, because the scope assignment
+        // legitimately uses it two lines above that branch. Scoping to the argument is
+        // what makes that sayable at all.
+        for nth in 0..PUBLISH_CALL_SITES {
+            let first = &publish_call_args(nth)[0];
+            assert!(
+                !first.contains("selected"),
+                "status::publish call {nth} is fed focus SELECTION (`{first}`). A \
+                 selected contract can be skipped before probing (no code, no \
+                 samples) or probed and never reach a verdict, and it would render on \
+                 the per-contract page as 'checked, no violation found'"
+            );
+        }
+    }
+
+    /// The tick's two headline counts must be the report's own, positionally.
+    ///
+    /// `judged_last_tick` and `without_verdict_last_tick` are complements over the
+    /// focus set. `report.probed` is NOT the first of them (a contract can be probed
+    /// and reach no verdict), and `skipped_no_code + skipped_no_samples` is not the
+    /// second (neither skip counter sees a probed-but-inconclusive contract). Both
+    /// wrong values type-check and both render as plausible numbers.
+    #[test]
+    fn dashboard_tick_counts_are_the_report_fields_positionally() {
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert_eq!(
+            args[1], "report.judged.len()",
+            "the judged-this-tick count is no longer `report.judged.len()`; \
+             `report.probed` counts contracts that ran cases without forming an \
+             opinion and would overstate what was established"
+        );
+        assert_eq!(
+            args[2], "report.without_verdict",
+            "the unjudged count is no longer `report.without_verdict`, so a probed \
+             contract whose every case was inconclusive stops counting toward the \
+             fleet-wide unjudged total and renders as a clean result"
+        );
+    }
+
+    /// The block `run_writer` runs when a tick selects nothing to probe.
+    ///
+    /// Sliced to the branch rather than searched for across `run_writer`: the whole
+    /// question this pin asks is WHICH branch publishes, and a whole-body `contains`
+    /// is answered by the completed-probe call site eighty lines further down.
+    fn work_is_empty_block() -> String {
+        let body = run_writer_code_only();
+        let anchor = "if work.is_empty() {";
+        let start = body
+            .find(anchor)
+            .expect("run_writer no longer branches on an empty work set")
+            + anchor.len()
+            - 1;
+        let mut depth = 0usize;
+        for (offset, ch) in body[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return body[start..start + offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the empty-work branch is not brace-balanced");
+    }
+
+    /// #5403 M3: a tick that selects nothing must still publish.
+    ///
+    /// This branch is the ordinary warm-up state — focus has picked contracts and the
+    /// sampler holds nothing for them yet — and it used to return without publishing,
+    /// leaving the previous snapshot standing with its age frozen. Three barren ticks
+    /// is 45 minutes, past `status::STALE_AFTER`, so a peer that had one healthy tick
+    /// and then went barren kept rendering that tick as a current "no violation
+    /// found", never aged past the staleness threshold and never carrying the stale
+    /// note. The unjudged contracts of a barren tick also never reached
+    /// `without_verdict_last_tick`, so nothing said they had not been judged either.
+    ///
+    /// Pinned rather than tested end to end because `run_writer` is a select loop no
+    /// test can call — which is also exactly why a call site inside it can go missing
+    /// unnoticed.
+    #[test]
+    fn a_tick_that_selects_nothing_still_publishes() {
+        let block = work_is_empty_block();
+        assert!(
+            block.contains("status::publish("),
+            "the empty-work branch returns without publishing, so a peer whose ticks \
+             have gone barren keeps serving its last healthy tick as a current \
+             result, with the snapshot's age frozen so it never reads as stale. \
+             got:\n{block}"
+        );
+
+        let args = publish_call_args(BARREN_PUBLISH);
+        assert_eq!(
+            args[0], "Vec::new()",
+            "a tick that probed nothing must publish an EMPTY record set. Anything \
+             else — focus selection most plausibly, since `focus` is in scope right \
+             here — puts contracts the tick formed no opinion about into the checked \
+             window, where the per-contract page renders them as 'checked, no \
+             violation found'. Un-asserted, this argument was the one position of the \
+             four that a wrong value could occupy silently"
+        );
+        assert_eq!(
+            args[1], "0",
+            "a tick that probed nothing must publish zero contracts judged; anything \
+             else reports established results from a tick that established none"
+        );
+        assert_eq!(
+            args[2], "awaiting_samples",
+            "the barren tick's unjudged count must be `awaiting_samples`, which is \
+             `focus.selected.len()` when the work set is empty — every contract this \
+             tick formed no opinion about. A zero here renders a barren tick as one \
+             with nothing left unjudged"
+        );
+        assert!(
+            args[3].contains("Instant::now()"),
+            "the barren tick's snapshot carries no publish time, so it cannot age and \
+             the frozen-checker note never fires. got: {}",
+            args[3]
+        );
+    }
+
+    /// The snapshot must carry a publish time.
+    ///
+    /// `publish` is reached from two places — the barren tick and the completed probe
+    /// — and a peer can stop reaching either indefinitely while the previous snapshot
+    /// stands: the probe task can panic, a probe can hang so `in_flight` never clears
+    /// and no further tick starts, or the writer task can be gone. Without an age, a
+    /// peer whose probe has been dead for a week keeps serving that week-old tick as a
+    /// current "no violation found".
+    #[test]
+    fn the_published_snapshot_carries_its_publish_time() {
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert!(
+            args[3].contains("Instant::now()"),
+            "the published snapshot no longer carries a publish time, so a frozen \
+             checker renders identically to a live clean one. got: {}",
+            args[3]
         );
     }
 }
@@ -1969,7 +2966,7 @@ mod tests {
             "fixture did not trigger a refusal, so this proves nothing"
         );
 
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let bundle =
             super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &watched))
@@ -1979,6 +2976,245 @@ mod tests {
             note.contains("related state refused"),
             "the bundle does not record that related state was refused, so a replay \
              cannot tell 'needed none' from 'could not keep it': {note}"
+        );
+    }
+
+    /// The related handle refuses on bytes BEFORE building, like its sibling.
+    ///
+    /// This is new production code with its own admission branches, and the writer-side
+    /// tests do not reach them. The ordering is the load-bearing part: validation-time
+    /// related state is another contract's whole state, so building it and then finding
+    /// the queue full would make the DROP path the most expensive path — on the
+    /// executor's validation path, under exactly the load that causes drops.
+    #[test]
+    fn the_related_handle_refuses_oversized_input_without_building_it() {
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let built = Arc::new(AtomicU64::new(0));
+        let counter = built.clone();
+        handle.observe_related_with(instance(1), MAX_QUEUED_BYTES + 1, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        });
+
+        assert_eq!(
+            built.load(Ordering::Relaxed),
+            0,
+            "the closure ran, so the copy was paid for before the refusal — which is \
+             the ordering this path exists to avoid"
+        );
+        assert_eq!(handle.dropped(), 1, "the refusal was not counted");
+    }
+
+    /// A full queue drops rather than blocking, and counts it.
+    #[test]
+    fn the_related_handle_drops_when_the_queue_is_full() {
+        // Capacity 1, filled, so `try_reserve` must fail on the second offer.
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        handle.observe_related_with(instance(1), 8, || vec![(instance(2), vec![0u8; 8])]);
+        assert_eq!(handle.dropped(), 0, "the first offer should have fit");
+
+        let built = Arc::new(AtomicU64::new(0));
+        let counter = built.clone();
+        handle.observe_related_with(instance(1), 8, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            vec![(instance(2), vec![0u8; 8])]
+        });
+
+        assert_eq!(handle.dropped(), 1, "a full queue did not count the drop");
+        assert_eq!(
+            built.load(Ordering::Relaxed),
+            0,
+            "the closure ran on the drop path, paying for copies that were discarded"
+        );
+    }
+
+    /// A discarded-because-untracked message is COUNTED in the corpus, not silent.
+    ///
+    /// This is the reachable case, not a corner: a fresh PUT runs `validate_state`, and
+    /// therefore this capture, before any transition for that contract has been
+    /// observed — so a contract validating its initial state against another contract
+    /// lands here every time. Without a count, the resulting empty related map is
+    /// indistinguishable from one that was never needed, which is #5376 all over again
+    /// with the loss moved from "no call site" to "silent discard".
+    #[tokio::test]
+    async fn related_state_discarded_for_an_untracked_contract_is_recorded_in_the_note() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut samplers = HashMap::new();
+        let tracked = instance(1);
+
+        // One genuinely tracked contract, so a bundle gets written at all.
+        let _evicted = record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            observation_for(tracked),
+        );
+
+        // Two messages for contracts with no sampler entry, as a fresh PUT produces.
+        assert_eq!(
+            record_related(&mut samplers, &SamplingScope::Wide, instance(8), &[]),
+            RelatedOutcome::Untracked
+        );
+        assert_eq!(
+            record_related(&mut samplers, &SamplingScope::Wide, instance(9), &[]),
+            RelatedOutcome::Untracked
+        );
+
+        write_all(dir.path(), &samplers, 0, 2).await;
+
+        let bundle =
+            super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &tracked))
+                .expect("bundle should have been written");
+        let note = bundle.note.unwrap_or_default();
+        assert!(
+            note.contains("2 validation-related message(s) discarded"),
+            "the corpus does not record that validation-resolved related state was \
+             discarded, so a reader cannot tell an untaken dependency from an absent \
+             one: {note}"
+        );
+    }
+
+    /// The note stays quiet when nothing was discarded.
+    ///
+    /// A counter that always prints is as uninformative as one that never does.
+    #[tokio::test]
+    async fn the_note_says_nothing_about_discards_when_there_were_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut samplers = HashMap::new();
+        let tracked = instance(1);
+        let _evicted = record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            observation_for(tracked),
+        );
+
+        write_all(dir.path(), &samplers, 0, 0).await;
+
+        let bundle =
+            super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &tracked))
+                .expect("bundle should have been written");
+        let note = bundle.note.unwrap_or_default();
+        assert!(
+            !note.contains("discarded"),
+            "a clean run still claims discards, so the signal means nothing: {note}"
+        );
+    }
+
+    /// Validation-resolved related state reaches the tracked contract.
+    ///
+    /// The #5376 regression. Related state arrives by two routes and only one travels
+    /// with a transition; without this path a contract whose VALIDITY depends on
+    /// another contract is permanently unjudgeable, because every replayed case
+    /// dead-ends at `Inconclusive::RelatedRequired` and that reads like a clean run.
+    #[test]
+    fn validation_resolved_related_state_is_merged_into_the_tracked_contract() {
+        let mut samplers = HashMap::new();
+        let watched = instance(1);
+        let scope = focused_on(&[1]);
+
+        // The contract is tracked from an ordinary transition that carried NO related
+        // state - which is the real shape: the update did not need any, only the
+        // validation did.
+        let mut obs = observation_for(watched);
+        obs.related = Vec::new();
+        let _evicted = record(&mut samplers, &scope, obs);
+        assert!(
+            samplers[&watched].related.is_empty(),
+            "fixture started with related state, so this proves nothing"
+        );
+
+        let recorded = record_related(
+            &mut samplers,
+            &scope,
+            watched,
+            &[(instance(2), vec![7u8; 32])],
+        );
+
+        assert_eq!(
+            recorded,
+            RelatedOutcome::Recorded,
+            "a real merge did not report itself as recorded, so the writer will skip \
+             the flush that persists it"
+        );
+        assert_eq!(
+            samplers[&watched].related.len(),
+            1,
+            "validation-resolved related state never reached the tracked contract, so \
+             a replay of it cannot reach a verdict"
+        );
+    }
+
+    /// It does NOT create a tracked entry for an unknown contract.
+    ///
+    /// Related state with no states of its own cannot produce a single case, so
+    /// admitting it would spend one of MAX_TRACKED_CONTRACTS on something no replay
+    /// can use - and on a peer at its cap that displaces a contract that CAN be judged.
+    #[test]
+    fn validation_related_state_does_not_create_an_untracked_contract() {
+        let mut samplers = HashMap::new();
+        let stranger = instance(9);
+
+        let recorded = record_related(
+            &mut samplers,
+            &focused_on(&[9]),
+            stranger,
+            &[(instance(2), vec![7u8; 32])],
+        );
+
+        assert_eq!(
+            recorded,
+            RelatedOutcome::Untracked,
+            "a message for an untracked contract must report Untracked specifically — \
+             it is the case where related state is DISCARDED, and reporting it as a \
+             plain no-op is how it goes uncounted"
+        );
+        assert!(
+            samplers.is_empty(),
+            "related state alone created a tracked entry, spending a slot on a \
+             contract no case can be built from"
+        );
+    }
+
+    /// Sampling follows focus for it too.
+    ///
+    /// Otherwise "sampling follows focus" would be true of transitions and quietly
+    /// false of related state, which is the kind of half-true invariant that is worse
+    /// than none.
+    #[test]
+    fn validation_related_state_is_not_collected_out_of_focus() {
+        let mut samplers = HashMap::new();
+        let watched = instance(1);
+
+        let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
+        // Rotate away, then let validation-resolved state arrive for it.
+        let recorded = record_related(
+            &mut samplers,
+            &focused_on(&[2]),
+            watched,
+            &[(instance(3), vec![7u8; 32])],
+        );
+
+        assert_eq!(
+            recorded,
+            RelatedOutcome::OutOfFocus,
+            "an out-of-focus message must report OutOfFocus, not Untracked — the first \
+             is benign and the second means data was lost, and conflating them is what \
+             the enum exists to prevent"
+        );
+        assert!(
+            samplers[&watched].related.is_empty(),
+            "an out-of-focus contract kept collecting related state"
         );
     }
 
@@ -2399,7 +3635,7 @@ mod tests {
         let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -2635,7 +3871,7 @@ mod tests {
         let _evicted = record(&mut samplers, &SamplingScope::Wide, observation());
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -2680,7 +3916,7 @@ mod tests {
         );
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -2712,7 +3948,7 @@ mod tests {
             obs.result_state = vec![i; 17];
             let _evicted = record(&mut samplers, &SamplingScope::Wide, obs);
         }
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
         let before = samplers
             .values()
             .next()
@@ -2765,7 +4001,15 @@ mod tests {
         let end = after
             .find("struct TrackedContract")
             .expect("run_writer no longer precedes TrackedContract");
-        let body = &after[..end];
+        // Whole-line comments stripped, for the reason
+        // `contract_store_registration_pin::code_only` gives: the region is production
+        // code with prose in it, and a comment naming the call would satisfy this
+        // assertion just as well as the call does.
+        let body = after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             body.contains("reload(&dir)"),
             "run_writer no longer reloads existing bundles on startup, so a node \

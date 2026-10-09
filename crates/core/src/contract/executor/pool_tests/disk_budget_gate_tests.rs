@@ -3,8 +3,8 @@
 //!
 //! The lower-level `DiskUsageTracker` / `HostingManager` admit+record arithmetic
 //! is unit-tested in isolation (boundary, overflow, growth-only, concurrency) in
-//! `ring/hosting.rs` and `ring/hosting/disk_usage.rs`. The V2 delegate path is
-//! covered by a `StateAdmitCallback` closure in `wasm_runtime/delegate_api.rs`.
+//! `ring/hosting.rs` and `ring/hosting/disk_usage.rs`. (A delegate write path
+//! used to carry its own copy of this gate; #5637 removed that path.)
 //!
 //! What was NOT covered before this file: the *executor-side wiring* of those
 //! gates — that `bridged_upsert_contract_state` actually calls

@@ -1120,10 +1120,10 @@ impl P2pConnManager {
                     op_manager
                         .interest_manager
                         .record_delta_send(new_state.size(), payload_size);
-                    crate::config::GlobalTestMetrics::record_delta_send();
+                    crate::config::GlobalTestMetrics::record_delta_send(payload_size);
                 } else {
                     op_manager.interest_manager.record_full_state_send();
-                    crate::config::GlobalTestMetrics::record_full_state_send();
+                    crate::config::GlobalTestMetrics::record_full_state_send(payload_size);
                 }
 
                 // Issue #3046: Refresh the peer's interest TTL on every successful

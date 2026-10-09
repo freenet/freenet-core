@@ -99,6 +99,19 @@ impl Drop for RelayConnectInflightGuard {
     }
 }
 
+/// Why a client-initiated CONNECT was issued, where that changes what the
+/// driver does with an acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientConnectKind {
+    /// Gateway join, ring acquisition, version probe.
+    Standard,
+    /// Route-to-self nearest-neighbor lattice probe (`Ring::connection_maintenance`),
+    /// issued in scheduler `generation`: an acceptor that is not a lattice edge
+    /// is reported as a probe miss for that generation
+    /// (`ConnectionManager::record_lattice_probe_result`, #5814).
+    LatticeProbe { generation: u64 },
+}
+
 /// Drive a client-initiated CONNECT to completion.
 ///
 /// Replaces the legacy `send_gateway_connect` + `process_message`
@@ -127,6 +140,7 @@ impl Drop for RelayConnectInflightGuard {
 /// caller's `add_transaction` registration against the first inbound
 /// Response, which can arrive before the spawn completes on a busy
 /// runtime.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_client_connect(
     tx: Transaction,
     gateway: PeerKeyLocation,
@@ -135,6 +149,7 @@ pub(crate) async fn start_client_connect(
     own: PeerKeyLocation,
     desired_location: Location,
     overall_timeout: Option<std::time::Duration>,
+    kind: ClientConnectKind,
 ) -> Result<(), OpError> {
     // Count this CONNECT toward the connection_maintenance acquisition throttle.
     // `start_client_connect` is the single entry for every *self-initiated*
@@ -226,6 +241,7 @@ pub(crate) async fn start_client_connect(
         started_without_address,
         receiver,
         op_manager,
+        kind,
     );
 
     let outcome = match overall_timeout {
@@ -259,6 +275,7 @@ async fn drive_client_connect_inner(
     started_without_address: bool,
     mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
+    kind: ClientConnectKind,
 ) -> Result<(), OpError> {
     use std::collections::HashSet;
 
@@ -354,7 +371,9 @@ async fn drive_client_connect_inner(
                     })
                     .await?;
 
-                let hole_punch_ok = match rx.recv().await {
+                // The address the connection was made to, which can differ from
+                // the advertised one when an existing transport is reused.
+                let (hole_punch_ok, connected_addr) = match rx.recv().await {
                     Some(Ok((peer_id, _remaining))) => {
                         tracing::info!(
                             %peer_id,
@@ -379,7 +398,7 @@ async fn drive_client_connect_inner(
                             true,
                             now,
                         );
-                        true
+                        (true, peer_id)
                     }
                     Some(Err(_)) => {
                         tracing::warn!(
@@ -387,7 +406,7 @@ async fn drive_client_connect_inner(
                             elapsed_ms = tx.elapsed().as_millis(),
                             "connect driver: ConnectPeer failed"
                         );
-                        false
+                        (false, acceptor_addr)
                     }
                     None => {
                         tracing::warn!(
@@ -395,9 +414,42 @@ async fn drive_client_connect_inner(
                             acceptor = %payload.acceptor,
                             "connect driver: ConnectPeer callback closed without result"
                         );
-                        false
+                        (false, acceptor_addr)
                     }
                 };
+
+                // Lattice-probe result (#5814). The route-to-self probe aims at
+                // the nearest UNCONNECTED peer (and near-terminus relays may also
+                // accept). If an acceptor neither fills nor tightens a lattice
+                // side, that is evidence the side is tight: report a miss, and
+                // once both sides have missed the scheduler sleeps until the
+                // lattice changes or its re-check, instead of probing every
+                // tau_max and keeping a non-lattice link each time. Classified
+                // before the failure branch below can `continue`: at
+                // max_connections our own cap refuses a non-lattice acceptor,
+                // which arrives here as a failure, but the probe did land there
+                // (otherwise a peer at max would never sleep). A lattice edge
+                // that could not be connected is reported as a failed hit, so
+                // the scheduler re-checks on its retry ladder. An established link
+                // is kept: dropping it would leave it dead on the far end until
+                // its idle timeout, since the transport has no close message.
+                if let ClientConnectKind::LatticeProbe { generation } = kind {
+                    let cm = &op_manager.ring.connection_manager;
+                    if cm.record_lattice_probe_result(
+                        Location::from_address(&connected_addr),
+                        connected_addr,
+                        generation,
+                        hole_punch_ok,
+                        cm.at_max_connections(),
+                    ) {
+                        tracing::debug!(
+                            tx = %tx,
+                            acceptor = %acceptor_addr,
+                            generation,
+                            "connect driver: lattice probe found no closer neighbor"
+                        );
+                    }
+                }
 
                 if !hole_punch_ok {
                     accepted.remove(&payload.acceptor);
@@ -1649,6 +1701,149 @@ mod tests {
             "happy-path accept branch (`initial_actions.accept`) must call \
              `dispatch_expect_connection_from` to promote the joiner to a ring \
              connection before forwarding the response upstream (#3838 / PR #3893)."
+        );
+    }
+
+    /// Pins the wiring of the lattice-probe miss report (#5814), which the
+    /// model test in `ring/lattice_degree_model.rs` exercises only through the
+    /// shared predicate and scheduler: (1) the maintenance loop tags its
+    /// route-to-self probe as `ClientConnectKind::LatticeProbe` and nothing
+    /// else, and `acquire_new` forwards the kind; (2) the client driver, after a
+    /// successful hole punch, classifies each probe acceptor with
+    /// `record_lattice_probe_result`, and does not drop it. Without (2) the
+    /// scheduler never learns the lattice is tight, probes forever, and degree
+    /// creeps.
+    #[test]
+    fn lattice_probe_miss_is_wired() {
+        const DRIVER: &str = include_str!("op_ctx_task.rs");
+        const RING: &str = include_str!("../../ring.rs");
+        // Production code only (before the first test module), with `//`
+        // comments removed so a commented-out call does not count.
+        let prod = |src: &str| -> String {
+            src[..src
+                .find("\n#[cfg(test)]\nmod ")
+                .expect("expected a `#[cfg(test)]` test module")]
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Whitespace removed, so formatting changes do not matter.
+        let squash = |s: &str| -> String { s.split_whitespace().collect() };
+        // The item starting at `start`, up to its closing line `end`, squashed.
+        let item = |src: &str, start: &str, end: &str| -> String {
+            let rest = &src[src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} not found"))..];
+            squash(&rest[..rest.find(end).unwrap_or_else(|| panic!("end of {start}"))])
+        };
+
+        // (1) ring.rs, inside `connection_maintenance`: the scheduler reads
+        // this peer's connection manager before the acquisition drain, and
+        // exactly one acquisition is tagged as a lattice probe (chosen by the
+        // probe-target comparison, with the scheduler's generation);
+        // `acquire_new` forwards the kind; and the router snapshot task
+        // exports the miss count.
+        let ring = prod(RING);
+        let maintenance = item(&ring, "async fn connection_maintenance(", "\n    }\n");
+        let tick = maintenance
+            .find("lattice_probe.tick_for(&self.connection_manager,")
+            .expect("connection_maintenance must drive LatticeProbeScheduler from its own ConnectionManager");
+        let drain = maintenance
+            .find("whileletSome(ideal_location)=pending_conn_adds.pop_first()")
+            .expect("acquisition drain loop not found in connection_maintenance");
+        assert!(
+            tick < drain,
+            "the probe must be scheduled before the drain, so it launches in the same tick"
+        );
+        assert!(
+            maintenance.contains(
+                "ifletSome(interval)=outcome.fired{self.connection_manager.record_lattice_probe_issued();pending_conn_adds.insert(me);"
+            ),
+            "the probe target must be queued only when the scheduler fires"
+        );
+        assert!(
+            maintenance.contains("#[cfg(not(test))]letprobe_timing=lattice_probe_timing::production();")
+                && maintenance.contains(
+                    "LatticeProbeScheduler::new(self.time_source.now(),self.connection_manager.lattice_probe_misses(),probe_timing,)"
+                ),
+            "connection_maintenance must run the scheduler on the production timing"
+        );
+        assert!(
+            maintenance.contains(
+                "GlobalRng::random_range(lattice_probe_timing::JITTER_LOW..=lattice_probe_timing::JITTER_HIGH,)"
+            ),
+            "the probe intervals must be jittered with the production bounds"
+        );
+        assert_eq!(
+            squash(&ring)
+                .matches("ClientConnectKind::LatticeProbe{")
+                .count(),
+            1,
+            "ring.rs must tag exactly one acquisition as a lattice probe"
+        );
+        assert!(
+            maintenance.contains(
+                "iflattice_probe_target==Some(ideal_location){ClientConnectKind::LatticeProbe{generation:lattice_probe.generation(),}"
+            ),
+            "the drain in connection_maintenance must tag the probe target with the current generation"
+        );
+        let acquire = item(&ring, "async fn acquire_new(", "\n    }\n");
+        assert!(
+            acquire.contains("kind:ClientConnectKind,")
+                && acquire.contains("ideal_location,None,kind,)"),
+            "acquire_new must forward its kind to start_client_connect"
+        );
+        let snapshot = item(
+            &ring,
+            "async fn emit_router_snapshot_telemetry(",
+            "\n    }\n",
+        );
+        assert!(
+            snapshot.contains("snapshot.lattice_probe_misses=Some(cm.lattice_probe_miss_total());"),
+            "the router snapshot task must export the probe miss count"
+        );
+
+        // (2) The client driver threads the kind through and classifies every
+        // lattice-probe acceptor for the probe's generation once the hole-punch
+        // result is known, before the failure branch can `continue`, and
+        // never drops it.
+        let driver = prod(DRIVER);
+        let start = item(
+            &driver,
+            "pub(crate) async fn start_client_connect(",
+            "\n}\n",
+        );
+        assert!(
+            start.contains("kind:ClientConnectKind,") && start.contains("op_manager,kind,);"),
+            "start_client_connect must forward its kind to the inner driver"
+        );
+        let body = item(&driver, "async fn drive_client_connect_inner(", "\n}\n");
+        let joined = body
+            .find("\"connectdriver:joinedpeer\"")
+            .expect("hole-punch result handling not found");
+        let gate = body
+            .find("ifletClientConnectKind::LatticeProbe{generation}=kind{")
+            .expect("lattice-probe miss report not found in drive_client_connect_inner");
+        let failed = body
+            .find("if!hole_punch_ok{")
+            .expect("hole-punch failure branch not found");
+        assert!(
+            joined < gate && gate < failed,
+            "the miss report must run once the hole-punch result is known and before the \
+             failure branch can `continue`, so a cap-refused acceptor still counts"
+        );
+        let gate_block = &body[gate..failed];
+        assert!(
+            gate_block.contains(
+                "ifcm.record_lattice_probe_result(Location::from_address(&connected_addr),connected_addr,generation,hole_punch_ok,cm.at_max_connections(),)"
+            ),
+            "every probe acceptor must be classified, for the probe's generation"
+        );
+        assert!(
+            !body.contains("NodeEvent::DropConnection(acceptor_addr)")
+                && !gate_block.contains("continue;"),
+            "a probe acceptor must be kept (a dropped link stays dead on the far end)"
         );
     }
 }

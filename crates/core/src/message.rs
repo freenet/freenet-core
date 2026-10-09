@@ -174,7 +174,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = Ulid::new().0;
+        let bytes: u128 = Ulid::generate().0;
         Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
@@ -1213,8 +1213,10 @@ impl Display for NetMessage {
 // compile time, preventing a whole class of bugs that previously could
 // only surface at runtime (or worse, as UB via unreachable_unchecked).
 
-/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (24 bytes, with niche) = 40 bytes.
-/// Any change to this layout would break serialization compatibility and network protocol.
+/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (32 bytes) = 48 bytes.
+/// `u128` has no niche, so `Option<Ulid>` cannot pack the discriminant and is
+/// 32 bytes, not 24. Any change to this layout would break serialization
+/// compatibility and network protocol.
 const _: () = {
     // Ulid is a newtype over u128 (16 bytes).
     assert!(std::mem::size_of::<ulid::Ulid>() == 16, "Ulid size changed");
@@ -1483,14 +1485,14 @@ mod tests {
 
     #[test]
     fn pack_transaction_type() {
-        let ts_0 = Ulid::new();
+        let ts_0 = Ulid::generate();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Connect, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
-        let ts_1 = Ulid::new();
+        let ts_1 = Ulid::generate();
         assert!(
             tx.id.timestamp_ms() > ts_0.timestamp_ms(),
             "{:?} <= {:?}",
@@ -1812,6 +1814,73 @@ mod tests {
         assert!(
             display.contains(&tx.to_string()),
             "should include tx id: {display}"
+        );
+    }
+
+    /// Wire and at-rest format pin for `Transaction` (#4882).
+    ///
+    /// `Transaction.id` is a `ulid::Ulid`, and `ulid`'s `Serialize` emits the
+    /// 26-character Crockford base32 STRING, not the underlying `u128`. That
+    /// encoding is inherited from a third-party crate, so a dependency bump can
+    /// change it with no diff in this repo at all. If it ever flips to a raw
+    /// `u128` — a plausible upstream change — every peer's `NetMessage` decode
+    /// breaks and every existing `NetLogMessage` AOF segment
+    /// (`tracing/aof.rs::encode_log`) becomes undecodable, while CI stays green:
+    /// `Transaction`'s serde is derived structurally, and `NetMessageV1`
+    /// versioning does not cover a nested field's representation.
+    ///
+    /// Verified byte-identical under ulid 1.2.1 and 3.0.0 during the 3.0 bump.
+    ///
+    /// This compares against FIXED bytes on purpose. A round-trip test would
+    /// re-encode with the same version it decodes with, so it is self-consistent
+    /// by construction and cannot detect this class of change.
+    #[test]
+    fn transaction_bincode_encoding_is_pinned() {
+        const RAW: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF;
+        const ENCODED: &str = "014D2PF2DBSQQG28T5CY4TQKFF";
+
+        // The base32 alphabet and length the pin below is built on.
+        assert_eq!(
+            Ulid(RAW).to_string(),
+            ENCODED,
+            "ULID string encoding changed; the wire format changed with it"
+        );
+
+        fn expect_ulid_bytes(encoded: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            // bincode writes a str as a little-endian u64 length, then the bytes.
+            v.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+            v.extend_from_slice(encoded.as_bytes());
+            v
+        }
+
+        let mut expected = expect_ulid_bytes(ENCODED);
+        expected.push(0); // Option::None
+
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: None,
+        };
+        let actual = bincode::serialize(&tx).expect("serialize Transaction");
+        assert_eq!(
+            actual, expected,
+            "Transaction bincode encoding changed: this is a network protocol \
+             break AND makes existing event-log segments undecodable"
+        );
+        assert_eq!(actual.len(), 35, "Transaction encodes to 8 + 26 + 1 bytes");
+
+        // The parent arm too, since `Option<Ulid>` is the other half of the layout.
+        let mut expected_parent = expect_ulid_bytes(ENCODED);
+        expected_parent.push(1); // Option::Some
+        expected_parent.extend_from_slice(&expect_ulid_bytes("00000000000000000000000001"));
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: Some(Ulid(1)),
+        };
+        assert_eq!(
+            bincode::serialize(&tx).expect("serialize Transaction"),
+            expected_parent,
+            "Transaction parent encoding changed"
         );
     }
 }

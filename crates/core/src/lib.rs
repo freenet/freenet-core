@@ -9,7 +9,7 @@ mod contract;
 
 /// Contract conformance: the shared verifier and evidence model (RFC #5320).
 ///
-/// Public because `fdev conformance` runs the *same* verifier the network does.
+/// Public because `fdev verify-merge` runs the *same* verifier the network does.
 /// A developer-facing check that could disagree with the network-facing one would
 /// be worse than no check at all.
 pub mod conformance;
@@ -67,6 +67,25 @@ mod wasm_runtime;
 /// Deterministic simulation testing framework.
 pub mod simulation;
 
+/// `build.rs`'s choice of `rerun-if-changed` paths (#5667). Build scripts have
+/// no test harness of their own, so the module is compiled here to test it.
+#[cfg(test)]
+#[path = "../build/git_watch.rs"]
+mod build_git_watch;
+
+/// Pin the process-start anchor used by the bootstrap-latency metric
+/// (`freenet.bootstrap.time_to_min_connections_seconds`, issue #4787).
+///
+/// `Instant` cannot be constructed for "when this process started", so the
+/// earliest instant available is whenever something first asks. Call this on
+/// the first line of `main` and the metric genuinely measures from process
+/// start — including config load, storage open, and every other startup step
+/// that can delay CONNECT. Without it the anchor falls back to
+/// `network_status::init()`, i.e. node start.
+pub fn mark_process_start() {
+    node::network_status::mark_process_start();
+}
+
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;
@@ -102,9 +121,10 @@ pub mod dev_tool {
         testing_impl::{
             ChurnConfig, ContractDistribution, ControlledEventChain, ControlledSimulationResult,
             ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
-            NetworkPeer, NodeLabel, OperationStats, OperationSummary, PeerMessage, PeerStatus,
-            PutOperationStats, RunningNode, ScheduledOperation, SimNetwork, SimOperation,
-            TurmoilConfig, TurmoilResult, UpdateOperationStats, check_convergence_from_logs,
+            FinalStateHandle, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
+            PeerMessage, PeerStatus, PutOperationStats, RunningNode, ScheduledOperation,
+            SimNetwork, SimOperation, TurmoilConfig, TurmoilResult, UpdateOperationStats,
+            check_convergence_from_logs, check_convergence_from_logs_and_state,
             run_turmoil_simulation,
         },
     };
@@ -149,6 +169,12 @@ pub mod dev_tool {
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
+    // Deterministic streaming PUT relay stream-failure injection, and the
+    // count of relay failures reported upstream (#5671).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_FAILURES_REPORTED;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::put::op_ctx_task::relay_stream_fault_injection as put_relay_stream_fault_injection;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 

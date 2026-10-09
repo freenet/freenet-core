@@ -15,11 +15,8 @@
 //!
 //! The engine provides two calling conventions, both synchronous at the trait level:
 //!
-//! - **Synchronous** (`call_3i64`, `call_3i64_async_imports`): Used for delegate
-//!   `process()` calls. Runs on the current thread. Wasmtime internally uses
-//!   `call_async()` via a `block_on_async` helper.
-//!   `call_3i64_async_imports` is the variant for V2 delegates with async host
-//!   function imports.
+//! - **Synchronous** (`call_3i64`): Used for delegate `process()` calls.
+//!   Wasmtime internally uses `call_async()` via a `block_on_async` helper.
 //!
 //! - **Blocking with timeout** (`call_2i64_blocking`, `call_3i64_blocking`): Offloads
 //!   WASM to a blocking thread with timeout. Used for contract operations that may
@@ -34,11 +31,10 @@ mod wasmtime_engine;
 /// Retired-instance bytes ONE wasmtime Store may hold before it is refreshed, for
 /// a host with `total_ram` bytes and `pool_size` executors. Re-exported because
 /// there is one Store per executor, so it is a per-worker term in the node's
-/// aggregate memory commitment — consulted by both
-/// `contract::executor::declared_cache_ceiling` (production) and
-/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe` (the
-/// test that verifies it stays safe).
-#[cfg(feature = "wasmtime-backend")]
+/// aggregate memory commitment — consulted by
+/// `contract::executor::declared_cache_ceiling`, which is test-only since #5647
+/// (it feeds `cache_byte_budgets_are_aggregate_safe`).
+#[cfg(all(feature = "wasmtime-backend", test))]
 pub(crate) use wasmtime_engine::store_arena_budget_for;
 
 use super::ContractError;
@@ -144,24 +140,26 @@ pub(crate) trait WasmEngine: Send {
     /// cache hits for that module.
     fn module_compiled_size(&self, module: &Self::Module) -> usize;
 
-    // -- Module inspection --
-
-    /// Check if a compiled module imports async host functions.
-    ///
-    /// Returns `true` if the module imports the `freenet_delegate_contracts`
-    /// namespace, indicating it's a V2 delegate that needs `call_async`.
-    fn module_has_async_imports(&self, module: &Self::Module) -> bool;
-
     // -- Instance lifecycle --
 
     /// Create a WASM instance from a compiled module.
     ///
     /// Sets up imports, calls `__frnt_set_id`, records memory address,
     /// and ensures sufficient memory for `req_bytes`.
+    ///
+    /// The instance id is NOT a parameter: it is issued by
+    /// `native_api::next_instance_id` and returned in the [`InstanceHandle`].
+    /// Instance ids key the process-global `MEM_ADDR` / `DELEGATE_ENV` /
+    /// `CONTRACT_IO` maps, so a caller-chosen id could collide with a LIVE
+    /// instance belonging to another engine in the same process and make
+    /// [`Self::drop_instance`] evict that instance's entry (#4213 / #5023).
+    ///
+    /// Any future backend implementing this trait MUST allocate the same way;
+    /// `create_instance_allocates_its_own_instance_id` in the wasmtime backend
+    /// pins that for the one implementation that exists today.
     fn create_instance(
         &mut self,
         module: &Self::Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError>;
 
@@ -185,23 +183,6 @@ pub(crate) trait WasmEngine: Send {
 
     /// Call a WASM function `name(a, b, c) -> i64` synchronously.
     fn call_3i64(
-        &mut self,
-        handle: &InstanceHandle,
-        name: &str,
-        a: i64,
-        b: i64,
-        c: i64,
-    ) -> Result<i64, WasmError>;
-
-    // -- Async-imports WASM function calls --
-    // Used for V2 delegates that have async host function imports.
-    // This is still a blocking call from Rust's perspective.
-
-    /// Call a WASM function `name(a, b, c) -> i64` using the async calling convention.
-    ///
-    /// Required when the module has async host function imports (e.g., V2 delegate
-    /// contract access functions registered via `func_wrap_async`).
-    fn call_3i64_async_imports(
         &mut self,
         handle: &InstanceHandle,
         name: &str,

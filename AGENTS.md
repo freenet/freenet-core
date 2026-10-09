@@ -25,14 +25,18 @@ When unsure which bucket a change is in, open an issue first.
 1. Is this in crates/core/?
    → Check .claude/rules/testing.md for DST requirements
    → Verify: TimeSource for time, GlobalRng for randomness
+   → Check .claude/rules/bug-prevention-patterns.md — patterns that have
+     already caused repeat production bugs in this crate
 
 2. Which module are you modifying?
    → ring/router/     → Check .claude/rules/ring.md
    → operations/      → Check .claude/rules/operations.md
    → transport/       → Check .claude/rules/transport.md
    → contract/wasm_runtime/ → Check .claude/rules/contracts.md
-   → server/path_handlers* or server/client_api* → Check .claude/rules/browser-assets.md
+   → anything under server/ → Check .claude/rules/browser-assets.md
      (the injected JS, plus the HTML/CSP wrappers that decide what it may do)
+   → bin/, build.rs, any Cargo.toml, apps/freenet-ping/, *.service, package.nix
+                      → Check .claude/rules/deployment.md
 
 3. Is this Rust code?
    → Check .claude/rules/code-style.md
@@ -45,6 +49,40 @@ When unsure which bucket a change is in, open an issue first.
 2. Check: Does commit message follow conventional commits?
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
+
+### AFTER opening a PR — and before you stop
+
+**Do not open a PR you are not going to drive to a terminal state.** A terminal
+state is merged, or closed with a reason. "Opened, CI green, walked away" is not
+an outcome — it is a liability handed to whoever comes next.
+
+```
+1. Watch CI to completion. Fix what it reports; don't leave it red and leave.
+2. Get the review the change's risk tier requires (CONTRIBUTING.md, and the
+   `pr-review` skill it links). Required approving reviews is 0 on this repo —
+   nothing external will stop a PR from sitting unreviewed forever, so the
+   author has to ask for the review.
+3. Merge it (the merge queue rebases and retests), or close it and say why.
+4. If you genuinely cannot finish, say so IN A PR COMMENT before you stop:
+   what is done, what remains, what you would do next. An abandoned PR with a
+   hand-off note is recoverable. A silent one is archaeology.
+```
+
+Why this is a rule and not a preference: measured 2026-08-24, the repo had **59
+open PRs**. Twenty were green, mergeable, and unreviewed — the oldest green and
+untouched since 2026-07-28, and a team member's PR had gone five weeks without a
+reply. None were blocked on CI. They were blocked on nobody owning the last step.
+
+The compounding cost is the real damage. Nine of those PRs had gone from mergeable
+to CONFLICTING, and they conflicted with *each other*, not just with main —
+`ring.rs` was contested by five open PRs at once. Every day a PR waits raises the
+cost of landing it, which lowers the odds it ever lands. That is a doom loop, not
+a static pile, and the only cheap moment to break it is before you walk away.
+
+The same applies to work that never reaches a PR: **an unpushed branch is invisible
+and unrecoverable by anyone but you.** Push before you stop, even mid-change. The
+2026-08-24 sweep found uncommitted work and orphan commits sitting in agent
+worktrees that no live session owned any more.
 
 ### WHEN fixing a bug (fix: PRs)
 
@@ -110,8 +148,6 @@ This is a recurring meta-pattern where a fix introduces cleanup with
 exemptions, then a follow-up discovers the exemptions themselves are
 buggy (permanently refreshable, missing TTL enforcement).
 Exemptions in GC deserve the same scrutiny as the original bug.
-
-See: docs/weekly-fix-review-2025-02.md (befb0bd → 0b88945 cycle)
 ```
 
 ### WHEN you discover outdated or missing documentation
@@ -142,101 +178,30 @@ cargo test -p freenet          # Test all
 cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
 ```
 
-### Repository Structure
-
-```
-crates/
-├── core/             # Runtime (node, transport, contracts, operations)
-├── fdev/             # Developer CLI
-├── freenet-macros/   # Test macros
-└── release-agent/    # HTTP service on each gateway for triggering
-                      # auto-updates from the release workflow (#4073)
-apps/                 # Example applications
-docs/architecture/    # Design docs
-```
-
-### Core Modules (`crates/core/src/`)
-
-| Module | Purpose |
-|--------|---------|
-| `node/` | Event loop, coordination |
-| `operations/` | State machines (GET, PUT, UPDATE, SUBSCRIBE, CONNECT) |
-| `contract/` | WASM execution |
-| `transport/` | UDP networking, encryption |
-| `ring/` | DHT topology |
-| `simulation/` | DST framework |
-
-### Key Abstractions
-
-| Need | Use | Location |
-|------|-----|----------|
-| Time | `TimeSource` | `crates/core/src/simulation/` |
-| RNG | `GlobalRng` | `crates/core/src/config.rs` |
-| Sockets | `Socket` trait | `crates/core/src/transport/` |
-
-## Documentation
-
-### Architecture Docs
-
-| Topic | Location |
-|-------|----------|
-| Architecture | `docs/architecture/README.md` |
-| Ring/DHT | `docs/architecture/ring/README.md` |
-| Operations | `docs/architecture/operations/README.md` |
-| Transport | `docs/architecture/transport/README.md` |
-| Testing | `docs/architecture/testing/README.md` |
-
-### Module Rules (path-scoped)
-
-| Module | Rules |
-|--------|-------|
-| Ring/Router | `.claude/rules/ring.md` |
-| Operations | `.claude/rules/operations.md` |
-| Transport | `.claude/rules/transport.md` |
-| Contracts | `.claude/rules/contracts.md` |
-| Browser assets (injected JS + its HTML/CSP wrappers) | `.claude/rules/browser-assets.md` |
-
-### General Rules
-
-| Topic | Location |
-|-------|----------|
-| Code style | `.claude/rules/code-style.md` |
-| Git workflow | `.claude/rules/git-workflow.md` |
-| DST testing | `.claude/rules/testing.md` |
-| Deployment | `.claude/rules/deployment.md` |
+Module and rule-file pointers are in "BEFORE modifying any file" above. Most
+`.claude/rules/*.md` are path-scoped and load automatically for the files they
+cover; `git-workflow.md` is deliberately unscoped because it is cross-cutting.
+Architecture design docs live under `docs/architecture/` — start at its
+`README.md`, then `<topic>/README.md`.
 
 ## Release Workflow & RELEASE_PAT
 
 The release pipeline (`.github/workflows/release.yml` →
 `.github/workflows/cross-compile.yml` → downstream `gateway-update.yml` /
-`release-announce.yml`) relies on a `RELEASE_PAT` repo secret to fire
-all the workflow events that make releases zero-touch.
+`release-announce.yml` / `docker-publish.yml`) relies on a `RELEASE_PAT` repo
+secret to fire all the workflow events that keep releases zero-touch. GitHub's
+`GITHUB_TOKEN` deliberately suppresses events it triggers from starting a new
+workflow run (anti-recursion safeguard). Two distinct failure modes hit the
+v0.2.57 release, and they have DIFFERENT remedies:
 
-### Why a PAT is required
-
-GitHub's `GITHUB_TOKEN` deliberately suppresses workflow-triggering
-events as an anti-recursion safeguard:
-
-> When you use the repository's `GITHUB_TOKEN` to perform tasks,
-> events triggered by the `GITHUB_TOKEN` will not create a new
-> workflow run.
-
-That means any `gh` call inside a workflow that *should* wake up
-another workflow has to authenticate with a personal access token
-(PAT) instead. Two concrete failure modes hit the v0.2.57 release:
-
-1. **Bump PR has 0 check-runs.** `release.yml` opens the
-   `release/vX.Y.Z` PR via `gh pr create`. With `GITHUB_TOKEN`, no
-   `pull_request` event fires, so `ci.yml` never runs and the PR's
-   required checks never go green. Workaround was
-   `gh pr close && gh pr reopen`, which broke `wait_for_pr` polling.
-
-2. **`release.published` doesn't fire downstream workflows.**
-   `cross-compile.yml`'s `attach-to-release` job ends with
-   `gh release edit --draft=false`. With `GITHUB_TOKEN`, the
-   `release.published` event is suppressed, so `gateway-update.yml`
-   and `release-announce.yml` don't auto-fire. v0.2.57 had to trigger
-   them manually via `workflow_dispatch`.
+1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
+   never runs and its required checks never turn green. `ci.yml` has no
+   `workflow_dispatch`, so it cannot be started by hand. The old workaround,
+   closing and reopening the PR, breaks `wait_for_pr` polling
+   (`release.yml:285`), whose `release_sha` output `verify_publishable` and
+   `create_release` depend on.
+2. **`release.published` does not fire downstream workflows.** Those DO expose
+   `workflow_dispatch`, so they can be triggered per step by hand.
 
 ### Configuring the secret
 
@@ -272,8 +237,11 @@ human has to intervene. `release.yml` emits a GitHub `::warning::`
 on every run that's missing the secret, so the gap is visible
 early.
 
-`.github/workflows/check-token-coalesce.yml` runs on every PR and
-fails if any new event-emitting step regresses to bare
+`.github/workflows/check-token-coalesce.yml` runs on every PR that
+touches a workflow file — it is path-filtered to
+`.github/workflows/**.yml` and `**.yaml`, which is safe here because it
+is not a required check (a path-filtered *required* check is #5451) —
+and fails if any new event-emitting step regresses to bare
 `GITHUB_TOKEN` / `github.token` — see issue #4118 for the regression
 class this guard prevents.
 
@@ -327,6 +295,67 @@ until a runtime path actually reads it.
 
 Operator-facing documentation (encryption model, migration matrix,
 `freenet secrets` CLI) lives in [`docs/secrets-at-rest.md`](docs/secrets-at-rest.md).
+
+## Two independent telemetry pipelines
+
+`telemetry-enabled` / `telemetry-endpoint` feed the project's central dashboard
+(`tracing/telemetry.rs`). `otel-telemetry-enabled` / `otel-endpoint` are a
+**separate, unrelated** OpenTelemetry SDK metrics pipeline (`tracing/otel.rs`):
+no shared config, no shared endpoint, no fallback in either direction, and
+`otel-endpoint` must never default to the dashboard collector.
+
+Rules when touching `tracing/otel.rs`:
+
+- Observable instruments must read **cumulative, never-reset** values.
+  `TransportSnapshot` fields are period accumulators that `take_snapshot`
+  zeroes for the legacy telemetry worker, so observing one as a counter yields
+  a non-monotonic series whenever `telemetry-enabled` is also on.
+- Never export a `PeerId`, socket address, or any attribute identifying the
+  remote end of a connection. `PeerId` renders as `{pub_key}@{addr}`, which
+  leaks our address and re-identifies the node whenever it changes. This node's
+  identity is two resource attributes (`freenet.node.*`, one per export batch),
+  not a per-datapoint attribute. "Peer" means the *other* end of a connection.
+- Histograms get their base-2 exponential aggregation from one `with_view` in
+  `build_provider_blocking`. Do not add explicit bucket boundaries per
+  instrument.
+- Export outcomes must be logged by `OtlpHttpClient::send_bytes`. The SDK will
+  not do it: `opentelemetry-otlp` logs network errors and non-2xx at DEBUG on
+  the stated grounds that `PeriodicReader` re-logs them at error level, which
+  is true for the batch log/span processors and false for metrics. Deleting
+  that logging makes a dead collector produce no output at all.
+- The `freenet.node.*` resource attributes are always emitted and must never
+  be made deferrable to `OTEL_RESOURCE_ATTRIBUTES`. They are what the
+  collector checks the bearer-token signature against; an override would
+  export an identity that does not match the signing key.
+- **Nothing is exported anywhere unless an operator asked.** Freenet is a
+  privacy-focused network, so `otel-telemetry-enabled` defaults false,
+  `otel-auth-mode` defaults `disabled`, and no endpoint is baked in — with
+  nothing configured the SDK default is loopback. Never add a default that
+  points off-machine, and never make the exporter on-by-default.
+- **The node's bearer token signs the request BODY** (as a hash, not
+  transmitted). Sign only the prefix and the token stops binding the payload,
+  so a captured token can be attached to invented metrics — the spoofing the
+  scheme exists to prevent. `REPLAY_WINDOW` is a wire contract with the
+  collector; changing it means changing `docs/otel-metrics.md` too.
+- **No credential leaves in cleartext.** `send_bytes` must refuse when the
+  endpoint is plaintext `http` to a non-loopback host — for our token AND for
+  every header the operator declared via `OTEL_EXPORTER_OTLP_HEADERS`, not just
+  `Authorization`. Redirects and ambient proxies stay disabled on the client:
+  reqwest replays a redirect with the original headers and honours `HTTP_PROXY`
+  with no loopback exemption, so either would carry a credential past a check
+  that only ever sees the endpoint we aimed at. Error bodies are redacted by
+  credential VALUE before logging, and endpoints by userinfo.
+- The exporter always installs its own `HttpClient`, so `opentelemetry-otlp`
+  needs none of its `reqwest-*`/TLS features — enabling one pulls a second
+  reqwest major, a second TLS stack, and a C/asm aws-lc build into every
+  release target.
+
+Everything else — the bearer-token format and its collector-side obligations,
+endpoint precedence, the `OTEL_*` variables honored, and per-instrument notes
+— is in
+[`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md),
+and operator-facing configuration is in
+[`docs/otel-metrics.md`](docs/otel-metrics.md).
 
 ## External Resources
 

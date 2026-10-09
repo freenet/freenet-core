@@ -7,7 +7,9 @@ members = [
 	"apps/freenet-ping/contracts/ping",
 	"tests/test-contract-integration",
 	"tests/test-contract-update-nochange",
-	"tests/test-contract-mock-aligned"
+	"tests/test-contract-mock-aligned",
+	"tests/test-contract-requires-related",
+	"tests/test-contract-delta-trap"
 ]
 
 [workspace.dependencies]
@@ -25,10 +27,9 @@ event-listener = "5"
 hex = "0.4"
 parking_lot = "0.12"
 pav_regression = "0.7.0"
-renegade-ml = "0.3.3"
 pin-project = "1"
 thiserror = "2"
-ulid = { version = "1.1", features = ["serde"] }
+ulid = { version = "3.0", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 # Async/networking
@@ -62,7 +63,7 @@ moka = { version = "0.12", features = ["sync"] }
 
 # File I/O
 directories = "6"
-dirs = "6"
+dirs = "7"
 filetime = "0.2"
 flate2 = "1"
 notify = "8"
@@ -86,11 +87,23 @@ chrono = { version = "0.4", default-features = true }
 
 # Random
 rand = "0.9"
+rand_chacha = "0.10"
+
+# XEdDSA (Signal's construction): signs with the x25519 transport key so the
+# OTel collector can verify node identity against the SAME public key peers
+# and UIs see. Its rand 0.10 dep is exposed as `rand10` for the sign nonce.
+xeddsa = "1.1"
+rand10 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
+rand_core10 = { package = "rand_core", version = "0.10" }
 
 # Observability
+async-trait = "0.1"
 opentelemetry = "0.32"
+# Trait/types only (HttpClient for the per-request auth wrapper); its reqwest
+# integration targets reqwest 0.13 and the workspace is on 0.12, so no features.
+opentelemetry-http = "0.32"
 opentelemetry-jaeger = "0.22"
-opentelemetry-otlp = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing = "0.1"
 # Bumping this? Re-read `rolling.rs`'s `impl io::Write for
@@ -118,10 +131,23 @@ wasmtime = { version = "47", default-features = false, features = [
     "profiling", "runtime", "std", "threads", "wat",
 ] }
 # Lightweight WASM section parser used to reject debug-compiled contracts at
-# PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
-# Pinned to the same minor wasmtime 45 already resolves transitively so cargo
-# reuses one copy rather than locking a second wasmparser build.
-wasmparser = "0.255"
+# PUT time (crates/core/src/client_events.rs::contains_debug_sections) and to
+# detect the deprecated host-clock import
+# (crates/core/src/conformance/host_clock.rs).
+#
+# This was pinned to match the copy wasmtime resolved transitively, so that
+# cargo reused one build. That is NO LONGER TRUE and the intent has not been
+# re-established: the lock now carries 0.244.0, 0.252.0 and 0.257.1, so we
+# parse with a different wasmparser from the one wasmtime validates with. It
+# is immaterial to both consumers today — each reads only section framing,
+# which is stable across these versions, and each runs immediately before a
+# real wasmtime validation that has the final say — but do not restate the
+# single-copy claim without re-checking `cargo tree -d -p wasmparser`.
+wasmparser = "0.258"
+# Test-only WAT assembler, so a fixture module can state its imports in text
+# rather than as hand-encoded LEB128. Already in the lock file: wasmtime's
+# "wat" feature above pulls the same crate, so this adds no new build.
+wat = "1"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }
@@ -130,7 +156,7 @@ freenet-test-network = "0.1.24"
 httptest = "0.16"
 proptest = "1"
 regex = "1"
-rstest = "0.26"
+rstest = "0.27"
 serial_test = "4"
 statrs = "0.19"
 test-log = "0.2"
@@ -151,16 +177,51 @@ libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 winapi = "0.3"
-tao = { version = "0.36", default-features = false, features = ["rwh_06"] }
-wry = { version = "0.56", default-features = false, features = ["os-webview"] }
+tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
 tray-icon = "0.24"
 muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
-# consumed by the #4117 delegate secret copy-forward.
+# 0.12.0 adds delegate manifests (a `freenet-manifest` WASM custom section,
+# read with `DelegateManifest::from_wasm`) and `InboundDelegateMsg::Lifecycle`
+# at tag 10 (stdlib #136). Core delivers `Lifecycle` ONLY to a delegate whose
+# manifest lists that kind and whose app holds the Background grant
+# (`contract::delegate_capabilities`), and refuses it (and `WakeupFired`) in a
+# client's `ApplicationMessages`.
+#
+# 0.11.0 removed seven delegate host imports no released core provided; core
+# never registered them, so nothing here changes.
+#
+# 0.10.0 adds three delegate wire variants, all APPENDED so existing tags are
+# unchanged (stdlib #98/#82). Core matches them explicitly rather than sweeping
+# them into a wildcard, but implements none of them yet:
+#   - `OutboundDelegateMsg::UnsubscribeContractRequest` — a delegate asking to
+#     drop a subscription. No core path behind it (#5600), so both dispatchers
+#     REJECT it with an explicit not-implemented error. A silent drop would
+#     strand the delegate on a response nobody sends and read as a successful
+#     unsubscribe while the subscription stayed live.
+#   - `InboundDelegateMsg::UnsubscribeContractResponse` — its answer, likewise
+#     never produced by core yet.
+#   - `InboundDelegateMsg::WakeupFired` — delivery of a wakeup scheduled via
+#     the new `__frnt__delegate__schedule_wakeup` host import (#5565). Core's
+#     wasmtime linker does not define that import and does not trap unknown
+#     imports, so a delegate that CALLS it fails at instantiation; one that
+#     merely links stdlib 0.10.0 without calling it is unaffected.
+#
+# 0.9.0 REMOVES `DelegateRequest::RegisterDelegateWithPredecessors` from the
+# wire (stdlib #91, GHSA-824h-7x5x-wfmf). Source-breaking, hence the minor bump.
+# Its node-side secret copy-forward was gated on an `origin_contract` any HTTP
+# client can forge, so the gate authorized nothing; #5199 had already disabled
+# the copy, leaving the variant registering exactly as `RegisterDelegate` does.
+# `SecretsStore::migrate_secrets` survives with its tests but now has NO caller.
+# Do NOT reintroduce a registration variant that copies secrets forward without
+# first making `origin_contract` attestable.
+#
+# 0.8.4 added that variant in the first place (stdlib PR #86), for the #4117
+# delegate secret copy-forward. Both are gone as of 0.9.0, above.
 #
 # 0.8.5 fixes the FlatBuffers client-request boundary (stdlib #85/#87/#88).
 # Behaviour changes for FBS clients, none for native ones:
@@ -178,7 +239,7 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Exposure is FBS-only: `client_events/websocket.rs` falls back to
 # Flatbuffers when no encoding is specified, and every first-party client
 # (fdev, riverctl, River UI, the test harness) explicitly pins native.
-freenet-stdlib = "0.8.5"
+freenet-stdlib = "0.12.1"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

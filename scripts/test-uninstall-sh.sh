@@ -66,7 +66,7 @@ run_case() {
     # Plant a sibling file so we can verify shared XDG parents survive.
     echo "other app" > "$home/.local/share/other-app.txt"
 
-    HOME="$home" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" "$@" </dev/null \
+    HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" "$@" </dev/null \
         >"$home/out.log" 2>&1
     status=$?
 
@@ -137,7 +137,7 @@ custom=$(mktemp -d)
 mkdir -p "$home/.local/bin"
 touch "$home/.local/bin/freenet" "$custom/freenet" "$custom/fdev"
 
-FREENET_INSTALL_DIR="$custom" HOME="$home" FREENET_ALLOW_ROOT=1 \
+FREENET_INSTALL_DIR="$custom" HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" FREENET_ALLOW_ROOT=1 \
     sh "$UNINSTALL" --keep-data </dev/null >"$home/out.log" 2>&1
 st=$?
 case_name="FREENET_INSTALL_DIR is honored"
@@ -153,10 +153,77 @@ if [ "$fails" -eq "$case_fails_before" ]; then
 fi
 rm -rf "$home" "$custom"
 
+# ── Case 2c: the freenet:// link handler is removed, nothing else is ───────
+#
+# Only Freenet's marked desktop entry and Freenet's own mimeapps.list line
+# go; an unmarked file at the same path and every other association stay.
+
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/applications" "$home/.config" "$home/.local/bin"
+touch "$home/.local/bin/freenet"
+printf '[Desktop Entry]\nExec="/x/freenet" open -- %%u\nX-Freenet-Managed=true\n' \
+    > "$home/.local/share/applications/freenet-url-handler.desktop"
+echo "[Desktop Entry]" > "$home/.local/share/applications/other.desktop"
+printf '[Default Applications]\ntext/html=firefox.desktop\nx-scheme-handler/freenet=freenet-url-handler.desktop\nx-scheme-handler/magnet=qbt.desktop\n' \
+    > "$home/.config/mimeapps.list"
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+    FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --keep-data </dev/null >"$home/out.log" 2>&1
+st=$?
+case_name="freenet:// handler removed, other associations kept"
+case_fails_before=$fails
+[ "$st" -eq 0 ] || fail "$case_name" "exit $st"
+assert_absent  "$case_name" "$home/.local/share/applications/freenet-url-handler.desktop"
+assert_present "$case_name" "$home/.local/share/applications/other.desktop"
+if grep -q 'x-scheme-handler/freenet' "$home/.config/mimeapps.list"; then
+    fail "$case_name" "freenet association still in mimeapps.list"
+fi
+for kept in 'text/html=firefox.desktop' 'x-scheme-handler/magnet=qbt.desktop' '\[Default Applications\]'; do
+    grep -q "^$kept\$" "$home/.config/mimeapps.list" \
+        || fail "$case_name" "lost unrelated line: $kept"
+done
+[ "$fails" -eq "$case_fails_before" ] && pass "$case_name"
+rm -rf "$home"
+
+# An unmarked desktop entry at our path is not ours: leave it, and leave the
+# association naming it.
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/applications" "$home/.config"
+echo "[Desktop Entry]" > "$home/.local/share/applications/freenet-url-handler.desktop"
+echo "x-scheme-handler/freenet=freenet-url-handler.desktop" > "$home/.config/mimeapps.list"
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+    FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --keep-data </dev/null >"$home/out.log" 2>&1
+case_name="unmarked desktop entry and its association are left alone"
+case_fails_before=$fails
+[ -e "$home/.local/share/applications/freenet-url-handler.desktop" ] \
+    || fail "$case_name" "removed a desktop entry without Freenet's marker"
+grep -q 'x-scheme-handler/freenet' "$home/.config/mimeapps.list" \
+    || fail "$case_name" "removed the association of an unmarked entry"
+[ "$fails" -eq "$case_fails_before" ] && pass "$case_name"
+rm -rf "$home"
+
+# A symlinked mimeapps.list stays a symlink; the legacy location is cleaned.
+home=$(mktemp -d)
+mkdir -p "$home/.local/share/applications" "$home/.config" "$home/dotfiles"
+printf 'x-scheme-handler/freenet=freenet-url-handler.desktop\na=b\n' > "$home/dotfiles/mimeapps.list"
+ln -s "$home/dotfiles/mimeapps.list" "$home/.config/mimeapps.list"
+printf 'x-scheme-handler/freenet=freenet-url-handler.desktop;\n' \
+    > "$home/.local/share/applications/mimeapps.list"
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" \
+    FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --keep-data </dev/null >"$home/out.log" 2>&1
+case_name="symlinked and legacy mimeapps.list are cleaned in place"
+case_fails_before=$fails
+[ -L "$home/.config/mimeapps.list" ] || fail "$case_name" "symlink replaced by a regular file"
+if grep -q freenet "$home/dotfiles/mimeapps.list" "$home/.local/share/applications/mimeapps.list"; then
+    fail "$case_name" "freenet association left behind"
+fi
+grep -qx 'a=b' "$home/dotfiles/mimeapps.list" || fail "$case_name" "lost an unrelated line"
+[ "$fails" -eq "$case_fails_before" ] && pass "$case_name"
+rm -rf "$home"
+
 # ── Case 3: nothing installed → exits cleanly with the right message ───────
 
 home=$(mktemp -d)
-HOME="$home" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --keep-data </dev/null \
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --keep-data </dev/null \
     >"$home/out.log" 2>&1
 st=$?
 if [ "$st" -ne 0 ]; then
@@ -173,7 +240,7 @@ rm -rf "$home"
 # ── Case 4: --purge and --keep-data are mutually exclusive ─────────────────
 
 home=$(mktemp -d)
-HOME="$home" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --purge --keep-data \
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --purge --keep-data \
     </dev/null >"$home/out.log" 2>&1
 st=$?
 if [ "$st" -eq 0 ]; then
@@ -190,7 +257,7 @@ rm -rf "$home"
 # ── Case 5: unknown flag errors out ────────────────────────────────────────
 
 home=$(mktemp -d)
-HOME="$home" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --definitely-not-a-flag \
+HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_CONFIG_HOME="$home/.config" FREENET_ALLOW_ROOT=1 sh "$UNINSTALL" --definitely-not-a-flag \
     </dev/null >"$home/out.log" 2>&1
 st=$?
 if [ "$st" -eq 0 ]; then

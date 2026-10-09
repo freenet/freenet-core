@@ -338,6 +338,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             packet_size,
             token,
             PacketStream::Stream(stream_id),
+            &last_packet_id,
         )
         .await
         {
@@ -736,6 +737,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             packet_size,
             token,
             PacketStream::Stream(outbound_stream_id),
+            &last_packet_id,
         )
         .await
         {

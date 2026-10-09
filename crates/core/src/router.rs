@@ -1,6 +1,20 @@
+pub(crate) mod dataset;
+#[cfg(test)]
+mod golden_replay;
+mod hierarchical;
 mod isotonic_estimator;
-mod routing_predictor;
+#[cfg(test)]
+mod recoverability;
+mod skill;
 mod util;
+
+/// Simulation coverage for the hierarchical estimator (#4485), gated on
+/// `simulation_tests` like the other in-crate simulation cases. The module name
+/// is load-bearing: CI's simulation job selects in-crate simulation tests with
+/// `-E 'kind(test) | (kind(lib) & test(sim_e2e_tests))'`, so a differently-named
+/// module would compile and never run (#4301).
+#[cfg(all(test, feature = "simulation_tests"))]
+mod sim_e2e_tests;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,8 +27,12 @@ use crate::ring::interest::{
     InterestRegistrationSource, InterestRemovalCause, MissingSummaryClass,
     SummaryPopulationOutcome, SummaryPopulationSource,
 };
-use crate::ring::{Distance, Location, PeerKeyLocation};
+use crate::ring::{Distance, Location, PeerKeyLocation, Ring};
 use crate::tracing::event_kind::STATE_SIZE_BUCKET_COUNT;
+pub(crate) use hierarchical::{
+    MIN_CURVE_POINTS_FAILURE, MIN_CURVE_POINTS_LOG, PeerOffset,
+    WINDOW_EVENTS as HIERARCHICAL_WINDOW_EVENTS,
+};
 pub(crate) use isotonic_estimator::{
     AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
 };
@@ -88,10 +106,6 @@ pub(crate) struct RoutingPredictionInfo {
     pub time_to_response_start: f64,
     pub expected_total_time: f64,
     pub transfer_speed_bps: f64,
-    /// How much renegade shifted the failure estimate (positive = renegade thinks more likely to fail).
-    /// None if renegade had no prediction for this candidate.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub renegade_failure_adjustment: Option<f64>,
 }
 
 impl From<RoutingPrediction> for RoutingPredictionInfo {
@@ -101,7 +115,6 @@ impl From<RoutingPrediction> for RoutingPredictionInfo {
             time_to_response_start: p.time_to_response_start,
             expected_total_time: p.expected_total_time,
             transfer_speed_bps: p.xfer_speed.bytes_per_second,
-            renegade_failure_adjustment: p.renegade_failure_adjustment,
         }
     }
 }
@@ -194,7 +207,11 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// and post-#5117 series separately. Still an undercount either way: the
     /// removal is only honoured within `INTEREST_TTL` and lives in a bounded LRU.
     pub recreated: [u64; InterestRemovalCause::COUNT],
-    /// Summary-population outcomes by source then outcome.
+    /// Summary-population outcomes by source then outcome. Each row grew from
+    /// 4 to 5 entries in #5647 (`rejected_oversized`, appended last) while the
+    /// schema stayed `v: 1`: positions of existing outcomes are unchanged, so a
+    /// reader indexes by `SummaryPopulationOutcome::ALL` order and treats a
+    /// shorter row as coming from an older node.
     pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
     /// Missing-pair history and active-attempt correlation overflows.
     pub corr_ovf: [u64; 2],
@@ -297,8 +314,12 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// `ring::hosting::HostingCause::ALL`: client GET, transit GET, sub-op GET,
     /// client PUT, transit PUT, startup restore, unattributed.
     ///
-    /// Answers "why is this peer hosting this contract" in aggregate, which
-    /// nothing recorded before: `AccessType` distinguishes only GET from PUT and
+    /// Answers "why did this peer BEGIN hosting this contract" in aggregate,
+    /// which nothing recorded before. The present-tense sibling is
+    /// `ring::HostingReason` (`freenet.node.contracts.hosted`), which
+    /// re-derives current demand on every collection instead of freezing
+    /// provenance at admission — see that enum's rustdoc for the split.
+    /// `AccessType` distinguishes only GET from PUT and
     /// so cannot separate a client's own request from transit — the distinction
     /// every hosting-policy decision rests on. In particular a subscribe-fetch
     /// travels the ordinary GET driver as a sub-op, and was indistinguishable
@@ -452,6 +473,35 @@ pub(crate) struct RouterSnapshotInfo {
     /// the soft limit (`EMFILE`) drove the v0.2.73 gateway crash-loop and was
     /// invisible to the collector at the time. See #4440.
     pub open_fds: Option<u64>,
+    /// Timeout route labels per peer since the previous snapshot (#5657),
+    /// as a histogram: how many peers collected 1, 2-3, 4-7 and 8+ timeout
+    /// labels in the window, the most any single peer collected, and how many
+    /// labels landed on peers beyond the tracking cap. Populated by `Ring`.
+    ///
+    /// Each window is one snapshot interval. The first runs from `Ring`
+    /// construction to the first snapshot (the loop skips its immediate first
+    /// tick), so it is the same length but covers the node's start-up routing.
+    /// Telemetry-only: there is no local dashboard view, because the window is
+    /// drained by the snapshot and a second reader would steal its labels.
+    ///
+    /// Soak signal for CHAIN BLAME: an originator timeout is labelled against
+    /// the first hop although the stall may be anywhere down the chain. One
+    /// stuck host behind a popular key shows up here as a tail of first hops
+    /// with many labels (a high max and a populated 8+ bucket). Accepted for
+    /// router-only labels (they never reach `peer_health`), but watched.
+    /// No peer identities are exported.
+    #[serde(default)]
+    pub timeout_label_peers_1: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_2_3: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_4_7: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_peers_8_plus: Option<u64>,
+    #[serde(default)]
+    pub timeout_label_max_per_peer: Option<u64>,
+    #[serde(default)]
+    pub timeout_labels_untracked: Option<u64>,
     /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
@@ -553,6 +603,64 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
+    /// Resident-overhead pressure axis (#5325, #5647), populated by `Ring` from
+    /// the `HostingManager` on the snapshot cadence. This is the SECOND,
+    /// independent eviction pressure: `hosting_budget_bytes` /
+    /// `hosting_current_bytes` above bound contract STATE bytes (on disk), while
+    /// this axis bounds the memory hosted contracts hold in RAM, and either can
+    /// trigger a sweep on its own.
+    ///
+    /// `hosting_resident_overhead_budget_bytes` is `--hosting-mem-share` of the
+    /// node's memory limit. `hosting_resident_overhead_bytes` is COUNTED, not
+    /// estimated: the neighbour-summary bytes the interest manager holds for the
+    /// hosted contracts plus a fixed per-entry charge, as of the last sweep. Both
+    /// are bytes, so `used / budget` is a utilization ratio; the budget moves
+    /// only if the memory limit does. Compare `hosting_resident_overhead_bytes`
+    /// with the process's `memory_rss_bytes` (resource_utilization) to see how
+    /// much of RSS hosting accounts for.
+    ///
+    /// `hosting_resident_overhead_evictions_total` is a monotonic counter the
+    /// collector differences to get this axis's eviction rate; it may overlap
+    /// with `hosting_budget_evictions_total`. `None` until the ring is built.
+    ///
+    /// `hosting_resident_overhead_evicted_charged_bytes_total` is a monotonic
+    /// sum of the bytes CHARGED to each contract this axis evicted, as of the
+    /// sweep before its eviction (#5647). It is what the accounting stopped
+    /// counting, not a measurement of memory released: the neighbour-record
+    /// part is freed a few minutes later, when #5782's reconciliation drops
+    /// the records of a contract that is neither hosted nor in use, and a
+    /// summary that arrived since the last sweep was never charged.
+    ///
+    /// `interest_summary_bound_trims_total` and
+    /// `interest_summary_bound_trimmed_bytes_total` count the neighbour
+    /// summaries dropped (and the distinct bytes freed) by the two summary
+    /// bounds (#5781): a hosted contract over its cap relative to our own
+    /// summary, or one peer holding more than its share of summary bytes only
+    /// it had sent. Nonzero means neighbours are sending far more summary
+    /// data than our own summaries justify.
+    ///
+    /// `interest_resident_bytes_total` is the bytes held for neighbour interest
+    /// records across EVERY contract, hosted or not, counted the same way as
+    /// the per-contract figure inside `hosting_resident_overhead_bytes` (#5647).
+    /// The excess over the hosted part is what the node holds for contracts it
+    /// does not host; #5782's reconciliation should keep it small, so a
+    /// growing excess means records are outliving the hosting they serve.
+    ///
+    /// Before #5647 the second field was `hosting_estimated_resident_overhead_bytes`
+    /// (`contract_count` times a flat 1 MiB) and a `hosting_contract_slot_budget`
+    /// was exported beside it. Both are gone; series from before and after do
+    /// not compare.
+    pub hosting_resident_overhead_budget_bytes: Option<u64>,
+    pub hosting_resident_overhead_bytes: Option<u64>,
+    pub hosting_resident_overhead_evictions_total: Option<u64>,
+    pub hosting_resident_overhead_evicted_charged_bytes_total: Option<u64>,
+    pub interest_resident_bytes_total: Option<u64>,
+    pub interest_summary_bound_trims_total: Option<u64>,
+    /// Distinct neighbour-summary bytes held node-wide, excluding our own
+    /// summaries (#5781). Capped at a quarter of
+    /// `hosting_resident_overhead_budget_bytes` by write-time refusal.
+    pub interest_neighbour_summary_bytes: Option<u64>,
+    pub interest_summary_bound_trimmed_bytes_total: Option<u64>,
     /// Local `UpdateNotification` deliveries dropped because the subscriber's
     /// channel was FULL (#4681). The subscriber's cached summary is invalidated
     /// at the same time, so the next update resyncs it with full state; a
@@ -717,6 +825,87 @@ pub(crate) struct RouterSnapshotInfo {
     pub broadcast_stream_attempts_total: Option<u64>,
     pub broadcast_stream_failures_total: Option<u64>,
     pub broadcast_stream_failures_last_snapshot: Option<u64>,
+    /// Contract-exec WASM counters, populated by `Ring` from the per-node
+    /// `ContractExecMetrics` the executor publishes into. These separate the
+    /// EXPENSIVE work (a WASM `summarize_state` / `get_state_delta`
+    /// invocation) from the cache hits that elide it — a distinction the only
+    /// prior production signal, a handler-entry span, could not make, which is
+    /// why every rate quoted across the #4473 / #4610 / #5040 / #5238 storm
+    /// investigations was undifferentiated. See
+    /// `ring::contract_exec_metrics` for the exact partition each arm belongs
+    /// to; briefly:
+    ///
+    /// - `*_fast_hits` — served from cache, no state load, no WASM
+    /// - `*_reload_hits` — state loaded and hashed, cache hit, no WASM
+    /// - `*_wasm_calls` — WASM ran, on the cached path (a true miss)
+    /// - `*_wasm_uncached` — WASM ran, at a site with no cache in front of it
+    ///
+    /// `*_total` are monotonic lifetime counters (the collector differences
+    /// them across the cadence); `*_last_snapshot` are the per-window deltas
+    /// `Ring` samples directly, so ONE snapshot answers "was this peer's
+    /// summarize load cache hits or real WASM work" without a stateful reader.
+    /// EVERY arm gets both, deliberately: emitting some arms as a delta and
+    /// others as a lifetime total, under parallel names, invites reading them as
+    /// comparable magnitudes and would understate exactly the uncached fan-out
+    /// arm most likely to dominate on a client-facing node.
+    /// `None` until the node has a `Ring`-backed executor.
+    pub contract_exec_summarize_fast_hits_total: Option<u64>,
+    pub contract_exec_summarize_reload_hits_total: Option<u64>,
+    pub contract_exec_summarize_wasm_calls_total: Option<u64>,
+    pub contract_exec_summarize_wasm_uncached_total: Option<u64>,
+    pub contract_exec_delta_fast_hits_total: Option<u64>,
+    pub contract_exec_delta_reload_hits_total: Option<u64>,
+    pub contract_exec_delta_wasm_calls_total: Option<u64>,
+    pub contract_exec_delta_wasm_uncached_total: Option<u64>,
+    pub contract_exec_summarize_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_reload_hits_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_wasm_uncached_last_snapshot: Option<u64>,
+    pub contract_exec_delta_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_delta_reload_hits_last_snapshot: Option<u64>,
+    pub contract_exec_delta_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_delta_wasm_uncached_last_snapshot: Option<u64>,
+    /// Occupancy of the executor summary/delta fast-path caches, populated by
+    /// `Ring` from the gauges the caches publish into
+    /// (`ContractExecMetrics::fast_path_cache_snapshot`). The hit/miss arms
+    /// above say whether the cache covered the summarize/delta load; these say
+    /// why not, and WHICH bound is responsible:
+    ///
+    /// - `*_byte_budget_evictions_total` climbing with `*_bytes` pinned near
+    ///   `*_budget_bytes`: the byte budget binds.
+    /// - `*_count_cap_evictions_total` climbing with `*_entries` at
+    ///   `*_count_cap`: the count cap (the hosted-set coverage target) binds —
+    ///   likely for the delta cache, whose key includes the peer's summary hash
+    ///   so one contract can hold several entries.
+    ///
+    /// `*_entries`, `*_bytes`, `*_budget_bytes` and `*_count_cap` are gauges
+    /// summed over every live cache (one shared pair per `RuntimePool`); the two
+    /// `*_evictions_total` are monotonic lifetime counters (the collector
+    /// differences them).
+    #[serde(default)]
+    pub contract_summary_cache_entries: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_bytes: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_count_cap: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_count_cap_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub contract_summary_cache_byte_budget_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_entries: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_bytes: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_count_cap: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_count_cap_evictions_total: Option<u64>,
+    #[serde(default)]
+    pub contract_delta_cache_byte_budget_evictions_total: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -786,6 +975,12 @@ pub(crate) struct RouterSnapshotInfo {
     pub lattice_predecessor_distance: Option<f64>,
     pub lattice_probes_issued: Option<u64>,
     pub lattice_probe_improvements: Option<u64>,
+    /// Route-to-self probe ACCEPTORS that were not a lattice edge (monotonic
+    /// lifetime total; one probe can have several acceptors, so this can
+    /// exceed `lattice_probes_issued`). Each one is evidence a side is tight;
+    /// once both sides have one, discovery sleeps, so on a converged peer
+    /// `probes_issued` flattens by design (#5814).
+    pub lattice_probe_misses: Option<u64>,
     /// Version-gate refusal counters (#5156), populated by `Ring` on the
     /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
     /// `supports_hash_first_summaries` and `supports_summary_first_put` both
@@ -848,51 +1043,357 @@ pub(crate) struct RouterSnapshotInfo {
     /// Monotonic lifetime totals. `None` until the ring's snapshot task populates.
     pub connect_accepts_emitted: Option<u64>,
     pub connect_rejects_emitted: Option<u64>,
+    /// Bootstrap-acceptance-churn counters (#4787): a restarted node's
+    /// gateway connection lingers as transient, expires, and is later reaped
+    /// as a zombie before the onward CONNECT promotes it to the ring — the
+    /// joiner cycles through repeated reconnects before it acquires real
+    /// peers. These are the "instrumentation before a fix" step the issue
+    /// calls for, not a behavior change.
+    ///
+    /// `bootstrap_transient_registered` / `_expired` / `_promoted_to_ring` are
+    /// monotonic lifetime totals on the ACCEPTOR side; a sustained high
+    /// `_expired`:`_promoted_to_ring` ratio is the churn signature. Both
+    /// promotion paths are counted, and only when the ring actually accepted
+    /// the connection.
+    ///
+    /// The rest are JOINER-side. `bootstrap_time_to_min_connections_secs` is
+    /// time from process start to first reaching `min_connections`, recorded
+    /// once per process; `bootstrap_completed` disambiguates the `None` there —
+    /// `Some(false)` means this node has never bootstrapped, `None` means the
+    /// field wasn't reported at all. The four `bootstrap_startup_rounds_*`
+    /// fields partition below-threshold join-loop rounds by what each round
+    /// actually did (dialled unconnected gateways / routed CONNECTs through
+    /// already-connected ones / blocked by gateway backoff / had no target),
+    /// which is what keeps a permanently-stuck joiner's count from being an
+    /// undifferentiated process-uptime proxy.
+    ///
+    /// Populated by `Ring` from the network_status singleton on the snapshot
+    /// cadence; `None` until the ring's snapshot task populates them.
+    pub bootstrap_transient_registered: Option<u64>,
+    pub bootstrap_transient_expired: Option<u64>,
+    pub bootstrap_promoted_to_ring: Option<u64>,
+    pub bootstrap_time_to_min_connections_secs: Option<f64>,
+    pub bootstrap_completed: Option<bool>,
+    pub bootstrap_startup_rounds_connect_issued_gateway: Option<u64>,
+    /// Sustained growth with `bootstrap_completed == Some(false)` means this
+    /// joiner never bootstrapped; the `bootstrap_transient_expired` :
+    /// `bootstrap_promoted_to_ring` ratio separates #4787 acceptance churn
+    /// from simply having too few acceptable peers.
+    pub bootstrap_startup_rounds_connect_issued_routed: Option<u64>,
+    pub bootstrap_startup_rounds_backoff_blocked: Option<u64>,
+    pub bootstrap_startup_rounds_no_target: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
-    /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
-    /// read by the in-process peer dashboard directly from this struct; they are
-    /// intentionally not mirrored into the hand-written OTLP `json!` block in
-    /// `tracing/telemetry.rs` (the dashboard is the only consumer). The per-op
-    /// scatter does reach OTLP, because `per_op_curves` is forwarded wholesale.
-    pub renegade_failure_events: usize,
-    pub renegade_response_time_events: usize,
-    pub renegade_transfer_speed_events: usize,
-    pub renegade_known_peers: usize,
-    /// Brier score for failure predictions (lower is better, 0.25 = random).
-    pub renegade_brier_score: Option<f64>,
-    /// Recent Brier score (EWMA).
-    pub renegade_recent_brier_score: Option<f64>,
-    /// Number of predictions evaluated against actual outcomes.
-    pub renegade_predictions_evaluated: u64,
-    /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
-    pub renegade_accuracy_pairs: Vec<(f64, f64)>,
-    /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
-    /// `#[serde(default)]` for decode consistency with the `*_points` fields
-    /// (no-op under the positional bincode AOF).
+    /// Brier SKILL of the hierarchical failure forecast (the one routing acts
+    /// on) against the climatological base rate: `1 - brier/(p(1-p))`. Zero
+    /// means "no better than assuming the base rate", negative means worse than
+    /// assuming nothing.
+    ///
+    /// Skill rather than raw Brier because raw Brier on a rare event is
+    /// dominated by how rare the event is, not by how good the forecast is — at
+    /// a 1% base rate a constant forecast scores 0.0099, which an absolute scale
+    /// grades "excellent". See #4485.
     #[serde(default)]
-    pub renegade_response_time_pairs: Vec<(f64, f64)>,
-    /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    pub failure_skill_hierarchical: Option<f64>,
+    /// Events the hierarchical failure forecast was scored on: events that
+    /// arrived once both it and the isotonic baseline could forecast.
     #[serde(default)]
-    pub renegade_transfer_speed_pairs: Vec<(f64, f64)>,
-    /// Number of response-time predictions scored against actual outcomes.
+    pub hierarchical_failure_evaluated: u64,
+    /// Brier score of the hierarchical failure forecast, and the climatology it
+    /// is scored against, so the dashboard can show the baseline alongside it.
     #[serde(default)]
-    pub renegade_response_time_evaluated: u64,
-    /// Number of transfer-speed predictions scored against actual outcomes.
+    pub failure_brier: Option<f64>,
     #[serde(default)]
-    pub renegade_transfer_speed_evaluated: u64,
+    pub failure_climatology_brier: Option<f64>,
+    #[serde(default)]
+    pub failure_base_rate: Option<f64>,
+    /// Forgetting horizon currently selected for the failure stage, in hours.
+    /// `None` both before the stage is active and when it forgets nothing
+    /// inside its window; `hierarchical_failure_active` tells the two apart.
+    #[serde(default)]
+    pub hierarchical_failure_horizon_hours: Option<f64>,
+    /// Events in each hierarchical stage's window, and whether the stage has a
+    /// curve yet. A timing stage without one is estimated by the isotonic
+    /// fallback instead (see `Router::predict_routing_outcome_at`).
+    #[serde(default)]
+    pub hierarchical_failure_events: usize,
+    #[serde(default)]
+    pub hierarchical_failure_active: bool,
+    #[serde(default)]
+    pub hierarchical_response_time_events: usize,
+    #[serde(default)]
+    pub hierarchical_response_time_active: bool,
+    #[serde(default)]
+    pub hierarchical_transfer_speed_events: usize,
+    #[serde(default)]
+    pub hierarchical_transfer_speed_active: bool,
+    /// Peers evicted from the hierarchical estimator's bounded peer tables,
+    /// summed over its three stages. Non-zero means this node's churn exceeds
+    /// the headroom `hierarchical_peer_capacity` allows.
+    #[serde(default)]
+    pub hierarchical_peer_evictions: u64,
+    /// Per-stage peer-table capacity, derived from `max_connections`.
+    #[serde(default)]
+    pub hierarchical_peer_capacity: usize,
+    /// Contracts held by the failure stage's contract term (#4485, #5700).
+    #[serde(default)]
+    pub hierarchical_contracts: usize,
+    /// Contracts evicted from that table, least-recently-used in batches.
+    #[serde(default)]
+    pub hierarchical_contract_evictions: u64,
+    /// Residuals the contract table did not record LIVE, because every entry
+    /// of their contract already held a larger decayed weight. The events
+    /// still train the curve and the peer levels.
+    #[serde(default)]
+    pub hierarchical_contract_residuals_refused: u64,
+    /// `(contract, peer)` pairs the LAST refit dropped for being outside a
+    /// contract's heaviest eight. A GAUGE, not a total: a persistently
+    /// over-full contract contributes the same drops at every refit, so a
+    /// cumulative count would read about 100x the distinct pairs ever dropped.
+    #[serde(default)]
+    pub hierarchical_contract_pairs_refused_last_refit: u64,
+    /// Live contract entries displaced by a heavier newcomer, whose
+    /// accumulated moments were discarded. Counted rather than merged,
+    /// because merging would attribute one peer's residuals to another.
+    #[serde(default)]
+    pub hierarchical_contract_entries_displaced: u64,
+    /// Refits after which the contract term's variance components were
+    /// estimable. NECESSARY for the term to do anything and not sufficient:
+    /// `effect` also returns nothing per query below the present-peer bar, and
+    /// on the recorded soak most failures are on contracts that never reach
+    /// it. The two counters below are what say whether anything moved.
+    #[serde(default)]
+    pub hierarchical_contract_estimable_refits: u64,
+    /// Learned residuals actually adjusted by a contract effect.
+    #[serde(default)]
+    pub hierarchical_contract_effects_applied: u64,
+    /// Scored forecasts that actually carried a contract offset.
+    #[serde(default)]
+    pub hierarchical_contract_forecast_offsets: u64,
+    /// Estimable refits at which the Bernoulli evidence floor was the binding
+    /// value for the contract term's `sigma2`, rather than the measured
+    /// within-cell variance. On the recorded gateway streams the floor bound
+    /// on every estimable refit, because cells there are mostly unanimous and
+    /// mostly tiny; this counter is how a reader sees whether that still holds
+    /// on their traffic.
+    #[serde(default)]
+    pub hierarchical_contract_floor_bound_refits: u64,
+    /// Estimable refits on which fewer than two contracts qualified, so
+    /// `tau2_contract` was zero and the term produced NOTHING although the
+    /// refit counted as estimable. Read alongside
+    /// `hierarchical_contract_estimable_refits`: their difference is the
+    /// refits on which the term could act at all.
+    #[serde(default)]
+    pub hierarchical_contract_den_below_two_refits: u64,
+    /// Contracts that qualified for `tau2_contract` at the last refit, and
+    /// present entries that informed the components. `tau2_contract` requires
+    /// at least two, so this is also how the term's WARM-UP silence is
+    /// observed: a freshly started node has one qualifying contract for its
+    /// first several thousand events and the term is off until it has two.
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_contracts: u64,
+    #[serde(default)]
+    pub hierarchical_contract_qualifying_entries: u64,
+    /// Between-contract variance at the last refit; `None` when the components
+    /// are not estimable. The term produces no effect while it is absent or 0.
+    #[serde(default)]
+    pub hierarchical_contract_tau2: Option<f64>,
+    /// Timed successes whose response time was floored to 1 ms before the log.
+    #[serde(default)]
+    pub hierarchical_floored_response_times: u64,
+    /// Successes that carried no transfer-speed sample (zero-byte payload or
+    /// zero duration). Skipped, as the isotonic estimator skips them; not
+    /// rejections.
+    #[serde(default)]
+    pub hierarchical_non_speed_samples: u64,
+    /// RMS error in SECONDS of the response time the hierarchical estimator
+    /// forecasts, and of the isotonic estimate a cold timing stage falls back
+    /// to, over the same events (both forecast, response timed), each error
+    /// clipped to 10x that event's own outcome (1 ms floor) and the mean
+    /// exponentially forgotten over 24 estimator hours. `response_time_scored`
+    /// counts events ever scored; `response_time_weight` is the forgotten
+    /// weight behind the current means as of the snapshot's own time, which is
+    /// what a verdict needs. This measures CALIBRATION of the absolute
+    /// estimate, not the candidate ranking routing uses.
+    ///
+    /// The clip is ONE-SIDED in practice: forecasts are non-negative, so an
+    /// under-forecast's error is at most the outcome and is never clipped, and
+    /// only over-forecasts are trimmed. Under heavy-tailed outcomes that favours
+    /// the higher forecaster (on lognormal outcomes at sigma 1.5, 20% of events
+    /// clip at the mean forecast, and the clipped-error minimiser is 1.3x the
+    /// mean). Dashboard evidence only.
+    #[serde(default)]
+    pub response_time_rmse_secs_isotonic: Option<f64>,
+    #[serde(default)]
+    pub response_time_rmse_secs_hierarchical: Option<f64>,
+    #[serde(default)]
+    pub response_time_scored: u64,
+    #[serde(default)]
+    pub response_time_weight: f64,
+    /// The same for transfer time, `payload bytes / forecast speed`, over real
+    /// payload transfers. Not a like-for-like contest: the hierarchical model
+    /// targets `E[bytes / V]` while the isotonic one estimates `bytes / E[V]`,
+    /// so wherever speeds vary the hierarchical model is favoured by Jensen's
+    /// inequality, and the one-sided clip (above) compounds that.
+    ///
+    /// POPULATION CHANGE at the release carrying #5681: an event whose
+    /// isotonic speed estimate was zero used to be dropped from BOTH models'
+    /// scoring; it is now scored at `DEGENERATE_SPEED_FLOOR_BPS`, i.e. a
+    /// transfer time of `bytes / 1e-6`, whose error the clip bounds at
+    /// `10 x` the actual time. So the isotonic figure can read worse than an
+    /// earlier release's on the same traffic, and the hierarchical one now
+    /// includes those events too.
+    #[serde(default)]
+    pub transfer_time_rmse_secs_isotonic: Option<f64>,
+    #[serde(default)]
+    pub transfer_time_rmse_secs_hierarchical: Option<f64>,
+    #[serde(default)]
+    pub transfer_time_scored: u64,
+    #[serde(default)]
+    pub transfer_time_weight: f64,
+    /// Lognormality check for the response-time stage: the within-cell log
+    /// residual variance expectation timing uses, and the skewness and excess
+    /// kurtosis of those residuals (both ~0 when log times are normal).
+    #[serde(default)]
+    pub hierarchical_response_time_log_shape: LogResidualShape,
+    /// The same for the transfer-speed stage.
+    #[serde(default)]
+    pub hierarchical_transfer_speed_log_shape: LogResidualShape,
+    /// The hierarchical estimate for a peer it holds no record of, in the
+    /// router's units, sampled across distance `[0, 0.5]`: the distance curve
+    /// every per-peer estimate starts from. Band effects are excluded.
+    #[serde(default)]
+    pub hierarchical_curves: HierarchicalCurves,
+    /// Recent `(forecast, outcome)` pairs of the hierarchical estimates, each
+    /// forecast made before its event was learned: failure probability against
+    /// `0`/`1`, response time and transfer speed against the measured value.
+    /// Read by the dashboard's accuracy panel; not mirrored into the OTLP body.
+    #[serde(default)]
+    pub hierarchical_failure_pairs: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub hierarchical_response_time_pairs: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub hierarchical_transfer_speed_pairs: Vec<(f64, f64)>,
+    /// Whether `FREENET_ROUTING_FALLBACK_ISOTONIC` has routing on the emergency
+    /// isotonic fallback instead of the hierarchical estimator.
+    #[serde(default)]
+    pub isotonic_fallback_enabled: bool,
+    /// Route events this router discarded because their peer had no known
+    /// location, since it was built (history included). Always 0 unless a
+    /// route-event producer breaks the invariant `Router::add_event` guards:
+    /// such an event is never learned, so without this count it would look
+    /// exactly like an event that never happened. Dashboard-only, like the
+    /// contract table's refusal counters (see `telemetry.rs`).
+    #[serde(default)]
+    pub route_events_discarded_unlocated: u64,
+    /// Where the router's chosen peer sits in distance order, and how often that
+    /// choice was made against a FULL candidate window. See
+    /// [`SelectionRankStats`] — this is the evidence for whether the
+    /// 25-of-`max_connections` truncation is costing anything.
+    #[serde(default)]
+    pub selection_ranks: SelectionRankSnapshot,
+}
+
+/// Plain-data lognormality check for one hierarchical log stage (#4485).
+///
+/// Expectation timing, `exp(mu + sigma2/2)`, assumes log residuals are roughly
+/// normal. A soak reads this to check that on real traffic: skewness and excess
+/// kurtosis near zero support it; a large positive value of either means a
+/// heavy slow tail the expectation understates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct LogResidualShape {
+    pub sigma2: Option<f64>,
+    pub skewness: Option<f64>,
+    pub excess_kurtosis: Option<f64>,
+    pub events: usize,
+}
+
+impl From<hierarchical::StageDiagnostics> for LogResidualShape {
+    fn from(stage: hierarchical::StageDiagnostics) -> Self {
+        LogResidualShape {
+            sigma2: stage.residual_sigma2,
+            skewness: stage.residual_shape.skewness,
+            excess_kurtosis: stage.residual_shape.excess_kurtosis,
+            events: stage.residual_shape.events,
+        }
+    }
+}
+
+/// The hierarchical estimator's distance curves for the dashboard, in the
+/// router's units. See [`RouterSnapshotInfo::hierarchical_curves`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct HierarchicalCurves {
+    pub failure: Vec<(f64, f64)>,
+    pub response_time: Vec<(f64, f64)>,
+    pub transfer_speed: Vec<(f64, f64)>,
 }
 
 /// Per-peer routing data for the dashboard detail page.
 pub(crate) struct PeerRoutingSnapshot {
-    /// (mean_adjustment, event_count) for the failure estimator.
-    pub failure_adjustment: Option<(f64, u64)>,
-    /// (mean_adjustment, event_count) for the response-time estimator.
-    pub response_time_adjustment: Option<(f64, u64)>,
-    /// (mean_adjustment, event_count) for the transfer-rate estimator.
-    pub transfer_rate_adjustment: Option<(f64, u64)>,
     /// Prediction at the peer's own location (distance ≈ 0).
     pub prediction_at_own_location: Option<RoutingPredictionInfo>,
+    /// What the hierarchical estimator has learned about this peer relative
+    /// to distance alone, per stage. See [`PeerOffset`].
+    pub offsets: [Option<PeerOffset>; 3],
+    /// What routing ACTUALLY predicts across distance for this peer and for a
+    /// peer with no record, `[response time, transfer speed]`. See
+    /// [`RoutingCurve`].
+    pub curves: [RoutingCurve; 2],
+    /// This peer's observations in the router's isotonic windows (the last
+    /// 500 route events of each kind, all peers), not downsampled:
+    /// `(distance, outcome)`. `outcomes` is every outcome (success or failure),
+    /// `response_times` the timed ones in seconds, `transfer_speeds` the real
+    /// payload transfers in bytes/s.
+    pub window: PeerWindow,
+    /// The same, per operation type (`OpType::as_str`), from the per-op
+    /// windows. An op with no events about this peer is absent.
+    pub window_by_op: HashMap<&'static str, PeerWindow>,
+    /// Recent hierarchical response-time `(forecast, actual)` pairs about this
+    /// peer, seconds, out of the router-wide window of the last 200.
+    pub response_time_pairs: Vec<(f64, f64)>,
+    /// How often this peer was eligible for and chosen in recent real routing
+    /// decisions. `None` if it never was, or was evicted
+    /// ([`Self::selection_evicted`]). See [`PeerSelectionCounts`].
+    pub selection: Option<PeerSelection>,
+    /// The peer's selection counts were evicted from the bounded table (and
+    /// it has not been eligible since). See [`PeerSelectionCounts`].
+    pub selection_evicted: bool,
+    /// How many times slower (above 1) or faster routing EXPECTS this peer to
+    /// reply than a peer with no record, for a contract at its own location
+    /// in a ring band the peer has no specific record in: the two
+    /// [`Self::curves`] response-time lines at distance 0. See
+    /// [`Router::expected_response_factor`].
+    pub expected_response_factor: Option<f64>,
+}
+
+/// One timing stage's predictions across distance `[0, 0.5]`, in router
+/// units, as routing makes them now. See [`PeerRoutingSnapshot::curves`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RoutingCurve {
+    /// For a peer with no record.
+    pub distance_alone: Vec<(f64, f64)>,
+    /// For this peer, for a contract in a ring band it has no record in.
+    /// Empty when routing predicts it exactly as `distance_alone` (no record
+    /// that routing uses yet).
+    pub this_peer: Vec<(f64, f64)>,
+    /// The hierarchical stage is still cold (fewer than its 30 samples), or
+    /// the emergency fallback is on, so routing uses the isotonic estimate
+    /// with its per-peer correction. See `predict_with_model`.
+    pub early: bool,
+}
+
+/// One peer's observations in one set of the router's isotonic windows. See
+/// [`PeerRoutingSnapshot::window`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PeerWindow {
+    /// Outcomes (success or failure) about this peer in the failure window.
+    pub outcomes: usize,
+    /// Of those, failures.
+    pub failures: usize,
+    pub response_times: Vec<(f64, f64)>,
+    pub transfer_speeds: Vec<(f64, f64)>,
 }
 
 /// # Usage
@@ -906,23 +1407,114 @@ pub(crate) struct Router {
     mean_transfer_size: Mean,
     consider_n_closest_peers: usize,
     /// Per-operation-type failure estimators (telemetry/dashboard only).
+    ///
+    /// All three `per_op_*` maps hold [`isotonic_estimator::FitPolicy::OnRead`]
+    /// estimators: nothing routes on them, so they keep their windows current
+    /// but fit only when the dashboard snapshot reads them, rather than paying a
+    /// full rebuild per event under `ring.router.write()` (#5662).
     per_op_failure: HashMap<OpType, IsotonicEstimator>,
     /// Per-operation-type response time estimators (telemetry/dashboard only).
     per_op_response_time: HashMap<OpType, IsotonicEstimator>,
     /// Per-operation-type transfer rate estimators (telemetry/dashboard only).
     per_op_transfer_rate: HashMap<OpType, IsotonicEstimator>,
-    /// Renegade-ML predictor for peer × contract interaction patterns.
-    /// Complements the isotonic estimators by detecting targeted attacks
-    /// and per-peer behavior that varies by contract location.
+    /// The hierarchical empirical-Bayes estimator (#4485): what routing acts on
+    /// for every stage it can estimate.
+    ///
+    /// The isotonic estimators above remain, in three roles: the 50-event gate
+    /// between distance-only and prediction-based routing, the estimate a
+    /// timing stage falls back to before its hierarchical curve exists, and the
+    /// dashboard's distance charts.
     #[serde(skip)]
-    renegade_predictor: routing_predictor::RoutingPredictor,
+    hierarchical: hierarchical::HierarchicalRouting,
+    /// The clock the hierarchical estimator's forgetting horizons run on.
+    #[serde(skip)]
+    estimator_clock: EstimatorClock,
+    /// Prequential skill of the hierarchical failure forecast.
+    #[serde(skip)]
+    failure_skill: skill::SkillTracker,
+    /// Connection cap the hierarchical estimator's peer tables are sized from.
+    #[serde(skip)]
+    max_connections: usize,
+    /// Prequential error, in seconds, of the response time and transfer time
+    /// the hierarchical estimator forecasts and of the isotonic fallback's,
+    /// over events both forecast and that carry the measurement.
+    #[serde(skip)]
+    response_time_error: PairedErrorTracker,
+    #[serde(skip)]
+    transfer_time_error: PairedErrorTracker,
+    /// Recent forecast/outcome pairs, for the dashboard's accuracy panel.
+    #[serde(skip)]
+    recent_accuracy: RecentAccuracy,
+    /// Where the chosen peer sits in distance order — the censoring diagnostic
+    /// for the candidate-window size. See [`SelectionRankStats`].
+    #[serde(skip)]
+    selection_ranks: SelectionRankStats,
+    /// Per-peer eligible and chosen counts for the dashboard. See
+    /// [`PeerSelectionCounts`].
+    #[serde(skip)]
+    peer_selections: PeerSelectionCounts,
+    /// Cumulative outcome counts over every [`Self::add_event`], never
+    /// windowed. See [`RouteOutcomeTotals`].
+    #[serde(skip)]
+    outcome_totals: RouteOutcomeTotals,
+    /// Route events discarded for having no peer location, history included.
+    /// Counted because the discard is otherwise silent in a release build.
+    #[serde(skip)]
+    route_events_discarded_unlocated: u64,
+    /// Test-only: `(peer address, source)` of every ingested event, so driver
+    /// tests can assert which dataset tag an outcome was recorded under.
+    #[cfg(test)]
+    #[serde(skip)]
+    recorded_sources: Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)>,
+    /// Test-only: predictions made by this router on the model routing acts
+    /// on, `[isotonic fallback, hierarchical]`; the other model's predictions
+    /// for the candidate log are not counted. Router state rather than a
+    /// thread-local, so a simulation can tell which path its nodes ACTUALLY
+    /// routed on, whatever thread ran them (`sim_e2e_tests`).
+    #[cfg(test)]
+    #[serde(skip)]
+    predictions_by_model: [std::sync::atomic::AtomicU64; 2],
+    /// Test-only: route events this router learned, by what
+    /// `isotonic_fallback_enabled()` returned on the thread that learned them,
+    /// `[switch off, switch on]`. Like `predictions_by_model` it is router
+    /// state, so it says which setting the nodes' own threads saw; unlike it,
+    /// it counts from the first event rather than from the 50-event gate, so a
+    /// short simulation fills it (`sim_e2e_tests`).
+    #[cfg(test)]
+    #[serde(skip)]
+    events_by_fallback_switch: [u64; 2],
+}
+
+/// Cumulative success / failure counts of the route events this router has
+/// ingested since it was built.
+///
+/// The isotonic estimators hold a rolling window of at most 500 events, so
+/// they cannot say how many failures were ever observed; these counters can.
+/// They exist so tests (and a future diagnostic) can check that the failure
+/// model is actually receiving failure labels (for most of its life it received
+/// almost none: relays labelled downstream NotFound a success and originators
+/// labelled only final successes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteOutcomeTotals {
+    /// `RouteOutcome::Failure` events.
+    pub failures: u64,
+    /// `RouteOutcome::Success` and `RouteOutcome::SuccessUntimed` events.
+    pub successes: u64,
 }
 
 impl Clone for Router {
     fn clone(&self) -> Self {
-        // RoutingPredictor is not cloneable. When Router is cloned (e.g., for
-        // batch reconstruction from history), the predictor starts empty and
-        // gets rebuilt as events are added.
+        // Every model and measurement is copied, the per-peer selection counts
+        // included. The selection-rank counters are atomics and not `Clone`,
+        // so the clone's start empty.
+        //
+        // NOTE: this impl has **no production call site**. The
+        // `*router.write() = Router::new(&history)` batch-reconstruction pattern
+        // it once served was replaced by in-place `refit()` inside `add_event`
+        // (#4811), and the only `router.clone()` left in the tree is an `Arc`
+        // pointer clone (ring.rs), which never reaches here. Kept because
+        // `Router` is still nominally `Clone`; if that is ever removed, this
+        // goes with it.
         Router {
             response_start_time_estimator: self.response_start_time_estimator.clone(),
             transfer_rate_estimator: self.transfer_rate_estimator.clone(),
@@ -932,16 +1524,661 @@ impl Clone for Router {
             per_op_failure: self.per_op_failure.clone(),
             per_op_response_time: self.per_op_response_time.clone(),
             per_op_transfer_rate: self.per_op_transfer_rate.clone(),
-            renegade_predictor: routing_predictor::RoutingPredictor::new(RENEGADE_MAX_OBSERVATIONS),
+            hierarchical: self.hierarchical.clone(),
+            estimator_clock: self.estimator_clock.clone(),
+            failure_skill: self.failure_skill.clone(),
+            max_connections: self.max_connections,
+            response_time_error: self.response_time_error,
+            transfer_time_error: self.transfer_time_error,
+            recent_accuracy: self.recent_accuracy.clone(),
+            selection_ranks: SelectionRankStats::default(),
+            peer_selections: self.peer_selections.clone(),
+            outcome_totals: self.outcome_totals,
+            route_events_discarded_unlocated: self.route_events_discarded_unlocated,
+            #[cfg(test)]
+            recorded_sources: self.recorded_sources.clone(),
+            #[cfg(test)]
+            predictions_by_model: Default::default(),
+            #[cfg(test)]
+            events_by_fallback_switch: [0; 2],
         }
     }
 }
 
-/// Maximum observations to retain per renegade funnel stage.
-const RENEGADE_MAX_OBSERVATIONS: usize = 5000;
+/// Hours since the router was built, on an injected [`TimeSource`].
+///
+/// The hierarchical estimator's forgetting horizons are wall-clock-like
+/// quantities, so they must advance with simulated time in simulations and be
+/// controllable in tests. Production wires the ring's own time source.
+///
+/// [`TimeSource`]: crate::util::time_source::TimeSource
+#[derive(Clone, Debug)]
+struct EstimatorClock {
+    source: crate::util::time_source::DynTimeSource,
+    origin: tokio::time::Instant,
+}
+
+impl EstimatorClock {
+    fn new(source: crate::util::time_source::DynTimeSource) -> Self {
+        let origin = source.now();
+        EstimatorClock { source, origin }
+    }
+
+    fn hours(&self) -> f64 {
+        self.source
+            .now()
+            .saturating_duration_since(self.origin)
+            .as_secs_f64()
+            / 3600.0
+    }
+}
+
+impl Default for EstimatorClock {
+    fn default() -> Self {
+        EstimatorClock::new(std::sync::Arc::new(
+            crate::util::time_source::InstantTimeSrc::new(),
+        ))
+    }
+}
+
+/// What a `FREENET_ROUTING_*` boolean switch was set to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingFlag {
+    Unset,
+    On,
+    Off,
+    /// Set, but to something that is neither an affirmative nor a negative,
+    /// including a value that is not valid UTF-8. Routes as [`Self::Off`].
+    Unrecognised,
+}
+
+/// Parse a `FREENET_ROUTING_*` boolean switch, failing safe.
+///
+/// Only an explicit affirmative (`1`, `true`, `yes`, `on`) turns a switch on.
+/// Anything else leaves it off, because a switch parsed here changes live
+/// routing and a misspelt value must not do that silently; but a value that
+/// is not a recognised negative either (`0`, `false`, `no`, `off`, empty) is
+/// [`RoutingFlag::Unrecognised`], so the startup warning can say it was
+/// ignored. Read with `std::env::var_os`: `std::env::var(..).ok()` would turn
+/// a non-UTF-8 value into "unset" and the warning would never fire.
+fn parse_routing_flag(value: Option<&std::ffi::OsStr>) -> RoutingFlag {
+    let Some(value) = value else {
+        return RoutingFlag::Unset;
+    };
+    let Some(value) = value.to_str() else {
+        return RoutingFlag::Unrecognised;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => RoutingFlag::On,
+        "" | "0" | "false" | "no" | "off" => RoutingFlag::Off,
+        _ => RoutingFlag::Unrecognised,
+    }
+}
+
+/// The environment variable that routes on the isotonic fallback.
+const ISOTONIC_FALLBACK_ENV: &str = "FREENET_ROUTING_FALLBACK_ISOTONIC";
+
+/// Whether routing is on the emergency isotonic fallback instead of the
+/// hierarchical estimator.
+///
+/// **An emergency operator fallback, for use only if the hierarchical
+/// estimator misbehaves in production.** No release has ever routed on this
+/// configuration as a whole: it is the path every timing stage takes before
+/// its hierarchical curve exists (the isotonic estimate with the per-peer
+/// EWMA), applied to every stage. Default off, and slated for removal once
+/// the hierarchical estimator has proven itself (#5792, #4485). The hierarchical
+/// estimator keeps learning while it is on, so switching back finds it warm.
+pub(crate) fn isotonic_fallback_enabled() -> bool {
+    // Tests override ahead of the cached read: the `OnceLock` is resolved by
+    // whichever test touches it first and then fixed for the process, so the
+    // switched-on branch would otherwise be untestable, and under plain
+    // `cargo test` one test's setting would leak into another's.
+    #[cfg(test)]
+    {
+        match TEST_ISOTONIC_FALLBACK.with(|cell| cell.get()) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_routing_flag(std::env::var_os(ISOTONIC_FALLBACK_ENV).as_deref()) == RoutingFlag::On
+    })
+}
+
+// Test-only override for `isotonic_fallback_enabled`: 0 unset, 1 on, 2 off.
+// Thread-local, not process-global, so parallel tests in one process cannot
+// see each other's setting.
+#[cfg(test)]
+thread_local! {
+    static TEST_ISOTONIC_FALLBACK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+// Test-only count of predictions in which at least one stage that the isotonic
+// estimator could estimate was decided by the isotonic fallback rather than the
+// hierarchical estimator, so a guard trained warm can assert that no stage fell
+// back (two estimators that agree bit for bit cannot be told apart otherwise).
+#[cfg(test)]
+thread_local! {
+    static FALLBACK_STAGE_EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Force the isotonic fallback on or off for the duration of a test.
+#[cfg(test)]
+pub(crate) fn force_isotonic_fallback(enabled: bool) -> IsotonicFallbackGuard {
+    let previous = TEST_ISOTONIC_FALLBACK.with(|cell| {
+        let previous = cell.get();
+        cell.set(if enabled { 1 } else { 2 });
+        previous
+    });
+    IsotonicFallbackGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct IsotonicFallbackGuard {
+    previous: u8,
+}
+
+#[cfg(test)]
+impl Drop for IsotonicFallbackGuard {
+    fn drop(&mut self) {
+        TEST_ISOTONIC_FALLBACK.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Environment switches that chose between routing predictors before #4485
+/// removed the legacy stack. Neither has any effect now; a node that still sets
+/// one is told so once, rather than left believing it chose something.
+const OBSOLETE_ROUTING_FLAGS: [(&str, &str); 2] = [
+    (
+        "FREENET_ROUTING_HIERARCHICAL",
+        "the hierarchical estimator always routes now, and the legacy stack this \
+         switch could select was removed. FREENET_ROUTING_FALLBACK_ISOTONIC does NOT \
+         restore that stack: it routes on the isotonic estimates alone, without the \
+         Renegade blend, a configuration no release has shipped as a whole",
+    ),
+    (
+        "FREENET_ROUTING_RESIDUAL_CORRECTION",
+        "the residual correction was removed with the legacy routing stack",
+    ),
+];
+
+/// The startup warnings the routing switches call for, as `(variable,
+/// message)`, given how to read an environment variable: one per obsolete
+/// switch that is set, and one for `FREENET_ROUTING_FALLBACK_ISOTONIC` when it
+/// is on or set to a value it does not recognise. Pure, so it is testable
+/// without the process environment.
+fn routing_flag_warnings(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, String)> {
+    let mut warnings = Vec::new();
+    for (name, reason) in OBSOLETE_ROUTING_FLAGS {
+        if let Some(value) = var(name) {
+            warnings.push((
+                name,
+                format!(
+                    "{name} is set (to {:?}) but no longer has any effect: {reason} (#4485)",
+                    value.to_string_lossy()
+                ),
+            ));
+        }
+    }
+    let fallback = var(ISOTONIC_FALLBACK_ENV);
+    match parse_routing_flag(fallback.as_deref()) {
+        RoutingFlag::On => warnings.push((
+            ISOTONIC_FALLBACK_ENV,
+            format!(
+                "{ISOTONIC_FALLBACK_ENV} is set: routing on the emergency isotonic fallback \
+                 instead of the hierarchical estimator. No release has routed on this \
+                 configuration as a whole; unset it once the problem it was set for is \
+                 resolved (#4485)"
+            ),
+        )),
+        RoutingFlag::Unrecognised => warnings.push((
+            ISOTONIC_FALLBACK_ENV,
+            format!(
+                "{ISOTONIC_FALLBACK_ENV} is set to {:?}, which is not a recognised value, so \
+                 routing stays on the hierarchical estimator. Use 1/true/yes/on to route on \
+                 the emergency isotonic fallback, or 0/false/no/off to keep it off (#4485)",
+                fallback.unwrap_or_default().to_string_lossy()
+            ),
+        )),
+        RoutingFlag::Unset | RoutingFlag::Off => {}
+    }
+    warnings
+}
+
+/// The INFO line stating which estimator routes, logged once per process when
+/// the first `Router` is built.
+///
+/// The soak's crossover verification greps a node's log for these strings to
+/// confirm its mode, as it did on releases that had the
+/// `FREENET_ROUTING_HIERARCHICAL` switch: `estimator: enabled (default)` and
+/// `estimator: disabled via`. Grep one of those, not the bare prefix
+/// `hierarchical routing estimator: `, which the peer-table saturation notice
+/// in `hierarchical.rs` shares. Pinned by
+/// `the_routing_mode_line_names_the_estimator_that_routes`; change them
+/// together.
+fn routing_mode_line(isotonic_fallback: bool) -> &'static str {
+    if isotonic_fallback {
+        "hierarchical routing estimator: disabled via FREENET_ROUTING_FALLBACK_ISOTONIC \
+         (routing on the emergency isotonic fallback)"
+    } else {
+        "hierarchical routing estimator: enabled (default)"
+    }
+}
+
+/// Once per process, log which estimator routes ([`routing_mode_line`]) and
+/// warn about the routing switches ([`routing_flag_warnings`]).
+fn warn_about_routing_flags() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::info!("{}", routing_mode_line(isotonic_fallback_enabled()));
+        for (variable, message) in routing_flag_warnings(|name| std::env::var_os(name)) {
+            tracing::warn!(variable, "{message}");
+        }
+    });
+}
+
+/// Rank buckets for [`SelectionRankStats`]. Sized past the default window of 25
+/// so a node configured with a wider one still lands in a real bucket.
+const SELECTION_RANK_BUCKETS: usize = 32;
+
+/// Where, in distance order, does the router's chosen peer actually sit?
+///
+/// # What this is for
+///
+/// The router scores only the `consider_n_closest_peers` (25) geographically
+/// closest candidates; everything beyond that is invisible to routing for that
+/// hop. Production nodes run `max_connections = 200`, so a well-connected peer
+/// has ~175 peers it never scores. Whether that truncation costs anything is an
+/// open question (#4485 follow-up), and it is not answerable from the outside:
+/// nothing currently records where within the window the decision lands.
+///
+/// This is a **censoring diagnostic**. If selections cluster at the near ranks,
+/// the window is comfortably wider than the decision needs and widening it would
+/// change nothing. If they pile up against the far edge *while the window was
+/// full*, the ordering is being truncated where the real optimum plausibly lies,
+/// and widening is worth testing.
+///
+/// The saturation qualifier is load-bearing. On a node with 8 connections the
+/// window is 8, so a selection at rank 7 is "last of 8" and says nothing about
+/// truncation — only a selection at the edge of a FULL window is evidence that
+/// options were discarded. Counting boundary hits without that condition would
+/// make every sparsely-connected node look like it needs a wider window.
+#[derive(Debug, Default)]
+pub(crate) struct SelectionRankStats {
+    /// Distance-rank of the selected peer, 0 = closest. The final bucket
+    /// collects anything at or beyond `SELECTION_RANK_BUCKETS - 1`.
+    rank: [std::sync::atomic::AtomicU64; SELECTION_RANK_BUCKETS],
+    /// Prediction-based decisions recorded.
+    total: std::sync::atomic::AtomicU64,
+    /// Decisions where the window was full, so truncation could have discarded
+    /// candidates that were never scored.
+    saturated: std::sync::atomic::AtomicU64,
+    /// Of the saturated decisions, those whose selection fell in the farthest
+    /// quarter of the window — the reading that would justify widening it.
+    saturated_far_quarter: std::sync::atomic::AtomicU64,
+    /// Exact sum of selected ranks, so the mean does not inherit the histogram's
+    /// ceiling.
+    ///
+    /// `SELECTION_RANK_BUCKETS` is fixed storage, but the window is
+    /// configurable via `considering_n_closest_peers`. Deriving the mean from
+    /// the buckets would understate the tail for any window wider than the
+    /// buckets — precisely the configuration someone would run while evaluating
+    /// whether a wider window helps, so the metric would mislead exactly when it
+    /// was being consulted.
+    rank_sum: std::sync::atomic::AtomicU64,
+    /// Largest rank ever selected, so a tail beyond the histogram is visible
+    /// rather than silently folded into the last bucket.
+    max_rank: std::sync::atomic::AtomicU64,
+}
+
+impl SelectionRankStats {
+    /// `candidates_before_truncation` is how many peers were available to the
+    /// decision, and `window` how many survived the distance cut.
+    fn record(&self, selected_rank: usize, window: usize, candidates_before_truncation: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bucket = selected_rank.min(SELECTION_RANK_BUCKETS - 1);
+        self.rank[bucket].fetch_add(1, Relaxed);
+        self.total.fetch_add(1, Relaxed);
+        // Exact, unbucketed, so the mean survives a window wider than the
+        // histogram. The histogram is for the SHAPE; this is for the number.
+        self.rank_sum.fetch_add(selected_rank as u64, Relaxed);
+        self.max_rank.fetch_max(selected_rank as u64, Relaxed);
+
+        // TRUNCATED, not merely full. A decision with exactly 25 candidates
+        // against a 25-peer window scored every one of them — nothing was
+        // discarded, so it is no evidence about the limit. Counting it would
+        // inflate the saturation rate with decisions the window never
+        // constrained, which is the precise false positive the qualifier exists
+        // to prevent: a node whose connection count happens to sit AT the limit
+        // would otherwise look starved on every decision.
+        if candidates_before_truncation > window && window > 0 {
+            self.saturated.fetch_add(1, Relaxed);
+            // Farthest quarter, rounded so that tiny windows still have one.
+            let threshold = window - (window / 4).max(1);
+            if selected_rank >= threshold {
+                self.saturated_far_quarter.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SelectionRankSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SelectionRankSnapshot {
+            rank: self.rank.each_ref().map(|slot| slot.load(Relaxed)),
+            total: self.total.load(Relaxed),
+            saturated: self.saturated.load(Relaxed),
+            saturated_far_quarter: self.saturated_far_quarter.load(Relaxed),
+            rank_sum: self.rank_sum.load(Relaxed),
+            max_rank: self.max_rank.load(Relaxed),
+        }
+    }
+}
+
+/// Plain-data view of [`SelectionRankStats`] for the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct SelectionRankSnapshot {
+    pub rank: [u64; SELECTION_RANK_BUCKETS],
+    pub total: u64,
+    pub saturated: u64,
+    pub saturated_far_quarter: u64,
+    #[serde(default)]
+    pub rank_sum: u64,
+    #[serde(default)]
+    pub max_rank: u64,
+}
+
+impl SelectionRankSnapshot {
+    /// Share of truncated decisions whose selection landed in the farthest
+    /// quarter of the window. High means the window is plausibly too narrow.
+    pub fn far_quarter_share(&self) -> Option<f64> {
+        (self.saturated > 0).then(|| self.saturated_far_quarter as f64 / self.saturated as f64)
+    }
+
+    /// Mean selected rank, for a one-number summary alongside the histogram.
+    ///
+    /// From the exact sum, NOT the buckets — see `rank_sum`.
+    pub fn mean_rank(&self) -> Option<f64> {
+        (self.total > 0).then(|| self.rank_sum as f64 / self.total as f64)
+    }
+}
+
+/// How often each peer was a candidate in a routing decision, and how often it
+/// was the router's first choice, for the dashboard's per-peer page.
+///
+/// # What is counted
+///
+/// Only prediction-based decisions (the 50-event gate is open) that the caller
+/// marks as real routing decisions: the ring selections whose outcome is
+/// recorded as a route event (`DecisionLog::Joinable`). Connection
+/// maintenance, CONNECT forwarding and test probes also call the router, and
+/// counting them would credit a peer with requests it was never in line for.
+/// "Eligible" means inside the scored window (the `consider_n_closest_peers`
+/// closest candidates); "chosen" means ranked first, the peer the request goes
+/// to. `even_share` sums `1 / window` over the decisions a peer was eligible
+/// for: what it would have been chosen if the router picked uniformly within
+/// its windows, the baseline the avoided-peer reading compares against.
+///
+/// # Window and bound
+///
+/// Recent: a peer's three counts are halved together once its eligible count
+/// reaches [`SELECTION_RECENT_DECISIONS`], so the eligible count stays between
+/// 100 and 199 and older decisions count for geometrically less (each halving
+/// halves the weight of everything before it). `chosen` and `even_share` are
+/// kept as `f64`, so halving is exact and a rarely chosen peer does not drift
+/// toward zero by rounding. The table holds at
+/// most `capacity` peers ([`hierarchical::peer_capacity`] of
+/// `max_connections`, the same headroom as the estimator's peer tables) and
+/// evicts the least-recently-eligible batch (`capacity / 64`) when full. Every
+/// decision restamps its window's entries, so a cap enforced by refusal would
+/// starve newcomers forever; see `.claude/rules/bug-prevention-patterns.md`.
+/// An evicted peer that returns starts again from zero; `evictions` counts
+/// the removals, and the last `capacity` evicted peers are remembered
+/// ([`PeerSelectionCounts::was_evicted`]) so a reader can tell an evicted peer
+/// from one that was never eligible.
+///
+/// Interior mutability because routing runs under the router's READ lock.
+/// The mutex is held for one window's worth of hash updates per decision.
+#[derive(Debug)]
+pub(crate) struct PeerSelectionCounts {
+    table: parking_lot::Mutex<PeerSelectionTable>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerSelectionTable {
+    entries: HashMap<PeerKeyLocation, PeerSelectionEntry>,
+    capacity: usize,
+    use_clock: u64,
+    evictions: u64,
+    /// Peers evicted and not eligible since, with their latest eviction's
+    /// stamp: at most `capacity` distinct peers. `evicted_order` is oldest
+    /// first and may hold stale entries (a peer evicted again, or returned),
+    /// which are skipped and compacted away; it never exceeds twice
+    /// `capacity`.
+    evicted: HashMap<PeerKeyLocation, u64>,
+    evicted_order: std::collections::VecDeque<(PeerKeyLocation, u64)>,
+}
+
+/// A peer's selection counts are halved, all three together, once its
+/// eligible count reaches this, so the eligible count stays between half of
+/// this and one less than it, and older decisions count for geometrically
+/// less: the dashboard compares them with what the router has learned NOW.
+pub(crate) const SELECTION_RECENT_DECISIONS: u64 = 200;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerSelectionEntry {
+    eligible: u64,
+    chosen: f64,
+    even_share: f64,
+    halved: bool,
+    last_used: u64,
+}
+
+/// One peer's [`PeerSelectionCounts`], for the dashboard.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PeerSelection {
+    /// Decisions in which the peer was inside the scored window.
+    pub eligible: u64,
+    /// Of those, decisions in which it was ranked first; fractional once the
+    /// counts have halved.
+    pub chosen: f64,
+    /// Sum of `1 / window size` over those decisions.
+    pub even_share: f64,
+    /// The counts have halved at least once, so they are a decayed recent
+    /// window rather than every decision the peer was eligible for.
+    pub halved: bool,
+}
+
+impl PeerSelectionCounts {
+    fn new(capacity: usize) -> Self {
+        PeerSelectionCounts {
+            table: parking_lot::Mutex::new(PeerSelectionTable {
+                entries: HashMap::new(),
+                capacity: capacity.max(1),
+                use_clock: 0,
+                evictions: 0,
+                evicted: HashMap::new(),
+                evicted_order: std::collections::VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Record one decision: every peer in `window` was eligible, `chosen` was
+    /// ranked first.
+    fn record(&self, window: &[&PeerKeyLocation], chosen: &PeerKeyLocation) {
+        if window.is_empty() {
+            return;
+        }
+        let share = 1.0 / window.len() as f64;
+        let mut table = self.table.lock();
+        table.use_clock += 1;
+        let stamp = table.use_clock;
+        // Stamp every incumbent in the window BEFORE making room, so an
+        // eviction can never take a peer of this same decision (it would be
+        // re-inserted at zero, losing its counts).
+        let mut newcomers = Vec::new();
+        for &peer in window {
+            match table.entries.get_mut(peer) {
+                Some(entry) => {
+                    entry.eligible += 1;
+                    entry.even_share += share;
+                    entry.last_used = stamp;
+                    if peer == chosen {
+                        entry.chosen += 1.0;
+                    }
+                    if entry.eligible >= SELECTION_RECENT_DECISIONS {
+                        entry.eligible /= 2;
+                        entry.chosen /= 2.0;
+                        entry.even_share /= 2.0;
+                        entry.halved = true;
+                    }
+                }
+                None => newcomers.push(peer),
+            }
+        }
+        let overflow = (table.entries.len() + newcomers.len()).saturating_sub(table.capacity);
+        if overflow > 0 {
+            table.evict_older_than(stamp, overflow);
+        }
+        for peer in newcomers {
+            table.evicted.remove(peer);
+            table.entries.insert(
+                peer.clone(),
+                PeerSelectionEntry {
+                    eligible: 1,
+                    chosen: if peer == chosen { 1.0 } else { 0.0 },
+                    even_share: share,
+                    halved: false,
+                    last_used: stamp,
+                },
+            );
+        }
+    }
+
+    fn get(&self, peer: &PeerKeyLocation) -> Option<PeerSelection> {
+        self.table
+            .lock()
+            .entries
+            .get(peer)
+            .map(|entry| PeerSelection {
+                eligible: entry.eligible,
+                chosen: entry.chosen,
+                even_share: entry.even_share,
+                halved: entry.halved,
+            })
+    }
+
+    /// The peer's counts were evicted, it is among the last `capacity`
+    /// DISTINCT peers evicted, and it has not been eligible since.
+    fn was_evicted(&self, peer: &PeerKeyLocation) -> bool {
+        self.table.lock().evicted.contains_key(peer)
+    }
+
+    fn evictions(&self) -> u64 {
+        self.table.lock().evictions
+    }
+}
+
+impl PeerSelectionTable {
+    /// Evict the least-recently-eligible peers stamped before `stamp`: at
+    /// least `needed`, and a batch of `capacity / 64` when that is larger.
+    /// The batch spaces out the scans on a large table kept full by churn; on
+    /// a table under 128 entries the batch is one, so each decision that
+    /// brings a newcomer scans once (at most `capacity` entries, under the
+    /// mutex). Peers stamped at `stamp` (the decision being recorded) are
+    /// never taken; with the window far smaller than the capacity there are
+    /// always enough older ones.
+    fn evict_older_than(&mut self, stamp: u64, needed: usize) {
+        let victims: Vec<PeerKeyLocation> = {
+            let mut by_age: Vec<(u64, &PeerKeyLocation)> = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.last_used < stamp)
+                .map(|(peer, entry)| (entry.last_used, peer))
+                .collect();
+            let batch = (self.capacity / 64).max(needed).min(by_age.len());
+            if batch == 0 {
+                return;
+            }
+            if batch < by_age.len() {
+                by_age.select_nth_unstable_by_key(batch - 1, |(last_used, _)| *last_used);
+            }
+            // Only the batch is cloned, not every older key.
+            by_age[..batch]
+                .iter()
+                .map(|(_, peer)| (*peer).clone())
+                .collect()
+        };
+        for peer in victims {
+            if self.entries.remove(&peer).is_some() {
+                self.evictions += 1;
+                self.remember_evicted(peer);
+            }
+        }
+    }
+
+    /// Remember an evicted peer, forgetting the least recently evicted
+    /// DISTINCT peer beyond `capacity`. A peer evicted again only refreshes
+    /// its stamp, so a flapping peer cannot push others out early.
+    fn remember_evicted(&mut self, peer: PeerKeyLocation) {
+        let stamp = self.evictions;
+        self.evicted.insert(peer.clone(), stamp);
+        self.evicted_order.push_back((peer, stamp));
+        while self.evicted.len() > self.capacity {
+            let Some((old, at)) = self.evicted_order.pop_front() else {
+                break;
+            };
+            // A stale entry: the peer was evicted again since (a newer
+            // stamp) or returned (no record). Its live record stays.
+            if self.evicted.get(&old) == Some(&at) {
+                self.evicted.remove(&old);
+            }
+        }
+        if self.evicted_order.len() > 2 * self.capacity {
+            let live = &self.evicted;
+            self.evicted_order
+                .retain(|(peer, at)| live.get(peer) == Some(at));
+        }
+    }
+}
+
+impl Clone for PeerSelectionCounts {
+    fn clone(&self) -> Self {
+        PeerSelectionCounts {
+            table: parking_lot::Mutex::new(self.table.lock().clone()),
+        }
+    }
+}
 
 impl Router {
     pub fn new(history: &[RouteEvent]) -> Self {
+        warn_about_routing_flags();
+        // The same hardening as `add_event_recording`: the isotonic estimators
+        // panic on an event about a peer with no location, so such events are
+        // left out of the history rather than trusted not to occur.
+        let located: Vec<RouteEvent>;
+        let mut discarded_unlocated = 0u64;
+        let history = if history.iter().all(|event| event.peer.location().is_some()) {
+            history
+        } else {
+            located = history
+                .iter()
+                .filter(|event| event.peer.location().is_some())
+                .cloned()
+                .collect();
+            discarded_unlocated = (history.len() - located.len()) as u64;
+            // Once per construction, so bounded; WARN because, as in
+            // `add_event_recording`, this should never happen.
+            tracing::warn!(
+                skipped = discarded_unlocated,
+                "route history events about peers with no known location; not learned"
+            );
+            &located
+        };
         let failure_outcomes: Vec<IsotonicEvent> = history
             .iter()
             .map(|re| IsotonicEvent {
@@ -1025,36 +2262,6 @@ impl Router {
             }
         }
 
-        let mut renegade_predictor =
-            routing_predictor::RoutingPredictor::new_batch(RENEGADE_MAX_OBSERVATIONS);
-
-        // Feed historical events into the renegade predictor.
-        // Use record_at_time with index-based ordering to preserve temporal
-        // relationships (batch events don't have real timestamps, but ordering
-        // is preserved from the event log).
-        for (idx, event) in history.iter().enumerate() {
-            let distance = event
-                .peer
-                .location()
-                .map(|loc| event.contract_location.distance(loc).as_f64())
-                .unwrap_or(0.5);
-
-            let (outcome, _) =
-                routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
-
-            // Use index-based time: events are ordered, each ~1 minute apart
-            let time_hours = idx as f64 / 60.0;
-            renegade_predictor.record_at_time(
-                &event.peer,
-                event.contract_location,
-                distance,
-                outcome,
-                time_hours,
-            );
-        }
-
-        renegade_predictor.finish_batch();
-
         // Build per-op-type estimators from history
         let mut per_op_failure: HashMap<OpType, Vec<IsotonicEvent>> = HashMap::new();
         let mut per_op_response_time: HashMap<OpType, Vec<IsotonicEvent>> = HashMap::new();
@@ -1124,16 +2331,26 @@ impl Router {
             ),
             mean_transfer_size,
             consider_n_closest_peers: DEFAULT_CONSIDER_N_CLOSEST_PEERS,
+            // Dashboard-only, so they fit on read. See `FitPolicy`.
             per_op_failure: per_op_failure
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_fit_on_read(
+                            v,
+                            EstimatorType::Positive,
+                            AdjustmentMode::Additive,
+                        ),
+                    )
+                })
                 .collect(),
             per_op_response_time: per_op_response_time
                 .into_iter()
                 .map(|(k, v)| {
                     (
                         k,
-                        IsotonicEstimator::new_with_mode(
+                        IsotonicEstimator::new_fit_on_read(
                             v,
                             EstimatorType::Positive,
                             AdjustmentMode::Multiplicative,
@@ -1143,10 +2360,61 @@ impl Router {
                 .collect(),
             per_op_transfer_rate: per_op_transfer_rate
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Negative)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_fit_on_read(
+                            v,
+                            EstimatorType::Negative,
+                            AdjustmentMode::Additive,
+                        ),
+                    )
+                })
                 .collect(),
-            renegade_predictor,
+            // Not replayed from `history`: batch events carry no timestamps, and
+            // the estimator's horizons are defined on its own clock. It learns
+            // from live traffic, which is the only path production uses.
+            hierarchical: hierarchical::HierarchicalRouting::new(Ring::DEFAULT_MAX_CONNECTIONS),
+            estimator_clock: EstimatorClock::default(),
+            failure_skill: skill::SkillTracker::new(),
+            max_connections: Ring::DEFAULT_MAX_CONNECTIONS,
+            response_time_error: PairedErrorTracker::default(),
+            transfer_time_error: PairedErrorTracker::default(),
+            recent_accuracy: RecentAccuracy::default(),
+            selection_ranks: SelectionRankStats::default(),
+            peer_selections: PeerSelectionCounts::new(hierarchical::peer_capacity(
+                Ring::DEFAULT_MAX_CONNECTIONS,
+            )),
+            outcome_totals: RouteOutcomeTotals::default(),
+            route_events_discarded_unlocated: discarded_unlocated,
+            #[cfg(test)]
+            recorded_sources: Vec::new(),
+            #[cfg(test)]
+            predictions_by_model: Default::default(),
+            #[cfg(test)]
+            events_by_fallback_switch: [0; 2],
         }
+    }
+
+    /// Run the hierarchical estimator's horizons on `source`. Production passes
+    /// the ring's `InstantTimeSrc`, which follows tokio's clock (so it advances
+    /// under a paused runtime); tests pass a mock they advance by hand.
+    pub(crate) fn with_time_source(
+        mut self,
+        source: crate::util::time_source::DynTimeSource,
+    ) -> Self {
+        self.estimator_clock = EstimatorClock::new(source);
+        self
+    }
+
+    /// Size the hierarchical estimator's peer tables from this node's
+    /// configured connection cap. Resets the estimator, so call at construction.
+    pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self.hierarchical = hierarchical::HierarchicalRouting::new(max_connections);
+        self.peer_selections =
+            PeerSelectionCounts::new(hierarchical::peer_capacity(max_connections));
+        self
     }
 
     #[allow(dead_code)]
@@ -1156,24 +2424,104 @@ impl Router {
     }
 
     pub fn add_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Originator, dataset::global());
+    }
+
+    /// [`Self::add_event`] for an outcome observed by a relay hop about its
+    /// downstream peer. Identical for the model; distinguished only in the
+    /// routing dataset, because relays record outcomes under their own
+    /// conventions (see `record_relay_route_event`).
+    pub(crate) fn add_relay_event(&mut self, event: RouteEvent) {
+        self.add_event_recording(event, dataset::RouteSource::Relay, dataset::global());
+    }
+
+    /// [`Self::add_event`], recording the event into `dataset` when one is
+    /// given. Split out so tests can supply a recorder without the
+    /// process-wide environment switch.
+    fn add_event_recording(
+        &mut self,
+        event: RouteEvent,
+        source: dataset::RouteSource,
+        dataset: Option<&dataset::RoutingDataset>,
+    ) {
+        // Hardening: the isotonic estimators require a peer location for every
+        // event they learn (`IsotonicEvent::route_distance`). No route-event
+        // producer passes a peer without one today, because every GET and PUT
+        // waits for this node's own address before routing. Nothing enforces
+        // that invariant here, though, and an event that slipped through would
+        // panic under the router's write lock. Skip it instead: an event about
+        // a peer that cannot be placed on the ring says nothing about distance.
+        if event.peer.location().is_none() {
+            self.route_events_discarded_unlocated += 1;
+            let discarded_total = self.route_events_discarded_unlocated;
+            // A should-be-zero invariant, so it must reach a release log, but a
+            // producer that breaks it may do so on every event: warn at
+            // power-of-two totals (1, 2, 4, 8, ...), as `note_dropped_event_log`
+            // does, and leave the rest at debug.
+            if discarded_total.is_power_of_two() {
+                tracing::warn!(
+                    peer = ?event.peer,
+                    discarded_total,
+                    "route event about a peer with no known location; not learned. A \
+                     route-event producer broke the invariant that routed peers are located"
+                );
+            } else {
+                tracing::debug!(
+                    peer = ?event.peer,
+                    discarded_total,
+                    "route event about a peer with no known location; not recorded"
+                );
+            }
+            return;
+        }
         let was_below_threshold = !self.has_sufficient_routing_events();
         let op_type = event.op_type;
+        #[cfg(test)]
+        self.recorded_sources
+            .push((event.peer.socket_addr(), source));
+        #[cfg(test)]
+        {
+            self.events_by_fallback_switch[usize::from(isotonic_fallback_enabled())] += 1;
+        }
+        match event.outcome {
+            RouteOutcome::Failure => self.outcome_totals.failures += 1,
+            RouteOutcome::Success { .. } | RouteOutcome::SuccessUntimed => {
+                self.outcome_totals.successes += 1;
+            }
+        }
 
-        // Feed renegade predictor (before isotonic, which moves event.peer)
         let distance = event
             .peer
             .location()
             .map(|loc| event.contract_location.distance(loc).as_f64())
             .unwrap_or(0.5);
-
-        let (renegade_outcome, _) =
-            routing_predictor::RoutingOutcome::from_route_outcome(&event.outcome);
-        self.renegade_predictor.record(
+        let (outcome, _) = hierarchical::RoutingOutcome::from_route_outcome(&event.outcome);
+        let actual_failure = if outcome.success { 0.0 } else { 1.0 };
+        // Every forecast scored or recorded below is made BEFORE this event is
+        // learned: the isotonic baseline here, before the isotonic estimators
+        // ingest it further down, and the hierarchical one inside `observe_at`.
+        // A forecast that has already seen its own outcome grades itself on the
+        // answer.
+        let baseline = self.isotonic_baseline(&event.peer, event.contract_location);
+        let now = self.estimator_clock.hours();
+        let observed = self.hierarchical.observe_at(
             &event.peer,
             event.contract_location,
             distance,
-            renegade_outcome,
+            &outcome,
+            now,
         );
+        let forecasts = self.score_hierarchical_layer(
+            &event.peer,
+            baseline,
+            observed,
+            ObservedTiming::of(&event.outcome),
+            actual_failure,
+            now,
+        );
+        if let Some(dataset) = dataset.filter(|dataset| dataset.is_recording()) {
+            dataset.record_route(self.route_record(&event, source, forecasts));
+        }
 
         // Feed global isotonic estimators
         match event.outcome {
@@ -1195,11 +2543,13 @@ impl Router {
 
                 // Per-op-type estimators
                 if let Some(ot) = op_type {
+                    // The per-op estimators are dashboard-only, so they fit on
+                    // read rather than on every event. See `FitPolicy`.
                     self.per_op_response_time
                         .entry(ot)
                         .or_insert_with(|| {
                             // Multiplicative to match the global response-time estimator.
-                            IsotonicEstimator::new_with_mode(
+                            IsotonicEstimator::new_fit_on_read(
                                 std::iter::empty(),
                                 EstimatorType::Positive,
                                 AdjustmentMode::Multiplicative,
@@ -1213,7 +2563,11 @@ impl Router {
                     self.per_op_failure
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            IsotonicEstimator::new_fit_on_read(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Additive,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer.clone(),
@@ -1236,7 +2590,11 @@ impl Router {
                         self.per_op_transfer_rate
                             .entry(ot)
                             .or_insert_with(|| {
-                                IsotonicEstimator::new(std::iter::empty(), EstimatorType::Negative)
+                                IsotonicEstimator::new_fit_on_read(
+                                    std::iter::empty(),
+                                    EstimatorType::Negative,
+                                    AdjustmentMode::Additive,
+                                )
                             })
                             .add_event(IsotonicEvent {
                                 contract_location: event.contract_location,
@@ -1261,7 +2619,11 @@ impl Router {
                     self.per_op_failure
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            IsotonicEstimator::new_fit_on_read(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Additive,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer,
@@ -1281,11 +2643,66 @@ impl Router {
         }
     }
 
+    /// Cumulative outcome counts. See [`RouteOutcomeTotals`].
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn outcome_totals(&self) -> RouteOutcomeTotals {
+        self.outcome_totals
+    }
+
+    /// `(peer address, source)` of every event this router learned. See
+    /// `recorded_sources`.
+    #[cfg(test)]
+    pub(crate) fn recorded_sources_for_test(
+        &self,
+    ) -> Vec<(Option<std::net::SocketAddr>, dataset::RouteSource)> {
+        self.recorded_sources.clone()
+    }
+
+    /// Predictions this router has made, `(isotonic fallback, hierarchical)`.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "simulation_tests"), allow(dead_code))]
+    pub(crate) fn predictions_by_model_for_test(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.predictions_by_model[0].load(Relaxed),
+            self.predictions_by_model[1].load(Relaxed),
+        )
+    }
+
+    /// Route events learned with the isotonic fallback switch `(off, on)`, as
+    /// the learning thread saw it. See `events_by_fallback_switch`.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "simulation_tests"), allow(dead_code))]
+    pub(crate) fn events_by_fallback_switch_for_test(&self) -> (u64, u64) {
+        (
+            self.events_by_fallback_switch[0],
+            self.events_by_fallback_switch[1],
+        )
+    }
+
+    /// Every `(peer address, result)` pair currently held in the failure
+    /// estimator's rolling window, in insertion order (`1.0` = failure,
+    /// `0.0` = success). Test-only: lets a driver test assert WHICH peer a
+    /// route event blamed.
+    #[cfg(test)]
+    pub(crate) fn failure_window_for_test(&self) -> Vec<(Option<std::net::SocketAddr>, f64)> {
+        self.failure_estimator
+            .raw_events_for_test()
+            .map(|e| (e.peer.socket_addr(), e.result))
+            .collect()
+    }
+
+    /// The `consider_n_closest_peers` closest candidates, plus HOW MANY were
+    /// available before that cut.
+    ///
+    /// The second value is what distinguishes "the window was full" from "the
+    /// window actually discarded someone", and only the latter is evidence
+    /// about whether the limit is costing anything.
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
         target_location: &Location,
-    ) -> Vec<&'a PeerKeyLocation> {
+    ) -> (Vec<&'a PeerKeyLocation>, usize) {
         let mut peer_distances: Vec<_> = peers
             .into_iter()
             .map(|peer| {
@@ -1308,9 +2725,13 @@ impl Router {
         if k > 0 && k < peer_distances.len() {
             peer_distances.select_nth_unstable_by(k - 1, |a, b| a.1.cmp(&b.1));
         }
+        let available = peer_distances.len();
         peer_distances.truncate(k);
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.into_iter().map(|(peer, _)| peer).collect()
+        (
+            peer_distances.into_iter().map(|(peer, _)| peer).collect(),
+            available,
+        )
     }
 
     pub fn select_peer<'a>(
@@ -1336,16 +2757,271 @@ impl Router {
         selected
     }
 
+    /// The dataset record for one event, built from the state the forecasts
+    /// were made in — i.e. before the event is ingested.
+    fn route_record(
+        &self,
+        event: &RouteEvent,
+        source: dataset::RouteSource,
+        forecasts: Option<dataset::FailureForecasts>,
+    ) -> dataset::RouteRecord {
+        let (outcome, time_to_response_start_s, payload_bytes, payload_transfer_s) =
+            match &event.outcome {
+                RouteOutcome::Success {
+                    time_to_response_start,
+                    payload_size,
+                    payload_transfer_time,
+                } => (
+                    "success",
+                    Some(time_to_response_start.as_secs_f64()),
+                    Some(*payload_size),
+                    Some(payload_transfer_time.as_secs_f64()),
+                ),
+                RouteOutcome::SuccessUntimed => ("success_untimed", None, None, None),
+                RouteOutcome::Failure => ("failure", None, None, None),
+            };
+        let peer_location = event.peer.location();
+        dataset::RouteRecord {
+            t_ms: dataset::now_ms(),
+            source,
+            peer: dataset::peer_hash(&event.peer),
+            peer_location: peer_location.map(|location| location.as_f64()),
+            contract_location: event.contract_location.as_f64(),
+            distance: peer_location
+                .map(|location| event.contract_location.distance(location).as_f64()),
+            op: event.op_type.map(|op| op.as_str()),
+            outcome,
+            time_to_response_start_s,
+            payload_bytes,
+            payload_transfer_s,
+            prior_failure_events: self.failure_estimator.len(),
+            forecasts,
+        }
+    }
+
+    /// The isotonic stack's forecasts for one query, before the event is
+    /// learned: the global failure curve, that curve with the per-peer EWMA,
+    /// and the timing a cold hierarchical stage would fall back to.
+    ///
+    /// `None` until the failure curve can estimate at all, or for a peer whose
+    /// location is unknown. A handful of interpolations over fits `add_event`
+    /// keeps current, so it is cheap under the write lock.
+    fn isotonic_baseline(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+    ) -> Option<IsotonicBaseline> {
+        let (Ok(global), Ok(adjusted)) = (
+            self.failure_estimator
+                .estimate_global(peer, contract_location),
+            self.failure_estimator
+                .estimate_retrieval_time(peer, contract_location),
+        ) else {
+            return None;
+        };
+        Some(IsotonicBaseline {
+            global_failure: global.clamp(0.0, 1.0),
+            adjusted_failure: adjusted.clamp(0.0, 1.0),
+            timing: self.isotonic_timing_forecast(peer, contract_location),
+        })
+    }
+
+    /// The timing and speed a cold hierarchical stage falls back to: the
+    /// isotonic estimates with the per-peer EWMA, exactly as
+    /// [`Self::predict_routing_outcome_at`] reads them. A stage the isotonic
+    /// estimator cannot estimate either is unknown, not zero.
+    fn isotonic_timing_forecast(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+    ) -> IsotonicTimingForecast {
+        IsotonicTimingForecast {
+            // Zero is kept, as routing keeps it; the scoring floors both
+            // models' times alike rather than dropping it.
+            time_to_response_start_secs: self
+                .response_start_time_estimator
+                .estimate_retrieval_time(peer, contract_location)
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0),
+            transfer_speed_bps: self
+                .isotonic_transfer_speed(peer, contract_location)
+                .filter(|speed| speed.is_finite() && *speed > 0.0),
+        }
+    }
+
+    /// The isotonic transfer-speed estimate routing uses: the estimator's own
+    /// value, raised to [`DEGENERATE_SPEED_FLOOR_BPS`] when it falls below it.
+    /// `None` when the estimator cannot estimate at all (too few transfers, or
+    /// no peer location).
+    fn isotonic_transfer_speed(
+        &self,
+        peer: &PeerKeyLocation,
+        contract_location: Location,
+    ) -> Option<f64> {
+        let raw = self
+            .transfer_rate_estimator
+            .estimate_retrieval_time(peer, contract_location)
+            .ok()?;
+        Some(raw.max(DEGENERATE_SPEED_FLOOR_BPS))
+    }
+
+    /// Score the hierarchical forecasts made for an event against what
+    /// happened, and return the forecasts for its dataset record.
+    ///
+    /// Scored only on events the isotonic baseline could also forecast
+    /// (`baseline` is `Some`), so the failure skill and both seconds errors
+    /// describe one population, and the dataset records forecasts only once
+    /// there is something to compare.
+    ///
+    /// The seconds errors compare the hierarchical estimate with the isotonic
+    /// one a cold stage falls back to, on the events that carry the
+    /// measurement. They are the calibration instrument the promotion gate was
+    /// read from (`.claude/rules/ring.md`).
+    fn score_hierarchical_layer(
+        &mut self,
+        peer: &PeerKeyLocation,
+        baseline: Option<IsotonicBaseline>,
+        observed: hierarchical::Observed,
+        actual: ObservedTiming,
+        actual_failure: f64,
+        now_hours: f64,
+    ) -> Option<dataset::FailureForecasts> {
+        let baseline = baseline?;
+        let hierarchical = observed.estimate;
+        // Both models' times pass through the same floor, for the dataset's log
+        // and for the seconds error alike: a 0 s forecast is scored as 1 ms, not
+        // dropped, so neither model's population loses events the other keeps.
+        let floor_time = |seconds: f64| seconds.max(hierarchical::MIN_RESPONSE_SECS);
+        let hierarchical_time = hierarchical.time_to_response_start_secs.map(floor_time);
+        let isotonic_time = baseline.timing.time_to_response_start_secs.map(floor_time);
+        let tag = peer_tag(peer);
+        if let Some(probability) = observed.failure {
+            self.failure_skill.record(probability, actual_failure);
+            self.recent_accuracy
+                .failure
+                .push(probability, actual_failure, tag);
+        }
+        if let (Some(actual), Some(forecast)) = (
+            actual.response_secs,
+            hierarchical.time_to_response_start_secs,
+        ) {
+            self.recent_accuracy
+                .response_time
+                .push(forecast, actual, tag);
+        }
+        if let (Some((bytes, seconds)), Some(forecast)) =
+            (actual.transfer, hierarchical.transfer_speed_bps)
+        {
+            self.recent_accuracy
+                .transfer_speed
+                .push(forecast, bytes / seconds, tag);
+        }
+        // Same population for both models: an event counts only when both
+        // forecast it and it carries the measurement.
+        if let (Some(actual), Some(isotonic_time), Some(hierarchical_time)) =
+            (actual.response_secs, isotonic_time, hierarchical_time)
+        {
+            self.response_time_error
+                .record(isotonic_time, hierarchical_time, actual, now_hours);
+        }
+        if let (Some((bytes, actual)), Some(isotonic_speed), Some(hierarchical_speed)) = (
+            actual.transfer,
+            baseline.timing.transfer_speed_bps,
+            hierarchical.transfer_speed_bps,
+        ) {
+            self.transfer_time_error.record(
+                bytes / isotonic_speed,
+                bytes / hierarchical_speed,
+                actual,
+                now_hours,
+            );
+        }
+        Some(dataset::FailureForecasts {
+            global: baseline.global_failure,
+            adjusted: baseline.adjusted_failure,
+            hierarchical: observed.failure,
+            log_response_time_legacy: isotonic_time.map(f64::ln),
+            log_response_time_hierarchical: hierarchical_time.map(f64::ln),
+            log_transfer_speed_legacy: baseline.timing.transfer_speed_bps.map(f64::ln),
+            log_transfer_speed_hierarchical: hierarchical.transfer_speed_bps.map(f64::ln),
+        })
+    }
+
     fn predict_routing_outcome(
         &self,
         peer: &PeerKeyLocation,
         target_location: Location,
     ) -> Result<RoutingPrediction, RoutingError> {
+        self.predict_routing_outcome_at(peer, target_location, self.estimator_clock.hours())
+    }
+
+    /// [`Self::predict_routing_outcome`] at an explicit estimator time (hours),
+    /// so a test can make two calls on one clock reading.
+    ///
+    /// Routing acts on the hierarchical estimate for every stage that has a
+    /// curve. Everything else here is kept exactly as the build that was soaked
+    /// with `FREENET_ROUTING_HIERARCHICAL=1` did it, and `golden_replay` pins
+    /// that: the 50-event gate, a peer with no location getting no prediction,
+    /// and a timing stage without a hierarchical curve (the timing stages need
+    /// 30 samples) falling back to the isotonic estimate with the per-peer EWMA.
+    /// `FREENET_ROUTING_FALLBACK_ISOTONIC` (off by default) sends every stage
+    /// down that fallback path.
+    ///
+    /// The isotonic transfer speed is floored at 1e-6 B/s, so a degenerate (zero
+    /// or near-zero) one is not priced as an unroutable transfer; the soaked
+    /// build did not floor it (see `DEGENERATE_SPEED_FLOOR_BPS`), which is the
+    /// second, and narrower, difference from it.
+    ///
+    /// The first difference from the soaked build is in that fallback: it also
+    /// blended Renegade in once Renegade held 10 samples of the stage, and that
+    /// term is gone with Renegade (#4485).
+    fn predict_routing_outcome_at(
+        &self,
+        peer: &PeerKeyLocation,
+        target_location: Location,
+        estimator_hours: f64,
+    ) -> Result<RoutingPrediction, RoutingError> {
+        self.predict_with_model(
+            peer,
+            target_location,
+            estimator_hours,
+            !isotonic_fallback_enabled(),
+        )
+        .map(|(prediction, _)| prediction)
+    }
+
+    /// The prediction routing would act on with the hierarchical estimator in
+    /// or out of routing (`use_hierarchical`), whatever
+    /// `FREENET_ROUTING_FALLBACK_ISOTONIC` is actually set to, and which stages
+    /// the hierarchical estimator supplied itself. With `use_hierarchical`
+    /// false every stage takes the isotonic fallback, which is what the
+    /// emergency switch routes on. Routing passes the switch; the candidate log
+    /// (`dataset`) also asks for the other model.
+    fn predict_with_model(
+        &self,
+        peer: &PeerKeyLocation,
+        target_location: Location,
+        estimator_hours: f64,
+        use_hierarchical: bool,
+    ) -> Result<(RoutingPrediction, dataset::HierarchicalStages), RoutingError> {
         if !self.has_sufficient_routing_events() {
             return Err(RoutingError::InsufficientDataError);
         }
+        // The test-only counters below count only the model routing acts on:
+        // the candidate log also computes the other one for every candidate,
+        // and counting that would read as routing on both.
+        #[cfg(test)]
+        let acting = use_hierarchical != isotonic_fallback_enabled();
+        #[cfg(test)]
+        if acting {
+            self.predictions_by_model[usize::from(use_hierarchical)]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-        // Failure estimator is required — it has data from all outcome types
+        // Required even though routing acts on the hierarchical failure
+        // estimate once it exists: a peer the isotonic estimator cannot estimate
+        // (its location is unknown) gets no prediction and sorts after every
+        // peer that has one, as it always has.
         let failure_estimate = self
             .failure_estimator
             .estimate_retrieval_time(peer, target_location)
@@ -1360,61 +3036,66 @@ impl Router {
             .response_start_time_estimator
             .estimate_retrieval_time(peer, target_location)
             .ok();
-        let transfer_estimate = self
-            .transfer_rate_estimator
-            .estimate_retrieval_time(peer, target_location)
-            .ok();
+        // Floored: see `DEGENERATE_SPEED_FLOOR_BPS`.
+        let transfer_estimate = self.isotonic_transfer_speed(peer, target_location);
 
-        // Clamp before using in cost formulas — per-peer EWMA adjustments can
-        // push the raw estimate slightly outside [0, 1].
-        let mut failure_estimate = failure_estimate.clamp(0.0, 1.0);
-        let isotonic_failure = failure_estimate;
-        let failure_cost_multiplier = 3.0;
-
-        // Blend renegade prediction if available. The renegade predictor captures
-        // peer × contract interactions that the global isotonic model cannot see
-        // (e.g., a peer selectively dropping requests for specific contracts).
         let distance = peer
             .location()
             .map(|loc| target_location.distance(loc).as_f64())
             .unwrap_or(0.5);
-        let renegade = self
-            .renegade_predictor
-            .predict(peer, target_location, distance);
 
-        let renegade_failure_adjustment =
-            if let Some(renegade_failure) = renegade.failure_probability {
-                if renegade_failure.is_finite() {
-                    let w = self.renegade_predictor.failure_weight();
-                    failure_estimate =
-                        failure_estimate * (1.0 - w) + renegade_failure.clamp(0.0, 1.0) * w;
-                    failure_estimate = failure_estimate.clamp(0.0, 1.0);
-                    Some(failure_estimate - isotonic_failure)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        // Without the hierarchical estimator (the emergency fallback, or the
+        // candidate log asking for the other model) every stage takes the
+        // isotonic estimate, which is exactly what a stage without a
+        // hierarchical curve uses. See `isotonic_fallback_enabled`.
+        let hierarchical = if use_hierarchical {
+            self.hierarchical
+                .estimate(peer, target_location, distance, estimator_hours)
+        } else {
+            hierarchical::Estimate::default()
+        };
+        let hierarchical_failure = hierarchical
+            .failure_probability
+            .filter(|p| p.is_finite())
+            .map(|p| p.clamp(0.0, 1.0));
+        let hierarchical_time = hierarchical
+            .time_to_response_start_secs
+            .filter(|t| t.is_finite() && *t >= 0.0);
+        let hierarchical_speed = hierarchical
+            .transfer_speed_bps
+            .filter(|v| v.is_finite() && *v > 0.0);
 
-        let mut time_to_response_start = time_estimate.unwrap_or(0.0);
-        let mut xfer_speed = transfer_estimate.unwrap_or(0.0);
-
-        // Blend renegade timing predictions if available (only when finite and positive)
-        if let Some(renegade_time) = renegade.time_to_response_start {
-            if time_estimate.is_some() && renegade_time.is_finite() && renegade_time >= 0.0 {
-                let w = self.renegade_predictor.response_time_weight();
-                time_to_response_start = time_to_response_start * (1.0 - w) + renegade_time * w;
-            }
-        }
-        if let Some(renegade_speed) = renegade.transfer_speed {
-            if transfer_estimate.is_some() && renegade_speed.is_finite() && renegade_speed > 0.0 {
-                let w = self.renegade_predictor.transfer_speed_weight();
-                xfer_speed = xfer_speed * (1.0 - w) + renegade_speed * w;
-            }
+        #[cfg(test)]
+        if acting
+            && (hierarchical_failure.is_none()
+                || (hierarchical_time.is_none() && time_estimate.is_some())
+                || (hierarchical_speed.is_none() && transfer_estimate.is_some()))
+        {
+            FALLBACK_STAGE_EVALUATIONS.with(|count| count.set(count.get() + 1));
         }
 
-        let expected_total_time = if time_estimate.is_some() && transfer_estimate.is_some() {
+        let failure_cost_multiplier = 3.0;
+        // Clamp the fallback before using it in cost formulas — the per-peer
+        // EWMA adjustment can push the raw estimate slightly outside [0, 1].
+        let failure_estimate =
+            hierarchical_failure.unwrap_or_else(|| failure_estimate.clamp(0.0, 1.0));
+        // The failure value the cost formula ranks by. For the hierarchical
+        // estimator it keeps the order of the forecasts BEFORE the [0, 1] bound,
+        // so peers whose forecasts all clamp at 1 are not tied (see
+        // `hierarchical::ranking_failure_probability`); it differs from the
+        // reported probability only ABOVE that bound, and then by at most 1e-6
+        // per unit of overshoot, so it is never negative and cannot make this
+        // cost negative. The isotonic fallback ranks by its own probability.
+        let failure_for_cost = match hierarchical_failure {
+            Some(probability) => hierarchical.failure_ranking.unwrap_or(probability),
+            None => failure_estimate,
+        };
+        let time_to_response_start = hierarchical_time.or(time_estimate).unwrap_or(0.0);
+        let xfer_speed = hierarchical_speed.or(transfer_estimate).unwrap_or(0.0);
+
+        let time_available = time_estimate.is_some() || hierarchical_time.is_some();
+        let transfer_available = transfer_estimate.is_some() || hierarchical_speed.is_some();
+        let expected_total_time = if time_available && transfer_available {
             // Guard against NaN from 0.0/0.0 (mean_transfer_size with no samples
             // divided by zero xfer_speed). Use a large finite fallback so the peer
             // sorts last but doesn't poison the comparator's total ordering.
@@ -1426,20 +3107,27 @@ impl Router {
             };
             time_to_response_start
                 + transfer_time
-                + (time_to_response_start * failure_estimate * failure_cost_multiplier)
+                + (time_to_response_start * failure_for_cost * failure_cost_multiplier)
         } else {
-            failure_estimate * failure_cost_multiplier
+            failure_for_cost * failure_cost_multiplier
         };
 
-        Ok(RoutingPrediction {
-            failure_probability: failure_estimate,
-            xfer_speed: TransferSpeed {
-                bytes_per_second: xfer_speed,
+        let stages = dataset::HierarchicalStages {
+            failure: hierarchical_failure.is_some(),
+            response_time: hierarchical_time.is_some(),
+            transfer_speed: hierarchical_speed.is_some(),
+        };
+        Ok((
+            RoutingPrediction {
+                failure_probability: failure_estimate,
+                xfer_speed: TransferSpeed {
+                    bytes_per_second: xfer_speed,
+                },
+                time_to_response_start,
+                expected_total_time,
             },
-            time_to_response_start,
-            expected_total_time,
-            renegade_failure_adjustment,
-        })
+            stages,
+        ))
     }
 
     /// Like `select_k_best_peers` but also returns a `RoutingDecisionInfo` for telemetry.
@@ -1449,6 +3137,37 @@ impl Router {
         target_location: Location,
         k: usize,
     ) -> (Vec<&'a PeerKeyLocation>, RoutingDecisionInfo) {
+        let (selected, decision, _) =
+            self.select_k_best_peers_capturing(peers, target_location, k, false, false);
+        (selected, decision)
+    }
+
+    /// [`Self::select_k_best_peers_with_telemetry`], and with `capture` also the
+    /// candidate set for the routing dataset's `decision` line: every scored
+    /// candidate with BOTH models' predictions, taken from the decision as it
+    /// is made. `None` without `capture`, and for a distance-based decision.
+    ///
+    /// Capturing costs one extra prediction per candidate (the model that is
+    /// not routing) under the caller's router READ lock; see the cost notes in
+    /// [`dataset`]'s "Candidate sets". Without `capture` the path is the plain
+    /// routing decision. Building and sending the record is left to the
+    /// caller, after the lock is released.
+    ///
+    /// `routes` says the caller routes by this selection and records its
+    /// outcome as a route event (`DecisionLog::Joinable`); only those
+    /// decisions are counted into [`PeerSelectionCounts`].
+    pub(crate) fn select_k_best_peers_capturing<'a>(
+        &self,
+        peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
+        target_location: Location,
+        k: usize,
+        capture: bool,
+        routes: bool,
+    ) -> (
+        Vec<&'a PeerKeyLocation>,
+        RoutingDecisionInfo,
+        Option<dataset::DecisionCapture<'a>>,
+    ) {
         let total_routing_events = self.failure_estimator.len();
 
         if k == 0 {
@@ -1460,6 +3179,7 @@ impl Router {
                     candidates: Vec::new(),
                     total_routing_events,
                 },
+                None,
             );
         }
 
@@ -1507,34 +3227,105 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, None)
         } else {
-            let closest = self.select_closest_peers(peers, &target_location);
+            let (closest, candidates_available) =
+                self.select_closest_peers(peers, &target_location);
             let mut fallback_count = 0;
+            // The model routing acts on: the hierarchical estimator, unless the
+            // emergency isotonic fallback is switched on. The candidate log's
+            // "legacy" model is the isotonic fallback (#4485).
+            let acting_hierarchical = !isotonic_fallback_enabled();
+            let mut captured: Vec<dataset::CapturedCandidate<'a>> = if capture {
+                Vec::with_capacity(closest.len())
+            } else {
+                Vec::new()
+            };
 
-            let mut scored: Vec<(&'a PeerKeyLocation, f64, Option<RoutingPrediction>)> = closest
-                .iter()
-                .map(|peer| {
-                    let distance = peer
-                        .location()
-                        .map(|loc| target_location.distance(loc).as_f64())
-                        .unwrap_or(0.5);
-                    match self.predict_routing_outcome(peer, target_location) {
-                        Ok(pred) => (*peer, distance, Some(pred)),
-                        Err(_) => {
+            // `closest` is distance-sorted, so the enumerate index IS the
+            // distance rank. Carrying it through the re-sort is how the rank
+            // survives being reordered by predicted cost; recovering it
+            // afterwards would need peer equality and an O(n) search for
+            // information we already had.
+            let mut scored: Vec<(usize, &'a PeerKeyLocation, f64, Option<RoutingPrediction>)> =
+                closest
+                    .iter()
+                    .enumerate()
+                    .map(|(distance_rank, peer)| {
+                        let distance = peer
+                            .location()
+                            .map(|loc| target_location.distance(loc).as_f64())
+                            .unwrap_or(0.5);
+                        let prediction = if capture {
+                            // Both models on one clock reading; the acting one
+                            // is exactly what routing sorts below.
+                            let estimator_hours = self.estimator_clock.hours();
+                            let acting = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    estimator_hours,
+                                    acting_hierarchical,
+                                )
+                                .ok();
+                            let other = self
+                                .predict_with_model(
+                                    peer,
+                                    target_location,
+                                    estimator_hours,
+                                    !acting_hierarchical,
+                                )
+                                .ok();
+                            let (legacy, hierarchical) = if acting_hierarchical {
+                                (other, acting)
+                            } else {
+                                (acting, other)
+                            };
+                            let estimate =
+                                |p: &(RoutingPrediction, dataset::HierarchicalStages)| {
+                                    dataset::ModelEstimate {
+                                        failure_probability: p.0.failure_probability,
+                                        time_to_response_start_s: p.0.time_to_response_start,
+                                        transfer_speed_bps: p.0.xfer_speed.bytes_per_second,
+                                        expected_total_time: p.0.expected_total_time,
+                                    }
+                                };
+                            captured.push(dataset::CapturedCandidate {
+                                peer,
+                                legacy: legacy.as_ref().map(estimate),
+                                hierarchical: hierarchical.as_ref().map(estimate),
+                                hierarchical_stages: hierarchical
+                                    .map(|(_, stages)| stages)
+                                    .unwrap_or_default(),
+                                selected_position: None,
+                            });
+                            acting.map(|(prediction, _)| prediction)
+                        } else {
+                            self.predict_routing_outcome(peer, target_location).ok()
+                        };
+                        if prediction.is_none() {
                             fallback_count += 1;
-                            (*peer, distance, None)
                         }
-                    }
-                })
-                .collect();
+                        (distance_rank, *peer, distance, prediction)
+                    })
+                    .collect();
 
             // Sort: peers with predictions by expected_total_time, others at the end
             scored.sort_by(|a, b| {
-                let time_a = a.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
-                let time_b = b.2.map(|p| p.expected_total_time).unwrap_or(f64::MAX);
+                let time_a = dataset::cost_order_key(a.3.map(|p| p.expected_total_time));
+                let time_b = dataset::cost_order_key(b.3.map(|p| p.expected_total_time));
                 time_a.total_cmp(&time_b)
             });
+
+            // Record where the winner sat in distance order, so the cost of the
+            // candidate-window truncation can be measured rather than guessed.
+            if let Some((distance_rank, winner, _, _)) = scored.first() {
+                self.selection_ranks
+                    .record(*distance_rank, closest.len(), candidates_available);
+                if routes {
+                    self.peer_selections.record(&closest, winner);
+                }
+            }
 
             let strategy = if fallback_count == 0 {
                 RoutingStrategy::PredictionBased
@@ -1546,7 +3337,7 @@ impl Router {
             let candidates: Vec<RoutingCandidate> = scored
                 .iter()
                 .enumerate()
-                .map(|(i, (_, dist, pred))| RoutingCandidate {
+                .map(|(i, (_, _, dist, pred))| RoutingCandidate {
                     distance: *dist,
                     prediction: pred.map(RoutingPredictionInfo::from),
                     selected: i < k,
@@ -1554,8 +3345,30 @@ impl Router {
                 .collect();
 
             scored.truncate(k);
+            // The selection, marked on the capture by the distance rank each
+            // returned peer carried through the sort: from the decision itself.
+            let capture = capture.then(|| {
+                for (position, (distance_rank, _, _, _)) in scored.iter().enumerate() {
+                    if let Some(candidate) = captured.get_mut(*distance_rank) {
+                        candidate.selected_position = Some(position);
+                    }
+                }
+                dataset::DecisionCapture {
+                    contract_location: target_location,
+                    acting_model: if acting_hierarchical {
+                        dataset::RoutingModel::Hierarchical
+                    } else {
+                        dataset::RoutingModel::Legacy
+                    },
+                    prediction_fallback: fallback_count > 0,
+                    k,
+                    candidates_available,
+                    prior_failure_events: total_routing_events,
+                    candidates: captured,
+                }
+            });
             let selected: Vec<&'a PeerKeyLocation> =
-                scored.into_iter().map(|(peer, _, _)| peer).collect();
+                scored.into_iter().map(|(_, peer, _, _)| peer).collect();
 
             let decision = RoutingDecisionInfo {
                 target_location: target_location.as_f64(),
@@ -1563,12 +3376,14 @@ impl Router {
                 candidates,
                 total_routing_events,
             };
-            (selected, decision)
+            (selected, decision, capture)
         }
     }
 
     /// Produce a snapshot of the router model state for telemetry.
     pub fn snapshot(&self) -> RouterSnapshotInfo {
+        let hierarchical = self.hierarchical.diagnostics();
+        let estimator_hours = self.estimator_clock.hours();
         RouterSnapshotInfo {
             network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
@@ -1611,23 +3426,23 @@ impl Router {
                 for ot in op_types {
                     let mut c = PerOpCurves::default();
                     if let Some(est) = self.per_op_failure.get(&ot) {
-                        let p = est.sampled_curve(0.0, 1.0, 50);
-                        c.failure_curve = p;
-                        c.failure_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.failure_curve, c.failure_data_range) =
+                            est.sampled_curve_and_range(0.0, 1.0, 50);
                         c.failure_events = est.len();
                         c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.response_time_curve = p;
-                        c.response_time_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.response_time_curve, c.response_time_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.response_time_events = est.len();
                         c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
-                        let p = est.sampled_curve(0.0, f64::INFINITY, 50);
-                        c.transfer_rate_curve = p;
-                        c.transfer_rate_data_range = est.data_x_range();
+                        // One fit for both: these estimators fit on read.
+                        (c.transfer_rate_curve, c.transfer_rate_data_range) =
+                            est.sampled_curve_and_range(0.0, f64::INFINITY, 50);
                         c.transfer_rate_events = est.len();
                         c.transfer_rate_points = est.sampled_raw_points(100);
                     }
@@ -1642,6 +3457,12 @@ impl Router {
             connect_forward_peer_adjustments: None,
             // Node-health gauges populated by Ring on the snapshot cadence (#4440).
             open_fds: None,
+            timeout_label_peers_1: None,
+            timeout_label_peers_2_3: None,
+            timeout_label_peers_4_7: None,
+            timeout_label_peers_8_plus: None,
+            timeout_label_max_per_peer: None,
+            timeout_labels_untracked: None,
             fd_soft_limit: None,
             contract_module_cache_entries: None,
             contract_module_cache_total_bytes: None,
@@ -1673,6 +3494,14 @@ impl Router {
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
+            hosting_resident_overhead_budget_bytes: None,
+            hosting_resident_overhead_bytes: None,
+            hosting_resident_overhead_evictions_total: None,
+            hosting_resident_overhead_evicted_charged_bytes_total: None,
+            interest_resident_bytes_total: None,
+            interest_summary_bound_trims_total: None,
+            interest_neighbour_summary_bytes: None,
+            interest_summary_bound_trimmed_bytes_total: None,
             notifications_dropped_channel_full: None,
             notifications_dropped_channel_closed: None,
             notifications_no_local_subscriber: None,
@@ -1732,6 +3561,34 @@ impl Router {
             // populated by Ring on the snapshot cadence (#4440).
             broadcast_stream_attempts_total: None,
             broadcast_stream_failures_total: None,
+            contract_exec_summarize_fast_hits_total: None,
+            contract_exec_summarize_reload_hits_total: None,
+            contract_exec_summarize_wasm_calls_total: None,
+            contract_exec_summarize_wasm_uncached_total: None,
+            contract_exec_delta_fast_hits_total: None,
+            contract_exec_delta_reload_hits_total: None,
+            contract_exec_delta_wasm_calls_total: None,
+            contract_exec_delta_wasm_uncached_total: None,
+            contract_exec_summarize_fast_hits_last_snapshot: None,
+            contract_exec_summarize_reload_hits_last_snapshot: None,
+            contract_exec_summarize_wasm_calls_last_snapshot: None,
+            contract_exec_summarize_wasm_uncached_last_snapshot: None,
+            contract_exec_delta_fast_hits_last_snapshot: None,
+            contract_exec_delta_reload_hits_last_snapshot: None,
+            contract_exec_delta_wasm_calls_last_snapshot: None,
+            contract_exec_delta_wasm_uncached_last_snapshot: None,
+            contract_summary_cache_entries: None,
+            contract_summary_cache_bytes: None,
+            contract_summary_cache_budget_bytes: None,
+            contract_summary_cache_count_cap: None,
+            contract_summary_cache_count_cap_evictions_total: None,
+            contract_summary_cache_byte_budget_evictions_total: None,
+            contract_delta_cache_entries: None,
+            contract_delta_cache_bytes: None,
+            contract_delta_cache_budget_bytes: None,
+            contract_delta_cache_count_cap: None,
+            contract_delta_cache_count_cap_evictions_total: None,
+            contract_delta_cache_byte_budget_evictions_total: None,
             broadcast_stream_failures_last_snapshot: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).
@@ -1759,6 +3616,7 @@ impl Router {
             lattice_predecessor_distance: None,
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
+            lattice_probe_misses: None,
             // Version-gate refusal counters, populated by Ring on the
             // snapshot cadence (#5156).
             hash_first_summaries_declined_unknown_version: None,
@@ -1790,71 +3648,246 @@ impl Router {
             // cadence (firehose-retirement precursor).
             connect_accepts_emitted: None,
             connect_rejects_emitted: None,
-            // Renegade predictor diagnostics
-            renegade_failure_events: self.renegade_predictor.len(),
-            renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
-            renegade_transfer_speed_events: self.renegade_predictor.stage_sizes().2,
-            renegade_known_peers: self.renegade_predictor.known_peers(),
-            renegade_brier_score: self.renegade_predictor.brier_score(),
-            renegade_recent_brier_score: self.renegade_predictor.recent_brier_score(),
-            renegade_predictions_evaluated: self.renegade_predictor.predictions_evaluated(),
-            renegade_accuracy_pairs: self
-                .renegade_predictor
-                .recent_accuracy_pairs()
-                .iter()
-                .copied()
-                .collect(),
-            renegade_response_time_pairs: self
-                .renegade_predictor
-                .response_time_accuracy_pairs()
-                .iter()
-                .copied()
-                .collect(),
-            renegade_transfer_speed_pairs: self
-                .renegade_predictor
-                .transfer_speed_accuracy_pairs()
-                .iter()
-                .copied()
-                .collect(),
-            renegade_response_time_evaluated: self
-                .renegade_predictor
-                .response_time_predictions_evaluated(),
-            renegade_transfer_speed_evaluated: self
-                .renegade_predictor
-                .transfer_speed_predictions_evaluated(),
+            // Bootstrap-acceptance-churn counters, populated by Ring on the
+            // snapshot cadence (#4787).
+            bootstrap_transient_registered: None,
+            bootstrap_transient_expired: None,
+            bootstrap_promoted_to_ring: None,
+            bootstrap_time_to_min_connections_secs: None,
+            bootstrap_completed: None,
+            bootstrap_startup_rounds_connect_issued_gateway: None,
+            bootstrap_startup_rounds_connect_issued_routed: None,
+            bootstrap_startup_rounds_backoff_blocked: None,
+            bootstrap_startup_rounds_no_target: None,
+            failure_skill_hierarchical: self.failure_skill.skill(),
+            hierarchical_failure_evaluated: self.failure_skill.count(),
+            failure_brier: self.failure_skill.brier(),
+            failure_climatology_brier: self.failure_skill.climatology_brier(),
+            failure_base_rate: self.failure_skill.base_rate(),
+            hierarchical_failure_horizon_hours: hierarchical[0].selected_horizon_hours,
+            hierarchical_failure_events: hierarchical[0].window_events,
+            hierarchical_failure_active: hierarchical[0].active,
+            hierarchical_response_time_events: hierarchical[1].window_events,
+            hierarchical_response_time_active: hierarchical[1].active,
+            hierarchical_transfer_speed_events: hierarchical[2].window_events,
+            hierarchical_transfer_speed_active: hierarchical[2].active,
+            hierarchical_peer_evictions: self.hierarchical.total_evictions(),
+            hierarchical_peer_capacity: hierarchical[0].peer_capacity,
+            hierarchical_contracts: hierarchical[0].contracts,
+            hierarchical_contract_evictions: hierarchical[0].contract_evictions,
+            hierarchical_contract_residuals_refused: hierarchical[0].contract_residuals_refused,
+            hierarchical_contract_pairs_refused_last_refit: hierarchical[0]
+                .contract_pairs_refused_last_refit,
+            hierarchical_contract_entries_displaced: hierarchical[0].contract_entries_displaced,
+            hierarchical_contract_estimable_refits: hierarchical[0].contract_estimable_refits,
+            hierarchical_contract_effects_applied: hierarchical[0].contract_effects_applied,
+            hierarchical_contract_forecast_offsets: hierarchical[0].contract_forecast_offsets,
+            hierarchical_contract_floor_bound_refits: hierarchical[0].contract_floor_bound_refits,
+            hierarchical_contract_den_below_two_refits: hierarchical[0]
+                .contract_den_below_two_refits,
+            hierarchical_contract_qualifying_contracts: hierarchical[0]
+                .contract_qualifying_contracts,
+            hierarchical_contract_qualifying_entries: hierarchical[0].contract_qualifying_entries,
+            hierarchical_contract_tau2: hierarchical[0].contract_tau2,
+            hierarchical_floored_response_times: self.hierarchical.floored_response_times(),
+            hierarchical_non_speed_samples: self.hierarchical.non_speed_samples(),
+            response_time_rmse_secs_isotonic: self.response_time_error.rmse().map(|(i, _)| i),
+            response_time_rmse_secs_hierarchical: self.response_time_error.rmse().map(|(_, h)| h),
+            response_time_scored: self.response_time_error.count,
+            response_time_weight: self.response_time_error.weight_at(estimator_hours),
+            transfer_time_rmse_secs_isotonic: self.transfer_time_error.rmse().map(|(i, _)| i),
+            transfer_time_rmse_secs_hierarchical: self.transfer_time_error.rmse().map(|(_, h)| h),
+            transfer_time_scored: self.transfer_time_error.count,
+            transfer_time_weight: self.transfer_time_error.weight_at(estimator_hours),
+            hierarchical_response_time_log_shape: hierarchical[1].into(),
+            hierarchical_transfer_speed_log_shape: hierarchical[2].into(),
+            hierarchical_curves: {
+                let [failure, response_time, transfer_speed] =
+                    self.hierarchical.peer_curves(None, estimator_hours);
+                HierarchicalCurves {
+                    failure,
+                    response_time,
+                    transfer_speed,
+                }
+            },
+            hierarchical_failure_pairs: self.recent_accuracy.failure.to_vec(),
+            hierarchical_response_time_pairs: self.recent_accuracy.response_time.to_vec(),
+            hierarchical_transfer_speed_pairs: self.recent_accuracy.transfer_speed.to_vec(),
+            isotonic_fallback_enabled: isotonic_fallback_enabled(),
+            route_events_discarded_unlocated: self.route_events_discarded_unlocated,
+            selection_ranks: self.selection_ranks.snapshot(),
         }
     }
 
     /// Produce a per-peer routing snapshot for the dashboard detail page.
     pub(crate) fn peer_snapshot(&self, peer: &PeerKeyLocation) -> PeerRoutingSnapshot {
-        let failure_adj = self
-            .failure_estimator
-            .peer_adjustments
-            .get(peer)
-            .map(|a| (a.value(), a.event_count()));
-        let response_time_adj = self
-            .response_start_time_estimator
-            .peer_adjustments
-            .get(peer)
-            .map(|a| (a.value(), a.event_count()));
-        let transfer_rate_adj = self
-            .transfer_rate_estimator
-            .peer_adjustments
-            .get(peer)
-            .map(|a| (a.value(), a.event_count()));
-
-        // Compute a sample prediction at the peer's own location (distance=0)
+        let now = self.estimator_clock.hours();
         let prediction = peer
             .location()
             .and_then(|loc| self.predict_routing_outcome(peer, loc).ok())
             .map(RoutingPredictionInfo::from);
 
+        let window = |failure: Option<&IsotonicEstimator>,
+                      response: Option<&IsotonicEstimator>,
+                      transfer: Option<&IsotonicEstimator>| {
+            let outcomes = failure.map_or_else(Vec::new, |e| e.points_for_peer(peer));
+            PeerWindow {
+                outcomes: outcomes.len(),
+                failures: outcomes
+                    .iter()
+                    .filter(|&&(_, failed)| failed >= 0.5)
+                    .count(),
+                response_times: response.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+                transfer_speeds: transfer.map_or_else(Vec::new, |e| e.points_for_peer(peer)),
+            }
+        };
+        let window_by_op = [OpType::Get, OpType::Put, OpType::Update, OpType::Subscribe]
+            .iter()
+            .filter_map(|op| {
+                let found = window(
+                    self.per_op_failure.get(op),
+                    self.per_op_response_time.get(op),
+                    self.per_op_transfer_rate.get(op),
+                );
+                (found != PeerWindow::default()).then(|| (op.as_str(), found))
+            })
+            .collect();
+
         PeerRoutingSnapshot {
-            failure_adjustment: failure_adj,
-            response_time_adjustment: response_time_adj,
-            transfer_rate_adjustment: transfer_rate_adj,
             prediction_at_own_location: prediction,
+            offsets: self.hierarchical.peer_offsets(peer, now),
+            curves: self.routing_curves(peer, now),
+            window: window(
+                Some(&self.failure_estimator),
+                Some(&self.response_start_time_estimator),
+                Some(&self.transfer_rate_estimator),
+            ),
+            window_by_op,
+            response_time_pairs: self.recent_accuracy.response_time.for_peer(peer_tag(peer)),
+            selection: self.peer_selections.get(peer),
+            selection_evicted: self.peer_selections.was_evicted(peer),
+            expected_response_factor: self.expected_response_factor(peer),
         }
+    }
+
+    /// What routing predicts for `peer` and for a peer with no record, per
+    /// timing stage: the hierarchical curves once that stage is warm, else
+    /// the isotonic estimate with its per-peer correction, which is what
+    /// `predict_with_model` falls back to (and what the emergency switch
+    /// routes every stage on). A transfer speed takes the same floor routing
+    /// gives it ([`DEGENERATE_SPEED_FLOOR_BPS`]).
+    ///
+    /// Empty before the 50-event gate opens and for a peer with no location:
+    /// routing predicts nothing for either.
+    fn routing_curves(&self, peer: &PeerKeyLocation, now: f64) -> [RoutingCurve; 2] {
+        const SAMPLES: usize = 50;
+        if !self.has_sufficient_routing_events() || peer.location().is_none() {
+            return Default::default();
+        }
+        let fallback = isotonic_fallback_enabled();
+        let alone = self.hierarchical.peer_curves(None, now);
+        let mine = self.hierarchical.peer_curves(Some(peer), now);
+        let curve = |stage: usize, estimator: &IsotonicEstimator, floor: f64| {
+            if !fallback && !alone[stage].is_empty() {
+                let this_peer = if mine[stage] == alone[stage] {
+                    Vec::new()
+                } else {
+                    mine[stage].clone()
+                };
+                return RoutingCurve {
+                    distance_alone: alone[stage].clone(),
+                    this_peer,
+                    early: false,
+                };
+            }
+            let floored = |points: Vec<(f64, f64)>| -> Vec<(f64, f64)> {
+                points.into_iter().map(|(d, v)| (d, v.max(floor))).collect()
+            };
+            let distance_alone = floored(estimator.estimate_curve(None, SAMPLES));
+            let this_peer = floored(estimator.estimate_curve(Some(peer), SAMPLES));
+            RoutingCurve {
+                this_peer: if this_peer == distance_alone {
+                    Vec::new()
+                } else {
+                    this_peer
+                },
+                distance_alone,
+                early: true,
+            }
+        };
+        [
+            curve(1, &self.response_start_time_estimator, 0.0),
+            curve(2, &self.transfer_rate_estimator, DEGENERATE_SPEED_FLOOR_BPS),
+        ]
+    }
+
+    /// How many times slower (above 1) or faster routing expects `peer` to
+    /// reply than a peer with no record: the ratio of the two response-time
+    /// lines of [`PeerRoutingSnapshot::curves`] at distance 0, bound
+    /// included. That is routing's expectation for a contract at the peer's
+    /// own location in a ring band the peer has no specific record in; a
+    /// band the peer does have a record in moves its prediction further.
+    ///
+    /// `None` where those lines are not the hierarchical model's: before the
+    /// 50-event gate, for a peer with no location, while the response-time
+    /// stage is cold, and on the emergency fallback.
+    pub(crate) fn expected_response_factor(&self, peer: &PeerKeyLocation) -> Option<f64> {
+        self.expected_response_factor_against(peer, self.response_line_at_zero(None)?)
+    }
+
+    /// The response-time line at distance 0 for `peer`, or for a peer with no
+    /// record: what [`Self::expected_response_factor`] divides. `None` where
+    /// that is not the hierarchical model's line (see there).
+    pub(crate) fn response_line_at_zero(&self, peer: Option<&PeerKeyLocation>) -> Option<f64> {
+        if isotonic_fallback_enabled() || !self.has_sufficient_routing_events() {
+            return None;
+        }
+        let [_, response, _] =
+            self.hierarchical
+                .peer_curves_sampled(peer, self.estimator_clock.hours(), 1);
+        response
+            .first()
+            .filter(|(distance, _)| *distance == 0.0)
+            .map(|&(_, seconds)| seconds)
+    }
+
+    /// [`Self::expected_response_factor`] given the no-record line at
+    /// distance 0, so a caller asking for many peers computes it once.
+    pub(crate) fn expected_response_factor_against(
+        &self,
+        peer: &PeerKeyLocation,
+        distance_alone_at_zero: f64,
+    ) -> Option<f64> {
+        peer.location()?;
+        let factor = self.response_line_at_zero(Some(peer))? / distance_alone_at_zero;
+        (factor.is_finite() && factor > 0.0).then_some(factor)
+    }
+
+    /// [`PeerRoutingSnapshot::offsets`] alone, for every connected peer on the
+    /// dashboard's comparison charts. `O(1)` per peer.
+    pub(crate) fn peer_offsets(&self, peer: &PeerKeyLocation) -> [Option<PeerOffset>; 3] {
+        self.hierarchical
+            .peer_offsets(peer, self.estimator_clock.hours())
+    }
+
+    /// `(outcomes, failures)` across every peer in the failure window: the
+    /// population [`PeerRoutingSnapshot::window`] is one peer's share of.
+    pub(crate) fn window_outcomes(&self) -> (usize, usize) {
+        self.failure_estimator.outcome_counts()
+    }
+
+    /// The forgetting horizon each hierarchical stage is predicting with
+    /// (`None` forgets nothing), `[failure, response time, transfer speed]`.
+    /// Runtime-only; the snapshot carries the failure stage's alone.
+    pub(crate) fn hierarchical_horizons(&self) -> [Option<f64>; 3] {
+        self.hierarchical
+            .diagnostics()
+            .map(|stage| stage.selected_horizon_hours)
+    }
+
+    /// Peers evicted from the per-peer selection table since the node started.
+    pub(crate) fn peer_selection_evictions(&self) -> u64 {
+        self.peer_selections.evictions()
     }
 
     /// Whether we have enough routing events to attempt prediction-based selection.
@@ -1870,6 +3903,260 @@ impl Router {
     fn has_sufficient_routing_events(&self) -> bool {
         const MIN_EVENTS_FOR_PREDICTION: usize = 50;
         self.failure_estimator.len() >= MIN_EVENTS_FOR_PREDICTION
+    }
+}
+
+/// The isotonic stack's forecasts for one event, taken before it is learned.
+#[derive(Debug, Clone, Copy)]
+struct IsotonicBaseline {
+    /// The global isotonic distance curve.
+    global_failure: f64,
+    /// The same with the per-peer EWMA adjustment.
+    adjusted_failure: f64,
+    timing: IsotonicTimingForecast,
+}
+
+/// The timing and transfer speed a cold hierarchical stage falls back to.
+#[derive(Debug, Clone, Copy, Default)]
+struct IsotonicTimingForecast {
+    time_to_response_start_secs: Option<f64>,
+    transfer_speed_bps: Option<f64>,
+}
+
+/// Floor, in bytes/s, under every isotonic transfer-speed estimate routing
+/// uses.
+///
+/// The transfer-rate estimator adjusts per peer ADDITIVELY, so a peer whose
+/// transfers ran slower than the curve can be driven to zero (the estimator
+/// clamps there), and the curve itself extrapolates to zero beyond its data;
+/// routing then priced that peer's transfer at the `f64::MAX / 2` sentinel. The
+/// floor keeps the price finite, so several such peers are ordered among
+/// themselves by their other costs, and no estimate is ever zero.
+///
+/// It is TINY on purpose, so that such a peer still sorts last, as it did at
+/// the sentinel. Its transfer term is `mean_transfer_size / 1e-6`, at least
+/// 1e6 s (the mean is of positive payload sizes over a 100-byte seed, so at
+/// least 1 byte; 1e8 s at the seed). A peer that works, with a response time
+/// within `OPERATION_TTL` (60 s; a slower one is a timeout, i.e. a failure)
+/// and a speed of at least 1 B/s, costs at most `t * (1 + 3f) + mean / speed`
+/// <= 240 s + mean, far below that for any mean. (A 1 B/s floor did not hold
+/// this: just after a restart, mean near the seed, a fast and reliable
+/// degenerate peer cost ~133 s and outranked a slow, unreliable working one at
+/// ~148 s. Pinned by `a_degenerate_transfer_speed_sorts_after_every_working_peer`.)
+/// The costs stay finite and well inside f64: about 1e12 s for a 1 MB mean,
+/// resolved to about 1e-4 s, so the other costs still order degenerate peers.
+///
+/// A consequence worth knowing, unchanged from the sentinel: sorting last, a
+/// floored peer is offered almost no new transfers (only when nothing better
+/// is a candidate), so it gathers little evidence to correct its estimate. The
+/// state is largely STICKY while it persists: until the hierarchical transfer
+/// stage warms (30 transfers node-wide), after which routing reads that stage
+/// instead, or until a refit re-anchors the peer's adjustment to a moved
+/// curve. With `FREENET_ROUTING_FALLBACK_ISOTONIC` on, the first way out never
+/// comes.
+///
+/// It is ONE absolute value, the same for every candidate, and a lower bound
+/// on every estimate (`max(raw, floor)`). Both are needed for routing to
+/// preserve the order of the raw estimates, so that a peer the estimator
+/// learned to be slower is never strictly faster at the transfer term than
+/// one it learned to be faster (estimates below the floor tie there):
+///   - Replacing only a zero estimate left a peer driven to a tiny positive
+///     speed priced near-unroutable while a worse peer, clamped to zero, was
+///     lifted above it.
+///   - A floor relative to the curve at each candidate's OWN distance (it was
+///     a tenth of it) lifted a degenerate NEAR peer, where the curve is high,
+///     above a FAR peer that had learned a positive speed: the curve falls with
+///     distance and the additive adjustment does not. Pinned by
+///     `a_floored_transfer_speed_ranks_monotonically_across_distances`.
+///
+/// Not a share of the curve's minimum either: the curve is fitted to its data
+/// and extrapolates toward zero beyond it, so on the production-like golden
+/// replay a tenth of the smallest fitted value was 11.7 kB/s while candidates
+/// sitting exactly on the curve were estimated at 0.3 to 9 kB/s. That floor
+/// tied them all and moved four compared decisions; 1e-6 B/s lifts only
+/// estimates that are zero for practical purposes and moves none.
+pub(crate) const DEGENERATE_SPEED_FLOOR_BPS: f64 = 1e-6;
+
+/// Recent forecast/outcome pairs kept per stage for the accuracy panel.
+const RECENT_PAIRS: usize = 200;
+
+/// A compact identity for the peer a recent pair is about: a hash of its
+/// [`PeerKeyLocation`], so the window holds eight bytes per pair instead of a
+/// public key. A collision would attribute another peer's pair to this one;
+/// at 200 pairs over a 64-bit hash that is not a practical concern.
+///
+/// `DefaultHasher::new()` uses fixed keys, so the tag is stable for the life
+/// of the process, which is all the window (runtime-only, never persisted)
+/// needs.
+fn peer_tag(peer: &PeerKeyLocation) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    peer.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A bounded window of recent `(forecast, outcome)` pairs, each tagged with
+/// the peer it was about ([`peer_tag`]). Runtime-only: the snapshot carries
+/// the untagged pairs, so `RouterSnapshotInfo`'s layout is unchanged.
+#[derive(Debug, Clone, Default)]
+struct RecentPairs(std::collections::VecDeque<(f64, f64, u64)>);
+
+impl RecentPairs {
+    fn push(&mut self, forecast: f64, outcome: f64, peer: u64) {
+        if !(forecast.is_finite() && outcome.is_finite()) {
+            return;
+        }
+        if self.0.len() >= RECENT_PAIRS {
+            self.0.pop_front();
+        }
+        self.0.push_back((forecast, outcome, peer));
+    }
+
+    fn to_vec(&self) -> Vec<(f64, f64)> {
+        self.0
+            .iter()
+            .map(|&(forecast, outcome, _)| (forecast, outcome))
+            .collect()
+    }
+
+    /// The pairs about one peer, oldest first.
+    fn for_peer(&self, peer: u64) -> Vec<(f64, f64)> {
+        self.0
+            .iter()
+            .filter(|&&(_, _, tag)| tag == peer)
+            .map(|&(forecast, outcome, _)| (forecast, outcome))
+            .collect()
+    }
+}
+
+/// Recent hierarchical forecasts against their outcomes, per stage.
+#[derive(Debug, Clone, Default)]
+struct RecentAccuracy {
+    failure: RecentPairs,
+    response_time: RecentPairs,
+    transfer_speed: RecentPairs,
+}
+
+/// The timing measurements an event carries.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObservedTiming {
+    response_secs: Option<f64>,
+    /// `(payload bytes, transfer seconds)`, only for a real payload transfer.
+    transfer: Option<(f64, f64)>,
+}
+
+impl ObservedTiming {
+    fn of(outcome: &RouteOutcome) -> Self {
+        match outcome {
+            RouteOutcome::Success {
+                time_to_response_start,
+                payload_size,
+                payload_transfer_time,
+            } => ObservedTiming {
+                response_secs: Some(time_to_response_start.as_secs_f64()),
+                transfer: (*payload_size > 0 && !payload_transfer_time.is_zero())
+                    .then_some((*payload_size as f64, payload_transfer_time.as_secs_f64())),
+            },
+            RouteOutcome::SuccessUntimed | RouteOutcome::Failure => ObservedTiming::default(),
+        }
+    }
+}
+
+/// Forgetting horizon of the seconds-error comparison, in estimator hours.
+const ERROR_FORGETTING_HOURS: f64 = 24.0;
+
+/// Each model's error on an event is clipped to this multiple of THAT EVENT'S
+/// outcome (floored at [`ERROR_CLIP_FLOOR_SECS`]).
+///
+/// Unclipped, one near-zero speed forecast (a transfer time of 1e6 s) squares
+/// to 1e12 and settles the comparison by itself. The bound is per event, not
+/// the largest outcome seen: a lifetime or even a decayed maximum lets one
+/// ordinary slow transfer (600 s on a large payload) admit a 6000 s error on
+/// every small payload after it. Relative to its own outcome, a forecast ten
+/// times off is simply "an order of magnitude wrong", and a larger miss says
+/// nothing more about calibration. It needs no state, so there is nothing to
+/// decay.
+const ERROR_CLIP_MULTIPLE: f64 = 10.0;
+
+/// Floor on the clip's base, so a zero-length outcome does not clip every
+/// error to zero. One millisecond, the same floor the hierarchical response
+/// stage applies before taking logs.
+const ERROR_CLIP_FLOOR_SECS: f64 = hierarchical::MIN_RESPONSE_SECS;
+
+/// Forgotten event weight (see [`PairedErrorTracker`]) below which the
+/// dashboard shows "insufficient data" rather than a verdict. Gated on the
+/// forgotten weight, not the lifetime count: 100 events a week ago are not 100
+/// events of evidence now.
+pub(crate) const MIN_WEIGHT_FOR_VERDICT: f64 = 100.0;
+
+/// Prequential squared error in seconds of BOTH models on the same events,
+/// exponentially forgotten over [`ERROR_FORGETTING_HOURS`].
+///
+/// Not [`skill::SkillTracker`]: that scores a binary forecast against a
+/// base-rate climatology, which has no meaning for a duration. One tracker for
+/// both models so they cannot drift onto different populations: an event is
+/// scored for both or for neither.
+#[derive(Debug, Default, Clone, Copy)]
+struct PairedErrorTracker {
+    isotonic: f64,
+    hierarchical: f64,
+    /// Forgotten count, the denominator of both means.
+    weight: f64,
+    /// Events ever scored.
+    count: u64,
+    last_hours: Option<f64>,
+}
+
+impl PairedErrorTracker {
+    fn record(&mut self, isotonic: f64, hierarchical: f64, actual: f64, now_hours: f64) {
+        let isotonic_error = isotonic - actual;
+        let hierarchical_error = hierarchical - actual;
+        if !(actual.is_finite()
+            && actual >= 0.0
+            && isotonic_error.is_finite()
+            && hierarchical_error.is_finite()
+            && now_hours.is_finite())
+        {
+            return;
+        }
+        let clip = ERROR_CLIP_MULTIPLE * actual.max(ERROR_CLIP_FLOOR_SECS);
+        let decay = self.last_hours.map_or(1.0, |then| {
+            (-(now_hours - then).max(0.0) / ERROR_FORGETTING_HOURS).exp()
+        });
+        self.isotonic = self.isotonic * decay + isotonic_error.clamp(-clip, clip).powi(2);
+        self.hierarchical =
+            self.hierarchical * decay + hierarchical_error.clamp(-clip, clip).powi(2);
+        self.weight = self.weight * decay + 1.0;
+        self.count += 1;
+        self.last_hours = Some(
+            self.last_hours
+                .map_or(now_hours, |then| then.max(now_hours)),
+        );
+    }
+
+    /// The forgotten weight as of `now_hours`, not as of the last scored event.
+    ///
+    /// The stored sums decay only when an event is recorded, so after a quiet
+    /// or failure-only stretch the stored weight would still read as recent.
+    /// The means need no such correction: decay scales both sums and the
+    /// weight alike, so it cancels in [`Self::rmse`].
+    fn weight_at(&self, now_hours: f64) -> f64 {
+        match self.last_hours {
+            Some(then) if now_hours.is_finite() => {
+                self.weight * (-(now_hours - then).max(0.0) / ERROR_FORGETTING_HOURS).exp()
+            }
+            _ => self.weight,
+        }
+    }
+
+    /// `(isotonic, hierarchical)` RMS error in seconds.
+    fn rmse(&self) -> Option<(f64, f64)> {
+        (self.weight > 0.0).then(|| {
+            (
+                (self.isotonic / self.weight).sqrt(),
+                (self.hierarchical / self.weight).sqrt(),
+            )
+        })
     }
 }
 
@@ -1891,8 +4178,6 @@ pub(crate) struct RoutingPrediction {
     pub xfer_speed: TransferSpeed,
     pub time_to_response_start: f64,
     pub expected_total_time: f64,
-    /// How much renegade shifted the failure estimate from isotonic baseline.
-    pub renegade_failure_adjustment: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1922,6 +4207,7 @@ pub enum RouteOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::isotonic_estimator::FitPolicy;
     use crate::ring::Distance;
 
     /// `NetworkEfficiencyV1`'s `futile` rustdoc, isolated from this test module
@@ -2004,6 +4290,371 @@ mod tests {
         }
     }
 
+    /// The routing dataset exists to let predictors be replayed and compared
+    /// offline, so a record is only useful if its forecasts are the ones made
+    /// BEFORE the outcome was ingested — a forecast that has already seen its own
+    /// outcome would make every layer look better than it is.
+    #[test]
+    fn dataset_records_pre_ingestion_forecasts_and_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing.jsonl");
+        let recorder = dataset::RoutingDataset::open(&path, dataset::DEFAULT_MAX_BYTES).unwrap();
+
+        // A frozen clock, so the forecast taken below and the one `add_event`
+        // records read the same instant.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        // A key of its own: `PeerKeyLocation::random()` reuses one key per
+        // thread, which would make the peer-hash assertion below vacuous.
+        let peer = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.10:31337".parse().unwrap(),
+        );
+        let contract = Location::new(0.5);
+
+        // Cold: nothing to forecast with yet, which the record must say rather
+        // than inventing numbers.
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Put),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+
+        add_relay_recorded_successes(&mut router, 120);
+        for _ in 0..30 {
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Failure,
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let expected_global = router
+            .failure_estimator
+            .estimate_global(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let expected_adjusted = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let events_before = router.failure_estimator.len();
+        let hierarchical_distance = contract.distance(peer.location().unwrap()).as_f64();
+        let hierarchical_estimate = |router: &Router| {
+            router
+                .hierarchical
+                .estimate(
+                    &peer,
+                    contract,
+                    hierarchical_distance,
+                    router.estimator_clock.hours(),
+                )
+                .failure_probability
+                .expect("the hierarchical failure stage is warm")
+        };
+        let expected_hierarchical = hierarchical_estimate(&router);
+        // What routing would act on for this query, before ingestion.
+        let acted_on = router.hierarchical.estimate(
+            &peer,
+            contract,
+            hierarchical_distance,
+            router.estimator_clock.hours(),
+        );
+        let legacy_acted_on = router.isotonic_timing_forecast(&peer, contract);
+
+        router.add_event_recording(
+            RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(250),
+                    payload_size: 4096,
+                    payload_transfer_time: Duration::from_millis(125),
+                },
+                op_type: Some(OpType::Get),
+            },
+            dataset::RouteSource::Originator,
+            Some(&recorder),
+        );
+        let adjusted_after = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        assert_ne!(
+            adjusted_after, expected_adjusted,
+            "sanity: ingesting the success must move the peer's estimate, or this \
+             test cannot tell pre- from post-ingestion forecasts"
+        );
+        let hierarchical_after = hierarchical_estimate(&router);
+        assert!(
+            (hierarchical_after - expected_hierarchical).abs() > 1e-4,
+            "sanity: the success must move the hierarchical estimate too: \
+             {expected_hierarchical} -> {hierarchical_after}"
+        );
+        drop(recorder);
+
+        let lines = dataset::lines_eventually(&path, |lines| {
+            lines.iter().filter(|line| line["kind"] == "route").count() == 2
+        });
+        let routes: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "route")
+            .collect();
+
+        let cold = routes[0];
+        assert_eq!(cold["outcome"], "failure");
+        assert_eq!(cold["op"], "PUT");
+        assert_eq!(cold["prior_failure_events"], 0);
+        assert!(
+            cold["forecasts"].is_null(),
+            "a cold router forecasts nothing: {cold}"
+        );
+
+        let warm = routes[1];
+        assert_eq!(warm["peer"], dataset::peer_hash(&peer));
+        assert_eq!(warm["source"], "originator");
+        let expected_distance = contract.distance(peer.location().unwrap()).as_f64();
+        assert!((warm["distance"].as_f64().unwrap() - expected_distance).abs() < 1e-12);
+        assert_eq!(warm["contract_location"], 0.5);
+        assert_eq!(warm["outcome"], "success");
+        assert_eq!(warm["time_to_response_start_s"], 0.25);
+        assert_eq!(warm["payload_bytes"], 4096);
+        assert_eq!(warm["payload_transfer_s"], 0.125);
+        assert_eq!(warm["prior_failure_events"], events_before);
+        // Within 1e-12, not bit-exact: serde_json's default float parser does not
+        // guarantee a lossless round trip, and which values it misses by an ulp
+        // depends on the randomly drawn peers.
+        let recorded = |field: &str| warm["forecasts"][field].as_f64().unwrap();
+        assert!((recorded("global") - expected_global).abs() < 1e-12);
+        assert!(
+            (recorded("adjusted") - expected_adjusted).abs() < 1e-12,
+            "the recorded forecast must be the pre-ingestion one: recorded {}, \
+             pre-ingestion {expected_adjusted}, post-ingestion {adjusted_after}",
+            recorded("adjusted")
+        );
+        assert!(
+            (recorded("hierarchical") - expected_hierarchical).abs() < 1e-12,
+            "the recorded hierarchical forecast must be the pre-ingestion one: \
+             recorded {}, pre-ingestion {expected_hierarchical}, post-ingestion \
+             {hierarchical_after}",
+            recorded("hierarchical")
+        );
+        // The only timed traffic so far took 100 ms, so both timing forecasts
+        // must sit near ln(0.1) — in log seconds, not milliseconds or seconds.
+        for field in ["log_response_time_legacy", "log_response_time_hierarchical"] {
+            let value = recorded(field);
+            assert!(
+                (value - 0.1f64.ln()).abs() < 0.2,
+                "{field} must be a log-seconds forecast near ln(0.1), got {value}"
+            );
+        }
+        // The recorded forecasts are the values routing ACTS on: ln E[T] and
+        // ln of the effective speed, not the log-scale location.
+        let pairs = [
+            (
+                "log_response_time_hierarchical",
+                acted_on.time_to_response_start_secs,
+            ),
+            (
+                "log_transfer_speed_hierarchical",
+                acted_on.transfer_speed_bps,
+            ),
+            (
+                "log_response_time_legacy",
+                legacy_acted_on.time_to_response_start_secs,
+            ),
+            (
+                "log_transfer_speed_legacy",
+                legacy_acted_on.transfer_speed_bps,
+            ),
+        ];
+        for (field, value) in pairs {
+            let expected = value
+                .unwrap_or_else(|| panic!("{field} has an acted-on value"))
+                .ln();
+            // Within 1e-12 for the JSON reason given above. Since #4485 the
+            // `_legacy` fields hold the isotonic fallback's forecasts, which
+            // read no host clock (Renegade's did), so they are held to the same
+            // bound as the hierarchical ones.
+            assert!(
+                (recorded(field) - expected).abs() < 1e-12,
+                "{field}: recorded {} but routing would act on ln = {expected}",
+                recorded(field)
+            );
+        }
+    }
+
+    /// The promotion gate's "not worse in seconds" instrument is populated by
+    /// traffic, on the same events for both models.
+    #[test]
+    fn timing_error_in_seconds_reaches_the_snapshot() {
+        let mut router = Router::new(&[]);
+        feed_mixed_traffic(&mut router, 400);
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.response_time_scored > 100,
+            "{}",
+            snapshot.response_time_scored
+        );
+        assert!(
+            snapshot.transfer_time_scored > 100,
+            "{}",
+            snapshot.transfer_time_scored
+        );
+
+        for value in [
+            snapshot.response_time_rmse_secs_isotonic,
+            snapshot.response_time_rmse_secs_hierarchical,
+            snapshot.transfer_time_rmse_secs_isotonic,
+            snapshot.transfer_time_rmse_secs_hierarchical,
+        ] {
+            let value = value.expect("scored");
+            assert!((0.0..1.0).contains(&value), "{value}");
+        }
+    }
+
+    /// One pathological legacy forecast (a near-zero speed, so a transfer time
+    /// of a million seconds) must not dominate the comparison, even right after
+    /// an ordinary large outcome: the clip is relative to each event's own
+    /// outcome, so a 600 s transfer earlier cannot admit a 6000 s error on a
+    /// 0.1 s one. Both models are scored on exactly the same events, and a
+    /// non-finite error for either skips the event for both.
+    #[test]
+    fn seconds_error_is_clipped_forgotten_and_paired() {
+        let mut tracker = PairedErrorTracker::default();
+        // An ordinary slow transfer, forecast well by both.
+        tracker.record(600.0, 600.0, 600.0, 0.0);
+        // Then the pathological legacy forecast on a small one.
+        tracker.record(1.0e6, 0.2, 0.1, 0.0);
+        let legacy_sq_after = tracker.isotonic;
+        assert!(
+            legacy_sq_after <= (ERROR_CLIP_MULTIPLE * 0.1).powi(2) + 1e-9,
+            "the small event's error must be clipped to 10x its own outcome, not the \
+             earlier 600 s: legacy squared error {legacy_sq_after}"
+        );
+
+        // A zero outcome must not clip every error to zero.
+        let mut zero = PairedErrorTracker::default();
+        zero.record(0.5, 0.0, 0.0, 0.0);
+        let (legacy, hierarchical) = zero.rmse().unwrap();
+        assert!(
+            (legacy - ERROR_CLIP_MULTIPLE * ERROR_CLIP_FLOOR_SECS).abs() < 1e-12,
+            "a zero outcome clips at the floor, not at zero: {legacy}"
+        );
+        assert_eq!(hierarchical, 0.0);
+
+        // Non-finite for one model: skipped for both.
+        tracker.record(f64::INFINITY, 0.1, 0.1, 0.0);
+        tracker.record(0.1, f64::NAN, 0.1, 0.0);
+        assert_eq!(
+            tracker.count, 2,
+            "a non-finite error must skip the event for both"
+        );
+
+        // A day of small, accurate traffic from both models afterwards.
+        for i in 0..2_000 {
+            let hours = 1.0 + i as f64 * 24.0 / 2_000.0;
+            tracker.record(0.10, 0.13, 0.1, hours);
+        }
+        let (legacy, hierarchical) = tracker.rmse().unwrap();
+        assert!(
+            legacy < hierarchical,
+            "a day later, the single bad legacy forecast must not decide the verdict: \
+             legacy {legacy} vs hierarchical {hierarchical}"
+        );
+        assert_eq!(tracker.count, 2_002);
+        assert!(
+            tracker.weight < 2_000.0 && tracker.weight > 100.0,
+            "the verdict's weight is forgotten, not the lifetime count: {}",
+            tracker.weight
+        );
+    }
+
+    /// The published weight decays to the snapshot's own time: after 48 quiet
+    /// hours, 500 events scored before them are not "recent" evidence.
+    #[test]
+    fn published_seconds_error_weight_decays_at_read_time() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let clock = SharedMockTimeSource::new();
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(clock.clone()));
+        for _ in 0..500 {
+            router.response_time_error.record(0.1, 0.1, 0.1, 0.0);
+            router.transfer_time_error.record(0.1, 0.1, 0.1, 0.0);
+        }
+        let fresh = router.snapshot();
+        assert!(fresh.response_time_weight >= MIN_WEIGHT_FOR_VERDICT);
+        clock.advance_time(Duration::from_secs(48 * 3600));
+        let stale = router.snapshot();
+        assert!(
+            stale.response_time_weight < MIN_WEIGHT_FOR_VERDICT
+                && stale.transfer_time_weight < MIN_WEIGHT_FOR_VERDICT,
+            "48 quiet hours must leave too little recent weight for a verdict: {} / {}",
+            stale.response_time_weight,
+            stale.transfer_time_weight
+        );
+        assert_eq!(
+            stale.response_time_rmse_secs_isotonic, fresh.response_time_rmse_secs_isotonic,
+            "read-time decay changes the weight, not the means"
+        );
+    }
+
+    /// A 0 s isotonic time forecast (routing acts on it) is scored at the
+    /// floor for both models, not dropped.
+    #[test]
+    fn zero_time_forecasts_are_floored_for_both_models_not_dropped() {
+        let mut router = Router::new(&[]);
+        feed_mixed_traffic(&mut router, 300);
+        let before = router.response_time_error.count;
+        let forecasts = router.score_hierarchical_layer(
+            &PeerKeyLocation::random(),
+            Some(IsotonicBaseline {
+                global_failure: 0.1,
+                adjusted_failure: 0.1,
+                timing: IsotonicTimingForecast {
+                    time_to_response_start_secs: Some(0.0),
+                    transfer_speed_bps: None,
+                },
+            }),
+            hierarchical::Observed {
+                failure: Some(0.1),
+                estimate: hierarchical::Estimate {
+                    failure_probability: Some(0.1),
+                    failure_ranking: Some(0.1),
+                    time_to_response_start_secs: Some(0.2),
+                    transfer_speed_bps: None,
+                },
+            },
+            ObservedTiming {
+                response_secs: Some(0.1),
+                transfer: None,
+            },
+            0.0,
+            router.estimator_clock.hours(),
+        );
+        assert_eq!(
+            router.response_time_error.count,
+            before + 1,
+            "the event must be scored"
+        );
+        let recorded = forecasts
+            .expect("a baseline was given, so the event is recorded")
+            .log_response_time_legacy
+            .unwrap();
+        assert!(
+            (recorded - hierarchical::MIN_RESPONSE_SECS.ln()).abs() < 1e-12,
+            "a 0 s forecast is recorded at the floor: {recorded}"
+        );
+    }
+
     #[test]
     fn add_event_preserves_relay_recorded_events() {
         // SCOPE, honestly: this guards the refit's NO-DATA-LOSS property, not the
@@ -2084,6 +4735,23 @@ mod tests {
              stale, so the model drifts exactly as it did before #4808"
         );
 
+        // The per-op estimators used to be checked for staleness here too. Since
+        // #5662 they fit on read and keep no per-peer adjustments, so they can
+        // never owe a refit and that check could not fail. What CAN go wrong is
+        // the policy itself: a routing estimator switched to fit-on-read would
+        // route on an empty fit, and a dashboard one switched back would pay a
+        // full rebuild per event under the router write lock. Pin both sides.
+        for (label, est) in [
+            ("response_start_time", &router.response_start_time_estimator),
+            ("transfer_rate", &router.transfer_rate_estimator),
+            ("failure", &router.failure_estimator),
+        ] {
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::EveryEvent,
+                "{label}: routing reads this estimator, so it must fit on every event"
+            );
+        }
         for (label, per_op) in [
             ("per_op_failure", &router.per_op_failure),
             ("per_op_response_time", &router.per_op_response_time),
@@ -2095,11 +4763,2375 @@ mod tests {
                  or this guard is vacuous"
             );
             for (op_type, est) in per_op {
-                assert!(
-                    !est.is_stale_for_test(),
-                    "{label}[{op_type:?}] left stale by add_event"
+                assert_eq!(
+                    est.fit_policy(),
+                    FitPolicy::OnRead,
+                    "{label}[{op_type:?}] is dashboard-only and must fit on read"
                 );
             }
+        }
+
+        // `Router::new` builds the estimators from history by a separate path
+        // from `add_event`'s lazy inserts, so pin that path too.
+        let op_event = |outcome| RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome,
+            op_type: Some(OpType::Get),
+        };
+        let from_history = Router::new(&[
+            op_event(RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            }),
+            op_event(RouteOutcome::Failure),
+        ]);
+        for (label, est) in [
+            (
+                "response_start_time",
+                &from_history.response_start_time_estimator,
+            ),
+            ("transfer_rate", &from_history.transfer_rate_estimator),
+            ("failure", &from_history.failure_estimator),
+        ] {
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::EveryEvent,
+                "{label} built from history: routing reads it, so it must fit on every event"
+            );
+        }
+        for (label, per_op) in [
+            ("per_op_failure", &from_history.per_op_failure),
+            ("per_op_response_time", &from_history.per_op_response_time),
+            ("per_op_transfer_rate", &from_history.per_op_transfer_rate),
+        ] {
+            let est = per_op
+                .get(&OpType::Get)
+                .unwrap_or_else(|| panic!("sanity: the history must populate {label}"));
+            assert_eq!(
+                est.fit_policy(),
+                FitPolicy::OnRead,
+                "{label} built from history is dashboard-only and must fit on read"
+            );
+        }
+    }
+
+    /// Traffic that gives every stage a curve: timed successes, untimed
+    /// successes and failures, with one peer that fails for its own region.
+    fn feed_mixed_traffic(router: &mut Router, rounds: usize) -> (PeerKeyLocation, Location) {
+        let targeted_peer = PeerKeyLocation::random();
+        let peer_location = targeted_peer
+            .location()
+            .expect("random peer has a location");
+        let targeted_contract =
+            Location::try_from((peer_location.as_f64() + 0.01).rem_euclid(1.0)).unwrap();
+        for index in 0..rounds {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: match index % 10 {
+                    0 => RouteOutcome::Failure,
+                    1 => RouteOutcome::SuccessUntimed,
+                    _ => RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(80 + index as u64 % 40),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    },
+                },
+                op_type: Some(OpType::Get),
+            });
+            router.add_event(RouteEvent {
+                peer: targeted_peer.clone(),
+                contract_location: if index % 2 == 0 {
+                    targeted_contract
+                } else {
+                    Location::random()
+                },
+                outcome: if index % 2 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+        (targeted_peer, targeted_contract)
+    }
+
+    /// How a routing-behaviour test trains its router.
+    ///
+    /// `Router::new(&history)` never feeds the hierarchical estimator (see its
+    /// "Not replayed from `history`" comment), so a history-built router keeps
+    /// a COLD estimator and routes entirely on the isotonic fallback. A warm
+    /// node routes on the hierarchical estimator instead, so each behavioural
+    /// guard runs in both modes:
+    ///
+    /// - `History` covers the cold-start fallback. That is also what a node
+    ///   with `FREENET_ROUTING_FALLBACK_ISOTONIC` set runs, but only by
+    ///   equivalence: today a never-fed estimator supplies no stage, so
+    ///   prediction takes the isotonic path for every stage. If a cold
+    ///   estimator ever supplies something (a warm-start prior, a seeded root
+    ///   curve), `History` stops covering the emergency fallback.
+    /// - `WarmHierarchical` covers the estimator the fleet routes with. Its
+    ///   precondition always pins the FAILURE stage. The timing stages warm only
+    ///   after 30 timed successes (`MIN_CURVE_POINTS_LOG`; the speed stage
+    ///   counts only those with a non-zero payload), so a guard trained on
+    ///   fewer still ranks on ISOTONIC timing; only the twins that train that
+    ///   many (realistic traffic, the transition's phase 3, #4230 steady state)
+    ///   have their timing pinned to the hierarchical estimator too.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Training {
+        History,
+        WarmHierarchical,
+    }
+
+    impl Training {
+        fn train(self, events: &[RouteEvent]) -> Router {
+            match self {
+                Training::History => Router::new(events),
+                Training::WarmHierarchical => warm_hierarchical_router(events),
+            }
+        }
+
+        /// Hold for the whole test: keeps the emergency isotonic fallback off
+        /// in the warm mode, whatever the environment says (the cold mode keeps
+        /// the test's original, unforced behaviour).
+        fn guard(self) -> Option<IsotonicFallbackGuard> {
+            (self == Training::WarmHierarchical).then(|| force_isotonic_fallback(false))
+        }
+
+        /// The warm mode's precondition: every failure probability the decision
+        /// ranks on, and every timing estimate the hierarchical estimator
+        /// supplies, came from the hierarchical estimate. See
+        /// [`assert_hierarchical_failure_decides`].
+        fn check_decides(self, router: &Router, peers: &[PeerKeyLocation], target: Location) {
+            if self == Training::WarmHierarchical {
+                assert_hierarchical_failure_decides(router, peers, target);
+            }
+        }
+    }
+
+    /// A router trained through `add_event` — production's path, on which the
+    /// hierarchical estimator learns every event. The clock is a
+    /// frozen mock, so a prediction and a direct `estimate` read the same
+    /// instant and can be compared exactly.
+    ///
+    /// The price: every event lands at one estimator instant, so the online
+    /// horizon choice and forgetting a real node's time-spread events go
+    /// through are degenerate in the twins. Those are covered by the router
+    /// tests that advance a `SharedMockTimeSource` by hand, not here.
+    fn warm_hierarchical_router(events: &[RouteEvent]) -> Router {
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        for event in events {
+            router.add_event(event.clone());
+        }
+        router
+    }
+
+    /// Precondition for a warm-hierarchical guard: for every candidate, the
+    /// failure probability the router acts on IS the hierarchical estimate,
+    /// and so is each timing estimate (response time, transfer speed) whenever
+    /// the hierarchical estimator supplies one. So a guard cannot pass on the
+    /// isotonic fallback for any stage the estimator has warmed. A timing stage it
+    /// has NOT warmed (below 30 timed successes) is legitimately isotonic and is not
+    /// checked; a guard whose property depends on timing must also call
+    /// [`assert_hierarchical_timing_decides`].
+    ///
+    /// Two stacks that happen to agree bit for bit (all-success data: both
+    /// read 0.0) cannot be told apart by equality; such a guard needs the
+    /// `FALLBACK_STAGE_EVALUATIONS` check as well (see the transition twin).
+    fn assert_hierarchical_failure_decides(
+        router: &Router,
+        peers: &[PeerKeyLocation],
+        target: Location,
+    ) {
+        assert!(
+            !isotonic_fallback_enabled(),
+            "call with the emergency isotonic fallback off"
+        );
+        let hours = router.estimator_clock.hours();
+        for peer in peers {
+            let distance = peer
+                .location()
+                .map(|loc| target.distance(loc).as_f64())
+                .unwrap_or(0.5);
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
+            let acted_on = router
+                .predict_routing_outcome(peer, target)
+                .expect("a warm router predicts");
+            assert_eq!(
+                estimate.failure_probability.map(|p| p.clamp(0.0, 1.0)),
+                Some(acted_on.failure_probability),
+                "the failure probability for {peer:?} must come from the (warm) \
+                 hierarchical estimator, not the isotonic fallback"
+            );
+            if let Some(seconds) = estimate
+                .time_to_response_start_secs
+                .filter(|t| t.is_finite() && *t >= 0.0)
+            {
+                assert_eq!(
+                    acted_on.time_to_response_start, seconds,
+                    "the response time for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
+            if let Some(speed) = estimate
+                .transfer_speed_bps
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                assert_eq!(
+                    acted_on.xfer_speed.bytes_per_second, speed,
+                    "the transfer speed for {peer:?} must come from the hierarchical \
+                     estimator once it supplies one"
+                );
+            }
+        }
+    }
+
+    /// The stricter precondition for a guard whose property depends on timing:
+    /// both hierarchical timing stages must be WARM for every candidate (so
+    /// [`assert_hierarchical_failure_decides`] compared them), not merely
+    /// consistent when present. Otherwise the guard's timing is isotonic.
+    fn assert_hierarchical_timing_decides(
+        router: &Router,
+        peers: &[PeerKeyLocation],
+        target: Location,
+    ) {
+        let hours = router.estimator_clock.hours();
+        for peer in peers {
+            let distance = peer
+                .location()
+                .map(|loc| target.distance(loc).as_f64())
+                .unwrap_or(0.5);
+            let estimate = router.hierarchical.estimate(peer, target, distance, hours);
+            assert!(
+                estimate.time_to_response_start_secs.is_some()
+                    && estimate.transfer_speed_bps.is_some(),
+                "both hierarchical timing stages must be warm for {peer:?} (train at \
+                 least 30 timed successes); got {estimate:?}"
+            );
+        }
+        assert_hierarchical_failure_decides(router, peers, target);
+    }
+
+    /// Once warm, all three stages come from the hierarchical estimator, in the
+    /// router's own units.
+    #[test]
+    fn a_warm_hierarchical_estimator_supplies_every_stage() {
+        let mut router = Router::new(&[]);
+        let (peer, contract) = feed_mixed_traffic(&mut router, 300);
+        let now = router.estimator_clock.hours();
+        let distance = contract.distance(peer.location().unwrap()).as_f64();
+        let estimate = router.hierarchical.estimate(&peer, contract, distance, now);
+        let prediction = router
+            .predict_routing_outcome_at(&peer, contract, now)
+            .unwrap();
+        assert_eq!(
+            Some(prediction.failure_probability),
+            estimate.failure_probability
+        );
+        assert_eq!(
+            Some(prediction.time_to_response_start),
+            estimate.time_to_response_start_secs
+        );
+        assert_eq!(
+            Some(prediction.xfer_speed.bytes_per_second),
+            estimate.transfer_speed_bps
+        );
+        let seconds = prediction.time_to_response_start;
+        assert!(
+            (0.05..0.2).contains(&seconds),
+            "response time must come back in seconds, got {seconds}"
+        );
+        assert!(
+            prediction.failure_probability > 0.3,
+            "the peer failing half its traffic in this region must read as risky, got {}",
+            prediction.failure_probability
+        );
+    }
+
+    /// A success with a payload but a zero transfer time has no transfer
+    /// speed: `bytes / 0` is infinite. `RoutingOutcome::from_route_outcome`
+    /// drops the speed for it, so neither transfer estimator learns it, while
+    /// its response time is still learned. The transfer stage would also
+    /// refuse an infinite input (counted in `rejected`), so the test asserts
+    /// it was never offered one: with the drop removed, `rejected` goes to 1.
+    /// (Formerly pinned on the legacy stack's side by `inf_output_rejected`.)
+    #[test]
+    fn a_zero_duration_transfer_is_not_learned_as_an_infinite_speed() {
+        let _seed = GlobalRng::seed_guard(0x4485_0D17);
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let peer = PeerKeyLocation::random();
+        let contract = Location::new(0.4);
+        let timed = |payload_transfer_time: Duration| RouteEvent {
+            peer: peer.clone(),
+            contract_location: contract,
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(80),
+                payload_size: 5_000,
+                payload_transfer_time,
+            },
+            op_type: Some(OpType::Get),
+        };
+        // Warm the transfer stage (30 samples) so it predicts.
+        for index in 0..40 {
+            router.add_event(timed(Duration::from_millis(20 + index)));
+        }
+        let before = router.hierarchical.diagnostics();
+        assert!(before[2].active, "the transfer stage must be warm");
+        let isotonic_before = router.transfer_rate_estimator.len();
+
+        router.add_event(timed(Duration::ZERO));
+
+        let after = router.hierarchical.diagnostics();
+        assert_eq!(
+            after[2].window_events, before[2].window_events,
+            "the transfer stage must not learn a speed from a zero-duration transfer"
+        );
+        assert_eq!(
+            after[2].rejected, before[2].rejected,
+            "and must not even be offered one"
+        );
+        assert_eq!(
+            after[1].window_events,
+            before[1].window_events + 1,
+            "the response time is still learned"
+        );
+        assert_eq!(router.transfer_rate_estimator.len(), isotonic_before);
+        let estimate = router.hierarchical.estimate(
+            &peer,
+            contract,
+            contract.distance(peer.location().unwrap()).as_f64(),
+            router.estimator_clock.hours(),
+        );
+        let speed = estimate.transfer_speed_bps.expect("a warm stage predicts");
+        assert!(speed.is_finite() && speed > 0.0, "speed {speed}");
+    }
+
+    /// The one place routing differs from the build soaked with
+    /// `FREENET_ROUTING_HIERARCHICAL=1` (#4485): a timing stage the
+    /// hierarchical estimator cannot estimate yet (fewer than 30 samples) falls
+    /// back to the isotonic estimate with the per-peer EWMA, and to NOTHING
+    /// else (bar the floor on the transfer speed, pinned by
+    /// `a_degenerate_isotonic_transfer_speed_is_floored`). The soaked build
+    /// also blended Renegade in there once Renegade held 10 samples.
+    /// `golden_replay` skips exactly that window, so this pins what
+    /// fills it: a term added to the fallback fails here instead of widening
+    /// the divergence unnoticed. Once the stage has its curve, routing reads the
+    /// hierarchical estimate.
+    #[test]
+    fn a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone() {
+        let _seed = GlobalRng::seed_guard(0x4485_C01D);
+        let mut router = Router::new(&[]);
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+        // Untimed traffic past the 50-event gate, which warms the failure stage.
+        for index in 0..80 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 5 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+                op_type: Some(OpType::Subscribe),
+            });
+        }
+        let timed = |router: &mut Router, count: usize| {
+            for index in 0..count {
+                router.add_event(RouteEvent {
+                    peer: if index % 3 == 0 {
+                        peer.clone()
+                    } else {
+                        PeerKeyLocation::random()
+                    },
+                    contract_location: Location::random(),
+                    outcome: RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(80 + (index % 40) as u64),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(40 + (index % 20) as u64),
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        };
+        let distance = contract.distance(peer.location().unwrap()).as_f64();
+
+        // 20 timing samples: inside the 10-29 window on both timing stages.
+        timed(&mut router, 20);
+        let stages = router.hierarchical.diagnostics();
+        assert!(stages[0].active, "the failure stage must be warm");
+        assert!(
+            !stages[1].active && !stages[2].active,
+            "20 samples must leave both timing stages without a curve"
+        );
+        let now = router.estimator_clock.hours();
+        let prediction = router
+            .predict_routing_outcome_at(&peer, contract, now)
+            .expect("past the 50-event gate");
+        let isotonic = router.isotonic_timing_forecast(&peer, contract);
+        assert!(
+            isotonic.time_to_response_start_secs.is_some() && isotonic.transfer_speed_bps.is_some(),
+            "sanity: the isotonic stages estimate from 5 samples"
+        );
+        assert_eq!(
+            Some(prediction.time_to_response_start),
+            isotonic.time_to_response_start_secs,
+            "a cold response-time stage must route on the isotonic estimate, unaltered"
+        );
+        assert_eq!(
+            Some(prediction.xfer_speed.bytes_per_second),
+            isotonic.transfer_speed_bps,
+            "a cold transfer-speed stage must route on the isotonic estimate, unaltered"
+        );
+        let estimate = router.hierarchical.estimate(&peer, contract, distance, now);
+        assert_eq!(
+            Some(prediction.failure_probability),
+            estimate.failure_probability,
+            "the warm failure stage is hierarchical meanwhile"
+        );
+
+        // 40 samples: both timing stages have their curve, and routing reads it.
+        timed(&mut router, 20);
+        let stages = router.hierarchical.diagnostics();
+        assert!(stages[1].active && stages[2].active);
+        let now = router.estimator_clock.hours();
+        let prediction = router
+            .predict_routing_outcome_at(&peer, contract, now)
+            .unwrap();
+        let estimate = router.hierarchical.estimate(&peer, contract, distance, now);
+        assert_eq!(
+            Some(prediction.time_to_response_start),
+            estimate.time_to_response_start_secs
+        );
+        assert_eq!(
+            Some(prediction.xfer_speed.bytes_per_second),
+            estimate.transfer_speed_bps
+        );
+    }
+
+    /// The routing switch fails safe: only an explicit affirmative turns on
+    /// something that changes live routing, and a value that is neither an
+    /// affirmative nor a negative is told apart from one that is.
+    #[test]
+    fn routing_flags_parse_fail_safe() {
+        use std::ffi::OsStr;
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(on))),
+                RoutingFlag::On,
+                "{on:?} must enable"
+            );
+        }
+        for off in ["", " ", "0", "false", "OFF", "no"] {
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(off))),
+                RoutingFlag::Off,
+                "{off:?} is a recognised negative"
+            );
+        }
+        for unrecognised in ["ture", "enabled", "2", "1 0"] {
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::new(unrecognised))),
+                RoutingFlag::Unrecognised,
+                "{unrecognised:?} must not enable, and must be reported"
+            );
+        }
+        assert_eq!(parse_routing_flag(None), RoutingFlag::Unset);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                parse_routing_flag(Some(OsStr::from_bytes(b"1\xff"))),
+                RoutingFlag::Unrecognised,
+                "a non-UTF-8 value is set and unrecognised, not unset"
+            );
+        }
+    }
+
+    /// The emergency switch's variable name, spelt out: a typo in the
+    /// constant would make the switch a silent no-op, and every reference to
+    /// it (the docs, `.claude/rules/ring.md`, an operator's unit file) uses
+    /// this spelling.
+    #[test]
+    fn the_isotonic_fallback_switch_reads_its_documented_variable() {
+        assert_eq!(ISOTONIC_FALLBACK_ENV, "FREENET_ROUTING_FALLBACK_ISOTONIC");
+    }
+
+    /// The startup line operators and the soak's crossover check grep for a
+    /// node's routing mode.
+    #[test]
+    fn the_routing_mode_line_names_the_estimator_that_routes() {
+        assert_eq!(
+            routing_mode_line(false),
+            "hierarchical routing estimator: enabled (default)"
+        );
+        let fallback = routing_mode_line(true);
+        assert!(
+            fallback.starts_with(
+                "hierarchical routing estimator: disabled via FREENET_ROUTING_FALLBACK_ISOTONIC"
+            ),
+            "{fallback}"
+        );
+    }
+
+    /// Which routing switches produce a startup warning, and what it says.
+    #[test]
+    fn routing_switches_warn_when_set_obsolete_unrecognised_or_on() {
+        /// An environment holding exactly `pairs`, values as raw bytes.
+        fn env(
+            pairs: &[(&'static str, &[u8])],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+            let pairs: Vec<(&'static str, Vec<u8>)> = pairs
+                .iter()
+                .map(|(key, value)| (*key, value.to_vec()))
+                .collect();
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStringExt;
+                            std::ffi::OsString::from_vec(value.clone())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::ffi::OsString::from(String::from_utf8_lossy(value).into_owned())
+                        }
+                    })
+            }
+        }
+        let variables = |warnings: &[(&'static str, String)]| -> Vec<&'static str> {
+            warnings.iter().map(|(variable, _)| *variable).collect()
+        };
+
+        assert!(
+            routing_flag_warnings(env(&[])).is_empty(),
+            "unset: no warning"
+        );
+        for off in [&b"0"[..], b"off", b""] {
+            assert!(
+                routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", off)]))
+                    .is_empty(),
+                "a recognised negative is not worth a warning"
+            );
+        }
+
+        let warnings = routing_flag_warnings(env(&[
+            ("FREENET_ROUTING_HIERARCHICAL", b"0"),
+            ("FREENET_ROUTING_RESIDUAL_CORRECTION", b"1"),
+        ]));
+        assert_eq!(
+            variables(&warnings),
+            [
+                "FREENET_ROUTING_HIERARCHICAL",
+                "FREENET_ROUTING_RESIDUAL_CORRECTION"
+            ]
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|(_, m)| m.contains("no longer has any effect"))
+        );
+        // The fallback switch must not be presented as the old legacy stack.
+        assert!(
+            warnings[0].1.contains("does NOT restore that stack"),
+            "{}",
+            warnings[0].1
+        );
+
+        let warnings =
+            routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b"ture")]));
+        assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+        assert!(
+            warnings[0].1.contains("not a recognised value"),
+            "{}",
+            warnings[0].1
+        );
+        assert!(warnings[0].1.contains("\"ture\""), "{}", warnings[0].1);
+
+        #[cfg(unix)]
+        {
+            let warnings =
+                routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b"1\xff")]));
+            assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+            assert!(
+                warnings[0].1.contains("not a recognised value"),
+                "{}",
+                warnings[0].1
+            );
+        }
+
+        let warnings =
+            routing_flag_warnings(env(&[("FREENET_ROUTING_FALLBACK_ISOTONIC", b" On ")]));
+        assert_eq!(variables(&warnings), ["FREENET_ROUTING_FALLBACK_ISOTONIC"]);
+        assert!(
+            warnings[0]
+                .1
+                .contains("routing on the emergency isotonic fallback"),
+            "{}",
+            warnings[0].1
+        );
+    }
+
+    /// `FREENET_ROUTING_FALLBACK_ISOTONIC` routes every stage on the isotonic
+    /// estimate with the per-peer EWMA, the path a cold stage takes, and the
+    /// snapshot says so. Off, a warm router reads the hierarchical estimate.
+    #[test]
+    fn the_isotonic_fallback_switch_routes_every_stage_on_the_isotonic_estimate() {
+        let mut router = Router::new(&[]);
+        let (peer, contract) = feed_mixed_traffic(&mut router, 300);
+        let now = router.estimator_clock.hours();
+        let distance = contract.distance(peer.location().unwrap()).as_f64();
+        let hierarchical = router.hierarchical.estimate(&peer, contract, distance, now);
+        let isotonic_failure = router
+            .failure_estimator
+            .estimate_retrieval_time(&peer, contract)
+            .unwrap()
+            .clamp(0.0, 1.0);
+        let isotonic_timing = router.isotonic_timing_forecast(&peer, contract);
+
+        let fallback = {
+            let _on = force_isotonic_fallback(true);
+            assert!(router.snapshot().isotonic_fallback_enabled);
+            router
+                .predict_routing_outcome_at(&peer, contract, now)
+                .unwrap()
+        };
+        assert_eq!(fallback.failure_probability, isotonic_failure);
+        assert_eq!(
+            Some(fallback.time_to_response_start),
+            isotonic_timing.time_to_response_start_secs
+        );
+        assert_eq!(
+            Some(fallback.xfer_speed.bytes_per_second),
+            isotonic_timing.transfer_speed_bps
+        );
+
+        let _off = force_isotonic_fallback(false);
+        assert!(!router.snapshot().isotonic_fallback_enabled);
+        let default = router
+            .predict_routing_outcome_at(&peer, contract, now)
+            .unwrap();
+        assert_eq!(
+            Some(default.failure_probability),
+            hierarchical.failure_probability
+        );
+        assert_ne!(
+            default.failure_probability.to_bits(),
+            fallback.failure_probability.to_bits(),
+            "the two paths must differ here, or the equalities above prove nothing"
+        );
+    }
+
+    /// An isotonic transfer-speed estimator whose global curve is `global_bps`
+    /// at every distance, with each `(peer, speed)` in `learned` given a
+    /// trusted per-peer adjustment that makes its raw estimate `speed`
+    /// (clamped at zero by the estimator, so a negative `speed` reads as 0).
+    fn transfer_estimator_with(
+        global_bps: f64,
+        learned: &[(PeerKeyLocation, f64)],
+    ) -> IsotonicEstimator {
+        let reference = (0..20).map(|index| IsotonicEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::new(f64::from(index) / 20.0),
+            result: global_bps,
+        });
+        let mut estimator = IsotonicEstimator::new(reference, EstimatorType::Negative);
+        for (peer, speed) in learned {
+            estimator.set_peer_adjustment_for_test(peer.clone(), speed - global_bps);
+        }
+        estimator
+    }
+
+    /// The isotonic transfer speed routing uses is floored at 1e-6 B/s,
+    /// whatever the curve, and the floor is a LOWER BOUND on every estimate,
+    /// not a replacement for a zero one: a peer driven to a tiny positive speed
+    /// is lifted exactly like one clamped to zero, and every estimate above the
+    /// floor is kept as it is.
+    #[test]
+    fn a_degenerate_isotonic_transfer_speed_is_floored() {
+        let _seed = GlobalRng::seed_guard(0x4485_F100);
+        let target = Location::new(0.3);
+        let speed = |router: &Router, peer: &PeerKeyLocation| {
+            router
+                .isotonic_transfer_speed(peer, target)
+                .expect("the estimator estimates")
+        };
+        let [zero, tiny, slow, fast] = std::array::from_fn(|_| PeerKeyLocation::random());
+        for curve in [1000.0, 5.0, 0.0] {
+            let mut router = Router::new(&[]);
+            router.transfer_rate_estimator = transfer_estimator_with(
+                curve,
+                &[
+                    (zero.clone(), -2000.0),
+                    (tiny.clone(), 1e-9),
+                    (slow.clone(), 0.5),
+                    (fast.clone(), 1500.0),
+                ],
+            );
+            assert_eq!(
+                speed(&router, &zero),
+                1e-6,
+                "a zero estimate is lifted ({curve})"
+            );
+            assert_eq!(
+                speed(&router, &tiny),
+                1e-6,
+                "a tiny positive one too ({curve})"
+            );
+            assert_eq!(
+                speed(&router, &slow),
+                0.5,
+                "one above the floor is kept ({curve})"
+            );
+            assert_eq!(speed(&router, &fast), 1500.0);
+        }
+    }
+
+    /// A router past the 50-event gate with no failures and a 100 ms response
+    /// anywhere, so that only the transfer term differs between candidates,
+    /// routing on `transfer` as its isotonic transfer-speed estimator.
+    fn router_ranking_on_transfer_speed(transfer: IsotonicEstimator) -> Router {
+        let reference = |result: f64| {
+            (0..60).map(move |index| IsotonicEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::new(f64::from(index) / 60.0),
+                result,
+            })
+        };
+        let mut router = Router::new(&[]);
+        router.failure_estimator = IsotonicEstimator::new(reference(0.0), EstimatorType::Positive);
+        router.response_start_time_estimator = IsotonicEstimator::new_with_mode(
+            reference(0.1),
+            EstimatorType::Positive,
+            AdjustmentMode::Multiplicative,
+        );
+        router.transfer_rate_estimator = transfer;
+        router
+    }
+
+    /// Rank `candidates` for `target` and assert the order is monotone in each
+    /// candidate's RAW isotonic transfer-speed estimate (what the estimator
+    /// learned for that peer at that target, before any floor): a peer with a
+    /// lower raw estimate never ranks above one with a higher, unless the
+    /// floor makes their routed speeds equal. Returns the number of candidates
+    /// whose routed speed was lifted by the floor.
+    fn assert_transfer_ranking_is_monotone(
+        router: &Router,
+        candidates: &[PeerKeyLocation],
+        target: Location,
+    ) -> usize {
+        let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
+        assert_eq!(ranked.len(), candidates.len());
+        let raw = |peer: &PeerKeyLocation| {
+            router
+                .transfer_rate_estimator
+                .estimate_retrieval_time(peer, target)
+                .expect("the estimator estimates")
+        };
+        let used: Vec<f64> = ranked
+            .iter()
+            .map(|peer| {
+                let prediction = router
+                    .predict_routing_outcome(peer, target)
+                    .expect("predicts");
+                assert_eq!(
+                    Some(prediction.xfer_speed.bytes_per_second),
+                    router.isotonic_transfer_speed(peer, target),
+                    "the transfer speed must come from the isotonic estimate"
+                );
+                prediction.xfer_speed.bytes_per_second
+            })
+            .collect();
+        for earlier in 0..ranked.len() {
+            for later in earlier + 1..ranked.len() {
+                let (better, worse) = (raw(ranked[earlier]), raw(ranked[later]));
+                assert!(
+                    better >= worse || used[earlier] == used[later],
+                    "a peer whose estimate is {better} B/s (routed at {}) ranks above one \
+                     whose estimate is {worse} B/s (routed at {})",
+                    used[earlier],
+                    used[later]
+                );
+            }
+        }
+        ranked
+            .iter()
+            .zip(&used)
+            .filter(|(peer, used)| **used > raw(peer))
+            .count()
+    }
+
+    /// Routing on the floored isotonic transfer speed is monotone in what the
+    /// estimator learned: a peer that learned a lower speed never ranks above
+    /// one that learned a higher speed, unless the floor makes them equal.
+    /// Every other cost term is the same for every candidate here, so the rank
+    /// is decided by the transfer speed alone.
+    #[test]
+    fn a_floored_transfer_speed_never_ranks_a_slower_peer_above_a_faster_one() {
+        let _seed = GlobalRng::seed_guard(0x4485_F101);
+        let _routing = force_isotonic_fallback(true);
+        let learned: Vec<(PeerKeyLocation, f64)> = [-500.0, 1e-9, 50.0, 150.0, 500.0, 2000.0]
+            .into_iter()
+            .map(|speed| (PeerKeyLocation::random(), speed))
+            .collect();
+        let router = router_ranking_on_transfer_speed(transfer_estimator_with(1000.0, &learned));
+        let candidates: Vec<PeerKeyLocation> =
+            learned.iter().rev().map(|(peer, _)| peer.clone()).collect();
+        let lifted = assert_transfer_ranking_is_monotone(&router, &candidates, Location::new(0.3));
+        assert!(lifted >= 2, "the floor must be in play: {lifted} lifted");
+    }
+
+    /// The same across distances, where it is easy to get wrong: the global
+    /// curve falls with distance and the per-peer adjustment does not, so a
+    /// floor taken from the curve at each candidate's OWN distance lifts a
+    /// degenerate NEAR peer above a far peer that learned a positive speed.
+    /// Here the near peer's estimate is 0 and the far one's lies between the
+    /// two candidates' per-distance floors.
+    #[test]
+    fn a_floored_transfer_speed_ranks_monotonically_across_distances() {
+        let _seed = GlobalRng::seed_guard(0x4485_F102);
+        let _routing = force_isotonic_fallback(true);
+        // A falling curve, 1000 B/s at distance 0 to 100 B/s at 0.5, from
+        // points spread over the whole of [0, 0.5] so nothing is extrapolated.
+        let reference = PeerKeyLocation::random();
+        let origin = reference.location().expect("located").as_f64();
+        let events = (0..40).map(|index| {
+            let distance = 0.5 * f64::from(index) / 39.0;
+            IsotonicEvent {
+                peer: reference.clone(),
+                contract_location: Location::new((origin + distance).rem_euclid(1.0)),
+                result: 1000.0 - 1800.0 * distance,
+            }
+        });
+        let mut transfer = IsotonicEstimator::new(events, EstimatorType::Negative);
+
+        let pool: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        let near = pool[0].clone();
+        let target = near.location().expect("located");
+        let distance =
+            |peer: &PeerKeyLocation| target.distance(peer.location().expect("located")).as_f64();
+        let far = pool
+            .iter()
+            .max_by(|a, b| distance(a).total_cmp(&distance(b)))
+            .expect("a pool")
+            .clone();
+        let global = |peer: &PeerKeyLocation| {
+            transfer
+                .estimate_global(peer, target)
+                .expect("the curve estimates")
+        };
+        let (near_global, far_global) = (global(&near), global(&far));
+        assert!(
+            near_global >= 2.0 * far_global && far_global > 0.0,
+            "the curve must fall with distance: {near_global} near vs {far_global} at {}",
+            distance(&far)
+        );
+        // Near: driven to zero. Far: a positive estimate above a tenth of the
+        // curve at its own distance and below a tenth of it at the near one,
+        // which is what a floor relative to each candidate's distance got
+        // wrong.
+        let far_raw = 0.1 * (near_global * far_global).sqrt();
+        transfer.set_peer_adjustment_for_test(near.clone(), -2.0 * near_global);
+        transfer.set_peer_adjustment_for_test(far.clone(), far_raw - far_global);
+
+        let router = router_ranking_on_transfer_speed(transfer);
+        let lifted = assert_transfer_ranking_is_monotone(&router, &[near, far], target);
+        assert!(lifted >= 1, "the floor must be in play: {lifted} lifted");
+    }
+
+    /// A peer whose isotonic transfer speed is degenerate (0) sorts after every
+    /// healthy peer, whatever their response times and failure probabilities,
+    /// as it did when the reference build priced it at the sentinel. The
+    /// scenario: a node just restarted on a network of small states, so the
+    /// mean transfer size is near its 100-byte seed. With a 1 B/s floor the
+    /// degenerate peer's transfer term was only ~133 s, and a fast, reliable
+    /// degenerate peer outranked a slow, unreliable but working one (148 s).
+    /// Two degenerate peers are still ordered by their other costs.
+    #[test]
+    fn a_degenerate_transfer_speed_sorts_after_every_working_peer() {
+        let _seed = GlobalRng::seed_guard(0x4485_F103);
+        let _routing = force_isotonic_fallback(true);
+        let [degenerate, healthy_but_slow, degenerate_fast] =
+            std::array::from_fn(|_| PeerKeyLocation::random());
+        let mut router = router_ranking_on_transfer_speed(transfer_estimator_with(
+            1000.0,
+            &[
+                (degenerate.clone(), -1000.0),
+                (healthy_but_slow.clone(), 1000.0),
+                (degenerate_fast.clone(), -1000.0),
+            ],
+        ));
+        // Failure: a flat 0 curve plus an additive per-peer offset.
+        for (peer, failure) in [
+            (&degenerate, 0.05),
+            (&healthy_but_slow, 0.9),
+            (&degenerate_fast, 0.0),
+        ] {
+            router
+                .failure_estimator
+                .set_peer_adjustment_for_test(peer.clone(), failure);
+        }
+        // Response time: a flat 100 ms curve times a per-peer factor.
+        for (peer, seconds) in [
+            (&degenerate, 0.2),
+            (&healthy_but_slow, 40.0),
+            (&degenerate_fast, 0.1),
+        ] {
+            router
+                .response_start_time_estimator
+                .set_peer_adjustment_for_test(peer.clone(), (seconds / 0.1f64).ln());
+        }
+        // Five ~200-byte transfers after the 100-byte seed.
+        for _ in 0..5 {
+            router.mean_transfer_size.add(200.0);
+        }
+        let target = Location::new(0.3);
+        let cost = |router: &Router, peer: &PeerKeyLocation| {
+            router
+                .predict_routing_outcome(peer, target)
+                .expect("predicts")
+                .expected_total_time
+        };
+        for peer in [&degenerate, &healthy_but_slow, &degenerate_fast] {
+            assert!(cost(&router, peer).is_finite(), "{}", cost(&router, peer));
+        }
+        let candidates = [
+            degenerate.clone(),
+            healthy_but_slow.clone(),
+            degenerate_fast.clone(),
+        ];
+        let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
+        assert_eq!(
+            ranked,
+            [&healthy_but_slow, &degenerate_fast, &degenerate],
+            "costs: healthy-but-slow {}, degenerate {}, degenerate-but-fast {}",
+            cost(&router, &healthy_but_slow),
+            cost(&router, &degenerate),
+            cost(&router, &degenerate_fast)
+        );
+
+        // At a 1 MB mean the degenerate costs are ~1e12 s: still finite, and
+        // still resolved finely enough to order the two degenerate peers.
+        router
+            .mean_transfer_size
+            .add_with_count(1e6 * 1e6, 1_000_000);
+        let costs =
+            [&degenerate, &healthy_but_slow, &degenerate_fast].map(|peer| cost(&router, peer));
+        assert!(costs.iter().all(|c| c.is_finite()), "{costs:?}");
+        assert!(costs[0] > 1e11, "{costs:?}");
+        let ranked = router.select_k_best_peers(candidates.iter(), target, candidates.len());
+        assert_eq!(
+            ranked,
+            [&healthy_but_slow, &degenerate_fast, &degenerate],
+            "{costs:?}"
+        );
+    }
+
+    /// `predictions_by_model` counts the model routing ACTS on, even when the
+    /// candidate log also computes the other model for every candidate. The
+    /// sim A/B's exclusivity checks rely on it: counting both would make each
+    /// arm look as if it had routed on the other once a recorder is on.
+    #[test]
+    fn predictions_by_model_counts_only_the_acting_model_under_capture() {
+        let _seed = GlobalRng::seed_guard(0x4485_C0C7);
+        for fallback in [false, true] {
+            let _routing = force_isotonic_fallback(fallback);
+            let mut router = Router::new(&[]);
+            add_relay_recorded_successes(&mut router, 60);
+            let candidates: Vec<PeerKeyLocation> =
+                (0..5).map(|_| PeerKeyLocation::random()).collect();
+            let (_, decision, captured) = router.select_k_best_peers_capturing(
+                candidates.iter(),
+                Location::new(0.3),
+                candidates.len(),
+                true,
+                false,
+            );
+            assert!(matches!(
+                decision.strategy,
+                RoutingStrategy::PredictionBased | RoutingStrategy::PredictionFallback
+            ));
+            let captured = captured.expect("a prediction-based decision is captured");
+            assert!(
+                captured
+                    .candidates
+                    .iter()
+                    .any(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+                "the capture must have computed both models, or this is vacuous"
+            );
+            let (isotonic, hierarchical) = router.predictions_by_model_for_test();
+            if fallback {
+                assert!(
+                    isotonic > 0 && hierarchical == 0,
+                    "{isotonic}/{hierarchical}"
+                );
+            } else {
+                assert!(
+                    hierarchical > 0 && isotonic == 0,
+                    "{isotonic}/{hierarchical}"
+                );
+            }
+        }
+    }
+
+    /// `FALLBACK_STAGE_EVALUATIONS` counts only the acting model's
+    /// predictions, like `predictions_by_model`: the candidate log computes
+    /// the isotonic fallback for every candidate as the non-acting model, and
+    /// counting that would make a warm hierarchical router look as if it had
+    /// fallen back.
+    #[test]
+    fn fallback_stage_evaluations_ignore_the_candidate_logs_other_model() {
+        let _seed = GlobalRng::seed_guard(0x4485_FA11);
+        let _routing = force_isotonic_fallback(false);
+        let mut router = Router::new(&[]);
+        // Untimed traffic: the failure stage is warm and no timing stage has
+        // an isotonic estimate to fall back to, so the acting (hierarchical)
+        // model falls back on nothing.
+        add_relay_recorded_successes(&mut router, 60);
+        let candidates: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+        let before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+        let (_, _, captured) = router.select_k_best_peers_capturing(
+            candidates.iter(),
+            Location::new(0.3),
+            candidates.len(),
+            true,
+            false,
+        );
+        let captured = captured.expect("a prediction-based decision is captured");
+        assert!(
+            captured
+                .candidates
+                .iter()
+                .any(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+            "the capture must have computed both models, or this is vacuous"
+        );
+        assert_eq!(
+            FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - before,
+            0,
+            "the non-acting isotonic predictions must not count as fallbacks"
+        );
+    }
+
+    /// Whether any candidate in a replayed decision prices its transfer as
+    /// unroutable, and how many candidates had a degenerate raw estimate.
+    fn unroutable_transfers(scenario: &str, only_cold_transfer_stage: bool) -> (usize, usize) {
+        let (mut unroutable, mut degenerate) = (0usize, 0usize);
+        golden_replay::visit_decisions(scenario, &mut |router, candidates, target| {
+            if only_cold_transfer_stage && router.hierarchical.diagnostics()[2].active {
+                return;
+            }
+            let now = router.estimator_clock.hours();
+            for peer in candidates {
+                let raw = router
+                    .transfer_rate_estimator
+                    .estimate_retrieval_time(peer, target);
+                if matches!(raw, Ok(speed) if speed <= 0.0) {
+                    degenerate += 1;
+                }
+                let Ok(prediction) = router.predict_routing_outcome_at(peer, target, now) else {
+                    continue;
+                };
+                let transfer_available = raw.is_ok();
+                if transfer_available
+                    && (prediction.xfer_speed.bytes_per_second <= 0.0
+                        || prediction.expected_total_time >= f64::MAX / 4.0)
+                {
+                    unroutable += 1;
+                }
+            }
+        });
+        (unroutable, degenerate)
+    }
+
+    /// With `FREENET_ROUTING_FALLBACK_ISOTONIC` on, every stage routes on the
+    /// isotonic estimate, and no candidate with a transfer estimate may be
+    /// priced at zero speed or an infinite transfer cost.
+    #[test]
+    fn the_isotonic_fallback_never_prices_a_transfer_as_unroutable() {
+        let _on = force_isotonic_fallback(true);
+        let mut degenerate_seen = 0;
+        for scenario in ["mixed_traffic", "production_like", "drift"] {
+            let (unroutable, degenerate) = unroutable_transfers(scenario, false);
+            assert_eq!(
+                unroutable, 0,
+                "{scenario}: {unroutable} unroutable transfers"
+            );
+            degenerate_seen += degenerate;
+        }
+        assert!(
+            degenerate_seen > 0,
+            "the scenarios must reach degenerate raw estimates, or this proves nothing"
+        );
+    }
+
+    /// The same for a transfer stage still without a hierarchical curve, in
+    /// the default configuration: the case the soaked build got wrong.
+    #[test]
+    fn a_cold_transfer_stage_never_prices_a_transfer_as_unroutable() {
+        let (unroutable, degenerate) = unroutable_transfers("production_like", true);
+        assert_eq!(unroutable, 0, "{unroutable} unroutable transfers");
+        assert!(
+            degenerate > 0,
+            "the cold stage must reach degenerate raw estimates, or this proves nothing"
+        );
+    }
+
+    /// A route event about a peer with no known location is skipped, not
+    /// learned: the isotonic estimators require a location for every event and
+    /// would otherwise panic under the router's write lock. Nothing the router
+    /// holds may change, whatever the outcome.
+    #[test]
+    fn a_route_event_for_a_peer_without_a_location_is_skipped() {
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 60);
+        let state = |router: &Router| {
+            (
+                router.failure_estimator.len(),
+                router.response_start_time_estimator.len(),
+                router.transfer_rate_estimator.len(),
+                router.hierarchical.diagnostics()[0].window_events,
+                router.outcome_totals(),
+            )
+        };
+        let before = state(&router);
+        assert_eq!(router.snapshot().route_events_discarded_unlocated, 0);
+        let unlocated =
+            PeerKeyLocation::with_unknown_addr(PeerKeyLocation::random().pub_key().clone());
+        assert!(unlocated.location().is_none(), "sanity: no location");
+        for outcome in [
+            RouteOutcome::Failure,
+            RouteOutcome::SuccessUntimed,
+            RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            },
+        ] {
+            router.add_event(RouteEvent {
+                peer: unlocated.clone(),
+                contract_location: Location::random(),
+                outcome,
+                op_type: Some(OpType::Get),
+            });
+        }
+        assert_eq!(
+            state(&router),
+            before,
+            "an event about a peer with no location must not be recorded"
+        );
+        assert_eq!(
+            router.snapshot().route_events_discarded_unlocated,
+            3,
+            "but each discard must be counted, or it reads as no event at all"
+        );
+    }
+
+    /// The same guard on the history path: `Router::new` skips events about
+    /// a peer with no known location instead of panicking in the isotonic
+    /// estimators, and learns every other event in the history.
+    #[test]
+    fn a_history_event_for_a_peer_without_a_location_is_skipped() {
+        let unlocated =
+            PeerKeyLocation::with_unknown_addr(PeerKeyLocation::random().pub_key().clone());
+        assert!(unlocated.location().is_none(), "sanity: no location");
+        let event = |peer: &PeerKeyLocation, outcome: RouteOutcome| RouteEvent {
+            peer: peer.clone(),
+            contract_location: Location::random(),
+            outcome,
+            op_type: Some(OpType::Get),
+        };
+        let timed = || RouteOutcome::Success {
+            time_to_response_start: Duration::from_millis(100),
+            payload_size: 5000,
+            payload_transfer_time: Duration::from_millis(50),
+        };
+        let mut history = Vec::new();
+        for _ in 0..10 {
+            let located = PeerKeyLocation::random();
+            history.push(event(&located, RouteOutcome::Failure));
+            history.push(event(&located, timed()));
+            history.push(event(&unlocated, RouteOutcome::Failure));
+            history.push(event(&unlocated, RouteOutcome::SuccessUntimed));
+            history.push(event(&unlocated, timed()));
+        }
+        let router = Router::new(&history);
+        assert_eq!(router.snapshot().route_events_discarded_unlocated, 30);
+        assert_eq!(router.failure_estimator.len(), 20);
+        assert_eq!(router.response_start_time_estimator.len(), 10);
+        assert_eq!(router.transfer_rate_estimator.len(), 10);
+        assert_eq!(
+            router
+                .per_op_failure
+                .get(&OpType::Get)
+                .map(IsotonicEstimator::len),
+            Some(20)
+        );
+    }
+
+    /// The hierarchical estimator routes, so it learns from every event,
+    /// whether or not a routing-dataset recorder is running. (Before #4485's
+    /// removal it learned only while its flag was on or a recorder recorded.)
+    #[test]
+    fn the_hierarchical_estimator_learns_from_every_event() {
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 200);
+        assert_eq!(router.hierarchical.diagnostics()[0].window_events, 200);
+        let stopped = dataset::RoutingDataset::stopped_for_test();
+        router.add_event_recording(
+            RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Failure,
+                op_type: None,
+            },
+            dataset::RouteSource::Originator,
+            Some(&stopped),
+        );
+        assert_eq!(
+            router.hierarchical.diagnostics()[0].window_events,
+            201,
+            "a stopped recorder must not stop routing from learning"
+        );
+    }
+
+    /// The contract term's counters reach the snapshot the dashboard, the
+    /// tracing event and the OTLP body read, and they MOVE on real traffic.
+    ///
+    /// Finding 10 of the 2026-09-17 round-1 review, and its round-2 follow-up:
+    /// the first version of this test snapshotted a fresh `Router::new(&[])`,
+    /// so three of its six assertions were `0 == 0` and would have passed for
+    /// a hard-coded zero or a transposed field. It now drives traffic that
+    /// saturates every counter and asserts each is non-zero THROUGH the
+    /// snapshot, in the shape of the sibling test below.
+    #[test]
+    fn contract_term_counters_reach_the_snapshot() {
+        use crate::node::network_status::OpType;
+
+        let _guard = crate::config::GlobalRng::seed_guard(0x4485_5417);
+        // Cold: absent rather than wrong, and every field still agrees with
+        // the stage's own diagnostic.
+        let cold = Router::new(&[]);
+        let snapshot = cold.snapshot();
+        assert_eq!(snapshot.hierarchical_contracts, 0);
+        assert_eq!(snapshot.hierarchical_contract_estimable_refits, 0);
+        assert_eq!(snapshot.hierarchical_contract_effects_applied, 0);
+        assert_eq!(snapshot.hierarchical_contract_tau2, None);
+
+        // Warm: a small contract pool with more peers per contract than the
+        // eight entries a contract keeps, so displacement, live refusal and
+        // refit dropping all occur, and a dead contract so the term activates.
+        let mut router = Router::new(&[]).with_max_connections(16);
+        let peers: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        let contracts: Vec<Location> = (0..6).map(|i| Location::new(i as f64 / 6.0)).collect();
+        let dead = Location::new(0.37);
+        for index in 0..3_000 {
+            let (peer, contract, outcome) = if index % 3 == 0 {
+                (&peers[index % peers.len()], dead, RouteOutcome::Failure)
+            } else {
+                (
+                    &peers[index % peers.len()],
+                    contracts[index % contracts.len()],
+                    if index % 7 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                )
+            };
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome,
+                op_type: Some(OpType::Get),
+            });
+        }
+        let snapshot = router.snapshot();
+        let diagnostics = router.hierarchical.diagnostics()[0];
+
+        // Each field must be NON-ZERO through the snapshot, so a hard-coded
+        // zero or a field that is never populated fails here, and must equal
+        // the stage's own diagnostic, so a transposition fails too.
+        for (name, from_snapshot, from_stage) in [
+            (
+                "contracts",
+                snapshot.hierarchical_contracts as u64,
+                diagnostics.contracts as u64,
+            ),
+            (
+                "residuals_refused",
+                snapshot.hierarchical_contract_residuals_refused,
+                diagnostics.contract_residuals_refused,
+            ),
+            (
+                "entries_displaced",
+                snapshot.hierarchical_contract_entries_displaced,
+                diagnostics.contract_entries_displaced,
+            ),
+            (
+                "estimable_refits",
+                snapshot.hierarchical_contract_estimable_refits,
+                diagnostics.contract_estimable_refits,
+            ),
+            (
+                "effects_applied",
+                snapshot.hierarchical_contract_effects_applied,
+                diagnostics.contract_effects_applied,
+            ),
+            (
+                "forecast_offsets",
+                snapshot.hierarchical_contract_forecast_offsets,
+                diagnostics.contract_forecast_offsets,
+            ),
+            (
+                "qualifying_contracts",
+                snapshot.hierarchical_contract_qualifying_contracts,
+                diagnostics.contract_qualifying_contracts,
+            ),
+            (
+                "qualifying_entries",
+                snapshot.hierarchical_contract_qualifying_entries,
+                diagnostics.contract_qualifying_entries,
+            ),
+            // I3 of the 2026-09-18 round-3 testing review: this field was
+            // wired to the snapshot and to the OTLP body but was absent from
+            // this loop, so hard-coding it to zero, or reading it from the
+            // wrong stage, survived. The telemetry test only checks the JSON
+            // key against a hand-set value.
+            (
+                "floor_bound_refits",
+                snapshot.hierarchical_contract_floor_bound_refits,
+                diagnostics.contract_floor_bound_refits,
+            ),
+        ] {
+            assert!(
+                from_snapshot > 0,
+                "hierarchical_contract_{name} must be non-zero on this traffic, \
+                 or the assertion cannot tell a wired field from an unwired one"
+            );
+            assert_eq!(
+                from_snapshot, from_stage,
+                "hierarchical_contract_{name} must be the failure stage's own value"
+            );
+        }
+        assert_eq!(
+            snapshot.hierarchical_contract_pairs_refused_last_refit,
+            diagnostics.contract_pairs_refused_last_refit,
+            "the refit gauge must be the failure stage's own value"
+        );
+        // Equality only, deliberately: a stream whose contracts all qualify
+        // from the first refit has a legitimate zero here, so asserting
+        // non-zero would make this test depend on the warm-up shape of its own
+        // traffic. The transposition is what this pins.
+        assert_eq!(
+            snapshot.hierarchical_contract_den_below_two_refits,
+            diagnostics.contract_den_below_two_refits,
+            "the den-gate count must be the failure stage's own value"
+        );
+        assert!(
+            snapshot.hierarchical_contract_den_below_two_refits
+                <= snapshot.hierarchical_contract_estimable_refits,
+            "the den gate is evaluated only on estimable refits, so its count \
+             cannot exceed them: {} against {}",
+            snapshot.hierarchical_contract_den_below_two_refits,
+            snapshot.hierarchical_contract_estimable_refits
+        );
+        assert!(
+            snapshot
+                .hierarchical_contract_tau2
+                .is_some_and(|tau2| tau2 > 0.0),
+            "between-contract variance must be estimated: {:?}",
+            snapshot.hierarchical_contract_tau2
+        );
+        assert_eq!(
+            snapshot.hierarchical_contract_tau2,
+            diagnostics.contract_tau2
+        );
+    }
+
+    /// The peer tables are sized from the configured connection cap, and
+    /// evictions under churn reach the snapshot the dashboard and telemetry read.
+    #[test]
+    fn peer_table_capacity_and_evictions_reach_the_snapshot() {
+        let mut router = Router::new(&[]).with_max_connections(5);
+        assert_eq!(router.snapshot().hierarchical_peer_capacity, 64);
+        assert_eq!(router.snapshot().hierarchical_peer_evictions, 0);
+        add_relay_recorded_successes(&mut router, 300);
+        let snapshot = router.snapshot();
+        assert!(
+            snapshot.hierarchical_peer_evictions > 0,
+            "300 distinct peers through a 64-slot table must evict"
+        );
+        assert_eq!(
+            snapshot.hierarchical_peer_evictions,
+            router.hierarchical.total_evictions()
+        );
+        assert_eq!(
+            Router::new(&[])
+                .with_max_connections(1_000)
+                .snapshot()
+                .hierarchical_peer_capacity,
+            2_000
+        );
+    }
+
+    /// Horizon selection through the Router on its injected clock: peers'
+    /// response times drift after several simulated hours, a forgetting horizon
+    /// takes over, and predictions after the drift are better than those of an
+    /// identical router whose clock never moves (so its horizons cannot forget).
+    #[test]
+    fn injected_time_lets_the_router_forget_after_drift() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let _seed = GlobalRng::seed_guard(0x4485_71de);
+        let peers: Vec<PeerKeyLocation> = (0..20).map(|_| PeerKeyLocation::random()).collect();
+        let effects: Vec<f64> = (0..peers.len())
+            .map(|i| if i % 2 == 0 { 0.8 } else { -0.8 })
+            .collect();
+        let clock = SharedMockTimeSource::new();
+        let mut moving = Router::new(&[]).with_time_source(std::sync::Arc::new(clock.clone()));
+        let mut frozen =
+            Router::new(&[]).with_time_source(std::sync::Arc::new(SharedMockTimeSource::new()));
+
+        let truth = |p: usize, flipped: bool| {
+            let effect = if flipped { -effects[p] } else { effects[p] };
+            (0.1f64).ln() + effect
+        };
+        let (mut moving_error, mut frozen_error, mut scored) = (0.0, 0.0, 0);
+        // 60 events per simulated hour: 40 hours stable, then 12 hours drifted.
+        for index in 0..(52 * 60) {
+            let flipped = index >= 40 * 60;
+            let p = index % peers.len();
+            let contract = Location::random();
+            if flipped && index >= 46 * 60 {
+                let expected = truth(p, true).exp() * (0.2f64 * 0.2 / 2.0).exp();
+                for (router, error) in [(&moving, &mut moving_error), (&frozen, &mut frozen_error)]
+                {
+                    let predicted = router
+                        .hierarchical
+                        .estimate(&peers[p], contract, 0.1, router.estimator_clock.hours())
+                        .time_to_response_start_secs
+                        .unwrap();
+                    *error += (predicted - expected).powi(2);
+                }
+                scored += 1;
+            }
+            let seconds = (truth(p, flipped) + 0.2 * uniform_normal()).exp();
+            let event = RouteEvent {
+                peer: peers[p].clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_secs_f64(seconds),
+                    payload_size: 0,
+                    payload_transfer_time: Duration::ZERO,
+                },
+                op_type: None,
+            };
+            moving.add_event(event.clone());
+            frozen.add_event(event);
+            clock.advance_time(Duration::from_secs(60));
+        }
+        let moving_horizon = moving.hierarchical.diagnostics()[1].selected_horizon_hours;
+        eprintln!(
+            "#4485 drift through the router: moving-clock horizon {moving_horizon:?}, \
+             mse {:.5} vs frozen {:.5} over {scored}",
+            moving_error / scored as f64,
+            frozen_error / scored as f64
+        );
+        assert!(
+            moving_horizon.is_some(),
+            "after the drift the moving clock must select a forgetting horizon"
+        );
+        assert_eq!(
+            frozen.hierarchical.diagnostics()[1].selected_horizon_hours,
+            None,
+            "with no time passing every horizon is identical, so none is selected"
+        );
+        assert!(
+            moving_error < frozen_error * 0.8,
+            "forgetting must improve predictions after drift: {moving_error} vs {frozen_error}"
+        );
+    }
+
+    fn uniform_normal() -> f64 {
+        let u1 = GlobalRng::random_range(0.0..1.0f64).max(f64::MIN_POSITIVE);
+        let u2 = GlobalRng::random_range(0.0..1.0f64);
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Timing and speed, scored in SECONDS against the generating expectations
+    /// (log-space scoring would favour the log-scale model by construction).
+    struct TimingHeadToHead {
+        isotonic_time_mse: f64,
+        hierarchical_time_mse: f64,
+        isotonic_transfer_mse: f64,
+        hierarchical_transfer_mse: f64,
+        /// Events both transfer errors were scored on.
+        transfer_scored: usize,
+        /// Events where the isotonic fallback had no transfer-speed estimate, or
+        /// only a degenerate one that `DEGENERATE_SPEED_FLOOR_BPS` lifted, left
+        /// out of BOTH transfer errors. Leaving them out flatters the fallback,
+        /// which is the conservative direction for this gate. Scoring the
+        /// floored speed instead would price such an event at ~5e9 s and pass
+        /// the gate on that alone.
+        isotonic_speed_missing: usize,
+    }
+
+    /// The pre-#4485-removal scenario, now scored against the isotonic
+    /// estimate with the per-peer EWMA: the estimate a cold timing stage falls
+    /// back to, and the only legacy estimator left.
+    fn timing_head_to_head(seed: u64) -> TimingHeadToHead {
+        const PEERS: usize = 12;
+        const EVENTS: usize = 2_000;
+        const WARMUP: usize = 300;
+        const BYTES: f64 = 5_000.0;
+        // Routing's side must be the hierarchical estimator whatever
+        // FREENET_ROUTING_FALLBACK_ISOTONIC says, or with it set both sides
+        // are the isotonic estimate and the 1.10 ratio passes trivially. The
+        // isotonic side is read from `isotonic_timing_forecast` directly.
+        let _routing = force_isotonic_fallback(false);
+        let _seed = GlobalRng::seed_guard(seed);
+        let peers: Vec<PeerKeyLocation> = (0..PEERS).map(|_| PeerKeyLocation::random()).collect();
+        let time_effect: Vec<f64> = (0..PEERS).map(|_| 0.5 * uniform_normal()).collect();
+        let speed_effect: Vec<f64> = (0..PEERS).map(|_| 0.5 * uniform_normal()).collect();
+        let (sd_time, sd_speed) = (0.6, 0.7);
+        // A frozen clock: the hierarchical estimator's horizons otherwise read
+        // the host's wall clock, and the figures drift from run to run.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let mut acc = [0.0f64; 4];
+        let (mut scored, mut transfer_scored, mut isotonic_speed_missing) =
+            (0usize, 0usize, 0usize);
+        for index in 0..EVENTS {
+            let p = GlobalRng::random_range(0..PEERS);
+            let contract = Location::random();
+            let distance = contract.distance(peers[p].location().unwrap()).as_f64();
+            let mu_time = (0.08f64).ln() + 2.0 * distance + time_effect[p];
+            let mu_speed = (50_000.0f64).ln() - 2.0 * distance + speed_effect[p];
+            if index >= WARMUP {
+                if index == WARMUP {
+                    let stages = router.hierarchical.diagnostics();
+                    assert!(
+                        stages[1].active && stages[2].active,
+                        "past warm-up routing must read the hierarchical timing stages"
+                    );
+                }
+                let expected_time = (mu_time + sd_time * sd_time / 2.0).exp();
+                let expected_transfer = BYTES * (-mu_speed + sd_speed * sd_speed / 2.0).exp();
+                let now = router.estimator_clock.hours();
+                let isotonic = router.isotonic_timing_forecast(&peers[p], contract);
+                let prediction = router
+                    .predict_routing_outcome_at(&peers[p], contract, now)
+                    .expect("prediction available after warm-up");
+                let isotonic_time = isotonic
+                    .time_to_response_start_secs
+                    .expect("isotonic time estimate after warm-up");
+                acc[0] += (isotonic_time - expected_time).powi(2);
+                acc[1] += (prediction.time_to_response_start - expected_time).powi(2);
+                scored += 1;
+                // A floored speed is a degenerate estimate, not a forecast.
+                let degenerate = router
+                    .transfer_rate_estimator
+                    .estimate_retrieval_time(&peers[p], contract)
+                    .is_ok_and(|raw| raw < DEGENERATE_SPEED_FLOOR_BPS);
+                match isotonic.transfer_speed_bps.filter(|_| !degenerate) {
+                    Some(isotonic_speed) => {
+                        acc[2] += (BYTES / isotonic_speed - expected_transfer).powi(2);
+                        acc[3] += (BYTES / prediction.xfer_speed.bytes_per_second
+                            - expected_transfer)
+                            .powi(2);
+                        transfer_scored += 1;
+                    }
+                    None => isotonic_speed_missing += 1,
+                }
+            }
+            let seconds = (mu_time + sd_time * uniform_normal()).exp();
+            let speed = (mu_speed + sd_speed * uniform_normal()).exp();
+            router.add_event(RouteEvent {
+                peer: peers[p].clone(),
+                contract_location: contract,
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_secs_f64(seconds),
+                    payload_size: BYTES as usize,
+                    payload_transfer_time: Duration::from_secs_f64(BYTES / speed),
+                },
+                op_type: None,
+            });
+        }
+        let n = scored as f64;
+        let t = transfer_scored.max(1) as f64;
+        TimingHeadToHead {
+            isotonic_time_mse: acc[0] / n,
+            hierarchical_time_mse: acc[1] / n,
+            isotonic_transfer_mse: acc[2] / t,
+            hierarchical_transfer_mse: acc[3] / t,
+            transfer_scored,
+            isotonic_speed_missing,
+        }
+    }
+
+    /// Timing and transfer non-regression gate against the isotonic fallback,
+    /// in seconds, at the same a-priori 1.10 ratio as the failure gate. Until
+    /// #4485's removal (#5681) this compared against the legacy blend
+    /// (isotonic plus Renegade); its last figures are in #5681.
+    #[test]
+    fn hierarchical_timing_is_not_materially_worse_than_the_isotonic_fallback_in_seconds() {
+        use recoverability::SEEDS;
+        const MATERIAL_RATIO: f64 = 1.10;
+        let runs: Vec<TimingHeadToHead> = SEEDS
+            .iter()
+            .map(|&seed| timing_head_to_head(seed))
+            .collect();
+        let mean = |f: &dyn Fn(&TimingHeadToHead) -> f64| {
+            runs.iter().map(f).sum::<f64>() / runs.len() as f64
+        };
+        let (it, ht) = (
+            mean(&|r| r.isotonic_time_mse),
+            mean(&|r| r.hierarchical_time_mse),
+        );
+        let (ix, hx) = (
+            mean(&|r| r.isotonic_transfer_mse),
+            mean(&|r| r.hierarchical_transfer_mse),
+        );
+        let transfer_scored: usize = runs.iter().map(|r| r.transfer_scored).sum();
+        let missing: usize = runs.iter().map(|r| r.isotonic_speed_missing).sum();
+        eprintln!(
+            "#4485 timing in seconds: response-time mse {ht:.6} vs isotonic {it:.6} (ratio {:.3}); \
+             transfer-time mse {hx:.6} vs isotonic {ix:.6} (ratio {:.3}) over {transfer_scored} \
+             events, {missing} more where the isotonic fallback had no or a degenerate speed",
+            ht / it,
+            hx / ix
+        );
+        assert!(
+            transfer_scored > missing,
+            "the transfer comparison must cover most events: {transfer_scored} scored, {missing} left out"
+        );
+        assert!(ht.is_finite() && it.is_finite() && hx.is_finite() && ix.is_finite());
+        assert!(
+            ht <= it * MATERIAL_RATIO,
+            "response time must not be materially worse than the isotonic fallback: {ht} vs {it}"
+        );
+        assert!(
+            hx <= ix * MATERIAL_RATIO,
+            "transfer time must not be materially worse than the isotonic fallback: {hx} vs {ix}"
+        );
+    }
+
+    /// Squared error against the generating probability of the failure
+    /// estimate routing acts on (the hierarchical one, warm after the warm-up)
+    /// and of the isotonic estimate with the per-peer EWMA, over the
+    /// recoverability scenarios, driven through the router's real `add_event`
+    /// and prediction API.
+    struct HeadToHead {
+        isotonic_mse: f64,
+        hierarchical_mse: f64,
+        targeted_isotonic_mse: f64,
+        targeted_hierarchical_mse: f64,
+        targeted: usize,
+    }
+
+    fn head_to_head(model: recoverability::Model, seed: u64) -> HeadToHead {
+        use recoverability::{RECOVERY_BUDGET_EVENTS, Scenario, WARMUP_EVENTS};
+        // As in `timing_head_to_head`: pin routing to the hierarchical
+        // estimator so the gate cannot compare the isotonic estimate with
+        // itself. The isotonic side is read from `isotonic_baseline` directly.
+        let _routing = force_isotonic_fallback(false);
+        let _seed = GlobalRng::seed_guard(seed);
+        let scenario = Scenario::new();
+        // A frozen clock: the hierarchical estimator's horizons otherwise read
+        // the host's wall clock, and the figures drift from run to run.
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        let (mut isotonic, mut hierarchical, mut scored) = (0.0, 0.0, 0usize);
+        let (mut t_isotonic, mut t_hierarchical, mut targeted) = (0.0, 0.0, 0usize);
+        for index in 0..RECOVERY_BUDGET_EVENTS {
+            let (peer_index, contract_value) = scenario.draw(model, index);
+            let peer = &scenario.peers[peer_index];
+            let contract = Location::try_from(contract_value).expect("contract within ring");
+            let distance = contract
+                .distance(peer.location().expect("peer has a location"))
+                .as_f64();
+            let p_star = scenario.true_probability(model, peer_index, contract_value, distance);
+            let failed = GlobalRng::random_range(0.0..1.0) < p_star;
+
+            if index >= WARMUP_EVENTS {
+                let now = router.estimator_clock.hours();
+                let i = router
+                    .isotonic_baseline(peer, contract)
+                    .expect("isotonic estimate available after warm-up")
+                    .adjusted_failure;
+                let h = router
+                    .predict_routing_outcome_at(peer, contract, now)
+                    .expect("prediction available after warm-up")
+                    .failure_probability;
+                isotonic += (i - p_star).powi(2);
+                hierarchical += (h - p_star).powi(2);
+                scored += 1;
+                if scenario.is_targeted(peer_index, contract_value) {
+                    t_isotonic += (i - p_star).powi(2);
+                    t_hierarchical += (h - p_star).powi(2);
+                    targeted += 1;
+                }
+            }
+
+            router.add_event(RouteEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                outcome: if failed {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::SuccessUntimed
+                },
+                op_type: None,
+            });
+        }
+        let n = scored.max(1) as f64;
+        let t = targeted.max(1) as f64;
+        HeadToHead {
+            isotonic_mse: isotonic / n,
+            hierarchical_mse: hierarchical / n,
+            targeted_isotonic_mse: t_isotonic / t,
+            targeted_hierarchical_mse: t_hierarchical / t,
+            targeted,
+        }
+    }
+
+    /// Non-regression gate for the hierarchical estimator on the three
+    /// structured scenarios: its error against `p*` must not be materially
+    /// worse than the isotonic estimate's (with the per-peer EWMA).
+    ///
+    /// The tolerance is the bake-off's a-priori `MATERIAL_RATIO` (1.10), fixed
+    /// before that bake-off ran and not re-chosen here. It is applied to the
+    /// seed-averaged mean squared error over all scored events. The
+    /// peer x contract TARGETED subset is printed but not gated: a +-0.02 band
+    /// is diluted inside a 1/8-ring cell, which a band hierarchy cannot resolve,
+    /// and asserting otherwise would assert a property the design does not
+    /// claim. Until #4485's removal (#5681) this compared against the legacy
+    /// blend (isotonic plus Renegade); its last figures are in #5681.
+    #[test]
+    fn hierarchical_estimator_is_not_materially_worse_than_the_isotonic_fallback() {
+        use recoverability::{Model, SEEDS};
+        const MATERIAL_RATIO: f64 = 1.10;
+        for model in [
+            Model::DistanceOnly,
+            Model::PeerMarginal,
+            Model::PeerContract,
+        ] {
+            let runs: Vec<HeadToHead> = SEEDS
+                .iter()
+                .map(|&seed| head_to_head(model, seed))
+                .collect();
+            let mean = |f: &dyn Fn(&HeadToHead) -> f64| {
+                runs.iter().map(f).sum::<f64>() / runs.len() as f64
+            };
+            let isotonic = mean(&|r| r.isotonic_mse);
+            let hierarchical = mean(&|r| r.hierarchical_mse);
+            let ratio = hierarchical / isotonic.max(f64::MIN_POSITIVE);
+            let per_seed: Vec<String> = runs
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{:.3}",
+                        r.hierarchical_mse / r.isotonic_mse.max(f64::MIN_POSITIVE)
+                    )
+                })
+                .collect();
+            eprintln!(
+                "#4485 hierarchical vs isotonic, {model:?}: mse {hierarchical:.5} vs \
+                 {isotonic:.5} (ratio {ratio:.3}, per seed {per_seed:?}); targeted \
+                 mse {:.5} vs {:.5} (n={:.0})",
+                mean(&|r| r.targeted_hierarchical_mse),
+                mean(&|r| r.targeted_isotonic_mse),
+                mean(&|r| r.targeted as f64),
+            );
+            assert!(
+                hierarchical.is_finite() && isotonic.is_finite(),
+                "{model:?}: errors must be finite"
+            );
+            assert!(
+                ratio <= MATERIAL_RATIO,
+                "{model:?}: the hierarchical estimator must not be materially worse \
+                 than the isotonic fallback; mse {hierarchical:.5} vs {isotonic:.5} \
+                 (ratio {ratio:.3})"
+            );
+        }
+    }
+
+    /// `add_event` must score the hierarchical forecasts, so a wiring break in
+    /// `score_hierarchical_layer` cannot pass unnoticed.
+    #[test]
+    fn add_event_scores_the_hierarchical_forecasts() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 7 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let snapshot = router.snapshot();
+        let skill = snapshot
+            .failure_skill_hierarchical
+            .expect("the hierarchical failure forecast produced no skill score");
+        assert!(skill.is_finite(), "skill must be finite, got {skill}");
+        assert!(
+            snapshot.failure_base_rate.is_some_and(|rate| rate > 0.0),
+            "a window containing failures must report a non-zero base rate"
+        );
+        let evaluated = snapshot.hierarchical_failure_evaluated as usize;
+        assert!(evaluated > 0, "add_event must score the failure forecast");
+        assert_eq!(
+            snapshot.hierarchical_failure_pairs.len(),
+            evaluated.min(RECENT_PAIRS),
+            "every scored failure forecast feeds the accuracy panel, up to its cap"
+        );
+        assert!(
+            !snapshot.hierarchical_response_time_pairs.is_empty()
+                && !snapshot.hierarchical_transfer_speed_pairs.is_empty(),
+            "timed traffic must feed the timing accuracy pairs"
+        );
+        assert!(
+            snapshot.response_time_scored > 0 && snapshot.transfer_time_scored > 0,
+            "timed traffic must score both seconds errors"
+        );
+        assert_eq!(snapshot.hierarchical_failure_events, 400);
+        assert!(
+            !snapshot.hierarchical_curves.failure.is_empty()
+                && !snapshot.hierarchical_curves.response_time.is_empty()
+                && !snapshot.hierarchical_curves.transfer_speed.is_empty(),
+            "warm stages must publish their distance curves"
+        );
+    }
+
+    /// The saturation qualifier is what makes the boundary count mean anything,
+    /// so it gets its own test.
+    #[test]
+    fn boundary_selections_only_count_against_a_full_window() {
+        let stats = SelectionRankStats::default();
+
+        // A node with 8 connections and a 25-peer limit: 8 candidates, 8
+        // scored. Choosing the FARTHEST of the 8 says nothing about truncation
+        // — there was nothing to truncate.
+        for _ in 0..10 {
+            stats.record(7, 8, 8);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total, 10);
+        assert_eq!(
+            snapshot.saturated, 0,
+            "an unfilled window cannot have discarded anyone"
+        );
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            None,
+            "with no truncated decisions there is no share to report"
+        );
+
+        // Exactly at the limit: 25 candidates, 25 scored. STILL not evidence —
+        // the window was full but discarded nobody. This is the case the first
+        // implementation got wrong, counting it as saturated and so inflating
+        // the rate with decisions the limit never constrained.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 25);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.saturated, 0,
+            "a full window that discarded nobody is not evidence about the limit"
+        );
+
+        // 40 candidates cut to 25: now peers really were discarded unscored,
+        // and a far-quarter selection is the reading that matters.
+        let stats = SelectionRankStats::default();
+        for _ in 0..10 {
+            stats.record(24, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 10);
+        assert_eq!(snapshot.far_quarter_share(), Some(1.0));
+    }
+
+    #[test]
+    fn near_selections_against_a_full_window_read_as_comfortable() {
+        let stats = SelectionRankStats::default();
+        for _ in 0..100 {
+            stats.record(0, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.saturated, 100);
+        assert_eq!(
+            snapshot.far_quarter_share(),
+            Some(0.0),
+            "always picking the closest peer means the limit costs nothing"
+        );
+        assert_eq!(snapshot.mean_rank(), Some(0.0));
+    }
+
+    #[test]
+    fn selection_rank_histogram_and_mean_track_the_recorded_ranks() {
+        let stats = SelectionRankStats::default();
+        for rank in [0usize, 0, 2, 4] {
+            stats.record(rank, 25, 40);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.rank[0], 2);
+        assert_eq!(snapshot.rank[2], 1);
+        assert_eq!(snapshot.rank[4], 1);
+        // (0 + 0 + 2 + 4) / 4
+        assert_eq!(snapshot.mean_rank(), Some(1.5));
+    }
+
+    #[test]
+    fn selection_rank_beyond_the_buckets_is_collected_not_lost() {
+        let stats = SelectionRankStats::default();
+        stats.record(10_000, 12_000, 20_000);
+        let snapshot = stats.snapshot();
+        assert_eq!(
+            snapshot.rank[SELECTION_RANK_BUCKETS - 1],
+            1,
+            "an out-of-range rank must land in the final bucket rather than panic \
+             or be dropped"
+        );
+        assert_eq!(snapshot.total, 1);
+        // The MEAN must not inherit the histogram's ceiling. Bucketing would
+        // report 31 here; the exact sum reports the rank that actually happened,
+        // which matters most for a window wider than the buckets — exactly the
+        // configuration someone runs while evaluating whether to widen it.
+        assert_eq!(
+            snapshot.mean_rank(),
+            Some(10_000.0),
+            "the mean comes from the exact rank sum, not the buckets"
+        );
+        assert_eq!(
+            snapshot.max_rank, 10_000,
+            "a tail beyond the histogram must stay visible"
+        );
+    }
+
+    #[test]
+    fn empty_selection_rank_stats_report_nothing_rather_than_zero() {
+        let snapshot = SelectionRankStats::default().snapshot();
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.mean_rank(), None);
+        assert_eq!(snapshot.far_quarter_share(), None);
+    }
+
+    /// The stats must actually be fed by real routing decisions, not merely
+    /// exist — a counter nothing increments is the same as no counter.
+    #[test]
+    fn routing_decisions_populate_the_selection_rank_stats() {
+        let mut router = Router::new(&[]);
+        for index in 0..400 {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: if index % 9 == 0 {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    }
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+
+        let candidates: Vec<PeerKeyLocation> = (0..40).map(|_| PeerKeyLocation::random()).collect();
+        for _ in 0..25 {
+            let _ = router.select_peer(candidates.iter(), Location::random());
+        }
+
+        let snapshot = router.snapshot().selection_ranks;
+        // EQUALITY, not `>=`. Each `select_peer` call should record exactly one
+        // decision, and `>=` would sail past a regression that recorded once per
+        // CANDIDATE instead of once per decision — 25 calls would report 1000
+        // and still satisfy the assertion, while every rate derived from these
+        // counters silently became garbage. The run is deterministic (25 calls,
+        // 40 fixed candidates against a 25-peer window), so equality is free.
+        assert_eq!(
+            snapshot.total, 25,
+            "each routing decision must be recorded exactly once"
+        );
+        assert_eq!(
+            snapshot.saturated, 25,
+            "40 candidates cut to a 25-peer window discards 15 unscored every time"
+        );
+    }
+
+    /// The routing dataset's candidate log must be the candidate set the router
+    /// actually scored and the selection it actually made, taken from the
+    /// decision itself — not a list re-derived afterwards from the peers it was
+    /// offered (the "metric re-derived at the call site" trap).
+    #[test]
+    fn decision_capture_is_the_candidate_set_the_router_scored() {
+        // A frozen clock, so the two passes below read the same instant and the
+        // logged model can be compared with the acting one bit for bit (#5754).
+        let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+            crate::util::time_source::SharedMockTimeSource::new(),
+        ));
+        // 40 peers against the default 25-peer window, each with its own key
+        // (`PeerKeyLocation::random()` shares one) and a distinct location.
+        let peers: Vec<PeerKeyLocation> =
+            (0..40u32).map(|i| peer_in_subnet(i * 1543 + 7)).collect();
+        let contract = Location::new(0.5);
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    // Reliability unrelated to distance, so cost order is not
+                    // distance order.
+                    outcome: if (index * 7 + round) % 5 < index % 4 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 13 * index as u64),
+                            payload_size: 5000,
+                            payload_transfer_time: Duration::from_millis(50),
+                        }
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+
+        let mut distance_order: Vec<&PeerKeyLocation> = peers.iter().collect();
+        distance_order.sort_by_key(|peer| contract.distance(peer.location().unwrap()));
+        let window = router.consider_n_closest_peers;
+        assert!(peers.len() > window, "the window must discard some peers");
+
+        // Each model's estimates from the pass where it acted, to compare with
+        // the pass where it was only logged.
+        let mut acted: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        let mut logged: Vec<(bool, Vec<dataset::ModelEstimate>)> = Vec::new();
+        // The candidate log's "legacy" model is the isotonic fallback (#4485),
+        // which routes when `FREENET_ROUTING_FALLBACK_ISOTONIC` is set.
+        for acting_hierarchical in [false, true] {
+            let _flag = force_isotonic_fallback(!acting_hierarchical);
+            let k = 3;
+            let (selected, decision, capture) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, true, false);
+            let capture = capture.expect("a prediction-based decision is captured");
+            assert_eq!(capture.k, k);
+            assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+            assert!(!capture.prediction_fallback);
+            assert!(matches!(
+                decision.strategy,
+                RoutingStrategy::PredictionBased
+            ));
+            assert!(
+                capture.candidates.iter().all(|c| c.hierarchical_stages
+                    == dataset::HierarchicalStages {
+                        failure: true,
+                        response_time: true,
+                        transfer_speed: true,
+                    }),
+                "every stage is warm for every peer here"
+            );
+            let legacy: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.legacy.unwrap())
+                .collect();
+            let hierarchical: Vec<_> = capture
+                .candidates
+                .iter()
+                .map(|c| c.hierarchical.unwrap())
+                .collect();
+            acted.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    hierarchical.clone()
+                } else {
+                    legacy.clone()
+                },
+            ));
+            logged.push((
+                acting_hierarchical,
+                if acting_hierarchical {
+                    legacy
+                } else {
+                    hierarchical
+                },
+            ));
+            let (uncaptured, _, none) =
+                router.select_k_best_peers_capturing(peers.iter(), contract, k, false, false);
+            assert!(none.is_none(), "nothing is captured when not asked");
+            assert_eq!(
+                selected, uncaptured,
+                "capturing must not change the selection"
+            );
+
+            assert_eq!(
+                capture.acting_model,
+                if acting_hierarchical {
+                    dataset::RoutingModel::Hierarchical
+                } else {
+                    dataset::RoutingModel::Legacy
+                }
+            );
+            assert_eq!(capture.candidates_available, peers.len());
+            assert_eq!(capture.candidates.len(), decision.candidates.len());
+            let captured_peers: Vec<&PeerKeyLocation> =
+                capture.candidates.iter().map(|c| c.peer).collect();
+            assert_eq!(
+                captured_peers,
+                distance_order[..window],
+                "the scored window, in distance order"
+            );
+            // The selection as the router returned it, position by position.
+            for (position, peer) in selected.iter().enumerate() {
+                let marked: Vec<&PeerKeyLocation> = capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position == Some(position))
+                    .map(|c| c.peer)
+                    .collect();
+                assert_eq!(marked, vec![*peer], "selected position {position}");
+            }
+            assert_eq!(
+                capture
+                    .candidates
+                    .iter()
+                    .filter(|c| c.selected_position.is_some())
+                    .count(),
+                k
+            );
+            assert!(
+                capture
+                    .candidates
+                    .iter()
+                    .all(|c| c.legacy.is_some() && c.hierarchical.is_some()),
+                "both models predict every candidate"
+            );
+
+            let record = capture.into_record(OpType::Get, 1);
+            assert_eq!(record.op, "GET");
+            assert_eq!(record.candidates_omitted, 0);
+            // The acting model's estimates are the ones the router sorted: its
+            // j-th ranked candidate carries exactly the decision's j-th cost.
+            for candidate in &record.candidates {
+                let (rank, estimate) = if acting_hierarchical {
+                    (candidate.rank_hierarchical, candidate.hierarchical)
+                } else {
+                    (candidate.rank_legacy, candidate.legacy)
+                };
+                let routed = decision.candidates[rank]
+                    .prediction
+                    .as_ref()
+                    .expect("prediction-based");
+                let estimate = estimate.unwrap();
+                assert_eq!(
+                    estimate.expected_total_time.to_bits(),
+                    routed.expected_total_time.to_bits()
+                );
+                assert_eq!(
+                    estimate.failure_probability.to_bits(),
+                    routed.failure_probability.to_bits()
+                );
+                assert_eq!(candidate.selected_position.is_some(), rank < k);
+            }
+            let chosen_acting = if acting_hierarchical {
+                record.chosen_rank_hierarchical
+            } else {
+                record.chosen_rank_legacy
+            };
+            assert_eq!(chosen_acting, Some(0));
+            assert!(
+                record
+                    .candidates
+                    .iter()
+                    .any(|c| c.rank_legacy != c.rank_hierarchical),
+                "the two models must disagree somewhere, or which model is which is untested"
+            );
+        }
+
+        // The model that was only logged must carry what it would route on when
+        // it acts: the isotonic fallback logged in the hierarchical pass matches
+        // the isotonic fallback acting in its own pass, and the other way round. Bit-equal: both passes
+        // read the same frozen clock, so any difference is a real divergence
+        // between what is logged and what would be acted on.
+        for (logged_in_hierarchical_pass, logged_estimates) in &logged {
+            let (_, acting_estimates) = acted
+                .iter()
+                .find(|(pass, _)| pass != logged_in_hierarchical_pass)
+                .unwrap();
+            for (logged, acting) in logged_estimates.iter().zip(acting_estimates) {
+                for (field, a, b) in [
+                    (
+                        "failure",
+                        logged.failure_probability,
+                        acting.failure_probability,
+                    ),
+                    (
+                        "time",
+                        logged.time_to_response_start_s,
+                        acting.time_to_response_start_s,
+                    ),
+                    (
+                        "speed",
+                        logged.transfer_speed_bps,
+                        acting.transfer_speed_bps,
+                    ),
+                    (
+                        "cost",
+                        logged.expected_total_time,
+                        acting.expected_total_time,
+                    ),
+                ] {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{field}: logged {a} vs acting {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cold stages and candidates neither model can predict are recorded as
+    /// such, from the decision.
+    #[test]
+    fn decision_capture_records_cold_stages_and_unpredictable_candidates() {
+        let mut router = Router::new(&[]);
+        let peers: Vec<PeerKeyLocation> =
+            (0..10u32).map(|i| peer_in_subnet(i * 977 + 11)).collect();
+        let contract = Location::new(0.5);
+        // Untimed outcomes only, so no timing stage has any data.
+        for round in 0..12 {
+            for (index, peer) in peers.iter().enumerate() {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: contract,
+                    outcome: if (index + round) % 3 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        // Acting on the isotonic fallback, so the hierarchical model is the
+        // logged one.
+        let _flag = force_isotonic_fallback(true);
+        // No location, so no failure estimate: the router ranks it last.
+        let unknown = PeerKeyLocation::with_unknown_addr(
+            crate::transport::TransportKeypair::new().public().clone(),
+        );
+        let mut offered = peers.clone();
+        offered.push(unknown.clone());
+
+        let (_, decision, capture) =
+            router.select_k_best_peers_capturing(offered.iter(), contract, 2, true, false);
+        let capture = capture.expect("prediction-based with some fallback");
+        assert!(matches!(
+            decision.strategy,
+            RoutingStrategy::PredictionFallback
+        ));
+        assert!(capture.prediction_fallback);
+        assert_eq!(capture.prior_failure_events, router.failure_estimator.len());
+
+        let blind = capture
+            .candidates
+            .iter()
+            .find(|c| c.peer == &unknown)
+            .expect("in the window");
+        assert!(blind.legacy.is_none() && blind.hierarchical.is_none());
+        assert_eq!(
+            blind.hierarchical_stages,
+            dataset::HierarchicalStages::default()
+        );
+        assert!(blind.selected_position.is_none());
+
+        for candidate in capture.candidates.iter().filter(|c| c.peer != &unknown) {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages {
+                    failure: true,
+                    response_time: false,
+                    transfer_speed: false,
+                },
+                "failure is learned, timing is cold"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            // A cold stage is the isotonic fallback, not a hierarchical number.
+            assert_eq!(
+                hierarchical.time_to_response_start_s,
+                legacy.time_to_response_start_s
+            );
+            assert_eq!(hierarchical.transfer_speed_bps, legacy.transfer_speed_bps);
+        }
+        let record = capture.into_record(OpType::Get, 1);
+        let blind = record
+            .candidates
+            .iter()
+            .find(|c| c.peer == dataset::peer_hash(&unknown))
+            .unwrap();
+        assert_eq!(blind.distance, None);
+        assert_eq!(blind.rank_legacy, record.candidates.len() - 1);
+
+        // A router whose hierarchical estimator never learned anything (built
+        // from history, which does not feed it): every hierarchical stage is
+        // cold, so its logged estimate is the isotonic one throughout and says
+        // so.
+        let history: Vec<RouteEvent> = (0..12)
+            .flat_map(|round| {
+                peers
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, peer)| RouteEvent {
+                        peer: peer.clone(),
+                        contract_location: contract,
+                        outcome: if (index + round) % 3 == 0 {
+                            RouteOutcome::Failure
+                        } else {
+                            RouteOutcome::SuccessUntimed
+                        },
+                        op_type: Some(OpType::Get),
+                    })
+            })
+            .collect();
+        let unlearned = Router::new(&history);
+        let (_, _, capture) =
+            unlearned.select_k_best_peers_capturing(peers.iter(), contract, 1, true, false);
+        for candidate in capture.expect("prediction-based").candidates {
+            assert_eq!(
+                candidate.hierarchical_stages,
+                dataset::HierarchicalStages::default(),
+                "nothing learned, nothing supplied"
+            );
+            let (legacy, hierarchical) =
+                (candidate.legacy.unwrap(), candidate.hierarchical.unwrap());
+            assert_eq!(hierarchical.failure_probability, legacy.failure_probability);
         }
     }
 
@@ -2319,6 +7351,7 @@ mod tests {
             Router::new(&[])
                 .considering_n_closest_peers(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
+                .0
                 .len()
         );
     }
@@ -2384,7 +7417,7 @@ mod tests {
                 .collect();
             let target = Location::random();
 
-            let window = router.select_closest_peers(&peers, &target);
+            let (window, _) = router.select_closest_peers(&peers, &target);
             if window.iter().any(|p| {
                 p.socket_addr()
                     .is_some_and(|a| subscriber_addrs.contains(&a))
@@ -2421,12 +7454,19 @@ mod tests {
     // distant peer that happens to have slightly better per-peer EWMA history
     // than the closest peer?
     //
+    // Since #4485 the same question applies to the hierarchical estimator,
+    // which routes (distance enters through its EB-shrunk prior curve;
+    // per-peer and per-(peer, band) cells play the EWMA's role), so the guards
+    // below also run in `Training::WarmHierarchical`. The paragraph after this
+    // one describes the isotonic fallback.
+    //
     // The predictor's scoring (`predict_routing_outcome`) has no direct
-    // distance term; distance enters only via (a) the global isotonic
-    // regression (`isotonic_estimator.rs`) and (b) as a feature handed to the
-    // renegade predictor. Once a peer has >= ADJUSTMENT_PRIOR_SIZE (10) events,
-    // its per-peer EWMA adjustment can shift its failure estimate away from the
-    // global distance curve. At window=5 the truncation was self-limiting; at
+    // distance term; distance enters only via the distance curves (the global
+    // isotonic regression in `isotonic_estimator.rs`, and since #4485 the
+    // hierarchical estimator's own curve). Once a peer has >= ADJUSTMENT_PRIOR_SIZE
+    // (10) events, its per-peer EWMA adjustment can shift its failure estimate
+    // away from the global distance curve; the hierarchical estimator's per-peer
+    // effect does the same, shrunk by evidence. At window=5 the truncation was self-limiting; at
     // window=25 there are 5x more candidates whose per-peer history can compete
     // against geographic locality.
     //
@@ -2462,8 +7502,8 @@ mod tests {
         PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
     }
 
-    /// Train a `Router` on a synthetic history whose global shape matches what
-    /// the production isotonic regression learns — a distance->failure gradient
+    /// Build a synthetic history whose global shape matches what both routing
+    /// estimators learn in production — a distance->failure gradient
     /// (closer peers succeed more, farther peers fail more) — but with each peer
     /// *also* carrying an individual reliability bias that is INDEPENDENT of its
     /// distance. The per-peer bias is what populates mature, divergent per-peer
@@ -2524,6 +7564,56 @@ mod tests {
         events
     }
 
+    /// `history` with every success TIMED, so the hierarchical timing stages
+    /// (30-point floor) warm and a ranking uses all three stages — but with
+    /// timing that carries NO locality and NO per-peer signal: it varies only
+    /// with the event's position in the history.
+    ///
+    /// Timing that rose with distance was a perfect "route to the closest
+    /// peer" term on its own, so a locality guard trained on it passed whatever
+    /// the failure stage did (measured: an inverted hierarchical failure
+    /// estimate left the #4230 steady twin green). Per-peer timing would add
+    /// exactly the per-peer-history-versus-locality competition #4230 guards,
+    /// from a source the test does not control. Deterministic: draws no RNG.
+    ///
+    /// The jitter has a second job: it keeps the values varied, so the
+    /// log-curve fit is well-conditioned rather than fitted to one repeated
+    /// value.
+    ///
+    /// "No per-peer signal" holds only while the caller's history is
+    /// ROUND-MAJOR (each round touches every peer once) AND its peer count is
+    /// not a multiple of the 7-event cycle; otherwise a peer's jitter is a
+    /// fixed offset.
+    ///
+    /// Those two conditions are guarded ASYMMETRICALLY, and a new caller has
+    /// to know it: each caller asserts its own peer count (the #4230
+    /// steady-state twin does), while the ROUND-MAJOR half rests on this
+    /// paragraph alone. A history batched per peer would hand every peer a
+    /// fixed offset with nothing failing.
+    fn with_uninformative_timing(history: &[RouteEvent]) -> Vec<RouteEvent> {
+        history
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let jitter = (index % 7) as f64;
+                let outcome = match event.outcome.clone() {
+                    RouteOutcome::SuccessUntimed => RouteOutcome::Success {
+                        time_to_response_start: Duration::from_secs_f64(0.05 + 0.002 * jitter),
+                        payload_size: 2000,
+                        payload_transfer_time: Duration::from_secs_f64(0.010 + 0.001 * jitter),
+                    },
+                    RouteOutcome::Success { .. } | RouteOutcome::Failure => event.outcome.clone(),
+                };
+                RouteEvent {
+                    peer: event.peer.clone(),
+                    contract_location: event.contract_location,
+                    outcome,
+                    op_type: event.op_type,
+                }
+            })
+            .collect()
+    }
+
     /// Measure routing convergence at a given candidate window over many random
     /// targets, against a fixed trained router and peer pool.
     ///
@@ -2549,13 +7639,19 @@ mod tests {
         pool: &[PeerKeyLocation],
         window: usize,
         trials: usize,
+        training: Training,
     ) -> (f64, f64) {
-        let router = Router::new(history).considering_n_closest_peers(window as u32);
+        let router = training
+            .train(history)
+            .considering_n_closest_peers(window as u32);
         assert!(
             router.has_sufficient_routing_events(),
             "trained router below prediction threshold ({} events)",
             router.failure_estimator.len()
         );
+        // A fixed probe target (no RNG draw, so the History mode's target
+        // sequence is exactly what it always was).
+        training.check_decides(&router, pool, Location::new(0.37));
         let mut percentiles: Vec<f64> = Vec::with_capacity(trials);
         for _ in 0..trials {
             let target = Location::random();
@@ -2599,6 +7695,24 @@ mod tests {
     /// Deterministic.
     #[test]
     fn routing_convergence_preserved_at_window_25_4230() {
+        convergence_at_window_25_case(Training::History);
+    }
+
+    /// [`routing_convergence_preserved_at_window_25_4230`] on the warm
+    /// hierarchical estimator, with the same bounds: the property #4230 pins
+    /// must hold for the estimator the fleet routes with, not only for the
+    /// isotonic fallback. The warm mode trains the same history with every
+    /// success timed ([`with_uninformative_timing`]: no distance or per-peer
+    /// signal) so ALL THREE hierarchical stages are warm and ranking uses the
+    /// full shipping formula, while the property still rests on the failure
+    /// stage: an inverted hierarchical failure estimate must turn it red.
+    #[test]
+    fn routing_convergence_preserved_at_window_25_4230_warm_hierarchical() {
+        convergence_at_window_25_case(Training::WarmHierarchical);
+    }
+
+    fn convergence_at_window_25_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_C0DE);
 
         // Pin the shipped window so a silent default change surfaces here too
@@ -2623,6 +7737,24 @@ mod tests {
             .map(|p| p.location().unwrap().as_f64().to_bits())
             .collect();
         assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
+        // `with_uninformative_timing` cycles its jitter every 7 events and
+        // `gradient_history` is round-major (each round touches every peer
+        // once), so a peer's jitter walks the cycle across rounds and per-peer
+        // means differ only by the partial final cycle — at 40 peers x 12
+        // rounds, 2.67 to 3.33 jitter units, about 1.3 ms on a 50 ms base.
+        // (They are exactly equal only when the round count is a multiple of
+        // 7.) If the pool size were a multiple of 7,
+        // the jitter would collapse to a FIXED per-peer offset: a per-peer
+        // timing signal, which is exactly the per-peer-history-versus-locality
+        // regime #4230 guards, injected by the test itself and invisible to
+        // every assertion below.
+        assert_ne!(
+            pool.len() % 7,
+            0,
+            "pool size {} is a multiple of with_uninformative_timing's 7-event \
+             jitter cycle, so its timing would become a fixed per-peer offset",
+            pool.len()
+        );
 
         let history = gradient_history(&pool, 12, 0.35); // 40 * 12 = 480 events
 
@@ -2660,11 +7792,27 @@ mod tests {
             adj_max - adj_min
         );
 
-        let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400);
+        // The History mode keeps the original untimed input. The warm mode
+        // times every success (with no distance signal, so the ranking stays
+        // failure-driven) so the hierarchical timing stages warm too, and
+        // proves they did before measuring.
+        let measured = match training {
+            Training::History => history.clone(),
+            Training::WarmHierarchical => {
+                let timed = with_uninformative_timing(&history);
+                assert_hierarchical_timing_decides(
+                    &warm_hierarchical_router(&timed),
+                    &pool,
+                    Location::new(0.37),
+                );
+                timed
+            }
+        };
+        let (mean_pct, p90_pct) = measure_convergence(&measured, &pool, 25, 400, training);
 
         assert!(
             mean_pct < 0.18,
-            "issue #4230 regression: at window=25 the chosen next hop's mean \
+            "issue #4230 regression ({training:?}): at window=25 the chosen next hop's mean \
              rank-percentile is {mean_pct:.3} — the predictor is drifting away \
              from the closest tail (0.5 = median = no progress), so per-peer \
              history is overriding geographic locality and small-world routing \
@@ -2672,7 +7820,7 @@ mod tests {
         );
         assert!(
             p90_pct < 0.40,
-            "issue #4230 regression: at window=25 the 90th-percentile chosen-hop \
+            "issue #4230 regression ({training:?}): at window=25 the 90th-percentile chosen-hop \
              rank-percentile is {p90_pct:.3} — the routing tail has degraded; \
              too many hops are landing far from the target"
         );
@@ -2704,6 +7852,21 @@ mod tests {
     /// locality) plus the bounded 5->25 increase.
     #[test]
     fn routing_convergence_window_sweep_does_not_degrade_4230() {
+        convergence_window_sweep_case(Training::History);
+    }
+
+    /// [`routing_convergence_window_sweep_does_not_degrade_4230`] on the warm
+    /// hierarchical estimator, with the same bounds. FAILURE-ONLY in both
+    /// modes: `gradient_history` has no timed events, so no timing estimate
+    /// exists in either stack and the ranking is the failure term alone. The
+    /// timed, all-stages ranking is covered by the steady-state twin.
+    #[test]
+    fn routing_convergence_window_sweep_does_not_degrade_4230_warm_hierarchical() {
+        convergence_window_sweep_case(Training::WarmHierarchical);
+    }
+
+    fn convergence_window_sweep_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_5EED);
 
         // 40 peers x 12 rounds = 480 events: mature per-peer EWMA within the
@@ -2724,7 +7887,8 @@ mod tests {
             // (window, mean_pct, p90_pct) for each swept window.
             let mut results: Vec<(usize, f64, f64)> = Vec::new();
             for &window in &[5usize, 10, 25, 40] {
-                let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
+                let (mean_pct, p90_pct) =
+                    measure_convergence(&history, &pool, window, 300, training);
                 results.push((window, mean_pct, p90_pct));
             }
 
@@ -2735,13 +7899,13 @@ mod tests {
             for &(window, mean_pct, p90_pct) in &results {
                 assert!(
                     mean_pct < 0.20,
-                    "issue #4230: at window={window} bias_mag={bias_mag} mean \
+                    "issue #4230 ({training:?}): at window={window} bias_mag={bias_mag} mean \
                      chosen-hop rank-percentile {mean_pct:.3} drifted toward the \
                      median — routing convergence degraded by candidate-window size"
                 );
                 assert!(
                     p90_pct < 0.42,
-                    "issue #4230: at window={window} bias_mag={bias_mag} p90 \
+                    "issue #4230 ({training:?}): at window={window} bias_mag={bias_mag} p90 \
                      chosen-hop rank-percentile {p90_pct:.3} is too high — the \
                      routing tail degraded"
                 );
@@ -2756,7 +7920,7 @@ mod tests {
             let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
             assert!(
                 m25 < 0.20 && m25 - m5 < 0.15,
-                "issue #4230: at bias_mag={bias_mag} widening the candidate \
+                "issue #4230 ({training:?}): at bias_mag={bias_mag} widening the candidate \
                  window from 5 to 25 raised the mean chosen-hop rank-percentile \
                  from {m5:.3} to {m25:.3} — the widening pushed routing \
                  materially toward the median and may need a soft distance bias \
@@ -2778,7 +7942,7 @@ mod tests {
         // Create a router with no historical data
         let router = Router::new(&[]).considering_n_closest_peers(CLOSEST_CAP);
         let asserted_closest: Vec<&PeerKeyLocation> =
-            router.select_closest_peers(&peers, &contract_location);
+            router.select_closest_peers(&peers, &contract_location).0;
 
         let mut expected_iter = expected_closest.iter();
         let mut asserted_iter = asserted_closest.iter();
@@ -2811,7 +7975,6 @@ mod tests {
             },
             time_to_response_start,
             expected_total_time: time_to_response_start + transfer_time,
-            renegade_failure_adjustment: None,
         }
     }
 
@@ -2893,7 +8056,7 @@ mod tests {
         let empty_peers: Vec<PeerKeyLocation> = vec![];
         let target = Location::random();
 
-        let result = router.select_closest_peers(&empty_peers, &target);
+        let (result, _) = router.select_closest_peers(&empty_peers, &target);
         assert!(
             result.is_empty(),
             "select_closest_peers should return empty vec for empty candidates"
@@ -2931,6 +8094,17 @@ mod tests {
     /// distances. Verify select_peer prefers peer A.
     #[test]
     fn test_failure_avoidance() {
+        failure_avoidance_case(Training::History);
+    }
+
+    /// [`test_failure_avoidance`] on the warm hierarchical estimator.
+    #[test]
+    fn test_failure_avoidance_warm_hierarchical() {
+        failure_avoidance_case(Training::WarmHierarchical);
+    }
+
+    fn failure_avoidance_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let peer_a = PeerKeyLocation::random();
         let peer_b = PeerKeyLocation::random();
@@ -2963,17 +8137,19 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
 
         // With 80 total events in failure_estimator (>= 50 threshold),
         // the router should use predictions and prefer peer A
         let peers = vec![peer_a.clone(), peer_b.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let selected = router.select_peer(&peers, contract_location);
         assert!(selected.is_some());
         assert_eq!(
             *selected.unwrap(),
             peer_a,
-            "Router should prefer peer A (all successes) over peer B (all failures)"
+            "Router should prefer peer A (all successes) over peer B (all failures) \
+             ({training:?})"
         );
     }
 
@@ -3191,6 +8367,18 @@ mod tests {
     /// the router should use failure probability to prefer low-failure peers.
     #[test]
     fn test_failure_only_differentiates_peers() {
+        failure_only_differentiates_peers_case(Training::History);
+    }
+
+    /// [`test_failure_only_differentiates_peers`] on the warm hierarchical
+    /// estimator.
+    #[test]
+    fn test_failure_only_differentiates_peers_warm_hierarchical() {
+        failure_only_differentiates_peers_case(Training::WarmHierarchical);
+    }
+
+    fn failure_only_differentiates_peers_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let good_peer = PeerKeyLocation::random();
         let bad_peer = PeerKeyLocation::random();
@@ -3218,13 +8406,14 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
         assert_eq!(router.response_start_time_estimator.len(), 0);
         assert_eq!(router.transfer_rate_estimator.len(), 0);
 
         // Router should prefer the good peer via failure-probability prediction
         let peers = vec![good_peer.clone(), bad_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
 
@@ -3368,50 +8557,74 @@ mod tests {
     }
 
     /// Verify ContractOpFailure increments failure_estimator with value 1.0,
-    /// and that after enough failures the router predicts higher failure probability.
+    /// and that after enough failures the router predicts higher failure
+    /// probability. The prediction is checked on BOTH paths: it comes from the
+    /// hierarchical estimator by default (#4485), and from the isotonic
+    /// estimator only under the emergency `FREENET_ROUTING_FALLBACK_ISOTONIC`.
     #[test]
     fn test_failure_outcome_feeds_failure_estimator_with_value_one() {
-        let peer = PeerKeyLocation::random();
-        let contract_location = Location::random();
+        for hierarchical in [false, true] {
+            let _mode = force_isotonic_fallback(!hierarchical);
+            let peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
 
-        let mut router = Router::new(&[]);
+            let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+                crate::util::time_source::SharedMockTimeSource::new(),
+            ));
 
-        // Add a failure event
-        router.add_event(RouteEvent {
-            peer: peer.clone(),
-            contract_location,
-            outcome: RouteOutcome::Failure,
-            op_type: None,
-        });
-        assert_eq!(
-            router.failure_estimator.len(),
-            1,
-            "Failure should be recorded in failure_estimator"
-        );
-
-        // Add enough failures to cross threshold and check prediction
-        for _ in 0..59 {
+            // Add a failure event
             router.add_event(RouteEvent {
                 peer: peer.clone(),
                 contract_location,
                 outcome: RouteOutcome::Failure,
                 op_type: None,
             });
-        }
-        assert_eq!(router.failure_estimator.len(), 60);
-        assert!(router.has_sufficient_routing_events());
+            assert_eq!(
+                router.failure_estimator.len(),
+                1,
+                "Failure should be recorded in failure_estimator"
+            );
 
-        // Prediction should show high failure probability
-        let peers = vec![peer.clone()];
-        let (selected, decision) =
-            router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
-        assert!(!selected.is_empty());
-        let pred = decision.candidates[0].prediction.as_ref().unwrap();
-        assert!(
-            pred.failure_probability > 0.5,
-            "After 60 failures, failure probability should be high, got {}",
-            pred.failure_probability
-        );
+            // Add enough failures to cross threshold and check prediction
+            for _ in 0..59 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+            assert_eq!(router.failure_estimator.len(), 60);
+            assert!(router.has_sufficient_routing_events());
+
+            // Prediction should show high failure probability
+            let peers = vec![peer.clone()];
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+            let fallback_evaluations =
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before;
+            if hierarchical {
+                assert_hierarchical_failure_decides(&router, &peers, contract_location);
+                assert_eq!(
+                    fallback_evaluations, 0,
+                    "a warm estimator with no timing data must not fall back to the isotonic estimate"
+                );
+            } else {
+                assert!(
+                    fallback_evaluations >= 1,
+                    "on the isotonic fallback the prediction must come from the isotonic estimate"
+                );
+            }
+            assert!(!selected.is_empty());
+            let pred = decision.candidates[0].prediction.as_ref().unwrap();
+            assert!(
+                pred.failure_probability > 0.5,
+                "After 60 failures, failure probability should be high, got {} \
+                 (hierarchical: {hierarchical})",
+                pred.failure_probability
+            );
+        }
     }
 
     /// Verify existing Success path (with timing) still feeds all 3 estimators.
@@ -3456,6 +8669,31 @@ mod tests {
     /// predictions with real timing values.
     #[test]
     fn test_transition_from_failure_only_to_full_predictions() {
+        transition_from_failure_only_case(Training::History);
+    }
+
+    /// [`test_transition_from_failure_only_to_full_predictions`] on the warm
+    /// hierarchical estimator, through three states a node passes through:
+    ///
+    /// 1. Failure-only (all-success, untimed). Both estimators read 0.0 failure
+    ///    here, so the precondition's equality cannot tell them apart; the
+    ///    warm mode instead asserts NO stage fell back to the isotonic
+    ///    estimate, which with no timing data holds only when a hierarchical
+    ///    failure estimate is PRESENT. It cannot tell which
+    ///    value that arm then uses: returning the raw isotonic estimate there
+    ///    would also read 0.0 and pass. That residual is equality-blind.
+    /// 2. Five timed successes: below the hierarchical timing stages' 30-point
+    ///    floor, so timing comes from the isotonic fallback while failure stays
+    ///    hierarchical — the mixed state of a node's first timed GETs.
+    /// 3. (Warm only) 30 more timed successes: every stage hierarchical, no
+    ///    legacy stage evaluated, timing pinned to the hierarchical estimate.
+    #[test]
+    fn test_transition_from_failure_only_to_full_predictions_warm_hierarchical() {
+        transition_from_failure_only_case(Training::WarmHierarchical);
+    }
+
+    fn transition_from_failure_only_case(training: Training) {
+        let _mode = training.guard();
         let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
         let contract_location = Location::random();
 
@@ -3469,8 +8707,18 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
+        training.check_decides(&router, &peers, contract_location);
+        let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
         let (_, decision) = router.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+        if training == Training::WarmHierarchical {
+            assert_eq!(
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before,
+                0,
+                "phase 1 has no timing data, so a stage falls back only if the \
+                 hierarchical failure estimate is missing or ignored"
+            );
+        }
         // Failure-only: timing fields should be 0.0
         let pred = decision.candidates[0].prediction.as_ref().unwrap();
         assert_eq!(pred.time_to_response_start, 0.0);
@@ -3490,8 +8738,9 @@ mod tests {
             });
         }
 
-        let router2 = Router::new(&events);
+        let router2 = training.train(&events);
         assert!(router2.response_start_time_estimator.len() >= 5);
+        training.check_decides(&router2, &peers, contract_location);
         let (_, decision2) =
             router2.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
         // Full prediction: timing fields should have real values
@@ -3504,6 +8753,41 @@ mod tests {
             pred2.transfer_speed_bps > 0.0,
             "Should have real transfer speed after transition"
         );
+
+        if training == Training::WarmHierarchical {
+            // Phase 3: past the hierarchical timing stages' 30-point floor
+            // (5 + 30 timed successes), so every stage is hierarchical and no
+            // stage may fall back to the isotonic estimate.
+            for round in 0..6u64 {
+                for peer in &peers {
+                    events.push(RouteEvent {
+                        peer: peer.clone(),
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40 + 5 * round),
+                            payload_size: 1000,
+                            payload_transfer_time: Duration::from_millis(8 + round),
+                        },
+                        op_type: None,
+                    });
+                }
+            }
+            let router3 = training.train(&events);
+            assert_hierarchical_timing_decides(&router3, &peers, contract_location);
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (_, decision3) =
+                router3.select_k_best_peers_with_telemetry(&peers, contract_location, 1);
+            assert_eq!(
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before,
+                0,
+                "phase 3: with every stage warm, no stage may fall back to the isotonic estimate"
+            );
+            let pred3 = decision3.candidates[0].prediction.as_ref().unwrap();
+            assert!(
+                pred3.time_to_response_start > 0.0 && pred3.transfer_speed_bps > 0.0,
+                "phase 3 must carry real hierarchical timing, got {pred3:?}"
+            );
+        }
     }
 
     /// Simulate realistic post-#3137 traffic: a mix of timed GET successes, untimed
@@ -3512,9 +8796,29 @@ mod tests {
     /// low-failure, low-latency peers.
     #[test]
     fn test_realistic_mixed_traffic_routing() {
+        realistic_mixed_traffic_case(Training::History);
+    }
+
+    /// [`test_realistic_mixed_traffic_routing`] on the warm hierarchical
+    /// estimator. The warm mode triples the timed GET successes (39, past the
+    /// 30-point floor) so BOTH timing stages are hierarchical as well and the
+    /// ranking runs entirely on the hierarchical estimate, which the timing
+    /// precondition proves. The failure ordering is unchanged (close ~4%, mid
+    /// ~21%, far 75%); the History mode keeps the original 13 timed events.
+    /// So under realistic traffic this twin covers only fully-warm timing; the
+    /// mixed state (warm failure, sparse isotonic timing) is covered by the
+    /// transition twin's phase 2, with uniform timing.
+    #[test]
+    fn test_realistic_mixed_traffic_routing_warm_hierarchical() {
+        realistic_mixed_traffic_case(Training::WarmHierarchical);
+    }
+
+    fn realistic_mixed_traffic_case(training: Training) {
+        let _mode = training.guard();
         // Seed RNG so peer ring distances are deterministic; without this the
-        // isotonic regression's ascending monotonicity constraint can conflict
-        // with the failure-rate ordering when random distances are adversarial.
+        // (history mode's) isotonic regression's ascending monotonicity
+        // constraint can conflict with the failure-rate ordering when random
+        // distances are adversarial.
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let contract_location = Location::random();
         let close_peer = PeerKeyLocation::random();
@@ -3523,9 +8827,17 @@ mod tests {
 
         let mut events = Vec::new();
 
+        // Timed-success multiplier: 1 in the History mode (the original
+        // input), 3 in the warm mode so the hierarchical timing stages warm.
+        let timed_rounds: usize = if training == Training::WarmHierarchical {
+            3
+        } else {
+            1
+        };
+
         // close_peer: 10 timed GET successes + 15 untimed PUT/SUB successes, 2 failures
         // → ~7% failure rate, good timing data
-        for _ in 0..10 {
+        for _ in 0..10 * timed_rounds {
             events.push(RouteEvent {
                 peer: close_peer.clone(),
                 contract_location,
@@ -3556,7 +8868,7 @@ mod tests {
 
         // mid_peer: 3 timed GET successes + 10 untimed successes, 5 failures
         // → ~28% failure rate, sparse timing data
-        for _ in 0..3 {
+        for _ in 0..3 * timed_rounds {
             events.push(RouteEvent {
                 peer: mid_peer.clone(),
                 contract_location,
@@ -3604,18 +8916,24 @@ mod tests {
             });
         }
 
-        // Total: 27 + 18 + 20 = 65 events > 50 threshold
-        let router = Router::new(&events);
+        // Total: 27 + 18 + 20 = 65 events > 50 threshold (History mode; the warm
+        // mode adds 26 timed successes)
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
 
-        // failure_estimator should have all 65 events
-        assert_eq!(router.failure_estimator.len(), 65);
-        // timing estimators only have the timed GET successes: 10 + 3 = 13
-        assert_eq!(router.response_start_time_estimator.len(), 13);
-        assert_eq!(router.transfer_rate_estimator.len(), 13);
+        let timed = 13 * timed_rounds;
+        // failure_estimator should have every event (65 in the History mode)
+        assert_eq!(router.failure_estimator.len(), 52 + timed);
+        // timing estimators only have the timed GET successes: 10 + 3 = 13 (x3 warm)
+        assert_eq!(router.response_start_time_estimator.len(), timed);
+        assert_eq!(router.transfer_rate_estimator.len(), timed);
 
         // Router should use prediction-based routing and prefer close_peer
         let peers = vec![close_peer.clone(), mid_peer.clone(), far_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
+        if training == Training::WarmHierarchical {
+            assert_hierarchical_timing_decides(&router, &peers, contract_location);
+        }
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
 
@@ -3698,6 +9016,18 @@ mod tests {
     /// that primarily handles PUT/SUBSCRIBE/UPDATE traffic.
     #[test]
     fn test_untimed_only_network_peer_ranking() {
+        untimed_only_network_case(Training::History);
+    }
+
+    /// [`test_untimed_only_network_peer_ranking`] on the warm hierarchical
+    /// estimator.
+    #[test]
+    fn test_untimed_only_network_peer_ranking_warm_hierarchical() {
+        untimed_only_network_case(Training::WarmHierarchical);
+    }
+
+    fn untimed_only_network_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
         let reliable_peer = PeerKeyLocation::random();
         let flaky_peer = PeerKeyLocation::random();
@@ -3733,7 +9063,7 @@ mod tests {
             });
         }
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(router.has_sufficient_routing_events());
         // No timing data at all
         assert_eq!(router.response_start_time_estimator.len(), 0);
@@ -3741,6 +9071,7 @@ mod tests {
 
         // Router should still make predictions and prefer the reliable peer
         let peers = vec![reliable_peer.clone(), flaky_peer.clone()];
+        training.check_decides(&router, &peers, contract_location);
         let (selected, decision) =
             router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
 
@@ -3762,65 +9093,102 @@ mod tests {
     }
 
     /// When the router receives SuccessUntimed events at one contract location
-    /// and Failure events at a different contract location through the same peer,
-    /// the failure estimator should track these as distinct (distance, result)
-    /// data points. This validates the isotonic model learns location-dependent
-    /// failure patterns using untimed success data from PUT/SUBSCRIBE/UPDATE.
+    /// and Failure events at a different contract location through the same
+    /// peer, its prediction must separate them, using untimed success data from
+    /// PUT/SUBSCRIBE/UPDATE. Checked on BOTH paths: the hierarchical estimator
+    /// (what routes since #4485, which separates them through its per-peer,
+    /// per-band cells) and the isotonic model (reached only under the
+    /// emergency `FREENET_ROUTING_FALLBACK_ISOTONIC`).
     #[test]
     fn test_location_dependent_failure_patterns() {
-        let peer = PeerKeyLocation::random();
-        let near_contract = Location::new(0.01); // very close distance (close to 0)
-        let far_contract = Location::new(0.49); // maximum distance on the ring
+        for hierarchical in [false, true] {
+            let _mode = force_isotonic_fallback(!hierarchical);
+            let peer = PeerKeyLocation::random();
+            let near_contract = Location::new(0.01); // very close distance (close to 0)
+            let far_contract = Location::new(0.49); // maximum distance on the ring
 
-        let mut router = Router::new(&[]);
+            let mut router = Router::new(&[]).with_time_source(std::sync::Arc::new(
+                crate::util::time_source::SharedMockTimeSource::new(),
+            ));
 
-        // Peer succeeds for nearby contracts (small distance)
-        for _ in 0..30 {
-            router.add_event(RouteEvent {
-                peer: peer.clone(),
-                contract_location: near_contract,
-                outcome: RouteOutcome::SuccessUntimed,
-                op_type: None,
-            });
+            // Peer succeeds for nearby contracts (small distance)
+            for _ in 0..30 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: near_contract,
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: None,
+                });
+            }
+
+            // Peer fails for distant contracts (large distance)
+            for _ in 0..25 {
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: far_contract,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+
+            assert!(router.has_sufficient_routing_events());
+            assert_eq!(router.failure_estimator.len(), 55);
+
+            // The router should give different failure predictions for near vs
+            // far contracts through this peer
+            let peers = vec![peer.clone()];
+
+            let fallback_before = FALLBACK_STAGE_EVALUATIONS.with(|count| count.get());
+            let (_, near_decision) =
+                router.select_k_best_peers_with_telemetry(&peers, near_contract, 1);
+            let (_, far_decision) =
+                router.select_k_best_peers_with_telemetry(&peers, far_contract, 1);
+            let fallback_evaluations =
+                FALLBACK_STAGE_EVALUATIONS.with(|count| count.get()) - fallback_before;
+            if hierarchical {
+                for contract in [near_contract, far_contract] {
+                    assert_hierarchical_failure_decides(&router, &peers, contract);
+                }
+                assert_eq!(
+                    fallback_evaluations, 0,
+                    "a warm estimator with no timing data must not fall back to the isotonic estimate"
+                );
+            } else {
+                assert!(
+                    fallback_evaluations >= 2,
+                    "on the isotonic fallback both predictions must come from the isotonic estimate"
+                );
+            }
+
+            let near_pred = near_decision.candidates[0]
+                .prediction
+                .as_ref()
+                .expect("should have prediction for near contract");
+            let far_pred = far_decision.candidates[0]
+                .prediction
+                .as_ref()
+                .expect("should have prediction for far contract");
+
+            // Near contract should have lower failure probability than far
+            // contract. The isotonic fit only guarantees `<=`; the
+            // hierarchical estimator's (peer, band) cells see the two bands
+            // separately, so it must separate them strictly.
+            if hierarchical {
+                assert!(
+                    near_pred.failure_probability < far_pred.failure_probability,
+                    "hierarchical: near contract failure prob ({}) must be < far ({})",
+                    near_pred.failure_probability,
+                    far_pred.failure_probability
+                );
+            } else {
+                assert!(
+                    near_pred.failure_probability <= far_pred.failure_probability,
+                    "isotonic: near contract failure prob ({}) should be <= far ({})",
+                    near_pred.failure_probability,
+                    far_pred.failure_probability
+                );
+            }
         }
-
-        // Peer fails for distant contracts (large distance)
-        for _ in 0..25 {
-            router.add_event(RouteEvent {
-                peer: peer.clone(),
-                contract_location: far_contract,
-                outcome: RouteOutcome::Failure,
-                op_type: None,
-            });
-        }
-
-        assert!(router.has_sufficient_routing_events());
-        assert_eq!(router.failure_estimator.len(), 55);
-
-        // The isotonic model should give different failure predictions
-        // for near vs far contracts through this peer
-        let peers = vec![peer.clone()];
-
-        let (_, near_decision) =
-            router.select_k_best_peers_with_telemetry(&peers, near_contract, 1);
-        let (_, far_decision) = router.select_k_best_peers_with_telemetry(&peers, far_contract, 1);
-
-        let near_pred = near_decision.candidates[0]
-            .prediction
-            .as_ref()
-            .expect("should have prediction for near contract");
-        let far_pred = far_decision.candidates[0]
-            .prediction
-            .as_ref()
-            .expect("should have prediction for far contract");
-
-        // Near contract should have lower failure probability than far contract
-        assert!(
-            near_pred.failure_probability <= far_pred.failure_probability,
-            "Near contract failure prob ({}) should be <= far contract failure prob ({})",
-            near_pred.failure_probability,
-            far_pred.failure_probability
-        );
     }
 
     /// Verify that a single peer's SuccessUntimed events correctly produce a 0.0
@@ -3880,6 +9248,165 @@ mod tests {
             ]
         }
 
+        // Each property runs in both `Training` modes: from history (the
+        // isotonic fallback) and warm hierarchical (what the fleet routes with).
+
+        fn predictions_never_nan_case(
+            outcomes: Vec<RouteOutcome>,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let peers: Vec<PeerKeyLocation> = (0..5).map(|_| PeerKeyLocation::random()).collect();
+            let contract_location = Location::random();
+
+            let events: Vec<RouteEvent> = outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(i, outcome)| RouteEvent {
+                    peer: peers[i % peers.len()].clone(),
+                    contract_location,
+                    outcome,
+                    op_type: None,
+                })
+                .collect();
+
+            let router = training.train(&events);
+
+            // Router should have enough events for prediction
+            prop_assert!(router.has_sufficient_routing_events());
+            training.check_decides(&router, &peers, contract_location);
+
+            // Predictions must not produce NaN
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+            prop_assert!(!selected.is_empty());
+            for candidate in &decision.candidates {
+                if let Some(pred) = &candidate.prediction {
+                    prop_assert!(
+                        !pred.failure_probability.is_nan(),
+                        "failure_probability is NaN"
+                    );
+                    prop_assert!(
+                        !pred.expected_total_time.is_nan(),
+                        "expected_total_time is NaN"
+                    );
+                    prop_assert!(
+                        !pred.time_to_response_start.is_nan(),
+                        "time_to_response_start is NaN"
+                    );
+                    prop_assert!(
+                        !pred.transfer_speed_bps.is_nan(),
+                        "transfer_speed_bps is NaN"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn failure_data_increases_failure_prediction_case(
+            n_good: usize,
+            n_bad: usize,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let good_peer = PeerKeyLocation::random();
+            let bad_peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
+
+            let mut events = Vec::new();
+
+            // Good peer: all successes (untimed for simplicity)
+            for _ in 0..n_good {
+                events.push(RouteEvent {
+                    peer: good_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::SuccessUntimed,
+                    op_type: None,
+                });
+            }
+
+            // Bad peer: all failures
+            for _ in 0..n_bad {
+                events.push(RouteEvent {
+                    peer: bad_peer.clone(),
+                    contract_location,
+                    outcome: RouteOutcome::Failure,
+                    op_type: None,
+                });
+            }
+
+            let router = training.train(&events);
+            prop_assert!(router.has_sufficient_routing_events());
+
+            let peers = vec![good_peer.clone(), bad_peer.clone()];
+            training.check_decides(&router, &peers, contract_location);
+            let (selected, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
+
+            let all_have_predictions = decision.candidates.iter().all(|c| c.prediction.is_some());
+
+            // With enough data, predictions should exist for both
+            if all_have_predictions && selected.len() == 2 {
+                // The first selected peer (lowest expected_total_time) should
+                // be the good peer since failures increase cost via the
+                // failure_cost_multiplier in predict_routing_outcome
+                prop_assert!(
+                    *selected[0] == good_peer,
+                    "Good peer (all successes) should be ranked first ({:?})",
+                    training
+                );
+            }
+            Ok(())
+        }
+
+        fn failure_probability_bounded_case(
+            outcomes: Vec<RouteOutcome>,
+            seed: u64,
+            training: Training,
+        ) -> Result<(), TestCaseError> {
+            let _mode = training.guard();
+            let _guard = crate::config::GlobalRng::seed_guard(seed);
+            let peers: Vec<PeerKeyLocation> = (0..3).map(|_| PeerKeyLocation::random()).collect();
+            let contract_location = Location::random();
+
+            let events: Vec<RouteEvent> = outcomes
+                .into_iter()
+                .enumerate()
+                .map(|(i, outcome)| RouteEvent {
+                    peer: peers[i % peers.len()].clone(),
+                    contract_location,
+                    outcome,
+                    op_type: None,
+                })
+                .collect();
+
+            let router = training.train(&events);
+            if !router.has_sufficient_routing_events() {
+                return Ok(());
+            }
+            training.check_decides(&router, &peers, contract_location);
+
+            let (_, decision) =
+                router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
+
+            for candidate in &decision.candidates {
+                if let Some(pred) = &candidate.prediction {
+                    // Allow small float tolerance around [0, 1]
+                    prop_assert!(
+                        pred.failure_probability >= 0.0 && pred.failure_probability <= 1.0,
+                        "failure_probability {} out of [0, 1] range",
+                        pred.failure_probability
+                    );
+                }
+            }
+            Ok(())
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -3890,52 +9417,17 @@ mod tests {
                 outcomes in proptest::collection::vec(arb_route_outcome(), 60..200),
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let peers: Vec<PeerKeyLocation> =
-                    (0..5).map(|_| PeerKeyLocation::random()).collect();
-                let contract_location = Location::random();
+                predictions_never_nan_case(outcomes, seed, Training::History)?;
+            }
 
-                let events: Vec<RouteEvent> = outcomes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, outcome)| RouteEvent {
-                        peer: peers[i % peers.len()].clone(),
-                        contract_location,
-                        outcome,
-                        op_type: None,
-                    })
-                    .collect();
-
-                let router = Router::new(&events);
-
-                // Router should have enough events for prediction
-                prop_assert!(router.has_sufficient_routing_events());
-
-                // Predictions must not produce NaN
-                let (selected, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
-
-                prop_assert!(!selected.is_empty());
-                for candidate in &decision.candidates {
-                    if let Some(pred) = &candidate.prediction {
-                        prop_assert!(
-                            !pred.failure_probability.is_nan(),
-                            "failure_probability is NaN"
-                        );
-                        prop_assert!(
-                            !pred.expected_total_time.is_nan(),
-                            "expected_total_time is NaN"
-                        );
-                        prop_assert!(
-                            !pred.time_to_response_start.is_nan(),
-                            "time_to_response_start is NaN"
-                        );
-                        prop_assert!(
-                            !pred.transfer_speed_bps.is_nan(),
-                            "transfer_speed_bps is NaN"
-                        );
-                    }
-                }
+            /// [`predictions_never_nan_or_panic`] on the warm hierarchical
+            /// estimator.
+            #[test]
+            fn predictions_never_nan_or_panic_warm_hierarchical(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..200),
+                seed in 0u64..u64::MAX,
+            ) {
+                predictions_never_nan_case(outcomes, seed, Training::WarmHierarchical)?;
             }
 
             /// Property: after enough failure data for a peer, the router predicts
@@ -3947,53 +9439,28 @@ mod tests {
                 n_bad in 30usize..60,
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let good_peer = PeerKeyLocation::random();
-                let bad_peer = PeerKeyLocation::random();
-                let contract_location = Location::random();
+                failure_data_increases_failure_prediction_case(
+                    n_good,
+                    n_bad,
+                    seed,
+                    Training::History,
+                )?;
+            }
 
-                let mut events = Vec::new();
-
-                // Good peer: all successes (untimed for simplicity)
-                for _ in 0..n_good {
-                    events.push(RouteEvent {
-                        peer: good_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::SuccessUntimed,
-                        op_type: None,
-                    });
-                }
-
-                // Bad peer: all failures
-                for _ in 0..n_bad {
-                    events.push(RouteEvent {
-                        peer: bad_peer.clone(),
-                        contract_location,
-                        outcome: RouteOutcome::Failure,
-                        op_type: None,
-                    });
-                }
-
-                let router = Router::new(&events);
-                prop_assert!(router.has_sufficient_routing_events());
-
-                let peers = vec![good_peer.clone(), bad_peer.clone()];
-                let (selected, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 2);
-
-                let all_have_predictions = decision.candidates.iter()
-                    .all(|c| c.prediction.is_some());
-
-                // With enough data, predictions should exist for both
-                if all_have_predictions && selected.len() == 2 {
-                    // The first selected peer (lowest expected_total_time) should
-                    // be the good peer since failures increase cost via the
-                    // failure_cost_multiplier in predict_routing_outcome
-                    prop_assert!(
-                        *selected[0] == good_peer,
-                        "Good peer (all successes) should be ranked first"
-                    );
-                }
+            /// [`failure_data_increases_failure_prediction`] on the warm
+            /// hierarchical estimator.
+            #[test]
+            fn failure_data_increases_failure_prediction_warm_hierarchical(
+                n_good in 30usize..60,
+                n_bad in 30usize..60,
+                seed in 0u64..u64::MAX,
+            ) {
+                failure_data_increases_failure_prediction_case(
+                    n_good,
+                    n_bad,
+                    seed,
+                    Training::WarmHierarchical,
+                )?;
             }
 
             /// Property: add_event is consistent with batch construction.
@@ -4077,41 +9544,17 @@ mod tests {
                 outcomes in proptest::collection::vec(arb_route_outcome(), 60..150),
                 seed in 0u64..u64::MAX,
             ) {
-                let _guard = crate::config::GlobalRng::seed_guard(seed);
-                let peers: Vec<PeerKeyLocation> =
-                    (0..3).map(|_| PeerKeyLocation::random()).collect();
-                let contract_location = Location::random();
+                failure_probability_bounded_case(outcomes, seed, Training::History)?;
+            }
 
-                let events: Vec<RouteEvent> = outcomes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, outcome)| RouteEvent {
-                        peer: peers[i % peers.len()].clone(),
-                        contract_location,
-                        outcome,
-                        op_type: None,
-                    })
-                    .collect();
-
-                let router = Router::new(&events);
-                if !router.has_sufficient_routing_events() {
-                    return Ok(());
-                }
-
-                let (_, decision) =
-                    router.select_k_best_peers_with_telemetry(&peers, contract_location, 3);
-
-                for candidate in &decision.candidates {
-                    if let Some(pred) = &candidate.prediction {
-                        // Allow small float tolerance around [0, 1]
-                        prop_assert!(
-                            pred.failure_probability >= 0.0
-                                && pred.failure_probability <= 1.0,
-                            "failure_probability {} out of [0, 1] range",
-                            pred.failure_probability
-                        );
-                    }
-                }
+            /// [`failure_probability_bounded`] on the warm hierarchical
+            /// estimator.
+            #[test]
+            fn failure_probability_bounded_warm_hierarchical(
+                outcomes in proptest::collection::vec(arb_route_outcome(), 60..150),
+                seed in 0u64..u64::MAX,
+            ) {
+                failure_probability_bounded_case(outcomes, seed, Training::WarmHierarchical)?;
             }
         }
     }
@@ -4120,6 +9563,22 @@ mod tests {
     /// in the estimator, preferring untried peers.
     #[test]
     fn test_distance_fallback_deprioritizes_failed_peers() {
+        distance_fallback_deprioritizes_failed_peers_case(Training::History);
+    }
+
+    /// [`test_distance_fallback_deprioritizes_failed_peers`] with the
+    /// hierarchical estimator WARM: below the prediction threshold the
+    /// fallback consults only the isotonic `peer_adjustments`, so a warm
+    /// estimator must not change what it picks. The sibling
+    /// `test_distance_fallback_k_greater_than_untried_count` exercises the same
+    /// branch, so it has no twin.
+    #[test]
+    fn test_distance_fallback_deprioritizes_failed_peers_warm_hierarchical() {
+        distance_fallback_deprioritizes_failed_peers_case(Training::WarmHierarchical);
+    }
+
+    fn distance_fallback_deprioritizes_failed_peers_case(training: Training) {
+        let _mode = training.guard();
         let _guard = crate::config::GlobalRng::seed_guard(0xDEAD_BEEF);
 
         // Create a "failed" peer that is very close to the target
@@ -4140,11 +9599,24 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
         assert!(
             !router.has_sufficient_routing_events(),
             "Should still be in distance-based fallback mode"
         );
+        if training == Training::WarmHierarchical {
+            // Warm: the failure stage has a curve and an estimate for the
+            // failed peer (at distance 0 from its own location), so the
+            // fallback below runs with the estimator ready to be consulted.
+            assert!(
+                router
+                    .hierarchical
+                    .estimate(&failed_peer, target, 0.0, router.estimator_clock.hours())
+                    .failure_probability
+                    .is_some(),
+                "the hierarchical failure stage must be warm for this twin to mean anything"
+            );
+        }
         assert!(
             router
                 .failure_estimator
@@ -4311,9 +9783,16 @@ mod tests {
         assert!(get_curves.failure_events > 0);
         assert!(get_curves.response_time_events > 0);
         assert!(get_curves.transfer_rate_events > 0);
+        // These curves come from a fit built inside `snapshot()`, because the
+        // per-op estimators fit on read (#5662): non-empty shows that path works
+        // end to end, which the event counts above (read without fitting) do not.
+        assert!(!get_curves.failure_curve.is_empty());
+        assert!(!get_curves.response_time_curve.is_empty());
+        assert!(!get_curves.transfer_rate_curve.is_empty());
 
         let put_curves = &snap.per_op_curves["PUT"];
         assert!(put_curves.failure_events > 0);
+        assert!(!put_curves.failure_curve.is_empty());
         assert_eq!(put_curves.response_time_events, 0);
         assert_eq!(put_curves.transfer_rate_events, 0);
     }
@@ -4413,6 +9892,18 @@ mod tests {
     /// `expected_total_time`, even when transfer speed is zero.
     #[test]
     fn predict_routing_outcome_no_nan_with_zero_transfer_speed() {
+        zero_transfer_speed_case(Training::History);
+    }
+
+    /// [`predict_routing_outcome_no_nan_with_zero_transfer_speed`] on the warm
+    /// hierarchical estimator.
+    #[test]
+    fn predict_routing_outcome_no_nan_with_zero_transfer_speed_warm_hierarchical() {
+        zero_transfer_speed_case(Training::WarmHierarchical);
+    }
+
+    fn zero_transfer_speed_case(training: Training) {
+        let _mode = training.guard();
         let peer = PeerKeyLocation::random();
         let contract_location = Location::random();
 
@@ -4437,7 +9928,8 @@ mod tests {
             })
             .collect();
 
-        let router = Router::new(&events);
+        let router = training.train(&events);
+        training.check_decides(&router, std::slice::from_ref(&peer), contract_location);
 
         // Not enough data (Err) is acceptable; only the Ok path is asserted.
         if let Ok(pred) = router.predict_routing_outcome(&peer, contract_location) {
@@ -4547,5 +10039,738 @@ mod tests {
                  regression"
             );
         }
+    }
+
+    // ── Per-peer dashboard data (peer page) ─────────────────────────────────
+
+    /// Twelve peers, forty rounds each through `add_event` on a frozen clock:
+    /// `peers[0]` replies four times slower than the rest, `peers[1]` fails
+    /// every other request, the others fail rarely. Timed replies carry no
+    /// payload, so only the failure and response-time stages warm.
+    fn peer_offset_router() -> (Router, Vec<PeerKeyLocation>) {
+        let mut router = warm_hierarchical_router(&[]);
+        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        for round in 0..40u64 {
+            for (index, peer) in peers.iter().enumerate() {
+                let jitter_ms = 100 + (index as u64 * 7 + round * 13) % 50;
+                let outcome = if (index == 1 && round % 2 == 0) || (round + index as u64) % 37 == 0
+                {
+                    RouteOutcome::Failure
+                } else {
+                    RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(if index == 0 {
+                            jitter_ms * 4
+                        } else {
+                            jitter_ms
+                        }),
+                        payload_size: 0,
+                        payload_transfer_time: Duration::ZERO,
+                    }
+                };
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::random(),
+                    outcome,
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        (router, peers)
+    }
+
+    /// A peer the estimator knows nothing about sits exactly on the
+    /// distance-alone line; a peer with a clear record sits off it in the
+    /// direction of that record. The offset is relative to distance alone,
+    /// not the raw posterior, so an unknown peer cannot read as "faster".
+    #[test]
+    fn peer_offsets_measure_each_peer_against_distance_alone() {
+        let (router, peers) = peer_offset_router();
+
+        let unknown = router.peer_offsets(&PeerKeyLocation::random());
+        for (stage, offset) in unknown.iter().take(2).enumerate() {
+            let offset = offset.expect("a warm stage reports an unknown peer");
+            assert_eq!(
+                (offset.offset, offset.evidence, offset.weight),
+                (0.0, 0.0, 0.0),
+                "stage {stage}: a peer with no record must sit on the distance-alone line"
+            );
+        }
+        assert!(
+            unknown[2].is_none(),
+            "the transfer stage never warmed, so it has nothing to report"
+        );
+
+        let slow = router.peer_offsets(&peers[0])[1].expect("response-time stage is warm");
+        assert!(
+            slow.offset.exp() > 2.0 && slow.weight > 0.5 && slow.evidence > 20.0,
+            "a peer replying 4x slower must read well above distance alone: {slow:?}"
+        );
+        let typical = router.peer_offsets(&peers[5])[1].expect("response-time stage is warm");
+        assert!(
+            typical.offset.exp() < 1.5 && typical.offset.exp() > 1.0 / 1.5,
+            "an ordinary peer stays near distance alone: {typical:?}"
+        );
+        let flaky = router.peer_offsets(&peers[1])[0].expect("failure stage is warm");
+        let steady = router.peer_offsets(&peers[5])[0].expect("failure stage is warm");
+        assert!(
+            flaky.offset > 0.1 && flaky.offset > steady.offset + 0.1,
+            "a peer failing half its requests must read as more likely to fail: \
+             flaky {flaky:?}, steady {steady:?}"
+        );
+
+        // The snapshot carries the same offsets.
+        assert_eq!(
+            router.peer_snapshot(&peers[0]).offsets,
+            router.peer_offsets(&peers[0])
+        );
+    }
+
+    #[test]
+    fn peer_offsets_are_absent_before_any_stage_has_a_curve() {
+        let router = warm_hierarchical_router(&[]);
+        assert_eq!(
+            router.peer_offsets(&PeerKeyLocation::random()),
+            [None, None, None]
+        );
+    }
+
+    /// The per-peer window holds exactly this peer's observations, split per
+    /// operation, with no other peer's mixed in and nothing downsampled.
+    #[test]
+    fn peer_snapshot_window_holds_only_this_peers_observations() {
+        let mut router = Router::new(&[]);
+        let peer = PeerKeyLocation::random();
+        let other = PeerKeyLocation::random();
+        let timed = |ms: u64, bytes: usize| RouteOutcome::Success {
+            time_to_response_start: Duration::from_millis(ms),
+            payload_size: bytes,
+            payload_transfer_time: Duration::from_millis(if bytes > 0 { 40 } else { 0 }),
+        };
+        let mut events = Vec::new();
+        for index in 0..5 {
+            events.push((peer.clone(), timed(100 + index, 4000), OpType::Get));
+        }
+        events.push((peer.clone(), RouteOutcome::Failure, OpType::Get));
+        events.push((peer.clone(), RouteOutcome::Failure, OpType::Get));
+        for _ in 0..3 {
+            events.push((peer.clone(), RouteOutcome::SuccessUntimed, OpType::Put));
+        }
+        for index in 0..30 {
+            events.push((other.clone(), timed(300 + index, 0), OpType::Subscribe));
+        }
+        for (who, outcome, op) in events {
+            router.add_event(RouteEvent {
+                peer: who,
+                contract_location: Location::random(),
+                outcome,
+                op_type: Some(op),
+            });
+        }
+
+        let snapshot = router.peer_snapshot(&peer);
+        assert_eq!(snapshot.window.outcomes, 10);
+        assert_eq!(snapshot.window.response_times.len(), 5);
+        assert!(
+            snapshot
+                .window
+                .response_times
+                .iter()
+                .all(|&(_, seconds)| seconds < 0.2),
+            "only this peer's replies, none of the other peer's 300 ms ones: {:?}",
+            snapshot.window.response_times
+        );
+        assert_eq!(snapshot.window.transfer_speeds.len(), 5);
+        let get = &snapshot.window_by_op["GET"];
+        assert_eq!((get.outcomes, get.response_times.len()), (7, 5));
+        let put = &snapshot.window_by_op["PUT"];
+        assert_eq!((put.outcomes, put.response_times.len()), (3, 0));
+        assert!(
+            !snapshot.window_by_op.contains_key("SUBSCRIBE"),
+            "an op with no event about this peer is absent"
+        );
+        assert_eq!(router.peer_snapshot(&other).window.outcomes, 30);
+    }
+
+    /// The recent response-time pairs are attributed to the peer each was
+    /// about, while the router-wide list stays untagged and complete.
+    #[test]
+    fn response_time_pairs_are_attributed_to_their_peer() {
+        let (mut router, peers) = peer_offset_router();
+        let marked = &peers[3];
+        for _ in 0..10 {
+            router.add_event(RouteEvent {
+                peer: marked.clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_secs(7),
+                    payload_size: 0,
+                    payload_transfer_time: Duration::ZERO,
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+        let pairs = router.peer_snapshot(marked).response_time_pairs;
+        let seven = pairs.iter().filter(|&&(_, actual)| actual == 7.0).count();
+        assert_eq!(
+            seven, 10,
+            "every 7 s reply is attributed to its peer: {pairs:?}"
+        );
+        let others = router.peer_snapshot(&peers[4]).response_time_pairs;
+        assert!(!others.is_empty(), "the other peers' pairs are kept too");
+        assert!(
+            others.iter().all(|&(_, actual)| actual < 1.0),
+            "no 7 s reply is attributed to another peer: {others:?}"
+        );
+        let all = router.snapshot().hierarchical_response_time_pairs;
+        assert_eq!(
+            all.iter().filter(|&&(_, actual)| actual == 7.0).count(),
+            10,
+            "the router-wide list still holds every pair"
+        );
+    }
+
+    /// Only decisions the caller routes by count, every candidate in the
+    /// scored window is eligible, and only the first-ranked one is chosen.
+    #[test]
+    fn peer_selection_counts_only_real_routing_decisions() {
+        let (router, peers) = peer_offset_router();
+        let window: Vec<PeerKeyLocation> = peers[..5].to_vec();
+        let target = Location::new(0.3);
+
+        for _ in 0..3 {
+            router.select_k_best_peers_with_telemetry(window.iter(), target, 1);
+            router.select_k_best_peers_capturing(window.iter(), target, 2, true, false);
+        }
+        assert!(
+            window
+                .iter()
+                .all(|peer| router.peer_snapshot(peer).selection.is_none()),
+            "probes and decisions that do not route must not be counted"
+        );
+
+        let mut chosen = Vec::new();
+        for _ in 0..20 {
+            let (selected, _, _) =
+                router.select_k_best_peers_capturing(window.iter(), target, 2, false, true);
+            chosen.push(selected[0].clone());
+        }
+        let mut chosen_total = 0.0;
+        for peer in &window {
+            let selection = router
+                .peer_snapshot(peer)
+                .selection
+                .expect("every peer in the window was eligible");
+            assert_eq!(selection.eligible, 20, "{peer:?}");
+            assert!(
+                (selection.even_share - 4.0).abs() < 1e-9,
+                "20 decisions over 5"
+            );
+            assert_eq!(
+                selection.chosen,
+                chosen.iter().filter(|c| *c == peer).count() as f64,
+                "chosen counts only the first-ranked peer, not the second of k = 2"
+            );
+            chosen_total += selection.chosen;
+        }
+        assert_eq!(
+            chosen_total, 20.0,
+            "exactly one peer is chosen per decision"
+        );
+        assert!(
+            router.peer_snapshot(&peers[5]).selection.is_none(),
+            "peers[5] was never in the window, so it has no counts"
+        );
+    }
+
+    /// The table is bounded by evicting the least-recently-eligible peers, a
+    /// batch at a time, and counts what it evicted; a clone keeps the counts.
+    #[test]
+    fn peer_selection_table_evicts_the_stalest_peers_and_counts_them() {
+        let counts = PeerSelectionCounts::new(64);
+        let peers: Vec<PeerKeyLocation> = (0..80).map(|_| PeerKeyLocation::random()).collect();
+        // peers[0] stays fresh; the rest arrive one decision each.
+        for peer in &peers[1..] {
+            counts.record(&[&peers[0], peer], &peers[0]);
+        }
+        let table = counts.table.lock();
+        assert!(table.entries.len() <= 64, "{} entries", table.entries.len());
+        assert_eq!(table.evictions, 80 - 64, "one per newcomer past the cap");
+        drop(table);
+        assert_eq!(counts.evictions(), 16);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| (s.eligible, s.chosen)),
+            Some((79, 79.0)),
+            "a peer in every decision is never the stalest"
+        );
+        assert!(
+            counts.get(&peers[1]).is_none(),
+            "the oldest newcomer went first"
+        );
+        assert!(counts.was_evicted(&peers[1]), "and is known to be evicted");
+        assert!(!counts.was_evicted(&peers[0]) && !counts.was_evicted(&peers[79]));
+        assert!(
+            !counts.was_evicted(&PeerKeyLocation::random()),
+            "a peer never eligible is not reported as evicted"
+        );
+        // Eligible again: counted from zero, no longer reported as evicted.
+        counts.record(&[&peers[0], &peers[1]], &peers[0]);
+        assert!(!counts.was_evicted(&peers[1]));
+        assert_eq!(counts.get(&peers[1]).map(|s| s.eligible), Some(1));
+        assert!(counts.get(&peers[79]).is_some());
+        assert_eq!(counts.clone().get(&peers[0]), counts.get(&peers[0]));
+    }
+
+    /// With a batch larger than one (capacity 256, batch 4) the stalest
+    /// peers go, and a peer of the decision being recorded is never taken,
+    /// even when it is the stalest entry until that decision stamps it.
+    #[test]
+    fn peer_selection_eviction_never_takes_a_peer_of_the_same_decision() {
+        let counts = PeerSelectionCounts::new(256);
+        let peers: Vec<PeerKeyLocation> = (0..260).map(|_| PeerKeyLocation::random()).collect();
+        for peer in &peers[..256] {
+            counts.record(&[peer], peer);
+        }
+        assert_eq!(counts.evictions(), 0);
+        // peers[0] is the stalest entry, and it is in this decision's window
+        // AFTER a newcomer that forces an eviction.
+        counts.record(&[&peers[256], &peers[0]], &peers[0]);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| (s.eligible, s.chosen)),
+            Some((2, 2.0)),
+            "a same-decision peer keeps its counts"
+        );
+        assert_eq!(counts.evictions(), 4, "one batch of capacity / 64");
+        for (index, peer) in peers[1..5].iter().enumerate() {
+            assert!(
+                counts.get(peer).is_none(),
+                "peers[{}] was stalest",
+                index + 1
+            );
+        }
+        assert!(counts.get(&peers[5]).is_some(), "only the batch goes");
+        assert_eq!(counts.get(&peers[256]).map(|s| s.eligible), Some(1));
+        assert!(counts.table.lock().entries.len() <= 256);
+
+        counts.record(&[], &peers[0]);
+        assert_eq!(
+            counts.get(&peers[0]).map(|s| s.eligible),
+            Some(2),
+            "an empty window records nothing"
+        );
+    }
+
+    /// The per-peer pairs follow the window as it rolls over: only pairs still
+    /// in the last 200 are attributed.
+    #[test]
+    fn recent_pairs_for_a_peer_follow_the_window_roll_over() {
+        let mut pairs = RecentPairs::default();
+        let (a, b) = (1u64, 2u64);
+        for i in 0..150 {
+            pairs.push(i as f64, 0.0, a);
+        }
+        for i in 0..150 {
+            pairs.push(i as f64, 1.0, b);
+        }
+        let mine = pairs.for_peer(a);
+        assert_eq!(mine.len(), 50, "100 of a's pairs rolled out");
+        assert_eq!(
+            mine.first(),
+            Some(&(100.0, 0.0)),
+            "the oldest survivors first"
+        );
+        assert_eq!(pairs.for_peer(b).len(), 150);
+        assert_eq!(pairs.to_vec().len(), RECENT_PAIRS);
+        pairs.push(f64::NAN, 1.0, a);
+        assert_eq!(pairs.for_peer(a).len(), 50, "non-finite pairs are refused");
+    }
+
+    /// Twelve peers whose replies differ by factors of 1 to 4, contracts in
+    /// ring bands 0-3 only (so bands 4-7 are unrecorded for everyone).
+    fn spread_router(rounds: u64, timed: bool) -> (Router, Vec<PeerKeyLocation>) {
+        let mut router = warm_hierarchical_router(&[]);
+        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        for round in 0..rounds {
+            for (index, peer) in peers.iter().enumerate() {
+                let jitter_ms = 100 + (index as u64 * 7 + round * 13) % 50;
+                let factor = 1 + (index as u64 % 4);
+                router.add_event(RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: Location::new(
+                        ((round * 7 + index as u64) % 50) as f64 / 100.0,
+                    ),
+                    outcome: if !timed {
+                        if (round + index as u64) % 5 == 0 && index % 3 == 0 {
+                            RouteOutcome::Failure
+                        } else {
+                            RouteOutcome::SuccessUntimed
+                        }
+                    } else if (round + index as u64) % 9 == 0 {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(jitter_ms * factor),
+                            payload_size: 20_000,
+                            payload_transfer_time: Duration::from_millis(
+                                30 * factor + jitter_ms / 5,
+                            ),
+                        }
+                    },
+                    op_type: Some(OpType::Get),
+                });
+            }
+        }
+        (router, peers)
+    }
+
+    /// A contract at ring distance `d` from `peer`, in an unrecorded band
+    /// (location 0.5 or above), when one exists.
+    fn unrecorded_contract_at(peer: &PeerKeyLocation, d: f64) -> Option<Location> {
+        let location = peer.location()?.as_f64();
+        [
+            (location + d).rem_euclid(1.0),
+            (location - d).rem_euclid(1.0),
+        ]
+        .into_iter()
+        .find(|c| *c >= 0.5 && *c < 1.0)
+        .map(Location::new)
+    }
+
+    /// A peer at the same address, so the same location, with a key the
+    /// router has never seen. (`PeerKeyLocation::random` reuses one key per
+    /// thread, so it cannot make one.)
+    fn twin_of(peer: &PeerKeyLocation) -> PeerKeyLocation {
+        PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            peer.socket_addr().unwrap(),
+        )
+    }
+
+    fn curve_at(curve: &[(f64, f64)], d: f64) -> f64 {
+        curve
+            .iter()
+            .find(|(x, _)| (x - d).abs() < 1e-12)
+            .unwrap_or_else(|| panic!("no sample at {d}"))
+            .1
+    }
+
+    fn line(curve: &RoutingCurve) -> &[(f64, f64)] {
+        if curve.this_peer.is_empty() {
+            &curve.distance_alone
+        } else {
+            &curve.this_peer
+        }
+    }
+
+    /// The expected factor the peer page states is the ratio of the two
+    /// response-time lines it draws, at distance 0, and there is none wherever
+    /// those lines are not the hierarchical model's.
+    #[test]
+    fn the_expected_factor_is_the_ratio_of_the_lines_at_distance_zero() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let (router, peers) = spread_router(40, true);
+        let mut differing = 0;
+        for peer in &peers {
+            let snapshot = router.peer_snapshot(peer);
+            let curve = &snapshot.curves[0];
+            let line = if curve.this_peer.is_empty() {
+                &curve.distance_alone
+            } else {
+                &curve.this_peer
+            };
+            assert_eq!((line[0].0, curve.distance_alone[0].0), (0.0, 0.0));
+            let ratio = line[0].1 / curve.distance_alone[0].1;
+            assert_eq!(snapshot.expected_response_factor, Some(ratio));
+            if (ratio - 1.0).abs() > 0.05 {
+                differing += 1;
+            }
+        }
+        assert!(differing > 0, "the fixture's peers differ");
+        {
+            let _on = force_isotonic_fallback(true);
+            assert_eq!(router.expected_response_factor(&peers[0]), None);
+        }
+        let unlocated =
+            PeerKeyLocation::with_unknown_addr(PeerKeyLocation::random().pub_key().clone());
+        assert_eq!(router.expected_response_factor(&unlocated), None);
+        let curves = router.peer_snapshot(&unlocated).curves;
+        assert!(
+            curves
+                .iter()
+                .all(|c| c.distance_alone.is_empty() && c.this_peer.is_empty()),
+            "routing predicts nothing for a peer with no location"
+        );
+    }
+
+    /// Below the 50-event gate routing predicts nothing, so there are no
+    /// lines and no factor; they appear when the gate opens.
+    #[test]
+    fn nothing_is_drawn_before_the_prediction_gate() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let mut router = warm_hierarchical_router(&[]);
+        let peer = PeerKeyLocation::random();
+        let event = |ms: u64| RouteEvent {
+            peer: peer.clone(),
+            contract_location: Location::random(),
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(ms),
+                payload_size: 20_000,
+                payload_transfer_time: Duration::from_millis(40),
+            },
+            op_type: Some(OpType::Get),
+        };
+        for round in 0..49 {
+            router.add_event(event(100 + round));
+        }
+        assert!(!router.snapshot().prediction_active);
+        let snapshot = router.peer_snapshot(&peer);
+        assert!(
+            snapshot
+                .curves
+                .iter()
+                .all(|c| c.distance_alone.is_empty() && c.this_peer.is_empty())
+        );
+        assert_eq!(snapshot.expected_response_factor, None);
+        router.add_event(event(150));
+        assert!(router.snapshot().prediction_active);
+        assert!(
+            !router.peer_snapshot(&peer).curves[0]
+                .distance_alone
+                .is_empty(),
+            "lines once routing predicts"
+        );
+    }
+
+    /// The peer page's prediction lines are routing's own predictions: for
+    /// this peer, and for a peer with no record at the same spot.
+    #[test]
+    fn routing_curves_are_what_routing_predicts() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let (router, peers) = spread_router(40, true);
+        let close = |a: f64, b: f64| (a / b - 1.0).abs() < 1e-9;
+        let mut compared = 0;
+        for peer in &peers {
+            let curves = router.peer_snapshot(peer).curves;
+            assert!(!curves[0].early && !curves[1].early, "both stages are warm");
+            for sample in [5, 10, 20, 40] {
+                let d = 0.5 * sample as f64 / 50.0;
+                let Some(contract) = unrecorded_contract_at(peer, d) else {
+                    continue;
+                };
+                let mine = router.predict_routing_outcome(peer, contract).unwrap();
+                let alone = router
+                    .predict_routing_outcome(&twin_of(peer), contract)
+                    .unwrap();
+                assert!(close(
+                    curve_at(line(&curves[0]), d),
+                    mine.time_to_response_start
+                ));
+                assert!(close(
+                    curve_at(&curves[0].distance_alone, d),
+                    alone.time_to_response_start
+                ));
+                assert!(close(
+                    curve_at(line(&curves[1]), d),
+                    mine.xfer_speed.bytes_per_second
+                ));
+                assert!(close(
+                    curve_at(&curves[1].distance_alone, d),
+                    alone.xfer_speed.bytes_per_second
+                ));
+                compared += 1;
+            }
+        }
+        assert!(compared > 10, "only {compared} comparisons");
+    }
+
+    /// While a timing stage is cold routing uses the isotonic estimate with
+    /// its per-peer correction, and the lines say so and show exactly that.
+    #[test]
+    fn a_cold_timing_stage_shows_the_estimate_routing_falls_back_to() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let mut router = warm_hierarchical_router(&[]);
+        let peers: Vec<PeerKeyLocation> = (0..4).map(|_| PeerKeyLocation::random()).collect();
+        // 60 untimed events open the prediction gate; 20 timed ones (fewer
+        // than the 30 a hierarchical timing stage needs) feed the isotonic
+        // response-time estimate.
+        for i in 0..60 {
+            router.add_event(RouteEvent {
+                peer: peers[i % 4].clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::SuccessUntimed,
+                op_type: Some(OpType::Get),
+            });
+        }
+        for i in 0..20u64 {
+            router.add_event(RouteEvent {
+                peer: peers[(i % 2) as usize].clone(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(
+                        if i % 2 == 0 { 600 } else { 100 } + i,
+                    ),
+                    payload_size: 0,
+                    payload_transfer_time: Duration::ZERO,
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+        let curves = router.peer_snapshot(&peers[0]).curves;
+        assert!(curves[0].early, "the response-time stage is cold");
+        assert!(
+            !curves[0].distance_alone.is_empty(),
+            "routing is predicting, so is the line"
+        );
+        let location = peers[0].location().unwrap().as_f64();
+        for sample in [0, 10, 25, 50] {
+            let d = 0.5 * sample as f64 / 50.0;
+            let contract = Location::new((location + d).rem_euclid(1.0));
+            let routed = router.predict_routing_outcome(&peers[0], contract).unwrap();
+            assert!(
+                (curve_at(line(&curves[0]), d) - routed.time_to_response_start).abs() < 1e-9,
+                "at {d}: line {} vs routing {}",
+                curve_at(line(&curves[0]), d),
+                routed.time_to_response_start
+            );
+        }
+    }
+
+    /// The failure offset is routing's own difference for a peer and a peer
+    /// with no record, in a band neither has a record in, while the
+    /// probabilities are unclamped.
+    #[test]
+    fn the_failure_offset_is_routings_own_difference() {
+        let _fallback_off = force_isotonic_fallback(false);
+        let (router, peers) = spread_router(60, false);
+        let mut compared = 0;
+        for peer in &peers {
+            let offset = router.peer_offsets(peer)[0].expect("failure stage is warm");
+            let Some(contract) = unrecorded_contract_at(peer, 0.1) else {
+                continue;
+            };
+            let mine = router.predict_routing_outcome(peer, contract).unwrap();
+            let alone = router
+                .predict_routing_outcome(&twin_of(peer), contract)
+                .unwrap();
+            let inside = |p: f64| p > 0.0 && p < 1.0;
+            if !(inside(mine.failure_probability) && inside(alone.failure_probability)) {
+                continue;
+            }
+            assert!(
+                (mine.failure_probability - alone.failure_probability - offset.offset).abs() < 1e-9,
+                "offset {} vs routing's difference {}",
+                offset.offset,
+                mine.failure_probability - alone.failure_probability
+            );
+            compared += 1;
+        }
+        assert!(compared > 0, "no unclamped comparison");
+    }
+
+    /// The eviction memory holds up to `capacity` DISTINCT peers, forgetting
+    /// the least recently evicted first, and a peer evicted, re-recorded and
+    /// evicted again does not push others out early.
+    #[test]
+    fn eviction_memory_holds_capacity_distinct_peers() {
+        let mut table = PeerSelectionTable {
+            entries: HashMap::new(),
+            capacity: 8,
+            use_clock: 0,
+            evictions: 0,
+            evicted: HashMap::new(),
+            evicted_order: std::collections::VecDeque::new(),
+        };
+        let peers: Vec<PeerKeyLocation> = (0..20).map(|_| PeerKeyLocation::random()).collect();
+        for peer in &peers {
+            table.evictions += 1;
+            table.remember_evicted(peer.clone());
+        }
+        assert_eq!(table.evicted.len(), 8);
+        assert!(table.evicted_order.len() <= 16);
+        assert!(
+            !table.evicted.contains_key(&peers[11]),
+            "the oldest are forgotten"
+        );
+        assert!(table.evicted.contains_key(&peers[12]));
+        // A flapping peer: evicted many times (returning in between).
+        let flapper = &peers[12];
+        for _ in 0..50 {
+            table.evicted.remove(flapper);
+            table.evictions += 1;
+            table.remember_evicted(flapper.clone());
+        }
+        for peer in &peers[13..] {
+            assert!(
+                table.evicted.contains_key(peer),
+                "a flapping peer pushed out a genuinely evicted one"
+            );
+        }
+        assert!(table.evicted.contains_key(flapper));
+        assert!(table.evicted.len() <= 8 && table.evicted_order.len() <= 16);
+        // New evictions now forget the least recently evicted first.
+        let newcomer = PeerKeyLocation::random();
+        table.evictions += 1;
+        table.remember_evicted(newcomer.clone());
+        assert!(!table.evicted.contains_key(&peers[13]));
+        assert!(table.evicted.contains_key(&newcomer) && table.evicted.contains_key(flapper));
+    }
+
+    /// The selection counts are recent: all three halve together once a
+    /// peer has been eligible SELECTION_RECENT_DECISIONS times, exactly (no
+    /// rounding), so the eligible count stays in `[N / 2, N)`.
+    #[test]
+    fn peer_selection_counts_decay_to_a_recent_window() {
+        const N: u64 = SELECTION_RECENT_DECISIONS;
+        let counts = PeerSelectionCounts::new(64);
+        let (a, b) = (PeerKeyLocation::random(), PeerKeyLocation::random());
+        for round in 0..N - 1 {
+            let chosen = if round % 4 == 0 { &a } else { &b };
+            counts.record(&[&a, &b], chosen);
+        }
+        let first_choices = (0..N - 1).filter(|round| round % 4 == 0).count() as f64;
+        let before = counts.get(&a).unwrap();
+        assert_eq!(before.eligible, N - 1);
+        assert_eq!(before.chosen, first_choices);
+        assert!(!before.halved, "every decision so far, none decayed");
+        counts.record(&[&a, &b], &a);
+        let after = counts.get(&a).unwrap();
+        assert_eq!(after.eligible, N / 2);
+        assert_eq!(after.chosen, (first_choices + 1.0) / 2.0, "halved exactly");
+        assert!((after.even_share - N as f64 / 4.0).abs() < 1e-9);
+        assert!(after.halved);
+        for _ in 0..10 * N {
+            counts.record(&[&a, &b], &b);
+            let now = counts.get(&a).unwrap();
+            assert!((N / 2..N).contains(&now.eligible), "{}", now.eligible);
+        }
+        let late = counts.get(&a).unwrap();
+        assert!(
+            late.chosen > 0.0 && late.chosen < 1.0,
+            "an old run of first choices decays geometrically: {}",
+            late.chosen
+        );
+    }
+
+    /// A peer chosen rarely keeps its share through the halvings: with an
+    /// integer count each halving would floor its one or two first choices
+    /// away, and its share would drift toward zero (and toward "avoided").
+    #[test]
+    fn a_rarely_chosen_peer_keeps_its_share_through_the_halvings() {
+        const N: u64 = SELECTION_RECENT_DECISIONS;
+        let counts = PeerSelectionCounts::new(64);
+        let (a, b) = (PeerKeyLocation::random(), PeerKeyLocation::random());
+        let every = N * 3 / 4 + 1;
+        let mut lowest = f64::INFINITY;
+        for round in 1..=40 * N {
+            let chosen = if round % every == 0 { &a } else { &b };
+            counts.record(&[&a, &b], chosen);
+            if round > 4 * N {
+                let now = counts.get(&a).unwrap();
+                lowest = lowest.min(now.chosen / now.eligible as f64 * every as f64);
+            }
+        }
+        assert!(
+            lowest > 0.3,
+            "share of first choices fell to {lowest} of its true rate"
+        );
     }
 }

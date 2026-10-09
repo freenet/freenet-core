@@ -21,6 +21,23 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(test_interest_renewal)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# #5780 interest-record reconciliation: a 1-gateway / 3-node Turmoil simulation
+# of ~2400s virtual time (ten slow GETs 45s apart, then a 1500s quiet period so
+# leases lapse and the 120s reconcile wait plus a sweep elapse before
+# measuring), with a topology snapshot per peer every virtual second. Measured
+# 68-72s wall-clock alone and 113s under the full parallel suite locally, too
+# close to the default 120s period on a slower runner.
+[[profile.ci.overrides]]
+filter = "test(test_evicted_contracts_keep_no_interest_records)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+# #5814 degree-creep model: two arms of a 1000-peer topology model over 3h of
+# virtual time, on parallel threads. Measured ~55s wall-clock locally; give it
+# headroom on a contended runner.
+[[profile.ci.overrides]]
+filter = "test(lattice_probe_does_not_grow_degree_with_uptime)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 # Ping integration tests have internal timeouts of 360-600s with sequential
 # phases (WS connect retries, ring connection waits, contract operations).
 # Default 240s nextest cap kills them before they can finish on slow runners.
@@ -69,6 +86,41 @@ retries = 0
 filter = "test(graceful_shutdown_on_sigterm_exits_zero)"
 retries = 0
 slow-timeout = { period = "300s", terminate-after = 2 }
+
+# #5176: three simulation tests run 138-147s on CI against the default 240s
+# cap (~1.6x headroom, measured over nine runs). Their spread is 1-16%, so they
+# are stable rather than erratic — the risk is a systematically slower runner
+# breaching the cap for all of them at once, not intermittent flakiness. The
+# `Simulation` job runs on `merge_group` as well as `pull_request`, so a
+# breach stalls the whole merge queue, not just one PR.
+[[profile.ci.overrides]]
+filter = "test(test_placement_migration_at_scale_renewal_load_stays_bounded) | test(test_connection_growth_plateau_diagnostic) | test(test_connection_growth_stall_regression)"
+slow-timeout = { period = "150s", terminate-after = 2 }
+
+# The post-update probation tests (#5232) spawn the real `freenet` binary and
+# wait out the rollback machinery's own 60s commit window, which is a hard-coded
+# constant in the binary under test — so ~65s of the runtime is a deliberate
+# sleep, not slack, and the default 120s period leaves little room for a cold
+# debug-build node start on a loaded runner.
+#
+# retries = 0 for the same reason as the canary above: this is brick-safety
+# equipment, and an intermittent failure here is a finding, not noise to absorb.
+# A retry would turn "the commit sometimes does not happen" — the exact bug class
+# #5232 was filed about — back into a green run.
+#
+# The canary's comment is explicit that its retries = 0 is only safe BECAUSE its
+# one transient failure mode is handled by an in-test retry loop, and that half
+# does NOT come for free. These tests inherit it deliberately: `spawn_ready` in
+# post_update_probation_commit.rs retries a bind collision up to 5 times with
+# ±20% jitter, and retries ONLY that (any other early exit still panics on the
+# first attempt). Without it a lost port race would red the merge queue with no
+# retry anywhere — and these tests hold two ports for ~65s against the canary's
+# ~5s, so the exposure is over an order of magnitude larger. If that loop is
+# ever removed, this retries = 0 has to be revisited with it.
+[[profile.ci.overrides]]
+filter = "test(/probation_(is_committed|survives)/)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+retries = 0
 
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.

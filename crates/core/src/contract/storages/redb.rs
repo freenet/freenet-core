@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use freenet_stdlib::prelude::*;
 use redb::{
-    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable, StorageError,
-    TableDefinition, TransactionError, WriteTransaction,
+    Database, DatabaseError, ReadTransaction, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, StorageError, TableDefinition, TransactionError, WriteTransaction,
 };
 
 use crate::wasm_runtime::StateStorage;
@@ -219,22 +219,23 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 
 /// Durable record of the web-app contract origins under which each delegate has
 /// been registered (#4117 H1 same-origin gate). Written on EVERY successful
-/// delegate registration (both `RegisterDelegate` and
-/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
-/// Local secrets are copied into a successor ONLY when the registering request's
-/// origin is among the predecessor's recorded origins (or both are the Admin/None
-/// class).
+/// delegate registration. `SecretsStore::migrate_secrets` consults it: a
+/// predecessor's Local secrets are copied into a successor ONLY when the
+/// registering request's origin is among the predecessor's recorded origins (or
+/// both are the Admin/None class).
 ///
 /// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
 /// The registering request's `origin_contract` is itself forgeable by any HTTP
 /// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
 /// a value that matches an unrelated victim delegate's recorded origin. The
-/// actual protection today is that the copy-forward's sole caller
-/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
-/// this gate is not currently invoked in production at all. Do not treat this
-/// table as a sufficient authorization control if the copy-forward is ever
-/// re-wired; `origin_contract` attestation needs hardening first. See
-/// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.
+/// actual protection today is that `migrate_secrets` has NO caller at all: its
+/// only network-reachable one was `DelegateRequest::RegisterDelegateWithPredecessors`,
+/// which #5199 disabled and freenet-stdlib 0.9.0 then removed from the wire
+/// entirely (freenet/freenet-stdlib#91) — so this gate is not invoked in
+/// production. Do not treat this table as a sufficient authorization control if
+/// a copy-forward is ever re-wired; `origin_contract` attestation needs
+/// hardening first. See `SecretsStore::delegate_origins` and
+/// `SecretsStore::migrate_secrets`.
 ///
 /// Key: DelegateKey (64 bytes)
 /// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
@@ -263,6 +264,92 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 /// Value: single presence byte
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
+
+/// Delegate capability records (manifest, registered parameters, bound apps,
+/// lifecycle flags), written by `contract::delegate_capabilities` when an app
+/// registers a delegate that declares a manifest. Encoding is owned by that
+/// module.
+///
+/// Key: DelegateKey bytes (32) || CodeHash (32) = 64 bytes
+pub(crate) const DELEGATE_CAPABILITY_RECORDS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_capability_records");
+
+/// The user's answers to node-enforced capability prompts, per app. Encoding
+/// is owned by `contract::delegate_capabilities`.
+///
+/// Key: user scope (tag byte, plus a 32-byte user id for a hosted user) ||
+/// app identity (tag byte || id bytes) || capability code (u16 BE)
+pub(crate) const APP_CAPABILITY_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("app_capability_grants");
+
+/// Durable half of the delegate contract-subscription registry
+/// (`wasm_runtime::delegate_subscriptions`), so a delegate's subscriptions
+/// survive a node restart (#5493). One row per `(contract, delegate)` pair,
+/// written and cleared ONLY through that module's writers, which keep it in step
+/// with the in-memory registry.
+///
+/// Contract-major so per-contract teardown (contract removal) is a prefix range
+/// scan rather than a full table walk.
+///
+/// Key: ContractInstanceId (32) || DelegateKey bytes (32) || delegate CodeHash (32) = 96 bytes
+/// Value: single format-version byte ([`DELEGATE_SUBSCRIPTION_ROW_V1`])
+pub(crate) const DELEGATE_SUBSCRIPTIONS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_contract_subscriptions");
+
+/// Format version stored as the value of every [`DELEGATE_SUBSCRIPTIONS_TABLE`]
+/// row. A row with any other value is treated as corrupt and dropped at load.
+pub(crate) const DELEGATE_SUBSCRIPTION_ROW_V1: u8 = 1;
+
+/// Node-wide ceiling on persisted delegate subscriptions.
+///
+/// The in-memory registry bounds each delegate at
+/// `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE` (256) but has no node-wide bound,
+/// because the number of delegates is not bounded on every registration path
+/// (see that constant's doc). The durable copy must not inherit that: it is
+/// read in full at every boot, so it gets its own absolute ceiling. 4096 rows
+/// is 16 delegates at their full per-delegate cap, orders of magnitude above
+/// legitimate use (River holds single digits per user, Harvest 4-5 per seller),
+/// and 4096 * 96 bytes is under 400 KiB on disk.
+///
+/// At the ceiling the table stays FAIR rather than first-come: a new row
+/// displaces one row of the delegate holding the most, provided that delegate
+/// holds more than one row more than the newcomer's (see
+/// [`ReDb::record_delegate_subscription`]). Otherwise the new subscription still
+/// works for the life of the process and is only not persisted, which is
+/// logged. Refusing the in-memory subscription instead would turn a durability
+/// bound into a functional one.
+pub(crate) const MAX_DURABLE_DELEGATE_SUBSCRIPTIONS: u64 = 4096;
+
+/// What [`ReDb::record_delegate_subscription`] did with the new row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DurableRecord {
+    /// Written (or already present).
+    Recorded,
+    /// Written at the ceiling by displacing one row of this delegate, the one
+    /// holding the most rows. The displaced subscription still works in memory
+    /// but will not survive a restart.
+    RecordedDisplacing(DelegateKey),
+    /// Not written: at the ceiling and no delegate holds disproportionately more
+    /// than this one.
+    Refused,
+}
+
+/// What [`ReDb::load_delegate_subscriptions`] found.
+#[derive(Debug, Default)]
+pub(crate) struct DurableDelegateSubscriptions {
+    /// Well-formed rows, in key order, at most `max_rows` of them.
+    pub valid: Vec<(ContractInstanceId, DelegateKey)>,
+    /// Raw keys of rows with the wrong key length: garbage under any format,
+    /// so the caller deletes them rather than re-reading them forever.
+    pub malformed: Vec<Vec<u8>>,
+    /// Count of rows with a correct key but an unknown format byte. Skipped and
+    /// deliberately NOT deleted: a later version may have written them, and an
+    /// auto-update rollback to this binary must not destroy its data.
+    pub unknown_version: usize,
+    /// Count of well-formed rows beyond `max_rows`. Skipped, NOT deleted, for
+    /// the same reason (a later version may have raised the ceiling).
+    pub excess: usize,
+}
 
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
@@ -1042,6 +1129,39 @@ impl ReDb {
                 );
                 e
             })?;
+
+            // Delegate capabilities: manifests + app grants. Created on first
+            // open of upgraded databases too.
+            for (table, name) in [
+                (
+                    DELEGATE_CAPABILITY_RECORDS_TABLE,
+                    "DELEGATE_CAPABILITY_RECORDS_TABLE",
+                ),
+                (APP_CAPABILITY_GRANTS_TABLE, "APP_CAPABILITY_GRANTS_TABLE"),
+            ] {
+                txn.open_table(table).map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        table = name,
+                        phase = "table_init_failed",
+                        "Failed to open delegate capability table"
+                    );
+                    e
+                })?;
+            }
+
+            // Durable delegate subscriptions (#5493). Created empty on first
+            // open of upgraded databases too, so an older database gains the
+            // table without disturbing any existing one.
+            txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_SUBSCRIPTIONS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_SUBSCRIPTIONS_TABLE"
+                );
+                e
+            })?;
         }
         txn.commit()?;
         Ok(db)
@@ -1178,25 +1298,22 @@ impl ReDb {
         })
     }
 
-    /// Store a contract's state synchronously.
+    /// Store a contract's state synchronously. Test-only.
     ///
     /// This is the same as `StateStorage::store` but without the async wrapper
-    /// and **without hosting metadata updates**. States written through this path
-    /// will not have `last_access_ms`, `access_type`, `state_size`, or `code_hash`
-    /// metadata tracked, meaning they won't be part of the hosting cache on restart.
+    /// and **without hosting metadata updates**: `last_access_ms`,
+    /// `access_type`, `state_size` and `code_hash` are not recorded, so a state
+    /// written this way is not part of the hosting cache on restart. Tests use
+    /// it to seed on-disk state in exactly that shape.
     ///
-    /// Used by V2 delegate host functions that need synchronous writes during
-    /// WASM `process()` execution. Hosting metadata integration is a follow-up.
-    ///
-    /// CHANGE-DETECTOR INVARIANT (future writers, read before using this): any
-    /// contract-state write that BYPASSES `StateStore` (as this raw sync write
-    /// does) MUST invalidate `StateStore`'s change-detector via
-    /// `StateCacheInvalidator` (and the moka state-bytes cache), or the
+    /// Its production caller was the delegate `put_contract_state` host
+    /// function, removed in #5637 because a write through here bypasses
+    /// `StateStore` and so skips the executor chokepoints' side effects. Before
+    /// giving this a production caller again: such a write MUST also invalidate
+    /// `StateStore`'s change-detector and moka state-bytes cache, or the
     /// summarize/delta fast path can serve a STALE summary/delta against the
-    /// new state → peer state divergence (#4621). The V2 delegate callers
-    /// (`put_contract_state_sync` / `update_contract_state_sync`) do this via
-    /// the runtime's `state_write_callback`. A new caller of this method (e.g.
-    /// the #4592 live-import work) must wire the same invalidation.
+    /// new state → peer state divergence (#4621).
+    #[cfg(test)]
     pub fn store_state_sync(
         &self,
         key: &ContractKey,
@@ -1210,42 +1327,11 @@ impl ReDb {
         Self::commit_guarded(txn)
     }
 
-    /// Atomically update a contract's state, failing if no prior state exists.
-    ///
-    /// Performs the existence check and write in a single write transaction to
-    /// eliminate the TOCTOU window that would exist with separate read + write.
-    /// Used by V2 delegate UPDATE host function.
-    ///
-    /// **Does not update hosting metadata** (same caveat as `store_state_sync`).
-    ///
-    /// CHANGE-DETECTOR INVARIANT: like `store_state_sync`, this bypasses
-    /// `StateStore`, so any caller MUST invalidate the `StateStore`
-    /// change-detector via `StateCacheInvalidator` or summarize/delta can serve
-    /// a stale result → peer state divergence (#4621). See `store_state_sync`.
-    pub fn update_state_sync(
-        &self,
-        key: &ContractKey,
-        state: WrappedState,
-    ) -> Result<bool, redb::Error> {
-        let txn = self.begin_write()?;
-        {
-            let mut tbl = txn.open_table(STATE_TABLE)?;
-            // Check existence within the same write transaction
-            let exists = tbl.get(key.as_bytes())?.is_some();
-            if !exists {
-                return Ok(false);
-            }
-            tbl.insert(key.as_bytes(), state.as_ref())?;
-        }
-        Self::commit_guarded(txn)?;
-        Ok(true)
-    }
-
     /// Read a contract's state synchronously.
     ///
     /// This is the same as `StateStorage::get` but without the async wrapper.
-    /// Used by V2 delegate host functions that need synchronous access during
-    /// WASM `process()` execution.
+    /// Used by the delegate `local_contract_state` host function, which runs
+    /// synchronously inside WASM `process()` execution.
     pub fn get_state_sync(&self, key: &ContractKey) -> Result<Option<WrappedState>, redb::Error> {
         self.read_guarded(|txn| {
             let tbl = txn.open_table(STATE_TABLE)?;
@@ -1822,6 +1908,121 @@ impl ReDb {
         Ok(wrote)
     }
 
+    // ==================== Delegate Capability Methods ====================
+    // Raw byte storage for `contract::delegate_capabilities`, which owns the
+    // encoding. Two tables, both small: one row per manifest-declaring
+    // delegate, one per (app, capability) the user answered.
+
+    pub(crate) fn put_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            tbl.insert(key.as_slice(), value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    pub(crate) fn get_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            Ok(tbl.get(key.as_slice())?.map(|v| v.value().to_vec()))
+        })
+    }
+
+    pub(crate) fn remove_delegate_capability_record(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            tbl.remove(key.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Every record, skipping rows whose key is not 64 bytes.
+    pub(crate) fn load_all_delegate_capability_records(
+        &self,
+    ) -> Result<Vec<(DelegateKey, Vec<u8>)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_CAPABILITY_RECORDS_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let k = key.value();
+                let (Ok(dk), Ok(ch)) = (
+                    <[u8; 32]>::try_from(&k[..k.len().min(32)]),
+                    <[u8; 32]>::try_from(&k[k.len().min(32)..]),
+                ) else {
+                    continue;
+                };
+                out.push((
+                    DelegateKey::new(dk, CodeHash::new(ch)),
+                    value.value().to_vec(),
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn put_app_capability_grant(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            tbl.insert(key, value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    pub(crate) fn get_app_capability_grant(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            Ok(tbl.get(key)?.map(|v| v.value().to_vec()))
+        })
+    }
+
+    pub(crate) fn remove_app_capability_grant(&self, key: &[u8]) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            tbl.remove(key)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn load_all_app_capability_grants(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(APP_CAPABILITY_GRANTS_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                out.push((key.value().to_vec(), value.value().to_vec()));
+            }
+            Ok(out)
+        })
+    }
+
     /// Fetch `delegate`'s FIRST-registration origin as `(has_admin_none,
     /// origins)`, or `None` if the delegate has never been registered on this
     /// node (the NoProvenance case — copy-forward refuses). With first-writer
@@ -2033,6 +2234,348 @@ impl ReDb {
             }
             Ok(result)
         })
+    }
+
+    // ==================== Delegate Subscription Methods ====================
+    // Durable half of `wasm_runtime::delegate_subscriptions` (#5493). Called
+    // only from that module, which owns keeping it in step with memory.
+
+    fn delegate_subscription_row_key(
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> [u8; 96] {
+        let mut key = [0u8; 96];
+        key[..32].copy_from_slice(contract.as_ref());
+        key[32..].copy_from_slice(&Self::delegate_key64(delegate));
+        key
+    }
+
+    /// Inclusive bounds covering every row for `contract`.
+    fn delegate_subscription_contract_range(contract: &ContractInstanceId) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..32].copy_from_slice(contract.as_ref());
+        let mut hi = [0xffu8; 96];
+        hi[..32].copy_from_slice(contract.as_ref());
+        (lo, hi)
+    }
+
+    /// Decode a row KEY. `None` only for a wrong length; the value (format
+    /// byte) is judged separately so an unknown version can be skipped without
+    /// being deleted.
+    fn decode_delegate_subscription_key(key: &[u8]) -> Option<(ContractInstanceId, DelegateKey)> {
+        if key.len() != 96 {
+            return None;
+        }
+        let contract: [u8; 32] = key[..32].try_into().ok()?;
+        let delegate: [u8; 32] = key[32..64].try_into().ok()?;
+        let code_hash: [u8; 32] = key[64..].try_into().ok()?;
+        Some((
+            ContractInstanceId::new(contract),
+            DelegateKey::new(delegate, CodeHash::new(code_hash)),
+        ))
+    }
+
+    /// Persist `(contract, delegate)`, and drop `evicted`'s row for the same
+    /// delegate in the SAME transaction when the registry evicted one to admit
+    /// it, so the cap can never be exceeded on disk by a crash between two
+    /// writes.
+    ///
+    /// At `max_rows` the table stays fair: the delegate holding the most rows
+    /// gives one up to the newcomer if it holds more than one row more than the
+    /// newcomer's delegate does; otherwise the new row is refused. The scan
+    /// that decides this runs only at the ceiling, over at most `max_rows`
+    /// rows. The eviction, if any, is applied in every case.
+    ///
+    /// The per-delegate cap is also enforced ON DISK (`per_delegate_cap`).
+    /// Rows outlive their in-memory entry when a contract is removed for
+    /// housekeeping (the row is kept so the next boot re-subscribes), and the
+    /// in-memory cap cannot see those rows, so without this a delegate's rows
+    /// could grow past its cap one eviction at a time. When a new row would
+    /// take the delegate to the cap, one of its rows whose subscription is no
+    /// longer live in memory (`is_live` false) is dropped first. The scan runs
+    /// only when the whole table already holds at least `per_delegate_cap`
+    /// rows, so a node with few subscriptions never pays it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+        evicted: Option<&ContractInstanceId>,
+        max_rows: u64,
+        per_delegate_cap: usize,
+        is_live: &dyn Fn(&ContractInstanceId) -> bool,
+    ) -> Result<DurableRecord, redb::Error> {
+        let row = Self::delegate_subscription_row_key(contract, delegate);
+        let txn = self.begin_write()?;
+        let outcome;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut freed_own_row = false;
+            if let Some(evicted) = evicted {
+                let evicted_row = Self::delegate_subscription_row_key(evicted, delegate);
+                freed_own_row = tbl.remove(evicted_row.as_slice())?.is_some();
+            }
+            let present = tbl.get(row.as_slice())?.is_some();
+            // The scan is skipped when this call already freed one of the
+            // delegate's own rows (a cap eviction): its count is then unchanged
+            // by the insert. That keeps the scan out of the path a delegate at
+            // its cap drives on every subscribe. It cannot let the count grow;
+            // a count ALREADY over the cap (not produced by this code, e.g. an
+            // older version's rows) is trimmed by restore at the next boot.
+            if !present && !freed_own_row && tbl.len()? >= per_delegate_cap as u64 {
+                let mine = Self::delegate_key64(delegate);
+                let mut own_rows: Vec<Vec<u8>> = Vec::new();
+                for entry in tbl.iter()? {
+                    let (k, v) = entry?;
+                    let key = k.value();
+                    // Only this version's rows: another version's are never
+                    // dropped by this binary (forward compatibility).
+                    if key.len() == 96
+                        && key[32..] == mine
+                        && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                    {
+                        own_rows.push(key.to_vec());
+                    }
+                }
+                if own_rows.len() >= per_delegate_cap {
+                    let stale = own_rows.iter().find(|key| {
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(&key[..32]);
+                        !is_live(&ContractInstanceId::new(id))
+                    });
+                    // With `is_live` answering from the index the in-memory cap
+                    // counts, at least one row must be stale here (memory holds
+                    // at most the cap, and the new pair is not on disk yet).
+                    // The fallback only keeps the on-disk cap exact if that
+                    // ever stops holding.
+                    if let Some(victim) = stale.or(own_rows.first()) {
+                        tbl.remove(victim.as_slice())?;
+                    }
+                }
+            }
+            if present {
+                // Includes a row another version wrote for this pair: it is
+                // left as is (never overwritten), so after a rollback this
+                // binary does not restore that one pair. Accepted: a rollback
+                // is transient and the alternative destroys newer data.
+                outcome = DurableRecord::Recorded;
+            } else if tbl.len()? < max_rows {
+                tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
+                outcome = DurableRecord::Recorded;
+            } else {
+                // Fair share at the ceiling. Count rows per delegate and find
+                // the heaviest holder, remembering one of its rows to give up.
+                // Only this version's rows count and can be displaced: another
+                // version's are never dropped by this binary.
+                let mine = Self::delegate_key64(delegate);
+                let mut counts: std::collections::HashMap<[u8; 64], usize> =
+                    std::collections::HashMap::new();
+                for entry in tbl.iter()? {
+                    let (k, v) = entry?;
+                    let key = k.value();
+                    if key.len() != 96 || v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] {
+                        continue;
+                    }
+                    let mut holder = [0u8; 64];
+                    holder.copy_from_slice(&key[32..]);
+                    *counts.entry(holder).or_insert(0) += 1;
+                }
+                let my_count = counts.get(&mine).copied().unwrap_or(0);
+                let heaviest = counts
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                    .map(|(holder, n)| (*holder, *n));
+                // Second pass only when a displacement will happen, to find one
+                // of the heaviest holder's rows without allocating per row.
+                let victim = match heaviest {
+                    Some((holder, n)) if holder != mine && n > my_count + 1 => {
+                        let mut found = None;
+                        for entry in tbl.iter()? {
+                            let (k, v) = entry?;
+                            let key = k.value();
+                            if key.len() == 96
+                                && key[32..] == holder
+                                && v.value() == [DELEGATE_SUBSCRIPTION_ROW_V1]
+                            {
+                                found = Some(key.to_vec());
+                                break;
+                            }
+                        }
+                        found.map(|victim| (holder, victim))
+                    }
+                    _ => None,
+                };
+                match victim {
+                    Some((holder, victim)) => {
+                        tbl.remove(victim.as_slice())?;
+                        tbl.insert(row.as_slice(), [DELEGATE_SUBSCRIPTION_ROW_V1].as_slice())?;
+                        let mut dk = [0u8; 32];
+                        dk.copy_from_slice(&holder[..32]);
+                        let mut ch = [0u8; 32];
+                        ch.copy_from_slice(&holder[32..]);
+                        outcome = DurableRecord::RecordedDisplacing(DelegateKey::new(
+                            dk,
+                            CodeHash::new(ch),
+                        ));
+                    }
+                    None => outcome = DurableRecord::Refused,
+                }
+            }
+        }
+        Self::commit_guarded(txn)?;
+        Ok(outcome)
+    }
+
+    /// Drop exactly one persisted `(contract, delegate)` row. Reached only
+    /// from the (currently test-only) single-pair `unsubscribe` (#5600).
+    #[cfg(test)]
+    pub(crate) fn remove_delegate_subscription(
+        &self,
+        contract: &ContractInstanceId,
+        delegate: &DelegateKey,
+    ) -> Result<(), redb::Error> {
+        let row = Self::delegate_subscription_row_key(contract, delegate);
+        let present = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            Ok(tbl.get(row.as_slice())?.is_some())
+        })?;
+        if !present {
+            return Ok(());
+        }
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            tbl.remove(row.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Drop every persisted row for `contract`. Returns how many were dropped.
+    ///
+    /// Checks with a READ transaction first and returns without writing when
+    /// there is nothing to drop. This runs on every contract removal, and a
+    /// node with no delegate subscriptions must not pay a write transaction
+    /// (and its fsync) per eviction for a table it never uses.
+    pub(crate) fn remove_delegate_subscriptions_for_contract(
+        &self,
+        contract: &ContractInstanceId,
+    ) -> Result<usize, redb::Error> {
+        let (lo, hi) = Self::delegate_subscription_contract_range(contract);
+        let rows: Vec<Vec<u8>> = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut rows = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _) = entry?;
+                rows.push(k.value().to_vec());
+            }
+            Ok(rows)
+        })?;
+        self.remove_delegate_subscription_rows(&rows)?;
+        Ok(rows.len())
+    }
+
+    /// Drop every persisted row for `delegate`. Returns how many were dropped.
+    ///
+    /// A full scan, deliberately: the table is bounded by
+    /// [`MAX_DURABLE_DELEGATE_SUBSCRIPTIONS`] and this runs only on
+    /// `UnregisterDelegate`, so a second, delegate-major index kept in step
+    /// with the first would cost more in consistency risk than it saves.
+    /// Read-then-write for the same inertness reason as the per-contract form.
+    pub(crate) fn remove_delegate_subscriptions_for_delegate(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<usize, redb::Error> {
+        let suffix = Self::delegate_key64(delegate);
+        let rows: Vec<Vec<u8>> = self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut rows = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, _) = entry?;
+                let key = k.value();
+                if key.len() == 96 && key[32..] == suffix {
+                    rows.push(key.to_vec());
+                }
+            }
+            Ok(rows)
+        })?;
+        self.remove_delegate_subscription_rows(&rows)?;
+        Ok(rows.len())
+    }
+
+    /// Delete the given raw rows in one transaction. No-op (no write
+    /// transaction) for an empty slice.
+    pub(crate) fn remove_delegate_subscription_rows(
+        &self,
+        rows: &[Vec<u8>],
+    ) -> Result<(), redb::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            for row in rows {
+                tbl.remove(row.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Read the persisted subscriptions, at most `max_rows` valid ones.
+    ///
+    /// Never fails on a bad ROW: wrong-length rows are reported in
+    /// [`DurableDelegateSubscriptions::malformed`] for the caller to delete;
+    /// unknown-version rows and rows past `max_rows` are counted and left in
+    /// place (forward compatibility). Fails only when the table
+    /// itself cannot be read, and a caller must treat that as "unknown", not as
+    /// "empty" (deleting on a transient read error would drop every delegate's
+    /// subscriptions).
+    pub(crate) fn load_delegate_subscriptions(
+        &self,
+        max_rows: usize,
+    ) -> Result<DurableDelegateSubscriptions, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            let mut out = DurableDelegateSubscriptions::default();
+            for entry in tbl.iter()? {
+                let (k, v) = entry?;
+                match Self::decode_delegate_subscription_key(k.value()) {
+                    None => out.malformed.push(k.value().to_vec()),
+                    Some(_) if v.value() != [DELEGATE_SUBSCRIPTION_ROW_V1] => {
+                        out.unknown_version += 1
+                    }
+                    Some(pair) if out.valid.len() < max_rows => out.valid.push(pair),
+                    Some(_) => out.excess += 1,
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Insert a raw row, bypassing every check. Test-only: lets tests plant
+    /// corrupt or over-cap tables that the real writers can never produce.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_delegate_subscription_row(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            tbl.insert(key, value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Number of persisted delegate-subscription rows. Test-only.
+    #[cfg(test)]
+    pub(crate) fn delegate_subscription_row_count(&self) -> u64 {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_SUBSCRIPTIONS_TABLE)?;
+            Ok(tbl.len()?)
+        })
+        .expect("count delegate subscription rows")
     }
 }
 
@@ -2921,7 +3464,12 @@ mod tests {
     /// rule that a failed origin record must ABORT the whole registration (a
     /// registered-but-recordless delegate has a claimable first-writer slot).
     /// Uses the fault-injecting backend to produce a REAL redb I/O failure.
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn record_delegate_origin_first_writer_surfaces_backend_failure() {
         let backend = FailingBackend::new();
         let db = open_redb_with_backend(backend.clone());
@@ -3176,7 +3724,12 @@ mod tests {
     /// the real underlying-I/O / poison errors and NOT on benign app-level errors.
     /// Uses REAL redb errors produced via the fault-injecting backend, so it is
     /// resilient to redb wording changes (we match variants, not strings).
+    /// `#[serial(redb_poison_recovery)]`: poisons a backend, which increments
+    /// the process-global `POISON_RECOVERY_TRIGGERED`. Overlapping
+    /// `poisoned_redb_takes_recovery_path_benign_does_not`'s
+    /// store-zero/assert-zero window makes that test fail. See its doc.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn redb_poison_classifier_is_precise() {
         let backend = FailingBackend::new();
         let db = Database::builder()
@@ -3263,13 +3816,262 @@ mod tests {
         );
     }
 
+    /// Every TEST that drives the redb fault injector must carry the
+    /// `redb_poison_recovery` serial key — enforced across the whole crate, not
+    /// just this module.
+    ///
+    /// The tag on any one test is worth nothing on its own. The counter these
+    /// tests contend over, `POISON_RECOVERY_TRIGGERED`, is process-global, and
+    /// `serial_test` serializes on the KEY rather than the module — so a single
+    /// untagged user anywhere in the crate can still land inside the benign
+    /// test's store-zero/assert-zero window and make it fail. That is exactly
+    /// what happened: three tests in this module were tagged and a fourth,
+    /// `register_aborts_when_origin_record_fails_then_recovers` over in
+    /// `contract::executor::runtime`, was missed, which NARROWED the race
+    /// instead of closing it. A reviewer caught it; nothing in the tree would
+    /// have.
+    ///
+    /// So this pin walks `src/` from disk rather than using `include_str!`. A
+    /// fixed list of files is the same defect one level up: the next user of the
+    /// injector will be in a file nobody thought to add. Any test that so much
+    /// as mentions `FailingBackend` or `start_failing(` must be tagged, and
+    /// over-inclusion is the deliberate bias — a spurious tag costs a little
+    /// serialization, a missing one costs an intermittent failure that CI
+    /// cannot see (`cargo nextest` gives each test its own process; see
+    /// `.claude/rules/testing.md`).
+    #[test]
+    fn every_test_using_the_failure_injector_is_serialized() {
+        const INJECTOR_MARKERS: [&str; 2] = ["FailingBackend", "start_failing("];
+        const SERIAL_KEY: &str = "serial(redb_poison_recovery)";
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "the walk found only {} files under {}; if the layout moved, FIX THE \
+             WALK rather than letting this pin pass vacuously",
+            files.len(),
+            src.display()
+        );
+
+        let mut untagged = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            for (attrs, name, body) in functions_with_attributes(&text) {
+                let is_test = attrs.contains("test]") || attrs.contains("test(");
+                if !is_test {
+                    continue;
+                }
+                // This pin names the markers in its own source, so it matches
+                // itself. Excluded by name rather than by weakening the search.
+                if name == "every_test_using_the_failure_injector_is_serialized" {
+                    continue;
+                }
+                if !INJECTOR_MARKERS.iter().any(|m| body.contains(m)) {
+                    continue;
+                }
+                checked += 1;
+                if !attrs.contains(SERIAL_KEY) {
+                    untagged.push(format!("{}::{name}", path.display()));
+                }
+            }
+        }
+
+        // The pin must not pass because it found nothing to look at.
+        assert!(
+            checked >= 4,
+            "expected at least the four known injector tests, found {checked}; a \
+             parser that matches nothing would report success forever"
+        );
+        assert!(
+            untagged.is_empty(),
+            "these tests drive the redb fault injector without \
+             `#[serial_test::serial(redb_poison_recovery)]`, so they can run \
+             concurrently with the poison-recovery tests and corrupt the \
+             process-global POISON_RECOVERY_TRIGGERED counter they share: {untagged:#?}"
+        );
+    }
+
+    /// Blank out string literals and `//` comments so brace counting sees only
+    /// code. Handles escapes and raw strings (`r"..."`, `r#"..."#`).
+    fn strip_strings_and_comments(line: &str) -> String {
+        let bytes: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            // Raw string: r, then any number of #, then a quote.
+            if c == 'r' {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < bytes.len() && bytes[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == '"' {
+                    let close: String = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', hashes))
+                        .collect();
+                    let rest: String = bytes[j + 1..].iter().collect();
+                    match rest.find(&close) {
+                        Some(end) => {
+                            i = j + 1 + end + close.len();
+                            continue;
+                        }
+                        // Unterminated on this line: the rest is string.
+                        None => break,
+                    }
+                }
+            }
+            if c == '"' {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\'' {
+                // Char literal or a lifetime. Only skip when it looks like a
+                // literal, so `'static` does not swallow the rest of the line.
+                if i + 2 < bytes.len() && bytes[i + 1] == '\\' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != '\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if i + 2 < bytes.len() && bytes[i + 2] == '\'' {
+                    i += 3;
+                    continue;
+                }
+            }
+            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == '/' {
+                break;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Split Rust source into `(attributes, name, body)` for every `fn`.
+    ///
+    /// Braces are counted only on text with string literals and line comments
+    /// removed, which is not cosmetic: `export_dispatch_arm_defers_off_loop` in
+    /// `contract::executor::runtime` embeds an unbalanced `{` inside a string
+    /// literal, so a naive counter never closes that function and runs its
+    /// "body" to end of file — reporting it, and everything after it, as an
+    /// injector user. The first version of this pin did exactly that.
+    ///
+    /// Where it is still crude the bias is deliberately toward over-matching: a
+    /// spurious hit costs a serial tag on a test that did not need one, and is
+    /// visible. Under-matching would silently drop a function from the sweep,
+    /// which is the failure this pin exists to prevent.
+    fn functions_with_attributes(text: &str) -> Vec<(String, String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut attrs = String::new();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim_start();
+            if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
+                attrs.push_str(line);
+                attrs.push('\n');
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.contains("fn ") {
+                let after_fn = line
+                    .strip_prefix("pub ")
+                    .unwrap_or(line)
+                    .strip_prefix("async ")
+                    .map(|rest| rest.strip_prefix("fn ").unwrap_or(rest))
+                    .or_else(|| line.split_once("fn ").map(|(_, rest)| rest));
+                if let Some(rest) = after_fn {
+                    let name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        let mut depth = 0i32;
+                        let mut body = String::new();
+                        let mut started = false;
+                        for l in &lines[i..] {
+                            body.push_str(l);
+                            body.push('\n');
+                            let code = strip_strings_and_comments(l);
+                            depth += code.matches('{').count() as i32;
+                            depth -= code.matches('}').count() as i32;
+                            if code.contains('{') {
+                                started = true;
+                            }
+                            if started && depth <= 0 {
+                                break;
+                            }
+                        }
+                        out.push((std::mem::take(&mut attrs), name, body));
+                        continue;
+                    }
+                }
+            }
+            attrs.clear();
+        }
+        out
+    }
+
     /// End-to-end (issue #4604, requirement 3): a poisoned database routes contract
     /// ops to the recovery path (process-exit-for-restart in production) rather than
     /// failing forever, while a benign not-found does NOT. The recovery handler is
     /// opt-in and OFF in tests, so it returns instead of exiting; the test-only
     /// counter proves the `begin_*` wrapper recognised the poison and would have
     /// exited under the real node binary.
+    /// `#[serial(redb_poison_recovery)]` because this test asserts on
+    /// `POISON_RECOVERY_TRIGGERED`, a PROCESS-GLOBAL counter that the `begin_*`
+    /// choke points increment for ANY poisoned handle in the process. Three
+    /// tests in this module poison a backend
+    /// (`record_delegate_origin_first_writer_surfaces_backend_failure`,
+    /// `redb_poison_classifier_is_precise`, and this one), so under the default
+    /// multi-threaded runner a sibling's increment lands inside another's
+    /// store-zero/assert-zero window and fails it.
+    ///
+    /// Measured, not theorised: 1 failure in 15 full-suite runs of
+    /// `cargo test --lib`, as
+    /// `assertion left == right failed: benign not-found / normal ops must NOT
+    /// take the poison-recovery path, left: 1, right: 0`. It is invisible under
+    /// `cargo nextest` at any repeat count, because nextest gives every test its
+    /// own process and the interference needs two tests in ONE — the exact
+    /// blindness `.claude/rules/testing.md` describes, and the reason CI never
+    /// caught it. Same shape and same fix as the version-discovery statics in
+    /// `transport.rs`.
     #[test]
+    #[serial_test::serial(redb_poison_recovery)]
     fn poisoned_redb_takes_recovery_path_benign_does_not() {
         use std::sync::atomic::Ordering;
 

@@ -193,36 +193,133 @@ Contracts/delegates call into the host via registered functions:
 
 ### Namespaces
 
-| Namespace | Purpose | Version |
-|-----------|---------|---------|
-| `freenet_log` | Logging | V1, V2 |
-| `freenet_random` | RNG | V1, V2 |
-| `freenet_time` | UTC timestamp | V1, V2 |
-| `freenet_delegate_context` | Delegate state | V1, V2 |
-| `freenet_delegate_secrets` | Secret storage | V1, V2 |
-| `freenet_delegate_contracts` | Contract access | V2 only |
+| Namespace | Purpose |
+|-----------|---------|
+| `freenet_log` | Logging |
+| `freenet_rand` | RNG |
+| `freenet_time` | UTC timestamp (**delegates only; deprecated for contracts**, see below) |
+| `freenet_contract_io` | Buffer fill for contract/delegate I/O |
+| `freenet_delegate_ctx` | Delegate state |
+| `freenet_delegate_secrets` | Secret storage |
+| `freenet_delegate_contracts` | Read-only lookup of contract state this node holds (`__frnt__delegate__get_contract_state`, `_len`); no writes, see below |
+| `freenet_delegate_management` | Delegate creation from a delegate |
 
-### Delegate API Versions
+These are the names the linker registers
+(`crates/core/src/wasm_runtime/engine/wasmtime_engine.rs`); import resolution is
+byte-exact, so a name that differs from this table by one character is a name no
+module can import.
 
-**V1 (Synchronous):**
-- Delegates use request/response pattern for contract access
-- All host functions are synchronous
-- Thread-local state via `CURRENT_DELEGATE_INSTANCE`
+### Contracts must not read the host clock
 
-**V2 (Async Host Functions):**
-- Delegates call `ctx.get_contract_state()` directly
-- Host functions registered as async (via `func_wrap_async`)
-- ReDb reads wrapped in async blocks
-- Requires wasmtime's `async_support(true)`
+**A contract must not call `freenet_time::__frnt__time__utc_now`.** Doing so is
+deprecated as of this release. In a future release the call will **trap**: the
+contract still loads, but any actual call to the clock fails that operation with
+a diagnosable error (issue #5465). Delegates are unaffected and may keep using
+it.
 
-**Detection:**
-```rust
-if module.imports().any(|i| i.module() == "freenet_delegate_contracts") {
-    // V2 delegate - use call_3i64_async_imports()
-} else {
-    // V1 delegate - use call_3i64()
-}
-```
+Trapping is per-*call*, which is why it was chosen over refusing to load the
+module. A contract that imports the symbol but never reaches it on a live path
+keeps working and does not need to be rebuilt or re-keyed — and since a
+contract's address is a function of its code and parameters, a re-key would mean
+link rot for a web container rather than a republish.
+
+#### Why
+
+A contract's `update_state` is required to be a function of its inputs. That is
+not a style preference, it is the reason replicas converge: two peers given the
+same updates in any order have to arrive at the same state, and the merge laws
+(`freenet::conformance`) are the statement of that requirement. A merge that
+reads the wall clock is not a function of its inputs, so those laws are not
+merely violated by such a contract; they are not well-formed statements about
+it. Two peers whose clocks differ by eleven minutes can produce different states
+from the same delta, and neither of them is wrong.
+
+This is not hypothetical. Among the deployed contracts measured for issue #5465,
+11 do not merely *reject* future-dated entries but silently **prune** them
+inside `update_state`, so the resulting state is a function of the evaluating
+peer's clock. That is the exact defect class contract conformance exists to
+detect, produced by the capability rather than prevented by it.
+
+The clock is not fixable by feeding the contract the operation's timestamp
+instead. Every measured use is "reject if a signed timestamp is later than now
+plus K", and an originator-supplied `now` is attacker-controlled: set it high
+and the check passes. Determinism and trustworthiness are in direct conflict for
+this check, and these contracts need the trustworthy one, which means it does
+not belong inside the merge at all.
+
+#### What to do instead
+
+**Carry a client-signed timestamp in the state, and have the contract enforce
+only monotonicity.** The timestamp becomes part of the signed payload rather
+than something the contract reads from its host, so every peer evaluating the
+same update sees the same value and reaches the same state.
+
+`freenet-weather` is the worked example: `BeaconState.timestamp_ms` is signed by
+the client, and the contract's only check is `new > current`. There is no clock
+call anywhere in it.
+
+For the two shapes that show up in practice:
+
+- **Anti-grief on a per-author log** (the common case): cap the log by count, or
+  key it on a monotonic counter. A client-supplied timestamp is an untrusted
+  hint for ordering and ranking; it should not be an eviction key.
+- **Capability expiry** (rare, and the genuinely hard one): there is no clean
+  in-contract substitute, because the party asserting the time is the party
+  being checked. The available shapes are sequence numbers plus a revocation
+  record, or enforcing expiry outside the contract.
+
+#### How to check a contract
+
+- `fdev verify-merge --wasm contract.wasm --state s1.bin --state s2.bin` reports
+  a `host_clock_import` **code diagnostic** when the module imports the clock.
+  It is a diagnostic, not a violation: it does not fail the command today, and
+  it is never grounds for removing a contract from the network.
+- A node logs a warning naming the contract key the first time it loads a
+  clock-reading contract.
+
+Both answers come from the same detector
+(`freenet::conformance::host_clock::imports_host_clock`), so the
+developer-facing answer and the node-facing answer cannot disagree.
+
+Both are **import**-level: a module that imports the function without calling it
+is reported too. That superset is deliberate and it is what makes the phasing
+safe. The warning fires on any import; the later trap fires on any actual call;
+a call cannot happen without the import, so nothing traps that was not warned
+about first. No call-graph analysis is involved at either stage, and in
+particular the check is not scoped to a subset of the entry points — a clock
+read reached from `validate_state` makes two peers disagree about whether an
+update is *acceptable*, which is a convergence problem of a different shape
+rather than a non-problem, and the census behind #5465 found `validate_state` to
+be the most common route of all.
+
+#### Delegates are unaffected
+
+A delegate holds private per-node state, is never replicated, and has no merge
+laws, so reading the clock in one raises no convergence question at all. A
+deployed delegate does exactly this to do hourly rate limiting, and that is
+fine.
+
+The namespace stays registered for both, and an earlier version of this plan
+that required splitting the contract and delegate linkers has been dropped. That
+split was only needed to enforce the rule at *import resolution*, which happens
+when the module is instantiated — a point at which the engine has no
+contract-vs-delegate parameter to consult. Enforcing at the *call* moves the
+decision to where the host already knows which instance is calling, so one
+linker still serves both.
+
+### Delegate contract access
+
+Delegates reach contract state through outbound messages (`GetContractRequest`,
+`PutContractRequest`, `UpdateContractRequest`, `SubscribeContractRequest`),
+which the contract-handling loop serves through the executor's normal path.
+The one exception is a read-only host function pair,
+`__frnt__delegate__get_contract_state` / `..._len`, which returns the state
+this node already holds and never reaches the network.
+
+There is no separate "V2" delegate API. Host functions that wrote contract
+state directly were removed in #5637: they bypassed the executor's state-store
+chokepoints, so their side effects had to be copied by hand, and two copies
+were missed in production (#4683, #5479).
 
 ## Async Execution
 
@@ -230,7 +327,7 @@ if module.imports().any(|i| i.module() == "freenet_delegate_contracts") {
 
 **Configuration:**
 ```rust
-wasmtime_config.async_support(true);  // Required for V2 delegates
+wasmtime_config.async_support(true);  // Required by `func_wrap_async` host functions
 ```
 
 **Implication:**
@@ -257,9 +354,13 @@ Contract operations use `spawn_blocking` with timeout:
 fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where F: FnOnce() -> WasmResult + Send + 'static
 {
-    // 1. Spawn blocking task (tokio or std::thread)
-    // 2. Poll for completion with 10ms interval
-    // 3. Return Timeout if exceeded
+    // 1. Spawn blocking task (tokio or std::thread); the job sends its
+    //    result over a capacity-1 channel when it finishes
+    // 2. Wait on that channel with recv_timeout (inside one block_in_place on
+    //    a multi-thread runtime), waking on completion or at a wall bound
+    // 3. At a bound: QueuedTimeout if the job never started (queue bound =
+    //    budget), Timeout if it ran past its guest bound (the epoch-trap
+    //    window plus a margin, so the epoch trap normally wins)
     // 4. Store is moved into/out of blocking context
 }
 ```
@@ -306,9 +407,6 @@ pub(crate) trait WasmEngine: Send {
     // Compilation
     fn compile(&mut self, code: &[u8]) -> Result<Self::Module, WasmError>;
 
-    // Module inspection
-    fn module_has_async_imports(&self, module: &Self::Module) -> bool;
-
     // Instance lifecycle
     fn create_instance(...) -> Result<InstanceHandle, WasmError>;
     fn drop_instance(&mut self, handle: &InstanceHandle);
@@ -320,7 +418,6 @@ pub(crate) trait WasmEngine: Send {
     // Execution
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError>;
     fn call_3i64(&mut self, ...) -> Result<i64, WasmError>;
-    fn call_3i64_async_imports(&mut self, ...) -> Result<i64, WasmError>;
     fn call_2i64_blocking(&mut self, ...) -> Result<i64, WasmError>;
     fn call_3i64_blocking(&mut self, ...) -> Result<i64, WasmError>;
 }

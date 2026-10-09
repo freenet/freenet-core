@@ -17,7 +17,7 @@ use anyhow::Result;
 use semver::Version;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use freenet::transport::{
@@ -117,8 +117,21 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(60);
 /// Maximum backoff interval for update checks (1 hour).
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
-/// Maximum consecutive update failures before disabling auto-update.
+/// Consecutive update failures after which auto-update is locked out: paused
+/// to at most one retry per [`UPDATE_LOCKOUT_COOLDOWN`].
 const MAX_UPDATE_FAILURES: u32 = 3;
+
+/// The minimum spacing of a locked-out node's retries. A permanent lockout
+/// stranded any peer that runs stably and never restarts, since it then never
+/// asked again; a lockout that reopens lets such a peer recover once whatever
+/// broke its installs is fixed. See [`claim_update_attempt`] for what keeps a
+/// peer whose installs ALWAYS fail at one attempt per cooldown.
+const UPDATE_LOCKOUT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
+/// When a locked-out node last spent its retry, as Unix seconds. Written by the
+/// NODE, before it asks GitHub, so the spacing does not depend on the updater
+/// managing to record its failure. Older binaries ignore it.
+const LOCKOUT_RETRY_FILE: &str = "update_lockout_retry";
 
 /// Non-API "latest release" URL (#5102).
 ///
@@ -244,7 +257,7 @@ where
 }
 
 /// [`parse_retry_after_at`] against the live wall clock.
-fn parse_retry_after<F>(header: F) -> Option<Duration>
+pub(crate) fn parse_retry_after<F>(header: F) -> Option<Duration>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -384,37 +397,39 @@ pub enum UpdateCheckResult {
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
-/// Set the first time this process logs the auto-update lockout at warn! level,
-/// so the permanent locked-out state is surfaced loudly once rather than on
-/// every 60s update-loop tick (it can be hit from multiple triggers per tick).
-static LOCKOUT_WARNED: AtomicBool = AtomicBool::new(false);
+/// The failure count this process last warned about (`u32::MAX` = none yet, so
+/// even a count of 0, which is what a node with no state dir reports, warns
+/// once). The lockout is
+/// surfaced loudly once per EPISODE rather than on every 60s update-loop tick:
+/// a failed retry after the cooldown raises the count, which warns again, so a
+/// long-running peer whose retries keep failing is not silent after the first.
+static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
     if !should_attempt_update() {
-        // Loud, operator-visible (issue #4580): a persistent lockout means this
-        // peer has stopped trying to auto-update entirely and will silently stay
-        // behind. A common cause is a non-writable binary path (e.g. a
-        // hand-installed binary the service account can't replace), which is a
-        // *permanent* lockout until an operator intervenes. Warn LOUDLY the first
-        // time we observe it this process, then drop to debug! so the permanent
-        // state does not spam the log every minute.
+        // Loud, operator-visible (issue #4580): a lockout means this peer has
+        // stopped trying to auto-update until the cooldown passes, and a common
+        // cause is a non-writable binary path (e.g. a hand-installed binary the
+        // service account can't replace), which will keep failing until an
+        // operator intervenes. Warn LOUDLY once per lockout episode, then drop
+        // to debug! so the state does not spam the log every minute.
         let failures = get_update_failure_count();
-        if !LOCKOUT_WARNED.swap(true, Ordering::Relaxed) {
+        if LOCKOUT_WARNED_AT.swap(failures, Ordering::Relaxed) != failures {
             tracing::warn!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
+                state_dir = ?state_dir(),
                 "Auto-update is LOCKED OUT after {MAX_UPDATE_FAILURES} consecutive failed update \
-                 attempts and will NOT retry. This peer will stay on the current version until an \
-                 operator intervenes. Run `freenet update` manually to update and reset the \
-                 lockout; if updates keep failing, the binary path is likely not writable by this \
-                 account.",
+                 attempts. It retries at most once a day. Run `freenet \
+                 update` manually to update now and reset the lockout; if updates keep failing, \
+                 the binary path is likely not writable by this account.",
             );
         } else {
             tracing::debug!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
-                "Skipping update check - auto-update locked out (already warned this process)"
+                "Skipping update check - auto-update locked out (already warned this episode)"
             );
         }
         return UpdateCheckResult::Skipped;
@@ -429,6 +444,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
         );
         return UpdateCheckResult::Skipped;
     }
+
+    // A locked-out node whose cooldown has passed records that it is spending
+    // its retry BEFORE asking GitHub, after the backoff gate so a backoff skip
+    // does not use it up. No-op for a node that is not locked out.
+    let Ok(_attempt) = claim_update_attempt() else {
+        return UpdateCheckResult::Skipped;
+    };
 
     // NOTE: the last-check timestamp is recorded only when a GitHub poll is
     // actually attempted (see the arms below), NOT here. A token-denied
@@ -689,12 +711,14 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
     // in #5102 silently turned a 10s worst case into 4 x 10s = 40s.
     //
     // That matters because of where this runs. `freenet update` is invoked from
-    // systemd's `ExecStopPost` on every non-0/43 exit, inside `TimeoutStopSec=45`
-    // — a budget the unit's own comment already allocates (30s drain + 15s
-    // headroom for teardown). A 40s probe would leave ~5s for the asset fetch,
-    // download, checksum, signature verify and `replace_binary`, moving the
-    // SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent window
-    // #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
+    // systemd's `ExecStopPost` on every non-0/43 exit, and that phase gets its
+    // own `TimeoutStopSec=45` timer (on an exit 42 the node's drain has already
+    // happened, before the process exited). The probe shares it with the asset
+    // list, the cache re-check and the install itself; since #5790 the archives
+    // normally come from the node's staged download, but when that failed they
+    // are still fetched here. A 40s probe would leave ~5s for all of it, moving
+    // the SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent
+    // window #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
     // chosen against this same number, back when the probe was one request;
     // nothing re-derived it at 4x.
     //
@@ -980,8 +1004,106 @@ async fn get_latest_version() -> Result<String> {
 /// persists its probation / known-bad markers in the SAME directory as the
 /// auto-update failure counter and backoff state, ensuring both the node and
 /// the supervisor-invoked `freenet update` agree on a single state location.
+///
+/// Normally `$HOME/.local/state/freenet`. When that directory cannot be
+/// created or written — a system service user whose home is `/var/empty` (the
+/// NixOS default for a user declared without `home`), a home that does not
+/// exist, or a state directory left owned by another user — it falls back to
+/// the first entry of systemd's `$STATE_DIRECTORY`. Without the fallback every
+/// write here fails, so the crash-probation marker, the known-good rollback
+/// snapshot and the known-bad pin are never persisted and #4073 crash-loop
+/// rollback is silently OFF on that peer.
+///
+/// Home stays first on purpose: an install whose home is usable keeps its
+/// existing state exactly where it was, so nothing has to migrate, and the
+/// fallback only ever applies where no state could have been saved before.
+/// `nix/freenet-node.sh` already consults `$STATE_DIRECTORY` for the known-bad
+/// pin.
+///
+/// Resolved ONCE per process and cached. Every reader and writer of this
+/// state must agree on one directory; re-probing on each call would let a
+/// process whose home changed writability mid-run (a late network mount, a
+/// remount) split its failure counter, probation marker and pins across two
+/// places. The node and the supervisor-invoked `freenet update` run in the
+/// same unit, as the same user, with the same environment, so they resolve the
+/// same directory as long as HOME's usability does not change between their
+/// starts. A `freenet update` run by hand OUTSIDE that unit has no
+/// `$STATE_DIRECTORY`; docs/nix.md says how to run one inside it.
+///
+/// Resolving is not read-only: it creates the chosen directory.
+///
+/// A home state directory that already holds state and then becomes
+/// unwritable is abandoned for `$STATE_DIRECTORY` without copying that state
+/// (a known-bad pin, an in-flight probation marker). Staying on it would fail
+/// every write, which is rollback off for good; switching loses that stale
+/// state once and has working rollback from the next update on.
 pub(crate) fn state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local/state/freenet"))
+    static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            resolve_state_dir(
+                dirs::home_dir(),
+                std::env::var_os("STATE_DIRECTORY").as_deref(),
+            )
+        })
+        .clone()
+}
+
+/// Testable core of [`state_dir`]: `home` is the user's home directory and
+/// `systemd_state` the raw value of `$STATE_DIRECTORY`, which systemd passes
+/// as a colon-separated list when a unit names several.
+///
+/// If neither candidate is usable the home path is returned anyway, preserving
+/// the historical result (and its failure) rather than inventing a third
+/// location.
+fn resolve_state_dir(
+    home: Option<PathBuf>,
+    systemd_state: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let home_state = home.map(|h| h.join(".local/state/freenet"));
+    if let Some(dir) = &home_state {
+        if is_usable_state_dir(dir) {
+            return home_state;
+        }
+    }
+    let systemd_dir = systemd_state
+        .and_then(|v| std::env::split_paths(v).next())
+        // systemd always passes absolute paths; a relative one would resolve
+        // against whatever the working directory happens to be.
+        .filter(|first| first.is_absolute());
+    if let Some(dir) = systemd_dir {
+        if is_usable_state_dir(&dir) {
+            return Some(dir);
+        }
+    }
+    home_state
+}
+
+/// Whether `dir` exists (creating it if needed) and this process may create
+/// files in it. `create_dir_all` alone is not enough: it succeeds on an
+/// existing directory whatever its permissions, so a state directory left
+/// owned by root would be selected and every write into it would fail.
+/// `access(2)` answers the permission and read-only-mount questions without
+/// creating anything, so a full disk cannot misclassify a directory that
+/// already holds state.
+fn is_usable_state_dir(dir: &std::path::Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `access` only reads it.
+        unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Get the last time we checked for updates.
@@ -1036,7 +1158,7 @@ fn should_check_for_update(backoff: Duration) -> bool {
 }
 
 /// Get the number of consecutive update failures.
-fn get_update_failure_count() -> u32 {
+pub(crate) fn get_update_failure_count() -> u32 {
     state_dir()
         .map(|d| get_update_failure_count_at(&d))
         .unwrap_or(0)
@@ -1046,15 +1168,57 @@ fn get_update_failure_count() -> u32 {
 /// directory.
 ///
 /// * Missing file → `0` (legitimate "no failures yet").
-/// * Present but unparseable → `MAX_UPDATE_FAILURES` (defensive: if the
-///   counter file has been truncated or corrupted we must NOT silently
-///   reset the lockout — that would be an amplification vector for any
-///   process that can partially overwrite the file, defeating the
-///   #3934 fix. Users can recover by explicitly deleting the file).
+/// * Present but unparseable, OR unreadable for any reason other than being
+///   absent → `MAX_UPDATE_FAILURES` (defensive: a truncated, corrupted or
+///   unreadable counter must not READ as zero, because that would silently
+///   reset the #3934 lockout on the strength of damage to the file).
+///
+/// Note the asymmetry with [`next_failure_count`], which is deliberate and was
+/// easy to mistake for an inconsistency, so it is written down here too: this
+/// function makes an unparseable counter read as fully-failed, while recording
+/// the next failure REWRITES an unparseable counter as `1` rather than as
+/// `MAX + 1`.
+///
+/// Both directions are the safe one for their own side:
+///
+/// * Reading MAX keeps the gate shut while the file is damaged, and heals by
+///   itself because the gate re-reads every time.
+/// * Writing `1` bounds the damage. `fs::write` is not atomic, so a power cut
+///   during [`record_update_failure_at`] can leave a truncated — hence
+///   unparseable — counter. Persisting `MAX + 1` for that would turn one
+///   ill-timed crash into a PERMANENT auto-update lockout needing manual file
+///   deletion, which is the failure this whole subsystem exists to avoid.
+///   Rewriting it as `1` costs at most two extra attempts before the gate
+///   closes again.
+///
+/// This is not an amplification vector, which is the objection it invites. To
+/// reach the rewrite at all something must record a failure, and that requires
+/// an update attempt; while the counter is unparseable the gate is shut, so no
+/// automatic attempt happens. And a process that can choose the file's contents
+/// does not need any of this — it writes `0`. Corruption alone only ever shuts
+/// the gate.
 pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
     match fs::read_to_string(dir.join("update_failures")) {
         Ok(s) => s.trim().parse().unwrap_or(MAX_UPDATE_FAILURES),
-        Err(_) => 0,
+        // Genuinely absent: no failures yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        // Present but unreadable (EACCES, EIO, a directory in its place) is the
+        // same situation as unparseable, and gets the same defensive answer.
+        // Reading it as zero would silently RESET the lockout — a fail-OPEN on
+        // the mechanism that bounds the #3934 restart loop, and an easier way to
+        // defeat it than the partial-overwrite this function's doc already
+        // guards against.
+        //
+        // Note this is NOT the read-only/full state dir case: EROFS and ENOSPC
+        // break writes, while reads still succeed or report NotFound, which is
+        // handled above. The states that land here are anomalous ones — a
+        // chmod'd or wrong-owner file, a directory in its place, a failing mount
+        // — and treating them as fully-failed is self-healing, because the gate
+        // re-reads every time and recovers the moment the file is readable again.
+        //
+        // `read_github_poll_bucket_at` in this file makes the same distinction
+        // for the same reason.
+        Err(_) => MAX_UPDATE_FAILURES,
     }
 }
 
@@ -1073,10 +1237,38 @@ pub fn record_update_failure() {
 
 /// Testable variant of [`record_update_failure`] that writes into an
 /// explicit directory. Missing directories are created on demand.
+/// What to persist after an install failure, given the raw read of the existing
+/// counter — or `None` to write nothing at all.
+///
+/// Split out from [`record_update_failure_at`] so the decision is testable
+/// without contriving a filesystem that reads one way and writes another.
+///
+/// The subtle case is the unreadable one. [`get_update_failure_count_at`]
+/// deliberately reports an unreadable counter as [`MAX_UPDATE_FAILURES`] so the
+/// GATE stays closed while the file cannot be read — that is transient and
+/// self-healing, because the gate re-reads every time. Feeding that defensive
+/// answer back into the file would be neither: it would bake `MAX + 1` into
+/// disk and lock the node out of auto-update PERMANENTLY on one transient read
+/// error (a flaky network mount, an EIO). That is a worse failure than the
+/// fail-open it replaced, so an unreadable counter writes nothing.
+///
+/// The unparseable-but-readable case is different and is answered differently:
+/// it restarts the count at `1`. See [`get_update_failure_count_at`] for why
+/// the two functions disagree about the same damaged file on purpose.
+fn next_failure_count(existing: std::io::Result<String>) -> Option<u32> {
+    match existing {
+        Ok(s) => Some(s.trim().parse::<u32>().unwrap_or(0).saturating_add(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(1),
+        Err(_) => None,
+    }
+}
+
 pub(crate) fn record_update_failure_at(dir: &std::path::Path) {
     let _mkdir = fs::create_dir_all(dir);
-    let count = get_update_failure_count_at(dir) + 1;
-    let _write = fs::write(dir.join("update_failures"), count.to_string());
+    let path = dir.join("update_failures");
+    if let Some(count) = next_failure_count(fs::read_to_string(&path)) {
+        let _write = fs::write(&path, count.to_string());
+    }
 }
 
 /// Clear the update failure count. Called from the update command after a
@@ -1093,6 +1285,7 @@ pub fn clear_update_failures() {
 /// explicit directory.
 pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
     let _rm = fs::remove_file(dir.join("update_failures"));
+    let _rm = fs::remove_file(dir.join(LOCKOUT_RETRY_FILE));
 }
 
 // ── Persistent GitHub-poll rate limit (token buckets) ──────────────────────
@@ -1422,7 +1615,7 @@ pub(crate) fn record_github_cooldown_at(
 }
 
 /// Live-clock, live-state-dir variant of [`record_github_cooldown_at`].
-fn record_github_cooldown(retry_after: Option<Duration>) {
+pub(crate) fn record_github_cooldown(retry_after: Option<Duration>) {
     if let Some(dir) = state_dir() {
         record_github_cooldown_at(&dir, retry_after, now_unix());
     }
@@ -1465,7 +1658,172 @@ pub fn should_attempt_update() -> bool {
 /// Testable variant of [`should_attempt_update`] that reads from an explicit
 /// directory. Used by the regression tests for the #3934 lockout invariant.
 pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
-    get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES
+    should_attempt_update_at_time(dir, SystemTime::now())
+}
+
+/// [`should_attempt_update_at`] with an explicit clock, so the cooldown can be
+/// tested without waiting a day. READ-ONLY: it never writes, so callers may use
+/// it for decisions and logging freely. Spending a retry is
+/// [`claim_update_attempt`]'s job.
+///
+/// Below [`MAX_UPDATE_FAILURES`] the answer is yes. At or above it the gate
+/// reopens once [`UPDATE_LOCKOUT_COOLDOWN`] has passed since the later of the
+/// last recorded failure (the counter's mtime) and the last retry this node
+/// claimed. An unreadable counter reads as fully failed (see
+/// [`get_update_failure_count_at`]) and its timestamps cannot be trusted, so it
+/// stays shut. A readable but unparseable one (a torn write) also reads as
+/// fully failed, but its mtime is a real timestamp, so it does expire; that is
+/// deliberate and bounded, because the next failure rewrites it as 1.
+fn should_attempt_update_at_time(dir: &std::path::Path, now: SystemTime) -> bool {
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return true;
+    }
+    lockout_expired(&lockout_events(dir), now)
+}
+
+/// When the lockout was last touched: the counter's mtime (the last recorded
+/// failure) and the last claimed retry, whichever exist.
+fn lockout_events(dir: &std::path::Path) -> Vec<SystemTime> {
+    let counter = dir.join("update_failures");
+    let mut events = Vec::new();
+    if fs::read_to_string(&counter).is_ok() {
+        if let Ok(mtime) = fs::metadata(&counter).and_then(|m| m.modified()) {
+            events.push(mtime);
+        }
+    }
+    if let Some(secs) = fs::read_to_string(dir.join(LOCKOUT_RETRY_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        // `checked_add`: a corrupt or hand-edited value too large for
+        // SystemTime must be ignored, not panic the update-check task on
+        // every tick.
+        if let Some(stamp) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+            events.push(stamp);
+        }
+    }
+    events
+}
+
+/// The pure decision behind [`should_attempt_update_at_time`]'s lockout arm.
+///
+/// * No usable timestamp at all: stay shut. Without one there is no way to
+///   space retries, which is how the #3934 loop comes back.
+/// * A timestamp slightly in the FUTURE (coarse mtime granularity, a network
+///   filesystem whose clock runs ahead, a clock stepped back): not expired. The
+///   cooldown then runs from that stamp, at worst a little longer than a day.
+/// * A timestamp more than a whole cooldown ahead is not a clock that is a bit
+///   off, it is a bogus one, and waiting it out could take years. It is
+///   ignored; if every timestamp is bogus the lockout counts as expired, and
+///   the retry claimed next writes a sane one.
+fn lockout_expired(events: &[SystemTime], now: SystemTime) -> bool {
+    if events.is_empty() {
+        return false;
+    }
+    let plausible = events
+        .iter()
+        .filter(|stamp| match stamp.duration_since(now) {
+            Ok(ahead) => ahead <= UPDATE_LOCKOUT_COOLDOWN,
+            Err(_) => true,
+        })
+        .max();
+    match plausible {
+        None => true,
+        Some(latest) => now
+            .duration_since(*latest)
+            .is_ok_and(|age| age >= UPDATE_LOCKOUT_COOLDOWN),
+    }
+}
+
+/// Proof that [`claim_update_attempt`] allowed a self-initiated update check.
+/// Only this module can make one, and the GitHub release checks the node runs
+/// on its own ([`startup_update_check`]) take it BY VALUE, so a check that
+/// skips the claim, ignores its answer, or reuses an earlier one does not
+/// compile.
+#[derive(Debug)]
+pub struct UpdateAttempt(());
+
+/// Why [`claim_update_attempt`] refused. Distinct because the remedies differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefused {
+    /// No state directory could be resolved, so nothing can space retries.
+    NoStateDir,
+    /// The failure counter exists but cannot be read.
+    CounterUnreadable,
+    /// Locked out (#3934) and this cooldown's retry is already spent.
+    CoolingDown,
+    /// Locked out, cooldown passed, but the retry could not be recorded.
+    NotRecordable,
+}
+
+impl std::fmt::Display for ClaimRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoStateDir => "no Freenet state directory could be resolved",
+            Self::CounterUnreadable => "the update-failure counter cannot be read",
+            Self::CoolingDown => {
+                "auto-update is locked out after repeated failed installs (#3934) and \
+                 retries at most once a day"
+            }
+            Self::NotRecordable => {
+                "auto-update is locked out and its once-a-day retry could not be recorded \
+                 in the state directory"
+            }
+        })
+    }
+}
+
+/// Call immediately before spending an update check; go ahead only on `Ok`.
+///
+/// A node that is not locked out always may, and nothing is written. A
+/// locked-out node may only once its cooldown has passed, and only after it
+/// has durably recorded that it is spending its retry now: if that write
+/// fails, the answer is no. This is what bounds a peer whose installs ALWAYS
+/// fail to one attempt per [`UPDATE_LOCKOUT_COOLDOWN`] without relying on the
+/// updater. Whether or not the failed install gets recorded, and whichever
+/// path spends the retry, every later claim sees it and refuses, so the
+/// restart that follows a failed attempt does not start another.
+pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
+    match state_dir() {
+        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        None => Err(ClaimRefused::NoStateDir),
+    }
+}
+
+pub(crate) fn claim_update_attempt_at(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    match fs::read_to_string(dir.join("update_failures")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(ClaimRefused::CounterUnreadable);
+        }
+        _ => {}
+    }
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return Ok(UpdateAttempt(()));
+    }
+    if !should_attempt_update_at_time(dir, now) {
+        return Err(ClaimRefused::CoolingDown);
+    }
+    let Ok(since_epoch) = now.duration_since(SystemTime::UNIX_EPOCH) else {
+        return Err(ClaimRefused::NotRecordable);
+    };
+    if fs::write(
+        dir.join(LOCKOUT_RETRY_FILE),
+        since_epoch.as_secs().to_string(),
+    )
+    .is_err()
+    {
+        return Err(ClaimRefused::NotRecordable);
+    }
+    tracing::warn!(
+        failures = get_update_failure_count_at(dir),
+        "Auto-update lockout cooldown has passed: spending this node's retry now. \
+         If it fails, the next one is in {} hours.",
+        UPDATE_LOCKOUT_COOLDOWN.as_secs() / 3600
+    );
+    Ok(UpdateAttempt(()))
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -1493,7 +1851,10 @@ pub fn has_reached_max_backoff() -> bool {
 ///
 /// Returns `Some(latest_version_string)` only when GitHub confirms a strictly
 /// newer release than `current_version`. Never returns a downgrade.
-pub async fn startup_update_check(current_version: &str) -> Option<String> {
+pub async fn startup_update_check(
+    _attempt: UpdateAttempt,
+    current_version: &str,
+) -> Option<String> {
     startup_update_check_with_fetcher(current_version, get_latest_version).await
 }
 
@@ -1632,6 +1993,136 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 
 #[cfg(test)]
 mod tests {
+    /// A transient read error must not be persisted as a permanent lockout.
+    ///
+    /// `get_update_failure_count_at` answers MAX_UPDATE_FAILURES when the
+    /// counter cannot be read, which keeps the GATE closed while the condition
+    /// lasts and heals by itself. Recording a failure used to feed that answer
+    /// straight back through `+ 1`, so one transient EIO would write 4 to disk
+    /// and lock auto-update off forever — turning the fail-CLOSED read into a
+    /// permanent brick, which is worse than the fail-open it replaced (#5244).
+    #[test]
+    fn an_unreadable_counter_is_never_persisted_as_a_count() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::PermissionDenied))),
+            None,
+            "an unreadable counter must write NOTHING: we cannot know the real count, and \
+             inventing MAX+1 makes a transient error permanent"
+        );
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::NotFound))),
+            Some(1),
+            "a genuinely absent counter is the first failure"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("2".to_string())),
+            Some(3),
+            "the ordinary case still increments"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("garbage".to_string())),
+            Some(1),
+            "an unparseable counter restarts the count rather than inventing a lockout"
+        );
+    }
+
+    /// An unreadable counter file must NOT read as "no failures".
+    ///
+    /// `Err(_) => 0` caught every read error, not just `NotFound`, so a counter
+    /// made unreadable (EACCES, EIO, a directory in its place) silently reset
+    /// the #3934 lockout — a fail-OPEN on the mechanism that bounds the
+    /// exit-42 → failed-install → restart loop. The doc comment above the
+    /// function promised the opposite and named the threat; only the parse path
+    /// was actually defended. See #5244.
+    ///
+    /// A directory is used rather than a chmod because it fails for root too,
+    /// so this cannot quietly degrade into a no-op in a container.
+    #[test]
+    fn an_unreadable_failure_counter_does_not_reset_the_lockout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("update_failures")).unwrap();
+
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "an unreadable counter must be treated as fully-failed, not as zero: reading it as \
+             zero re-enables the update loop the counter exists to stop"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "and the lockout it feeds must stay engaged"
+        );
+    }
+
+    /// The legitimate case still reads as zero, so a fresh node is not born
+    /// locked out.
+    #[test]
+    fn an_absent_failure_counter_reads_as_no_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 0);
+        assert!(super::should_attempt_update_at(dir.path()));
+    }
+
+    /// Pins the deliberate asymmetry between READING and REWRITING a damaged
+    /// counter, end to end, because it reads as a bug and was filed as one:
+    /// the read reports `MAX_UPDATE_FAILURES` (gate shut) while recording the
+    /// next failure rewrites the file as `1` (gate open again).
+    ///
+    /// The property that makes the rewrite safe is not that the gate stays
+    /// shut — it does not — but that reopening it is BOUNDED. So this asserts
+    /// the bound, not the reopening: after the rewrite, `MAX` further failures
+    /// put the lockout back. Without that, "resets to 1" really would be a way
+    /// to get unlimited attempts out of a corrupted file.
+    ///
+    /// `fs::write` is not atomic, so the truncated counter this covers is
+    /// reachable from an ordinary power cut mid-write, not only from tampering
+    /// — which is why persisting `MAX + 1` here would be the worse choice: it
+    /// would turn one ill-timed crash into a permanent lockout.
+    #[test]
+    fn a_corrupt_counter_shuts_the_gate_and_reopens_it_only_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update_failures");
+
+        // A truncated write is the realistic corruption; an empty file does
+        // not parse as a u32.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "a damaged counter must read as fully-failed, never as zero"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "so the gate is shut while the file is damaged"
+        );
+
+        super::record_update_failure_at(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "1",
+            "an unparseable counter restarts the count; persisting MAX + 1 would make a \
+             truncated write a permanent lockout that only manual deletion clears"
+        );
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 1);
+        assert!(super::should_attempt_update_at(dir.path()));
+
+        // ...and the reopening is bounded: the lockout re-engages on schedule.
+        for _ in 1..super::MAX_UPDATE_FAILURES {
+            super::record_update_failure_at(dir.path());
+        }
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "corruption must not buy unlimited attempts — the gate closes again \
+             after MAX_UPDATE_FAILURES"
+        );
+    }
+
     use super::*;
     use freenet::transport::{
         set_open_connection_count, signal_version_mismatch, version_mismatch_generation,
@@ -1853,6 +2344,377 @@ mod tests {
         // Clearing an already-clear counter is idempotent.
         clear_update_failures_at(dir);
         assert_eq!(get_update_failure_count_at(dir), 0);
+    }
+
+    /// A "home" that cannot hold `.local/state/freenet`. A regular file in
+    /// place of the directory makes `create_dir_all` fail with ENOTDIR even
+    /// when the tests run as root, which a read-only directory would not.
+    fn unusable_home(tmp: &std::path::Path) -> PathBuf {
+        let home = tmp.join("not-a-directory");
+        std::fs::write(&home, b"").unwrap();
+        home
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_state_directory_when_home_is_unusable() {
+        // The NixOS shape: a system user declared without `home` gets
+        // `/var/empty`, so nothing under HOME can be created. Before the
+        // fallback, state_dir() returned that unusable path, every
+        // probation/known-good/known-bad write failed, and crash-loop
+        // rollback was silently off.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home), Some(systemd.as_os_str()));
+        assert_eq!(resolved.as_deref(), Some(systemd.as_path()));
+        assert!(systemd.is_dir(), "the fallback directory must be created");
+    }
+
+    #[test]
+    fn state_dir_prefers_a_usable_home_even_when_state_directory_is_set() {
+        // An existing install keeps its state where it always was, so a
+        // unit that happens to set StateDirectory= does not strand its
+        // probation marker or known-bad pin by moving directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home.clone()), Some(systemd.as_os_str()));
+        assert_eq!(resolved, Some(home.join(".local/state/freenet")));
+        assert!(!systemd.exists(), "the fallback must not be touched");
+    }
+
+    #[test]
+    fn state_dir_uses_the_first_entry_of_a_state_directory_list() {
+        // systemd passes several StateDirectory= entries colon-separated.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let list = std::env::join_paths([&first, &second]).unwrap();
+        let resolved = resolve_state_dir(Some(home), Some(list.as_os_str()));
+        assert_eq!(resolved, Some(first));
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn state_dir_keeps_the_home_path_when_there_is_nothing_to_fall_back_to() {
+        // No STATE_DIRECTORY, or an empty one: the historical result stands
+        // rather than a guessed third location.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let expected = Some(home.join(".local/state/freenet"));
+        assert_eq!(resolve_state_dir(Some(home.clone()), None), expected);
+        assert_eq!(
+            resolve_state_dir(Some(home), Some(std::ffi::OsStr::new(""))),
+            expected
+        );
+    }
+
+    #[test]
+    fn state_dir_uses_state_directory_when_there_is_no_home_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd = tmp.path().join("var-lib-freenet");
+        assert_eq!(
+            resolve_state_dir(None, Some(systemd.as_os_str())),
+            Some(systemd)
+        );
+        assert_eq!(resolve_state_dir(None, None), None);
+    }
+
+    #[test]
+    fn state_dir_keeps_the_home_path_when_neither_candidate_is_usable() {
+        // Both unusable: the historical result, not a guessed third location.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let blocked = tmp.path().join("also-not-a-directory");
+        std::fs::write(&blocked, b"").unwrap();
+        let systemd = blocked.join("state");
+        assert_eq!(
+            resolve_state_dir(Some(home.clone()), Some(systemd.as_os_str())),
+            Some(home.join(".local/state/freenet"))
+        );
+    }
+
+    #[test]
+    fn state_dir_ignores_a_relative_state_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        assert_eq!(
+            resolve_state_dir(
+                Some(home.clone()),
+                Some(std::ffi::OsStr::new("relative/dir"))
+            ),
+            Some(home.join(".local/state/freenet"))
+        );
+    }
+
+    /// `create_dir_all` succeeds on an EXISTING directory whatever its
+    /// permissions, so a home state directory left read-only (owned by root, or
+    /// under systemd `ProtectHome=read-only`) used to be selected, and every
+    /// write into it failed. It must fall back instead.
+    #[test]
+    #[cfg(unix)]
+    fn state_dir_falls_back_when_the_existing_home_state_dir_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` reads the calling process's effective uid. It takes
+        // no arguments, touches no memory, and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, which bypasses directory write permissions");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let home_state = home.join(".local/state/freenet");
+        std::fs::create_dir_all(&home_state).unwrap();
+        std::fs::set_permissions(&home_state, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home), Some(systemd.as_os_str()));
+        // Restore before asserting so tempdir cleanup cannot fail.
+        std::fs::set_permissions(&home_state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolved, Some(systemd));
+    }
+
+    /// The pure tests above inject HOME and STATE_DIRECTORY. This one runs the
+    /// REAL `state_dir()` (the env lookup and the per-process cache) and the
+    /// rollback entry points that depend on it, in a child process whose
+    /// environment has an unusable HOME and a usable STATE_DIRECTORY: the
+    /// NixOS `/var/empty` shape. A child process, because both variables are
+    /// process-global and `state_dir()` caches its first answer.
+    #[test]
+    #[cfg(unix)] // `dirs::home_dir()` ignores $HOME on Windows
+    fn real_state_dir_and_rollback_use_state_directory_when_home_is_unusable() {
+        const CHILD_ENV: &str = "FREENET_STATE_DIR_FALLBACK_CHILD";
+        const CHILD_TEST: &str = "commands::auto_update::tests::\
+            real_state_dir_and_rollback_use_state_directory_when_home_is_unusable";
+
+        if let Some(expected) = std::env::var_os(CHILD_ENV) {
+            let expected = PathBuf::from(expected);
+            assert_eq!(state_dir(), Some(expected.clone()));
+            // Cached: a second call agrees even if nothing changed.
+            assert_eq!(state_dir(), Some(expected.clone()));
+
+            // Round-trip the crash-loop rollback state through the public,
+            // state_dir()-based entry points, not the `_at` variants.
+            let target = expected.join("freenet-under-test");
+            std::fs::write(&target, b"binary").unwrap();
+            let meta = crate::commands::rollback::KnownGoodMeta {
+                size: 6,
+                sha256: "0".repeat(64),
+            };
+            crate::commands::rollback::begin_probation("0.2.200", "0.2.199", &target, &meta)
+                .expect("probation marker must persist under STATE_DIRECTORY");
+            let probation = crate::commands::rollback::read_probation()
+                .expect("probation marker must read back through state_dir()");
+            assert_eq!(probation.new_version, "0.2.200");
+            record_update_failure();
+            assert_eq!(get_update_failure_count(), 1);
+            assert!(expected.join("update_failures").is_file());
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let systemd = tmp.path().join("var-lib-freenet");
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+            .env("HOME", &home)
+            .env("STATE_DIRECTORY", &systemd)
+            .env(CHILD_ENV, &systemd)
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+        // nothing, which would make this whole check vacuous.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run {CHILD_TEST}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(systemd.join("update_failures").is_file());
+    }
+
+    /// Lock `dir` out and return the counter file's own mtime, the instant the
+    /// cooldown is measured from.
+    fn lock_out(dir: &std::path::Path) -> SystemTime {
+        for _ in 0..MAX_UPDATE_FAILURES {
+            record_update_failure_at(dir);
+        }
+        std::fs::metadata(dir.join("update_failures"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    #[test]
+    fn update_lockout_holds_for_the_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        let just_short = stamp + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1);
+        assert!(!should_attempt_update_at_time(tmp.path(), just_short));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), just_short).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn update_lockout_expires_after_the_cooldown() {
+        // The stranded-peer bug: a node that runs stably never restarts, and a
+        // permanent lockout meant it never asked again.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_claimed_retry_closes_the_lockout_for_a_cooldown_even_if_the_failure_is_never_recorded() {
+        // The restart burst: after the retry is spent, the node restarts and
+        // its startup check must NOT ask again, even when the updater's
+        // failure did not get recorded (network error, rate limit, or no
+        // failure recording on that path at all). The claim alone closes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        let expiry = stamp + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(claim_update_attempt_at(tmp.path(), expiry).is_ok());
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), expiry).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
+        assert!(!should_attempt_update_at_time(
+            tmp.path(),
+            expiry + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1)
+        ));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            expiry + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_retry_that_cannot_be_recorded_is_not_spent() {
+        // If the claim cannot be written, the node must not ask: that is what
+        // keeps retries spaced without any probe of the counter's writability.
+        // A directory in place of the stamp file fails the write even as root.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::create_dir(tmp.path().join(LOCKOUT_RETRY_FILE)).unwrap();
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).unwrap_err(),
+            ClaimRefused::NotRecordable
+        );
+    }
+
+    #[test]
+    fn claiming_writes_nothing_for_a_node_that_is_not_locked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_update_failure_at(tmp.path());
+        assert!(claim_update_attempt_at(tmp.path(), SystemTime::now()).is_ok());
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn a_successful_update_clears_the_claimed_retry_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
+        clear_update_failures_at(tmp.path());
+        assert!(!tmp.path().join("update_failures").exists());
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn an_unreadable_update_counter_never_expires() {
+        // A directory in place of the counter reads as fully failed, and its
+        // timestamps are not evidence of anything.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("update_failures")).unwrap();
+        let far_future = SystemTime::now() + UPDATE_LOCKOUT_COOLDOWN * 30;
+        assert!(!should_attempt_update_at_time(tmp.path(), far_future));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), far_future).unwrap_err(),
+            ClaimRefused::CounterUnreadable
+        );
+    }
+
+    /// The peer-signal path spends the lockout claim before it asks GitHub, as a
+    /// `let ... else` that returns on refusal (so the result cannot be ignored),
+    /// at statement position (so commenting it out fails), inside
+    /// `check_if_update_available`, and before the fetch. Without it an expired
+    /// node reaching GitHub through a peer signal writes no claim, and a
+    /// transient failure there lets the startup check on restart retry again
+    /// the same day.
+    #[test]
+    fn peer_signal_check_spends_the_lockout_claim_before_asking_github() {
+        let src = include_str!("auto_update.rs");
+        let body = fn_body(src, "pub async fn check_if_update_available(");
+        let claim = "let Ok(_attempt) = claim_update_attempt() else {";
+        let fetch = "match get_latest_version().await {";
+        let at_statement = |needle: &str| {
+            body.match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    body[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("`{needle}` is not at statement position"))
+        };
+        assert!(
+            at_statement(claim) < at_statement(fetch),
+            "check_if_update_available must spend the lockout claim before asking GitHub (#3934)"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_retry_stamp_is_ignored_not_a_panic() {
+        // A corrupt or hand-edited stamp too large for SystemTime used to
+        // panic in `UNIX_EPOCH + secs` on every update-check tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::write(tmp.path().join(LOCKOUT_RETRY_FILE), u64::MAX.to_string()).unwrap();
+        // Ignored, so the counter's own mtime governs.
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
+    }
+
+    #[test]
+    fn lockout_expiry_decision_edges() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let later = t0 + UPDATE_LOCKOUT_COOLDOWN;
+        // No usable timestamp: stay shut.
+        assert!(!lockout_expired(&[], later));
+        // Exactly at the boundary it expires; one second short it does not.
+        assert!(lockout_expired(&[t0], later));
+        assert!(!lockout_expired(&[t0], later - Duration::from_secs(1)));
+        // The LATER of the failure and the claimed retry counts.
+        assert!(!lockout_expired(
+            &[t0, t0 + Duration::from_secs(3600)],
+            later
+        ));
+        // Slightly in the future (coarse mtime, a clock running ahead): NOT
+        // expired. Treating it as expired reopened the gate at once.
+        assert!(!lockout_expired(&[t0 + Duration::from_secs(2)], t0));
+        assert!(!lockout_expired(&[later], t0));
+        // More than a whole cooldown ahead is a bogus clock: ignored, and if
+        // nothing plausible remains the lockout counts as expired...
+        let bogus = later + Duration::from_secs(1);
+        assert!(lockout_expired(&[bogus], t0));
+        // ...but a plausible timestamp alongside it still governs.
+        assert!(!lockout_expired(&[bogus, t0], t0 + Duration::from_secs(60)));
     }
 
     #[test]
@@ -2086,8 +2948,8 @@ mod tests {
     fn test_locked_out_update_check_is_loud() {
         // Source-scrape pin for #4580: when the failure lockout disables
         // auto-update, the skip MUST be operator-visible (warn!), not a silent
-        // debug! line. A regression to debug! would re-hide the permanent
-        // lockout (e.g. non-writable binary path) the issue calls out.
+        // debug! line. A regression to debug! would re-hide the lockout (e.g.
+        // a non-writable binary path) the issue calls out.
         let src = include_str!("auto_update.rs");
         let (_, after_fn_start) = src
             .split_once("pub async fn check_if_update_available(")
@@ -3395,9 +4257,9 @@ mod tests {
     fn probe_chain_deadline_does_not_widen_the_stop_phase_budget() {
         // The follow must not make the probe's worst case any longer than the
         // single request it replaced. `freenet update` runs from ExecStopPost
-        // inside TimeoutStopSec=45, which the unit already spends on the 30s
-        // drain plus teardown headroom; a probe that grew to 4x would push the
-        // SIGKILL from mid-probe into mid-install.
+        // inside its own TimeoutStopSec=45, which the probe shares with the
+        // rest of the install; a probe that grew to 4x would push the SIGKILL
+        // from mid-probe into mid-install.
         assert_eq!(
             PROBE_CHAIN_TIMEOUT, PROBE_REQUEST_TIMEOUT,
             "the chain deadline must equal the per-request timeout, so following \
@@ -3419,7 +4281,9 @@ mod tests {
         // and what actually matters, is that every HTTP client on this path is
         // bounded by SOMETHING — so a stalled connection can never hang until
         // systemd SIGKILLs the updater mid-install.
-        let update_src = include_str!("update.rs");
+        // `update/staged.rs` too (#5790): the installer reads its cache, and its
+        // downloader shares the update path's clients' obligations.
+        let update_src = concat!(include_str!("update.rs"), include_str!("update/staged.rs"));
         let clients = update_src.matches("reqwest::Client::builder()").count();
         let bounded =
             update_src.matches(".timeout(").count() + update_src.matches(".read_timeout(").count();

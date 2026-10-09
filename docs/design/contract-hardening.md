@@ -141,15 +141,15 @@ Contracts that exceed the threshold can still exist — they just can't conscrip
 
 | Component | Status |
 |-----------|--------|
-| `OutboundRequestCounter` (per-peer request count) | Live — fired from `ring.rs:1658` |
-| `RequestDensityTracker` (per-location density) | Live — drives gap-targeted growth |
-| `adjust_topology` (Add/Remove/Swap decisions) | Live on ring tick (`ring.rs:2573`) |
+| `OutboundRequestCounter` (per-peer request count) | Live — fired from `Ring::report_route_outcome_to_health` (`report_outbound_request`) |
+| `RequestDensityTracker` (per-location density) | Fed, but its density map is only read by tests; growth targets come from log-distance gap targeting (updated 2026-10) |
+| `adjust_topology` (Add/Remove/Swap decisions) | Live on ring tick (`Ring::connection_maintenance`) |
 | min/max connections enforcement | Live |
 | Topology swap (replace least-routed peer) | Live |
-| `Meter::report` (bandwidth into meter) | **Dead** — `#[allow(dead_code)] // fixme: use this` |
-| Cost/benefit removal via `select_connections_to_remove` | Wired but starved — meter empty |
+| `Meter::report` (bandwidth into meter) | Live since this doc was written: per-peer bandwidth is reported via `report_resource_usage` in `ring.rs` (updated 2026-10) |
+| Cost/benefit removal via `select_connections_to_remove` | Was starved (meter empty) when written; now fed by the bandwidth reporting above (updated 2026-10) |
 
-So the peer side has the cost/benefit removal pipeline assembled but the bandwidth signal isn't reaching it. `adjust_topology` sits permanently in the "under-utilized" branch.
+When this was written, the peer side had the cost/benefit removal pipeline assembled but the bandwidth signal wasn't reaching it, so `adjust_topology` sat permanently in the "under-utilized" branch. That gap has since been closed.
 
 ### Direct reuse for contract side
 
@@ -433,6 +433,8 @@ The meter sits on every executor hot path after Phase 3. `DashMap` swap addresse
 ### Determinism
 
 Governance decisions depend on `TimeSource` and meter readings. Thread `TimeSource` through `ContractScore` (matches core conventions).
+
+Contract-side determinism is a separate concern from this plan and is documented separately: a contract must not read the host wall clock, because a merge that does is not a function of its inputs and its replicas are not guaranteed to converge. That rule, why it exists and what to do instead are in [the contract execution architecture doc](../architecture/contracts/README.md#contracts-must-not-read-the-host-clock) (issue #5465). Nothing in this plan depends on it either way.
 
 ### Remaining arbitrary parameters — honest audit
 

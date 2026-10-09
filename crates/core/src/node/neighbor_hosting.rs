@@ -25,7 +25,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tracing::{debug, info, trace};
 
@@ -88,8 +88,10 @@ impl NeighborHostingResult {
 /// This information is used to forward UPDATEs to hosts who have a contract
 /// but may not be explicitly subscribed to it.
 pub struct NeighborHostingManager {
-    /// Contracts we are hosting locally.
-    my_contracts: Arc<DashSet<ContractInstanceId>>,
+    /// Contracts we are hosting locally, with the full key of each so the
+    /// hosting sweep can reconcile the advertised set against the hosted set
+    /// (#5782).
+    my_contracts: Arc<DashMap<ContractInstanceId, ContractKey>>,
 
     /// What we know about our neighbors' hosted contracts.
     /// Maps neighbor public key to the set of contracts they're hosting.
@@ -108,7 +110,7 @@ impl NeighborHostingManager {
     /// Create a new neighbor hosting manager.
     pub fn new() -> Self {
         Self {
-            my_contracts: Arc::new(DashSet::new()),
+            my_contracts: Arc::new(DashMap::new()),
             neighbor_contracts: DashMap::new(),
         }
     }
@@ -120,7 +122,11 @@ impl NeighborHostingManager {
     pub fn on_contract_hosted(&self, contract_key: &ContractKey) -> Option<NeighborHostingMessage> {
         let contract_id = *contract_key.id();
 
-        if self.my_contracts.insert(contract_id) {
+        if self
+            .my_contracts
+            .insert(contract_id, *contract_key)
+            .is_none()
+        {
             info!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: Added contract to locally hosted"
@@ -223,7 +229,7 @@ impl NeighborHostingManager {
         if still_hosted() {
             // Re-host / re-subscribe raced us: put the advertisement back and
             // emit nothing. Neighbors never observed the removal.
-            self.my_contracts.insert(contract_id);
+            self.my_contracts.insert(contract_id, *contract_key);
             trace!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: eviction retraction skipped — contract re-hosted \
@@ -325,7 +331,7 @@ impl NeighborHostingManager {
                 let overlapping: Vec<ContractInstanceId> = added
                     .iter()
                     .filter(|id| !previously_known.contains(id)) // Only NEW contracts
-                    .filter(|id| self.my_contracts.contains(*id)) // That we also have
+                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also have
                     .copied()
                     .collect();
 
@@ -353,9 +359,12 @@ impl NeighborHostingManager {
             NeighborHostingMessage::HostingStateRequest => {
                 let mut contracts: Vec<ContractInstanceId> =
                     self.my_contracts.iter().map(|r| *r.key()).collect();
-                // Sort for deterministic message order (DashSet iteration is non-deterministic)
-                // ContractInstanceId doesn't impl Ord, so sort by string representation
-                contracts.sort_by_key(|a| a.to_string());
+                // Sort for deterministic message order (DashSet iteration is non-deterministic).
+                // ContractInstanceId doesn't impl Ord, so compare raw bytes. Do NOT sort by
+                // `to_string()`: that base58-encodes per comparison (~O(n log n) encodes per
+                // request) and was ~40% of CPU on a peer hosting ~6,200 contracts. Ids are
+                // unique, so an unstable sort is still deterministic.
+                contracts.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
                 debug!(
                     peer = %from,
@@ -406,7 +415,7 @@ impl NeighborHostingManager {
                 let overlapping: Vec<ContractInstanceId> = contracts
                     .iter()
                     .filter(|id| !previously_known.contains(*id)) // Only NEW from this peer
-                    .filter(|id| self.my_contracts.contains(*id)) // That we also host
+                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also host
                     .copied()
                     .collect();
 
@@ -547,13 +556,10 @@ impl NeighborHostingManager {
 
     /// Initialize my_contracts from contracts loaded from disk.
     /// Must be called after loading the hosting cache and before ring connections establish.
-    pub fn initialize_from_hosting_cache(
-        &self,
-        contract_ids: impl Iterator<Item = ContractInstanceId>,
-    ) {
+    pub fn initialize_from_hosting_cache(&self, contract_keys: impl Iterator<Item = ContractKey>) {
         let mut count = 0;
-        for id in contract_ids {
-            self.my_contracts.insert(id);
+        for key in contract_keys {
+            self.my_contracts.insert(*key.id(), key);
             count += 1;
         }
         if count > 0 {
@@ -567,7 +573,15 @@ impl NeighborHostingManager {
     /// Check if we are hosting a contract locally.
     #[allow(dead_code)]
     pub fn is_hosted_locally(&self, contract_key: &ContractKey) -> bool {
-        self.my_contracts.contains(contract_key.id())
+        self.my_contracts.contains_key(contract_key.id())
+    }
+
+    /// The contracts this node advertises hosting (`my_contracts`).
+    pub(crate) fn advertised_contract_keys(&self) -> Vec<ContractKey> {
+        self.my_contracts
+            .iter()
+            .map(|entry| *entry.value())
+            .collect()
     }
 
     /// Get the number of contracts we advertise hosting locally (`my_contracts`).
@@ -743,6 +757,59 @@ mod tests {
         } else {
             panic!("Expected HostingStateResponse");
         }
+    }
+
+    /// The `HostingStateResponse` contract list must be in ascending id-byte order
+    /// regardless of insertion order (the backing `DashSet` iterates
+    /// non-deterministically), so the message is deterministic. Ids are chosen so
+    /// byte order differs from insertion order.
+    #[test]
+    fn test_hosting_state_response_is_sorted_by_id_bytes() {
+        let neighbor = make_pub_key(1);
+        let seeds: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let key_for = |s: u8| {
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new([s; 32]),
+                CodeHash::new([s ^ 0xff; 32]),
+            )
+        };
+
+        let respond = |order: &[u8]| -> Vec<ContractInstanceId> {
+            let manager = NeighborHostingManager::new();
+            for &s in order {
+                manager.on_contract_hosted(&key_for(s));
+            }
+            match manager
+                .handle_message(&neighbor, NeighborHostingMessage::HostingStateRequest)
+                .response
+            {
+                Some(NeighborHostingMessage::HostingStateResponse { contracts }) => contracts,
+                other => panic!("Expected HostingStateResponse, got {other:?}"),
+            }
+        };
+
+        let mut expected: Vec<ContractInstanceId> = seeds
+            .iter()
+            .map(|&s| ContractInstanceId::new([s; 32]))
+            .collect();
+        expected.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let insertion_order: Vec<ContractInstanceId> = seeds
+            .iter()
+            .map(|&s| ContractInstanceId::new([s; 32]))
+            .collect();
+        assert_ne!(
+            insertion_order, expected,
+            "test ids must not already be in byte order"
+        );
+
+        let mut reversed = seeds.clone();
+        reversed.reverse();
+        let a = respond(&seeds);
+        let b = respond(&reversed);
+        assert_eq!(a, expected, "response must be in ascending id-byte order");
+        assert_eq!(a, b, "response must not depend on insertion order");
     }
 
     #[test]
@@ -1325,10 +1392,14 @@ mod tests {
         assert_eq!(manager.local_hosted_count(), 0);
 
         // Initialize from hosting cache
-        manager.initialize_from_hosting_cache(vec![*key1.id(), *key2.id()].into_iter());
+        manager.initialize_from_hosting_cache(vec![key1, key2].into_iter());
 
-        // Should now report both contracts
+        // Should now report both contracts, under their full keys
         assert_eq!(manager.local_hosted_count(), 2);
+        let mut keys = manager.advertised_contract_keys();
+        keys.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        let code_hashes: Vec<CodeHash> = keys.iter().map(|k| *k.code_hash()).collect();
+        assert_eq!(code_hashes, vec![*key1.code_hash(), *key2.code_hash()]);
         assert!(manager.is_hosted_locally(&key1));
         assert!(manager.is_hosted_locally(&key2));
 
@@ -1542,6 +1613,13 @@ mod tests {
                 .on_contract_unhosted_unless_rehosted(&key, || true)
                 .is_none(),
             "a re-hosted contract must not be retracted"
+        );
+        let restored = manager.advertised_contract_keys();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].code_hash(),
+            key.code_hash(),
+            "the restored entry must carry the full key (#5782)"
         );
         assert!(
             manager.is_hosted_locally(&key),

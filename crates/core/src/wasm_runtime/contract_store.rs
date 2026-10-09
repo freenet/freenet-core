@@ -522,8 +522,25 @@ impl ContractStore {
             .map_err(|e| anyhow::anyhow!("Failed to remove contract index: {e}"))?;
         self.key_to_code_part.remove(key.id());
 
-        // Clean up any delegate subscriptions for this contract instance.
-        super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
+        // Clean up any delegate subscriptions for this contract instance, and
+        // release the local interest they took (#5542). The release is
+        // self-discharging — each hold carries its own node's closure — so this
+        // module keeps no `crate::ring` dependency.
+        //
+        // IN MEMORY ONLY (#5493). This runs for storage reasons, not because a
+        // delegate withdrew its subscription: hosting-cache eviction, PUT
+        // rollback (including a transient related-contract fetch failure), the
+        // disk-budget and init-tracker rejections. Erasing the persisted row
+        // here would turn any of those into a permanent loss of the delegate's
+        // subscription, and restored pairs are exposed to eviction until their
+        // interest is re-established. The row stays; the next boot re-subscribes,
+        // which is what the delegate asked for. Only `UnregisterDelegate` (and
+        // restore's unregistered-delegate backstop) deletes rows.
+        super::delegate_subscriptions::remove_contract(
+            key.id(),
+            super::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        super::delegate_interest::release_contract(key.id());
 
         // The WASM blob on disk is keyed by code hash and shared by every
         // contract instance with the same code (e.g. all River rooms share

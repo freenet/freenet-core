@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 mod commands;
 use commands::{
-    secrets_cmd::SecretsCliConfig, service::ServiceCommand, uninstall::UninstallCommand,
-    update::UpdateCommand,
+    open_link::OpenCommand, secrets_cmd::SecretsCliConfig, service::ServiceCommand,
+    uninstall::UninstallCommand, update::UpdateCommand,
 };
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
@@ -34,17 +34,17 @@ struct Cli {
 enum Command {
     /// Run the node in network mode (default if no subcommand specified)
     ///
-    /// NOTE ON AUTO-UPDATE: a node detects new releases and exits with code 42
-    /// to request an update, but it does NOT update itself. Applying the update
-    /// requires a supervisor that catches exit code 42 and runs `freenet update`
-    /// before restarting — this is set up by `freenet service install` (systemd
-    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows).
+    /// About auto-update: the node spots new releases and exits with code 42 to
+    /// ask for an update, and something else has to apply it. That something is
+    /// a supervisor which catches exit code 42, runs `freenet update`, and
+    /// restarts the node. `freenet service install` sets one up: a systemd unit
+    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows.
     ///
-    /// A bare `freenet network` run has no such supervisor: it will detect an
-    /// update, exit, and NOT be restarted, so it stays on its current version.
-    /// To keep a hand-run node current, either run `freenet update` yourself when
-    /// prompted in the logs, or install Freenet as a service. Dirty/dev builds
-    /// disable auto-update entirely (it would clobber local changes).
+    /// A bare `freenet network` run has no supervisor, so it spots an update,
+    /// exits, and is never restarted, leaving it on its current version. To keep
+    /// a hand-run node current, run `freenet update` yourself when the logs
+    /// prompt you, or install Freenet as a service. Builds from a dirty working
+    /// tree skip auto-update entirely, since it would discard local changes.
     Network {
         #[command(flatten)]
         config: ConfigArgs,
@@ -61,11 +61,20 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
-    /// Manage the node KEK (Key Encryption Key) backend.
+    /// Open a freenet:// link in your browser, via your local Freenet peer.
     ///
-    /// The KEK is the master key from which every per-delegate DEK is
-    /// derived via HKDF. Subcommands report status, rotate, or migrate
-    /// the KEK between backends (OS keyring / systemd credential / file).
+    /// This is what the operating system runs when you click a freenet:// link
+    /// (for example "Open in Freenet" on freenet.org/open). It opens
+    /// http://127.0.0.1:<port>/v1/contract/web/<contract-id>/... using the port
+    /// from your Freenet config, or a page explaining that Freenet isn't
+    /// running.
+    Open(OpenCommand),
+    /// Manage the node KEK (key encryption key) backend.
+    ///
+    /// The KEK is the master key that every per-delegate data encryption key
+    /// (DEK) is derived from, via HKDF. The subcommands report its status,
+    /// rotate it, or move it between backends: OS keyring, systemd credential,
+    /// or a file.
     Secrets(SecretsCliConfig),
 }
 
@@ -235,6 +244,14 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     let clients = serve_client_api(config.ws_api.clone())
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
+
+    // Register the freenet:// link handler for a managed install whose
+    // registration is missing or stale (#5726). This is how installs that
+    // predate the handler get it: the auto-updater replaces the binary but
+    // never re-runs the installer. Detached and best-effort; it cannot fail,
+    // block or delay the node.
+    commands::url_handler::spawn_self_registration();
+
     tracing::info!("Initializing node configuration");
 
     // Capture before `config` is moved into NodeConfig; threaded to the
@@ -315,11 +332,12 @@ async fn run_network_node_with_signals(
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
-        UpdateNeededError, check_if_update_available, clear_version_mismatch,
+        UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
         jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
         version_mismatch_generation,
     };
+    use commands::update::stage_latest_release;
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
 
@@ -365,7 +383,18 @@ async fn run_network_node_with_signals(
                 commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
             ))
             .await;
-            commands::rollback::commit_probation(&version);
+            // `spawn_blocking`, not a direct call: `commit_probation` does
+            // synchronous filesystem work (`read_to_string`, `remove_file`) and
+            // then takes the process-global stderr lock to write one line. Under
+            // the shipped unit that stderr is a journald socket, so a stopped or
+            // backed-up journald would park a runtime WORKER — and every later
+            // `eprintln!` in the process queues behind the same lock. The commit
+            // itself is fire-and-forget either way, so the failure mode this
+            // avoids is entirely in the runtime, not here.
+            let _stderr_may_block = tokio::task::spawn_blocking(move || {
+                commands::rollback::commit_probation(&version);
+            })
+            .await;
         })
     };
 
@@ -494,6 +523,10 @@ async fn run_network_node_with_signals(
             return;
         }
 
+        // A release staged for an update this binary already is (#5790) has
+        // served its purpose, however the update was applied.
+        commands::update::discard_stale_staged(build_info::VERSION);
+
         // --- Startup update check (#3864) ---
         //
         // Ask GitHub directly, once at boot, whether a newer release exists.
@@ -515,16 +548,38 @@ async fn run_network_node_with_signals(
         //
         // Fail-open: any GitHub / parse error returns None and the node
         // continues booting normally into the peer-signal loop below.
+        //
+        // A locked-out node (#3934) runs this check only when it can claim its
+        // once-per-cooldown retry. Ungated, every restart after a failed retry
+        // would ask again and exit 42 again, a burst of failed installs a day
+        // bounded only by the GitHub poll budget, which on Windows counts
+        // toward the wrapper's give-up limit. Claimed before logging, so a skip
+        // never reads as a check that ran. `startup_update_check` takes the
+        // claim's token, so the check cannot run without it.
+        let startup_attempt = commands::auto_update::claim_update_attempt();
+        if let Err(reason) = &startup_attempt {
+            tracing::warn!(
+                reason = %reason,
+                "Startup update check skipped: {reason}. Run `freenet update` to update now."
+            );
+        }
+        let startup_check_ran = startup_attempt.is_ok();
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_jitter_secs > 0 {
+        if startup_check_ran && startup_jitter_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
         }
-        tracing::info!(
-            current = build_info::VERSION,
-            jitter_secs = startup_jitter_secs,
-            "Startup update check against GitHub"
-        );
-        if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+        let latest = match startup_attempt {
+            Ok(attempt) => {
+                tracing::info!(
+                    current = build_info::VERSION,
+                    jitter_secs = startup_jitter_secs,
+                    "Startup update check against GitHub"
+                );
+                startup_update_check(attempt, build_info::VERSION).await
+            }
+            Err(_) => None,
+        };
+        if let Some(new_version) = latest {
             // #4073: don't auto-update to a version that is locally BLOCKED — a
             // crash-loop known-bad pin OR a version that has repeatedly failed to
             // install (checksum / signature / download / extract). The installer
@@ -543,6 +598,7 @@ async fn run_network_node_with_signals(
                     new_version = %new_version,
                     "Startup check: newer version on GitHub, triggering auto-update"
                 );
+                stage_latest_release(build_info::VERSION).await;
                 #[allow(clippy::let_underscore_must_use)]
                 let _ = update_tx.send(new_version);
                 return;
@@ -565,10 +621,15 @@ async fn run_network_node_with_signals(
         // Do not reword it into a claim about the version, and do not change the
         // leading phrase: scripts/auto-update-canary.sh greps for it, and
         // scripts/auto-update-canary_test.sh pins it against this file.
-        tracing::info!(
-            current = build_info::VERSION,
-            "Startup update check complete: staying on the current version"
-        );
+        //
+        // Only when the check actually ran: a skip above is its own terminal
+        // line, and this one must keep meaning "the check finished".
+        if startup_check_ran {
+            tracing::info!(
+                current = build_info::VERSION,
+                "Startup update check complete: staying on the current version"
+            );
+        }
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
@@ -628,6 +689,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Urgent update confirmed on GitHub, triggering immediate auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -689,6 +751,7 @@ async fn run_network_node_with_signals(
                                         new_version = %new_version,
                                         "Update confirmed on GitHub after stagger, triggering auto-update"
                                     );
+                                    stage_latest_release(build_info::VERSION).await;
                                     #[allow(clippy::let_underscore_must_use)]
                                     let _ = update_tx.send(new_version);
                                     return;
@@ -749,19 +812,33 @@ async fn run_network_node_with_signals(
 
                 // Hard timeout: force exit if isolated with mismatch for too long.
                 if let Some(since) = isolated_mismatch_since {
-                    if since.elapsed() > HARD_EXIT_TIMEOUT {
+                    // A locked-out node (#3934) that cannot claim its retry
+                    // must not exit 42 here either; it restarts the 6h window
+                    // instead, so this is not re-evaluated every tick.
+                    if since.elapsed() > HARD_EXIT_TIMEOUT
+                        && claim_update_attempt()
+                            .inspect_err(|_| isolated_mismatch_since = Some(Instant::now()))
+                            .is_ok()
+                    {
                         tracing::error!(
                             isolated_secs = since.elapsed().as_secs(),
                             "Isolated with version mismatch >6h — forcing exit for auto-update"
                         );
                         clear_version_mismatch();
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send("unknown (hard timeout)".to_string());
                         return;
                     }
                 }
 
-                tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                // A locked-out node does not check GitHub here, so saying it
+                // does every 60s tick would be both noise and false.
+                if should_attempt_update() {
+                    tracing::info!("Version mismatch detected, checking GitHub for updates...");
+                } else {
+                    tracing::debug!("Version mismatch detected; auto-update locked out");
+                }
 
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -770,6 +847,7 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
+                        stage_latest_release(build_info::VERSION).await;
                         #[allow(clippy::let_underscore_must_use)]
                         let _ = update_tx.send(new_version);
                         return;
@@ -777,21 +855,32 @@ async fn run_network_node_with_signals(
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
                         let open_connections = get_open_connection_count();
                         if open_connections == 0 {
-                            tracing::warn!(
-                                "Max backoff + 0 connections — \
-                                 trusting gateway version signal, exiting for auto-update"
+                            // Claimed like every other self-initiated exit 42,
+                            // so a locked-out node (#3934) cannot loop through
+                            // here. On refusal the mismatch is KEPT rather than
+                            // cleared: the node still knows it is isolated on an
+                            // old version, so its next allowed retry (usually the
+                            // peer-signal check above, once the cooldown passes)
+                            // happens promptly instead of waiting for a re-poll.
+                            if claim_update_attempt().is_ok() {
+                                tracing::warn!(
+                                    "Max backoff + 0 connections — \
+                                     trusting gateway version signal, exiting for auto-update"
+                                );
+                                clear_version_mismatch();
+                                stage_latest_release(build_info::VERSION).await;
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send("unknown (gateway mismatch)".to_string());
+                                return;
+                            }
+                        } else {
+                            tracing::info!(
+                                open_connections,
+                                "Max backoff reached but node has connections — \
+                                 clearing version mismatch flag"
                             );
                             clear_version_mismatch();
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = update_tx.send("unknown (gateway mismatch)".to_string());
-                            return;
                         }
-                        tracing::info!(
-                            open_connections,
-                            "Max backoff reached but node has connections — \
-                             clearing version mismatch flag"
-                        );
-                        clear_version_mismatch();
                     }
                     UpdateCheckResult::Skipped => {}
                     UpdateCheckResult::RateLimited => {
@@ -858,16 +947,20 @@ async fn run_network_node_with_signals(
                 // re-poll MUST honor the same lockout — otherwise a locked-out
                 // long-running node would exit-42 every interval and make the
                 // supervisor rerun the same failing update, reintroducing the
-                // exact loop the lockout exists to stop. (The boot-time startup
-                // check bypasses the lockout, but only once per restart; a
-                // *recurring* bypass is the regression.) A successful manual
-                // `freenet update` clears the counter and re-enables this path.
-                if should_attempt_update() {
+                // exact loop the lockout exists to stop. The boot-time startup
+                // check honours it too, through the same claim. A successful
+                // manual `freenet update` clears the counter and re-enables this
+                // path, and a locked-out node gets one retry per
+                // UPDATE_LOCKOUT_COOLDOWN, claimed here before it asks GitHub,
+                // so a stable node is not stranded forever.
+                if let Ok(attempt) = claim_update_attempt() {
                     tracing::debug!(
                         current = build_info::VERSION,
                         "Periodic re-poll: checking GitHub directly for a newer release"
                     );
-                    if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+                    if let Some(new_version) =
+                        startup_update_check(attempt, build_info::VERSION).await
+                    {
                         // #4073 (rebase onto #4591/#4593): mirror the boot-time
                         // startup check — never exit-42 to a version that is
                         // locally BLOCKED (crash-loop known-bad pin OR repeatedly
@@ -892,16 +985,57 @@ async fn run_network_node_with_signals(
                                 new_version = %new_version,
                                 "Periodic re-poll: newer version on GitHub, triggering auto-update"
                             );
+                            stage_latest_release(build_info::VERSION).await;
                             #[allow(clippy::let_underscore_must_use)]
                             let _ = update_tx.send(new_version);
                             return;
                         }
                     }
                 } else {
-                    tracing::debug!(
-                        "Periodic re-poll: skipped — auto-update locked out after repeated \
+                    // Once per lockout episode, not once per 6h tick: a failed
+                    // retry raises the failure count, which announces it again.
+                    // Mirrors `LOCKOUT_WARNED_AT` in `check_if_update_available`.
+                    static LOCKOUT_REPORTED_AT: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(u32::MAX);
+                    let failures = commands::auto_update::get_update_failure_count();
+                    if LOCKOUT_REPORTED_AT.swap(failures, std::sync::atomic::Ordering::Relaxed)
+                        != failures
+                    {
+                        // The second state where the update machinery is silently
+                        // OFF (#5244). This was `debug!`, which release builds
+                        // compile out entirely (`release_max_level_info`), and the
+                        // loud once-per-process warning in `check_if_update_available`
+                        // is only reachable from the PEER-signal triggers — so on a
+                        // node whose peers all share its version, nothing said this
+                        // node would never update again.
+                        //
+                        // Once per episode, mirroring `LOCKOUT_WARNED_AT`: the
+                        // condition usually persists until an operator acts, so
+                        // repeating it every 6h is noise.
+                        // Names the file as well as the command: the lockout can
+                        // also be reached with the counter UNREADABLE, and in that
+                        // state `freenet update` cannot clear it (the removal is
+                        // best-effort and fails the same way the read did), so
+                        // "run freenet update" alone would be advice that does not
+                        // work. `--force` bypasses the gate for a one-off recovery.
+                        // Print the directory actually in use: it is not always
+                        // under HOME (see `auto_update::state_dir`).
+                        let state = commands::auto_update::state_dir().map_or_else(
+                            || "the Freenet state directory".to_string(),
+                            |d| d.display().to_string(),
+                        );
+                        eprintln!(
+                            "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
+                         installs, #3934, or an unreadable failure counter). After failed installs it \
+                         retries at most once a day; an unreadable counter stays locked until it can be read. Run `freenet \
+                         update` manually, or delete `update_failures` in {state}. `freenet \
+                         update --force` bypasses the gate for a single run."
+                        );
+                        tracing::warn!(
+                            "Periodic re-poll: skipped — auto-update locked out after repeated \
                          failed installs (#3934); run `freenet update` to recover"
-                    );
+                        );
+                    }
                 }
             }
         }
@@ -1007,34 +1141,238 @@ const EXIT_CODE_ALREADY_RUNNING: i32 = 43;
 #[error("another freenet instance is already running")]
 struct AlreadyRunningError;
 
+/// How many times to probe the WS API port before concluding it is genuinely
+/// held by a live process.
+///
+/// A process that was just OOM-killed can keep its listening socket
+/// answering for a short window while the kernel finishes tearing it down.
+/// Before this retry loop existed, a single 500ms probe treated that corpse
+/// exactly like a live instance and exited 43 immediately — and because
+/// `Restart=always` retried within milliseconds, every restart attempt hit
+/// the same still-answering corpse, burning systemd's `StartLimitBurst`
+/// before the socket was actually released and leaving the gateway down
+/// with no self-heal (#4565, 2026-07-17 vega outage).
+///
+/// # The corpse window, measured
+///
+/// The budget below is anchored to measurement, not to the intuition that a
+/// socket "goes away within seconds". Measured on Linux 6.8 (nova, 2026-09)
+/// by SIGKILLing a process holding a LISTEN socket and polling until
+/// `connect()` was refused:
+///
+/// | RSS at kill | LISTEN socket released at |
+/// |-------------|---------------------------|
+/// | 8 GiB       | t = 2.0 s                 |
+/// | 20 GiB      | t = 1.8 s                 |
+/// | 24 GiB      | t = 6.2 s                 |
+///
+/// The window tracks how much work `exit_mm()` has to do, which is why a
+/// large-RSS gateway holds its socket for seconds where a small process
+/// releases it in microseconds.
+///
+/// 6 attempts 1s apart sleeps ~5s in total (5 sleeps — the last attempt does
+/// not sleep after itself), which covers the 8 GiB and 20 GiB cases outright.
+///
+/// It does **not** cover the 24 GiB case: at 6.2s this loop has already given
+/// up and exited 43. That is stated rather than rounded up to "comfortably
+/// outlasts". The residual benefit in that case is a different one, and still
+/// worth having: spending ~5s per attempt spreads systemd's
+/// `StartLimitBurst=5` over ~25s instead of the milliseconds it took on
+/// 2026-07-17, so the burst is no longer exhausted before the socket is
+/// released and `Restart=always` still gets a real attempt afterwards.
+const EXISTING_PROCESS_PROBE_ATTEMPTS: u32 = 6;
+
+/// How long to wait between probes.
+///
+/// Deliberately **unjittered**, overriding `.claude/rules/code-style.md`'s
+/// "all retry/backoff loops MUST apply random jitter". Recorded here so the
+/// override is a decision on the record rather than a finding every future
+/// review and lint bot re-raises.
+///
+/// Jitter exists to break up a thundering herd: many independent retriers
+/// converging on one contended resource, where synchronised retries amplify
+/// the contention they are waiting out. This loop has none of that shape.
+///
+/// - It is a single process, polling its own loopback port and its own
+///   `/proc`, a bounded 6 times, once at startup. There is no fleet.
+/// - What it waits on is the kernel finishing `exit_files()` for a dead
+///   process. That runs on the kernel's own schedule; a loopback `connect()`
+///   and a `/proc/<pid>` stat neither compete for it nor push back on it, so
+///   aligned polls cannot prolong what they are waiting for.
+/// - Concurrent freenet instances poll different ports by construction — each
+///   probes only its own configured `ws_api` port — so there is no shared
+///   queue for them to synchronise on even in the multi-instance case.
+const EXISTING_PROCESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
     let addr = SocketAddr::from((config.ws_api.address, config.ws_api.port));
-    if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
-        let pid = find_process_on_port(config.ws_api.port);
-        if let Some(pid) = pid {
-            tracing::warn!(
-                port = config.ws_api.port,
-                pid = pid,
-                "Another process (PID {pid}) is already listening on port {}. \
-                 If freenet is installed as a service, use 'freenet service stop' before \
-                 running manually. Otherwise use 'kill {pid}' to stop it.",
-                config.ws_api.port
-            );
-        } else {
-            tracing::warn!(
-                port = config.ws_api.port,
-                "Port {} is already in use by another process. \
-                 If freenet is installed as a service, use 'freenet service stop' before \
-                 running manually.",
-                config.ws_api.port
-            );
+    check_for_existing_process_with(
+        config.ws_api.port,
+        EXISTING_PROCESS_PROBE_ATTEMPTS,
+        EXISTING_PROCESS_PROBE_INTERVAL,
+        || TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok(),
+        find_process_on_port,
+        pid_is_alive,
+    )
+}
+
+/// Core retry/liveness logic behind [`check_for_existing_process`], with the
+/// socket probe, PID lookup, and PID-liveness check injected so the retry
+/// behavior can be unit-tested without real sockets or `/proc`.
+///
+/// This is a one-time, bounded startup gate that runs before any shutdown
+/// signal handling is wired up (there is nothing to interrupt against yet),
+/// so a plain blocking sleep between attempts is used rather than routing
+/// through a cancellable async retry loop.
+///
+/// That ordering is what makes the blocking sleep *correct* rather than
+/// merely unmonitored: no signal handler is installed until
+/// `run_network_node_with_signals`, so for the whole of these ~5s the
+/// **default signal disposition** still applies, and `systemctl stop`
+/// (SIGTERM) or Ctrl-C (SIGINT) terminates the process immediately. There is
+/// no handler that the sleep could be delaying.
+fn check_for_existing_process_with(
+    port: u16,
+    max_attempts: u32,
+    retry_interval: std::time::Duration,
+    mut port_is_occupied: impl FnMut() -> bool,
+    mut find_owning_pid: impl FnMut(u16) -> Option<u32>,
+    mut pid_is_alive: impl FnMut(u32) -> bool,
+) -> anyhow::Result<()> {
+    for attempt in 1..=max_attempts {
+        if !port_is_occupied() {
+            return Ok(());
         }
-        return Err(AlreadyRunningError.into());
+
+        match find_owning_pid(port) {
+            // The fast-fail path, and the ONLY arm that exits 43 early.
+            //
+            // `pid_is_alive` is not what detects a corpse — a corpse does not
+            // reach this arm at all, because it presents as `None` (see that
+            // arm). Its job here is to NARROW the fast fail: we abandon
+            // startup immediately only for a PID we can still see in `/proc`,
+            // and everything else falls through to the retry.
+            Some(pid) if pid_is_alive(pid) => {
+                tracing::warn!(
+                    port = port,
+                    pid = pid,
+                    "Another process (PID {pid}) is already listening on port {port}. \
+                     If freenet is installed as a service, use 'freenet service stop' before \
+                     running manually. Otherwise use 'kill {pid}' to stop it."
+                );
+                return Err(AlreadyRunningError.into());
+            }
+            Some(pid) => {
+                // A PID was resolved from the socket's inode, but `/proc/<pid>`
+                // had already gone by the time we checked it.
+                //
+                // This is NOT the OOM-kill corpse case, despite reading like
+                // it: it requires the fd table to still be readable during the
+                // scan and the process to vanish entirely in the microseconds
+                // before the liveness check — a narrow race, not the field
+                // behaviour. The corpse arrives as `None`; see below.
+                //
+                // Retry anyway: whatever produced it, nothing here justifies
+                // an unrecoverable exit 43.
+                tracing::debug!(
+                    port = port,
+                    pid = pid,
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    "Port answering but owning PID is no longer alive; retrying (#4565)"
+                );
+            }
+            None => {
+                // THE LOAD-BEARING RETRY BRANCH: this, not the `Some(pid)` arm
+                // above, is what saves the node after an OOM kill.
+                //
+                // A corpse presents as `None`. Linux's `do_exit` runs
+                // `exit_mm()` before `exit_files()`, so for a SIGKILLed
+                // large-RSS process `/proc/<pid>/fd` becomes unreadable
+                // (EACCES) within ~25-50ms while the LISTEN socket survives
+                // for seconds (measured: see EXISTING_PROCESS_PROBE_ATTEMPTS).
+                // `find_process_on_port` identifies the owner by scanning
+                // `/proc/*/fd` for the socket's inode, so throughout the
+                // corpse window it matches nothing and returns `None`.
+                // (`/proc/<pid>` itself survives the whole window, so
+                // `pid_is_alive` would report a corpse ALIVE if a PID for one
+                // ever did reach it.)
+                //
+                // Two other situations land here, and both want this same
+                // retry rather than an exit 43:
+                //
+                //   * A genuinely live instance owned by a DIFFERENT uid.
+                //     Reading `/proc/<pid>/fd` requires the same uid or root,
+                //     so a manual `freenet network` run as your own user
+                //     against the system service running as the `freenet` user
+                //     gets `None`. That is the canonical "I forgot I already
+                //     have one running" case, and it now costs ~5s and prints
+                //     the generic port-occupied message below instead of the
+                //     immediate `kill {pid}` hint. Accepted deliberately: a
+                //     slower and vaguer error for a user at a terminal is a
+                //     better trade than an unrecoverable gateway outage.
+                //
+                //   * Non-Linux, where `find_process_on_port` returns `None`
+                //     unconditionally (see `pid_is_alive`'s non-Linux note).
+                //
+                // If the port is still occupied on the last attempt we bail
+                // out below.
+                tracing::debug!(
+                    port = port,
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    "Port answering but owning PID could not be determined; retrying (#4565)"
+                );
+            }
+        }
+
+        if attempt < max_attempts {
+            std::thread::sleep(retry_interval);
+        }
     }
-    Ok(())
+
+    tracing::warn!(
+        port = port,
+        "Port {port} is still occupied after {max_attempts} attempts. \
+         If freenet is installed as a service, use 'freenet service stop' before \
+         running manually."
+    );
+    Err(AlreadyRunningError.into())
+}
+
+/// Whether the PID resolved from a listening socket is still present in
+/// `/proc`.
+///
+/// This does **not** detect the OOM-kill corpse of #4565, and an earlier
+/// version of this comment claimed it did. `/proc/<pid>` outlives the LISTEN
+/// socket, so a corpse would report ALIVE here — but a corpse never reaches
+/// this function at all, because `exit_files()` tears down its fd table first
+/// and `find_process_on_port` therefore returns `None` for the whole window.
+/// See the `None` arm of `check_for_existing_process_with`.
+///
+/// Its actual job is to narrow the fast-fail arm: exit 43 immediately only
+/// for a process we can still see, and let everything else retry.
+#[cfg(target_os = "linux")]
+fn pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// We can't cheaply determine PID liveness off Linux; `find_process_on_port`
+/// already returns `None` there unconditionally, so this is unreachable in
+/// practice.
+///
+/// The consequence of that `None` is worth stating plainly, because it is a
+/// real behavioural change for non-Linux operators: on macOS and Windows
+/// EVERY occupied-port startup now takes the `None` retry branch and pays the
+/// full ~5s probe budget before exiting 43, where before this change it
+/// exited immediately. There is no PID lookup on those platforms for the
+/// fast-fail arm to work from.
+#[cfg(not(target_os = "linux"))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Try to find the PID of the process listening on the given port.
@@ -1201,6 +1539,9 @@ fn freenet_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // The link-handler commands need no node directories: skip building
+        // ConfigPaths, which creates them (and has no default in debug builds).
+        Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),
         Some(Command::Service(cmd)) => {
             // Build only ConfigPaths (directory layout), not the full Config
             // which triggers a remote gateway fetch that fails on fresh
@@ -1216,8 +1557,21 @@ fn freenet_main() -> anyhow::Result<()> {
                 config_paths,
             )
         }
-        Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
+        Some(Command::Update(cmd)) => {
+            // #5244: this process previously ran with NO subscriber installed —
+            // `set_logger` is called only on the node path — so every
+            // `tracing::warn!`/`error!` in the installer was a no-op. That is
+            // the process the supervisor runs from `ExecStopPost` to drive
+            // crash-loop rollback, so its warnings are exactly the ones an
+            // operator needs. WARN (not INFO) because this runs on every
+            // non-clean stop of a crash-looping node.
+            freenet::config::set_cli_logger(tracing::level_filters::LevelFilter::WARN);
+            cmd.run(build_info::VERSION)
+        }
         Some(Command::Uninstall(cmd)) => cmd.run(),
+        // Launched by the OS with an untrusted link from any website: no
+        // config build (it fetches gateways), no node, no setup wizard.
+        Some(Command::Open(cmd)) => cmd.run(cli.config.config_paths.config_dir.as_deref()),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
             // multi-thread / blocking-pool tuning needed for IO-light
@@ -1325,6 +1679,12 @@ fn log_umask_override() {
 fn log_umask_override() {}
 
 fn main() {
+    // Anchor the bootstrap-latency clock at process start, before anything
+    // else, so `freenet.bootstrap.time_to_min_connections_seconds` measures
+    // what its name says — including config load, storage open and the
+    // cached-peer fast-reconnect path (issue #4787).
+    freenet::mark_process_start();
+
     // Defense-in-depth: tighten umask BEFORE the tokio runtime spawns
     // any worker threads. See `set_secure_umask` and issue #4196.
     set_secure_umask();
@@ -1478,6 +1838,279 @@ mod tests {
 
         // A run that somehow returned Ok stays Ok.
         assert!(finish_run(Ok(()), false).is_ok());
+    }
+
+    /// Whitespace-stripped view of source text, so a source-scrape pin survives
+    /// `rustfmt` re-wrapping a call across lines (`shutdown_requested\n
+    /// .store(..)` would otherwise stop matching a contiguous needle).
+    fn squeeze(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The part of this file BEFORE its `#[cfg(test)] mod tests`, i.e. production
+    /// code only.
+    ///
+    /// A pin that counts occurrences across the whole file counts its own
+    /// assertion literals too (`include_str!` pulls in the test module), so it
+    /// can never assert "exactly once". Cutting the region here is a structural
+    /// fix rather than the `concat!("a", "b")` needle-splitting used elsewhere in
+    /// this module, which only holds until someone writes the contiguous string.
+    ///
+    /// `.expect`, not a silent fallback: if the attribute stops matching, the
+    /// region would widen to the whole file and the pin would pass vacuously.
+    /// Refuse instead. (Same fail-closed reasoning as `commands::auto_update`'s
+    /// `fn_body`; see `.claude/rules/bug-prevention-patterns.md`.)
+    ///
+    /// Uniqueness is asserted rather than taking the first match: a second
+    /// `#[cfg(test)] mod` added ABOVE this one would truncate the region early
+    /// and hide any production code below it — fail-OPEN in exactly the
+    /// direction a bounded region exists to protect.
+    fn production_region(src: &str) -> &str {
+        let anchor = "\n#[cfg(test)]\nmod ";
+        assert_eq!(
+            src.matches(anchor).count(),
+            1,
+            "expected exactly one `#[cfg(test)] mod` in this file — the region this \
+             pin counts over is bounded by it, and an earlier one would truncate \
+             the region and hide production code"
+        );
+        let tests_at = src
+            .find(anchor)
+            .expect("test module not located — this pin cannot bound anything");
+        &src[..tests_at]
+    }
+
+    /// Slice `src` from `opener` (which must end at the block's `{`) to its
+    /// brace-matched close.
+    ///
+    /// Panics when the anchor is missing or the braces never balance, so a moved
+    /// anchor fails LOUDLY rather than silently widening the scoped region —
+    /// the #5102 failure mode that shipped twice.
+    fn braced_block<'a>(src: &'a str, opener: &str) -> &'a str {
+        delimited_block(src, opener, '{', '}')
+    }
+
+    /// As `braced_block`, for an arbitrary delimiter pair — used to slice a call's
+    /// argument list, where asserting on a substring would let a widened
+    /// expression through (`shutdown_requested.load(..) || whatever`).
+    fn delimited_block<'a>(src: &'a str, opener: &str, open: char, close: char) -> &'a str {
+        assert!(
+            opener.ends_with(open),
+            "opener must end at the opening delimiter: {opener}"
+        );
+        // Uniqueness, for the same reason `production_region` asserts it: this
+        // returns the FIRST match, so a second anchor would be sliced past in
+        // silence and every assertion below would describe the wrong block —
+        // fail-OPEN, the direction a bounded region exists to prevent.
+        assert_eq!(
+            src.matches(opener).count(),
+            1,
+            "expected exactly one `{opener}` in the scanned region; this slice \
+             takes the first, so any other is invisible to the pin that consumes it"
+        );
+        let at = src
+            .find(opener)
+            .unwrap_or_else(|| panic!("block anchor not found: {opener}"));
+        let body_start = at + opener.len();
+        let mut depth = 1usize;
+        for (i, c) in src[body_start..].char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[body_start..body_start + i];
+                }
+            }
+        }
+        panic!("delimiters never balanced after: {opener}");
+    }
+
+    /// #5230 rests entirely on `shutdown_requested` meaning EXACTLY "an operator
+    /// asked THIS process to stop". `finish_run` maps
+    /// `EventLoopExitReason::GracefulShutdown` to a success exit only when that
+    /// flag is set, because the identical sentinel is ALSO raised by faults — a
+    /// dead critical `p2p_protoc` channel, or `client_events` losing every client
+    /// transport. Those must keep exiting non-zero, or systemd skips the unit's
+    /// `ExecStopPost` self-heal and the macOS/Windows wrappers read "normal
+    /// shutdown" and leave the node DOWN.
+    ///
+    /// The whole discrimination therefore depends on there being exactly ONE
+    /// place that sets the flag. `finish_run_maps_only_a_requested_graceful_stop_to_success`
+    /// above takes it as a parameter, so it cannot see WHERE it is set: a second
+    /// store elsewhere would launder a fault into a success exit — the node exits
+    /// 0, looks healthy, and stays dead — with the entire suite green. The
+    /// tempting site is the auto-update arm of the `select!` in
+    /// `run_network_node_with_signals`, which also calls `shutdown_handle
+    /// .shutdown()` but is NOT an operator stop (it must keep exiting 42).
+    ///
+    /// So: the flag is mentioned in production only in the four ways below, its
+    /// one store is in the signal-handler task, and it happens only after a
+    /// signal has actually arrived.
+    ///
+    /// The check is CLOSED-WORLD — an enumeration of every permitted mention —
+    /// rather than a blocklist of forbidden spellings. A blocklist was the first
+    /// attempt and it leaked badly: `(*shutdown_requested).store(..)`,
+    /// `shutdown_requested.as_ref().store(..)`, and passing `&shutdown_requested`
+    /// to a helper that stores through it all raise the flag while matching no
+    /// banned string. Enumerating what is ALLOWED needs no foresight about how
+    /// the next author might spell it.
+    #[test]
+    fn shutdown_requested_is_stored_only_by_the_signal_handler() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let signal_task = squeeze(braced_block(prod, "let signal_task = {"));
+
+        // Anti-vacuity: if brace matching ran past the block, these markers from
+        // later in `run_network_node_with_signals` would be inside it, and the
+        // containment assertion below would prove nothing. `update_tx` and
+        // `startup_update_check` bound the NEAR side of an over-run (the update
+        // loop, immediately after this block); the rest bound the far side.
+        for escaped in [
+            "update_tx",
+            "startup_update_check",
+            "run_network_node(",
+            "UpdateNeededError",
+            "finish_run(",
+        ] {
+            assert!(
+                !signal_task.contains(&squeeze(escaped)),
+                "the scoped signal-task block escaped its braces (found `{escaped}`) — \
+                 this pin would pass vacuously"
+            );
+        }
+        // Anti-vacuity, other direction: confirm we scoped the right block. The
+        // marker must be one the TEMPTING block does not share — awaiting a
+        // signal is unique to this task, whereas `shutdown_handle.shutdown()`
+        // appears in the auto-update arm too and so would not discriminate. A set
+        // rather than one literal, so extracting the cfg-gated wait into a helper
+        // (a legitimate refactor) does not panic with a misleading message.
+        let awaits_a_signal = ["ctrl_c()", "sigterm.recv()", "shutdown_signal("]
+            .iter()
+            .filter_map(|m| signal_task.rfind(&squeeze(m)))
+            .max()
+            .expect("scoped block is not the signal-handler task: it awaits no signal");
+
+        // Every mention of the flag in production, in source order, identified by
+        // what FOLLOWS it. Anything else — any spelling, any new call site, any
+        // borrow handed to a helper — changes this list and fails.
+        let flat = squeeze(prod);
+        let follows: Vec<String> = flat
+            .split("shutdown_requested")
+            .skip(1)
+            .map(|after| after.chars().take(13).collect())
+            .collect();
+        let expected = [
+            // The `Arc<AtomicBool>` in `run_network_node_with_signals`:
+            "=Arc::new(std", // the declaration
+            "=Arc::clone(&", // the signal task's own handle
+            ");GlobalExecu", // ... the argument to that clone
+            ".store(true,s", // THE one write, in the signal task
+            ".load(std::sy", // the read that feeds `finish_run`
+            // `finish_run`'s parameter of the same name is a DISTINCT binding, a
+            // plain `bool`, so it cannot raise the flag:
+            ":bool)->anyho", // the parameter
+            "&&freenet::li", // the guard that consumes it
+        ];
+        assert_eq!(
+            follows, expected,
+            "production mentions `shutdown_requested` in a way this pin does not \
+             recognise. Every mention is enumerated on purpose: a new one is a new \
+             way to raise the flag (`(*flag).store(..)`, `flag.as_ref().store(..)`, \
+             `helper(&flag)`, `swap`/`fetch_or`/`compare_exchange`, a second \
+             `Arc::clone`), and raising it outside an operator stop makes \
+             `finish_run` report a FAULT as a clean exit 0 — the service manager \
+             skips its self-heal and the node stays dead (#5230). If the change is \
+             legitimate, extend the list deliberately"
+        );
+
+        // The enumeration above identifies each mention by only the first 13
+        // characters that follow it, which stops well short of the initialiser:
+        // `AtomicBool::new(true)` leaves all seven windows byte-identical, keeps
+        // the single store where it belongs, and still raises the flag before any
+        // signal arrives — so EVERY fault exits 0. That is the #5230 hole itself,
+        // reached without tripping anything else in this file or in
+        // `tests/graceful_shutdown_exit_code.rs`, which asserts SIGTERM => 0 and
+        // is equally satisfied by a flag that is never false.
+        //
+        // Pinned separately rather than by widening the windows: reaching `false`
+        // needs ~50 characters, which would drag that much incidental following
+        // text into all seven entries and make every adjacent edit churn the list.
+        assert_eq!(
+            flat.matches(&squeeze(
+                "shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false))"
+            ))
+            .count(),
+            1,
+            "the flag must be DECLARED false, exactly once. It means `an operator \
+             asked THIS process to stop`, so any initialiser that can be true \
+             before the signal task observes a signal makes `finish_run` report a \
+             FAULT as a clean exit 0 — the service manager skips its self-heal and \
+             the node stays dead (#5230)"
+        );
+
+        let store_at = signal_task
+            .find(&squeeze("shutdown_requested.store("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the one store must live in the signal-handler task, which is \
+                     the only place that knows an operator (SIGTERM/SIGINT) asked \
+                     us to stop (#5230)"
+                )
+            });
+        // Location alone is not the invariant: a store hoisted ABOVE the signal
+        // await would still sit inside this block, yet would raise the flag
+        // unconditionally at startup and launder EVERY fault into a clean exit 0.
+        assert!(
+            store_at > awaits_a_signal,
+            "the store must come AFTER the signal await, not before it — a hoisted \
+             store raises the flag at startup, so every fault exits 0 (#5230)"
+        );
+    }
+
+    /// The write site is only half of #5230: `finish_run` must be FED the flag.
+    ///
+    /// `finish_run(result, true)` reopens the identical hole without touching the
+    /// store, and so does widening the argument
+    /// (`shutdown_requested.load(..) || transports_lost`) — which is not
+    /// hypothetical, since lost client transports are one of the two faults that
+    /// must keep exiting non-zero. No other test covers this: the truth-table test
+    /// takes the bool as a parameter and `tests/graceful_shutdown_exit_code.rs`
+    /// drives it with a real signal.
+    ///
+    /// So the whole argument list is matched, not a prefix of it.
+    #[test]
+    fn finish_run_is_fed_the_live_shutdown_flag() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        // `= finish_run(` is the CALL; `fn finish_run(` is the definition. Keying
+        // on the `=` identifies the call wherever it sits in the file.
+        //
+        // `delimited_block` asserts `= finish_run(` is unique, but a second call
+        // written `return finish_run(result, true);` carries no `=`, so it would
+        // slip past that check while re-opening the hole this pin is named for.
+        // Exactly two mentions: the one call, and the definition.
+        assert_eq!(
+            prod.matches("finish_run(").count(),
+            2,
+            "expected exactly one `finish_run` CALL and one definition in \
+             production. A second call site is not inspected by this pin, so it \
+             could be fed a constant and make every fault exit 0 (#5230)"
+        );
+        let args = squeeze(delimited_block(prod, "= finish_run(", '(', ')'));
+        assert!(
+            args.contains(&squeeze("shutdown_requested.load(")),
+            "`finish_run` must receive the live `shutdown_requested` flag — a \
+             constant would make every fault exit 0 (#5230); got `{args}`"
+        );
+        for widened in ["||", "&&", "true", "false"] {
+            assert!(
+                !args.contains(widened),
+                "`finish_run`'s argument must be the flag ALONE: `{widened}` widens \
+                 the operator-stop test to cover something else, which is the #5230 \
+                 fault-laundering hole in a new spelling; got `{args}`"
+            );
+        }
     }
 
     #[test]
@@ -1758,6 +2391,236 @@ mod tests {
         assert_eq!(parse_listening_inode(content, "1D55"), None);
     }
 
+    /// The `Some(dead_pid)` shape: a PID resolved from the socket's inode
+    /// that has vanished from `/proc` by the time liveness is checked.
+    ///
+    /// This is a narrow race rather than the field behaviour — the real
+    /// OOM-kill corpse presents as `None`, covered by
+    /// `check_for_existing_process_with_retries_past_a_corpse_with_no_resolvable_pid`
+    /// below. Kept because the arm exists and must keep retrying.
+    #[test]
+    fn check_for_existing_process_with_retries_past_a_dying_corpse() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                probes <= 2
+            },
+            |_port| Some(999),
+            |_pid| false, // PID 999 no longer exists: a corpse.
+        );
+
+        assert!(
+            result.is_ok(),
+            "must succeed once the corpse's socket clears, not exit 43 on the first probe"
+        );
+        assert_eq!(probes, 3, "must stop probing as soon as the port frees");
+    }
+
+    /// A genuinely live process holding the port must fail immediately —
+    /// retrying against a real conflict would only delay a correct exit 43,
+    /// and (per #4565) burn part of the retry budget for no benefit.
+    #[test]
+    fn check_for_existing_process_with_fails_fast_on_a_live_process() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                true
+            },
+            |_port| Some(42),
+            |_pid| true, // Genuinely alive.
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            probes, 1,
+            "must not keep retrying once a live owning process is confirmed"
+        );
+    }
+
+    /// If the port never frees and no PID can be identified (e.g. non-Linux,
+    /// or a permissions gap), the retry loop must still terminate and report
+    /// AlreadyRunningError rather than looping forever.
+    #[test]
+    fn check_for_existing_process_with_exhausts_retries_when_never_freed() {
+        use super::{AlreadyRunningError, check_for_existing_process_with};
+
+        let mut probes = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            3,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                true
+            },
+            |_port| None, // Can't identify an owning PID.
+            |_pid| false,
+        );
+
+        assert!(
+            result
+                .expect_err("port stays occupied the whole time")
+                .downcast_ref::<AlreadyRunningError>()
+                .is_some()
+        );
+        assert_eq!(probes, 3, "must attempt exactly max_attempts probes");
+    }
+
+    /// A corpse on the first attempt followed by a DIFFERENT, genuinely live
+    /// process taking the port (e.g. some other service raced to bind it
+    /// during the retry window) must still be caught and reported as
+    /// AlreadyRunningError rather than retried away.
+    #[test]
+    fn check_for_existing_process_with_recognizes_liveness_over_multiple_attempts() {
+        use super::check_for_existing_process_with;
+        use std::cell::Cell;
+
+        let find_pid_calls: Cell<u32> = Cell::new(0);
+        let result = check_for_existing_process_with(
+            1234,
+            5,
+            std::time::Duration::ZERO,
+            || true,
+            |_port| {
+                find_pid_calls.set(find_pid_calls.get() + 1);
+                if find_pid_calls.get() == 1 {
+                    Some(999) // corpse
+                } else {
+                    Some(42) // live process
+                }
+            },
+            |pid| pid == 42,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(find_pid_calls.get(), 2);
+    }
+
+    /// Regression test for the ACTUAL production path of #4565 (2026-07-17
+    /// vega outage).
+    ///
+    /// During the corpse window `find_process_on_port` returns `None`, not
+    /// `Some(dead_pid)`: Linux's `do_exit` runs `exit_mm()` before
+    /// `exit_files()`, so a SIGKILLed large-RSS process loses a readable
+    /// `/proc/<pid>/fd` within ~25-50ms while its LISTEN socket survives for
+    /// seconds (measured on nova: 8 GiB -> 2.0s, 20 GiB -> 1.8s, 24 GiB ->
+    /// 6.2s). The inode scan therefore matches nothing for the whole window.
+    ///
+    /// So this — not the `Some(999)` + not-alive test above — is the case
+    /// that reproduces the outage and the case the fix has to survive. The
+    /// port answers on the first two probes and frees on the third.
+    #[test]
+    fn check_for_existing_process_with_retries_past_a_corpse_with_no_resolvable_pid() {
+        use super::check_for_existing_process_with;
+
+        let mut probes = 0u32;
+        let mut pid_lookups = 0u32;
+        let result = check_for_existing_process_with(
+            1234,
+            super::EXISTING_PROCESS_PROBE_ATTEMPTS,
+            std::time::Duration::ZERO,
+            || {
+                probes += 1;
+                probes <= 2
+            },
+            |_port| {
+                pid_lookups += 1;
+                // The corpse's fd table is already gone: nothing to match.
+                None
+            },
+            |_pid| unreachable!("no PID is resolvable during the corpse window"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unresolvable owner must be retried past, not treated as a live \
+             instance — this is the branch that self-heals the OOM-kill outage"
+        );
+        assert_eq!(
+            probes, 3,
+            "must probe until the corpse's socket clears, then stop"
+        );
+        assert_eq!(
+            pid_lookups, 2,
+            "each occupied probe must attempt an owner lookup"
+        );
+    }
+
+    /// Wiring pin: `check_for_existing_process` must actually pass the probe
+    /// budget constants through to `check_for_existing_process_with`, and the
+    /// attempt count must be greater than one.
+    ///
+    /// Without this, a regression setting `EXISTING_PROCESS_PROBE_ATTEMPTS = 1`
+    /// deletes the entire retry — restoring the exact 2026-07-17 failure mode
+    /// — while every behavioural test above stays green, because they all pass
+    /// their own attempt counts in as arguments and so cannot see the constant.
+    /// Inlining a literal at the call site would be just as invisible.
+    ///
+    /// The scraped region is bounded to the function body via `braced_block`
+    /// (not a bare `split_once`, which would match the later occurrence in
+    /// this test's own assertion strings and pass vacuously — the #5102
+    /// failure mode, see `.claude/rules/bug-prevention-patterns.md`), and over
+    /// `production_region` so the test module is excluded outright.
+    #[test]
+    fn check_for_existing_process_wires_up_the_retry_budget() {
+        // A `const` block, so a regression to `ATTEMPTS = 1` fails the build
+        // outright rather than waiting for anyone to run this test. (It is also
+        // what `clippy::assertions_on_constants` requires of an assertion whose
+        // operands are all compile-time constants.)
+        const {
+            assert!(
+                super::EXISTING_PROCESS_PROBE_ATTEMPTS > 1,
+                "a single attempt is not a retry: with ATTEMPTS = 1 the loop \
+                 probes once and exits 43, which is precisely the pre-#4565 \
+                 behaviour that burned systemd's StartLimitBurst against a \
+                 corpse's socket"
+            );
+        }
+
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let body = squeeze(braced_block(
+            prod,
+            "fn check_for_existing_process(config: &Config) -> anyhow::Result<()> {",
+        ));
+
+        // Anti-vacuity: if brace matching over-ran the function, these markers
+        // from `check_for_existing_process_with` immediately below would be
+        // inside the region and the assertions would prove nothing.
+        for escaped in ["AlreadyRunningError", "port_is_occupied()", "thread::sleep"] {
+            assert!(
+                !body.contains(&squeeze(escaped)),
+                "the scoped function body escaped its braces (found `{escaped}`) \
+                 — this pin would pass vacuously"
+            );
+        }
+
+        for constant in [
+            "EXISTING_PROCESS_PROBE_ATTEMPTS",
+            "EXISTING_PROCESS_PROBE_INTERVAL",
+        ] {
+            assert!(
+                body.contains(constant),
+                "`check_for_existing_process` must pass `{constant}` to \
+                 `check_for_existing_process_with`; a hard-coded literal there \
+                 would make the constant (and its recorded justification) dead \
+                 code that no test can see"
+            );
+        }
+    }
+
     /// Regression test for issue #4196: a plain `File::create` from
     /// inside a `tokio::spawn`'d task on a tokio worker thread must
     /// land at mode `0o600` after `set_secure_umask` runs, even though
@@ -1918,6 +2781,64 @@ mod tests {
         );
     }
 
+    /// #5790: every exit for auto-update must first download the release while
+    /// the node is still running. A trigger that sends without staging hands
+    /// the download back to systemd's `ExecStopPost`, whose `TimeoutStopSec`
+    /// kills it on a slow link, and the node restart-loops on the old version.
+    /// The sends stay inline (the canary pins them), so this checks each one
+    /// is directly preceded by the staging call.
+    #[test]
+    fn every_update_trigger_downloads_before_exiting() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module not found")
+            .0;
+        let statements: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("#["))
+            .collect();
+        // Every send, in whatever form, so a trigger spelled differently from
+        // the `let _ =` form cannot slip past the check below.
+        let all_sends = production.matches(concat!("update_tx", ".send(")).count();
+        let mut sends = 0;
+        for (i, stmt) in statements.iter().enumerate() {
+            if stmt.starts_with(concat!("let _ = update_tx", ".send(")) {
+                sends += 1;
+                assert_eq!(
+                    i.checked_sub(1).map(|p| statements[p]),
+                    Some("stage_latest_release(build_info::VERSION).await;"),
+                    "update trigger `{stmt}` must call stage_latest_release first (#5790)"
+                );
+            }
+        }
+        assert_eq!(
+            sends, 7,
+            "expected the 7 update trigger sites in freenet.rs"
+        );
+        // Stale staged releases are cleared once auto-update is known to be on,
+        // before the startup check can stage a new one.
+        let cleanup = production
+            .find("commands::update::discard_stale_staged(build_info::VERSION);")
+            .expect("the update task must clear stale staged releases (#5790)");
+        let disabled_return = production
+            .find("std::future::pending::<()>().await;")
+            .expect("auto-update-disabled branch not found");
+        let startup_check = production
+            .find("let startup_attempt = commands::auto_update::claim_update_attempt();")
+            .expect("startup update check not found");
+        assert!(
+            disabled_return < cleanup && cleanup < startup_check,
+            "discard_stale_staged must run after the auto-update-disabled return and \
+             before the startup check"
+        );
+        assert_eq!(
+            all_sends, sends,
+            "every send on update_tx must use the checked `let _ =` trigger form"
+        );
+    }
+
     /// #4073: a version pinned known-bad after a crash-loop rollback must never
     /// cause the node to exit for auto-update — the updater would only refuse it,
     /// producing a slow exit-42 restart loop (the Codex finding on the reworked
@@ -2026,35 +2947,402 @@ mod tests {
             "both systemd unit templates must set Environment=FREENET_SUPERVISED=1 \
              (#4580); found {marker_count}"
         );
+
+        // The Nix supervisor (`nix/freenet-node.sh`, run by the `freenet-node`
+        // package). It is a Freenet supervisor exactly as the systemd units and
+        // the launchd wrapper are, so it owes the same marker.
+        //
+        // Read with `std::fs` rather than `include_str!`: the file lives ABOVE
+        // `crates/core`, so an `include_str!` would be a compile-time dependency
+        // on a path outside the crate and would break a packaged build of it.
+        // A missing file PANICS here rather than skipping -- a pin that
+        // disappears with its subject is worse than no pin.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read_repo_file = |rel: &str| -> String {
+            let path = repo_root.join(rel);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "could not read {} ({e}). The Nix supervisor is pinned here for \
+                     the same reason as the systemd and launchd ones (#4580); if it \
+                     moved, update this test rather than removing it.",
+                    path.display()
+                )
+            })
+        };
+
+        // STATEMENT POSITION, not mere presence. `nix/freenet-node.sh` documents
+        // the systemd directives it mirrors in its own header comments, so a
+        // bare `contains` would be satisfied by prose describing a marker the
+        // script no longer sets.
+        //
+        // The needle must survive stripping the line's comment. A
+        // `!trimmed.starts_with('#')` test rejected only a FULL-LINE comment
+        // and passed vacuously for a trailing one: `child=0  # export
+        // FREENET_SUPERVISED=1` satisfied it while the script exported nothing.
+        // Verified by performing that edit, per the "test the pin by performing
+        // the edit" rule in .claude/rules/bug-prevention-patterns.md. Splitting
+        // on the first `#` is sound for every file scraped here -- shell, nix,
+        // YAML and the nix code blocks inside docs/nix.md all comment with `#`,
+        // and no line carrying one of these needles has a `#` before it.
+        //
+        // EVERY POSITIVE assertion below goes through this, not just the ones
+        // about the wrapper. Two used a bare whole-file `contains` and were
+        // therefore satisfied by a COMMENTED-OUT line, which is the realistic
+        // edit (deletion fails loudly; disabling does not, and disabling is
+        // what a person does while debugging -- exactly when the pin is the
+        // only thing left watching). Measured: commenting out the three
+        // `assert_eq "$(self_of ...)"` lines in the wrapper test, with BOTH
+        // `network` and `update` simultaneously run from the read-only store
+        // seed, left the shell suite, the rule-lint counter, this pin and
+        // shellcheck all green over the failure the wrapper's own header calls
+        // "the single worst failure this package has".
+        //
+        // The one NEGATIVE assertion (docs must not offer `on-failure`)
+        // deliberately keeps the bare `contains`: for a must-not-appear needle
+        // the broader match is the stronger one, and stripping comments there
+        // would let the forbidden form back in as an example.
+        // A nested `fn`, not a closure: closure inference ties the argument and
+        // return to one lifetime, which does not typecheck for a borrow-through.
+        //
+        // A bare `split('#')` also truncates at a `#` that is CODE, not a
+        // comment -- `${#arr[@]}` is the one that occurs here, and
+        // `nix/freenet-node.sh` has such a line. No needle is affected (none
+        // sits after a `${#...}` on its line), but the next one could be, so
+        // cut only where a comment can actually begin: at a line-leading `#`,
+        // or at a `#` preceded by whitespace. That is the shell/nix/YAML
+        // convention, and it leaves `${#arr[@]}` and `%s#%s` intact.
+        fn code_of(line: &str) -> &str {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return "";
+            }
+            match line
+                .char_indices()
+                .find(|&(i, c)| c == '#' && i > 0 && line.as_bytes()[i - 1].is_ascii_whitespace())
+            {
+                Some((i, _)) => &line[..i],
+                None => line,
+            }
+        }
+        let has_statement =
+            |src: &str, needle: &str| src.lines().any(|line| code_of(line).contains(needle));
+
+        // `code_of` is only as good as its notion of where a comment starts, and
+        // it is easy to make it eat code. These four pin both directions.
+        assert_eq!(code_of("  # a full-line comment").trim(), "");
+        assert_eq!(code_of("foo=1  # trailing").trim_end(), "foo=1");
+        assert_eq!(
+            code_of("    if [ \"${#failures[@]}\" -gt 0 ]; then"),
+            "    if [ \"${#failures[@]}\" -gt 0 ]; then",
+            "a `#` that is CODE must not truncate the line -- `${{#arr[@]}}` is \
+             the shape that occurs in nix/freenet-node.sh"
+        );
+        assert_eq!(
+            code_of("printf '%s#%s' \"$a\" \"$b\""),
+            "printf '%s#%s' \"$a\" \"$b\"",
+            "nor a `#` with no whitespace before it"
+        );
+
+        let nix_src = read_repo_file("nix/freenet-node.sh");
+        let supervised_export = format!(
+            "export {}=1",
+            super::commands::auto_update::SUPERVISED_ENV_VAR
+        );
+        assert!(
+            has_statement(&nix_src, &supervised_export),
+            "the Nix supervisor must `{supervised_export}` on the node it runs, so the \
+             node detects its supervisor instead of erroring on the exit-42 path (#4580)"
+        );
+        // The marker is a CLAIM that something applies the update. These two
+        // pin that the claim is true: the script must actually invoke the
+        // updater, and must forward the node's status so crash-loop rollback
+        // can classify it (#4073).
+        assert!(
+            has_statement(&nix_src, "update --quiet"),
+            "the Nix supervisor sets the supervised marker, so it must actually run \
+             `freenet update --quiet` on a non-graceful exit (#4580/#4073)"
+        );
+        assert!(
+            has_statement(
+                &nix_src,
+                super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+            ),
+            "the Nix supervisor must forward the node's exit status via {} so \
+             crash-loop auto-rollback can tell a post-stop restart from a manual \
+             update (#4073)",
+            super::commands::rollback::POST_STOP_EXIT_CODE_ENV_VAR
+        );
+        // The wrapper's seed/re-seed decision must be driven by ONE predicate --
+        // "can this binary update itself?" -- not by a version comparison. The
+        // distinction is the whole invariant: a CLEAN OLDER binary walks itself
+        // to the current release, while a DIRTY NEWER one never exits 42 again,
+        // so ordering versions answers the wrong question and each refusal
+        // layered on top of it opened a new stuck corner.
+        assert!(
+            has_statement(&nix_src, "self_update_blocker"),
+            "the Nix supervisor must decide what to run from whether the binary can \
+             UPDATE ITSELF, not from which version is newer: a clean older binary is \
+             forward progress (it exits 42 and walks itself to current), a dirty newer \
+             one is a dead end (GIT_DIRTY is an auto-update kill switch)"
+        );
+        assert!(
+            has_statement(&nix_src, "binary_is_dirty"),
+            "the Nix supervisor must recognise a -dirty build specifically: it never \
+             auto-updates, and `freenet --version` prints the marker on the COMMIT \
+             HASH, so a version comparison alone cannot see it"
+        );
+        // ...and the ONE refusal that is genuinely about which version.
+        //
+        // It is standing in for a safety net that is absent rather than backing
+        // one up: `capture_known_good` and `begin_probation` run only inside
+        // `commands::update`, so EVERY binary the wrapper installs -- not just a
+        // pinned-bad one -- arrives with no known-good snapshot and no probation
+        // marker, and #4073 rollback cannot fire for a version the wrapper
+        // itself first put there. `handle_post_stop_at` drops a marker belonging
+        // to a different version rather than mis-applying it, so the residual is
+        // a loud flap (the wrapper's own limiter plus `Restart=always`), not a
+        // wrong-version rollback. The wrapper header says so next to the guard.
+        assert!(
+            has_statement(&nix_src, "version_is_pinned_bad"),
+            "the Nix supervisor must consult the node's known-bad pin before replacing \
+             a peer that is still serving. `is_version_pinned_bad` only refuses to \
+             INSTALL such a version; nothing refuses to RUN one already in place, and \
+             the wrapper installs it with no probation marker, so rollback could never \
+             fire"
+        );
+        // The pin lives under the node's HOME whenever that is usable (falling
+        // back to $STATE_DIRECTORY only when it is not), and `dirs::home_dir()` falls back
+        // to `getpwuid_r` when $HOME is unset or empty -- so the node writes a
+        // pin in an environment where a `[ -n "$HOME" ]` guard sees nothing.
+        // systemd exports $HOME only for a unit with `User=`, which the
+        // documented root-capable shapes need not have. Verified by execution:
+        // same pin on disk, only $HOME differing, the guard refused with it set
+        // and installed the pinned-bad version with it unset.
+        assert!(
+            has_statement(&nix_src, "passwd_home"),
+            "the Nix supervisor must mirror `dirs::home_dir()`'s passwd fallback when \
+             $HOME is unset or empty, or the known-bad lookup fails OPEN in exactly \
+             the environment (a systemd unit without `User=`, a scrubbed container) \
+             where the node still writes the pin"
+        );
+        // ...under the name and in the directory the node actually uses. Both
+        // sides are scraped so a rename on either fails here, rather than
+        // leaving the shell reading a path that is now always absent -- which
+        // reads exactly like "no pin", the fail-open direction.
+        // Matched as a complete quoted path segment (`/known_bad_version"`), not
+        // as a bare substring: a bare one is satisfied by any name this is a
+        // PREFIX of, and a suffixed near-miss is exactly the drift to catch.
+        let pin_file_needle = format!("/{}\"", super::commands::rollback::KNOWN_BAD_FILE);
+        assert!(
+            has_statement(&nix_src, &pin_file_needle),
+            "the Nix supervisor must read the known-bad pin from the file the node \
+             writes it to ({})",
+            super::commands::rollback::KNOWN_BAD_FILE
+        );
+        // The directory half cannot be taken from a constant -- `state_dir()`
+        // builds the path inline -- so it is pinned from BOTH sides instead:
+        // move it in Rust and this fails, naming the shell file that has to
+        // move with it. Note what each half is worth. The Rust-side assertion
+        // is decisive. The shell-side one is a floor, not a proof: the wrapper
+        // also uses this path for its own XDG fallback, so it would survive
+        // deleting the known-bad lookup. What actually proves the wrapper reads
+        // the pin THERE is the behavioural case in the wrapper suite, which
+        // writes the pin only under a fake $HOME (verified by execution:
+        // dropping that directory from the lookup turns it red).
+        let auto_update_src = include_str!("commands/auto_update.rs");
+        const NODE_STATE_DIR: &str = ".local/state/freenet";
+        assert!(
+            auto_update_src.contains(NODE_STATE_DIR),
+            "auto_update::state_dir() is expected to resolve to {NODE_STATE_DIR} under \
+             HOME, which is where the node writes the known-bad pin and therefore \
+             where nix/freenet-node.sh looks for it. If it moved, move the wrapper too"
+        );
+        assert!(
+            has_statement(&nix_src, NODE_STATE_DIR),
+            "the Nix supervisor must know about HOME/{NODE_STATE_DIR}: that is where \
+             `auto_update::state_dir()` puts the known-bad pin whenever HOME is usable, \
+             falling back to $STATE_DIRECTORY only when it is not"
+        );
+        // ...and the flake must actually build that script, or the assertions
+        // above guard a file nothing runs.
+        let node_nix = read_repo_file("nix/node.nix");
+        assert!(
+            has_statement(&node_nix, "./freenet-node.sh"),
+            "nix/node.nix must build the supervisor from ./freenet-node.sh, or the \
+             pins above guard a script the `freenet-node` package never runs (#4580)"
+        );
+        // ...and the flake must make that supervised output the DEFAULT.
+        // Changing `default` to the bare `freenet` leaves every other test in
+        // the tree green while silently turning `nix run
+        // github:freenet/freenet-core` -- the headline command in docs/nix.md --
+        // into a peer that never updates itself.
+        let flake_nix = read_repo_file("flake.nix");
+        assert!(
+            has_statement(&flake_nix, "default = freenet-node;"),
+            "flake.nix must set `packages.default = freenet-node`, so the documented \
+             `nix run github:freenet/freenet-core` gets the supervised, self-updating node \
+             instead of a peer pinned forever to the flake's version"
+        );
+
+        // A source scrape cannot see a statement wrapped in `if false; then ...
+        // fi`, and should not pretend to: what catches that is EXECUTION. So
+        // pin the executable guard as well -- that it exists, that it asserts
+        // the property these text markers only stand in for, and that CI runs
+        // it. Without this, deleting the behavioural test silently downgrades
+        // every assertion above to "the text is still somewhere in the file".
+        let wrapper_test = read_repo_file("scripts/nix-node-wrapper_test.sh");
+        assert!(
+            has_statement(&wrapper_test, "self_of network")
+                && has_statement(&wrapper_test, "self_of update"),
+            "scripts/nix-node-wrapper_test.sh must assert WHICH binary `freenet network` and \
+             `freenet update` ran. Run either from the read-only /nix/store seed and \
+             `current_exe()` is un-renameable, every update fails with EROFS, and after \
+             MAX_UPDATE_FAILURES the node stops exiting 42 at all -- a silently and \
+             permanently stale peer, which is the whole failure this package exists to avoid"
+        );
+        // ...and the two re-seed refusals above are likewise only text until
+        // something drives them. Their cases feed the wrapper a store binary
+        // that is newer AND unusable, in each of the two ways.
+        // The needles are the ASSERTION TEXT of the driving cases, not the knob
+        // names that set them up. `"-dirty\""` and `"WRAP_PINNED_BAD"` were both
+        // satisfied by the suite's own declaration and reset lines, which
+        // survive deleting every case that uses them: measured by deleting the
+        // three refusal cases, which left the shell suite green AND this pin
+        // green, and then by stubbing `version_is_pinned_bad` to always return
+        // false, which also left both green -- zero coverage of the guard this
+        // pin exists to protect. These two strings occur exactly once each, in
+        // an `assert_contains` naming the behaviour, so commenting the case out
+        // strips them with `code_of` and this fails closed.
+        assert!(
+            has_statement(&wrapper_test, "it is a -dirty build")
+                && has_statement(&wrapper_test, "KNOWN-BAD"),
+            "scripts/nix-node-wrapper_test.sh must drive BOTH halves of the re-seed \
+             decision that depend on more than \"can it update itself\" -- a -dirty \
+             binary and a version pinned known-bad -- or the source pins above are \
+             satisfied by guards that never fire"
+        );
+        let ci_yml = read_repo_file(".github/workflows/ci.yml");
+        assert!(
+            has_statement(&ci_yml, "bash scripts/nix-node-wrapper_test.sh"),
+            "CI must run scripts/nix-node-wrapper_test.sh, or the Nix supervisor's only \
+             behavioural guard never executes and these source scrapes are all that is left"
+        );
+
+        // The documented unit must RESTART a wrapper that stood down. The
+        // wrapper exits 0 both for a clean shutdown and for exit 43 ("another
+        // instance already holds the port"), and the #3967 stale-orphan
+        // pre-flight is deliberately NOT ported (a KNOWN DIVERGENCE recorded in
+        // the wrapper header). Under `Restart = "on-failure"` a peer blocked by
+        // a stale orphan is therefore dead forever with nothing to revive it.
+        let nix_docs = read_repo_file("docs/nix.md");
+        assert!(
+            has_statement(&nix_docs, "Restart = \"always\";"),
+            "the docs/nix.md example unit must use `Restart = \"always\"`, so a wrapper that \
+             stood down is retried rather than left dead (the wrapper's exit 0 does not mean \
+             the peer is healthy)"
+        );
+        assert!(
+            !nix_docs.contains("Restart = \"on-failure\""),
+            "docs/nix.md must not offer `Restart = \"on-failure\"` for freenet-node: it \
+             restarts only on a non-zero exit, and the peer-is-stood-down case exits 0"
+        );
+        // ...and the unit must not inherit systemd's own start limit on top of
+        // the wrapper's. Its default (burst 5 / interval 10s) never fires at
+        // `RestartSec = 30`, so an operator who lowers RestartSec reinstates
+        // the #3967 permanent death this example exists to prevent.
+        assert!(
+            has_statement(&nix_docs, "startLimitIntervalSec = 0;"),
+            "the docs/nix.md example unit must disable systemd's own start limit, or \
+             lowering RestartSec puts the unit permanently in `failed` on the fifth \
+             exit -- dead forever, with nothing to revive it (#3967)"
+        );
+
+        // A packager surface documented on the same page: all three provenance
+        // variables treat EMPTY as "no override". `SOURCE_DATE_EPOCH` was the
+        // odd one out and PANICKED the build for a set-but-empty value, which
+        // is what a wrapper produces when it forwards a variable it has not
+        // got. This is a SOURCE SCRAPE, not execution: `cargo test` has no test
+        // target for a build script, so nothing can run the arm.
+        let build_rs = read_repo_file("crates/core/build.rs");
+        assert!(
+            has_statement(&build_rs, r#"Ok("") | Err(_) => chrono::Utc::now()"#),
+            "crates/core/build.rs must treat an EMPTY SOURCE_DATE_EPOCH as \"no \
+             override\", as its FREENET_GIT_COMMIT_HASH and FREENET_GIT_IS_DIRTY \
+             siblings do and as docs/nix.md documents -- not panic the build"
+        );
     }
 
-    /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on
-    /// `should_attempt_update()` so it honors the persistent auto-update failure
-    /// lockout (#3934). Without the gate, a locked-out long-running node (e.g. a
-    /// non-writable binary path that makes every install fail) would exit-42 once
-    /// per re-poll interval and make the supervisor rerun the same failing
-    /// update, reintroducing the loop the lockout exists to stop. The boot-time
-    /// startup check bypasses the lockout, but only once per restart; the
-    /// recurring re-poll must not.
+    /// Every self-initiated exit 42 must spend the lockout claim first, so a
+    /// node locked out by repeated failed installs (#3934) retries at most once
+    /// per cooldown. The two GitHub checks (boot and periodic re-poll) are
+    /// gated by the type system: `startup_update_check` takes the claim's
+    /// `UpdateAttempt`. The two fallbacks below exit 42 without asking GitHub,
+    /// so they are pinned here instead: each send must sit inside the block
+    /// whose condition spends the claim, and must occur exactly once, so an
+    /// ungated copy elsewhere fails too. The needles are split with `concat!`
+    /// so this file does not grow extra trigger-send sites for
+    /// scripts/auto-update-canary_test.sh's trigger-site count to trip on.
+    /// "Startup update check complete" means the check RAN and finished; the
+    /// release canary (#5222) greps for it on exactly that premise. A startup
+    /// check skipped by the lockout claim logs its own line instead, so the
+    /// completion line must sit inside the block gated on the claim.
     #[test]
-    fn periodic_repoll_respects_update_lockout() {
-        let src = strip_line_comments(include_str!("freenet.rs"));
-        // `should_attempt_update()` (with parens) appears only at the re-poll
-        // gate; the bare name without parens is the `use` import. The re-poll's
-        // GitHub call is the LAST `startup_update_check(...)` in the file (the
-        // first is the boot-time startup check).
-        let gate = src.find("should_attempt_update()").expect(
-            "periodic re-poll must gate on should_attempt_update() to honor the \
-             #3934 auto-update failure lockout",
-        );
-        let repoll_check = src
-            .rfind("startup_update_check(build_info::VERSION).await")
-            .expect("periodic re-poll startup_update_check call not found");
+    fn startup_completion_line_is_not_logged_for_a_skipped_check() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        let complete = "\"Startupupdatecheckcomplete:stayingonthecurrentversion\"";
+        assert_eq!(prod.matches(complete).count(), 1);
         assert!(
-            gate < repoll_check,
-            "the should_attempt_update() lockout gate must precede the periodic \
-             re-poll's startup_update_check call, so a locked-out node does not \
-             exit-42 in a loop (#4073 / #3934)"
+            braced_block(&prod, "ifstartup_check_ran{").contains(complete),
+            "the startup completion line must only log when the lockout claim allowed the check"
+        );
+    }
+
+    #[test]
+    fn fallback_update_exits_are_gated_on_the_lockout_claim() {
+        let prod = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        for (opener, send) in [
+            (
+                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&claim_update_attempt()\
+                 .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
+                concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),
+            ),
+            (
+                "ifclaim_update_attempt().is_ok(){",
+                concat!(
+                    "update_tx",
+                    ".send(\"unknown(gatewaymismatch)\".to_string())"
+                ),
+            ),
+        ] {
+            assert_eq!(
+                prod.matches(send).count(),
+                1,
+                "expected exactly one `{send}`; a second one would bypass the claim"
+            );
+            assert!(
+                braced_block(&prod, opener).contains(send),
+                "`{send}` must be inside the block gated by claim_update_attempt() (#3934)"
+            );
+        }
+        // ...and a REFUSED claim at max backoff with no connections keeps the
+        // version mismatch: the only clear inside that block is the claimed one.
+        let max_backoff_arm = braced_block(
+            &prod,
+            "UpdateCheckResult::Skippedifhas_reached_max_backoff()=>{",
+        );
+        let isolated = braced_block(max_backoff_arm, "ifopen_connections==0{");
+        assert_eq!(
+            isolated.matches("clear_version_mismatch()").count(),
+            1,
+            "with 0 connections, clear the mismatch only when the claim is granted"
+        );
+        assert!(
+            braced_block(isolated, "ifclaim_update_attempt().is_ok(){")
+                .contains("clear_version_mismatch()")
         );
     }
 }

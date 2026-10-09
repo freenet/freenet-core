@@ -2,7 +2,9 @@ mod contract;
 mod contract_store;
 mod delegate;
 pub(crate) mod delegate_api;
+pub(crate) mod delegate_interest;
 mod delegate_store;
+pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
@@ -60,13 +62,18 @@ impl SharedStores {
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
+#[cfg(test)]
+pub(crate) use module_cache::combine_ram_limits;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,
-    budget_for_ram, contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct,
-    interest_tiered_enabled, migration_admission_recovered_now, read_available_memory_bytes,
-    read_own_rss_bytes, read_total_ram_bytes,
+    contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct, interest_tiered_enabled,
+    migration_admission_recovered_now, read_own_rss_bytes, read_total_ram_bytes,
 };
+// Only `contract::executor::declared_cache_ceiling` reads this through the
+// module root, and that is test-only since #5647.
+#[cfg(test)]
+pub(crate) use module_cache::budget_for_ram;
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
 // byte values (so the test can't drift from the clamp). Gated to test builds so
@@ -76,10 +83,18 @@ pub(crate) use module_cache::{
     MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
-    DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
+    DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
     new_delegate_context_cache, new_delegate_counter, new_inherited_origins,
     release_created_delegate_slot,
 };
+// Narrow re-export rather than making `native_api` crate-visible: only the
+// conformance test driver (outside the `wasm_runtime` subtree) needs the
+// clock-override primitive, and widening the whole module would also expose
+// unrelated delegate-context/inherited-origins internals crate-wide. Gated to
+// test builds — production code that needs it (`execute_wasm_blocking`) is a
+// descendant of `wasm_runtime` and reaches `native_api::time` directly.
+#[cfg(test)]
+pub(crate) use native_api::time::override_contract_clock;
 // Only constructed by name in test code (e.g. resolve_message_origin tests);
 // production read/write paths access the entry through the DashMap without
 // naming the type, so gate the re-export to avoid an unused-import warning.

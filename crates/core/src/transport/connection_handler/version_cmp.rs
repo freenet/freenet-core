@@ -287,6 +287,29 @@ mod tests {
         }
     }
 
+    /// Companion to the marker guard: the floor must never drop to or below a
+    /// release known NOT to carry `AckConnectionV2`.
+    ///
+    /// Kept alongside the marker test rather than replaced by it, because the
+    /// two catch different mistakes: this one catches the floor being
+    /// LOWERED (e.g. someone "fixing" a gate that seems not to fire), the
+    /// marker one catches the RELEASE advancing past a stationary floor. Once
+    /// `ACK_VERSION_SHIPPED_IN` is `Some(...)`, the marker test's only
+    /// remaining assertion is `shipped == floor` — trivially true forever —
+    /// so without this companion nothing catches the floor being lowered.
+    /// Mirrors `hash_first_floor_stays_above_every_release_without_the_variants`.
+    #[test]
+    fn ack_version_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the `AckConnectionV2` variant.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 119);
+        assert!(
+            GATEWAY_ACK_VERSION_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "GATEWAY_ACK_VERSION_MIN_VERSION ({GATEWAY_ACK_VERSION_MIN_VERSION:?}) dropped to \
+             or below {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no AckConnectionV2 \
+             variant index. Sending it to those peers means the handshake never completes.",
+        );
+    }
+
     #[test]
     fn test_parse_semver() {
         assert_eq!(parse_semver("0.1.152"), (0, 1, 152));
@@ -478,6 +501,40 @@ mod tests {
         assert!(
             !old_peer_rejection_means_we_must_update("0.1.100", &local),
             "should not trigger update for peer below our min_compatible"
+        );
+    }
+
+    /// 0.2.120 and 0.2.121 cannot auto-update (#5221), so the shipped floor
+    /// must refuse them. Both advertised min_compatible 0.2.64.
+    ///
+    /// Only the refusal is pinned against fixed versions: raising the floor
+    /// further later is legitimate, so the accepting half is stated against
+    /// whatever floor this build ships, not against 0.2.122.
+    ///
+    /// This exercises this build's comparison logic only. That the handshake
+    /// sites act on a refusal is not covered here (#5835).
+    #[test]
+    fn shipped_floor_refuses_releases_that_cannot_auto_update() {
+        for stranded in ["0.2.120", "0.2.121"] {
+            let remote = encode_new_format(stranded, "0.2.64");
+            assert!(
+                is_compatible(&PROTOC_VERSION, &remote).is_err(),
+                "{stranded} cannot auto-update (#5221) and must be refused, \
+                 but the shipped floor {MIN_COMPATIBLE_VERSION} accepts it"
+            );
+            // Arguments swapped on purpose: this is the stranded peer's view
+            // (it is "local") of our handshake bytes, i.e. whether it learns
+            // that it is below our floor.
+            assert!(
+                remote_requires_newer_than_us(&remote, &PROTOC_VERSION),
+                "a refused {stranded} peer must be told it is below our floor"
+            );
+        }
+
+        let at_floor = encode_new_format(MIN_COMPATIBLE_VERSION, MIN_COMPATIBLE_VERSION);
+        assert!(
+            is_compatible(&PROTOC_VERSION, &at_floor).is_ok(),
+            "a peer exactly at the shipped floor {MIN_COMPATIBLE_VERSION} must be accepted"
         );
     }
 

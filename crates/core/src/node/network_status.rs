@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::ring::reconcile::ReconcileActionDivergence;
 use crate::ring::{PeerKeyLocation, SubscribedContractSnapshot};
@@ -79,9 +79,29 @@ pub struct RingStatsSnapshot {
     /// may be getting dropped — operators should watch this.
     pub updates_rate_limited: u64,
     /// Total relayed UPDATEs dropped because the limiter's tracking map
-    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
-    /// identity churn / admission pressure, distinct from per-pair rate.
+    /// was at capacity (`MAX_TRACKED_PAIRS`) and eviction could not free
+    /// a slot. Since #4981 this means the map is full *and* contended;
+    /// ordinary saturation shows up in `updates_capacity_evicted`.
     pub updates_capacity_dropped: u64,
+    /// Total tracked `(sender, contract)` pairs evicted to admit new
+    /// ones at capacity. This is the saturation signal: a busy node
+    /// relaying for more pairs than `MAX_TRACKED_PAIRS` shows this
+    /// climbing while `updates_capacity_dropped` stays flat, and no
+    /// legitimate UPDATE is dropped for it.
+    pub updates_capacity_evicted: u64,
+    /// Total relayed UPDATEs dropped because the sending peer was over
+    /// its budget for introducing brand-new `(sender, contract)` pairs.
+    /// This is the fresh-contract-id churn signal: unlike the counters
+    /// above it never counts a peer's traffic for contracts already
+    /// being tracked, so a non-zero value really does mean one peer is
+    /// presenting unfamiliar contract ids faster than the budget allows.
+    pub updates_sender_budget_dropped: u64,
+    /// Total relayed UPDATEs admitted for a brand-new pair WITHOUT a
+    /// budget check, because the per-sender budget's own map was full.
+    /// Should be zero. A non-zero value means the budget map is
+    /// undersized for this node's peer churn, so those senders are not
+    /// actually being bounded — the safety valve is firing.
+    pub updates_sender_budget_unmetered: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its
@@ -111,6 +131,108 @@ pub struct RingStatsSnapshot {
     /// lattice and the improvement rate falls toward zero.
     pub lattice_probes_issued: u64,
     pub lattice_probe_improvements: u64,
+}
+
+/// The scalars this module owns directly, for the OTel metrics callbacks.
+///
+/// Deliberately NOT [`get_snapshot`]: that builds per-peer and per-contract
+/// vectors and formats failure HTML, and the SDK has no batch-callback API in
+/// 0.32 — every observable instrument gets its own callback, so the exporter
+/// would pay that cost once per instrument per collection cycle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtelStatusScalars {
+    pub connection_attempts: u32,
+    pub op_stats: OperationStats,
+    /// Bootstrap-acceptance-churn counters (#4787). Sourced from the same
+    /// `NETWORK_STATUS` lock as the fields above, so it rides this existing
+    /// scalar source rather than a new provider.
+    pub bootstrap_transient_registered: u64,
+    pub bootstrap_transient_expired: u64,
+    pub bootstrap_promoted_to_ring: u64,
+    pub bootstrap_time_to_min_connections: Option<Duration>,
+    pub bootstrap_startup_rounds_connect_issued_gateway: u64,
+    pub bootstrap_startup_rounds_connect_issued_routed: u64,
+    pub bootstrap_startup_rounds_backoff_blocked: u64,
+    pub bootstrap_startup_rounds_no_target: u64,
+}
+
+/// Read this module's own scalars, or `None` before [`init`] has run.
+///
+/// One accessor per SOURCE, not one snapshot over all of them. An observable
+/// instrument that skips a collection cycle exports nothing, which reads as
+/// "not known yet", while a zero is a real datapoint —
+/// `freenet.ring.connections = 0` before the ring provider registers is
+/// indistinguishable from a node that has lost every connection. But that
+/// decision has to be per-source: an earlier version `?`-chained all of them
+/// into one snapshot, so an unregistered ring provider silently zeroed the
+/// queue metrics too, which do not depend on it at all.
+pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
+    let status = NETWORK_STATUS.get()?;
+    // Poison tolerance matches the writers in this module, which already keep
+    // going field-by-field. Propagating it instead would make every metric
+    // sourced here vanish permanently, silently, for the process's life.
+    let status = status.read().unwrap_or_else(|poisoned| {
+        POISON_REPORTED.call_once(|| {
+            tracing::warn!(
+                "network status lock is poisoned; metrics continue against \
+                 the last consistent state"
+            )
+        });
+        poisoned.into_inner()
+    });
+    let b = &status.bootstrap_churn_stats;
+    Some(OtelStatusScalars {
+        connection_attempts: status.connection_attempts,
+        op_stats: status.op_stats.clone(),
+        bootstrap_transient_registered: b.transient_registered,
+        bootstrap_transient_expired: b.transient_expired,
+        bootstrap_promoted_to_ring: b.promoted_to_ring,
+        bootstrap_time_to_min_connections: b.time_to_min_connections,
+        bootstrap_startup_rounds_connect_issued_gateway: b.startup_rounds_connect_issued_gateway,
+        bootstrap_startup_rounds_connect_issued_routed: b.startup_rounds_connect_issued_routed,
+        bootstrap_startup_rounds_backoff_blocked: b.startup_rounds_backoff_blocked,
+        bootstrap_startup_rounds_no_target: b.startup_rounds_no_target,
+    })
+}
+
+/// Logged at most once — a poisoned lock stays poisoned, so this would
+/// otherwise fire on every collection cycle forever.
+static POISON_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Live ring stats, or `None` before the provider is registered.
+pub(crate) fn otel_ring_stats() -> Option<RingStatsSnapshot> {
+    RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Hosted contracts partitioned by why they are held, or `None` before the
+/// provider is registered.
+///
+/// Its own accessor, read by exactly the two gauges that need it: this is an
+/// O(hosted) walk under the hosting-cache read lock, and folding it into a
+/// shared snapshot ran it once per observable callback — eighteen times a
+/// cycle to serve two of them.
+pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> {
+    HOSTING_REASON_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Source of the per-reason hosted-contract breakdown
+/// (`Ring::hosted_by_reason`). OTel-only; see [`otel_hosting_reasons`].
+pub type HostingReasonProvider =
+    Arc<dyn Fn() -> crate::ring::HostingReasonStats + Send + Sync + 'static>;
+
+static HOSTING_REASON_PROVIDER: parking_lot::RwLock<Option<HostingReasonProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the hosting-reason data source. Replaces any previously-registered
+/// provider.
+pub fn set_hosting_reason_provider(provider: HostingReasonProvider) {
+    *HOSTING_REASON_PROVIDER.write() = Some(provider);
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -208,6 +330,31 @@ pub struct NetworkStatus {
     pub gateway_addresses: HashSet<SocketAddr>,
     /// Active peer connections.
     pub connected_peers: Vec<ConnectedPeer>,
+    /// When the current spell without any peer-to-peer connection began, as
+    /// far as the gateway-only warning is concerned. Set when the node first
+    /// becomes gateway-only (connected, every connection a gateway); cleared
+    /// when it gains a peer-to-peer connection.
+    ///
+    /// Maintained by [`NetworkStatus::refresh_gateway_only_since`], which
+    /// every mutation of `connected_peers` must call. Kept as its own
+    /// timestamp because no property of the current connections can stand in
+    /// for it: the age of the oldest connection is too old when a long-lived
+    /// gateway link outlives the last peer, and too young when a gateway link
+    /// is re-established.
+    ///
+    /// It SURVIVES a drop to zero connections, because a real reconnect is a
+    /// disconnect followed by a connect: clearing it there would let a
+    /// firewalled node whose one gateway link flaps stay "still joining"
+    /// forever. It is restarted only if the node then stays disconnected for
+    /// longer than the grace itself (see [`Self::gateway_only_outage_since`]),
+    /// so a node that has been offline for a long stretch is treated as
+    /// joining afresh. (Time spent suspended does not count: `Instant` is a
+    /// monotonic clock that stops during sleep, so what is measured is the
+    /// disconnected time while awake.)
+    pub gateway_only_since: Option<Instant>,
+    /// When the node dropped to zero connections while
+    /// [`Self::gateway_only_since`] was set. `None` while connected.
+    pub gateway_only_outage_since: Option<Instant>,
     /// Freenet version string.
     pub version: String,
     /// This node's ring location.
@@ -249,6 +396,156 @@ pub struct NetworkStatus {
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
     pub reconcile_shadow_connection_drop: ReconcileShadowStats,
     pub reconcile_shadow_host_formation: ReconcileShadowStats,
+    /// Bootstrap-acceptance-churn counters (#4787). See [`BootstrapChurnStats`].
+    pub bootstrap_churn_stats: BootstrapChurnStats,
+}
+
+/// Bootstrap-acceptance-churn counters (issue #4787): a restarted node's
+/// connection to a gateway lingers as transient, its tracking entry expires,
+/// and (if the onward CONNECT never promotes it) the underlying transport is
+/// later reaped as a zombie by a separate, uninstrumented sweep — cycling the
+/// joiner through repeated reconnects before it acquires real peers. These
+/// counters are the "instrumentation before a fix" step the issue calls for:
+/// they don't change acceptance behavior, only make the churn rate and the
+/// time-to-bootstrap legible in production telemetry.
+///
+/// `transient_registered` / `transient_expired` / `promoted_to_ring` are
+/// ACCEPTOR-side, monotonic lifetime totals, recorded at the four sites in
+/// `p2p_protoc/connection_lifecycle.rs` that own the transient lifecycle. A
+/// sustained high `transient_expired` : `promoted_to_ring` ratio is the churn
+/// signature reported in the issue.
+///
+/// They are still not a clean partition of `transient_registered`: the #3113
+/// recovery path (a slow CONNECT that completes after the tracking entry's
+/// TTL already expired, `handle_connect_peer`) increments BOTH
+/// `transient_expired` (the tracking entry lapsed) AND `promoted_to_ring` (it
+/// promoted anyway) for the SAME connection. So `transient_expired +
+/// promoted_to_ring` can exceed `transient_registered`, and a connection that
+/// recovers this way is indistinguishable in these counters from one that is
+/// genuinely lost and later reaped as a zombie (the zombie-reap sweep itself,
+/// `p2p_protoc.rs`'s `drop_zombie_connection`, is not instrumented here) —
+/// both increment `transient_expired` exactly once. Read the ratio as a churn
+/// signal, not a strict recovered-vs-lost accounting.
+///
+/// The remaining fields are JOINER-side, recorded by `initial_join_procedure`
+/// in `operations/connect.rs`. `time_to_min_connections` is set at most once
+/// per process (the first time `open_connections()` reaches
+/// `min_connections`), measured from [`mark_process_start`]; `None` means this
+/// node has NOT bootstrapped yet, which is a distinct state from "no data" —
+/// the exporter publishes `freenet.bootstrap.completed` as a 0/1 gauge so a
+/// permanently-stuck joiner is visible rather than absent.
+///
+/// The four `startup_rounds_*` counters partition every below-threshold
+/// iteration of the join loop by what that iteration actually DID, and stop
+/// at the process's first real bootstrap (a later transient dip below
+/// `min_connections` is ordinary post-startup churn, not startup). Splitting
+/// them is what keeps them from degrading into a process-uptime proxy: a node
+/// stuck below `min_connections` forever increments SOMETHING every ~4s no
+/// matter how the counter is shaped, so the informative quantity is which one:
+///
+/// - `connect_issued_gateway` — dialled gateways this node was not yet
+///   connected to. Ordinary bootstrap; a healthy joiner's first rounds.
+/// - `connect_issued_routed` — every gateway transport was already up and the
+///   node was still more than `gateways.len()` connections short, so CONNECTs
+///   were routed THROUGH the connected gateways toward gap locations.
+///   **This is the series that moves during the #4787 stall.** With
+///   `min_connections = 25` and the 1–3 gateways a real deployment has, a
+///   joiner whose gateway transports are up but which acquires no real peers
+///   takes this branch on every round, for the whole multi-minute stall.
+/// - `backoff_blocked` — issued nothing because every candidate gateway was
+///   in exponential backoff.
+/// - `no_target` — issued nothing for any other reason. Principally: all
+///   gateways connected AND the node is within `gateways.len()` of the
+///   threshold, so the routed-CONNECT branch above does not apply and the
+///   round deliberately waits. This is NOT the #4787 acceptance-churn
+///   signature — an earlier revision of this instrumentation documented it as
+///   such, which would have had an operator watching a series that reads flat
+///   zero for the entire stall. But do not read it as merely quiet either: a
+///   node parked at, say, 24 of 25 connections matches this condition on
+///   every round forever, so sustained growth here is its own kind of stall —
+///   a joiner that has stopped issuing anything a few connections short of
+///   the threshold.
+///
+/// ## Reading the routed counter
+///
+/// Sustained `connect_issued_routed` growth while `time_to_min_connections`
+/// stays `None` (exported as `freenet.bootstrap.completed = 0`) identifies **a
+/// joiner that never bootstrapped**. That is NECESSARY for the #4787 stall but
+/// not SUFFICIENT, and the difference matters operationally: a network with
+/// fewer than `min_connections` reachable peers, a node behind restrictive
+/// NAT, and a node whose peers keep refusing for capacity all match the pair
+/// permanently and identically. An alert built on it alone fires forever on
+/// every node of a small network, gets muted, and then the real stall is
+/// invisible — the same defect this instrumentation exists to fix, one level
+/// up.
+///
+/// **The discriminator is `transient_registered` / `transient_expired` /
+/// `promoted_to_ring`**, documented above. A high `transient_expired` :
+/// `promoted_to_ring` ratio alongside climbing `connect_issued_routed` is
+/// acceptance churn — connections are being made and lost, which is #4787.
+/// Churn near zero with `connect_issued_routed` climbing means the CONNECTs
+/// are simply not finding acceptable peers: too few peers, or unreachable
+/// ones. Same routed counter, different fix.
+///
+/// Quantifying "sustained", so the guidance is implementable without
+/// re-deriving it from this loop: a round takes `BASE_WAIT_SECS * 3` plus 0–2s
+/// of jitter once the node holds any connection, so a joiner stuck in this
+/// branch emits on the order of 900 routed rounds per hour, without bound. A
+/// healthy joiner emits a few tens of them over the first minute or two and
+/// then stops, because reaching `min_connections` ends the counting. More than
+/// a few minutes of continued growth is the threshold worth alerting on.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapChurnStats {
+    /// Counts transient tracking entries actually inserted, not call-site
+    /// visits: the recording site branches on whether `try_register_transient`
+    /// inserted a NEW entry, so a budget-exhausted refusal (nothing inserted)
+    /// and a re-registration of an already-tracked address (nothing new
+    /// inserted) do not inflate it.
+    pub transient_registered: u64,
+    pub transient_expired: u64,
+    /// Counts promotions the ring actually accepted — both promotion call
+    /// sites gate on `Ring::add_connection`'s reported `added`, so a
+    /// cap-rejected promotion attempt is not counted as a promotion.
+    pub promoted_to_ring: u64,
+    pub time_to_min_connections: Option<Duration>,
+    /// Below-threshold join-loop rounds that dialled gateways this node was
+    /// not yet connected to.
+    pub startup_rounds_connect_issued_gateway: u64,
+    /// Below-threshold join-loop rounds that routed CONNECTs through
+    /// already-connected gateways because every gateway transport was already
+    /// up. Sustained growth with `time_to_min_connections == None` means this
+    /// joiner never bootstrapped; the `transient_*` / `promoted_to_ring` ratio
+    /// is what separates #4787 acceptance churn from simply having too few
+    /// acceptable peers. See [`BootstrapChurnStats`].
+    pub startup_rounds_connect_issued_routed: u64,
+    /// Below-threshold join-loop rounds that issued nothing because every
+    /// candidate gateway was in exponential backoff.
+    pub startup_rounds_backoff_blocked: u64,
+    /// Below-threshold join-loop rounds that issued nothing for any other
+    /// reason — principally: every gateway is connected AND the node is within
+    /// `gateways.len()` of the threshold, so the routed-CONNECT branch does
+    /// not apply and the round deliberately waits for handshakes or pending
+    /// reservations. Not the #4787 acceptance-churn signature (see
+    /// `startup_rounds_connect_issued_routed`), but not benign either:
+    /// sustained growth means a joiner parked a few connections short of the
+    /// threshold and no longer issuing anything.
+    pub startup_rounds_no_target: u64,
+}
+
+/// Why one below-bootstrap-threshold round of `initial_join_procedure` did or
+/// did not issue CONNECTs (#4787). See [`BootstrapChurnStats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRoundOutcome {
+    /// CONNECTs were issued to gateways this node is not yet connected to.
+    ConnectIssuedGateway,
+    /// CONNECTs were routed through already-connected gateways toward gap
+    /// locations, because every gateway transport is already up. The #4787
+    /// stall signature — see [`BootstrapChurnStats`].
+    ConnectIssuedRouted,
+    /// Nothing issued: every candidate gateway was in exponential backoff.
+    BackoffBlocked,
+    /// Nothing issued for any other reason.
+    NoTarget,
 }
 
 /// Per-node counters measuring how often the demand-driven-hosting **computed
@@ -518,7 +815,7 @@ pub struct ConnectedPeer {
 }
 
 /// Counters for each operation type: (success, failure).
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OperationStats {
     pub gets: (u32, u32),
     pub puts: (u32, u32),
@@ -655,6 +952,10 @@ pub enum FailureReason {
 /// `RING_STATS_PROVIDER`, `ROUTER`) live in their own statics with their own
 /// replace-on-set semantics and are intentionally left untouched here.
 pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: String) {
+    // Pin the process-start anchor if `main` didn't (library embeddings), so
+    // the #4787 bootstrap-latency metric is measured from node start at worst
+    // rather than from the moment the threshold happened to be crossed.
+    mark_process_start();
     let status = NetworkStatus {
         gateway_failures: Vec::new(),
         connection_attempts: 0,
@@ -662,6 +963,8 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         started_at: Instant::now(),
         gateway_addresses: gateway_addrs,
         connected_peers: Vec::new(),
+        gateway_only_since: None,
+        gateway_only_outage_since: None,
         version,
         own_location: None,
         external_address: None,
@@ -678,6 +981,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats::default(),
         reconcile_shadow_connection_drop: ReconcileShadowStats::default(),
         reconcile_shadow_host_formation: ReconcileShadowStats::default(),
+        bootstrap_churn_stats: BootstrapChurnStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -729,6 +1033,33 @@ pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
     }
 }
 
+impl NetworkStatus {
+    /// Bring [`Self::gateway_only_since`] in line with `connected_peers`.
+    /// Call after every change to that list.
+    fn refresh_gateway_only_since(&mut self, now: Instant) {
+        if self.connected_peers.iter().any(|p| !p.is_gateway) {
+            // A peer-to-peer connection: not gateway-only, nothing to time.
+            self.gateway_only_since = None;
+            self.gateway_only_outage_since = None;
+        } else if self.connected_peers.is_empty() {
+            // Disconnected. Keep the anchor and note when the outage began.
+            if self.gateway_only_since.is_some() && self.gateway_only_outage_since.is_none() {
+                self.gateway_only_outage_since = Some(now);
+            }
+        } else {
+            // Gateway-only. A long outage in between starts the grace over; a
+            // short one (a reconnect) does not.
+            let long_outage = self.gateway_only_outage_since.is_some_and(|since| {
+                now.saturating_duration_since(since).as_secs() >= GATEWAY_ONLY_GRACE_SECS
+            });
+            if self.gateway_only_since.is_none() || long_outage {
+                self.gateway_only_since = Some(now);
+            }
+            self.gateway_only_outage_since = None;
+        }
+    }
+}
+
 /// Record a successful peer connection.
 pub fn record_peer_connected(
     addr: SocketAddr,
@@ -747,6 +1078,7 @@ pub fn record_peer_connected(
                 connected_since: Instant::now(),
                 peer_key_location,
             });
+            s.refresh_gateway_only_since(Instant::now());
             s.gateway_failures.clear();
         }
     }
@@ -757,6 +1089,7 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
     // Free the per-peer metrics slot so the bounded table doesn't accumulate
@@ -1176,6 +1509,123 @@ pub fn connect_emit_counts() -> Option<(u64, u64)> {
     Some((c.accepts_emitted, c.rejects_emitted))
 }
 
+/// Record that a gateway-side connection was registered as transient (not
+/// yet added to ring topology) — issue #4787 instrumentation. Called from
+/// the "Registered transient connection" site in
+/// `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_transient_registered() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_registered = s
+                .bootstrap_churn_stats
+                .transient_registered
+                .saturating_add(1);
+        }
+    }
+}
+
+/// Record that a transient tracking entry expired (TTL elapsed) before the
+/// onward CONNECT promoted it — issue #4787 instrumentation. Called from the
+/// "Transient connection expired" site in
+/// `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_transient_expired() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_expired =
+                s.bootstrap_churn_stats.transient_expired.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a connection was promoted from transient to ring topology —
+/// issue #4787 instrumentation. Called from the "connect_peer: promoted to
+/// ring" site in `p2p_protoc/connection_lifecycle.rs`.
+pub fn record_bootstrap_promoted_to_ring() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.promoted_to_ring =
+                s.bootstrap_churn_stats.promoted_to_ring.saturating_add(1);
+        }
+    }
+}
+
+/// Process-start anchor for the bootstrap-latency metric (#4787).
+///
+/// `Instant` has no "process start" constructor, so this is the earliest
+/// instant the process is able to take. The `freenet` binary forces it on the
+/// first line of `main` (via [`crate::mark_process_start`]), which makes
+/// `freenet.bootstrap.time_to_min_connections_seconds` literally
+/// time-from-process-start for real nodes — including config load, storage
+/// open and every other startup step that can delay CONNECT. Anything
+/// embedding the node as a library and never calling it gets the anchor
+/// lazily at first touch, which [`init`] forces, i.e. node start rather than
+/// process start.
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Pin the process-start anchor to *now*. Call as early as possible in
+/// `main`; see [`PROCESS_START`].
+pub fn mark_process_start() {
+    LazyLock::force(&PROCESS_START);
+}
+
+/// Elapsed time since the process-start anchor (see [`PROCESS_START`]).
+pub fn since_process_start() -> Duration {
+    PROCESS_START.elapsed()
+}
+
+/// Record that this process has first reached `min_connections`, measured from
+/// the [`PROCESS_START`] anchor (issue #4787 instrumentation, joiner-side).
+///
+/// Taking the elapsed time here rather than from a caller-supplied clock is
+/// the point: the caller's own clock necessarily starts after the cached-peer
+/// fast-reconnect path and after all node startup, so a successful cached
+/// reconnect would report ~0s for a bootstrap that really took seconds.
+///
+/// Idempotent: only the first call per process has any effect, so a wobble
+/// around the threshold does not overwrite the real bootstrap latency.
+pub fn record_bootstrap_min_connections_reached() {
+    let elapsed = since_process_start();
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            if s.bootstrap_churn_stats.time_to_min_connections.is_none() {
+                s.bootstrap_churn_stats.time_to_min_connections = Some(elapsed);
+            }
+        }
+    }
+}
+
+/// Record one below-threshold round of `initial_join_procedure`, classified by
+/// what that round actually did (issue #4787 instrumentation, joiner-side).
+/// See [`BootstrapChurnStats`] for why the classification is the measurement.
+pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            let b = &mut s.bootstrap_churn_stats;
+            let slot = match outcome {
+                StartupRoundOutcome::ConnectIssuedGateway => {
+                    &mut b.startup_rounds_connect_issued_gateway
+                }
+                StartupRoundOutcome::ConnectIssuedRouted => {
+                    &mut b.startup_rounds_connect_issued_routed
+                }
+                StartupRoundOutcome::BackoffBlocked => &mut b.startup_rounds_backoff_blocked,
+                StartupRoundOutcome::NoTarget => &mut b.startup_rounds_no_target,
+            };
+            *slot = slot.saturating_add(1);
+        }
+    }
+}
+
+/// Read the current bootstrap-churn counters for export to `router_snapshot`
+/// (issue #4787). `None` before the singleton is initialized — which is what
+/// distinguishes "no data" from a node that has simply never bootstrapped
+/// (present, with `time_to_min_connections: None`).
+pub fn bootstrap_churn_counts() -> Option<BootstrapChurnStats> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    Some(s.bootstrap_churn_stats)
+}
+
 /// Count of this node's active connections that are to gateways (the
 /// NAT-stranded fingerprint — a peer stuck on gateways only). Read from the
 /// authoritative tracked `connected_peers` list. `None` before the singleton is
@@ -1381,8 +1831,14 @@ pub struct NetworkStatusSnapshot {
     pub contracts: Vec<ContractSnapshot>,
     pub op_stats: OpStatsSnapshot,
     pub nat_stats: NatStatsSnapshot,
-    /// True if all connections are to gateways (no peer-to-peer connections).
-    pub gateway_only: bool,
+    /// True if every connection is to a gateway (no peer-to-peer connections)
+    /// AND that has held for longer than [`GATEWAY_ONLY_GRACE_SECS`].
+    ///
+    /// The raw "all my peers are gateways" fact is deliberately not exposed:
+    /// it is true of every node for a while after it joins, since a node's
+    /// first connection is always a gateway, and rendering it as a warning
+    /// told every new user their firewall was at fault.
+    pub gateway_only_persisting: bool,
     /// Cumulative bytes uploaded (lifetime, never reset).
     pub bytes_uploaded: u64,
     /// Cumulative bytes downloaded (lifetime, never reset).
@@ -1596,9 +2052,11 @@ pub struct NetworkNorms {
 pub enum HealthLevel {
     /// Node has peer-to-peer connections and things are working.
     Healthy,
-    /// Connected but degraded (gateway-only, or all NAT attempts failing).
+    /// Connected but degraded: still gateway-only after the joining grace
+    /// period, or every NAT attempt failing over a meaningful sample.
     Degraded,
-    /// Still trying to establish connections.
+    /// Still joining: no connections yet, or connected only to gateways and
+    /// still within [`GATEWAY_ONLY_GRACE_SECS`].
     Connecting,
     /// No connections after extended time, or version mismatch.
     Trouble,
@@ -1627,14 +2085,26 @@ pub struct PeerSnapshot {
 pub struct ContractSnapshot {
     pub key_short: String,
     pub key_full: String,
-    /// `ContractKey.id().to_string()` — the 32-byte content hash
-    /// portion of the key. Distinct from `key_full` which carries
-    /// the full ContractKey encoding (instance id + parameters /
-    /// code-hash bookkeeping). Surfaced so the dashboard can
-    /// cross-reference this contract against
-    /// `GovernanceSnapshot.state_by_id`, which is keyed by
-    /// `ContractInstanceId::to_string()`. Codex review of
-    /// dashboard-polish PR caught the id/key string mismatch.
+    /// `ContractKey.id().to_string()` — the 32-byte instance id.
+    ///
+    /// Surfaced so the dashboard can cross-reference this contract against
+    /// `GovernanceSnapshot`, which is keyed by
+    /// `ContractInstanceId::to_string()`.
+    ///
+    /// NOT distinct from `key_full`, despite what this comment claimed until
+    /// 2026-08-21. `impl Display for ContractKey` delegates to
+    /// `self.instance` and `ContractKey::id()` returns `&self.instance`, so
+    /// `key.to_string()` and `key.id().to_string()` produce the SAME string
+    /// and the code-hash half reaches neither. The old wording ("Distinct
+    /// from `key_full` which carries the full ContractKey encoding") sent
+    /// three separate readers of the contract detail page down the same wrong
+    /// path — twice as a reported blocking bug, once as a fix for a case that
+    /// cannot occur.
+    ///
+    /// The field still earns its place: it states the intent explicitly, and
+    /// it keeps working if the Display impl ever changes. That equality is
+    /// pinned by `contract_key_display_equals_its_instance_id` in
+    /// `server/home_page.rs`, which fails if it stops holding.
     pub instance_id: String,
     pub subscribed_secs: u64,
     pub last_updated_secs: Option<u64>,
@@ -1691,28 +2161,17 @@ pub struct HostingSnapshot {
     /// real value — so the panel can distinguish "not yet computed" from a
     /// genuine (if enormous) budget.
     pub disk_budget_bytes: Option<u64>,
-    /// Configured resident-overhead budget (bytes, #5325): the RAM-scaled
-    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, a
-    /// pressure axis independent of `budget_bytes`/`used_bytes` (which cover
-    /// contract STATE bytes only, not the per-contract resident bookkeeping
-    /// overhead that scales with count). See
+    /// Resident-overhead budget (bytes, #5325/#5647): the memory hosted
+    /// contracts may hold in RAM, `--hosting-mem-share` of the node's memory
+    /// limit. A pressure axis independent of `budget_bytes`/`used_bytes`,
+    /// which cover contract STATE bytes on disk. See
     /// `.claude/rules/hosting-invariants.md` invariant 3.
     pub resident_overhead_budget_bytes: u64,
-    /// Current estimated resident-overhead bytes (#5325): `contract_count *
-    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Compare against
-    /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
-    /// against `budget_bytes`.
-    pub estimated_resident_overhead_bytes: u64,
-    /// The resident-overhead budget expressed as the contract COUNT it really
-    /// bounds (`resident_overhead_budget_bytes / 1 MiB-per-contract`).
-    ///
-    /// The dashboard renders this rather than the byte pair, because the byte
-    /// pair is not a memory measurement: the "used" side is
-    /// `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, so printing
-    /// it in MB reads to an operator as measured RAM when it is really a
-    /// contract-count ceiling. Derived in `HostingCache::contract_slot_budget`
-    /// so the per-contract constant keeps exactly one reader.
-    pub contract_slot_budget: u64,
+    /// Bytes hosted contracts currently hold in RAM (#5647): neighbour
+    /// summaries plus a fixed per-entry charge, counted from what is stored.
+    /// Compare against `resident_overhead_budget_bytes` the same way
+    /// `used_bytes` is compared against `budget_bytes`.
+    pub resident_overhead_bytes: u64,
     /// Monotonic count of evictions where resident-overhead pressure was
     /// active at decision time (#5325); may overlap with
     /// `budget_evictions_total`.
@@ -1798,11 +2257,58 @@ pub struct NatStatsSnapshot {
     pub recent_successes: u32,
 }
 
+/// NAT traversal attempts needed before "every one failed" is read as a
+/// blocked port.
+///
+/// Individual hole-punch attempts fail routinely on a healthy node (the
+/// failure list on the same page labels them "normal"), so a node whose first
+/// attempt or two happened to fail used to be told, in red, "0/1 successful —
+/// Port may be blocked". Below this the counts are shown without a verdict.
+pub const NAT_MIN_ATTEMPTS_FOR_VERDICT: u32 = 5;
+
+/// How long a node may be connected only to gateways before the dashboard
+/// treats it as a reachability problem rather than a node still joining.
+///
+/// Every node is gateway-only from its first connection until its first
+/// peer-to-peer one, and with no grace the dashboard greeted every fresh start
+/// with an amber banner and "Firewall likely blocking incoming connections".
+/// The same applies to a node that loses its last peer: it gets this long to
+/// find another before being told its firewall is at fault.
+///
+/// Two minutes is a judgement, not a measurement. It is long enough that a
+/// node joining normally is not warned, and short enough that a genuinely
+/// unreachable node is told within one look at the page. Measuring the real
+/// time-to-first-peer distribution is tracked in #5770.
+pub const GATEWAY_ONLY_GRACE_SECS: u64 = 120;
+
+impl NatStatsSnapshot {
+    /// Every NAT traversal attempt has failed, over enough attempts for that
+    /// to mean something. The one place this judgement is made: the health
+    /// level, the status card, the favicon and the tab title all read it.
+    pub fn looks_blocked(&self) -> bool {
+        self.attempts >= NAT_MIN_ATTEMPTS_FOR_VERDICT && self.successes == 0
+    }
+}
+
+/// Whether a node that became gateway-only at `since` has been that way long
+/// enough, as of `now`, to warn about.
+fn gateway_only_is_persisting(since: Option<Instant>, now: Instant) -> bool {
+    since.is_some_and(|since| {
+        now.saturating_duration_since(since).as_secs() >= GATEWAY_ONLY_GRACE_SECS
+    })
+}
+
 /// Get a snapshot of the current network status for the dashboard.
 pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
+    snapshot_at(Instant::now())
+}
+
+/// [`get_snapshot`] as of `now`. Split out so a test can ask what the
+/// dashboard shows some time from now without sleeping or constructing an
+/// `Instant` in the past (which can underflow on a freshly booted machine).
+fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     let status = NETWORK_STATUS.get()?;
     let s = status.read().ok()?;
-    let now = Instant::now();
 
     let failures = s
         .gateway_failures
@@ -1825,6 +2331,16 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                         "<strong>NAT traversal failed</strong>: Could not connect to this \
                          peer. This is normal — not all NAT traversal attempts succeed."
                             .to_string()
+                    } else if !s.connected_peers.is_empty() {
+                        // Connected, but only to gateways. "Can't reach
+                        // gateway" would be false here, and one failed attempt
+                        // is not yet evidence of a blocked port.
+                        format!(
+                            "<strong>NAT traversal failed</strong>: Could not connect to \
+                             this peer. If no peer connections succeed, check that UDP \
+                             port <code>{}</code> is open in your firewall.",
+                            s.listening_port
+                        )
                     } else {
                         format!(
                             "<strong>NAT traversal failed</strong>: Can't reach gateway. \
@@ -1859,7 +2375,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                 address: p.address,
                 is_gateway: p.is_gateway,
                 location: p.location,
-                connected_secs: now.duration_since(p.connected_since).as_secs(),
+                connected_secs: now.saturating_duration_since(p.connected_since).as_secs(),
                 peer_key_location: p.peer_key_location.clone(),
                 bytes_sent: sent,
                 bytes_received: recv,
@@ -1869,6 +2385,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
 
     let open_connections = peers.len() as u32;
     let gateway_only = open_connections > 0 && peers.iter().all(|p| p.is_gateway);
+    let gateway_only_persisting =
+        gateway_only && gateway_only_is_persisting(s.gateway_only_since, now);
 
     // Read subscribed contracts from the registered provider, which in
     // production points at the canonical lease map in `HostingManager`.
@@ -1907,19 +2425,29 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         })
         .unwrap_or_default();
 
-    let elapsed_secs = s.started_at.elapsed().as_secs();
+    let elapsed_secs = now.saturating_duration_since(s.started_at).as_secs();
     let has_version_mismatch = s
         .gateway_failures
         .iter()
         .any(|f| matches!(f.reason, FailureReason::VersionMismatch { .. }));
-    let nat_all_failing = s.nat_stats.attempts > 0 && s.nat_stats.successes == 0;
+    let nat_stats = NatStatsSnapshot {
+        attempts: s.nat_stats.attempts,
+        successes: s.nat_stats.successes,
+        recent_attempts: s.nat_stats.recent_attempts(),
+        recent_successes: s.nat_stats.recent_successes(),
+    };
 
     let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
-    } else if gateway_only || nat_all_failing {
+    } else if gateway_only_persisting || nat_stats.looks_blocked() {
         HealthLevel::Degraded
+    } else if gateway_only {
+        // Connected to a gateway and nothing else yet, within the grace: the
+        // node is still joining. Not a problem, but not "connected to N
+        // peers" either, since it has no peer-to-peer connection.
+        HealthLevel::Connecting
     } else {
         HealthLevel::Healthy
     };
@@ -1953,13 +2481,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             subscribes: s.op_stats.subscribes,
             updates_received: s.op_stats.updates_received,
         },
-        nat_stats: NatStatsSnapshot {
-            attempts: s.nat_stats.attempts,
-            successes: s.nat_stats.successes,
-            recent_attempts: s.nat_stats.recent_attempts(),
-            recent_successes: s.nat_stats.recent_successes(),
-        },
-        gateway_only,
+        nat_stats,
+        gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
         health,
@@ -2181,6 +2704,102 @@ mod tests {
         );
     }
 
+    /// End-to-end for the bootstrap-acceptance-churn counters (#4787): each
+    /// record function must feed the `bootstrap_churn_counts()` getter that
+    /// `Ring` polls for the `router_snapshot` export. Distinct counts per
+    /// field so a transposition can't pass; `time_to_min_connections` is
+    /// asserted idempotent (only the FIRST call has effect).
+    #[test]
+    fn bootstrap_churn_counts_reflect_recorded_events() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Fresh singleton state for a deterministic baseline (init overwrites
+        // the process-global tracker in place, zeroing the counters).
+        init(31337, HashSet::new(), "test".to_string());
+
+        assert_eq!(
+            bootstrap_churn_counts(),
+            Some(BootstrapChurnStats::default()),
+            "counters start at zero/None after init"
+        );
+
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_registered();
+        record_bootstrap_transient_expired();
+        record_bootstrap_transient_expired();
+        record_bootstrap_promoted_to_ring();
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        record_bootstrap_startup_round(StartupRoundOutcome::BackoffBlocked);
+        record_bootstrap_startup_round(StartupRoundOutcome::BackoffBlocked);
+        record_bootstrap_startup_round(StartupRoundOutcome::NoTarget);
+
+        // Not yet bootstrapped: the getter must distinguish this from
+        // "no data" — it returns `Some(..)` with a `None` latency.
+        let before = bootstrap_churn_counts().expect("singleton is initialized");
+        assert_eq!(
+            before.time_to_min_connections, None,
+            "time_to_min_connections is None until min_connections is reached"
+        );
+
+        record_bootstrap_min_connections_reached();
+        let first = bootstrap_churn_counts()
+            .expect("singleton is initialized")
+            .time_to_min_connections
+            .expect("recorded on the first call");
+        // A second call must NOT overwrite the first — the real bootstrap
+        // latency, not the latest wobble around the threshold.
+        record_bootstrap_min_connections_reached();
+
+        assert_eq!(
+            bootstrap_churn_counts(),
+            Some(BootstrapChurnStats {
+                transient_registered: 3,
+                transient_expired: 2,
+                promoted_to_ring: 1,
+                time_to_min_connections: Some(first),
+                startup_rounds_connect_issued_gateway: 4,
+                startup_rounds_connect_issued_routed: 5,
+                startup_rounds_backoff_blocked: 2,
+                startup_rounds_no_target: 1,
+            }),
+            "each record function must feed its own field, and \
+             time-to-min-connections is set on the FIRST call only"
+        );
+    }
+
+    /// The bootstrap-latency clock must run from the process-start anchor, not
+    /// from the moment the threshold is crossed — otherwise a fast cached-peer
+    /// reconnect reports ~0s for a bootstrap that really took the whole
+    /// startup. Pins that `record_bootstrap_min_connections_reached` reads
+    /// [`since_process_start`] rather than starting a fresh clock.
+    #[test]
+    fn bootstrap_latency_measures_from_process_start_anchor() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31338, HashSet::new(), "test".to_string());
+        // The anchor is process-global and was forced no later than the first
+        // `init()` in this test binary, so real elapsed time has accrued.
+        let before = since_process_start();
+        record_bootstrap_min_connections_reached();
+        let recorded = bootstrap_churn_counts()
+            .expect("singleton is initialized")
+            .time_to_min_connections
+            .expect("recorded");
+        assert!(
+            recorded >= before,
+            "recorded latency {recorded:?} must be measured from the \
+             process-start anchor (>= {before:?} observed just before the call), \
+             not from a clock started at the call site"
+        );
+    }
+
     /// End-to-end for the per-site reconcile-controller SHADOW counters (keystone
     /// step-2, #4642): the record site must feed the `reconcile_shadow_counts()`
     /// getter that `Ring` polls for the `router_snapshot` export. `comparisons`
@@ -2323,9 +2942,14 @@ mod tests {
                 connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        // Read past the joining grace, where gateway-only counts as persisting.
+        let later = Instant::now() + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
+        let snap = snapshot_at(later).unwrap();
+        assert!(snap.gateway_only_persisting);
 
         // Not gateway-only: add a non-gateway peer
         {
@@ -2337,22 +2961,27 @@ mod tests {
                 connected_since: Instant::now(),
                 peer_key_location: None,
             });
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(!snap.gateway_only);
+        let snap = snapshot_at(later).unwrap();
+        assert!(!snap.gateway_only_persisting);
 
         // Back to gateway-only: remove non-gateway peer
         {
             let mut s = status.write().unwrap();
             s.connected_peers.retain(|p| p.address != peer_addr);
+            s.refresh_gateway_only_since(Instant::now());
         }
-        let snap = get_snapshot().unwrap();
-        assert!(snap.gateway_only);
+        // Gateway-only again, but only just: the grace restarts.
+        assert!(!get_snapshot().unwrap().gateway_only_persisting);
+        let snap = snapshot_at(later).unwrap();
+        assert!(snap.gateway_only_persisting);
 
         // Cleanup
         {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
+            s.refresh_gateway_only_since(Instant::now());
         }
     }
 
@@ -2464,6 +3093,261 @@ mod tests {
         clear_subscription_provider();
     }
 
+    /// A node that has just connected to its first gateway is joining, not
+    /// degraded. Only once that state has outlasted the grace period is it a
+    /// reachability problem.
+    #[test]
+    fn gateway_only_is_degraded_only_after_the_joining_grace() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 12345);
+        init(31346, HashSet::new(), "0.1.148".to_string());
+        {
+            let mut s = NETWORK_STATUS.get().unwrap().write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+        }
+        let just_short = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS - 1);
+        let past_grace = Duration::from_secs(GATEWAY_ONLY_GRACE_SECS + 5);
+
+        // Freshly connected to a gateway: joining, not a problem.
+        let before_join = Instant::now();
+        record_peer_connected(gw_addr, None, None);
+        let joined = Instant::now();
+        let snap = get_snapshot().unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        let snap = snapshot_at(before_join + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
+
+        // Still gateway-only past the grace period: now it is a problem.
+        let snap = snapshot_at(joined + past_grace).unwrap();
+        assert!(snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Degraded);
+
+        // Recording the gateway connection again must NOT restart the grace.
+        // This happens in production without a disconnect in between (the
+        // connection is recorded when the transport inserts it and again when
+        // it is promoted into the ring), and the anchor is when the node
+        // became gateway-only, not the age of any one connection record.
+        // Asked at exactly the grace after `joined`, which is only satisfied
+        // if the anchor is still at or before `joined`: an anchor moved to the
+        // reconnect would be a moment short.
+        record_peer_connected(gw_addr, None, None);
+        assert!(
+            snapshot_at(joined + Duration::from_secs(GATEWAY_ONLY_GRACE_SECS))
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        // A peer-to-peer connection clears it...
+        record_peer_connected(peer_addr, None, None);
+        let snap = snapshot_at(joined + past_grace).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Healthy);
+
+        // ...and losing that peer starts a NEW grace, even though the gateway
+        // connection is by now long-lived. A node gets time to find another
+        // peer before it is told its firewall is at fault.
+        let before_loss = Instant::now();
+        record_peer_disconnected(peer_addr);
+        let lost_peer = Instant::now();
+        let snap = snapshot_at(before_loss + just_short).unwrap();
+        assert!(!snap.gateway_only_persisting);
+        assert_eq!(snap.health, HealthLevel::Connecting);
+        assert!(
+            snapshot_at(lost_peer + past_grace)
+                .unwrap()
+                .gateway_only_persisting
+        );
+
+        record_peer_disconnected(gw_addr);
+        assert!(
+            !snapshot_at(lost_peer + past_grace)
+                .unwrap()
+                .gateway_only_persisting,
+            "with no connections the node is not gateway-only, whatever the anchor says"
+        );
+    }
+
+    /// A real reconnect is a disconnect followed by a connect. It must not
+    /// restart the grace, or a firewalled node whose one gateway link flaps
+    /// would be "still joining" forever; but an outage longer than the grace
+    /// is a fresh start, so a node back from a long time offline is not warned
+    /// at once.
+    #[test]
+    fn gateway_only_grace_survives_a_reconnect_but_not_a_long_outage() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
+        init(31348, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        // Drive the state machine at chosen instants. `record_peer_*` stamp
+        // `Instant::now()`, so the list is edited directly and the refresh is
+        // called with the time under test.
+        let set_gateway_connected = |connected: bool, at: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_addresses.insert(gw_addr);
+            s.connected_peers.clear();
+            if connected {
+                s.connected_peers.push(ConnectedPeer {
+                    address: gw_addr,
+                    is_gateway: true,
+                    location: None,
+                    connected_since: at,
+                    peer_key_location: None,
+                });
+            }
+            s.refresh_gateway_only_since(at);
+        };
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+        }
+        let persisting = |at: Instant| snapshot_at(at).unwrap().gateway_only_persisting;
+
+        // Gateway link flaps every 50s: up at 0, down at 50, up at 60, down at
+        // 110, up at 115. No single connection lives long enough to reach the
+        // grace, but the node has had no peer since t0.
+        set_gateway_connected(true, t0);
+        set_gateway_connected(false, t0 + secs(50));
+        set_gateway_connected(true, t0 + secs(60));
+        set_gateway_connected(false, t0 + secs(110));
+        set_gateway_connected(true, t0 + secs(115));
+        assert!(!persisting(t0 + secs(GATEWAY_ONLY_GRACE_SECS - 1)));
+        assert!(
+            persisting(t0 + secs(GATEWAY_ONLY_GRACE_SECS)),
+            "a flapping gateway link must not keep restarting the grace"
+        );
+
+        // Now the node goes dark for longer than the grace, then reconnects.
+        // That is a fresh join: the grace starts over from the reconnect.
+        let down = t0 + secs(200);
+        set_gateway_connected(false, down);
+        let back = down + secs(GATEWAY_ONLY_GRACE_SECS + 30);
+        set_gateway_connected(true, back);
+        assert!(
+            !persisting(back + secs(GATEWAY_ONLY_GRACE_SECS - 1)),
+            "after a long outage the node gets the joining grace again"
+        );
+        assert!(persisting(back + secs(GATEWAY_ONLY_GRACE_SECS)));
+
+        // The outage boundary: exactly the grace counts as long, one second
+        // less does not.
+        let reset_to_gateway_only_at = |at: Instant| {
+            let mut s = status.write().unwrap();
+            s.gateway_only_since = None;
+            s.gateway_only_outage_since = None;
+            drop(s);
+            set_gateway_connected(true, at);
+        };
+        let t1 = back + secs(1_000);
+        reset_to_gateway_only_at(t1);
+        set_gateway_connected(false, t1 + secs(10));
+        set_gateway_connected(true, t1 + secs(10 + GATEWAY_ONLY_GRACE_SECS - 1));
+        assert!(
+            persisting(t1 + secs(GATEWAY_ONLY_GRACE_SECS)),
+            "an outage one second short of the grace is a reconnect, not a fresh start"
+        );
+        let t2 = t1 + secs(1_000);
+        reset_to_gateway_only_at(t2);
+        set_gateway_connected(false, t2 + secs(10));
+        let back2 = t2 + secs(10 + GATEWAY_ONLY_GRACE_SECS);
+        set_gateway_connected(true, back2);
+        assert!(
+            !persisting(back2 + secs(GATEWAY_ONLY_GRACE_SECS - 1)),
+            "an outage of exactly the grace is a fresh start"
+        );
+
+        // Gateway-only, then a peer, then nothing, then gateway-only again: the
+        // peer ended the old spell, so the new one starts at the reconnect.
+        let t3 = t2 + secs(1_000);
+        reset_to_gateway_only_at(t3);
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.push(ConnectedPeer {
+                address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 1),
+                is_gateway: false,
+                location: None,
+                connected_since: t3 + secs(20),
+                peer_key_location: None,
+            });
+            s.refresh_gateway_only_since(t3 + secs(20));
+            assert!(s.gateway_only_since.is_none());
+        }
+        set_gateway_connected(false, t3 + secs(30));
+        assert!(
+            status.read().unwrap().gateway_only_outage_since.is_none(),
+            "an outage with no gateway-only spell running has nothing to time"
+        );
+        set_gateway_connected(true, t3 + secs(40));
+        assert!(!persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS - 1)));
+        assert!(persisting(t3 + secs(40 + GATEWAY_ONLY_GRACE_SECS)));
+
+        set_gateway_connected(false, t3 + secs(500));
+        let mut s = status.write().unwrap();
+        s.gateway_only_since = None;
+        s.gateway_only_outage_since = None;
+    }
+
+    /// Single NAT traversal attempts fail routinely, so a node is not
+    /// "degraded" until every attempt has failed over a real sample.
+    #[test]
+    fn nat_failures_degrade_health_only_over_a_real_sample() {
+        let blocked = |attempts, successes| {
+            NatStatsSnapshot {
+                attempts,
+                successes,
+                ..Default::default()
+            }
+            .looks_blocked()
+        };
+        assert!(!blocked(0, 0));
+        assert!(!blocked(1, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT - 1, 0));
+        assert!(blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT, 0));
+        assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT * 10, 1));
+
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 12345);
+        init(31347, HashSet::new(), "0.1.148".to_string());
+        let status = NETWORK_STATUS.get().unwrap();
+        {
+            let mut s = status.write().unwrap();
+            s.connected_peers.clear();
+            s.gateway_failures.clear();
+            s.nat_stats = NatStats::default();
+            s.connected_peers.push(ConnectedPeer {
+                address: peer_addr,
+                is_gateway: false,
+                location: Some(0.3),
+                connected_since: Instant::now(),
+                peer_key_location: None,
+            });
+        }
+
+        record_nat_attempt(false);
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Healthy);
+
+        for _ in 1..NAT_MIN_ATTEMPTS_FOR_VERDICT {
+            record_nat_attempt(false);
+        }
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Degraded);
+
+        let mut s = status.write().unwrap();
+        s.connected_peers.clear();
+        s.nat_stats = NatStats::default();
+    }
+
     #[test]
     fn test_nat_stats() {
         let _lock = TEST_MUTEX.lock().unwrap();
@@ -2559,6 +3443,12 @@ mod tests {
         assert!(html.contains("NAT traversal failed"));
         assert!(html.contains("firewall"));
         assert!(!html.contains("This is normal"));
+        // But it must not claim the gateway is unreachable: this node is
+        // connected to one.
+        assert!(
+            !html.contains("Can't reach gateway"),
+            "a node connected to a gateway must not be told it can't reach one — got: {html}"
+        );
 
         // Cleanup
         record_peer_disconnected(gw_addr);

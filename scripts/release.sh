@@ -1323,9 +1323,15 @@ trigger_gateway_updates() {
     fi
 
     # Known gateways: host, SSH user, SSH options
+    # The AWS gateway was retired 2026-09; its entry is removed so a fallback
+    # release does not SSH to a host that no longer exists and record a failed
+    # update on every run. nova's second gateway (freenet-gateway-2) needs no
+    # entry of its own: it carries WantedBy=freenet-gateway.service, so the same
+    # stop/start cycle brings it up, and gateway-auto-update.sh now verifies
+    # companion units from the .wants symlinks rather than reporting success
+    # while one is down.
     local -a GATEWAYS=(
         "nova.locut.us:ian:"
-        "vega.locut.us:ian:"
     )
 
     local all_ok=true
@@ -1965,7 +1971,7 @@ echo "   Wait 5-10 minutes, then check gateway logs for issues:"
 echo
 echo "   Quick check commands:"
 echo "   ssh ian@nova.locut.us 'sudo /usr/local/bin/freenet --version'"
-echo "   ssh ian@vega.locut.us 'sudo /usr/local/bin/freenet --version'"
+echo "   ssh ian@nova.locut.us 'systemctl is-active freenet-gateway freenet-gateway-2'"
 echo
 echo "   Look for: log spam, rapid log growth, new error patterns"
 echo "   See: ~/.claude/skills/freenet-release/SKILL.md for full checklist"

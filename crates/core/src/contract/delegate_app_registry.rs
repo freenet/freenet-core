@@ -2,8 +2,8 @@
 //! talk to it, so notification-driven delegate invocations can route their
 //! outbound [`ApplicationMessage`]s back to those apps.
 //!
-//! This is the mirror of [`crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS`]:
-//! `DELEGATE_SUBSCRIPTIONS` maps `contract -> delegates` (which delegates want
+//! This is the mirror of [`crate::wasm_runtime::delegate_subscriptions`]:
+//! that registry maps `contract -> delegates` (which delegates want
 //! to hear about a contract's state changes); this registry maps
 //! `delegate -> apps` (which client connections should receive the delegate's
 //! resulting `ApplicationMessage`s).
@@ -423,7 +423,7 @@ mod tests {
     use freenet_stdlib::prelude::CodeHash;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // The registry is a process-global (mirroring DELEGATE_SUBSCRIPTIONS), so
+    // The registry is a process-global (mirroring delegate_subscriptions), so
     // these unit tests run against SHARED state under plain `cargo test`'s
     // in-process parallelism. Each test therefore carves out its OWN key/id
     // namespace from a global counter instead of relying on clear_for_test()

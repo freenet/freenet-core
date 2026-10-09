@@ -229,6 +229,17 @@ pub(crate) struct OpManager {
     ///
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    /// This node's delegate capability state, set once by the executor pool
+    /// when it is built, so the HTTP server can answer "Apps and permissions"
+    /// requests. `None` until then (and on executors without capabilities).
+    ///
+    /// WEAK: the pool owns it. `DelegateCapabilities` holds a redb handle, and
+    /// the `OpManager` outlives the node's run loop, so a strong reference
+    /// here would keep the database file locked after shutdown and break an
+    /// in-process restart (`test_in_process_restart_releases_redb_lock`).
+    delegate_capabilities: Arc<
+        OnceLock<std::sync::Weak<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    >,
     /// Registry for handling race conditions between stream fragments and metadata messages.
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
@@ -243,6 +254,12 @@ pub(crate) struct OpManager {
     /// stream-inactivity timeout instead of a fixed per-attempt deadline. See
     /// `operations::stream_progress`.
     stream_progress_registry: Arc<StreamProgressRegistry>,
+    /// Per-attempt record of the peer an originator's GET/PUT attempt was
+    /// actually forwarded to (#5657). Same two-task shape as
+    /// `stream_progress_registry`: the retry loop registers a slot keyed by the
+    /// attempt `Transaction` (removed by an RAII guard), the originator-loopback
+    /// relay fills it. See `operations::route_attempt`.
+    attempt_hop_registry: Arc<crate::operations::route_attempt::AttemptHopRegistry>,
     /// Size threshold in bytes above which streaming is used.
     pub streaming_threshold: usize,
     /// Backoff tracker for failed gateway connection attempts.
@@ -264,6 +281,23 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    /// Identity of this `OpManager` instance, unique for the life of the
+    /// process (#5542 finding C).
+    ///
+    /// Used as the node component of a key in the process-global
+    /// `wasm_runtime::delegate_interest` hold map, which has to distinguish two
+    /// nodes running in ONE process — the in-process multi-node test harness.
+    ///
+    /// A MONOTONIC COUNTER, not `Arc::as_ptr`. The pointer was the obvious
+    /// choice and is wrong: `OpManager` has no `Drop`, and glibc's tcache
+    /// reuses freed allocations LIFO, so a second `OpManager` can land on a
+    /// dropped one's address and silently inherit its identity — at which point
+    /// its `record` is discarded as a duplicate and its refcount leaks. That is
+    /// reachable only under `cargo test`, because the binary uses jemalloc and
+    /// the test harness does not; `cargo test` is the runner `AGENTS.md` tells
+    /// contributors to use, and the one where cross-test interference is
+    /// observable at all (#5314).
+    pub(crate) node_identity: crate::wasm_runtime::delegate_interest::NodeIdentity,
     /// Transactions with an active driver relay-GET driver at this
     /// node. Populated by `start_relay_get` before spawn and removed by
     /// an RAII guard on the driver task. Consulted by the dispatch gate
@@ -345,14 +379,19 @@ impl Clone for OpManager {
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
+            delegate_capabilities: self.delegate_capabilities.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
+            attempt_hop_registry: self.attempt_hop_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
+            // The SAME node, so the same identity. A fresh id here would make
+            // one node look like two to the delegate-interest hold map.
+            node_identity: self.node_identity,
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
@@ -420,6 +459,11 @@ impl OpManager {
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
         task_monitor: &super::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
+        // Monotonic per-process instance id. `Relaxed` is sufficient: the only
+        // requirement is uniqueness, not ordering against other memory.
+        static NEXT_NODE_IDENTITY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(1);
+        let node_identity = NEXT_NODE_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ring = Ring::new(
             config,
             notification_channel.clone(),
@@ -559,8 +603,12 @@ impl OpManager {
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
             request_router,
+            delegate_capabilities: Arc::new(OnceLock::new()),
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
+            attempt_hop_registry: Arc::new(
+                crate::operations::route_attempt::AttemptHopRegistry::new(),
+            ),
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
@@ -576,6 +624,7 @@ impl OpManager {
                     .collect(),
             ),
             pending_contract_fetches,
+            node_identity,
             active_relay_get_txs,
             active_relay_update_txs,
             active_relay_put_txs,
@@ -752,6 +801,28 @@ impl OpManager {
     /// without holding an `Arc<OpManager>` across the drain wait.
     pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
         self.inflight_client_ops.clone()
+    }
+
+    /// Set once by the executor pool; later calls are ignored.
+    pub(crate) fn set_delegate_capabilities(
+        &self,
+        caps: &Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        if self
+            .delegate_capabilities
+            .set(Arc::downgrade(caps))
+            .is_err()
+        {
+            tracing::debug!("delegate capabilities already set; ignoring repeat wiring");
+        }
+    }
+
+    pub(crate) fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities
+            .get()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.
@@ -1649,6 +1720,14 @@ impl OpManager {
     /// looks it up to record per-fragment progress.
     pub(crate) fn stream_progress_registry(&self) -> &Arc<StreamProgressRegistry> {
         &self.stream_progress_registry
+    }
+
+    /// Per-attempt first-hop registry for originator route attribution
+    /// (#5657). See `operations::route_attempt::AttemptHopRegistry`.
+    pub(crate) fn attempt_hop_registry(
+        &self,
+    ) -> &Arc<crate::operations::route_attempt::AttemptHopRegistry> {
+        &self.attempt_hop_registry
     }
 
     /// Determines if streaming should be used for a payload of the given size.

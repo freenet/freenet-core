@@ -96,11 +96,11 @@ pub struct FaultInjectorState {
     pub stats: NetworkStats,
     /// Network name for delivering pending messages
     pub network_name: Option<String>,
-    /// Opt-in: when true, the sim's global packet-delivery callback DROPS every
+    /// Opt-in: when true, the network's packet-delivery callback DROPS every
     /// packet to/from a crashed node (`config.crashed_nodes`, counted in
     /// `stats.messages_dropped_crash`) OR blocked by an active partition
     /// (`config.partitions`, counted in `stats.messages_dropped_partition`).
-    /// Off by default so merely installing the global callback does not silently
+    /// Off by default so merely installing the callback does not silently
     /// change fault behavior for networks that never opted in. Both
     /// `SimNetwork::run_controlled_simulation` (scripted `CrashNode`, #4642 piece F)
     /// and `SimNetwork::run_simulation_direct` (churn driver crashes, #4694) set it
@@ -263,8 +263,12 @@ pub fn get_fault_injector(network_name: &str) -> Option<Arc<std::sync::Mutex<Fau
     FAULT_INJECTORS.get(network_name).map(|r| r.value().clone())
 }
 
-/// Clears all fault injectors. Useful for test cleanup.
+/// Clears all fault injectors, for EVERY network in the process.
 #[allow(dead_code)]
+#[deprecated(
+    note = "also wipes simulations running concurrently in this process (#5673); \
+            use set_fault_injector(name, None)"
+)]
 pub fn clear_all_fault_injectors() {
     FAULT_INJECTORS.clear();
 }

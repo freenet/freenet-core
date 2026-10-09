@@ -1,5 +1,17 @@
 # Cutting a Freenet release
 
+> **The AWS gateway was retired in September 2026.** References to it below that
+> remain are historical incident records (notably the v0.2.71 half-applied
+> rollout that motivated the post-deploy verify) and are kept deliberately —
+> they explain why a check exists. It is no longer a rollout target: the release
+> matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
+> have all been removed. nova now runs two gateway processes; the second,
+> `freenet-gateway-2`, has no release-agent of its own and is brought up by the
+> primary's stop/start cycle, with `gateway-auto-update.sh` verifying it via the
+> `.wants` symlinks so a companion that fails to start is not reported as a
+> successful update.
+
+
 The release pipeline is fully automated. Any maintainer with workflow-run access
 can cut a release by triggering one workflow; everything else cascades:
 crates.io publish, GitHub release with binaries, gateway updates, and the
@@ -39,14 +51,15 @@ Within ~30–60 minutes you should see:
 2. An auto-created bump PR titled `build: release X.Y.Z` that merges itself.
 3. A `vX.Y.Z` git tag pushed and a **draft** GitHub release created, which
    triggers `Build and Cross-Compile`.
-4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows + signed
-   DMG and attaches all 14 artifacts to the draft release.
+4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows
+   (Authenticode-signed) + signed DMG and attaches all 14 artifacts to the
+   draft release.
 5. Still inside that job, in this order: **Gate A** (the blocking auto-update
    pre-flight, see "Release gates" below) → `freenet` and `fdev` published to
    crates.io → undraft.
 6. The undraft fires `release.published` → `Gateway Update` and
    `Release Announcements` both auto-trigger.
-7. nova and vega gateways converge to the new version (verified by the
+7. nova's gateways converge to the new version (verified by the
    workflow polling `/version` after the update).
 8. A Matrix message lands in `#freenet-locutus:matrix.org`. A River chat
    announcement is sent via nova's release-agent.
@@ -65,13 +78,164 @@ a `::warning::` annotation telling you what to fix.
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
-| `RELEASE_AGENT_HMAC_VEGA` | gateway-update.yml | vega update fails (HTTP 401). |
+| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
 | `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
 To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `Build and Cross-Compile` workflow via `workflow_dispatch`: its
 `verify-signing-key` job derives the public key from the secret, asserts it
 matches the key baked into the binary, and does a sign/verify round-trip.
+
+### One-time setup: GHCR package visibility
+
+`docker-publish.yml` pushes `ghcr.io/freenet/freenet-core`. GitHub creates a new
+package as **private**, so until its visibility is set to public once, every
+`docker pull` in the Docker README fails for everyone except maintainers, and
+the error reads as a missing image rather than a permissions problem.
+
+This is needed once, not per release, and it cannot be automated: there is no
+REST API for it (`PATCH` on the package route returns 404), so it is a manual
+change in the web UI.
+
+    https://github.com/orgs/freenet/packages/container/package/freenet-core
+    -> package settings -> visibility -> Public
+
+**This happened on v0.2.133**, the release that introduced the workflow. The
+image published correctly and the `smoke` job failed with
+
+    Head "https://ghcr.io/v2/freenet/freenet-core/manifests/v0.2.133": unauthorized
+
+which looks like a broken image and is actually the package being private. The
+smoke job now authenticates its pull, so it tests whether the image runs rather
+than whether the package is public.
+
+Public-ness is a separate job, `public-pull`, and what it actually tests is an
+anonymous `docker manifest inspect` — the thing a user does — rather than the
+package's `visibility` field, because `GITHUB_TOKEN` cannot always read org
+package metadata and a lookup that fails must read as "could not tell", never
+as "not public". It is a separate job rather than a step of `smoke` so that
+"the image is broken" and "a registry setting is wrong" stay distinguishable:
+the dev-room alert for a `smoke` failure says `latest` is now stale, which is
+true of the first and false of the second.
+
+The anonymous fetch is retried three times before failing. It is one
+unauthenticated call from a shared runner IP moments after a push, and a
+release gate that goes red on a network blip stops being read. If the
+`visibility` field says `public` but the anonymous fetch still fails, the job
+says so specifically rather than telling you to set a flag that is already
+set.
+
+After changing it, re-run the publish for that tag:
+
+```bash
+gh workflow run docker-publish.yml --field tag=vX.Y.Z
+```
+
+### Windows code signing (Authenticode)
+
+`freenet.exe` and `fdev.exe` are Authenticode-signed in
+`build-x86_64-windows` via [Azure Artifact
+Signing](https://learn.microsoft.com/azure/artifact-signing/), on release tags
+and on manual `workflow_dispatch` only (routine main-push builds are not
+signed, and can never become a release because `attach-to-release` is
+tag-gated). Signing sits between the smoke test and the `upload-artifact`
+steps, so `SHA256SUMS.txt` — generated later in `attach-to-release` from the
+downloaded artifacts — covers the signed bytes.
+
+Signing `freenet.exe` covers the installer, uninstaller, tray, service wrapper
+and updater at once: on Windows they are all the same self-contained binary.
+`fdev.exe` is signed because `installer::run_install` downloads it from the
+GitHub release at install time.
+
+Expected signer subject:
+
+```
+CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
+```
+
+**Unlike every other secret in the table above, this path is fail-closed.** The
+`Verify signatures` step runs `Get-AuthenticodeSignature` on the runner and
+throws if a binary is unsigned, invalid, missing its RFC3161 timestamp, or
+**signed by a publisher other than `CN=Freenet Project Inc`**. That last check
+matters because `Valid` on its own only means "chains to a trusted root and is
+timestamped" — it says nothing about who signed it, so without an explicit
+subject assertion a binary signed by a different certificate profile would pass. A
+broken Azure configuration therefore fails `build-x86_64-windows`, and because
+`attach-to-release` needs that job, the release stops as a draft rather than
+shipping unsigned binaries. That is deliberate — but it means Azure-side
+breakage is a release-blocking failure, not a warning.
+
+Authentication is OIDC federation (`azure/login@v3`), so there is no client
+secret and no exportable key: the Artifact Signing key lives in Microsoft's
+HSM and never leaves it. The three `AZURE_*` values are identifiers, stored as
+secrets only by convention. The federated credential in Entra is pinned to the
+subject `repo:freenet/freenet-core:environment:release`, which is why the job
+declares `environment: release` and `permissions: id-token: write`. **Those
+three lines are load-bearing for authentication — do not "simplify" them.**
+
+Note that adding required reviewers to the `release` environment would pause
+*every* `Build and Cross-Compile` run, including main-push builds, since the
+Windows job is not itself gated to tags.
+
+The RFC3161 timestamp is not optional: Artifact Signing certificates are
+short-lived (~3 days), so without a countersigned timestamp every release
+binary would stop validating almost immediately.
+
+To verify a published asset from Linux or macOS (no Windows machine needed).
+Fetch the Microsoft root and verify against it — that root alone is enough, so
+this works the same on both platforms:
+
+```bash
+# Linux: apt install osslsigncode    macOS: brew install osslsigncode
+curl -o msroot.crt \
+  "https://www.microsoft.com/pkiops/certs/microsoft%20identity%20verification%20root%20certificate%20authority%202020.crt"
+openssl x509 -inform DER -in msroot.crt -out msroot.pem
+
+osslsigncode verify -in freenet.exe -CAfile msroot.pem -TSA-CAfile msroot.pem
+```
+
+Expect, on a good binary:
+
+```
+Current message digest    : <hash>
+Calculated message digest : <hash>      # must MATCH — this is the integrity check
+Signature verification: ok
+Timestamp Server Signature verification: ok
+Number of verified signatures: 1
+Succeeded
+```
+
+plus the signer subject above.
+
+**Pass `-TSA-CAfile` as well as `-CAfile`, and do not skip it.** With `-CAfile`
+alone the command still prints `Succeeded` and exits 0 — but the timestamp
+chain was NOT verified, and the only sign of that is a
+`Timestamp Server Signature verification: failed` line further up the output.
+Given the three-day signing certificate below, the countersignature is the part
+that matters most, so a check that silently skips it is close to no check at
+all. Measured behaviour against a real signed artifact:
+
+| Invocation | Signature | Timestamp | Prints |
+|---|---|---|---|
+| no CA arguments | failed | failed | `Failed` (exit 1) |
+| `-CAfile msroot.pem` | ok | **failed** | `Succeeded` (exit 0) |
+| `-CAfile msroot.pem -TSA-CAfile msroot.pem` | ok | ok | `Succeeded` (exit 0) |
+
+The bare form fails because the Microsoft Identity Verification Root CA 2020 is
+not in a typical Linux or macOS trust store, so no chain can be built. That is
+a local trust-store artifact, not a problem with the signature — but it means
+**a bare `osslsigncode verify` reports `failed` on a perfectly good binary**,
+which is exactly the wrong impression to give someone checking a release.
+
+**The signing certificate is valid for about 3 days** (a real example:
+`notBefore Aug 24 15:22:28 2026`, `notAfter Aug 27 15:22:28 2026`). That is
+normal for Artifact Signing and is exactly why the RFC3161 countersignature is
+mandatory — the timestamp is what keeps already-shipped binaries validating
+after the certificate expires.
+
+SmartScreen reputation is per-publisher and accrues over downloads, so expect
+the download warning to soften rather than vanish on the first signed release.
+Observing that requires a Windows machine and does not gate anything.
 
 `RELEASE_PAT` is a personal access token with `repo` (Contents, Pull
 requests, Metadata) and `workflow` scopes. See AGENTS.md → "Release Workflow
@@ -184,17 +348,40 @@ Current wire-gated floors:
   gateway, and the release cascade upgrades the gateways FIRST.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`, checked by
+  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, now `Some((0, 2, 120))`
+  (this feature shipped in 0.2.120), checked by
   `version_cmp.rs::ack_version_floor_tracks_the_shipping_release`. When a
-  release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test fails
+  release bump raises `CARGO_PKG_VERSION` to a new floor, that test fails
   until the releaser consciously either sets
   `ACK_VERSION_SHIPPED_IN = Some(GATEWAY_ACK_VERSION_MIN_VERSION)` (this release
   carries it) or raises the floor (it does not).
+  `ack_version_floor_stays_above_every_release_without_the_variants` is the
+  companion that catches the floor being *lowered*.
 
   Note the emission gate reads the peer's version from the intro packet it just
   parsed, never from a cached value, so unlike the floors above there is no
   bootstrapping round-trip and no way for the decision to go stale against a
   peer that downgraded at a reused address.
+
+- `UNTRACKED_ACK_NOOP_MIN_VERSION` in
+  `crates/core/src/transport/peer_connection.rs` (fire-and-forget ack-only
+  `NoOp`s, #5795). Not a new wire variant: it gates a RECEIVE-side decision,
+  "stop acking this peer's NoOps", which is only safe once the peer no longer
+  tracks them.
+
+  Set to **`(0, 2, 142)`** and guarded by `UNTRACKED_ACK_NOOP_SHIPPED_IN`,
+  which is ALREADY `Some((0, 2, 142))` (set in #5803 ahead of the release so
+  the 0.2.142 bump PR stays green), checked by
+  `ack_policy_tests::untracked_noop_floor_tracks_the_shipping_release`
+  (`Some(v)` must equal the floor and be at most the next patch release;
+  `None` requires the floor strictly above the crate version). **Releaser
+  check:** confirm #5803's code is in the 0.2.142 tag. If it is not, raise BOTH
+  constants to the release that carries it — nothing else will catch this.
+  Failure mode of a floor that is too LOW: we ignore NoOps a pre-#5795 peer
+  still tracks, and it retransmits each one up to `MAX_PACKET_RETRANSMITS`
+  times. Bias high.
+  `untracked_noop_floor_stays_above_every_release_that_tracks_noops` catches
+  the floor being lowered.
 
 - `BROADCAST_TARGET_LIST_MIN_VERSION` in
   `crates/core/src/node/network_bridge/p2p_protoc.rs` — the originator target
@@ -212,10 +399,10 @@ Current wire-gated floors:
   did nothing.
 
   Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
-  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`,
-  checked by
+  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, now
+  `Some((0, 2, 120))` (this feature shipped in 0.2.120), checked by
   `connection_manager.rs::broadcast_target_list_floor_tracks_the_shipping_release`.
-  When a release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test
+  When a release bump raises `CARGO_PKG_VERSION` to a new floor, that test
   fails until the releaser consciously either sets
   `BROADCAST_TARGET_LIST_SHIPPED_IN = Some(BROADCAST_TARGET_LIST_MIN_VERSION)`
   (this release carries it) or raises the floor (it does not).
@@ -274,7 +461,6 @@ gh workflow run release.yml
                     └─→ fires release.published event
                             └─→ gateway-update.yml fires
                                     └─→ POST /update to nova (HTTPS)
-                                    └─→ POST /update to vega (HTTPS:8443)
                             └─→ release-announce.yml fires
                                     └─→ Matrix message
                                     └─→ POST /announce/river to nova
@@ -289,7 +475,6 @@ gh workflow run release.yml
   show up here in rough chronological order.
 - **Gateway versions**:
   - `curl https://nova.locut.us/release-agent/version`
-  - `curl https://vega.locut.us:8443/release-agent/version`
 - **Bump PR**:
   `gh pr list --repo freenet/freenet-core --search "build: release"` —
   there should be exactly one open per release, gone within a few minutes.
@@ -495,7 +680,7 @@ Recovery:
    --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
-   gateways=vega`.
+   gateways=nova`.
 
 ### River announcement failed but Matrix worked
 
@@ -519,6 +704,39 @@ Standard semver. The workflow updates the version in:
 If you're bumping a major or minor version, double-check the binstall
 URL rewrite (a regression test in `crates/fdev/tests/binstall_metadata.rs`
 covers this).
+
+### The handshake floor (`min-compatible-version`)
+
+`[package.metadata.freenet] min-compatible-version` in `crates/core/Cargo.toml`
+is the oldest peer version a node will connect to. The check runs in both
+directions. It is a different mechanism from the wire-gated feature floors
+above: it refuses the connection outright, rather than deciding which message
+variants a peer can receive.
+
+`release.yml` ships the committed value unchanged, so raising it is its own
+reviewed PR, never a side effect of a release. (`scripts/release.sh` still
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
+major.minor as the package and no higher than the package version. The
+handshake carries only the patch component. A minor or major version bump
+therefore has to reset the floor in the same PR, or the build fails.
+
+Raise it only to cut off versions that cannot rejoin by themselves, such as
+0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first
+release after the broken ones, and no higher.
+
+Before raising it:
+
+- **Count what it cuts.** It is a single threshold, so it also refuses every
+  older release. Count the peers below the new value in telemetry.
+- **Tell the affected operators.** Announce the change to their operators
+  with the release. A refused node whose update check works starts a normal
+  auto-update. A node that cannot detect updates (0.2.120/0.2.121) updates
+  itself only once it has no connections left, through its supervisor's
+  `freenet update`. Until then, its operator has to run `freenet update` by
+  hand.
+- **Expect a gradual effect.** Peers still on older releases keep accepting
+  the refused versions until they update, so the refusal reaches the whole
+  network only as the release spreads.
 
 ## Rollback
 
@@ -603,6 +821,16 @@ something. So a break in the installer half of the binary you are shipping is
 caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
+
+**Neither gate runs on a slow link.** #5790 (an update download killed by
+systemd's `TimeoutStopSec`, then an exit-42 restart loop) never showed on CI
+because runners download the release in seconds. Since #5790 the node
+downloads the release before it exits 42. Once the previous release does
+that, Gate B requires its download to finish (`MARKER_STAGE_DONE`) and
+`freenet update` to install from it (`MARKER_INSTALLED_STAGED`), so a staging
+path that silently falls back to the stop-phase download is caught; it then
+installs once more with no staged download, so the installer's own download
+path stays covered. What no gate can show is the time budget itself.
 
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag
@@ -804,8 +1032,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 
    A clean run here is **not** evidence that the harness is sound. CI stages
    the binary differently — `cross-compile.yml` puts it at `/tmp/freenet`,
-   which used to collide with a directory the node creates under `$TMPDIR` and
-   blocked v0.2.124 on a healthy binary. Running from `./target/release/` is
+   which used to collide with a directory the node created under `$TMPDIR` and
+   blocked v0.2.124 on a healthy binary. That mkdir is gone (#5291), but the
+   staging-environment difference it exposed is not, so the warning stands.
+   Running from `./target/release/` is
    precisely the environment where that class of fault cannot occur, which is
    why local validation went 4/4 green while CI blocked. If local reproduces
    nothing, suspect the staging environment before the binary.
@@ -813,8 +1043,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Five distinct outcomes end in a red job; only one of them means
-a node on the previous release genuinely cannot reach this one. **Read the
+enough to tell.** Several distinct outcomes end in a red job. Only the ones that
+name a specific detection or install failure mean a node on the previous release
+genuinely cannot reach this one; the rows that say GitHub never served this
+release as latest mean no node can see it YET, and their Response column says
+whether that is a re-run or a real problem. **Read the
 `::error::` line in the job log before doing anything** — it names which.
 
 The wording below is generated from the code, so match on the quoted phrases
@@ -826,7 +1059,24 @@ rather than on the shape of the alarm.
 | `UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host` | 75 | ⚠️ quiet | Something else on the runner held the ports; the node never started. | Re-run the job. |
 | `UNVERIFIED: … reported it could not reach GitHub … but THIS RUNNER reached the same endpoint immediately afterwards` | 1 | 🚨 loud | The published binary consistently could not do what the runner just did. Most likely its persisted poll-budget cooldown (#5102), possibly a published fetch-side regression. **Not a stranded fleet.** | Read the node output. Re-run; if it recurs across releases it is not the runner. |
 | `UNVERIFIED: at least one attempt started the update check and never logged an outcome` | 1 | 🚨 loud | A hung updater, or the check was cut short. Genuinely unknown. | Re-run. Persisting, treat as a real fault. |
+| `GitHub never reported vX as latest within Ns: … last named '<older tag>'` | 1 | 🚨 loud | Before booting the node, Gate B waits (up to `CANARY_LATEST_WAIT_SECS`, 300s) for `releases/latest` to name this release (#5715). It never did. The node was **not started**, so this says nothing about the updater, but until GitHub serves this release as latest no node can see it. | Check the release is published, not a prerelease, and marked latest. `freenet update` by hand will not help: it reads the same endpoint. |
+| `GitHub reports a NEWER release than the one this run was asked to verify` | 1 | 🚨 loud | A newer release is already latest, usually because an old tag's workflow was re-run. Node not started. | Expected on a re-run of an old tag. Otherwise check which release is marked latest. |
+| `GitHub never reported vX as latest: … answered none of N probe(s) … with a release redirect, yet THIS RUNNER could connect to it during the wait` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
+| `GitHub never reported vX as latest on 3 consecutive probes … the wait ended N answer(s) into a streak naming it … Of P probe(s), A named a different tag and B got no tag at all` | 1 | 🚨 loud | The budget ran out mid-streak. If P − A − B equals N, every answer naming the release was in that final streak, so GitHub began serving it only at the end. Otherwise it was served earlier and the streak kept breaking: on another tag (A, a flapping CDN) or on a failed probe (B). Node not started. | Re-run. If it recurs, GitHub is not serving the release consistently. |
+| `GitHub never reported vX as latest: … was still naming a different tag Ns into the wait (the cutoff for publication lag is 120s …)` | 1 | 🚨 loud | GitHub served another tag later than lag explains (at any point in the wait, not only last), then the probes failed. The stale answer is the finding. Node not started. | As for the "last named '<older tag>'" row above. |
+| `GitHub never reported vX as latest: … last named '<tag>', then answered none of the last N probe(s) with a release redirect … while THIS RUNNER could still connect` | 1 | 🚨 loud | GitHub answered, then the endpoint stopped answering with a redirect while the runner could still connect: the endpoint went bad. Node not started. | Check the endpoint by hand as above. |
+| `UNVERIFIED (ENVIRONMENTAL): … last named '<tag>', then this runner lost its connection to it` | 75 | ⚠️ quiet | GitHub answered, then the runner's network went for the rest of the wait, and no answer naming another tag came later than 120s in (which would have been the loud row above). Node not started, nothing learned. | Re-run the job. |
+| `UNVERIFIED (ENVIRONMENTAL): no probe of … releases/latest produced a release tag … and after every one of them this runner also failed to connect to it` | 75 | ⚠️ quiet | The runner could not connect to GitHub after any probe of the wait. Node not started, nothing learned. | Re-run the job. |
 | Anything naming a specific detection or install failure | 1 | 🚨 loud | The real thing. See case 3. | See case 3. |
+
+**The residual from #5715.** The latest-release wait requires three consecutive
+answers naming the release before the node boots, which removed the v0.2.136 and
+v0.2.140 false failures. It cannot rule out the node's own request landing on a
+stale CDN edge seconds later. That shows up as `compared against the WRONG
+release` or `did NOT decide to update`, with the node's logged `latest=` equal to
+the PREVIOUS version. Gate B does not retry it (a retry would let an intermittent
+real fault pass). If the job log shows the wait succeeded and the node still read
+the previous tag, re-run once. If it recurs, treat it as real.
 
 **The trap this table exists to remove.** An earlier version of this section said
 a fetch failure always gives exit 75 and the quiet ⚠️, and told the reader that
@@ -844,7 +1094,9 @@ on an otherwise healthy runner — produces **exit 1 and the loud 🚨**, and th
 text sent the reader straight past it into "a real detection failure" and on to
 cutting a fix release for a poll-budget cooldown.
 
-**1. Environmental (exit 75, quiet ⚠️).** Two causes, both above. The previous
+**1. Environmental (exit 75, quiet ⚠️).** Three causes, all in the table above
+(the third, the runner failing to connect during the latest-release wait, never
+starts the node, so the rest of this paragraph is about the first two). The previous
 release's binary retries its startup fetch zero times, so a single bad moment on
 the network is enough to produce the first. Gate B retries (`CANARY_ATTEMPTS`, 2
 by default) and only reports this if every attempt lands the same way AND this
@@ -911,9 +1163,12 @@ verification skill if you have it):
 1. <https://crates.io/crates/freenet> shows the new version.
 2. <https://github.com/freenet/freenet-core/releases/tag/vX.Y.Z> is
    published (not draft) with 14 assets.
-3. `curl https://nova.locut.us/release-agent/version` and
-   `curl https://vega.locut.us:8443/release-agent/version` both return the
-   new version.
+3. `curl https://nova.locut.us/release-agent/version` returns the new version,
+   and `systemctl is-active freenet-gateway freenet-gateway-2` on nova reports
+   both units `active`. These are two separate checks: the first confirms the
+   binary was swapped, the second that BOTH gateway processes came back up —
+   the second gateway follows the first via `WantedBy=`, and a companion that
+   fails to start is the case `verify_service_active` now catches.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.

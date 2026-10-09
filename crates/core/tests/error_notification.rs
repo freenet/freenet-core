@@ -324,6 +324,93 @@ async fn test_put_error_notification_multi_hop(ctx: &mut TestContext) -> TestRes
     Ok(())
 }
 
+/// #5671: a streaming PUT whose relay cannot assemble the inbound stream must
+/// complete for the client promptly.
+///
+/// The client is on peer-a, so peer-a's own relay stores the ~1 MB PUT locally
+/// and forwards it to the gateway as a streaming PUT; the gateway runs the
+/// streaming relay. Its assembly failure is injected at the real assembly step
+/// (`put_relay_stream_fault_injection`). The relay now reports it upstream, and
+/// since peer-a already stored the contract, peer-a reports the #5458 local
+/// success at once. Before #5671 the relay only logged it: no reply went
+/// upstream, and a streaming originator cannot advance to another peer, so the
+/// client heard nothing until the originator's attempt budget ran out (well
+/// over 90 s for this size).
+///
+/// The relay's `PutMsg::Error` itself (its cause, that exactly one is sent,
+/// that it labels no peer) is asserted at the unit level: the relay side in
+/// `put::op_ctx_task::streaming_relay_failure_tests`, the originator side in
+/// `streaming_relay_error_after_local_store_is_a_local_success`.
+#[cfg(feature = "testing")]
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 240,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_streaming_put_relay_failure_completes_promptly(ctx: &mut TestContext) -> TestResult {
+    use freenet::dev_tool::put_relay_stream_fault_injection::{
+        RelayStreamFault, inject_failures, is_armed,
+    };
+    use freenet_stdlib::client_api::ContractResponse;
+
+    let peer = ctx.node("peer-a")?;
+    let (ws_stream, _) = connect_async(&peer.ws_url()).await?;
+    let mut client = WebApi::start(ws_stream);
+
+    // Parameters of its own give this test a contract key no other test in the
+    // process uses, so the injected failure cannot be consumed elsewhere.
+    let contract = load_contract("test-contract-integration", vec![0x56, 0x71].into())?;
+    let key = contract.key();
+    // About 1 MB, far above the 64 KiB streaming threshold.
+    let state = WrappedState::new(freenet::test_utils::create_large_todo_list());
+    let put = || {
+        ClientRequest::ContractOp(ContractRequest::Put {
+            contract: contract.clone(),
+            state: state.clone(),
+            related_contracts: Default::default(),
+            subscribe: false,
+            blocking_subscribe: false,
+        })
+    };
+
+    inject_failures(key, 1, RelayStreamFault::Assembly);
+    client.send(put()).await?;
+    let started = std::time::Instant::now();
+
+    // 30 s is far below the originator's own budget for this attempt (well
+    // over 90 s), so only a relay that reports its failure can make this.
+    match timeout(Duration::from_secs(30), client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: stored }))) => {
+            info!("PUT completed after {:?}", started.elapsed());
+            assert_eq!(stored, key, "the PUT reports the contract it stored");
+        }
+        Ok(other) => panic!(
+            "the contract is stored on peer-a, so the PUT must report the \
+             local success, got {other:?}"
+        ),
+        Err(_) => panic!(
+            "the PUT got no reply within 30 s: the streaming relay's assembly \
+             failure was not reported upstream (#5671)"
+        ),
+    }
+    // Per contract key, so no other test in the process can satisfy it.
+    assert!(
+        !is_armed(&key),
+        "the gateway's streaming relay must have consumed the injected \
+         assembly failure; otherwise this PUT never exercised #5671"
+    );
+
+    client
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    Ok(())
+}
+
 /// Test that UPDATE operation errors are delivered to WebSocket clients
 ///
 /// This test verifies that when an UPDATE operation fails (e.g., contract doesn't exist),

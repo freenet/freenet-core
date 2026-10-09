@@ -24,6 +24,9 @@ impl UninstallCommand {
         if service_removed {
             println!("Freenet service removed.");
         }
+        if !self.system {
+            super::url_handler::unregister_for_uninstall();
+        }
 
         // Step 2: Determine whether to purge data
         let do_purge = super::service::should_purge(self.purge, self.keep_data)?;

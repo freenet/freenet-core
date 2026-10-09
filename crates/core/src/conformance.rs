@@ -8,7 +8,7 @@
 //! exactly that.
 //!
 //! This module is the *single* implementation of what "conformance" means. The
-//! offline `fdev conformance` harness and (later) the node-side checker both call
+//! offline `fdev verify-merge` harness and the node's opt-in shadow-mode checker both call
 //! [`verify_case`], so the developer-facing answer and the network-facing answer
 //! cannot disagree.
 //!
@@ -28,11 +28,15 @@
 //! - [`evidence`] — the self-contained, bounded reproducer that travels between peers.
 //! - [`bundle`] — the offline replay corpus format.
 //! - [`generator`] — turns a corpus of observed states into cases to check.
+//! - [`host_clock`] — whether a contract reads the host wall clock, which makes the
+//!   laws below ill-formed rather than merely broken. Deprecated; see #5465.
 //! - [`minimize`] — shrinks a failing case to the smallest witness that still fails,
 //!   so evidence fits its size bound and reads as a usable bug report.
 //! - [`capture`] — operator-enabled recording of real contract traffic for replay.
 //! - [`sampler`] — the bounded, restart-safe store of states a peer observed.
 //! - [`focus`] — which contracts a peer watches, and when it moves on.
+//! - [`shadow`] — the opt-in loop that replays sampled states on a peer and records
+//!   what it would remove, without acting on it.
 //! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
 //!   last step of the RFC's deployment plan, and this is where that ordering is
 //!   enforced and tested rather than merely intended.
@@ -52,8 +56,11 @@
 //! are where the measured production damage actually came from (#5153), and a
 //! re-apply probe cannot see any of them.
 //!
-//! This module does not replace or disable that probe. Nothing here is wired into
-//! the node yet.
+//! This module does not replace or disable that probe. The node can run this verifier
+//! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and
+//! [`shadow`]) and it samples observed states and records what it *would* remove.
+//! Nothing is ever removed: [`EnforcementMode::Enforce`] is not reachable from
+//! configuration, and with the variable unset none of this runs.
 //!
 //! # The bias toward `Inconclusive`
 //!
@@ -101,6 +108,7 @@ pub mod capture;
 pub mod evidence;
 pub mod focus;
 pub mod generator;
+pub mod host_clock;
 pub mod minimize;
 pub mod oracle;
 pub mod policy;
@@ -108,6 +116,7 @@ pub mod property;
 pub mod runtime_oracle;
 pub mod sampler;
 pub mod shadow;
+pub mod status;
 pub mod verifier;
 
 #[cfg(test)]
@@ -117,16 +126,23 @@ mod tests;
 #[cfg(test)]
 mod wasm_tests;
 
-pub use bundle::ReplayBundle;
+pub use bundle::{ReplayBundle, Transition};
 pub use capture::{CaptureHandle, Observation};
-pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
+pub use evidence::{
+    ConformanceEvidence, EVIDENCE_MAGIC, EVIDENCE_SCHEMA_VERSION, EvidenceError, EvidenceId,
+    EvidenceRejected,
+};
 pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};
+pub use host_clock::{
+    HOST_CLOCK_DEPRECATION_DOC, HOST_CLOCK_IMPORT, HOST_CLOCK_NAMESPACE, imports_host_clock,
+};
 pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 pub use policy::{ConformanceAction, EnforcementMode, decide};
 pub use property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PropertyOutcome, Severity, Violation,
+    ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
+    PropertyOutcome, Severity, Violation,
 };
 pub use runtime_oracle::{OracleBuildError, RuntimeOracle};
 pub use sampler::{Admission, ContractSampler, SamplerConfig, Stratum};

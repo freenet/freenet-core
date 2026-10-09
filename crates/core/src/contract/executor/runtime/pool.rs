@@ -198,6 +198,25 @@ pub struct RuntimePool {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// The ONE summary fast-path cache every executor reads and writes (#5795),
+    /// sized to `pool_size × per-executor budget` — the product the node already
+    /// declared. Before this, each executor had its own, and because the
+    /// serialized loop's `pop_executor` always takes the first free slot only
+    /// executor 0's ever filled. Pool-owned so a replacement executor inherits
+    /// the warm cache instead of starting cold.
+    shared_summary_cache: super::SharedSummaryCache,
+    /// Delta twin of `shared_summary_cache`.
+    shared_delta_cache: super::SharedDeltaCache,
+    /// Manifests, consent-once grants and the unprompted-run budget for this
+    /// node's delegates (`contract::delegate_capabilities`). Per node, never
+    /// a process global: simulation tests run many nodes in one process.
+    ///
+    /// `None` in hosted mode: there every client can present any app's token
+    /// from what the node sees as a local connection, and runs have no
+    /// per-user secret namespace, so neither app identity nor a node-wide
+    /// grant means anything there.
+    delegate_capabilities:
+        Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
     /// Sender for delegate notifications (cloned into each executor and replacements).
     delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
@@ -511,6 +530,27 @@ impl RuntimePool {
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
 
+        // One summary cache and one delta cache for the whole pool (#5795),
+        // each sized to the aggregate the node already declares for them
+        // (`pool_size × per-executor budget`, see `declared_cache_ceiling`). The
+        // declared ceiling is unchanged, but resident memory can now approach it
+        // (with per-executor caches only executor 0's slice ever filled). A
+        // single entry is still capped at ONE executor's budget, so a large
+        // contract-controlled summary/delta cannot be admitted just because the
+        // aggregate could hold it. Occupancy is published into the node's
+        // contract-exec metrics (`router_snapshot`).
+        let exec_metrics = op_manager.ring.contract_exec_metrics();
+        let shared_summary_cache = super::new_summary_cache(
+            super::pool_summary_cache_budget_bytes(pool_size_usize),
+            super::per_executor_summary_cache_budget_bytes(pool_size_usize),
+            Some(exec_metrics.summary_cache_gauges().clone()),
+        );
+        let shared_delta_cache = super::new_delta_cache(
+            super::pool_delta_cache_budget_bytes(pool_size_usize),
+            super::per_executor_delta_cache_budget_bytes(pool_size_usize),
+            Some(exec_metrics.delta_cache_gauges().clone()),
+        );
+
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend
         // engine because compiled modules store references tied to the compiling
@@ -535,6 +575,8 @@ impl RuntimePool {
             shared_client_counts.clone(),
         );
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
+        first_executor
+            .set_shared_fast_path_caches(shared_summary_cache.clone(), shared_delta_cache.clone());
         first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
         runtimes.push(Some(first_executor));
 
@@ -560,6 +602,10 @@ impl RuntimePool {
                 shared_client_counts.clone(),
             );
             executor.set_recovery_guard(shared_recovery_guard.clone());
+            executor.set_shared_fast_path_caches(
+                shared_summary_cache.clone(),
+                shared_delta_cache.clone(),
+            );
             executor.set_delegate_notification_tx(delegate_notification_tx.clone());
 
             runtimes.push(Some(executor));
@@ -599,7 +645,27 @@ impl RuntimePool {
             None
         };
 
+        #[cfg(feature = "redb")]
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(shared_state_store.inner().clone());
+        #[cfg(not(feature = "redb"))]
+        let capability_storage: Arc<
+            dyn crate::contract::delegate_capabilities::CapabilityStorage,
+        > = Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
+        let delegate_capabilities = if config.ws_api.hosted_mode {
+            tracing::info!("Hosted mode: delegate capabilities (background runs) are disabled");
+            None
+        } else {
+            let caps = crate::contract::delegate_capabilities::DelegateCapabilities::new(
+                capability_storage,
+            );
+            op_manager.set_delegate_capabilities(&caps);
+            Some(caps)
+        };
+
         Ok(Self {
+            delegate_capabilities,
             runtimes,
             available: Semaphore::new(pool_size_usize),
             config,
@@ -619,6 +685,8 @@ impl RuntimePool {
             shared_inherited_origins,
             shared_backend_engine,
             shared_recovery_guard,
+            shared_summary_cache,
+            shared_delta_cache,
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
@@ -813,6 +881,10 @@ impl RuntimePool {
             self.shared_client_counts.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
+        executor.set_shared_fast_path_caches(
+            self.shared_summary_cache.clone(),
+            self.shared_delta_cache.clone(),
+        );
         executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());
 
         Ok(executor)
@@ -848,6 +920,16 @@ impl RuntimePool {
             }
         }
         self.log_health_if_degraded();
+    }
+
+    /// Replace the pool's capability state, so a test can drive the real
+    /// handler with a clock it controls (wake-up intervals are minutes).
+    #[cfg(test)]
+    pub(crate) fn set_delegate_capabilities_for_test(
+        &mut self,
+        caps: Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        self.delegate_capabilities = Some(caps);
     }
 
     /// Get a reference to the shared state store.
@@ -894,6 +976,25 @@ impl ContractExecutor for RuntimePool {
 
     fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
         Some(self.op_manager.clone())
+    }
+
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities.clone()
+    }
+
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        // The delegate index and code cache are shared by every executor in
+        // the pool, so any one that is not checked out can answer.
+        self.runtimes
+            .iter()
+            .flatten()
+            .find_map(|executor| executor.runtime.delegate_code(key))
+    }
+
+    fn delegate_subscription_store(&self) -> Option<Storage> {
+        Some(self.shared_state_store.inner().clone())
     }
 
     async fn fetch_contract(
@@ -1214,8 +1315,11 @@ impl ContractExecutor for RuntimePool {
                     limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
                     "Subscriber limit reached for contract, rejecting registration"
                 );
+                let key = self
+                    .lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "subscriber limit ({}) reached for contract",
                         super::MAX_SUBSCRIBERS_PER_CONTRACT
@@ -1233,8 +1337,11 @@ impl ContractExecutor for RuntimePool {
                     current = client_sub_count,
                     "Per-client subscription limit reached, rejecting registration"
                 );
+                let key = self
+                    .lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "per-client subscription limit ({}) reached",
                         super::MAX_SUBSCRIPTIONS_PER_CLIENT
@@ -1675,6 +1782,180 @@ mod tests {
         let wrapped = WrappedContract::new(Arc::new(code), params);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
         (container, key)
+    }
+
+    /// The start-up manifest refresh (`refresh_capability_manifests`) reads a
+    /// delegate's code through `RuntimePool::delegate_code`. Through the real
+    /// pool and store: a registered delegate's exact module comes back, and an
+    /// unknown key gives `None`.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn delegate_code_returns_the_stored_module() {
+        use crate::wasm_runtime::DelegateRuntimeInterface;
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+
+        let config_args = ConfigArgs {
+            id: Some("pool-delegate-code".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let mut pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(2).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        let code = crate::wasm_runtime::tests::get_test_module("test_delegate_lifecycle")
+            .expect("build the fixture delegate");
+        let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &code.clone().into(),
+            &b"params".to_vec().into(),
+        ))));
+        let key = delegate.key().clone();
+        pool.runtimes[0]
+            .as_mut()
+            .expect("pool executor present")
+            .runtime
+            .register_delegate(
+                delegate,
+                XChaCha20Poly1305::new(&[0u8; 32].into()),
+                [0u8; 24].into(),
+            )
+            .expect("register the delegate");
+
+        assert_eq!(pool.delegate_code(&key), Some(code));
+        assert_eq!(
+            pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
+            None
+        );
+    }
+
+    /// Every executor of a real `RuntimePool` — including a replacement — uses
+    /// the SAME summary and delta cache (#5795), sized to `pool_size ×` the
+    /// per-executor budget, and the exported budget gauge equals that aggregate
+    /// (the executors' discarded private caches withdrew their contribution).
+    #[tokio::test]
+    async fn pool_executors_share_one_fast_path_cache_pair() {
+        let config_args = ConfigArgs {
+            id: Some("pool-shared-fast-path-caches".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        const POOL: usize = 3;
+        let pool = RuntimePool::new(
+            config,
+            op_manager.clone(),
+            NonZeroUsize::new(POOL).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        for slot in &pool.runtimes {
+            let executor = slot.as_ref().expect("executor present");
+            assert!(Arc::ptr_eq(
+                executor.summary_cache_handle(),
+                &pool.shared_summary_cache
+            ));
+            assert!(Arc::ptr_eq(
+                executor.delta_cache_handle(),
+                &pool.shared_delta_cache
+            ));
+        }
+        let replacement = pool
+            .create_replacement_executor()
+            .await
+            .expect("replacement executor");
+        assert!(Arc::ptr_eq(
+            replacement.summary_cache_handle(),
+            &pool.shared_summary_cache
+        ));
+        assert!(Arc::ptr_eq(
+            replacement.delta_cache_handle(),
+            &pool.shared_delta_cache
+        ));
+        drop(replacement);
+
+        let summary_budget =
+            super::super::lock_fast_path_cache(&pool.shared_summary_cache).byte_budget();
+        let delta_budget =
+            super::super::lock_fast_path_cache(&pool.shared_delta_cache).byte_budget();
+        assert_eq!(
+            summary_budget,
+            super::super::pool_summary_cache_budget_bytes(POOL)
+        );
+        assert_eq!(
+            delta_budget,
+            super::super::pool_delta_cache_budget_bytes(POOL)
+        );
+        // The aggregate is exactly POOL per-executor budgets, and a single entry
+        // is capped at ONE of them.
+        let per_exec_summary = super::super::per_executor_summary_cache_budget_bytes(POOL);
+        let per_exec_delta = super::super::per_executor_delta_cache_budget_bytes(POOL);
+        assert_eq!(summary_budget, POOL * per_exec_summary);
+        assert_eq!(delta_budget, POOL * per_exec_delta);
+        assert_eq!(
+            super::super::lock_fast_path_cache(&pool.shared_summary_cache).max_entry_bytes(),
+            per_exec_summary
+        );
+        assert_eq!(
+            super::super::lock_fast_path_cache(&pool.shared_delta_cache).max_entry_bytes(),
+            per_exec_delta
+        );
+        let snap = op_manager
+            .ring
+            .contract_exec_metrics()
+            .fast_path_cache_snapshot();
+        assert_eq!(snap.summary.budget_bytes, summary_budget as u64);
+        assert_eq!(snap.delta.budget_bytes, delta_budget as u64);
+        drop(task_monitor);
     }
 
     /// End-to-end proof that evicting an advertised contract through the real

@@ -45,10 +45,9 @@ pub use client_api::{OriginContract, OriginContractMap};
 /// This controls URL path prefixes (`/v1/...` vs `/v2/...`) and is used by
 /// the HTTP client API and WebSocket proxy to version client-facing endpoints.
 ///
-/// **Not to be confused with [`crate::wasm_runtime::delegate_api::DelegateApiVersion`]**,
-/// which governs WASM-level delegate host function availability and is
-/// auto-detected from the delegate module's imports. The two version axes are
-/// independent: a V1 HTTP client can invoke a V2 delegate, and vice versa.
+/// It has nothing to do with delegate WASM. freenet-stdlib's
+/// `DelegateWasmAPIVersion` has a single variant, and core no longer keeps a
+/// delegate "version" of its own (it was removed in #5637).
 ///
 /// V1 is the default for backwards compatibility. V2 currently behaves
 /// identically but provides a routing seam for future protocol changes.
