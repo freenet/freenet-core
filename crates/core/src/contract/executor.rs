@@ -2560,6 +2560,85 @@ mod tests {
                 "STANDALONE_DELEGATE_STORE_BYTES",
                 "conformance runtime-oracle harness store size, not a node budget",
             ),
+            // ---- Surfaced by the rebase onto main after #5730-#5802, each read
+            // at its definition before being classified.
+            (
+                "pool_summary_budget_for",
+                "the pool-shared summary cache (#5795), defined as \
+                 summary_budget_for times the pool, which IS the summed term; \
+                 summing it too would count that memory twice",
+            ),
+            (
+                "pool_delta_budget_for",
+                "the pool-shared delta cache (#5795), defined as delta_budget_for \
+                 times the pool, which IS the summed term; summing it too would \
+                 count that memory twice",
+            ),
+            (
+                "HOSTED_ENTRY_BYTES",
+                "per-contract charge INSIDE the hosting resident-overhead budget \
+                 (#5647), a hosting-side budget the hosting safety test adds \
+                 separately",
+            ),
+            (
+                "PEER_INTEREST_ENTRY_BYTES",
+                "per-record charge counted INTO the hosting resident-overhead \
+                 budget (#5647), not a budget of its own",
+            ),
+            (
+                "MAX_STORED_PARAMS_BYTES",
+                "per-delegate cap on the parameters kept for lifecycle runs, a \
+                 size limit on one entry rather than a cache budget",
+            ),
+            (
+                "MAX_RESPONSE_BYTES",
+                "CLI `report` command's read limit on one HTTP reply, not a node budget",
+            ),
+            (
+                "CONTRACT_KEY_BYTES",
+                "length of a contract id in the CLI `open` command's parser, not a budget",
+            ),
+            (
+                "MAX_EVIDENCE_TEXT_BYTES",
+                "conformance evidence field size limit, not a node memory budget",
+            ),
+            (
+                "MAX_EVIDENCE_ENCODED_BYTES",
+                "conformance evidence decode limit, not a node memory budget",
+            ),
+            (
+                "DEFAULT_CANDIDATES_MAX_BYTES",
+                "routing-dataset decision-line budget per run, written to DISK",
+            ),
+            (
+                "PACE_BURST_BYTES",
+                "routing-dataset write pacing burst, bytes written to DISK",
+            ),
+            (
+                "DEFAULT_MAX_BYTES",
+                "routing-dataset file size cap, on DISK",
+            ),
+            (
+                "EVENT_BYTES",
+                "compile-time size bound on one hierarchical-router struct; the \
+                 router's whole published budget is a few hundred KB",
+            ),
+            (
+                "PREPARED_BYTES",
+                "compile-time size bound on one hierarchical-router struct",
+            ),
+            (
+                "PEER_NODE_BYTES",
+                "compile-time size bound on one hierarchical-router struct",
+            ),
+            (
+                "LEVEL_BYTES",
+                "compile-time size bound on one hierarchical-router struct",
+            ),
+            (
+                "CONTRACT_NODE_BYTES",
+                "compile-time size bound on one hierarchical-router struct",
+            ),
         ];
 
         // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.

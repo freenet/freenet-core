@@ -58,6 +58,7 @@ BYTE_TESTS = [
     "every_context_carrying_variant_is_charged",
     "the_byte_cap_charges_retained_payloads_not_just_the_continuation",
     "an_unmeasurable_variant_cannot_be_admitted_at_any_budget",
+    "pending_network_ops_are_charged_for_their_context",
 ]
 
 BYTES_CASES = [
@@ -200,6 +201,24 @@ BYTES_CASES = [
         PARK,
         "const ELEMENT_OVERHEAD_BYTES: ByteCount = ByteCount::new(256);",
         "const ELEMENT_OVERHEAD_BYTES: ByteCount = ByteCount::new(0);",
+        BYTE_TESTS,
+        "RED",
+    ),
+    # Added after the rebase onto #5615/#5747: main's terms, not only this
+    # branch's.
+    (
+        "task_bytes pending network-op context dropped",
+        PARK,
+        "        .map(|op| ctx_len(&op.context) + ctx_len(&op.context))",
+        "        .map(|_op| ByteCount::default())",
+        BYTE_TESTS,
+        "RED",
+    ),
+    (
+        "inbound WakeupFired tag zeroed",
+        PARK,
+        "InboundDelegateMsg::WakeupFired { tag } => ByteCount::new(tag.len()),",
+        "InboundDelegateMsg::WakeupFired { tag: _ } => ByteCount::new(0),",
         BYTE_TESTS,
         "RED",
     ),
@@ -372,7 +391,7 @@ GUARDS_CASES = [
     (
         # ...and the same hole one indirection later: keep the label, zero the
         # value. Every membership check still passes while the term contributes
-        # nothing to the aggregate hosting derives its residual from.
+        # nothing to the aggregate the memory-safety tests check.
         "a summed term's label kept while its value is zeroed",
         EXECUTOR,
         '        ("parked_budget_for", parked),',
@@ -395,6 +414,56 @@ GUARDS_CASES = [
         "    if false {\n        delegate_app_registry::sweep_expired();\n    }",
         ["ttl_sweep_precedes_every_exit_from_the_notification_path"],
         "GREEN",
+    ),
+    # Added after the rebase onto #5615, which added the third sink.
+    (
+        "ParkGuard::deliver: answers lock back to .unwrap()",
+        PARK,
+        "let mut inbound = std::mem::take(&mut *answers.lock().unwrap_or_else(|e| e.into_inner()));",
+        "let mut inbound = std::mem::take(&mut *answers.lock().unwrap());",
+        ["a_poisoned_sink_lock_still_delivers_from_drop"],
+        "RED",
+    ),
+    (
+        "ParkGuard::deliver: fetches lock back to .unwrap()",
+        PARK,
+        "let upserts = std::mem::take(&mut *fetches.lock().unwrap_or_else(|e| e.into_inner()));",
+        "let upserts = std::mem::take(&mut *fetches.lock().unwrap());",
+        ["a_poisoned_sink_lock_still_delivers_from_drop"],
+        "RED",
+    ),
+    (
+        "ParkGuard::deliver: contract_ops lock back to .unwrap()",
+        PARK,
+        "std::mem::take(&mut *contract_ops.lock().unwrap_or_else(|e| e.into_inner()));",
+        "std::mem::take(&mut *contract_ops.lock().unwrap());",
+        ["a_poisoned_sink_lock_still_delivers_from_drop"],
+        "RED",
+    ),
+    (
+        "upsert reconciliation reverted to a (contract, is_put) multiset",
+        PARK,
+        "        let unresolved_upserts: Vec<OwedUpsert> = owed_upserts\n"
+        "            .into_iter()\n"
+        "            .filter(|owed| !resolved.contains(&owed.id))",
+        "        let _ = &resolved;\n"
+        "        let mut keyed: Vec<(ContractInstanceId, bool)> = upserts\n"
+        "            .iter()\n"
+        "            .map(|r| (*r.pending.key.id(), r.pending.is_put))\n"
+        "            .collect();\n"
+        "        let unresolved_upserts: Vec<OwedUpsert> = owed_upserts\n"
+        "            .into_iter()\n"
+        "            .filter(|owed| {\n"
+        "                match keyed.iter().position(|k| *k == (owed.contract, owed.is_put)) {\n"
+        "                    Some(i) => {\n"
+        "                        keyed.remove(i);\n"
+        "                        false\n"
+        "                    }\n"
+        "                    None => true,\n"
+        "                }\n"
+        "            })",
+        ["a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context"],
+        "RED",
     ),
 ]
 

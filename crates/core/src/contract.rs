@@ -536,8 +536,9 @@ async fn fetch_related_off_loop(
 /// A COUNTER AS WELL AS THE `warn!`, per this repo's own rule that "a refusal
 /// that is not counted renders as a clean zero" — the same reasoning behind
 /// `delegate_park::RefusalCounts`. The degradation here is legitimate (the
-/// fetch is refused and the upsert re-runs inline on the serial loop, so the
-/// write still completes, more slowly), which is precisely why it needs to be
+/// fetch is refused and the upsert re-runs inline on the serial loop, slower
+/// and subject to the inline fetch timeout, #5831), which is precisely why it
+/// needs to be
 /// visible: a
 /// legitimate behaviour change that nothing counts is indistinguishable from
 /// nothing happening, and the symptom an operator sees is latency somewhere
@@ -606,14 +607,14 @@ fn within_fetch_allowance(
             total_refused = total,
             // SAYS WHAT THE CODE DOES. This read "failing the upsert", which
             // stopped being true when the disposition became `RetryInline`:
-            // the write completes on the inline path. An operator-facing line
+            // the write is retried on the inline path. An operator-facing line
             // that reports a failure where none occurred is worse than no line,
             // because it is the signal for one of the three degradations this
             // change promises are observable.
             "Off-loop related fetch retained more than the park reserved for \
              it; re-running this upsert INLINE on the serial loop rather than \
-             holding unbounded bytes behind a park. The write still completes; \
-             the cost is a stall (#5554 follow-up)"
+             holding unbounded bytes behind a park. The cost is a stall and a \
+             second fetch under the inline timeout (#5831)"
         );
         // RETRY INLINE, DO NOT FAIL. Returning `Err` here failed the write —
         // and failed it precisely when the park was ADMITTED, so an identical
@@ -3226,45 +3227,29 @@ where
         // node with a steady stream of resumes would otherwise never sweep, and
         // the backstop exists precisely for the case where something is wedged.
         //
-        // WORST CASE PER ITERATION IS 105 DELEGATE RUNS, NOT 32 AND NOT 80.
-        // This comment has now been wrong twice in the same change, in the same
-        // direction, and the second time is the more instructive one.
+        // RESUME-DRIVEN DELEGATE RUNS PER ITERATION: AT MOST 105.
         //
-        // It first said "2 x MAX_RESUME_DRAIN_BATCH" = 32, which understates it
-        // by more than three times. Corrected to 80 after deriving the two
-        // budgeted loops properly. A reviewer then found that 80 counts only
-        // those two and omits a THIRD delegate-run path in this same loop body:
-        // the `let _ = handle_delegate_resume(..)` select arm below, which
-        // discards its run count exactly as the sweep did before M2 fixed it.
-        // At up to 25 runs that is 105.
-        //
-        // Narrower than it sounds, and worth saying so rather than leaving the
-        // number to imply more than it means: that arm is in the IDLE select,
-        // reached only with the fair queue already empty, so it is not the
-        // head-of-line shape M2 is about. It is still a delegate run inside one
-        // iteration, so a per-iteration bound that omits it is wrong.
-        //
-        // The lesson is the one this change keeps relearning. Correcting an
-        // over-strong bound is not the same as deriving the right one, and the
-        // corrected figure inherits whatever the original derivation forgot to
-        // enumerate. Both errors were mine, in the change whose subject is
-        // over-strong bound claims, a few hundred lines from the
-        // `PARK_WORK_BUDGET` "the guard always wins" correction.
-        //
-        // The arithmetic, because a bound worth stating is worth deriving.
-        // BOTH loops test the budget BEFORE consuming a victim's cost — the
-        // batch as `while resume_budget > 0`, the sweep as
+        // BOTH budgeted loops test the budget BEFORE consuming a victim's cost:
+        // the batch as `while resume_budget > 0`, the sweep as
         // `if spent >= budget { break }`. So fifteen one-run victims take a
         // 16-unit budget down to its last unit, and the sixteenth is STILL
         // admitted, at up to `1 + MAX_PENDING_PER_DELEGATE +
         // MAX_PENDING_NOTIFICATION_CONTRACTS` = 25 runs (see
-        // `handle_delegate_resume`). Each BUDGETED loop is therefore
-        // `(MAX_RESUME_DRAIN_BATCH - 1) + 25` = 40, and the two together are 80.
-        // The unbudgeted idle-select arm adds up to another 25, giving 105.
+        // `handle_delegate_resume`). Each budgeted loop is therefore
+        // `(MAX_RESUME_DRAIN_BATCH - 1) + 25` = 40, the two together 80, and the
+        // unbudgeted idle-select resume arm below adds up to another 25. That
+        // arm is reached only with the fair queue already empty, so it is not
+        // the head-of-line shape the sweep budget is for.
         //
-        // Still a bound, and still bounded by constants — which is what the
-        // budget is for. It is simply 105 rather than 32, and stating the real
-        // number is the whole point of the exercise this comment sits inside.
+        // THIS COUNTS RESUME-DRIVEN RUNS ONLY. The same iteration can also run
+        // up to `MAX_DELEGATE_DRAIN_BATCH` notification-driven runs,
+        // `delegate_capabilities::MAX_LIFECYCLE_RUNS_PER_ITERATION` lifecycle
+        // and wake-up runs, the idle-select notification arm, and the fair-queue
+        // event; each is bounded by its own constant and none is in the 105. A
+        // "run" can itself be several `process()` calls. Earlier versions of
+        // this comment said 32 and then 80; both omitted paths, so a new
+        // delegate-run path added to this loop must be added to this list.
+        //
         // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
         // boundary, which the original test could not see because its victims
         // cost exactly one run each.
@@ -3495,8 +3480,8 @@ where
                 // iteration, so there is exactly one sweep implementation.
             }
             Some(delegate_resume) = delegate_resume_rx.recv() => {
-                // THE THIRD DELEGATE-RUN PATH IN THIS LOOP BODY, and it is
-                // counted in the per-iteration bound at the top (105, not 80).
+                // The third RESUME-driven delegate-run path in this loop body,
+                // counted in the per-iteration resume bound at the top (105).
                 // The `let _ =` discards a run count exactly as the TTL sweep
                 // did before M2, but this arm is NOT that defect: it is in the
                 // idle select, so it is reached only with the fair queue
@@ -5486,8 +5471,9 @@ where
                 inbound: Vec::new(),
                 upserts: Vec::new(),
                 // The sweep does not know what the task owed; that task's
-                // own guard still fires and is rejected on epoch, so
-                // nothing is answered twice.
+                // own guard still fires and is rejected on epoch. So the
+                // owed upserts and network ops are answered zero times, not
+                // twice: the delegate gets no response for them (#5834).
                 unresolved_upserts: Vec::new(),
                 contract_ops: Vec::new(),
                 unresolved_contract_ops: Vec::new(),
@@ -5675,8 +5661,9 @@ where
         // AN OVER-ALLOWANCE FETCH DEGRADES TO INLINE HERE, on the serial loop,
         // which is where `run_deferred_upsert_inline` already belongs. This is
         // what makes `upsert_fetch_allowance`'s "degrades to the inline path"
-        // true rather than aspirational: the write completes, at the cost of a
-        // second fetch and a stall for this one operation.
+        // true rather than aspirational. The cost is a second fetch under the
+        // inline 10 s timeout, which can fail where the off-loop fetch
+        // succeeded, and a stall for this one operation (#5831).
         match resolved.fetched {
             delegate_park::FetchDisposition::RetryInline => {
                 all_inbound
@@ -5721,8 +5708,7 @@ where
     }
     // Network operations the off-loop task never resolved (panic, cancellation,
     // budget). Same reasoning as the unresolved upserts above: the delegate is
-    // TOLD rather than left waiting. `DelegateContext` is defaulted because the
-    // `PendingContractOp` that carried it is gone by then.
+    // TOLD rather than left waiting, with the context the guard carried.
     for (contract_id, kind, context) in unresolved_contract_ops {
         all_inbound.push(contract_op_response_msg(
             kind,
@@ -7144,6 +7130,19 @@ mod tests {
                 continue;
             }
             let ident = &code[start..name_end];
+            // A call to a function DEFINED IN THE SCANNED TEXT is not itself a
+            // spawn: whatever it spawns is written inside its own body, which
+            // this same loop reaches and scans where it is written
+            // (`spawn_capability_prompt`, #5730, is the first). Exempting it by
+            // that fact rather than by name keeps the rule syntactic: a spawn
+            // helper imported from ANOTHER file has no definition here and
+            // still reaches the panic below, because its body is never scanned.
+            if [format!("fn {ident}("), format!("fn {ident}<")]
+                .iter()
+                .any(|decl| code.contains(decl.as_str()))
+            {
+                continue;
+            }
 
             let mut i = skip_ws(code, name_end + 1);
             if let Some(next) = eat_kw(code, i, "async") {
@@ -7272,6 +7271,28 @@ mod tests {
         let bodies = spawned_bodies(code);
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].contains("NEEDLE"));
+    }
+
+    /// A call to a spawn HELPER defined in the scanned text is skipped, and
+    /// the spawn inside the helper's own body is what gets scanned. Both halves
+    /// are asserted: skipping the call without scanning the helper's body
+    /// would hide the task entirely.
+    #[test]
+    fn the_spawn_scan_reads_a_local_helper_at_its_definition() {
+        let code = "fn caller() { spawn_helper(a, b); } \
+                    fn spawn_helper<P>(a: P, b: u8) { GlobalExecutor::spawn(async move { NEEDLE }); }";
+        let bodies = spawned_bodies(code);
+        assert_eq!(bodies.len(), 1, "only the helper's real spawn is a task");
+        assert!(bodies[0].contains("NEEDLE"));
+    }
+
+    /// ...and a spawn helper with NO definition in the scanned text (imported
+    /// from elsewhere) still panics: its body is never scanned here.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_spawn_helper_defined_elsewhere_still_panics() {
+        let code = "fn caller() { other::spawn_helper(a, b); }";
+        let _ = spawned_bodies(code);
     }
 
     /// The second audit defeat, and the subtler one: it uses a RECOGNISED spawn
@@ -8607,10 +8628,13 @@ mod hol_4391_tests {
             //
             // That was a fact about the tests that happened to exist. Wrapping
             // every installed stub makes it a fact about all of them, including
-            // the ones nobody has written, and it fails AT THE MISTAKE: adding
-            // a large-stub test panics here with the reason, instead of making
-            // an unrelated test flaky in a way that only parses if you have
-            // read a comment in another module.
+            // the ones nobody has written, and it fails the test that made the
+            // mistake: an oversized stub records the reason, and `Drop` below
+            // panics with it in that test's own thread. It does not panic
+            // HERE, because this closure runs inside the spawned off-loop task,
+            // where a panic is absorbed by the task and surfaces only as a
+            // synthesized upsert failure, which a test expecting failure would
+            // read as a pass.
             //
             // For scale: every stub today returns seven bytes against a floor
             // allowance of 512 KiB, so this is not load-bearing now. It is here
@@ -8622,8 +8646,10 @@ mod hol_4391_tests {
                     let out = inner.await;
                     if let Ok(states) = &out {
                         for (id, state) in states {
-                            assert!(
-                                delegate_park::ByteCount::new(state.as_ref().len()) <= floor,
+                            if delegate_park::ByteCount::new(state.as_ref().len()) <= floor {
+                                continue;
+                            }
+                            let reason = format!(
                                 "off-loop fetch stub returned {} bytes for {id}, over the \
                                  floor per-fetch allowance of {floor}. That reaches the \
                                  refusal branch of `within_fetch_allowance`, which \
@@ -8636,6 +8662,10 @@ mod hol_4391_tests {
                                  and say why",
                                 state.as_ref().len()
                             );
+                            STUB_OVER_FLOOR
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert(reason);
                         }
                     }
                     out
@@ -8648,8 +8678,22 @@ mod hol_4391_tests {
     impl Drop for OverrideGuard {
         fn drop(&mut self) {
             set_off_loop_fetch_override(None);
+            let violation = STUB_OVER_FLOOR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(reason) = violation
+                && !std::thread::panicking()
+            {
+                panic!("{reason}");
+            }
         }
     }
+
+    /// The first oversized-stub violation seen while an `OverrideGuard` is
+    /// installed, reported by its `Drop` on the test's own thread. Tests that
+    /// install a stub serialise on `TEST_GUARD`, so one slot is enough.
+    static STUB_OVER_FLOOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     fn make_contract(code_bytes: &[u8]) -> ContractContainer {
         let code = ContractCode::from(code_bytes.to_vec());
@@ -11597,9 +11641,10 @@ mod hol_4391_tests {
     /// final unit and the next victim is STILL admitted, at up to
     /// `1 + MAX_PENDING_PER_DELEGATE + MAX_PENDING_NOTIFICATION_CONTRACTS` = 25
     /// runs. The real per-loop bound is therefore `(budget - 1) + 25` = 40, and
-    /// 80 across both BUDGETED loops (105 counting the unbudgeted idle-select
-    /// arm, see `contract_handling`) — not the `2 x MAX_RESUME_DRAIN_BATCH` = 32 the
-    /// loop comment claimed until this test was written.
+    /// 80 across both BUDGETED loops (105 resume-driven runs counting the
+    /// unbudgeted idle-select arm, see `contract_handling`) — not the
+    /// `2 x MAX_RESUME_DRAIN_BATCH` = 32 the loop comment claimed until this
+    /// test was written.
     ///
     /// The sibling test could not see it because every victim there costs
     /// exactly one run, so the budget is spent in units of one and never

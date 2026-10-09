@@ -337,7 +337,9 @@ pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
 /// THAT DIVISOR CARRIES A SECOND DECISION, named here because a later reader
 /// takes an unexplained constant for arithmetic. The previous shape allowed
 /// EIGHT fetching parks per budget; this allows four. Four parks x four upserts
-/// is sixteen concurrent related fetches, which is ample, and halving the
+/// is sixteen concurrent related fetches. The reserve is per UPSERT, so sixteen
+/// single-upsert parks fill the budget just the same, and the seventeenth goes
+/// inline however small its related states turn out to be (#5831). Halving the
 /// concurrency is part of how the per-upsert figure gets large enough to be
 /// useful. It is a choice about how many parks may fetch at once, riding inside
 /// a fix for how much each may retain — change it deliberately, not as a
@@ -349,8 +351,11 @@ pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
 /// 50 MiB related state would blow the whole node-wide budget on a single park.
 /// What it degrades TO is the pre-#5544 inline path: the upsert is re-run on
 /// the serial loop at resume (see `contract::apply_resolved_upsert`'s caller),
-/// which stalls the loop for that operation and re-fetches, but **completes the
-/// write**.
+/// which stalls the loop for that operation and re-fetches. The re-fetch runs
+/// under the inline path's own related-fetch timeout (10 s, against 62 s
+/// off-loop), so a related contract slow enough to need longer FAILS there,
+/// where unbounded retention would have let it succeed. That is the price of
+/// the bound, tracked in #5831 with the options for lowering it.
 ///
 /// AND THE INLINE PATH APPLIES NO SIZE ALLOWANCE AT ALL
 /// (`contract::run_deferred_upsert_inline` -> `upsert_contract_state`), so say
@@ -1451,11 +1456,10 @@ struct ParkGuardPayload {
     answers: std::sync::Arc<std::sync::Mutex<Vec<InboundDelegateMsg<'static>>>>,
     fetches: std::sync::Arc<std::sync::Mutex<Vec<ResolvedUpsert>>>,
     /// Network operations this park owes a response for, as
-    /// `(contract, kind)` (#5542). A MULTISET for the same reason as
-    /// `owed_upserts`: one `process()` return can emit two GETs naming the same
-    /// contract, and reconciling those by SET membership would let one
-    /// completion discharge both obligations, leaving the delegate waiting
-    /// forever for a response nothing remained to produce.
+    /// `(op id, contract, kind, context)` (#5542). One `process()` return can
+    /// emit two GETs naming the same contract, so they are reconciled by the
+    /// node-assigned op id, never by `(contract, kind)`: matching on the key
+    /// would let one completion discharge the other's obligation.
     /// Carries the delegate's own `DelegateContext` so a synthesized failure
     /// hands back the CONTINUATION STATE the request arrived with, not an empty
     /// one (#5542 finding F7). `DelegateContext` is how a delegate correlates a
@@ -1565,13 +1569,14 @@ impl ParkGuard {
         // at this `Drop` impl announces "you are now at a different level of
         // the same question", and nothing at the task body announced it either.
         //
-        // RECONCILED BY COUNT, NOT BY SET (#5544 F1/F3). Both owed lists are
-        // multisets — `request_id` is delegate-chosen, and two upserts can name
-        // one contract — so filtering by membership let ONE completion cancel
-        // the obligation for BOTH, and the delegate waited forever for a
-        // response nothing remained to produce. That is reachable on the
-        // ordinary budget-expiry path too, not just on panic, because partial
-        // results are delivered by design.
+        // PROMPTS ARE RECONCILED BY COUNT, NOT BY SET (#5544 F1/F3).
+        // `request_id` is delegate-chosen, so the owed prompts are a multiset,
+        // and filtering by membership let ONE answer cancel the obligation for
+        // BOTH, leaving the delegate waiting forever for a response nothing
+        // remained to produce. That is reachable on the ordinary budget-expiry
+        // path too, not just on panic, because partial results are delivered
+        // by design. Upserts and network ops below carry node-assigned ids and
+        // are reconciled by identity instead.
         let mut answered: HashMap<u32, usize> = HashMap::new();
         for msg in &inbound {
             if let InboundDelegateMsg::UserResponse(r) = msg {
@@ -2475,6 +2480,17 @@ mod tests {
                 ),
                 T_CTX,
             ),
+            (
+                "UnsubscribeContractRequest",
+                OutboundDelegateMsg::UnsubscribeContractRequest(
+                    freenet_stdlib::prelude::UnsubscribeContractRequest {
+                        contract_id: ContractInstanceId::new([5u8; 32]),
+                        context: t_ctx(),
+                        processed: false,
+                    },
+                ),
+                T_CTX,
+            ),
         ];
         for (name, msg, expected) in cases {
             let charged = outbound_bytes(&msg);
@@ -2488,7 +2504,7 @@ mod tests {
         }
     }
 
-    /// The same, for every `InboundDelegateMsg` variant.
+    /// The same, for every `InboundDelegateMsg` variant that carries a payload.
     ///
     /// FALSIFY by zeroing any single term in `inbound_bytes`.
     #[test]
@@ -2578,6 +2594,26 @@ mod tests {
                 ),
                 T_CTX,
             ),
+            (
+                "UnsubscribeContractResponse",
+                InboundDelegateMsg::UnsubscribeContractResponse(
+                    freenet_stdlib::prelude::UnsubscribeContractResponse {
+                        contract_id: cid,
+                        result: Ok(()),
+                        context: t_ctx(),
+                    },
+                ),
+                T_CTX,
+            ),
+            (
+                "WakeupFired",
+                InboundDelegateMsg::WakeupFired {
+                    tag: vec![0u8; T_PAYLOAD],
+                },
+                T_PAYLOAD,
+            ),
+            // `Lifecycle` is a fixed-size event charged 0, so it has no
+            // payload term to pin here.
         ];
         for (name, msg, expected) in cases {
             let charged = inbound_bytes(&msg);
@@ -2596,7 +2632,10 @@ mod tests {
     /// Each gets a distinct size and is asserted as a DELTA against a baseline
     /// that has it empty, so no term can be satisfied by a sibling.
     ///
-    /// FALSIFY by zeroing any single term in `task_bytes`.
+    /// FALSIFY by zeroing any single prompt or upsert term in `task_bytes`.
+    /// The pending-network-op term (#5542) is pinned separately, by
+    /// `pending_network_ops_are_charged_for_their_context`: the helper this
+    /// test calls passes no network ops.
     #[test]
     fn every_task_bytes_term_is_charged() {
         fn upsert(
@@ -3441,6 +3480,12 @@ mod tests {
              exercising an ordinary lock"
         );
         let net_ops: std::sync::Arc<std::sync::Mutex<Vec<ResolvedContractOp>>> = Default::default();
+        // A finished network op lands before the poisoning too, so delivery
+        // THROUGH the third lock is checked, not only that it does not abort.
+        net_ops.lock().unwrap().push(ResolvedContractOp {
+            pending: net_op_with(41, 9, ContractOpKind::Get, b"op".to_vec()),
+            outcome: ContractOpOutcome::Fetched(None),
+        });
         let poison_net_ops = std::sync::Arc::clone(&net_ops);
         let poisoned_net_ops = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = poison_net_ops.lock().unwrap();
@@ -3467,7 +3512,12 @@ mod tests {
             Vec::new(),
             answers,
             fetches,
-            Vec::new(),
+            vec![(
+                41,
+                ContractInstanceId::new([9u8; 32]),
+                ContractOpKind::Get,
+                DelegateContext::new(b"op".to_vec()),
+            )],
             net_ops,
         ));
 
@@ -3485,6 +3535,21 @@ mod tests {
                 .any(|m| matches!(m, InboundDelegateMsg::UserResponse(r) if r.request_id == 1)),
             "the answer written before the poisoning must still be delivered, \
              not discarded with the lock"
+        );
+        assert_eq!(
+            resume
+                .contract_ops
+                .iter()
+                .map(|r| r.pending.id)
+                .collect::<Vec<_>>(),
+            vec![41],
+            "the network op finished before the poisoning must be delivered \
+             through the poisoned contract-ops lock"
+        );
+        assert!(
+            resume.unresolved_contract_ops.is_empty(),
+            "the delivered op discharges its own obligation, so nothing may be \
+             synthesized as failed"
         );
     }
 
@@ -4378,16 +4443,21 @@ mod tests {
 
     /// The context survives RECONCILIATION, not just construction.
     ///
-    /// The owed list is matched against completions as a MULTISET on
-    /// `(contract, is_put)`, so two upserts naming one contract are
-    /// indistinguishable by key — which is exactly the case where a defaulted
-    /// context is unusable rather than merely unhelpful. Here one of the two
-    /// completes and the other does not; the survivor must carry ITS OWN
-    /// context through.
+    /// The owed list is matched against completions by `UpsertId`. Two
+    /// upserts naming one contract are indistinguishable by key, which is
+    /// exactly the case where a defaulted context is unusable rather than
+    /// merely unhelpful. Here the LATER of the two completes and the EARLIER
+    /// does not; the survivor must be the earlier one, carrying its own
+    /// context.
+    ///
+    /// The later one completes ON PURPOSE. A `(contract, is_put)` multiset
+    /// match consumes the FIRST matching owed entry, so if the earlier upsert
+    /// completed, key matching and identity matching would agree and this test
+    /// could not tell them apart.
     ///
     /// FALSIFY by reconciling on `(contract, is_put)` again instead of on
-    /// `id`: the later completion then cancels the earlier's obligation and the
-    /// count goes to 0.
+    /// `id`: the completion of the second then discharges the first's
+    /// obligation, and the survivor carries the wrong context.
     ///
     /// **NOT by defaulting the context**, which is what this line used to say
     /// and which is false of THIS test. It constructs `OwedUpsert` by hand, so
@@ -4416,6 +4486,7 @@ mod tests {
             freenet_stdlib::prelude::ContractCode::from(vec![0u8; 4]),
         );
         let contract = *resolved_key.id();
+        let first_id = UpsertId::next();
         let resolved_id = UpsertId::next();
         let guard = ParkGuard::new(
             tx,
@@ -4424,13 +4495,13 @@ mod tests {
             Vec::new(),
             vec![
                 OwedUpsert {
-                    id: resolved_id,
+                    id: first_id,
                     contract,
                     is_put: true,
                     context: DelegateContext::new(b"first".to_vec()),
                 },
                 OwedUpsert {
-                    id: UpsertId::next(),
+                    id: resolved_id,
                     contract,
                     is_put: true,
                     context: DelegateContext::new(b"second".to_vec()),
@@ -4441,7 +4512,7 @@ mod tests {
             Vec::new(),
             Default::default(),
         );
-        // Exactly ONE of the pair resolves.
+        // Exactly ONE of the pair resolves: the LATER one.
         fetches.lock().unwrap().push(ResolvedUpsert {
             pending: PendingUpsert {
                 id: resolved_id,
@@ -4450,7 +4521,7 @@ mod tests {
                 related_contracts: RelatedContracts::default(),
                 code: None,
                 is_put: true,
-                context: DelegateContext::new(b"first".to_vec()),
+                context: DelegateContext::new(b"second".to_vec()),
                 missing: Vec::new(),
             },
             fetched: FetchDisposition::Resolved(Ok(Vec::new())),
@@ -4463,10 +4534,17 @@ mod tests {
             1,
             "one of the pair resolved, so exactly one obligation must remain"
         );
-        assert!(
-            !resume.unresolved_upserts[0].context.as_ref().is_empty(),
-            "the surviving obligation must still carry a context; a defaulted \
-             one cannot be told from the resolved sibling's"
+        assert_eq!(
+            resume.unresolved_upserts[0].id, first_id,
+            "the EARLIER upsert is the one that did not complete; matching on \
+             (contract, is_put) would have discharged it with the later one's \
+             completion"
+        );
+        assert_eq!(
+            resume.unresolved_upserts[0].context.as_ref(),
+            b"first",
+            "the surviving obligation must carry ITS OWN context, not the \
+             resolved sibling's and not a default"
         );
     }
 

@@ -869,18 +869,21 @@ mod tests {
         // `PROMPT_EVENTS` is process-global with a capacity of
         // `PROMPT_EVENT_CAPACITY`, shared with every other test in this binary,
         // so this receiver could fall behind through no fault of the code under
-        // test. The `#[serial(prompt_events)]` attribute on the three tests that
-        // touch that channel is what REMOVES that: they no longer run
-        // concurrently, so nothing else is publishing into the window between
-        // the subscribe above and this drain.
+        // test. The `#[serial(prompt_events)]` attribute on the three tests in
+        // this module that touch that channel stops THEM publishing into each
+        // other's window. It does not cover every publisher: tests in
+        // `server::client_api::permission_prompts` also send on this channel
+        // and are not in that group, so under `cargo test` they can still
+        // publish between the subscribe above and this drain (nextest's
+        // process-per-test isolation hides it).
         //
-        // Handling `Lagged` is then defence in depth rather than the fix, and
-        // saying so matters: `while let Ok(..)` BREAKS on that arm, so a lagged
+        // That is why handling `Lagged` matters, and saying so matters too:
+        // `while let Ok(..)` BREAKS on that arm, so a lagged
         // receiver reported `removed == false` and failed with a message
-        // accusing `PromptEntryGuard` of never emitting `Removed`. If the
-        // serialisation is ever removed, or a future emitter appears outside
-        // these three tests, the failure says which of the two it was instead
-        // of blaming the guard. Only `Empty`/`Closed` end the drain.
+        // accusing `PromptEntryGuard` of never emitting `Removed`. Now the
+        // skipped count rides in the failure message, so a lag caused by
+        // another publisher is reported as that rather than blamed on the
+        // guard. Only `Empty`/`Closed` end the drain.
         let mut removed = false;
         let mut lagged = 0u64;
         loop {
