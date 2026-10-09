@@ -2724,7 +2724,7 @@ fi
 # The budgets come from the canary's OWN defaults, sourced in a clean
 # environment so an exported CANARY_* in the caller cannot skew them. The
 # remaining terms are allowances. Only the first three are hard curl bounds in
-# auto-update-canary.sh; the last two are ESTIMATES, so this is a sanity bound
+# auto-update-canary.sh; the last three are ESTIMATES, so this is a sanity bound
 # with margin, not a proof that the job can never time out:
 #   300  previous-release download (curl --max-time 300)
 #   OVERRUN of the latest-release wait past its budget. The deadline is

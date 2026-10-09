@@ -123,6 +123,10 @@ MARKER_STAGE_STARTED='Preparing the update before exiting'
 MARKER_STAGE_DOWNLOADING='Downloading the update before exiting'
 MARKER_STAGE_DONE='Update downloaded and verified'
 MARKER_INSTALLED_STAGED='from the update downloaded in advance.'
+# update/staged.rs -- the two WARN lines a staging failure ends in: the tag
+# lookup, and the download. Either can carry a rate limit.
+MARKER_STAGE_UNRESOLVED='Could not resolve the release to download in advance'
+MARKER_STAGE_FAILED='Could not download the update in advance'
 # auto_update.rs -- GithubRateLimitedError's Display, inside a staging failure.
 MARKER_RATE_LIMITED='GitHub rate-limited this IP'
 # freenet.rs -- detection succeeded and an update was requested. There are
@@ -2054,10 +2058,11 @@ cmd_selfupdate() {
   if log_has "$work/logs" "$MARKER_STAGE_STARTED"; then
     staging_armed=1
     if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
-      # Only a rate limit on the staging failure itself, not one anywhere in
-      # the log. log_lines greps the files directly; no pipe (SIGPIPE).
+      # Only a rate limit on a staging failure line itself (the tag lookup or
+      # the download), not one anywhere in the log. log_lines greps the files
+      # directly; no pipe (SIGPIPE).
       local staging_failure
-      staging_failure="$(log_lines "$work/logs" "Could not download the update in advance")"
+      staging_failure="$(log_lines "$work/logs" "$MARKER_STAGE_UNRESOLVED"; log_lines "$work/logs" "$MARKER_STAGE_FAILED")"
       if [[ "$staging_failure" == *"$MARKER_RATE_LIMITED"* ]]; then
         fail "UNVERIFIED: v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
         log_lines "$work/logs" "the update" | head -8 >&2

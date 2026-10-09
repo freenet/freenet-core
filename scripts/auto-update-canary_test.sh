@@ -2564,6 +2564,8 @@ for pin in \
     "staged|tracing::info!(\"${MARKER_STAGE_STARTED//[[:space:]]/}" \
     "staged|tracing::info!(tag=%tag,\"${MARKER_STAGE_DOWNLOADING//[[:space:]]/}" \
     "staged|tracing::info!(\"${MARKER_STAGE_DONE//[[:space:]]/}" \
+    "staged|tracing::warn!(error=%e,\"${MARKER_STAGE_UNRESOLVED//[[:space:]]/}" \
+    "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/}" \
     "update|writeln!(io::stderr(),\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}" \
     "auto_update|\"${MARKER_RATE_LIMITED//[[:space:]]/}"; do
     file="${pin%%|*}" needle="${pin#*|}"

@@ -781,6 +781,8 @@ STAGE_DL='INFO freenet::commands::update::staged: Downloading the update before 
 STAGE_DONE='INFO freenet::commands::update::staged: Update downloaded and verified; exiting to install it (v0.2.122, 3s)'
 STAGE_LIMITED='WARN freenet::commands::update::staged: Could not download the update in advance; exiting anyway, the updater will download what is missing tag=v0.2.122 error=GitHub rate-limited this IP'
 STAGE_FAILED='WARN freenet::commands::update::staged: Could not download the update in advance; exiting anyway, the updater will download what is missing tag=v0.2.122 error=Download failed: 500'
+STAGE_TAG_LIMITED='WARN freenet::commands::update::staged: Could not resolve the release to download in advance; the update will be downloaded after exit error=GitHub rate-limited this IP; retrying in 900s'
+UNRELATED_LIMIT='WARN freenet::commands::auto_update: Update check deferred: GitHub rate-limited this IP'
 
 rc="$(gate_b_rc_for "$TRIGGER_LINE
 $STAGE_PREP
@@ -821,6 +823,20 @@ $STAGE_DL
 $STAGE_LIMITED" 1)"
 expect_rc "$rc" "$EXIT_UNVERIFIED_ENVIRONMENTAL" "Gate B calls a rate-limited staging environmental ($EXIT_UNVERIFIED_ENVIRONMENTAL), not a fault" \
     "for a rate-limited staging; expected $EXIT_UNVERIFIED_ENVIRONMENTAL, or the dev room is told auto-update is broken."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_TAG_LIMITED" 1)"
+expect_rc "$rc" "$EXIT_UNVERIFIED_ENVIRONMENTAL" "Gate B calls a rate-limited tag lookup during staging environmental too" \
+    "a rate limit on staging's tag lookup is as environmental as one on its download."
+
+rc="$(gate_b_rc_for "$UNRELATED_LIMIT
+$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_FAILED" 1)"
+expect_rc "$rc" 1 "Gate B does not excuse a failed staging because of an unrelated rate-limit line" \
+    "a staging that failed for another reason must not be called environmental."
 
 rc="$(gate_b_rc_for "$TRIGGER_LINE" 1)"
 expect_rc "$rc" 0 "Gate B still passes a previous release that predates staging" \
