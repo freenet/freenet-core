@@ -7137,18 +7137,29 @@ mod tests {
             if code[name_end..].starts_with("::<") {
                 let mut depth = 0usize;
                 for (off, b) in bytes[name_end + 2..].iter().enumerate() {
+                    let at = name_end + 2 + off;
                     match b {
                         b'<' => depth += 1,
-                        b'>' => {
+                        // `->` inside `Fn() -> T` is not a closing bracket.
+                        b'>' if bytes[at - 1] != b'-' => {
                             depth -= 1;
                             if depth == 0 {
-                                paren = name_end + 2 + off + 1;
+                                paren = at + 1;
                                 break;
                             }
                         }
                         _ => {}
                     }
                 }
+                // Once a turbofish is entered, landing anywhere but on the
+                // call's paren is a form this scan does not understand.
+                assert_eq!(
+                    bytes.get(paren),
+                    Some(&b'('),
+                    "unrecognised spawn form: `{}` at byte {start} has a turbofish \
+                     this scan could not step over",
+                    &code[start..name_end]
+                );
             }
             if bytes.get(paren) != Some(&b'(') {
                 continue;
@@ -7175,9 +7186,16 @@ mod tests {
             //    type alias hiding `Future` defeats this; none exists in the
             //    scanned text.
             //  * The call's ARGUMENTS are still scanned, as a body of their
-            //    own, so nothing written inline in the call is hidden.
+            //    own, so nothing written inline in the call is hidden, and the
+            //    scan continues inside them for nested spawns.
             //
             // A helper that fails any of these reaches the panic below.
+            //
+            // KNOWN LIMITS of this text scan, none of which occurs in the
+            // scanned code today: a trait bound standing in for `Future`
+            // (`fn spawn_x<T: Job>`), a multi-byte char literal or a raw string
+            // inside a helper's arguments (both can misalign the literal
+            // skipping), and a local method sharing a free function's name.
             let before = code[..start].trim_end();
             // A DECLARATION (`fn spawn_x(`) is not a call and spawns nothing.
             if let Some(head) = before.strip_suffix("fn")
@@ -7242,7 +7260,9 @@ mod tests {
                     panic!("`{ident}` at byte {start} opens an argument list that is never closed")
                 });
                 out.push(&code[paren..=close]);
-                cursor = close + 1;
+                // Continue INSIDE the arguments, not past them: a spawn written
+                // in an argument still has to meet the literal-block rule.
+                cursor = paren + 1;
                 continue;
             }
 
@@ -7459,6 +7479,27 @@ mod tests {
         );
     }
 
+    /// A spawn NESTED in a local helper's arguments still meets the
+    /// literal-block rule: the scan continues inside the arguments.
+    #[test]
+    #[should_panic(expected = "unrecognised spawn form")]
+    fn a_spawn_nested_in_a_local_helper_s_arguments_is_checked() {
+        let code = "fn caller() { spawn_note(a, { GlobalExecutor::spawn(fut); b }); } \
+                    fn spawn_note(a: u8, b: u8) { }";
+        let _ = spawned_bodies(code);
+    }
+
+    /// A turbofish whose type contains `->` is stepped over, not mistaken
+    /// for its closing bracket.
+    #[test]
+    fn the_spawn_scan_steps_over_an_arrow_in_a_turbofish() {
+        let code =
+            "fn f() { tokio::task::spawn_blocking::<Box<dyn Fn() -> u8>>(move || { NEEDLE }); }";
+        let bodies = spawned_bodies(code);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("NEEDLE"));
+    }
+
     /// A turbofish call is still a call.
     #[test]
     fn the_spawn_scan_sees_a_turbofish_call() {
@@ -7549,7 +7590,7 @@ mod tests {
     /// FALSIFY: add a call to `handle_delegate_with_contract_requests` in a new
     /// function, call `execute_delegate_request` from anywhere but the
     /// chokepoint, or — the case checks 1 and 2 could not see — put either
-    /// call inside a `GlobalExecutor::spawn` body WITHIN one of the four
+    /// call inside a `GlobalExecutor::spawn` body WITHIN one of the
     /// allowed functions. All three fail. Verified by doing all three.
     ///
     /// Two further falsifications, added after a post-merge audit found this
@@ -7626,7 +7667,7 @@ mod tests {
         //
         //    Checks 1 and 2 ask only which TOP-LEVEL function encloses a call,
         //    so a `GlobalExecutor::spawn(async move { ... })` block placed
-        //    inside one of the four allowed functions passes both unchanged —
+        //    inside one of the allowed functions passes both unchanged —
         //    while doing exactly what the message above says breaks the
         //    invariant ("a call from a spawned task, a pooled executor or a
         //    second loop"). The guard returned a true answer about the wrong
@@ -7650,6 +7691,13 @@ mod tests {
         // this.dispatch_delegate_request(req).await })` would otherwise pass
         // all three checks, because check 2 attributes the chokepoint call to
         // the allowed function and the spawned body names neither needle.
+        //
+        // This is ONE HOP. A spawned body calling a caller of an allowed
+        // function (`handle_contract_event`, `sweep_expired_parks`, or a new
+        // wrapper) is not caught here. What stops that in practice is the type
+        // system: those paths need the loop's `&mut` handler, which cannot move
+        // into a `'static` spawned task. This scan catches the textual
+        // shortcuts; it does not prove the property on its own.
         let allowed_calls: Vec<String> = allowed.iter().map(|a| format!("{a}(")).collect();
         for body in &spawned {
             for needle in [chokepoint, ".execute_delegate_request("]
