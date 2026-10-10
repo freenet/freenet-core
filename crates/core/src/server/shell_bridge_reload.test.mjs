@@ -163,6 +163,168 @@ function check(name, cond) {
   check('future-dated window start resets to a fresh, allowed window', d.allow === true);
 }
 
+// 7. freloadStripDecision: once the shell is served (the app link answered),
+//    `_freload` is dropped from the address bar so a link copied from it later
+//    is a FRESH link (a stale stamp sends a top-level open on a joining node
+//    straight to the dashboard: connecting.html's expired-window branch). It
+//    may only be dropped when doing so cannot change the cap above: a count of
+//    0 (the connecting page's own stamp) at once, a live window only once it
+//    has expired. Property: from the moment the decision says strip, for every
+//    later time, the cap answers the stripped URL no more permissively than
+//    the stamped one — never a fresh budget the stamped URL would refuse.
+const freloadStripDecision = new Function(
+  `${extractFrom('reload-url-cap:BEGIN', 'reload-url-cap:END', 'function reloadUrlCapDecision(')}\nreturn freloadStripDecision;`,
+)();
+{
+  const base = 'http://n.test/v1/contract/web/k/';
+  const T = 10_000_000;
+  const countOf = (u) => Number(/_freload=\d+-(\d+)/.exec(u)[1]);
+  let swept = 0;
+  let deferred = 0;
+  let violations = 0;
+  let firstViolation = null;
+  let maxDelay = 0;
+  // One stamp: stripped (now or after its delay), every later reload decision
+  // compared. A delay is re-decided when it fires (stripFreload), so a clamped
+  // delay is followed until the decision says "now" (bounded: a stamp years
+  // ahead re-decides every WINDOW_MS, so the walk is capped and counted).
+  const sweep = (raw, label) => {
+    const href = `${base}?view=chat&_freload=${raw}#m`;
+    let at = T;
+    let d = freloadStripDecision(href, at);
+    if (!d) {
+      violations++;
+      return;
+    }
+    if (d.url !== `${base}?view=chat#m`) violations++;
+    if (d.delay > 0) deferred++;
+    for (let hops = 0; d.delay > 0 && hops < 3; hops++) {
+      maxDelay = Math.max(maxDelay, d.delay);
+      at += d.delay;
+      d = freloadStripDecision(href, at);
+    }
+    maxDelay = Math.max(maxDelay, d.delay);
+    // Every reload decision from the moment of stripping on: the stripped
+    // URL is never allowed where the stamped one is refused, and never
+    // carries a lower count.
+    for (const later of [0, 1, 1_000, 30_000, 59_999, 60_000, 120_000]) {
+      const t = at + d.delay + later;
+      const a = reloadUrlCapDecision(href, t);
+      const b = reloadUrlCapDecision(d.url, t);
+      swept++;
+      if (b.allow && !a.allow) {
+        violations++;
+        firstViolation ??= `${label}, stripped after ${at - T + d.delay} ms, reload at +${later} ms`;
+      }
+      const ca = /_freload=\d+-(\d+)/.test(a.url) ? countOf(a.url) : 0;
+      const cb = /_freload=\d+-(\d+)/.test(b.url) ? countOf(b.url) : 0;
+      if (a.allow && b.allow && cb < ca) violations++;
+    }
+  };
+  for (const age of [
+    0, 1, 5_000, 59_999, 60_000, 60_001, 3_600_000, -5_000, -120_000,
+    // Far future (review of #5750): a hand-made link or a stamp written before
+    // a large backwards clock correction — years ahead.
+    -3 * 365 * 86_400_000,
+  ]) {
+    for (const count of [0, 1, 2, 3, 4]) sweep(`${T - age}-${count}`, `stamp age ${age} count ${count}`);
+  }
+  // Malformed stamps (review of #5750): each the cap already reads as fresh.
+  for (const raw of ['abc', '5-abc', '', '-', `${T}-NaN`, `${T - 5_000}-`, 'NaN-2']) sweep(raw, `malformed ${JSON.stringify(raw)}`);
+  check(
+    `stripping never loosens the reload cap (${swept} cases${firstViolation ? `; first: ${firstViolation}` : ''})`,
+    violations === 0 && swept > 200,
+  );
+  check(
+    `a live window (count >= 1) is kept until it expires (${deferred} deferred)`,
+    deferred > 0,
+  );
+  check(
+    `no strip timer is longer than the window (longest ${maxDelay} ms)`,
+    maxDelay <= 60_000,
+  );
+  check(
+    'a stamp years in the future re-decides every window, never a delay past it',
+    freloadStripDecision(`${base}?_freload=99999999999999-1`, T).delay === 60_000,
+  );
+  // ...and is still kept when the clock reaches it, through its whole window,
+  // while the cap honours it (Codex on #5750: the sweep's three hops never got
+  // there). Dropped only at its end, when the cap gives a fresh budget anyway.
+  {
+    const S = T + 3 * 365 * 86_400_000;
+    const far = `${base}?_freload=${S}-3`;
+    const keptThrough = freloadStripDecision(far, S - 1).delay > 0 && [S, S + 1, S + 30_000, S + 59_999].every(
+      (t) => freloadStripDecision(far, t).delay > 0 && !reloadUrlCapDecision(far, t).allow,
+    );
+    check(
+      'a far-future maxed stamp is kept through its own window (the cap refuses there)',
+      keptThrough && freloadStripDecision(far, S + 60_000).delay === 0,
+    );
+  }
+  // The two windows are one value: the strip is cap-safe only because it
+  // expires a stamp exactly when the cap stops honouring it.
+  {
+    const windowOf = (fn) => {
+      const at = src.indexOf(`function ${fn}(`);
+      const m = /var WINDOW_MS = (\d+);/.exec(src.slice(at));
+      return m && Number(m[1]);
+    };
+    const cap = windowOf('reloadUrlCapDecision');
+    const strip = windowOf('freloadStripDecision');
+    check(
+      `freloadStripDecision's WINDOW_MS equals reloadUrlCapDecision's (${strip} vs ${cap})`,
+      cap !== null && cap === strip,
+    );
+  }
+  check(
+    "the connecting page's own stamp (count 0) is dropped at once",
+    freloadStripDecision(`${base}?_freload=${T - 5_000}-0`, T).delay === 0,
+  );
+  check(
+    'a live cap window is dropped only when it expires',
+    freloadStripDecision(`${base}?_freload=${T - 5_000}-2`, T).delay === 55_000,
+  );
+  check(
+    'no _freload, nothing to do',
+    freloadStripDecision(`${base}?view=chat`, T) === null,
+  );
+  check(
+    'query and fragment survive',
+    freloadStripDecision(`${base}?a=1&_freload=${T}-0&b=2#h`, T).url ===
+      `${base}?a=1&b=2#h`,
+  );
+  // THE CONTROL: stripping a live count-2 window at once WOULD loosen the
+  // cap — it hands out a fresh budget of 3 where the stamped URL has 1 left.
+  const live = `${base}?_freload=${T - 5_000}-3`;
+  check(
+    'control: an early strip of a maxed live window would be allowed where the cap refuses',
+    reloadUrlCapDecision(live, T).allow === false &&
+      reloadUrlCapDecision(base, T).allow === true,
+  );
+}
+
+// 8. A same-contract navigation's frame path (iframe.src and the
+//    history.state.iframePath Back/Forward restore) never carries the shell's
+//    `_freload` stamp, whatever the encoding of its name, and keeps the app's
+//    own query, the routing flag and the fragment (Codex on #5750).
+{
+  const sameContractFramePath = new Function(
+    `${extractFrom('reload-url-cap:BEGIN', 'reload-url-cap:END', 'function reloadUrlCapDecision(')}\nreturn sameContractFramePath;`,
+  )();
+  const p = sameContractFramePath(
+    'http://n.test/v1/contract/web/k/page?x=1&_freload=1000-0&_fre%6Coad=2-1&y=2',
+    '#h',
+  );
+  check(
+    `a same-contract frame path drops _freload (${p})`,
+    !/_fre(load|%6Coad)/i.test(p),
+  );
+  check(
+    'a same-contract frame path keeps the app query, __sandbox=1 and the hash',
+    p === '/v1/contract/web/k/page?x=1&y=2&__sandbox=1#h',
+  );
+}
+
 if (failures > 0) {
   console.error(`\nshell-bridge-reload: ${failures} check(s) FAILED`);
   process.exit(1);

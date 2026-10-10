@@ -327,7 +327,8 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
 // — it was previously bounded only by fdev's 300s default, which is what made
 // this test hit nextest's cap when #5432 widened the node-side stall window),
 // the shell-readiness poll (up to 120s), and the Playwright suite (~90s for the
-// 16 specs in shell.spec.ts, plus the two node-free suites). An observed local
+// 16 specs in shell.spec.ts, plus every other suite under tests/playwright/tests,
+// connecting-recovery.spec.ts among them). An observed local
 // run finished in ~282s BEFORE that cap; it is well under that now. 600s gives
 // comfortable headroom without masking a genuine hang (the individual sub-steps
 // have their own tighter internal deadlines).

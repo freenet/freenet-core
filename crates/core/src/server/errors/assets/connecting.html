@@ -7,13 +7,16 @@
       yet rejoined to the ring. It can be rendered EITHER as a top-level document
       (a user hitting a contract URL directly) OR inside a webapp's sandboxed
       shell iframe (the app re-requesting its own content during the rejoin
-      window). A top-level instance should go to the dashboard at `/`; a FRAMED
-      instance must NOT — navigating an iframe to `/` yanks the running webapp to
-      the node root (which denies framing on hardened deployments -> "Refused to
-      display ... X-Frame-Options" -> broken tab). So the redirect is done in JS,
+      window). App URLs retry in place, including top-level shared links with no
+      recovery marker yet. Other unmarked top-level paths go to the dashboard
+      at `/`. A FRAMED instance must NOT — navigating an iframe to `/` yanks the
+      running webapp to the node root (which denies framing on hardened
+      deployments -> "Refused to display ... X-Frame-Options" -> broken tab).
+      So the redirect is done in JS,
       conditioned on whether we are the top document; a framed instance reloads
       its OWN url in place until the peer rejoins and the app loads normally. The
-      <noscript> meta is the no-JS fallback (top-level dashboard redirect only).
+      <noscript> meta is the no-JS fallback (top-level dashboard redirect only;
+      an app link cannot run without JS anyway).
     -->
     <noscript><meta http-equiv="refresh" content="3;url=/" /></noscript>
     <title>Connecting to Freenet</title>
@@ -67,7 +70,9 @@
     <script>
       // See the head comment. The redirect must be bounded and framing-aware:
       //
-      //  - A top-level ordinary connecting page (no `_freload`) -> dashboard `/`.
+      //  - An unmarked top-level app URL starts the same bounded recovery as a
+      //    framed page, preserving shared links while the peer joins the ring.
+      //  - Other top-level pages without `_freload` -> dashboard `/`.
       //  - A page carrying the shell's `_freload` recovery marker (set by
       //    shell_bridge.js's reload) is a recovery reload that momentarily landed
       //    here while the peer rejoins the ring. Navigating it to `/` would
@@ -82,21 +87,25 @@
       // connecting-recovery-decision:BEGIN — pure, extracted & unit-tested by
       // crates/core/src/server/connecting_recovery.test.mjs. Keep it pure (only
       // its params/locals) so the extraction works.
-      function connectingRecoveryDecision(search, atTop, now) {
+      function connectingRecoveryDecision(search, atTop, now, pathname) {
         var RECOVERY_MAX_MS = 120000; // 2 min: bound the retry-in-place loop
-        var m = /[?&]_freload=([^&]*)/.exec(search || '');
+        // Read the stamp as the shell's cap does (URLSearchParams: the name
+        // percent-decoded, `_fre%6Coad` is `_freload`), and without throwing
+        // on a malformed escape (`%E0%A4%A`), which decodeURIComponent did
+        // inside the retry timer, leaving the page on "Connecting" for good.
+        var val = new URLSearchParams(search || '').get('_freload');
         var recoveryStart = null;
-        if (m) {
-          var val = decodeURIComponent(m[1]);
+        if (val !== null) {
           var dash = val.indexOf('-');
           var ts = parseInt(dash >= 0 ? val.slice(0, dash) : val, 10);
           if (isFinite(ts)) recoveryStart = ts;
         }
         if (recoveryStart === null) {
-          // No recovery marker: ordinary connecting page. Top-level -> dashboard;
-          // framed -> stamp a start time so subsequent retries are wall-clock
-          // bounded (then retry in place).
-          return atTop ? { action: 'dashboard' } : { action: 'stamp' };
+          // Stamp app links and framed pages so retries are wall-clock bounded.
+          var isApp = /^\/v\d+\/contract\/web\//.test(pathname || ''); // every ApiVersion prefix (server.rs)
+          return atTop && !isApp
+            ? { action: 'dashboard' }
+            : { action: 'stamp' };
         }
         var elapsed = now - recoveryStart;
         if (elapsed >= 0 && elapsed < RECOVERY_MAX_MS) {
@@ -115,7 +124,12 @@
           // can't prove we're top-level, treat as framed (never navigate to `/`).
           atTop = false;
         }
-        var d = connectingRecoveryDecision(location.search, atTop, Date.now());
+        var d = connectingRecoveryDecision(
+          location.search,
+          atTop,
+          Date.now(),
+          location.pathname,
+        );
         if (d.action === 'dashboard') {
           window.location.replace('/');
         } else if (d.action === 'retry') {

@@ -513,6 +513,62 @@ function freenetBridge(authToken, userToken, hostedMode) {
     url.searchParams.set(PARAM, windowStart + '-' + (count + 1));
     return { allow: true, url: url.toString() };
   }
+
+  // Once this shell is served, the app link has answered and `_freload` has
+  // done its job — but it stays in the address bar, so a link a person copies
+  // from there carries it. Opened later, top-level, on a node still joining,
+  // connecting.html reads that old stamp as an expired recovery window and goes
+  // straight to the dashboard instead of retrying the link. So the shell drops
+  // it — but only when that cannot change reloadUrlCapDecision's answer: a
+  // count of 0 (connecting.html's own stamp, no recovery reload counted) at
+  // once; a live window (count >= 1) once it has expired, when the cap ignores
+  // it anyway. Returns null when there is nothing to drop, else { url, delay }:
+  // the URL without the param, and the ms to wait before dropping it. The
+  // delay is at most WINDOW_MS: a stamp further in the future (a hand-made
+  // link, or one written before a large backwards clock correction) is
+  // re-decided every WINDOW_MS instead, because a setTimeout delay past
+  // 2^31-1 ms fires at once and stripFreload would re-arm it without end.
+  // WINDOW_MS must equal reloadUrlCapDecision's; shell_bridge_reload.test.mjs
+  // asserts it, and sweeps that stripping never loosens the cap.
+  function freloadStripDecision(href, now) {
+    var PARAM = '_freload';
+    var WINDOW_MS = 60000;
+    var url;
+    try {
+      url = new URL(href);
+    } catch (e) {
+      return null;
+    }
+    var raw = url.searchParams.get(PARAM);
+    if (raw === null) return null;
+    url.searchParams.delete(PARAM);
+    var dash = raw.indexOf('-');
+    var ts = parseInt(dash >= 0 ? raw.slice(0, dash) : raw, 10);
+    var c = dash >= 0 ? parseInt(raw.slice(dash + 1), 10) : 0;
+    var delay = 0;
+    // A counted window is kept until it has expired. That includes a
+    // FUTURE-dated one: the cap resets it today, but once the clock reaches it
+    // the cap honours it, so dropping it early would hand out a fresh budget.
+    // Anything else (no count, a malformed stamp, an expired window) the cap
+    // already treats as fresh: dropped at once.
+    if (isFinite(ts) && isFinite(c) && c > 0 && ts + WINDOW_MS > now) {
+      delay = Math.min(ts + WINDOW_MS - now, WINDOW_MS);
+    }
+    return { url: url.toString(), delay: delay };
+  }
+
+  // The frame path for a SAME-CONTRACT navigation (the iframe's src, and
+  // history.state.iframePath, which Back/Forward restore): the link's path and
+  // query with the routing flag __sandbox=1, and without `_freload` — the
+  // shell's own top-level recovery stamp, never the app's (a stale one in the
+  // frame would make a later framed connecting page give up at once; see
+  // shell_page's filter). `hash` is the already-capped fragment.
+  function sameContractFramePath(href, hash) {
+    var u = new URL(href);
+    u.searchParams.set('__sandbox', '1');
+    u.searchParams.delete('_freload');
+    return u.pathname + u.search + hash;
+  }
   // reload-url-cap:END
 
   // Whether a WebSocket close should trigger recovery: ONLY the node's trusted
@@ -533,6 +589,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
     return code;
   }
   // close-recovery-decision:END
+
+  // Drop the recovery stamp from the address bar (see freloadStripDecision).
+  // Re-decided from the CURRENT URL when the timer fires, since the shell's
+  // hash forwarding may have replaced it meanwhile; history.state is kept.
+  function stripFreload() {
+    var d = freloadStripDecision(location.href, Date.now());
+    if (!d) return;
+    if (d.delay > 0) {
+      setTimeout(stripFreload, d.delay);
+      return;
+    }
+    try {
+      history.replaceState(history.state, '', d.url);
+    } catch (e) {
+      // An address bar we cannot rewrite keeps the stamp: the old behaviour.
+    }
+  }
+  stripFreload();
 
   // Re-fetch THIS shell HTML to mint a fresh auth token — the autonomous
   // recovery a manual refresh performs, now driven by the node's trusted 4401
@@ -1254,10 +1328,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
               } catch (e) {}
             });
             connections.clear();
-            // Build new sandbox URL preserving __sandbox=1
-            resolved.searchParams.set('__sandbox', '1');
-            var newIframePath =
-              resolved.pathname + resolved.search + cappedHash;
+            // Build new sandbox URL preserving __sandbox=1, without the
+            // recovery stamp (see sameContractFramePath).
+            var newIframePath = sameContractFramePath(
+              resolved.href,
+              cappedHash,
+            );
             iframe.src = newIframePath;
             // Push a history entry so back/forward navigate between
             // visited subpages, and update the address bar to the
