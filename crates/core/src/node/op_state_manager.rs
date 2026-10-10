@@ -338,8 +338,13 @@ pub(crate) struct OpManager {
     /// shutdown drain in `ShutdownHandle::shutdown` to wait for
     /// client-initiated work (most importantly PUTs from the
     /// `freenet-git` mirror) to finish before tearing down peer
-    /// connections. The drain is bounded by `config.shutdown_drain_secs`.
+    /// connections. The drain is bounded by `config.shutdown_drain_secs`
+    /// and by each op's drain deadline (`inflight_client_op_deadlines`).
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
+    /// Drain deadlines of the same drivers (admission + `OPERATION_TTL`,
+    /// pushed out by streaming progress), so the drain can stop waiting
+    /// for ones past theirs (#5838). See [`ClientOpDeadlines`].
+    pub(crate) inflight_client_op_deadlines: Arc<ClientOpDeadlines>,
     /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
     /// begins, so `start_client_{put,get,update,subscribe}` can fail
     /// fast with `OpError::NodeShuttingDown` instead of bumping the
@@ -398,6 +403,7 @@ impl Clone for OpManager {
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
             inflight_client_ops: self.inflight_client_ops.clone(),
+            inflight_client_op_deadlines: self.inflight_client_op_deadlines.clone(),
             shutting_down: self.shutting_down.clone(),
         }
     }
@@ -412,14 +418,104 @@ impl Clone for OpManager {
 /// a branch can't leak count.
 ///
 /// The shutdown drain in `ShutdownHandle::shutdown` reads the counter
-/// via [`OpManager::inflight_client_op_count`] and waits for it to
-/// reach zero before letting the node tear down.
+/// and waits for it to reach zero before letting the node tear down,
+/// or until every op still counted is past its drain deadline in
+/// [`ClientOpDeadlines`] (#5838).
 pub(crate) struct ClientOpGuard {
     counter: Arc<AtomicUsize>,
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
+}
+
+/// How long the shutdown drain may still wait for each in-flight
+/// client-originated driver, keyed by a monotonically increasing id.
+///
+/// Each op gets a drain deadline of admission time plus
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, the op
+/// is retrying, or still waiting on a peer that never answered, and the
+/// drain stops waiting for it. A driver in a phase that can legitimately
+/// take longer (a streaming PUT transfer, a GET stream assembly) pushes
+/// its deadline out with [`note_client_op_progress`] each time that
+/// phase makes progress. A summary-first PUT probe that never got a
+/// reply makes none: that is what held the #5838 stop (see #5839).
+///
+/// Issue #5838: a SIGTERM caught 14 River PUTs that were 68-119 s old,
+/// waiting on summary-first probes; the drain waited its full 30 s for
+/// them and 8 were still running when it gave up.
+///
+/// Locked when an op starts and ends, about once a second per streaming
+/// op while it streams, and once per 200 ms drain poll.
+#[derive(Default)]
+pub(crate) struct ClientOpDeadlines {
+    inner: Mutex<ClientOpDeadlinesInner>,
+}
+
+#[derive(Default)]
+struct ClientOpDeadlinesInner {
+    next_id: u64,
+    /// id -> drain deadline
+    ops: std::collections::HashMap<u64, tokio::time::Instant>,
+}
+
+/// Drain window for a client op whose driver does not set one:
+/// `OPERATION_TTL`, the attempt deadline of every non-streaming
+/// operation. The ops the drain exists for (a `freenet-git` mirror
+/// push caught by a release restart) are seconds old when the signal
+/// arrives.
+pub(crate) const DEFAULT_CLIENT_OP_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
+
+impl ClientOpDeadlines {
+    pub(crate) fn register(&self, window: std::time::Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut inner = self.inner.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.ops.insert(id, deadline);
+        id
+    }
+
+    /// Push op `id`'s drain deadline out to at least `window` from now.
+    /// Never pulls it in. Returns whether the op was found (production
+    /// ignores it: an op that has already finished needs nothing).
+    pub(crate) fn extend_from_now(&self, id: u64, window: std::time::Duration) -> bool {
+        let until = tokio::time::Instant::now() + window;
+        let mut inner = self.inner.lock();
+        let Some(deadline) = inner.ops.get_mut(&id) else {
+            return false;
+        };
+        if *deadline < until {
+            *deadline = until;
+        }
+        true
+    }
+
+    /// Set op `id`'s drain deadline to exactly `window` from now, for
+    /// the end of a phase whose longer window should not carry over.
+    /// `now + window` is never earlier than the admission deadline as
+    /// long as `window >= DEFAULT_CLIENT_OP_DRAIN_WINDOW`.
+    pub(crate) fn set_from_now(&self, id: u64, window: std::time::Duration) {
+        if let Some(deadline) = self.inner.lock().ops.get_mut(&id) {
+            *deadline = tokio::time::Instant::now() + window;
+        }
+    }
+
+    pub(crate) fn unregister(&self, id: u64) {
+        self.inner.lock().ops.remove(&id);
+    }
+
+    /// The latest drain deadline among in-flight ops, if any.
+    pub(crate) fn latest_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inner.lock().ops.values().copied().max()
+    }
 }
 
 impl ClientOpGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
+    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {
+        // Register BEFORE the counter bump: a drain that sees this op
+        // through the SeqCst counter load must also find its deadline,
+        // or it would treat the op as not worth waiting for. Pinned by
+        // `client_op_deadline_registered_while_counted`.
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
         // SeqCst, not Relaxed — the increment participates in a
         // two-atomic Dekker-style handshake with `shutting_down`
         // (see `OpManager::admit_client_op`). Under a relaxed model
@@ -428,8 +524,109 @@ impl ClientOpGuard {
         // Codex + skeptical r3 finding. The cost is negligible
         // (once per client request, not in a hot loop).
         counter.fetch_add(1, Ordering::SeqCst);
-        Self { counter }
+        Self {
+            counter,
+            deadlines,
+            id,
+        }
     }
+
+    /// Handle that lets this op's driver extend its own drain deadline
+    /// through [`note_client_op_progress`]. Install it with
+    /// [`with_client_op_drain`] around the driver future.
+    pub(crate) fn drain_handle(&self) -> ClientOpDrainHandle {
+        ClientOpDrainHandle {
+            deadlines: self.deadlines.clone(),
+            id: self.id,
+            last_noted: std::cell::Cell::new(None),
+        }
+    }
+}
+
+/// The in-flight client op whose driver is running on the current task,
+/// for [`note_client_op_progress`].
+#[derive(Clone)]
+pub(crate) struct ClientOpDrainHandle {
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
+    /// The deadline this task last set, so a stream's per-fragment
+    /// wakeups take the shared lock only when they move it by a second.
+    last_noted: std::cell::Cell<Option<tokio::time::Instant>>,
+}
+
+tokio::task_local! {
+    static CLIENT_OP_DRAIN: ClientOpDrainHandle;
+}
+
+/// Run a client-op driver with its drain handle installed, so phases
+/// deep in the driver can call [`note_client_op_progress`] without the
+/// handle being threaded through every signature.
+pub(crate) async fn with_client_op_drain<F: std::future::Future>(
+    handle: ClientOpDrainHandle,
+    driver: F,
+) -> F::Output {
+    CLIENT_OP_DRAIN.scope(handle, driver).await
+}
+
+/// Drain window for the tail of a client op after a streaming phase ends
+/// (finalize, deliver the result, a blocking subscribe): the same
+/// `OPERATION_TTL` a freshly admitted op gets (#5838).
+pub(crate) const CLIENT_OP_TAIL_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
+
+/// Minimum extra reach before a task takes the shared lock again, so a
+/// fast stream's per-fragment wakeups do not each take it.
+const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Called by a client-op driver when a long-running phase starts or makes
+/// progress: a streaming PUT attempt, a GET stream claim or assembly, or
+/// the reply or completion that ends one. These can legitimately outlast
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (#5838). `window` is that phase's
+/// own liveness rule: the timeout after which the phase itself would
+/// declare the stream dead (a phase end uses
+/// [`note_client_op_phase_end`] instead). The shutdown drain then keeps
+/// waiting for the op for at least `window` from now, so it never gives
+/// up on a phase sooner than the phase itself would, and stops waiting
+/// once the phase has gone quiet for that long.
+///
+/// A call that would move the deadline less than
+/// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] past the last one this task made
+/// is skipped; to cover that, every note reaches one spacing past
+/// `window`, so the deadline is always at least `now + window`.
+///
+/// A no-op outside a `with_client_op_drain` scope: relay drivers share
+/// the streaming code, and sub-op GETs (including the contract fetches a
+/// client UPDATE or SUBSCRIBE may wait on) run on their own spawned tasks.
+pub(crate) fn note_client_op_progress(window: std::time::Duration) {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        // Every note reaches one spacing further than asked, so a call the
+        // throttle skips (it would have moved the deadline by less than
+        // the spacing) never leaves the deadline short of `now + window`.
+        let reach = window + CLIENT_OP_PROGRESS_NOTE_SPACING;
+        let until = tokio::time::Instant::now() + reach;
+        if h.last_noted
+            .get()
+            .is_some_and(|last| until < last + CLIENT_OP_PROGRESS_NOTE_SPACING)
+        {
+            return;
+        }
+        h.last_noted.set(Some(until));
+        h.deadlines.extend_from_now(h.id, reach);
+    });
+}
+
+/// Called when a streaming phase ends (a PUT attempt's reply, ceiling or
+/// stall, a GET assembly's completion): sets the op's drain deadline to
+/// [`CLIENT_OP_TAIL_DRAIN_WINDOW`] from now, replacing the phase's longer
+/// window, so the tail (finalize, deliver, a blocking subscribe, or the
+/// retry a rejection leads to) gets exactly the window a fresh op gets
+/// (#5838). Never throttled. A no-op outside a client-op scope.
+pub(crate) fn note_client_op_phase_end() {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        h.last_noted.set(Some(
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        ));
+        h.deadlines.set_from_now(h.id, CLIENT_OP_TAIL_DRAIN_WINDOW);
+    });
 }
 
 impl Drop for ClientOpGuard {
@@ -440,6 +637,11 @@ impl Drop for ClientOpGuard {
         // late observation is an extra 200ms poll interval before
         // the drain notices counter==0.
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        // Unregister AFTER the decrement, so a counted op always has a
+        // deadline. The reverse order lets a drain poll see a counted
+        // op with no deadline and log that the remaining ops were
+        // abandoned when this one had in fact just finished.
+        self.deadlines.unregister(self.id);
     }
 }
 
@@ -631,6 +833,7 @@ impl OpManager {
             active_relay_subscribe_txs,
             active_relay_connect_txs,
             inflight_client_ops: Arc::new(AtomicUsize::new(0)),
+            inflight_client_op_deadlines: Arc::new(ClientOpDeadlines::default()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -721,7 +924,10 @@ impl OpManager {
     /// and counter bump are atomic. Kept module-private for the
     /// `admit_client_op` implementation.
     fn client_op_guard(&self) -> ClientOpGuard {
-        ClientOpGuard::new(self.inflight_client_ops.clone())
+        ClientOpGuard::new(
+            self.inflight_client_ops.clone(),
+            self.inflight_client_op_deadlines.clone(),
+        )
     }
 
     /// Atomically check the shutdown admission gate AND bump the
@@ -801,6 +1007,12 @@ impl OpManager {
     /// without holding an `Arc<OpManager>` across the drain wait.
     pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
         self.inflight_client_ops.clone()
+    }
+
+    /// Cloneable handle to the in-flight client ops' drain deadlines,
+    /// read by the shutdown drain alongside the counter (#5838).
+    pub(crate) fn inflight_client_op_deadlines_handle(&self) -> Arc<ClientOpDeadlines> {
+        self.inflight_client_op_deadlines.clone()
     }
 
     /// Set once by the executor pool; later calls are ignored.
@@ -5416,12 +5628,19 @@ mod tests {
     #[test]
     fn client_op_guard_decrements_on_panic() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpDeadlines::default());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ClientOpGuard::new(counter.clone());
+            let _guard = ClientOpGuard::new(counter.clone(), starts.clone());
             assert_eq!(counter.load(Ordering::Relaxed), 1);
+            assert!(starts.latest_deadline().is_some());
             panic!("simulated driver panic");
         }));
         assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            starts.latest_deadline().is_none(),
+            "ClientOpGuard::Drop must remove the op's drain deadline even on \
+             panic, or the drain keeps waiting for a dead driver"
+        );
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
@@ -5446,7 +5665,7 @@ mod tests {
         let op_state = include_str!("op_state_manager.rs");
         // Counter bump in ClientOpGuard::new.
         let new_body = op_state
-            .split("fn new(counter: Arc<AtomicUsize>) -> Self {")
+            .split("fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {")
             .nth(1)
             .and_then(|s| s.split("Self {").next())
             .expect("ClientOpGuard::new body must be findable");
@@ -5490,6 +5709,116 @@ mod tests {
         );
     }
 
+    /// `extend_from_now` only ever pushes a deadline out, and an unknown
+    /// (already finished) op is left alone.
+    #[tokio::test(start_paused = true)]
+    async fn client_op_deadline_extension_never_shortens() {
+        let deadlines = ClientOpDeadlines::default();
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
+        let initial = deadlines.latest_deadline().unwrap();
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(1)));
+        assert_eq!(deadlines.latest_deadline().unwrap(), initial);
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(600)));
+        let extended = deadlines.latest_deadline().unwrap();
+        assert!(extended > initial);
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(5)));
+        assert_eq!(deadlines.latest_deadline().unwrap(), extended);
+        assert!(!deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)));
+        deadlines.unregister(id);
+        assert!(deadlines.latest_deadline().is_none());
+    }
+
+    /// A phase end lands even right after a fragment note (it is never
+    /// throttled), and it REPLACES a longer phase window: the tail after
+    /// a 240 s streaming PUT window gets exactly the tail window.
+    #[tokio::test(start_paused = true)]
+    async fn phase_end_lands_after_a_fragment_note_and_replaces_a_longer_window() {
+        let deadlines = Arc::new(ClientOpDeadlines::default());
+        let guard = ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone());
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(5));
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+            "a phase end 100 ms after a fragment note must land and set the tail window"
+        );
+        // A longer phase window does not carry over into the tail.
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(240));
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        );
+    }
+
+    /// Source-grep pin (#5838): a counted client op must always have a
+    /// drain deadline. `ClientOpGuard::new` registers the deadline
+    /// before the SeqCst counter bump, and `Drop` decrements before
+    /// unregistering. Swapping either pair lets a drain see a counted op
+    /// with no deadline: on admission it would skip an op that just
+    /// started, and the drain tests (which drive real guards) only
+    /// exercise the intended order.
+    #[test]
+    fn client_op_deadline_registered_while_counted() {
+        // Production code only, so an anchor that moves cannot match this
+        // test's own string literals; method bodies end at their
+        // 4-space-indented closing brace.
+        let src = include_str!("op_state_manager.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("test module must be locatable")
+            .0;
+        let method_body = |sig: &str| -> &str {
+            let (_, after) = production
+                .split_once(sig)
+                .unwrap_or_else(|| panic!("{sig} not found in production code"));
+            after
+                .split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("end of {sig} not found"))
+                .0
+        };
+
+        let new_body = method_body(
+            "    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {",
+        );
+        let register = new_body
+            .find("deadlines.register(")
+            .expect("ClientOpGuard::new must register a drain deadline");
+        let bump = new_body
+            .find("counter.fetch_add(1, Ordering::SeqCst)")
+            .expect("ClientOpGuard::new must bump the counter");
+        assert!(
+            register < bump,
+            "ClientOpGuard::new must register the deadline BEFORE the counter bump"
+        );
+
+        let (_, after_impl) = production
+            .split_once("impl Drop for ClientOpGuard {")
+            .expect("impl Drop for ClientOpGuard not found in production code");
+        let drop_body = after_impl
+            .split_once("\n    }\n")
+            .expect("end of ClientOpGuard::drop not found")
+            .0;
+        let decrement = drop_body
+            .find("self.counter.fetch_sub(1,")
+            .expect("ClientOpGuard::drop must decrement the counter");
+        let unregister = drop_body
+            .find("self.deadlines.unregister(self.id)")
+            .expect("ClientOpGuard::drop must unregister the deadline");
+        assert!(
+            decrement < unregister,
+            "ClientOpGuard::drop must decrement BEFORE unregistering the deadline"
+        );
+    }
+
     /// Source-grep pin: `admit_client_op` must bump the counter
     /// BEFORE checking the gate. The reverse order (check-then-bump)
     /// re-opens the Codex r2 TOCTOU. The `admit_client_op_refuses_when_shutting_down`
@@ -5529,6 +5858,7 @@ mod tests {
     #[test]
     fn admit_client_op_refuses_when_shutting_down() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpDeadlines::default());
         let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
         // Build a minimal stand-in: just the two atomics — we test
         // `admit_client_op` against an `OpManager`-shaped struct by
@@ -5537,7 +5867,7 @@ mod tests {
         // is a 4-line function; pinning its semantic via a parallel
         // implementation is acceptable for a single-function gate.
         let admit = || -> Option<ClientOpGuard> {
-            let guard = ClientOpGuard::new(counter.clone());
+            let guard = ClientOpGuard::new(counter.clone(), starts.clone());
             if gate.load(Ordering::Relaxed) {
                 drop(guard);
                 return None;
@@ -5555,6 +5885,11 @@ mod tests {
             "the bump-then-check pattern must net-zero the counter \
              on rejection — otherwise the gate leaks bumped counts \
              that the drain then waits on indefinitely."
+        );
+        assert!(
+            starts.latest_deadline().is_none(),
+            "a refused admission must not leave a drain deadline behind, \
+             or the drain waits for an op that never ran"
         );
 
         // Open the gate; admit succeeds and bumps the counter.
@@ -5765,5 +6100,21 @@ mod tests {
              after load_hosting_cache so restored hosted contracts serve locally and \
              rejoin anti-entropy (#4780)",
         );
+    }
+}
+
+/// Test-only access to real `ClientOpGuard`s from outside `crate::node`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn deadlines() -> Arc<ClientOpDeadlines> {
+        Arc::new(ClientOpDeadlines::default())
+    }
+
+    pub(crate) const TAIL_WINDOW: std::time::Duration = CLIENT_OP_TAIL_DRAIN_WINDOW;
+
+    pub(crate) fn admit_test_client_op(deadlines: &Arc<ClientOpDeadlines>) -> ClientOpGuard {
+        ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone())
     }
 }

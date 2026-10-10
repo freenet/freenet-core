@@ -1868,11 +1868,22 @@ pub struct Config {
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
     ///
+    /// Each op is waited for only until its own drain deadline: 60 s
+    /// (`OPERATION_TTL`) after it was admitted, pushed out by streaming
+    /// activity to whatever that phase's own liveness rule allows (240 s
+    /// of silence for a streaming PUT attempt, a GET stream claim while it
+    /// is pending, about 6 s between a GET stream's fragments) and to 60 s after a
+    /// streaming phase ends. An op past that deadline is retrying,
+    /// stalled, or waiting on a peer that never answered, and is not
+    /// waited for (#5838). Client UPDATE and SUBSCRIBE ops have no
+    /// streaming phase and get the 60 s window only. Every wait is still
+    /// bounded by this setting.
+    ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
     /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
-    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// 45s in the generated unit (30s drain + 15s peer-teardown
     /// headroom) — raise both in lockstep if you raise this value;
     /// `TimeoutStopSec` is the hard ceiling at which systemd
     /// SIGKILLs the process.

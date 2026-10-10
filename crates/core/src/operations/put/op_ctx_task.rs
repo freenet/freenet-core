@@ -107,15 +107,21 @@ pub(crate) async fn start_client_put(
     };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
-        run_client_put(
-            op_manager,
-            client_tx,
-            contract,
-            related,
-            value,
-            htl,
-            subscribe,
-            blocking_subscribe,
+        // Lets the streaming phases extend this op's shutdown-drain
+        // deadline as they make progress (#5838, `note_client_op_progress`).
+        let drain = _inflight_guard.drain_handle();
+        crate::node::with_client_op_drain(
+            drain,
+            run_client_put(
+                op_manager,
+                client_tx,
+                contract,
+                related,
+                value,
+                htl,
+                subscribe,
+                blocking_subscribe,
+            ),
         )
         .await;
     });

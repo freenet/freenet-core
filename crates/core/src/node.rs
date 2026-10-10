@@ -87,6 +87,11 @@ pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_cou
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
+#[cfg(test)]
+pub(crate) use op_state_manager::test_support as op_state_manager_test_support;
+pub(crate) use op_state_manager::{
+    note_client_op_phase_end, note_client_op_progress, with_client_op_drain,
+};
 
 mod network_bridge;
 
@@ -124,6 +129,10 @@ pub struct ShutdownHandle {
     /// `shutdown` to wait for those tasks to finish before triggering
     /// the Disconnect.
     inflight_client_ops: Arc<std::sync::atomic::AtomicUsize>,
+    /// Drain deadlines of the same drivers. The drain stops waiting
+    /// once every op still in flight is past its deadline (#5838); see
+    /// [`op_state_manager::ClientOpDeadlines`].
+    inflight_client_op_deadlines: Arc<op_state_manager::ClientOpDeadlines>,
     /// Admission gate flipped by `shutdown` *before* the drain begins,
     /// so `start_client_*` can fail fast with `OpError::NodeShuttingDown`
     /// instead of slipping a new op into the post-drain race window.
@@ -150,7 +159,10 @@ impl ShutdownHandle {
     ///    cut off by the Disconnect. (Codex reviewer call-out
     ///    2026-05.)
     /// 2. **Drain**: wait up to `drain_timeout` for the in-flight
-    ///    client-op counter to reach zero. Without this wait, a
+    ///    client-op counter to reach zero, but no longer than the
+    ///    latest per-op drain deadline (#5838): an op admitted more
+    ///    than `OPERATION_TTL` ago that has made no recent streaming
+    ///    progress is not waited for. Without this wait, a
     ///    SIGTERM arriving mid-PUT (e.g. release-driven auto-update
     ///    on the nova gateway) drops the client's WebSocket
     ///    mid-operation. See the rationale on
@@ -192,9 +204,21 @@ impl ShutdownHandle {
         }
     }
 
-    /// Poll-loop the in-flight client-op counter until it hits zero or
+    /// Poll-loop the in-flight client-op counter until it hits zero,
+    /// every op still in flight is past its drain deadline, or
     /// `drain_timeout` expires. Cap each individual sleep at 200ms so
     /// the drain can react promptly when the counter clears.
+    ///
+    /// The deadline cut (#5838): an op's drain deadline is its admission
+    /// time plus `OPERATION_TTL`, pushed out by each sign of activity in a
+    /// streaming PUT attempt or GET stream claim or assembly, by that
+    /// phase's own liveness window (`note_client_op_progress`). Past it,
+    /// the op is retrying, stalled,
+    /// or still waiting on a peer that never answered (such as an
+    /// unanswered summary-first probe, #5839), so holding the shutdown
+    /// for it mostly buys a 30 s stop. On the `framework` test peer a
+    /// SIGTERM caught 14 River PUTs that were all 68-119 s old; the drain
+    /// ran its full 30 s and 8 were still unfinished.
     ///
     /// Counter loads use `SeqCst` so they synchronize with
     /// `ClientOpGuard::new`'s `fetch_add(SeqCst)` — without this, the
@@ -209,6 +233,14 @@ impl ShutdownHandle {
         }
         let initial = self.inflight_client_ops.load(Ordering::SeqCst);
         if initial == 0 {
+            return;
+        }
+        if !self.has_drainable_client_op() {
+            tracing::info!(
+                initial,
+                "Shutdown drain skipped: every in-flight client op is past its drain \
+                 deadline (admitted over OPERATION_TTL ago, no recent streaming progress)"
+            );
             return;
         }
         tracing::info!(
@@ -234,7 +266,12 @@ impl ShutdownHandle {
                 // let the poll see a stale 0 even after a racing
                 // bump, missing a late-arrived op.
                 if self.inflight_client_ops.load(Ordering::SeqCst) == 0 {
-                    return;
+                    return true;
+                }
+                if !self.has_drainable_client_op() {
+                    // The last op may have finished between the two
+                    // checks; report that rather than an abandonment.
+                    return self.inflight_client_ops.load(Ordering::SeqCst) == 0;
                 }
                 tick.tick().await;
             }
@@ -245,7 +282,15 @@ impl ShutdownHandle {
         // fine, this doesn't gate any further action.
         let remaining = self.inflight_client_ops.load(Ordering::Relaxed);
         match drained {
-            Ok(()) => tracing::info!(initial, "Shutdown drain complete (all client ops finished)"),
+            Ok(true) => {
+                tracing::info!(initial, "Shutdown drain complete (all client ops finished)")
+            }
+            Ok(false) => tracing::info!(
+                initial,
+                remaining,
+                "Shutdown drain complete: the client ops still in flight are all past their \
+                 drain deadline (admitted over OPERATION_TTL ago, no recent streaming progress)"
+            ),
             Err(_) => tracing::warn!(
                 initial,
                 remaining,
@@ -253,6 +298,14 @@ impl ShutdownHandle {
                 "Shutdown drain timed out; proceeding with disconnect"
             ),
         }
+    }
+
+    /// Whether any in-flight client op is still within its drain
+    /// deadline, i.e. worth holding the shutdown for.
+    fn has_drainable_client_op(&self) -> bool {
+        self.inflight_client_op_deadlines
+            .latest_deadline()
+            .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
     }
 }
 
@@ -907,6 +960,9 @@ impl NodeConfig {
         let shutdown_handle = ShutdownHandle {
             tx: shutdown_tx,
             inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
+            inflight_client_op_deadlines: node_inner
+                .op_manager
+                .inflight_client_op_deadlines_handle(),
             shutting_down: node_inner.op_manager.shutting_down_handle(),
             drain_timeout,
         };
@@ -10063,14 +10119,384 @@ mod tests {
         ) {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let counter = Arc::new(AtomicUsize::new(initial_count));
+            // Every simulated op is admitted now, so it is within its
+            // drain window for the whole (sub-second) test.
+            let deadlines = Arc::new(op_state_manager::ClientOpDeadlines::default());
+            for _ in 0..initial_count {
+                deadlines.register(op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW);
+            }
             let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let handle = ShutdownHandle {
                 tx,
                 inflight_client_ops: counter.clone(),
+                inflight_client_op_deadlines: deadlines,
                 shutting_down: gate.clone(),
                 drain_timeout,
             };
             (handle, counter, gate, rx)
+        }
+
+        /// A ShutdownHandle plus the counter and deadline registry it
+        /// reads, so tests can admit real `ClientOpGuard`s and control
+        /// each op's age with the paused tokio clock.
+        fn make_handle_with_deadlines(
+            drain_timeout: Duration,
+        ) -> (
+            ShutdownHandle,
+            Arc<AtomicUsize>,
+            Arc<op_state_manager::ClientOpDeadlines>,
+            tokio::sync::mpsc::Receiver<NodeEvent>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let counter = Arc::new(AtomicUsize::new(0));
+            let deadlines = Arc::new(op_state_manager::ClientOpDeadlines::default());
+            let handle = ShutdownHandle {
+                tx,
+                inflight_client_ops: counter.clone(),
+                inflight_client_op_deadlines: deadlines.clone(),
+                shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                drain_timeout,
+            };
+            (handle, counter, deadlines, rx)
+        }
+
+        /// A streaming PUT attempt's liveness window, the longest phase
+        /// window drivers pass to `note_client_op_progress`.
+        const PUT_STREAM_WINDOW: Duration =
+            crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
+
+        fn admit(
+            counter: &Arc<AtomicUsize>,
+            deadlines: &Arc<op_state_manager::ClientOpDeadlines>,
+        ) -> op_state_manager::ClientOpGuard {
+            op_state_manager::ClientOpGuard::new(counter.clone(), deadlines.clone())
+        }
+
+        /// Regression for #5838. A SIGTERM on the `framework` test peer
+        /// found 14 River PUTs in flight, all 68-119 s old and stuck in
+        /// summary-first probes; the drain waited its full 30 s and 8
+        /// were still running. Ops past their drain deadline must not
+        /// hold the shutdown.
+        #[tokio::test(start_paused = true)]
+        async fn drain_does_not_wait_for_ops_past_their_deadline() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let stuck: Vec<_> = (0..14).map(|_| admit(&counter, &deadlines)).collect();
+            tokio::time::advance(
+                op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW + Duration::from_secs(8),
+            )
+            .await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "every in-flight op is past its deadline, so shutdown must not \
+                 wait the 30 s drain for them (waited {elapsed:?})"
+            );
+            assert_eq!(counter.load(Ordering::SeqCst), 14);
+            drop(stuck);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// An op that is fresh at SIGTERM is waited for only until its
+        /// deadline, not for the whole drain window.
+        #[tokio::test(start_paused = true)]
+        async fn drain_stops_when_last_op_reaches_its_deadline() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let _stuck = admit(&counter, &deadlines);
+            let into_life =
+                op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW - Duration::from_secs(10);
+            tokio::time::advance(into_life).await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(11),
+                "the drain must wait for the op until its deadline (10 s from \
+                 now) and no longer; waited {elapsed:?}"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Ops past their deadline do not cut the drain short while a
+        /// fresh op is still running: the drain waits for the fresh one
+        /// to finish, then stops without waiting for the old ones.
+        #[tokio::test(start_paused = true)]
+        async fn drain_waits_for_fresh_op_but_not_ones_past_deadline() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let _stuck = admit(&counter, &deadlines);
+            tokio::time::advance(
+                op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW + Duration::from_secs(5),
+            )
+            .await;
+            let fresh = admit(&counter, &deadlines);
+            let finisher = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                drop(fresh);
+            });
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            finisher.await.expect("finisher must not panic");
+            assert!(
+                elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(5),
+                "the drain must wait for the fresh op (4 s) and then stop \
+                 without waiting for the old one; waited {elapsed:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "the old op is still in flight"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// A streaming transfer can legitimately outlast `OPERATION_TTL`.
+        /// While it keeps making progress, the drain keeps waiting for it,
+        /// even at 90 s old: the `freenet-git` mirror push the drain was
+        /// built for (#4291).
+        #[tokio::test(start_paused = true)]
+        async fn drain_waits_for_old_op_while_it_makes_progress() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let streaming = admit(&counter, &deadlines);
+            tokio::time::advance(Duration::from_secs(90)).await;
+            let drain = streaming.drain_handle();
+            let transfer =
+                tokio::spawn(op_state_manager::with_client_op_drain(drain, async move {
+                    // A fragment every 4 s, done after 12 s.
+                    for _ in 0..3 {
+                        op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                    drop(streaming);
+                }));
+            // Let the transfer note its first fragment before the signal.
+            tokio::task::yield_now().await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            transfer.await.expect("transfer task must not panic");
+            assert!(
+                elapsed >= Duration::from_secs(12) && elapsed < Duration::from_secs(13),
+                "an op making progress must be waited for until it finishes; \
+                 waited {elapsed:?}"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// A stream with no activity for a progress window ages out of the
+        /// drain, even though the op is still in flight: here the last
+        /// fragment was 5 s short of a window ago, so the drain stops after
+        /// 5 s rather than at `drain_timeout`.
+        #[tokio::test(start_paused = true)]
+        async fn drain_stops_waiting_for_a_stalled_stream() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let stalled = admit(&counter, &deadlines);
+            tokio::time::advance(Duration::from_secs(90)).await;
+            op_state_manager::with_client_op_drain(stalled.drain_handle(), async {
+                op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
+            })
+            .await;
+            tokio::time::advance(PUT_STREAM_WINDOW - Duration::from_secs(5)).await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            // One progress window plus the 1 s throttle slack every note
+            // carries, after the last fragment.
+            assert!(
+                elapsed >= Duration::from_secs(6) && elapsed < Duration::from_secs(7),
+                "the drain must stop one progress window (plus the note's 1 s \
+                 slack) after the last fragment; waited {elapsed:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "the stalled op is still in flight"
+            );
+            drop(stalled);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Progress reaches only the op whose driver installed the scope,
+        /// and outside any scope (relay drivers share the streaming code)
+        /// it does nothing and does not panic.
+        #[tokio::test(start_paused = true)]
+        async fn progress_only_touches_the_scoped_op() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let other = admit(&counter, &deadlines);
+            let scoped = admit(&counter, &deadlines);
+            tokio::time::advance(
+                op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW + Duration::from_secs(1),
+            )
+            .await;
+            // Unscoped: a no-op, so `other` stays past its deadline.
+            op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
+            op_state_manager::with_client_op_drain(scoped.drain_handle(), async {
+                op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
+            })
+            .await;
+
+            // `scoped` just made progress, so the drain waits; it finishes
+            // after 3 s and the drain must then stop at once.
+            let finisher = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drop(scoped);
+            });
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            finisher.await.expect("finisher must not panic");
+            assert!(
+                elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+                "the drain must wait only for the op that made progress; \
+                 waited {elapsed:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "`other` is still in flight"
+            );
+            drop(other);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Progress never lets the drain run past `drain_timeout`, the
+        /// bound systemd's `TimeoutStopSec` is sized against.
+        #[tokio::test(start_paused = true)]
+        async fn progressing_op_is_still_bounded_by_drain_timeout() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let streaming = admit(&counter, &deadlines);
+            let drain = streaming.drain_handle();
+            let transfer = tokio::spawn(op_state_manager::with_client_op_drain(drain, async {
+                loop {
+                    op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }));
+            tokio::task::yield_now().await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31),
+                "the drain must stop at drain_timeout (30 s); waited {elapsed:?}"
+            );
+            transfer.abort();
+            drop(streaming);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Source pin (#5838): progress only helps if the streaming phases
+        /// note it and the client drivers run inside a drain scope.
+        /// Without the scope the note is a silent no-op,
+        /// and a healthy streaming PUT older than `OPERATION_TTL` would
+        /// be cut off at shutdown (the #4291 mirror-push failure).
+        #[test]
+        fn streaming_phases_extend_the_client_op_drain() {
+            // A live (non-comment) call, so commenting it out goes red.
+            fn calls(code: &str, needle: &str) -> bool {
+                code.lines()
+                    .any(|l| l.contains(needle) && !l.trim_start().starts_with("//"))
+            }
+            // Production code only (an anchor that moves must not match a
+            // test module's string literals), and free-function bodies end
+            // at their column-0 closing brace.
+            fn production(src: &'static str) -> &'static str {
+                src.split_once("\n#[cfg(test)]\nmod ")
+                    .expect("test module must be locatable")
+                    .0
+            }
+            fn fn_body(src: &'static str, sig: &str) -> &'static str {
+                let (_, after) = production(src)
+                    .split_once(sig)
+                    .unwrap_or_else(|| panic!("{sig} not found in production code"));
+                after
+                    .split_once("\n}\n")
+                    .unwrap_or_else(|| panic!("end of {sig} not found"))
+                    .0
+            }
+            let get = include_str!("operations/get/op_ctx_task.rs");
+            for (what, src, sig) in [
+                (
+                    "the streaming PUT attempt",
+                    include_str!("operations/op_ctx.rs"),
+                    "\nasync fn await_streaming_attempt(",
+                ),
+                (
+                    "GET stream assembly",
+                    get,
+                    "\nasync fn assemble_noting_progress<",
+                ),
+            ] {
+                assert!(
+                    calls(fn_body(src, sig), "note_client_op_progress("),
+                    "{what} must note client-op progress"
+                );
+            }
+            assert!(
+                calls(
+                    fn_body(get, "\nasync fn assemble_and_cache_stream("),
+                    "assemble_noting_progress(handle.assemble()"
+                ),
+                "GET stream assembly must go through assemble_noting_progress"
+            );
+            let assemble_and_cache = fn_body(get, "\nasync fn assemble_and_cache_stream(");
+            assert!(
+                calls(
+                    assemble_and_cache,
+                    "let handle = match claim_noting_progress("
+                ),
+                "the GET stream claim must go through claim_noting_progress"
+            );
+
+            for (name, src, start) in [
+                (
+                    "put",
+                    include_str!("operations/put/op_ctx_task.rs"),
+                    "\npub(crate) async fn start_client_put(",
+                ),
+                ("get", get, "\npub(crate) async fn start_client_get("),
+            ] {
+                let body = fn_body(src, start);
+                assert!(
+                    calls(body, "with_client_op_drain("),
+                    "start_client_{name} must run its driver inside with_client_op_drain"
+                );
+            }
         }
 
         #[tokio::test]
