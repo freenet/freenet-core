@@ -89,7 +89,7 @@ use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
 #[cfg(test)]
 pub(crate) use op_state_manager::test_support as op_state_manager_test_support;
-pub(crate) use op_state_manager::{extend_client_op_drain, with_client_op_drain};
+pub(crate) use op_state_manager::{note_client_op_progress, with_client_op_drain};
 
 mod network_bridge;
 
@@ -158,8 +158,9 @@ impl ShutdownHandle {
     ///    2026-05.)
     /// 2. **Drain**: wait up to `drain_timeout` for the in-flight
     ///    client-op counter to reach zero, but no longer than the
-    ///    latest per-op drain deadline (#5838): an op past its first
-    ///    attempt deadline is not waited for. Without this wait, a
+    ///    latest per-op drain deadline (#5838): an op admitted more
+    ///    than `OPERATION_TTL` ago that has made no recent streaming
+    ///    progress is not waited for. Without this wait, a
     ///    SIGTERM arriving mid-PUT (e.g. release-driven auto-update
     ///    on the nova gateway) drops the client's WebSocket
     ///    mid-operation. See the rationale on
@@ -207,13 +208,14 @@ impl ShutdownHandle {
     /// the drain can react promptly when the counter clears.
     ///
     /// The deadline cut (#5838): an op's drain deadline is its admission
-    /// time plus `OPERATION_TTL`, pushed out for as long as it is in a
-    /// streaming PUT transfer or a GET stream assembly. Past it, the op
-    /// is retrying, or still waiting on a peer that never answered (such
-    /// as an unanswered summary-first probe, #5839), so holding the
-    /// shutdown for it mostly buys a 30 s stop. On framework a SIGTERM caught 14 River PUTs
-    /// that were all 68-119 s old; the drain ran its full 30 s and 8
-    /// were still unfinished.
+    /// time plus `OPERATION_TTL`, pushed out to 15 s past each sign of
+    /// progress in a streaming PUT transfer or GET stream assembly
+    /// (`note_client_op_progress`). Past it, the op is retrying, stalled,
+    /// or still waiting on a peer that never answered (such as an
+    /// unanswered summary-first probe, #5839), so holding the shutdown
+    /// for it mostly buys a 30 s stop. On the `framework` test peer a
+    /// SIGTERM caught 14 River PUTs that were all 68-119 s old; the drain
+    /// ran its full 30 s and 8 were still unfinished.
     ///
     /// Counter loads use `SeqCst` so they synchronize with
     /// `ClientOpGuard::new`'s `fetch_add(SeqCst)` — without this, the
@@ -233,8 +235,8 @@ impl ShutdownHandle {
         if !self.has_drainable_client_op() {
             tracing::info!(
                 initial,
-                "Shutdown drain skipped: every in-flight client op is past its first \
-                 attempt deadline, so none is waited for"
+                "Shutdown drain skipped: every in-flight client op is past its drain \
+                 deadline (admitted over OPERATION_TTL ago, no recent streaming progress)"
             );
             return;
         }
@@ -284,7 +286,7 @@ impl ShutdownHandle {
                 initial,
                 remaining,
                 "Shutdown drain complete: the client ops still in flight are all past their \
-                 first attempt deadline, so they are not waited for"
+                 drain deadline (admitted over OPERATION_TTL ago, no recent streaming progress)"
             ),
             Err(_) => tracing::warn!(
                 initial,
@@ -10162,10 +10164,11 @@ mod tests {
             op_state_manager::ClientOpGuard::new(counter.clone(), deadlines.clone())
         }
 
-        /// Regression for #5838. A SIGTERM on framework found 14 River
-        /// PUTs in flight, all 68-119 s old and retrying; the drain
-        /// waited its full 30 s and 8 were still running. Ops past their
-        /// first attempt deadline must not hold the shutdown.
+        /// Regression for #5838. A SIGTERM on the `framework` test peer
+        /// found 14 River PUTs in flight, all 68-119 s old and stuck in
+        /// summary-first probes; the drain waited its full 30 s and 8
+        /// were still running. Ops past their drain deadline must not
+        /// hold the shutdown.
         #[tokio::test(start_paused = true)]
         async fn drain_does_not_wait_for_ops_past_their_deadline() {
             let (handle, counter, deadlines, mut rx) =
@@ -10255,40 +10258,37 @@ mod tests {
             ));
         }
 
-        /// A streaming transfer can legitimately outlast `OPERATION_TTL`
-        /// while making progress. Once the driver extends its deadline at
-        /// the start of the transfer, the op is still waited for at 90 s
-        /// old, up to `drain_timeout`: the `freenet-git` mirror push the
-        /// drain was built for (#4291).
+        /// A streaming transfer can legitimately outlast `OPERATION_TTL`.
+        /// While it keeps making progress, the drain keeps waiting for it,
+        /// even at 90 s old: the `freenet-git` mirror push the drain was
+        /// built for (#4291).
         #[tokio::test(start_paused = true)]
-        async fn drain_waits_for_streaming_op_within_its_longer_window() {
+        async fn drain_waits_for_old_op_while_it_makes_progress() {
             let (handle, counter, deadlines, mut rx) =
                 make_handle_with_deadlines(Duration::from_secs(30));
             let streaming = admit(&counter, &deadlines);
-            // In its summary-first probe for 50 s, then the transfer starts.
-            tokio::time::advance(Duration::from_secs(50)).await;
+            tokio::time::advance(Duration::from_secs(90)).await;
+            let drain = streaming.drain_handle();
             let transfer =
-                op_state_manager::with_client_op_drain(streaming.drain_handle(), async {
-                    op_state_manager::extend_client_op_drain(
-                        crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
-                    )
-                })
-                .await;
-            tokio::time::advance(Duration::from_secs(40)).await;
-            let finisher = tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(12)).await;
-                drop(transfer);
-                drop(streaming);
-            });
+                tokio::spawn(op_state_manager::with_client_op_drain(drain, async move {
+                    // A fragment every 4 s, done after 12 s.
+                    for _ in 0..3 {
+                        op_state_manager::note_client_op_progress();
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                    drop(streaming);
+                }));
+            // Let the transfer note its first fragment before the signal.
+            tokio::task::yield_now().await;
 
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
             let elapsed = start.elapsed();
-            finisher.await.expect("finisher must not panic");
+            transfer.await.expect("transfer task must not panic");
             assert!(
                 elapsed >= Duration::from_secs(12) && elapsed < Duration::from_secs(13),
-                "a streaming op inside its own window must be waited for until \
-                 it finishes; waited {elapsed:?}"
+                "an op making progress must be waited for until it finishes; \
+                 waited {elapsed:?}"
             );
             assert!(matches!(
                 rx.recv().await.expect("Disconnect must be sent"),
@@ -10296,32 +10296,65 @@ mod tests {
             ));
         }
 
-        /// `extend_client_op_drain` reaches only the op whose driver
-        /// installed the scope, and outside any scope (relay drivers share
-        /// the streaming attempt code) it does nothing and does not panic.
+        /// A stream that stops making progress ages out of the drain one
+        /// progress window after its last fragment, well before
+        /// `drain_timeout`, even though the op is still in flight.
         #[tokio::test(start_paused = true)]
-        async fn extend_client_op_drain_only_touches_the_scoped_op() {
+        async fn drain_stops_waiting_for_a_stalled_stream() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let stalled = admit(&counter, &deadlines);
+            tokio::time::advance(Duration::from_secs(90)).await;
+            op_state_manager::with_client_op_drain(stalled.drain_handle(), async {
+                op_state_manager::note_client_op_progress();
+            })
+            .await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            let window = op_state_manager::CLIENT_OP_PROGRESS_DRAIN_WINDOW;
+            assert!(
+                elapsed >= window && elapsed < window + Duration::from_secs(1),
+                "the drain must stop one progress window after the last \
+                 fragment; waited {elapsed:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "the stalled op is still in flight"
+            );
+            drop(stalled);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Progress reaches only the op whose driver installed the scope,
+        /// and outside any scope (relay drivers share the streaming code)
+        /// it does nothing and does not panic.
+        #[tokio::test(start_paused = true)]
+        async fn progress_only_touches_the_scoped_op() {
             let (handle, counter, deadlines, mut rx) =
                 make_handle_with_deadlines(Duration::from_secs(30));
             let other = admit(&counter, &deadlines);
-            // Unscoped: a no-op.
-            let _unscoped = op_state_manager::extend_client_op_drain(Duration::from_secs(600));
             let scoped = admit(&counter, &deadlines);
-            let extension = op_state_manager::with_client_op_drain(scoped.drain_handle(), async {
-                op_state_manager::extend_client_op_drain(Duration::from_secs(600))
-            })
-            .await;
             tokio::time::advance(
                 op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW + Duration::from_secs(1),
             )
             .await;
+            // Unscoped: a no-op, so `other` stays past its deadline.
+            op_state_manager::note_client_op_progress();
+            op_state_manager::with_client_op_drain(scoped.drain_handle(), async {
+                op_state_manager::note_client_op_progress();
+            })
+            .await;
 
-            // `scoped` is extended, so the drain waits; it finishes after
-            // 3 s and the drain must then stop at once, because `other`
-            // was never extended and is past its deadline.
+            // `scoped` just made progress, so the drain waits; it finishes
+            // after 3 s and the drain must then stop at once.
             let finisher = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                drop(extension);
                 drop(scoped);
             });
             let start = tokio::time::Instant::now();
@@ -10330,7 +10363,7 @@ mod tests {
             finisher.await.expect("finisher must not panic");
             assert!(
                 elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
-                "the drain must wait only for the scoped (extended) op; \
+                "the drain must wait only for the op that made progress; \
                  waited {elapsed:?}"
             );
             assert_eq!(
@@ -10345,19 +10378,21 @@ mod tests {
             ));
         }
 
-        /// An extended deadline never lets the drain run past
-        /// `drain_timeout`, the bound systemd's `TimeoutStopSec` is sized
-        /// against.
+        /// Progress never lets the drain run past `drain_timeout`, the
+        /// bound systemd's `TimeoutStopSec` is sized against.
         #[tokio::test(start_paused = true)]
-        async fn extended_op_is_still_bounded_by_drain_timeout() {
+        async fn progressing_op_is_still_bounded_by_drain_timeout() {
             let (handle, counter, deadlines, mut rx) =
                 make_handle_with_deadlines(Duration::from_secs(30));
             let streaming = admit(&counter, &deadlines);
-            let _transfer =
-                op_state_manager::with_client_op_drain(streaming.drain_handle(), async {
-                    op_state_manager::extend_client_op_drain(Duration::from_secs(600))
-                })
-                .await;
+            let drain = streaming.drain_handle();
+            let transfer = tokio::spawn(op_state_manager::with_client_op_drain(drain, async {
+                loop {
+                    op_state_manager::note_client_op_progress();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }));
+            tokio::task::yield_now().await;
 
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
@@ -10366,6 +10401,7 @@ mod tests {
                 elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31),
                 "the drain must stop at drain_timeout (30 s); waited {elapsed:?}"
             );
+            transfer.abort();
             drop(streaming);
             assert!(matches!(
                 rx.recv().await.expect("Disconnect must be sent"),
@@ -10373,9 +10409,9 @@ mod tests {
             ));
         }
 
-        /// Source pin (#5838): the deadline extension only helps if the
-        /// streaming phases call it and the client drivers run inside a
-        /// drain scope. Without the scope the extend is a silent no-op,
+        /// Source pin (#5838): progress only helps if the streaming phases
+        /// note it and the client drivers run inside a drain scope.
+        /// Without the scope the note is a silent no-op,
         /// and a healthy streaming PUT older than `OPERATION_TTL` would
         /// be cut off at shutdown (the #4291 mirror-push failure).
         #[test]
@@ -10402,6 +10438,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("end of {sig} not found"))
                     .0
             }
+            let get = include_str!("operations/get/op_ctx_task.rs");
             for (what, src, sig) in [
                 (
                     "the streaming PUT attempt",
@@ -10410,17 +10447,22 @@ mod tests {
                 ),
                 (
                     "GET stream assembly",
-                    include_str!("operations/get/op_ctx_task.rs"),
-                    "\nasync fn assemble_and_cache_stream(",
+                    get,
+                    "\nasync fn assemble_noting_progress<",
                 ),
             ] {
                 assert!(
-                    calls(fn_body(src, sig), "let _drain_extension =")
-                        && calls(fn_body(src, sig), "extend_client_op_drain("),
-                    "{what} must hold a client-op drain extension for its duration"
+                    calls(fn_body(src, sig), "note_client_op_progress("),
+                    "{what} must note client-op progress"
                 );
             }
-            let get = include_str!("operations/get/op_ctx_task.rs");
+            assert!(
+                calls(
+                    fn_body(get, "\nasync fn assemble_and_cache_stream("),
+                    "assemble_noting_progress(handle.assemble()"
+                ),
+                "GET stream assembly must go through assemble_noting_progress"
+            );
 
             for (name, src, start) in [
                 (

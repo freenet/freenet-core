@@ -1869,10 +1869,12 @@ pub struct Config {
     /// finish before tearing down peer connections.
     ///
     /// Each op is waited for only until its own drain deadline: 60 s
-    /// (`OPERATION_TTL`) after it was admitted, pushed out when it
-    /// starts a streaming transfer or a GET stream assembly. An op past
-    /// that deadline is retrying or waiting on a peer that never
-    /// answered, and is not waited for (#5838).
+    /// (`OPERATION_TTL`) after it was admitted, or 15 s after its last
+    /// sign of progress in a streaming PUT transfer or GET stream
+    /// assembly, whichever is later. An op past that deadline is
+    /// retrying, stalled, or waiting on a peer that never answered, and
+    /// is not waited for (#5838). Client UPDATE and SUBSCRIBE ops have
+    /// no streaming phase and get the 60 s window only.
     ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which

@@ -669,13 +669,6 @@ async fn await_streaming_attempt(
     use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
-    // A streaming transfer may legitimately run past the default
-    // shutdown-drain window while it makes progress; keep a client op's
-    // drain waiting for it, up to this attempt's hard ceiling, for as
-    // long as the attempt runs (#5838). The inactivity timeout below
-    // still ends a stalled transfer.
-    let _drain_extension = crate::node::extend_client_op_drain(STREAMING_ATTEMPT_TIMEOUT_CAP);
-
     let handle = progress.handle();
     // NOTE: deliberately NOT resetting the progress clock here, though
     // `StreamProgress` is built once per OPERATION and cloned per attempt so a
@@ -704,11 +697,22 @@ async fn await_streaming_attempt(
 
         tokio::select! {
             // Arm 1: terminal reply (unchanged semantics).
-            reply = &mut round_trip => return Ok(reply),
+            reply = &mut round_trip => {
+                // The transfer ended with a reply: give the op's short tail
+                // (finalize, deliver the result) its drain window (#5838).
+                crate::node::note_client_op_progress();
+                return Ok(reply);
+            }
             // Arm 3: hard ceiling.
             _ = &mut ceiling => return Err(TimeoutCause::StreamCeiling),
             // Arm 2: a fragment landed — reset the inactivity window.
-            _ = handle.notified() => continue,
+            _ = handle.notified() => {
+                // A fragment moved: a live transfer keeps a client op's
+                // shutdown drain waiting for it, a stalled one ages out
+                // (#5838).
+                crate::node::note_client_op_progress();
+                continue;
+            }
             // Arm 2: inactivity window elapsed with no Notify ping. Before
             // declaring a stall, re-read the atomic: a fragment that landed in
             // the Notify race window (notify_one permit consumed elsewhere, or
@@ -2368,60 +2372,62 @@ mod tests {
         producer.await.expect("producer task panicked");
     }
 
-    /// #5838: a streaming attempt run by a client-op driver must push that
-    /// op's shutdown-drain deadline out to the attempt's hard ceiling, or
-    /// a healthy transfer older than `OPERATION_TTL` is abandoned at
-    /// SIGTERM. Drives the real `await_streaming_attempt` inside the real
-    /// `with_client_op_drain` scope, so a broken scope (whose extend would
-    /// be a silent no-op) fails here.
+    /// #5838: each fragment of a streaming attempt run by a client-op
+    /// driver, and its final reply, must push that op's shutdown-drain
+    /// deadline out by the progress window, or a healthy transfer older
+    /// than `OPERATION_TTL` is abandoned at SIGTERM. Drives the real
+    /// `await_streaming_attempt` inside the real `with_client_op_drain`
+    /// scope, so a broken scope (whose note is a silent no-op) fails here.
     #[tokio::test(start_paused = true)]
-    async fn streaming_attempt_extends_client_op_drain_deadline() {
+    async fn streaming_attempt_notes_client_op_progress() {
+        use crate::node::op_state_manager_test_support::PROGRESS_WINDOW;
         use crate::node::op_state_manager_test_support::{admit_test_client_op, deadlines};
-        use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
 
-        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
         let registry = deadlines();
         let guard = admit_test_client_op(&registry);
-        let before = registry.latest_deadline().expect("op is registered");
+        // An old op: its admission deadline is long past.
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let stale = registry.latest_deadline().expect("op is registered");
+        assert!(stale < tokio::time::Instant::now());
 
-        let peer = tokio::spawn(async move {
-            let (reply_sender, _outbound, _target) =
-                rx.recv().await.expect("outbound msg should be delivered");
-            // Reply only after the observer below has sampled the deadline.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            reply_sender
-                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
-                .expect("reply channel accepts the reply");
-        });
-        let started = tokio::time::Instant::now();
         let during = std::sync::Arc::new(parking_lot::Mutex::new(None));
         let observed = during.clone();
         let observer_registry = registry.clone();
-        // Sample the deadline while the attempt is in flight.
-        let observer = tokio::spawn(async move {
+        let peer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
             tokio::time::sleep(Duration::from_secs(1)).await;
-            *observed.lock() = observer_registry.latest_deadline();
+            handle.record(); // one fragment
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *observed.lock() = Some((
+                tokio::time::Instant::now(),
+                observer_registry.latest_deadline(),
+            ));
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("reply channel accepts the reply");
         });
         let result = crate::node::with_client_op_drain(
             guard.drain_handle(),
             await_streaming_attempt(&mut ctx, dummy_reply_with_tx(tx), &progress),
         )
         .await;
+        let replied = tokio::time::Instant::now();
         assert!(result.is_ok());
-        observer.await.expect("observer task panicked");
         peer.await.expect("peer task panicked");
 
-        let in_flight = during.lock().expect("op is registered during the attempt");
+        let (sampled, in_flight) = during.lock().expect("observer sampled");
+        let in_flight = in_flight.expect("op is registered during the attempt");
         assert!(
-            in_flight >= started + STREAMING_ATTEMPT_TIMEOUT_CAP,
-            "while the streaming attempt runs, the drain deadline must reach \
-             its hard ceiling (before {before:?}, during {in_flight:?})"
+            in_flight >= sampled + PROGRESS_WINDOW - Duration::from_secs(1),
+            "a fragment must extend the drain deadline by the progress window \
+             (stale {stale:?}, after fragment {in_flight:?})"
         );
-        assert_eq!(
-            registry.latest_deadline(),
-            Some(before),
-            "once the attempt ends, the extension must be dropped and the \
-             previous deadline restored"
+        assert!(
+            registry.latest_deadline().expect("still registered") >= replied + PROGRESS_WINDOW,
+            "the final reply must give the op's tail a progress window"
         );
     }
 

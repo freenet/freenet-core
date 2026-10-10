@@ -433,15 +433,15 @@ pub(crate) struct ClientOpGuard {
 /// Each op gets a drain deadline of admission time plus
 /// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, the op
 /// is retrying, or still waiting on a peer that never answered, and the
-/// drain stops waiting for it. A driver that enters a phase which can legitimately take
-/// longer while making progress (a streaming PUT transfer, a GET stream
-/// assembly) pushes its deadline out with [`extend_client_op_drain`].
-/// A summary-first PUT probe that never got a reply does not: that is
-/// exactly what held the #5838 stop (see #5839).
+/// drain stops waiting for it. A driver in a phase that can legitimately
+/// take longer (a streaming PUT transfer, a GET stream assembly) pushes
+/// its deadline out with [`note_client_op_progress`] each time that
+/// phase makes progress. A summary-first PUT probe that never got a
+/// reply makes none: that is what held the #5838 stop (see #5839).
 ///
-/// Issue #5838: a SIGTERM caught 14 River PUTs that were 68-119 s
-/// old and retrying; the drain waited its full 30 s for them and 8
-/// were still running when it gave up.
+/// Issue #5838: a SIGTERM caught 14 River PUTs that were 68-119 s old,
+/// waiting on summary-first probes; the drain waited its full 30 s for
+/// them and 8 were still running when it gave up.
 ///
 /// Locked once when an op starts, once when it ends, once per streaming
 /// phase it enters, and once per 200 ms drain poll. Never on a hot path.
@@ -475,27 +475,17 @@ impl ClientOpDeadlines {
     }
 
     /// Push op `id`'s drain deadline out to at least `window` from now.
-    /// Returns the deadline it replaced, for [`ClientOpDrainExtension`]
-    /// to restore.
-    pub(crate) fn extend_from_now(
-        &self,
-        id: u64,
-        window: std::time::Duration,
-    ) -> Option<tokio::time::Instant> {
+    /// Never pulls it in. Returns whether the op was found.
+    pub(crate) fn extend_from_now(&self, id: u64, window: std::time::Duration) -> bool {
         let until = tokio::time::Instant::now() + window;
         let mut inner = self.inner.lock();
-        let deadline = inner.ops.get_mut(&id)?;
-        let prior = *deadline;
+        let Some(deadline) = inner.ops.get_mut(&id) else {
+            return false;
+        };
         if *deadline < until {
             *deadline = until;
         }
-        Some(prior)
-    }
-
-    fn restore(&self, id: u64, prior: tokio::time::Instant) {
-        if let Some(deadline) = self.inner.lock().ops.get_mut(&id) {
-            *deadline = prior;
-        }
+        true
     }
 
     pub(crate) fn unregister(&self, id: u64) {
@@ -531,7 +521,7 @@ impl ClientOpGuard {
     }
 
     /// Handle that lets this op's driver extend its own drain deadline
-    /// through [`extend_client_op_drain`]. Install it with
+    /// through [`note_client_op_progress`]. Install it with
     /// [`with_client_op_drain`] around the driver future.
     pub(crate) fn drain_handle(&self) -> ClientOpDrainHandle {
         ClientOpDrainHandle {
@@ -542,7 +532,7 @@ impl ClientOpGuard {
 }
 
 /// The in-flight client op whose driver is running on the current task,
-/// for [`extend_client_op_drain`].
+/// for [`note_client_op_progress`].
 #[derive(Clone)]
 pub(crate) struct ClientOpDrainHandle {
     deadlines: Arc<ClientOpDeadlines>,
@@ -554,7 +544,7 @@ tokio::task_local! {
 }
 
 /// Run a client-op driver with its drain handle installed, so phases
-/// deep in the driver can call [`extend_client_op_drain`] without the
+/// deep in the driver can call [`note_client_op_progress`] without the
 /// handle being threaded through every signature.
 pub(crate) async fn with_client_op_drain<F: std::future::Future>(
     handle: ClientOpDrainHandle,
@@ -563,41 +553,30 @@ pub(crate) async fn with_client_op_drain<F: std::future::Future>(
     CLIENT_OP_DRAIN.scope(handle, driver).await
 }
 
-/// Called by a client-op driver when it starts a phase that can
-/// legitimately run past [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] while making
-/// progress: a streaming PUT transfer or a GET stream assembly, both
-/// bounded by their own inactivity timeouts. While the returned value is
-/// alive, the shutdown drain keeps waiting for the op for up to `window`
-/// from the call (#5838). Dropping it restores the previous deadline, so
-/// an op that falls back to ordinary retries after a failed stream is not
-/// held for.
+/// How long the shutdown drain keeps waiting for a client op after it
+/// last made progress (#5838): a fragment of a streaming PUT or GET
+/// stream, or the reply that ends a streaming transfer. Long enough to
+/// cover the gap between fragments of a slow but live stream and the
+/// short tail (finalize, deliver the result) after a transfer completes;
+/// short enough that a stalled stream is not waited for.
+pub(crate) const CLIENT_OP_PROGRESS_DRAIN_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Called by a client-op driver each time a long-running phase makes
+/// progress: a streaming PUT transfer or a GET stream assembly, which can
+/// legitimately outlast [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`]. The shutdown
+/// drain then keeps waiting for the op for at least
+/// [`CLIENT_OP_PROGRESS_DRAIN_WINDOW`] from now (#5838). An op that stops
+/// making progress, including a streaming PUT stuck retrying, ages out
+/// of the drain again.
 ///
-/// A no-op outside a client-op driver (relay drivers share the same
-/// streaming attempt code and have no drain entry).
-#[must_use = "the extension lasts only while the returned value is alive"]
-pub(crate) fn extend_client_op_drain(window: std::time::Duration) -> ClientOpDrainExtension {
-    let extended = CLIENT_OP_DRAIN
-        .try_with(|h| {
-            h.deadlines
-                .extend_from_now(h.id, window)
-                .map(|prior| (h.clone(), prior))
-        })
-        .ok()
-        .flatten();
-    ClientOpDrainExtension { extended }
-}
-
-/// Scope of one [`extend_client_op_drain`] call.
-pub(crate) struct ClientOpDrainExtension {
-    extended: Option<(ClientOpDrainHandle, tokio::time::Instant)>,
-}
-
-impl Drop for ClientOpDrainExtension {
-    fn drop(&mut self) {
-        if let Some((handle, prior)) = self.extended.take() {
-            handle.deadlines.restore(handle.id, prior);
-        }
-    }
+/// A no-op outside a `with_client_op_drain` scope: relay drivers share
+/// the streaming code, and sub-op GETs run on their own spawned tasks.
+pub(crate) fn note_client_op_progress() {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        h.deadlines
+            .extend_from_now(h.id, CLIENT_OP_PROGRESS_DRAIN_WINDOW)
+    });
 }
 
 impl Drop for ClientOpGuard {
@@ -5680,32 +5659,21 @@ mod tests {
         );
     }
 
-    /// `extend_from_now` only ever pushes a deadline out: a later, shorter
-    /// extension (e.g. a GET assembly after a streaming PUT phase) must
-    /// not pull it back in.
+    /// `extend_from_now` only ever pushes a deadline out, and an unknown
+    /// (already finished) op is left alone.
     #[tokio::test(start_paused = true)]
     async fn client_op_deadline_extension_never_shortens() {
         let deadlines = ClientOpDeadlines::default();
         let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
         let initial = deadlines.latest_deadline().unwrap();
-        assert_eq!(
-            deadlines.extend_from_now(id, std::time::Duration::from_secs(1)),
-            Some(initial)
-        );
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(1)));
         assert_eq!(deadlines.latest_deadline().unwrap(), initial);
-        deadlines.extend_from_now(id, std::time::Duration::from_secs(600));
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(600)));
         let extended = deadlines.latest_deadline().unwrap();
         assert!(extended > initial);
-        assert_eq!(
-            deadlines.extend_from_now(id, std::time::Duration::from_secs(5)),
-            Some(extended)
-        );
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(5)));
         assert_eq!(deadlines.latest_deadline().unwrap(), extended);
-        assert_eq!(
-            deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)),
-            None,
-            "an unknown op has nothing to extend"
-        );
+        assert!(!deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)));
         deadlines.unregister(id);
         assert!(deadlines.latest_deadline().is_none());
     }
@@ -6062,6 +6030,8 @@ pub(crate) mod test_support {
     pub(crate) fn deadlines() -> Arc<ClientOpDeadlines> {
         Arc::new(ClientOpDeadlines::default())
     }
+
+    pub(crate) const PROGRESS_WINDOW: std::time::Duration = CLIENT_OP_PROGRESS_DRAIN_WINDOW;
 
     pub(crate) fn admit_test_client_op(deadlines: &Arc<ClientOpDeadlines>) -> ClientOpGuard {
         ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone())

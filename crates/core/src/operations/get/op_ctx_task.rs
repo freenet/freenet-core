@@ -177,7 +177,7 @@ pub(crate) async fn start_client_get(
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
         // Lets the streaming phases extend this op's shutdown-drain
-        // deadline (#5838, `extend_client_op_drain`).
+        // deadline as they make progress (#5838, `note_client_op_progress`).
         let drain = _inflight_guard.drain_handle();
         crate::node::with_client_op_drain(
             drain,
@@ -2165,6 +2165,39 @@ async fn cache_contract_locally(
 /// outbound `stream_id` per hop (#4307), so the originator always claims
 /// the stream keyed by its `current_target` (the immediate next hop),
 /// regardless of how many relays the response traversed. See #3883.
+/// Await a stream's `assembly`, noting client-op progress (#5838)
+/// whenever `received_fragments` has grown since the last check (once a
+/// second) and when assembly succeeds, so the shutdown drain keeps waiting
+/// for a client GET whose body is still streaming in and stops waiting
+/// for a stalled one. A no-op on the sub-op path, which has no client-op
+/// scope. Called as `assemble_noting_progress(handle.assemble(), || ...)`.
+async fn assemble_noting_progress<T, E>(
+    assembly: impl std::future::Future<Output = Result<T, E>>,
+    received_fragments: impl Fn() -> usize,
+) -> Result<T, E> {
+    tokio::pin!(assembly);
+    let mut seen = received_fragments();
+    let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut assembly => {
+                if result.is_ok() {
+                    crate::node::note_client_op_progress();
+                }
+                return result;
+            }
+            _ = check.tick() => {
+                let received = received_fragments();
+                if received > seen {
+                    seen = received;
+                    crate::node::note_client_op_progress();
+                }
+            }
+        }
+    }
+}
+
 async fn assemble_and_cache_stream(
     op_manager: &OpManager,
     peer_addr: std::net::SocketAddr,
@@ -2174,14 +2207,6 @@ async fn assemble_and_cache_stream(
     // Hosting attribution for the store below; see `cache_contract_locally`.
     cause: crate::ring::HostingCause,
 ) -> Result<StreamProgress, AssemblyFailure> {
-    // The header proved the contract exists and the body is streaming in;
-    // keep a client GET's shutdown drain waiting for the assembly while it
-    // runs (#5838). The stream's inactivity timeout still ends a stall, and
-    // the extension ends with this function, so a fall-back retry after a
-    // failed assembly is not held for. A no-op on the sub-op path.
-    let _drain_extension =
-        crate::node::extend_client_op_drain(crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP);
-
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
     // stream is left orphaned for GC), so the retry path is exercised
@@ -2227,24 +2252,25 @@ async fn assemble_and_cache_stream(
         }
     };
 
-    let bytes = match handle.assemble().await {
-        Ok(b) => b,
-        Err(e) => {
-            // Read fragment counts BEFORE building the error (the WHERE
-            // signal). The inactivity / cancelled AGGREGATE counters are
-            // recorded by the transport `StreamHandle::assemble` site itself
-            // (which also covers relay receive paths), so they are NOT
-            // re-recorded here — only the per-op terminal-event cause is
-            // classified from the `StreamError` variant.
-            let fragments_received = Some(handle.received_fragments() as u32);
-            let total_fragments = Some(handle.total_fragments() as u32);
-            return Err(AssemblyFailure::from_failure(
-                &StreamFailure::Assembly(e),
-                fragments_received,
-                total_fragments,
-            ));
-        }
-    };
+    let bytes =
+        match assemble_noting_progress(handle.assemble(), || handle.received_fragments()).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Read fragment counts BEFORE building the error (the WHERE
+                // signal). The inactivity / cancelled AGGREGATE counters are
+                // recorded by the transport `StreamHandle::assemble` site itself
+                // (which also covers relay receive paths), so they are NOT
+                // re-recorded here — only the per-op terminal-event cause is
+                // classified from the `StreamError` variant.
+                let fragments_received = Some(handle.received_fragments() as u32);
+                let total_fragments = Some(handle.total_fragments() as u32);
+                return Err(AssemblyFailure::from_failure(
+                    &StreamFailure::Assembly(e),
+                    fragments_received,
+                    total_fragments,
+                ));
+            }
+        };
 
     // Assembly succeeded: every expected fragment is present.
     let fragments_received = Some(handle.received_fragments() as u32);
@@ -6797,6 +6823,85 @@ mod tests {
     /// check the key matches before caching. The source-scrape
     /// verifies the function's structure hasn't been simplified in a
     /// way that would skip any of those steps.
+    /// #5838: while a client GET's body streams in, each check that sees
+    /// new fragments must extend the op's shutdown-drain deadline by the
+    /// progress window, and success must give the tail a window; a stall
+    /// must not extend it.
+    #[tokio::test(start_paused = true)]
+    async fn assembly_notes_client_op_progress_only_while_fragments_arrive() {
+        use crate::node::op_state_manager_test_support::{
+            PROGRESS_WINDOW, admit_test_client_op, deadlines,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let stale = registry.latest_deadline().unwrap();
+
+        let fragments = Arc::new(AtomicUsize::new(0));
+        let feeder = {
+            let fragments = fragments.clone();
+            tokio::spawn(async move {
+                // Fragments for 5 s, then a 20 s stall, then completion.
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    fragments.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let t0 = tokio::time::Instant::now();
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = {
+            let observed = observed.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                for at in [6, 24] {
+                    tokio::time::sleep_until(t0 + Duration::from_secs(at)).await;
+                    observed.lock().push((
+                        tokio::time::Instant::now(),
+                        registry.latest_deadline().unwrap(),
+                    ));
+                }
+            })
+        };
+        let assembly = async {
+            tokio::time::sleep(Duration::from_secs(26)).await;
+            Ok::<_, ()>(())
+        };
+        let counter = fragments.clone();
+        crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            assemble_noting_progress(assembly, move || counter.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
+        let done = tokio::time::Instant::now();
+        feeder.await.unwrap();
+        observer.await.unwrap();
+
+        let observed = observed.lock().clone();
+        let (at_6, deadline_6) = observed[0];
+        assert!(
+            deadline_6 > stale && deadline_6 + Duration::from_secs(2) >= at_6 + PROGRESS_WINDOW,
+            "fragments must keep the deadline a progress window ahead"
+        );
+        let (at_24, deadline_24) = observed[1];
+        assert_eq!(
+            deadline_24, deadline_6,
+            "no fragments arrived between 6 s and 24 s, so the deadline must not move"
+        );
+        assert!(
+            deadline_24 < at_24,
+            "after a long stall the op is past its deadline"
+        );
+        assert!(
+            registry.latest_deadline().unwrap() >= done + PROGRESS_WINDOW,
+            "a completed assembly must give the tail a progress window"
+        );
+    }
+
     #[test]
     fn assemble_and_cache_stream_performs_claim_assemble_key_check() {
         let src = production_source();
@@ -6807,8 +6912,9 @@ mod tests {
             "assemble_and_cache_stream must claim the stream via \
              orphan_stream_registry().claim_or_wait()"
         );
+        // Assembly runs through `assemble_noting_progress` (#5838).
         assert!(
-            body.contains(".assemble()") && body.contains(".await"),
+            body.contains("assemble_noting_progress(handle.assemble()"),
             "assemble_and_cache_stream must await stream assembly"
         );
         assert!(
