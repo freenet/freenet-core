@@ -340,6 +340,10 @@ pub(crate) struct OpManager {
     /// `freenet-git` mirror) to finish before tearing down peer
     /// connections. The drain is bounded by `config.shutdown_drain_secs`.
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
+    /// Admission times of the same drivers, so the drain can stop
+    /// waiting for ones that are already past a full attempt deadline
+    /// (#5838). See [`ClientOpStarts`].
+    pub(crate) inflight_client_op_starts: Arc<ClientOpStarts>,
     /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
     /// begins, so `start_client_{put,get,update,subscribe}` can fail
     /// fast with `OpError::NodeShuttingDown` instead of bumping the
@@ -398,6 +402,7 @@ impl Clone for OpManager {
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
             inflight_client_ops: self.inflight_client_ops.clone(),
+            inflight_client_op_starts: self.inflight_client_op_starts.clone(),
             shutting_down: self.shutting_down.clone(),
         }
     }
@@ -416,10 +421,72 @@ impl Clone for OpManager {
 /// reach zero before letting the node tear down.
 pub(crate) struct ClientOpGuard {
     counter: Arc<AtomicUsize>,
+    starts: Arc<ClientOpStarts>,
+    start_id: u64,
+}
+
+/// Admission time of every client-originated driver currently in
+/// flight, keyed by a monotonically increasing id.
+///
+/// The shutdown drain uses it to tell an op that may still finish from
+/// one that has already run past a full attempt deadline
+/// ([`CLIENT_OP_DRAIN_MAX_AGE`]). Issue #5838: a SIGTERM that arrived
+/// while 14 River PUTs were 68-119 s into their retry loops waited the
+/// whole 30 s drain for them, and 8 were still running when it gave up.
+///
+/// Ids and instants are assigned under the same lock, so the
+/// highest-id entry is always the most recently admitted op still in
+/// flight. Locked once when a client op starts and once when it ends,
+/// never on a hot path.
+#[derive(Default)]
+pub(crate) struct ClientOpStarts {
+    inner: Mutex<ClientOpStartsInner>,
+}
+
+#[derive(Default)]
+struct ClientOpStartsInner {
+    next_id: u64,
+    starts: std::collections::BTreeMap<u64, tokio::time::Instant>,
+}
+
+/// An in-flight client op older than this is not worth holding a
+/// shutdown for. It has outlived a whole non-streaming attempt
+/// deadline (`OPERATION_TTL`), so it is retrying against a route that
+/// already failed it once and its completion time no longer says
+/// anything about the drain window. The ops the drain exists for (a
+/// `freenet-git` mirror push caught by a release restart) are seconds
+/// old when the signal arrives.
+pub(crate) const CLIENT_OP_DRAIN_MAX_AGE: std::time::Duration = crate::config::OPERATION_TTL;
+
+impl ClientOpStarts {
+    pub(crate) fn register(&self) -> u64 {
+        let mut inner = self.inner.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.starts.insert(id, tokio::time::Instant::now());
+        id
+    }
+
+    pub(crate) fn unregister(&self, id: u64) {
+        self.inner.lock().starts.remove(&id);
+    }
+
+    /// Admission time of the most recently admitted op still in flight.
+    pub(crate) fn newest_start(&self) -> Option<tokio::time::Instant> {
+        self.inner
+            .lock()
+            .starts
+            .last_key_value()
+            .map(|(_, started)| *started)
+    }
 }
 
 impl ClientOpGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
+    fn new(counter: Arc<AtomicUsize>, starts: Arc<ClientOpStarts>) -> Self {
+        // Record the start BEFORE the counter bump: a drain that sees
+        // this op through the SeqCst counter load must also find its
+        // start time, or it would treat the op as already stale.
+        let start_id = starts.register();
         // SeqCst, not Relaxed — the increment participates in a
         // two-atomic Dekker-style handshake with `shutting_down`
         // (see `OpManager::admit_client_op`). Under a relaxed model
@@ -428,12 +495,17 @@ impl ClientOpGuard {
         // Codex + skeptical r3 finding. The cost is negligible
         // (once per client request, not in a hot loop).
         counter.fetch_add(1, Ordering::SeqCst);
-        Self { counter }
+        Self {
+            counter,
+            starts,
+            start_id,
+        }
     }
 }
 
 impl Drop for ClientOpGuard {
     fn drop(&mut self) {
+        self.starts.unregister(self.start_id);
         // Decrement does NOT participate in the admission handshake
         // (it announces "I'm done" to a drain that's already
         // polling). Relaxed is sufficient: the only consequence of a
@@ -631,6 +703,7 @@ impl OpManager {
             active_relay_subscribe_txs,
             active_relay_connect_txs,
             inflight_client_ops: Arc::new(AtomicUsize::new(0)),
+            inflight_client_op_starts: Arc::new(ClientOpStarts::default()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -721,7 +794,10 @@ impl OpManager {
     /// and counter bump are atomic. Kept module-private for the
     /// `admit_client_op` implementation.
     fn client_op_guard(&self) -> ClientOpGuard {
-        ClientOpGuard::new(self.inflight_client_ops.clone())
+        ClientOpGuard::new(
+            self.inflight_client_ops.clone(),
+            self.inflight_client_op_starts.clone(),
+        )
     }
 
     /// Atomically check the shutdown admission gate AND bump the
@@ -801,6 +877,12 @@ impl OpManager {
     /// without holding an `Arc<OpManager>` across the drain wait.
     pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
         self.inflight_client_ops.clone()
+    }
+
+    /// Cloneable handle to the in-flight client ops' admission times,
+    /// read by the shutdown drain alongside the counter (#5838).
+    pub(crate) fn inflight_client_op_starts_handle(&self) -> Arc<ClientOpStarts> {
+        self.inflight_client_op_starts.clone()
     }
 
     /// Set once by the executor pool; later calls are ignored.
@@ -5416,12 +5498,19 @@ mod tests {
     #[test]
     fn client_op_guard_decrements_on_panic() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpStarts::default());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ClientOpGuard::new(counter.clone());
+            let _guard = ClientOpGuard::new(counter.clone(), starts.clone());
             assert_eq!(counter.load(Ordering::Relaxed), 1);
+            assert!(starts.newest_start().is_some());
             panic!("simulated driver panic");
         }));
         assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            starts.newest_start().is_none(),
+            "ClientOpGuard::Drop must remove the op's start time even on \
+             panic, or the drain keeps treating a dead driver as fresh"
+        );
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
@@ -5446,7 +5535,7 @@ mod tests {
         let op_state = include_str!("op_state_manager.rs");
         // Counter bump in ClientOpGuard::new.
         let new_body = op_state
-            .split("fn new(counter: Arc<AtomicUsize>) -> Self {")
+            .split("fn new(counter: Arc<AtomicUsize>, starts: Arc<ClientOpStarts>) -> Self {")
             .nth(1)
             .and_then(|s| s.split("Self {").next())
             .expect("ClientOpGuard::new body must be findable");
@@ -5529,6 +5618,7 @@ mod tests {
     #[test]
     fn admit_client_op_refuses_when_shutting_down() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpStarts::default());
         let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
         // Build a minimal stand-in: just the two atomics — we test
         // `admit_client_op` against an `OpManager`-shaped struct by
@@ -5537,7 +5627,7 @@ mod tests {
         // is a 4-line function; pinning its semantic via a parallel
         // implementation is acceptable for a single-function gate.
         let admit = || -> Option<ClientOpGuard> {
-            let guard = ClientOpGuard::new(counter.clone());
+            let guard = ClientOpGuard::new(counter.clone(), starts.clone());
             if gate.load(Ordering::Relaxed) {
                 drop(guard);
                 return None;

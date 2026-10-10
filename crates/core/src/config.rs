@@ -1868,6 +1868,11 @@ pub struct Config {
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
     ///
+    /// Ops already older than `OPERATION_TTL` (60 s) are not waited
+    /// for, and a younger op is waited for only until it reaches that
+    /// age: by then it has outlived a whole attempt deadline and is
+    /// retrying (#5838).
+    ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
