@@ -10323,10 +10323,12 @@ mod tests {
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
             let elapsed = start.elapsed();
+            // One progress window plus the 1 s throttle slack every note
+            // carries, after the last fragment.
             assert!(
-                elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
-                "the drain must stop one progress window after the last \
-                 fragment; waited {elapsed:?}"
+                elapsed >= Duration::from_secs(6) && elapsed < Duration::from_secs(7),
+                "the drain must stop one progress window (plus the note's 1 s \
+                 slack) after the last fragment; waited {elapsed:?}"
             );
             assert_eq!(
                 counter.load(Ordering::SeqCst),

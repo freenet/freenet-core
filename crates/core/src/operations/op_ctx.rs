@@ -707,12 +707,17 @@ async fn await_streaming_attempt(
                 // The transfer ended with a reply: give the op's tail
                 // (finalize, deliver the result, or the retry a rejection
                 // leads to; the reply kind is not distinguished) its drain
-                // window (#5838).
+                // window, replacing the streaming window (#5838).
                 crate::node::note_client_op_phase_end();
                 return Ok(reply);
             }
             // Arm 3: hard ceiling.
-            _ = &mut ceiling => return Err(TimeoutCause::StreamCeiling),
+            _ = &mut ceiling => {
+                // The phase is over; do not leave its streaming window on
+                // the op (#5838).
+                crate::node::note_client_op_phase_end();
+                return Err(TimeoutCause::StreamCeiling);
+            }
             // Arm 2: a fragment landed — reset the inactivity window.
             _ = handle.notified() => {
                 // A fragment moved: keep a client op's shutdown drain
@@ -732,8 +737,13 @@ async fn await_streaming_attempt(
                 // Only a confirmed stall returns `TimeoutCause::StreamStall`.
                 let elapsed = handle.since_last();
                 if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {
+                    // A fragment raced this arm and is recognised here
+                    // rather than in the notified arm: refresh the client
+                    // op's drain deadline the same way (#5838).
+                    crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
                     continue;
                 }
+                crate::node::note_client_op_phase_end();
                 return Err(TimeoutCause::StreamStall);
             }
         }
@@ -2418,9 +2428,10 @@ mod tests {
             tokio::time::sleep_until(t0 + Duration::from_millis(5100)).await;
             sample(tokio::time::Instant::now());
             // A long quiet phase after the last fragment (still inside the
-            // attempt's own inactivity window), so the reply's tail window
-            // reaches past the fragment's.
-            tokio::time::sleep_until(t0 + Duration::from_secs(205)).await;
+            // attempt's own inactivity window). The reply's tail window ends
+            // before the fragment's would, so the exact-deadline assertion
+            // below tells replacing the window from keeping the longer one.
+            tokio::time::sleep_until(t0 + Duration::from_secs(100)).await;
             reply_sender
                 .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("reply channel accepts the reply");
@@ -2447,6 +2458,39 @@ mod tests {
             registry.latest_deadline().unwrap() == replied + TAIL_WINDOW,
             "the final reply must give the op's tail exactly its window"
         );
+    }
+
+    /// #5838: a streaming attempt that ends in a stall must not leave its
+    /// 240 s streaming window on the client op: the phase end replaces it
+    /// with the tail window, as a reply does.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_streaming_attempt_ends_the_drain_phase() {
+        use crate::node::op_state_manager_test_support::{
+            TAIL_WINDOW, admit_test_client_op, deadlines,
+        };
+
+        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        // The peer accepts the request and then never sends anything.
+        let peer = tokio::spawn(async move {
+            let delivered = rx.recv().await.expect("outbound msg should be delivered");
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(delivered);
+        });
+        let result = crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            await_streaming_attempt(&mut ctx, dummy_reply_with_tx(tx), &progress),
+        )
+        .await;
+        let ended = tokio::time::Instant::now();
+        assert!(matches!(result, Err(TimeoutCause::StreamStall)));
+        assert_eq!(
+            registry.latest_deadline(),
+            Some(ended + TAIL_WINDOW),
+            "a stalled attempt must end its drain phase with the tail window"
+        );
+        peer.abort();
     }
 
     /// Progress flows for 40 s then stops. The inactivity timeout MUST fire

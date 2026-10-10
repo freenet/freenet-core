@@ -2166,9 +2166,10 @@ async fn await_with_ticks<T>(
     }
 }
 
-/// Drain window refreshed each second while a stream phase is pending:
-/// a second of tick spacing plus a second of slack, so the deadline
-/// lapses within about 2 s of the phase ending.
+/// Drain window refreshed each second while a stream phase is pending
+/// (one tick of spacing plus slack; `note_client_op_progress` adds its
+/// own throttle slack), so the deadline lapses within about 3 s of the
+/// phase ending.
 const PENDING_PHASE_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Await a GET stream `claim`, keeping a client GET's shutdown drain

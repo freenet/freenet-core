@@ -590,14 +590,19 @@ const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration
 ///
 /// A call that would move the deadline less than
 /// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] past the last one this task made
-/// is skipped.
+/// is skipped; to cover that, every note reaches one spacing past
+/// `window`, so the deadline is always at least `now + window`.
 ///
 /// A no-op outside a `with_client_op_drain` scope: relay drivers share
 /// the streaming code, and sub-op GETs (including the contract fetches a
 /// client UPDATE or SUBSCRIBE may wait on) run on their own spawned tasks.
 pub(crate) fn note_client_op_progress(window: std::time::Duration) {
     let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
-        let until = tokio::time::Instant::now() + window;
+        // Every note reaches one spacing further than asked, so a call the
+        // throttle skips (it would have moved the deadline by less than
+        // the spacing) never leaves the deadline short of `now + window`.
+        let reach = window + CLIENT_OP_PROGRESS_NOTE_SPACING;
+        let until = tokio::time::Instant::now() + reach;
         if h.last_noted
             .get()
             .is_some_and(|last| until < last + CLIENT_OP_PROGRESS_NOTE_SPACING)
@@ -605,12 +610,12 @@ pub(crate) fn note_client_op_progress(window: std::time::Duration) {
             return;
         }
         h.last_noted.set(Some(until));
-        h.deadlines.extend_from_now(h.id, window);
+        h.deadlines.extend_from_now(h.id, reach);
     });
 }
 
-/// Called when a streaming phase ends (a PUT attempt's reply, a GET
-/// assembly's completion): sets the op's drain deadline to
+/// Called when a streaming phase ends (a PUT attempt's reply, ceiling or
+/// stall, a GET assembly's completion): sets the op's drain deadline to
 /// [`CLIENT_OP_TAIL_DRAIN_WINDOW`] from now, replacing the phase's longer
 /// window, so the tail (finalize, deliver, a blocking subscribe, or the
 /// retry a rejection leads to) gets exactly the window a fresh op gets
