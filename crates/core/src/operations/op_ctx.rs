@@ -3007,6 +3007,27 @@ mod tests {
             "the stall arm must not report a ceiling"
         );
 
+        // #5838: every exit ends the client-op drain phase, and a fragment
+        // recognised by the fallback refreshes the drain deadline. The
+        // reply and stall exits also have behavioural tests; the ceiling
+        // exit and the fallback note are pinned here.
+        assert!(
+            ceiling_arm.contains("note_client_op_phase_end()"),
+            "the ceiling arm must end the client-op drain phase"
+        );
+        let fallback = stall_arm
+            .split_once("if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {")
+            .expect("the stall arm must keep its since_last fallback")
+            .1;
+        let fallback = fallback
+            .split_once("continue;")
+            .expect("the fallback must continue")
+            .0;
+        assert!(
+            fallback.contains("note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT)"),
+            "a fragment recognised by the fallback must refresh the drain deadline"
+        );
+
         assert!(
             !body.contains("Err(())"),
             "streaming abandon paths must not regress to an untyped Err(()) — \

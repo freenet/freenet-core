@@ -582,8 +582,8 @@ const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration
 /// the reply or completion that ends one. These can legitimately outlast
 /// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (#5838). `window` is that phase's
 /// own liveness rule: the timeout after which the phase itself would
-/// declare the stream dead (or, at a phase end,
-/// [`CLIENT_OP_TAIL_DRAIN_WINDOW`]). The shutdown drain then keeps
+/// declare the stream dead (a phase end uses
+/// [`note_client_op_phase_end`] instead). The shutdown drain then keeps
 /// waiting for the op for at least `window` from now, so it never gives
 /// up on a phase sooner than the phase itself would, and stops waiting
 /// once the phase has gone quiet for that long.
