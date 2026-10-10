@@ -94,7 +94,9 @@ impl NetworkPeer {
         let shutdown_handle = ShutdownHandle {
             tx: shutdown_tx,
             inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
-            inflight_client_op_starts: node_inner.op_manager.inflight_client_op_starts_handle(),
+            inflight_client_op_deadlines: node_inner
+                .op_manager
+                .inflight_client_op_deadlines_handle(),
             shutting_down: node_inner.op_manager.shutting_down_handle(),
             drain_timeout: std::time::Duration::ZERO,
         };

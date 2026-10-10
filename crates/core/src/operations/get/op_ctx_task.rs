@@ -176,13 +176,19 @@ pub(crate) async fn start_client_get(
     };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
-        run_client_get(
-            op_manager,
-            client_tx,
-            instance_id,
-            return_contract_code,
-            subscribe,
-            blocking_subscribe,
+        // Lets the streaming phases extend this op's shutdown-drain
+        // deadline (#5838, `extend_client_op_drain`).
+        let drain = _inflight_guard.drain_handle();
+        crate::node::with_client_op_drain(
+            drain,
+            run_client_get(
+                op_manager,
+                client_tx,
+                instance_id,
+                return_contract_code,
+                subscribe,
+                blocking_subscribe,
+            ),
         )
         .await;
     });
@@ -1585,6 +1591,11 @@ async fn drive_get_with_assembly_retry(
         };
 
         let stream_start = tokio::time::Instant::now();
+        // The header proved the contract exists and the body is now
+        // streaming in; keep a client GET's shutdown drain waiting for
+        // the assembly (#5838). Its inactivity timeout still ends a
+        // stalled stream.
+        crate::node::extend_client_op_drain(crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP);
         match assemble_and_cache_stream(
             op_manager,
             peer_addr,

@@ -338,12 +338,13 @@ pub(crate) struct OpManager {
     /// shutdown drain in `ShutdownHandle::shutdown` to wait for
     /// client-initiated work (most importantly PUTs from the
     /// `freenet-git` mirror) to finish before tearing down peer
-    /// connections. The drain is bounded by `config.shutdown_drain_secs`.
+    /// connections. The drain is bounded by `config.shutdown_drain_secs`
+    /// and by each op's drain deadline (`inflight_client_op_deadlines`).
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
-    /// Admission times of the same drivers, so the drain can stop
-    /// waiting for ones that are already past a full attempt deadline
-    /// (#5838). See [`ClientOpStarts`].
-    pub(crate) inflight_client_op_starts: Arc<ClientOpStarts>,
+    /// Drain deadlines of the same drivers, so the drain can stop
+    /// waiting for ones that are already past their first attempt
+    /// deadline (#5838). See [`ClientOpDeadlines`].
+    pub(crate) inflight_client_op_deadlines: Arc<ClientOpDeadlines>,
     /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
     /// begins, so `start_client_{put,get,update,subscribe}` can fail
     /// fast with `OpError::NodeShuttingDown` instead of bumping the
@@ -402,7 +403,7 @@ impl Clone for OpManager {
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
             inflight_client_ops: self.inflight_client_ops.clone(),
-            inflight_client_op_starts: self.inflight_client_op_starts.clone(),
+            inflight_client_op_deadlines: self.inflight_client_op_deadlines.clone(),
             shutting_down: self.shutting_down.clone(),
         }
     }
@@ -421,72 +422,90 @@ impl Clone for OpManager {
 /// reach zero before letting the node tear down.
 pub(crate) struct ClientOpGuard {
     counter: Arc<AtomicUsize>,
-    starts: Arc<ClientOpStarts>,
-    start_id: u64,
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
 }
 
-/// Admission time of every client-originated driver currently in
-/// flight, keyed by a monotonically increasing id.
+/// How long the shutdown drain may still wait for each in-flight
+/// client-originated driver, keyed by a monotonically increasing id.
 ///
-/// The shutdown drain uses it to tell an op that may still finish from
-/// one that has already run past a full attempt deadline
-/// ([`CLIENT_OP_DRAIN_MAX_AGE`]). Issue #5838: a SIGTERM that arrived
-/// while 14 River PUTs were 68-119 s into their retry loops waited the
-/// whole 30 s drain for them, and 8 were still running when it gave up.
+/// Each op gets a drain deadline of admission time plus
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, a
+/// non-streaming op has outlived its first attempt and is retrying
+/// against a route that already failed it, and the drain stops waiting
+/// for it. A driver that enters a phase which can legitimately take
+/// longer while making progress (a streaming PUT transfer, a GET stream
+/// assembly) pushes its deadline out with [`extend_client_op_drain`].
+/// A summary-first PUT probe that never got a reply does not: that is
+/// exactly what held the #5838 stop (see #5839).
 ///
-/// Ids and instants are assigned under the same lock, so the
-/// highest-id entry is always the most recently admitted op still in
-/// flight. Locked once when a client op starts and once when it ends,
-/// never on a hot path.
+/// Issue #5838: a SIGTERM caught 14 River PUTs that were 68-119 s
+/// old and retrying; the drain waited its full 30 s for them and 8
+/// were still running when it gave up.
+///
+/// Locked once when an op starts, once when it ends, once per streaming
+/// phase it enters, and once per 200 ms drain poll. Never on a hot path.
 #[derive(Default)]
-pub(crate) struct ClientOpStarts {
-    inner: Mutex<ClientOpStartsInner>,
+pub(crate) struct ClientOpDeadlines {
+    inner: Mutex<ClientOpDeadlinesInner>,
 }
 
 #[derive(Default)]
-struct ClientOpStartsInner {
+struct ClientOpDeadlinesInner {
     next_id: u64,
-    starts: std::collections::BTreeMap<u64, tokio::time::Instant>,
+    /// id -> (admission time, drain deadline)
+    ops: std::collections::HashMap<u64, (tokio::time::Instant, tokio::time::Instant)>,
 }
 
-/// An in-flight client op older than this is not worth holding a
-/// shutdown for. It has outlived a whole non-streaming attempt
-/// deadline (`OPERATION_TTL`), so it is retrying against a route that
-/// already failed it once and its completion time no longer says
-/// anything about the drain window. The ops the drain exists for (a
-/// `freenet-git` mirror push caught by a release restart) are seconds
-/// old when the signal arrives.
-pub(crate) const CLIENT_OP_DRAIN_MAX_AGE: std::time::Duration = crate::config::OPERATION_TTL;
+/// Drain window for a client op whose driver does not set one:
+/// `OPERATION_TTL`, the attempt deadline of every non-streaming
+/// operation. The ops the drain exists for (a `freenet-git` mirror
+/// push caught by a release restart) are seconds old when the signal
+/// arrives.
+pub(crate) const DEFAULT_CLIENT_OP_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
 
-impl ClientOpStarts {
-    pub(crate) fn register(&self) -> u64 {
+impl ClientOpDeadlines {
+    pub(crate) fn register(&self, window: std::time::Duration) -> u64 {
+        let now = tokio::time::Instant::now();
         let mut inner = self.inner.lock();
         let id = inner.next_id;
         inner.next_id += 1;
-        inner.starts.insert(id, tokio::time::Instant::now());
+        inner.ops.insert(id, (now, now + window));
         id
     }
 
-    pub(crate) fn unregister(&self, id: u64) {
-        self.inner.lock().starts.remove(&id);
+    /// Push op `id`'s drain deadline out to at least `window` from now.
+    fn extend_from_now(&self, id: u64, window: std::time::Duration) {
+        let until = tokio::time::Instant::now() + window;
+        if let Some((_, deadline)) = self.inner.lock().ops.get_mut(&id) {
+            if *deadline < until {
+                *deadline = until;
+            }
+        }
     }
 
-    /// Admission time of the most recently admitted op still in flight.
-    pub(crate) fn newest_start(&self) -> Option<tokio::time::Instant> {
+    pub(crate) fn unregister(&self, id: u64) {
+        self.inner.lock().ops.remove(&id);
+    }
+
+    /// The latest drain deadline among in-flight ops, if any.
+    pub(crate) fn latest_deadline(&self) -> Option<tokio::time::Instant> {
         self.inner
             .lock()
-            .starts
-            .last_key_value()
-            .map(|(_, started)| *started)
+            .ops
+            .values()
+            .map(|(_, deadline)| *deadline)
+            .max()
     }
 }
 
 impl ClientOpGuard {
-    fn new(counter: Arc<AtomicUsize>, starts: Arc<ClientOpStarts>) -> Self {
-        // Record the start BEFORE the counter bump: a drain that sees
-        // this op through the SeqCst counter load must also find its
-        // start time, or it would treat the op as already stale.
-        let start_id = starts.register();
+    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {
+        // Register BEFORE the counter bump: a drain that sees this op
+        // through the SeqCst counter load must also find its deadline,
+        // or it would treat the op as not worth waiting for. Pinned by
+        // `client_op_deadline_registered_while_counted`.
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
         // SeqCst, not Relaxed — the increment participates in a
         // two-atomic Dekker-style handshake with `shutting_down`
         // (see `OpManager::admit_client_op`). Under a relaxed model
@@ -497,21 +516,69 @@ impl ClientOpGuard {
         counter.fetch_add(1, Ordering::SeqCst);
         Self {
             counter,
-            starts,
-            start_id,
+            deadlines,
+            id,
+        }
+    }
+
+    /// Handle that lets this op's driver extend its own drain deadline
+    /// through [`extend_client_op_drain`]. Install it with
+    /// [`with_client_op_drain`] around the driver future.
+    pub(crate) fn drain_handle(&self) -> ClientOpDrainHandle {
+        ClientOpDrainHandle {
+            deadlines: self.deadlines.clone(),
+            id: self.id,
         }
     }
 }
 
+/// The in-flight client op whose driver is running on the current task,
+/// for [`extend_client_op_drain`].
+#[derive(Clone)]
+pub(crate) struct ClientOpDrainHandle {
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
+}
+
+tokio::task_local! {
+    static CLIENT_OP_DRAIN: ClientOpDrainHandle;
+}
+
+/// Run a client-op driver with its drain handle installed, so phases
+/// deep in the driver can call [`extend_client_op_drain`] without the
+/// handle being threaded through every signature.
+pub(crate) async fn with_client_op_drain<F: std::future::Future>(
+    handle: ClientOpDrainHandle,
+    driver: F,
+) -> F::Output {
+    CLIENT_OP_DRAIN.scope(handle, driver).await
+}
+
+/// Called by a client-op driver when it starts a phase that can
+/// legitimately run past [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] while making
+/// progress: a streaming PUT transfer or a GET stream assembly, both
+/// bounded by their own inactivity timeouts. Lets the shutdown drain
+/// keep waiting for the op for up to `window` from now (#5838).
+///
+/// A no-op outside a client-op driver (relay drivers share the same
+/// retry loop and have no drain entry).
+pub(crate) fn extend_client_op_drain(window: std::time::Duration) {
+    let _not_a_client_op = CLIENT_OP_DRAIN.try_with(|h| h.deadlines.extend_from_now(h.id, window));
+}
+
 impl Drop for ClientOpGuard {
     fn drop(&mut self) {
-        self.starts.unregister(self.start_id);
         // Decrement does NOT participate in the admission handshake
         // (it announces "I'm done" to a drain that's already
         // polling). Relaxed is sufficient: the only consequence of a
         // late observation is an extra 200ms poll interval before
         // the drain notices counter==0.
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        // Unregister AFTER the decrement, so a counted op always has a
+        // deadline. The reverse order lets a drain poll see a counted
+        // op with no deadline and log that the remaining ops were
+        // abandoned when this one had in fact just finished.
+        self.deadlines.unregister(self.id);
     }
 }
 
@@ -703,7 +770,7 @@ impl OpManager {
             active_relay_subscribe_txs,
             active_relay_connect_txs,
             inflight_client_ops: Arc::new(AtomicUsize::new(0)),
-            inflight_client_op_starts: Arc::new(ClientOpStarts::default()),
+            inflight_client_op_deadlines: Arc::new(ClientOpDeadlines::default()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -796,7 +863,7 @@ impl OpManager {
     fn client_op_guard(&self) -> ClientOpGuard {
         ClientOpGuard::new(
             self.inflight_client_ops.clone(),
-            self.inflight_client_op_starts.clone(),
+            self.inflight_client_op_deadlines.clone(),
         )
     }
 
@@ -879,10 +946,10 @@ impl OpManager {
         self.inflight_client_ops.clone()
     }
 
-    /// Cloneable handle to the in-flight client ops' admission times,
+    /// Cloneable handle to the in-flight client ops' drain deadlines,
     /// read by the shutdown drain alongside the counter (#5838).
-    pub(crate) fn inflight_client_op_starts_handle(&self) -> Arc<ClientOpStarts> {
-        self.inflight_client_op_starts.clone()
+    pub(crate) fn inflight_client_op_deadlines_handle(&self) -> Arc<ClientOpDeadlines> {
+        self.inflight_client_op_deadlines.clone()
     }
 
     /// Set once by the executor pool; later calls are ignored.
@@ -5498,18 +5565,18 @@ mod tests {
     #[test]
     fn client_op_guard_decrements_on_panic() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let starts = Arc::new(ClientOpStarts::default());
+        let starts = Arc::new(ClientOpDeadlines::default());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ClientOpGuard::new(counter.clone(), starts.clone());
             assert_eq!(counter.load(Ordering::Relaxed), 1);
-            assert!(starts.newest_start().is_some());
+            assert!(starts.latest_deadline().is_some());
             panic!("simulated driver panic");
         }));
         assert!(result.is_err(), "the closure must have panicked");
         assert!(
-            starts.newest_start().is_none(),
-            "ClientOpGuard::Drop must remove the op's start time even on \
-             panic, or the drain keeps treating a dead driver as fresh"
+            starts.latest_deadline().is_none(),
+            "ClientOpGuard::Drop must remove the op's drain deadline even on \
+             panic, or the drain keeps waiting for a dead driver"
         );
         assert_eq!(
             counter.load(Ordering::Relaxed),
@@ -5535,7 +5602,7 @@ mod tests {
         let op_state = include_str!("op_state_manager.rs");
         // Counter bump in ClientOpGuard::new.
         let new_body = op_state
-            .split("fn new(counter: Arc<AtomicUsize>, starts: Arc<ClientOpStarts>) -> Self {")
+            .split("fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {")
             .nth(1)
             .and_then(|s| s.split("Self {").next())
             .expect("ClientOpGuard::new body must be findable");
@@ -5579,6 +5646,49 @@ mod tests {
         );
     }
 
+    /// Source-grep pin (#5838): a counted client op must always have a
+    /// drain deadline. `ClientOpGuard::new` registers the deadline
+    /// before the SeqCst counter bump, and `Drop` decrements before
+    /// unregistering. Swapping either pair lets a drain see a counted op
+    /// with no deadline: on admission it would skip an op that just
+    /// started, and the drain tests (which drive real guards) only
+    /// exercise the intended order.
+    #[test]
+    fn client_op_deadline_registered_while_counted() {
+        let op_state = include_str!("op_state_manager.rs");
+        let new_body = op_state
+            .split("fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("ClientOpGuard::new body must be findable");
+        let register = new_body
+            .find("deadlines.register(")
+            .expect("ClientOpGuard::new must register a drain deadline");
+        let bump = new_body
+            .find("counter.fetch_add(1, Ordering::SeqCst)")
+            .expect("ClientOpGuard::new must bump the counter");
+        assert!(
+            register < bump,
+            "ClientOpGuard::new must register the deadline BEFORE the counter bump"
+        );
+
+        let drop_body = op_state
+            .split("impl Drop for ClientOpGuard {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("ClientOpGuard::drop body must be findable");
+        let decrement = drop_body
+            .find("self.counter.fetch_sub(1,")
+            .expect("ClientOpGuard::drop must decrement the counter");
+        let unregister = drop_body
+            .find("self.deadlines.unregister(self.id)")
+            .expect("ClientOpGuard::drop must unregister the deadline");
+        assert!(
+            decrement < unregister,
+            "ClientOpGuard::drop must decrement BEFORE unregistering the deadline"
+        );
+    }
+
     /// Source-grep pin: `admit_client_op` must bump the counter
     /// BEFORE checking the gate. The reverse order (check-then-bump)
     /// re-opens the Codex r2 TOCTOU. The `admit_client_op_refuses_when_shutting_down`
@@ -5618,7 +5728,7 @@ mod tests {
     #[test]
     fn admit_client_op_refuses_when_shutting_down() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let starts = Arc::new(ClientOpStarts::default());
+        let starts = Arc::new(ClientOpDeadlines::default());
         let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
         // Build a minimal stand-in: just the two atomics — we test
         // `admit_client_op` against an `OpManager`-shaped struct by
@@ -5645,6 +5755,11 @@ mod tests {
             "the bump-then-check pattern must net-zero the counter \
              on rejection — otherwise the gate leaks bumped counts \
              that the drain then waits on indefinitely."
+        );
+        assert!(
+            starts.latest_deadline().is_none(),
+            "a refused admission must not leave a drain deadline behind, \
+             or the drain waits for an op that never ran"
         );
 
         // Open the gate; admit succeeds and bumps the counter.

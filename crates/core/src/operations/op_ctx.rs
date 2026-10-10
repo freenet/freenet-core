@@ -793,6 +793,13 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // up on EVERY exit (success, stall, ceiling, error) AND if this
             // future is cancelled or panics mid-`await`. It cannot leak.
             Some(progress) => {
+                // A streaming transfer may legitimately run past the
+                // default drain window while it makes progress; keep a
+                // client op's shutdown drain waiting for it (#5838). Its
+                // inactivity timeout still ends a stalled transfer.
+                crate::node::extend_client_op_drain(
+                    crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+                );
                 let _progress_guard = crate::operations::stream_progress::StreamProgressGuard::new(
                     op_manager.stream_progress_registry().clone(),
                     attempt_tx,
