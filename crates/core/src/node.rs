@@ -208,9 +208,9 @@ impl ShutdownHandle {
     /// the drain can react promptly when the counter clears.
     ///
     /// The deadline cut (#5838): an op's drain deadline is its admission
-    /// time plus `OPERATION_TTL`, pushed out to 15 s past each sign of
-    /// progress in a streaming PUT transfer or GET stream assembly
-    /// (`note_client_op_progress`). Past it, the op is retrying, stalled,
+    /// time plus `OPERATION_TTL`, pushed out to a stream-inactivity window
+    /// past each sign of activity in a streaming PUT attempt or GET stream
+    /// assembly (`note_client_op_progress`). Past it, the op is retrying, stalled,
     /// or still waiting on a peer that never answered (such as an
     /// unanswered summary-first probe, #5839), so holding the shutdown
     /// for it mostly buys a 30 s stop. On the `framework` test peer a
@@ -10296,9 +10296,10 @@ mod tests {
             ));
         }
 
-        /// A stream that stops making progress ages out of the drain one
-        /// progress window after its last fragment, well before
-        /// `drain_timeout`, even though the op is still in flight.
+        /// A stream with no activity for a progress window ages out of the
+        /// drain, even though the op is still in flight: here the last
+        /// fragment was 5 s short of a window ago, so the drain stops after
+        /// 5 s rather than at `drain_timeout`.
         #[tokio::test(start_paused = true)]
         async fn drain_stops_waiting_for_a_stalled_stream() {
             let (handle, counter, deadlines, mut rx) =
@@ -10309,13 +10310,16 @@ mod tests {
                 op_state_manager::note_client_op_progress();
             })
             .await;
+            tokio::time::advance(
+                op_state_manager::CLIENT_OP_PROGRESS_DRAIN_WINDOW - Duration::from_secs(5),
+            )
+            .await;
 
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
             let elapsed = start.elapsed();
-            let window = op_state_manager::CLIENT_OP_PROGRESS_DRAIN_WINDOW;
             assert!(
-                elapsed >= window && elapsed < window + Duration::from_secs(1),
+                elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
                 "the drain must stop one progress window after the last \
                  fragment; waited {elapsed:?}"
             );

@@ -669,6 +669,12 @@ async fn await_streaming_attempt(
     use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
+    // A streaming attempt is live by its own rule (no
+    // `STREAM_OP_INACTIVITY_TIMEOUT` of silence) from the moment it starts;
+    // keep a client op's shutdown drain waiting for it on the same terms
+    // (#5838). Each fragment and the final reply note again below.
+    crate::node::note_client_op_progress();
+
     let handle = progress.handle();
     // NOTE: deliberately NOT resetting the progress clock here, though
     // `StreamProgress` is built once per OPERATION and cloned per attempt so a
@@ -698,7 +704,7 @@ async fn await_streaming_attempt(
         tokio::select! {
             // Arm 1: terminal reply (unchanged semantics).
             reply = &mut round_trip => {
-                // The transfer ended with a reply: give the op's short tail
+                // The transfer ended with a reply: give the op's tail
                 // (finalize, deliver the result) its drain window (#5838).
                 crate::node::note_client_op_progress();
                 return Ok(reply);
@@ -707,9 +713,8 @@ async fn await_streaming_attempt(
             _ = &mut ceiling => return Err(TimeoutCause::StreamCeiling),
             // Arm 2: a fragment landed — reset the inactivity window.
             _ = handle.notified() => {
-                // A fragment moved: a live transfer keeps a client op's
-                // shutdown drain waiting for it, a stalled one ages out
-                // (#5838).
+                // A fragment moved: keep a client op's shutdown drain
+                // waiting for it (#5838).
                 crate::node::note_client_op_progress();
                 continue;
             }
@@ -2372,39 +2377,44 @@ mod tests {
         producer.await.expect("producer task panicked");
     }
 
-    /// #5838: each fragment of a streaming attempt run by a client-op
-    /// driver, and its final reply, must push that op's shutdown-drain
-    /// deadline out by the progress window, or a healthy transfer older
-    /// than `OPERATION_TTL` is abandoned at SIGTERM. Drives the real
+    /// #5838: a streaming attempt run by a client-op driver must keep that
+    /// op's shutdown-drain deadline a progress window ahead of its start,
+    /// of each fragment, and of its final reply, or a healthy transfer
+    /// older than `OPERATION_TTL` is abandoned at SIGTERM. Drives the real
     /// `await_streaming_attempt` inside the real `with_client_op_drain`
     /// scope, so a broken scope (whose note is a silent no-op) fails here.
     #[tokio::test(start_paused = true)]
     async fn streaming_attempt_notes_client_op_progress() {
-        use crate::node::op_state_manager_test_support::PROGRESS_WINDOW;
-        use crate::node::op_state_manager_test_support::{admit_test_client_op, deadlines};
+        use crate::node::op_state_manager_test_support::{
+            PROGRESS_WINDOW, admit_test_client_op, deadlines,
+        };
 
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
         let registry = deadlines();
         let guard = admit_test_client_op(&registry);
         // An old op: its admission deadline is long past.
         tokio::time::advance(Duration::from_secs(100)).await;
-        let stale = registry.latest_deadline().expect("op is registered");
-        assert!(stale < tokio::time::Instant::now());
+        let t0 = tokio::time::Instant::now();
+        assert!(registry.latest_deadline().unwrap() < t0);
 
-        let during = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        let observed = during.clone();
+        let samples = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observed = samples.clone();
         let observer_registry = registry.clone();
         let peer = tokio::spawn(async move {
             let (reply_sender, _outbound, _target) =
                 rx.recv().await.expect("outbound msg should be delivered");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let sample = |at| {
+                observed
+                    .lock()
+                    .push((at, observer_registry.latest_deadline().unwrap()));
+            };
+            tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
+            sample(tokio::time::Instant::now()); // before any fragment
+            tokio::time::sleep_until(t0 + Duration::from_secs(5)).await;
             handle.record(); // one fragment
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            *observed.lock() = Some((
-                tokio::time::Instant::now(),
-                observer_registry.latest_deadline(),
-            ));
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep_until(t0 + Duration::from_millis(5100)).await;
+            sample(tokio::time::Instant::now());
+            tokio::time::sleep_until(t0 + Duration::from_secs(10)).await;
             reply_sender
                 .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("reply channel accepts the reply");
@@ -2418,15 +2428,17 @@ mod tests {
         assert!(result.is_ok());
         peer.await.expect("peer task panicked");
 
-        let (sampled, in_flight) = during.lock().expect("observer sampled");
-        let in_flight = in_flight.expect("op is registered during the attempt");
+        let samples = samples.lock().clone();
         assert!(
-            in_flight >= sampled + PROGRESS_WINDOW - Duration::from_secs(1),
-            "a fragment must extend the drain deadline by the progress window \
-             (stale {stale:?}, after fragment {in_flight:?})"
+            samples[0].1 >= t0 + PROGRESS_WINDOW,
+            "starting the attempt must extend the drain deadline"
         );
         assert!(
-            registry.latest_deadline().expect("still registered") >= replied + PROGRESS_WINDOW,
+            samples[1].1 >= t0 + Duration::from_secs(5) + PROGRESS_WINDOW,
+            "a fragment must extend the drain deadline"
+        );
+        assert!(
+            registry.latest_deadline().unwrap() >= replied + PROGRESS_WINDOW,
             "the final reply must give the op's tail a progress window"
         );
     }

@@ -443,8 +443,8 @@ pub(crate) struct ClientOpGuard {
 /// waiting on summary-first probes; the drain waited its full 30 s for
 /// them and 8 were still running when it gave up.
 ///
-/// Locked once when an op starts, once when it ends, once per streaming
-/// phase it enters, and once per 200 ms drain poll. Never on a hot path.
+/// Locked when an op starts and ends, at most once a second per
+/// streaming op while it streams, and once per 200 ms drain poll.
 #[derive(Default)]
 pub(crate) struct ClientOpDeadlines {
     inner: Mutex<ClientOpDeadlinesInner>,
@@ -527,6 +527,7 @@ impl ClientOpGuard {
         ClientOpDrainHandle {
             deadlines: self.deadlines.clone(),
             id: self.id,
+            last_noted: std::cell::Cell::new(None),
         }
     }
 }
@@ -537,6 +538,9 @@ impl ClientOpGuard {
 pub(crate) struct ClientOpDrainHandle {
     deadlines: Arc<ClientOpDeadlines>,
     id: u64,
+    /// When this task last moved the deadline, so a stream's per-fragment
+    /// wakeups take the shared lock at most once a second.
+    last_noted: std::cell::Cell<Option<tokio::time::Instant>>,
 }
 
 tokio::task_local! {
@@ -554,28 +558,45 @@ pub(crate) async fn with_client_op_drain<F: std::future::Future>(
 }
 
 /// How long the shutdown drain keeps waiting for a client op after it
-/// last made progress (#5838): a fragment of a streaming PUT or GET
-/// stream, or the reply that ends a streaming transfer. Long enough to
-/// cover the gap between fragments of a slow but live stream and the
-/// short tail (finalize, deliver the result) after a transfer completes;
-/// short enough that a stalled stream is not waited for.
+/// last showed streaming activity (#5838): the start of a streaming PUT
+/// attempt or GET stream assembly, a fragment, or the reply or completion
+/// that ends it. This is the streaming attempt's own liveness rule
+/// (`STREAM_OP_INACTIVITY_TIMEOUT`): the phases before the first fragment
+/// and after the last one routinely run more than 30 s with nothing to
+/// record, and the drain should not call a transfer dead sooner than the
+/// transfer itself would. In practice it means a streaming op that is
+/// alive by that rule is waited for up to `drain_timeout`.
 pub(crate) const CLIENT_OP_PROGRESS_DRAIN_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
-/// Called by a client-op driver each time a long-running phase makes
-/// progress: a streaming PUT transfer or a GET stream assembly, which can
-/// legitimately outlast [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`]. The shutdown
-/// drain then keeps waiting for the op for at least
-/// [`CLIENT_OP_PROGRESS_DRAIN_WINDOW`] from now (#5838). An op that stops
-/// making progress, including a streaming PUT stuck retrying, ages out
-/// of the drain again.
+/// Minimum spacing between deadline updates from one task, so a fast
+/// stream's per-fragment wakeups do not each take the shared lock.
+const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Called by a client-op driver when a long-running streaming phase
+/// starts or makes progress: a streaming PUT attempt or a GET stream
+/// assembly, which can legitimately outlast
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`]. The shutdown drain then keeps
+/// waiting for the op for at least [`CLIENT_OP_PROGRESS_DRAIN_WINDOW`]
+/// from now (#5838). An op with no streaming activity for that long ages
+/// out of the drain. Calls closer together than
+/// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] are skipped.
 ///
 /// A no-op outside a `with_client_op_drain` scope: relay drivers share
-/// the streaming code, and sub-op GETs run on their own spawned tasks.
+/// the streaming code, and sub-op GETs (including the contract fetches a
+/// client UPDATE or SUBSCRIBE may wait on) run on their own spawned tasks.
 pub(crate) fn note_client_op_progress() {
     let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        let now = tokio::time::Instant::now();
+        if h.last_noted
+            .get()
+            .is_some_and(|last| now.duration_since(last) < CLIENT_OP_PROGRESS_NOTE_SPACING)
+        {
+            return;
+        }
+        h.last_noted.set(Some(now));
         h.deadlines
-            .extend_from_now(h.id, CLIENT_OP_PROGRESS_DRAIN_WINDOW)
+            .extend_from_now(h.id, CLIENT_OP_PROGRESS_DRAIN_WINDOW);
     });
 }
 

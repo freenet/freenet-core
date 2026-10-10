@@ -2147,34 +2147,18 @@ async fn cache_contract_locally(
     state_matches || put_persisted
 }
 
-/// Claim an orphan stream, await assembly, deserialize the payload,
-/// and cache the contract state locally.
-///
-/// Mirrors the originator-side streaming branch of the legacy
-/// `process_message` at `get.rs:2721-3196`. The driver is the only
-/// place this can run for driver GETs because the bypass at
-/// `node.rs::handle_pure_network_message_v1` forwards the
-/// `ResponseStreaming` envelope to the driver before
-/// `handle_op_request` — `process_message` never executes on the
-/// originator for driver ops (`load_or_init` would return
-/// `OpNotPresent`).
-///
-/// `peer_addr` is the sender's transport address — we use
-/// `driver.current_target.socket_addr()`. Multi-hop streamed GET IS now
-/// supported: relays fork+pipe the stream and re-key it with a fresh
-/// outbound `stream_id` per hop (#4307), so the originator always claims
-/// the stream keyed by its `current_target` (the immediate next hop),
-/// regardless of how many relays the response traversed. See #3883.
-/// Await a stream's `assembly`, noting client-op progress (#5838)
-/// whenever `received_fragments` has grown since the last check (once a
-/// second) and when assembly succeeds, so the shutdown drain keeps waiting
-/// for a client GET whose body is still streaming in and stops waiting
-/// for a stalled one. A no-op on the sub-op path, which has no client-op
+/// Await a stream's `assembly`, noting client-op progress (#5838) when it
+/// starts, whenever `received_fragments` has grown since the last check
+/// (once a second), and when assembly succeeds, so the shutdown drain
+/// keeps waiting for a client GET whose body is streaming in. A no-op on the sub-op path, which has no client-op
 /// scope. Called as `assemble_noting_progress(handle.assemble(), || ...)`.
 async fn assemble_noting_progress<T, E>(
     assembly: impl std::future::Future<Output = Result<T, E>>,
     received_fragments: impl Fn() -> usize,
 ) -> Result<T, E> {
+    // Assembly is under way: it is live until its own inactivity timeout,
+    // so keep a client GET's shutdown drain waiting for it (#5838).
+    crate::node::note_client_op_progress();
     tokio::pin!(assembly);
     let mut seen = received_fragments();
     let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -2198,6 +2182,24 @@ async fn assemble_noting_progress<T, E>(
     }
 }
 
+/// Claim an orphan stream, await assembly, deserialize the payload,
+/// and cache the contract state locally.
+///
+/// Mirrors the originator-side streaming branch of the legacy
+/// `process_message` at `get.rs:2721-3196`. The driver is the only
+/// place this can run for driver GETs because the bypass at
+/// `node.rs::handle_pure_network_message_v1` forwards the
+/// `ResponseStreaming` envelope to the driver before
+/// `handle_op_request` — `process_message` never executes on the
+/// originator for driver ops (`load_or_init` would return
+/// `OpNotPresent`).
+///
+/// `peer_addr` is the sender's transport address — we use
+/// `driver.current_target.socket_addr()`. Multi-hop streamed GET IS now
+/// supported: relays fork+pipe the stream and re-key it with a fresh
+/// outbound `stream_id` per hop (#4307), so the originator always claims
+/// the stream keyed by its `current_target` (the immediate next hop),
+/// regardless of how many relays the response traversed. See #3883.
 async fn assemble_and_cache_stream(
     op_manager: &OpManager,
     peer_addr: std::net::SocketAddr,
@@ -6818,15 +6820,9 @@ mod tests {
         );
     }
 
-    /// Bug #1 follow-through: `assemble_and_cache_stream` must claim
-    /// the stream by `(peer_addr, stream_id)`, await assembly, and
-    /// check the key matches before caching. The source-scrape
-    /// verifies the function's structure hasn't been simplified in a
-    /// way that would skip any of those steps.
-    /// #5838: while a client GET's body streams in, each check that sees
-    /// new fragments must extend the op's shutdown-drain deadline by the
-    /// progress window, and success must give the tail a window; a stall
-    /// must not extend it.
+    /// #5838: starting assembly, each check that sees new fragments, and
+    /// success must each extend a client GET's shutdown-drain deadline by
+    /// the progress window; checks that see no new fragments must not.
     #[tokio::test(start_paused = true)]
     async fn assembly_notes_client_op_progress_only_while_fragments_arrive() {
         use crate::node::op_state_manager_test_support::{
@@ -6857,8 +6853,8 @@ mod tests {
             let observed = observed.clone();
             let registry = registry.clone();
             tokio::spawn(async move {
-                for at in [6, 24] {
-                    tokio::time::sleep_until(t0 + Duration::from_secs(at)).await;
+                for at in [500, 6_000, 24_000] {
+                    tokio::time::sleep_until(t0 + Duration::from_millis(at)).await;
                     observed.lock().push((
                         tokio::time::Instant::now(),
                         registry.latest_deadline().unwrap(),
@@ -6882,19 +6878,20 @@ mod tests {
         observer.await.unwrap();
 
         let observed = observed.lock().clone();
-        let (at_6, deadline_6) = observed[0];
+        let (at_start, deadline_start) = observed[0];
+        assert!(
+            deadline_start >= at_start - Duration::from_millis(500) + PROGRESS_WINDOW,
+            "starting assembly must extend the deadline before any fragment arrives"
+        );
+        let (at_6, deadline_6) = observed[1];
         assert!(
             deadline_6 > stale && deadline_6 + Duration::from_secs(2) >= at_6 + PROGRESS_WINDOW,
             "fragments must keep the deadline a progress window ahead"
         );
-        let (at_24, deadline_24) = observed[1];
+        let (_at_24, deadline_24) = observed[2];
         assert_eq!(
             deadline_24, deadline_6,
             "no fragments arrived between 6 s and 24 s, so the deadline must not move"
-        );
-        assert!(
-            deadline_24 < at_24,
-            "after a long stall the op is past its deadline"
         );
         assert!(
             registry.latest_deadline().unwrap() >= done + PROGRESS_WINDOW,
@@ -6902,6 +6899,11 @@ mod tests {
         );
     }
 
+    /// Bug #1 follow-through: `assemble_and_cache_stream` must claim
+    /// the stream by `(peer_addr, stream_id)`, await assembly, and
+    /// check the key matches before caching. The source-scrape
+    /// verifies the function's structure hasn't been simplified in a
+    /// way that would skip any of those steps.
     #[test]
     fn assemble_and_cache_stream_performs_claim_assemble_key_check() {
         let src = production_source();
@@ -6914,7 +6916,7 @@ mod tests {
         );
         // Assembly runs through `assemble_noting_progress` (#5838).
         assert!(
-            body.contains("assemble_noting_progress(handle.assemble()"),
+            body.contains("assemble_noting_progress(handle.assemble()") && body.contains(".await"),
             "assemble_and_cache_stream must await stream assembly"
         );
         assert!(
