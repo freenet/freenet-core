@@ -89,7 +89,9 @@ use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
 #[cfg(test)]
 pub(crate) use op_state_manager::test_support as op_state_manager_test_support;
-pub(crate) use op_state_manager::{note_client_op_progress, with_client_op_drain};
+pub(crate) use op_state_manager::{
+    CLIENT_OP_TAIL_DRAIN_WINDOW, note_client_op_progress, with_client_op_drain,
+};
 
 mod network_bridge;
 
@@ -208,9 +210,10 @@ impl ShutdownHandle {
     /// the drain can react promptly when the counter clears.
     ///
     /// The deadline cut (#5838): an op's drain deadline is its admission
-    /// time plus `OPERATION_TTL`, pushed out to a stream-inactivity window
-    /// past each sign of activity in a streaming PUT attempt or GET stream
-    /// assembly (`note_client_op_progress`). Past it, the op is retrying, stalled,
+    /// time plus `OPERATION_TTL`, pushed out by each sign of activity in a
+    /// streaming PUT attempt or GET stream claim or assembly, by that
+    /// phase's own liveness window (`note_client_op_progress`). Past it,
+    /// the op is retrying, stalled,
     /// or still waiting on a peer that never answered (such as an
     /// unanswered summary-first probe, #5839), so holding the shutdown
     /// for it mostly buys a 30 s stop. On the `framework` test peer a
@@ -10157,6 +10160,11 @@ mod tests {
             (handle, counter, deadlines, rx)
         }
 
+        /// A streaming PUT attempt's liveness window, the longest phase
+        /// window drivers pass to `note_client_op_progress`.
+        const PUT_STREAM_WINDOW: Duration =
+            crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
+
         fn admit(
             counter: &Arc<AtomicUsize>,
             deadlines: &Arc<op_state_manager::ClientOpDeadlines>,
@@ -10273,7 +10281,7 @@ mod tests {
                 tokio::spawn(op_state_manager::with_client_op_drain(drain, async move {
                     // A fragment every 4 s, done after 12 s.
                     for _ in 0..3 {
-                        op_state_manager::note_client_op_progress();
+                        op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
                         tokio::time::sleep(Duration::from_secs(4)).await;
                     }
                     drop(streaming);
@@ -10307,13 +10315,10 @@ mod tests {
             let stalled = admit(&counter, &deadlines);
             tokio::time::advance(Duration::from_secs(90)).await;
             op_state_manager::with_client_op_drain(stalled.drain_handle(), async {
-                op_state_manager::note_client_op_progress();
+                op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
             })
             .await;
-            tokio::time::advance(
-                op_state_manager::CLIENT_OP_PROGRESS_DRAIN_WINDOW - Duration::from_secs(5),
-            )
-            .await;
+            tokio::time::advance(PUT_STREAM_WINDOW - Duration::from_secs(5)).await;
 
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
@@ -10349,9 +10354,9 @@ mod tests {
             )
             .await;
             // Unscoped: a no-op, so `other` stays past its deadline.
-            op_state_manager::note_client_op_progress();
+            op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
             op_state_manager::with_client_op_drain(scoped.drain_handle(), async {
-                op_state_manager::note_client_op_progress();
+                op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
             })
             .await;
 
@@ -10392,7 +10397,7 @@ mod tests {
             let drain = streaming.drain_handle();
             let transfer = tokio::spawn(op_state_manager::with_client_op_drain(drain, async {
                 loop {
-                    op_state_manager::note_client_op_progress();
+                    op_state_manager::note_client_op_progress(PUT_STREAM_WINDOW);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }));
@@ -10466,6 +10471,17 @@ mod tests {
                     "assemble_noting_progress(handle.assemble()"
                 ),
                 "GET stream assembly must go through assemble_noting_progress"
+            );
+            let assemble_and_cache = fn_body(get, "\nasync fn assemble_and_cache_stream(");
+            let claim_note = assemble_and_cache
+                .find("note_client_op_progress(STREAM_CLAIM_TIMEOUT)")
+                .expect("the GET stream claim wait must note client-op progress");
+            let claim = assemble_and_cache
+                .find(".claim_or_wait(")
+                .expect("assemble_and_cache_stream must claim the stream");
+            assert!(
+                claim_note < claim,
+                "the claim-wait note must come before the claim wait"
             );
 
             for (name, src, start) in [

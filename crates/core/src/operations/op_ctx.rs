@@ -673,7 +673,7 @@ async fn await_streaming_attempt(
     // `STREAM_OP_INACTIVITY_TIMEOUT` of silence) from the moment it starts;
     // keep a client op's shutdown drain waiting for it on the same terms
     // (#5838). Each fragment and the final reply note again below.
-    crate::node::note_client_op_progress();
+    crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
 
     let handle = progress.handle();
     // NOTE: deliberately NOT resetting the progress clock here, though
@@ -706,7 +706,7 @@ async fn await_streaming_attempt(
             reply = &mut round_trip => {
                 // The transfer ended with a reply: give the op's tail
                 // (finalize, deliver the result) its drain window (#5838).
-                crate::node::note_client_op_progress();
+                crate::node::note_client_op_progress(crate::node::CLIENT_OP_TAIL_DRAIN_WINDOW);
                 return Ok(reply);
             }
             // Arm 3: hard ceiling.
@@ -715,7 +715,7 @@ async fn await_streaming_attempt(
             _ = handle.notified() => {
                 // A fragment moved: keep a client op's shutdown drain
                 // waiting for it (#5838).
-                crate::node::note_client_op_progress();
+                crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
                 continue;
             }
             // Arm 2: inactivity window elapsed with no Notify ping. Before
@@ -2386,8 +2386,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn streaming_attempt_notes_client_op_progress() {
         use crate::node::op_state_manager_test_support::{
-            PROGRESS_WINDOW, admit_test_client_op, deadlines,
+            TAIL_WINDOW, admit_test_client_op, deadlines,
         };
+        const PROGRESS_WINDOW: Duration = STREAM_OP_INACTIVITY_TIMEOUT;
 
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
         let registry = deadlines();
@@ -2414,7 +2415,10 @@ mod tests {
             handle.record(); // one fragment
             tokio::time::sleep_until(t0 + Duration::from_millis(5100)).await;
             sample(tokio::time::Instant::now());
-            tokio::time::sleep_until(t0 + Duration::from_secs(10)).await;
+            // A long quiet phase after the last fragment (still inside the
+            // attempt's own inactivity window), so the reply's tail window
+            // reaches past the fragment's.
+            tokio::time::sleep_until(t0 + Duration::from_secs(205)).await;
             reply_sender
                 .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("reply channel accepts the reply");
@@ -2438,8 +2442,9 @@ mod tests {
             "a fragment must extend the drain deadline"
         );
         assert!(
-            registry.latest_deadline().unwrap() >= replied + PROGRESS_WINDOW,
-            "the final reply must give the op's tail a progress window"
+            registry.latest_deadline().unwrap() >= t0 + Duration::from_secs(5) + PROGRESS_WINDOW
+                && registry.latest_deadline().unwrap() >= replied + TAIL_WINDOW,
+            "the final reply must not shorten the deadline and must give the tail its window"
         );
     }
 

@@ -443,8 +443,8 @@ pub(crate) struct ClientOpGuard {
 /// waiting on summary-first probes; the drain waited its full 30 s for
 /// them and 8 were still running when it gave up.
 ///
-/// Locked when an op starts and ends, at most once a second per
-/// streaming op while it streams, and once per 200 ms drain poll.
+/// Locked when an op starts and ends, about once a second per streaming
+/// op while it streams, and once per 200 ms drain poll.
 #[derive(Default)]
 pub(crate) struct ClientOpDeadlines {
     inner: Mutex<ClientOpDeadlinesInner>,
@@ -538,8 +538,8 @@ impl ClientOpGuard {
 pub(crate) struct ClientOpDrainHandle {
     deadlines: Arc<ClientOpDeadlines>,
     id: u64,
-    /// When this task last moved the deadline, so a stream's per-fragment
-    /// wakeups take the shared lock at most once a second.
+    /// The deadline this task last set, so a stream's per-fragment
+    /// wakeups take the shared lock only when they move it by a second.
     last_noted: std::cell::Cell<Option<tokio::time::Instant>>,
 }
 
@@ -557,46 +557,44 @@ pub(crate) async fn with_client_op_drain<F: std::future::Future>(
     CLIENT_OP_DRAIN.scope(handle, driver).await
 }
 
-/// How long the shutdown drain keeps waiting for a client op after it
-/// last showed streaming activity (#5838): the start of a streaming PUT
-/// attempt or GET stream assembly, a fragment, or the reply or completion
-/// that ends it. This is the streaming attempt's own liveness rule
-/// (`STREAM_OP_INACTIVITY_TIMEOUT`): the phases before the first fragment
-/// and after the last one routinely run more than 30 s with nothing to
-/// record, and the drain should not call a transfer dead sooner than the
-/// transfer itself would. In practice it means a streaming op that is
-/// alive by that rule is waited for up to `drain_timeout`.
-pub(crate) const CLIENT_OP_PROGRESS_DRAIN_WINDOW: std::time::Duration =
-    crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
+/// Drain window for the tail of a client op after a streaming phase ends
+/// (finalize, deliver the result, a blocking subscribe): the same
+/// `OPERATION_TTL` a freshly admitted op gets (#5838).
+pub(crate) const CLIENT_OP_TAIL_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
 
-/// Minimum spacing between deadline updates from one task, so a fast
-/// stream's per-fragment wakeups do not each take the shared lock.
+/// Minimum extra reach before a task takes the shared lock again, so a
+/// fast stream's per-fragment wakeups do not each take it.
 const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Called by a client-op driver when a long-running streaming phase
-/// starts or makes progress: a streaming PUT attempt or a GET stream
-/// assembly, which can legitimately outlast
-/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`]. The shutdown drain then keeps
-/// waiting for the op for at least [`CLIENT_OP_PROGRESS_DRAIN_WINDOW`]
-/// from now (#5838). An op with no streaming activity for that long ages
-/// out of the drain. Calls closer together than
-/// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] are skipped.
+/// Called by a client-op driver when a long-running phase starts or makes
+/// progress: a streaming PUT attempt, a GET stream claim or assembly, or
+/// the reply or completion that ends one. These can legitimately outlast
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (#5838). `window` is that phase's
+/// own liveness rule: the timeout after which the phase itself would
+/// declare the stream dead (or, at a phase end,
+/// [`CLIENT_OP_TAIL_DRAIN_WINDOW`]). The shutdown drain then keeps
+/// waiting for the op for at least `window` from now, so it never gives
+/// up on a phase sooner than the phase itself would, and stops waiting
+/// once the phase has gone quiet for that long.
+///
+/// A call that would move the deadline less than
+/// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] past the last one this task made
+/// is skipped.
 ///
 /// A no-op outside a `with_client_op_drain` scope: relay drivers share
 /// the streaming code, and sub-op GETs (including the contract fetches a
 /// client UPDATE or SUBSCRIBE may wait on) run on their own spawned tasks.
-pub(crate) fn note_client_op_progress() {
+pub(crate) fn note_client_op_progress(window: std::time::Duration) {
     let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
-        let now = tokio::time::Instant::now();
+        let until = tokio::time::Instant::now() + window;
         if h.last_noted
             .get()
-            .is_some_and(|last| now.duration_since(last) < CLIENT_OP_PROGRESS_NOTE_SPACING)
+            .is_some_and(|last| until < last + CLIENT_OP_PROGRESS_NOTE_SPACING)
         {
             return;
         }
-        h.last_noted.set(Some(now));
-        h.deadlines
-            .extend_from_now(h.id, CLIENT_OP_PROGRESS_DRAIN_WINDOW);
+        h.last_noted.set(Some(until));
+        h.deadlines.extend_from_now(h.id, window);
     });
 }
 
@@ -6052,7 +6050,7 @@ pub(crate) mod test_support {
         Arc::new(ClientOpDeadlines::default())
     }
 
-    pub(crate) const PROGRESS_WINDOW: std::time::Duration = CLIENT_OP_PROGRESS_DRAIN_WINDOW;
+    pub(crate) const TAIL_WINDOW: std::time::Duration = CLIENT_OP_TAIL_DRAIN_WINDOW;
 
     pub(crate) fn admit_test_client_op(deadlines: &Arc<ClientOpDeadlines>) -> ClientOpGuard {
         ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone())
