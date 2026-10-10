@@ -2983,9 +2983,11 @@ mod tests {
             .find("_ = &mut ceiling =>")
             .expect("the hard-ceiling select arm must exist");
         let ceiling_arm = &body[ceiling_arm_start..];
+        // The arm runs up to the next select arm (it also ends the
+        // client-op drain phase, #5838, so it is no longer one line).
         let ceiling_arm_end = ceiling_arm
-            .find('\n')
-            .expect("the ceiling arm must be a single line");
+            .find("_ = handle.notified()")
+            .expect("the fragment arm must follow the ceiling arm");
         let ceiling_arm = &ceiling_arm[..ceiling_arm_end];
         assert!(
             ceiling_arm.contains("Err(TimeoutCause::StreamCeiling)"),

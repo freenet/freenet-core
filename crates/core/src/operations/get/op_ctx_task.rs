@@ -6893,9 +6893,10 @@ mod tests {
         );
         let after = registry.latest_deadline().unwrap();
         assert!(
-            after <= resolved + Duration::from_secs(2),
-            "once the claim resolves the extension must lapse within ~2 s, \
-             not run on to the claim's own 60 s bound"
+            after <= resolved + Duration::from_secs(3),
+            "once the claim resolves the extension must lapse within ~3 s \
+             (2 s window + 1 s note slack), not run on to the claim's own \
+             60 s bound"
         );
     }
 
