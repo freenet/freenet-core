@@ -219,6 +219,8 @@ impl StreamHandle {
             listener: None,
             #[cfg(test)]
             before_rearmed_listener_poll: None,
+            #[cfg(test)]
+            before_rearm_listen: None,
         }
     }
 
@@ -270,6 +272,8 @@ impl StreamHandle {
             listener: None,
             #[cfg(test)]
             before_rearmed_listener_poll: None,
+            #[cfg(test)]
+            before_rearm_listen: None,
         }
     }
 
@@ -366,7 +370,19 @@ impl StreamHandle {
     /// [`StreamError::InactivityTimeout`]. This prevents operations from hanging
     /// forever when the sending peer's connection dies mid-transfer.
     pub async fn assemble(&self) -> Result<Vec<u8>, StreamError> {
+        self.assemble_inner(|| {}).await
+    }
+
+    /// [`Self::assemble`], with `before_wait` run after each check and before
+    /// the wait: the window a test injects an arrival into (#5785).
+    async fn assemble_inner(&self, mut before_wait: impl FnMut()) -> Result<Vec<u8>, StreamError> {
         loop {
+            // Listener FIRST, then the checks (the event_listener pattern, as
+            // `poll_next` does): a fragment or a cancel() that lands after a
+            // check notifies this listener instead of going unseen until the
+            // inactivity timeout (#5785).
+            let listener = self.buffer.notifier().listen();
+
             // Check cancelled state
             if self.sync.read().cancelled {
                 // Aggregate receiver-abort counter (Group B telemetry). Recorded
@@ -399,12 +415,12 @@ impl StreamHandle {
                 );
             }
 
+            before_wait();
+
             // Wait for notification with inactivity timeout.
             // Each arriving fragment triggers a notification, so the timeout resets
             // on every fragment. Only fires when the stream is truly stalled.
-            match tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, self.buffer.notifier().listen())
-                .await
-            {
+            match tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, listener).await {
                 Ok(()) => { /* fragment arrived or stream cancelled — loop to check */ }
                 Err(_) => {
                     // Re-check before declaring timeout — a fragment may have arrived
@@ -482,6 +498,10 @@ pub struct StreamingInboundStream {
     /// Inject an arrival after the re-armed listener's buffer check, before its poll.
     #[cfg(test)]
     before_rearmed_listener_poll: Option<Box<dyn FnOnce() + Send + Sync>>,
+    /// Inject an event after the re-arm loop's cancellation check, before its
+    /// fresh listener is created (#5785).
+    #[cfg(test)]
+    before_rearm_listen: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StreamingInboundStream {
@@ -637,7 +657,19 @@ impl Stream for StreamingInboundStream {
                     }
                     // Spurious notification. Create a fresh listener,
                     // re-check, and register waker.
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_rearm_listen.take() {
+                        hook();
+                    }
                     self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
+                    // Listener first, then BOTH conditions (#5785): a cancel()
+                    // between the check at the top of this loop and listen()
+                    // notified no one, so the fresh listener never fires for
+                    // it — checked here, it is seen.
+                    if self.handle.sync.read().cancelled {
+                        self.listener = None;
+                        return Poll::Ready(Some(Err(StreamError::Cancelled)));
+                    }
                     if let Some(data) = self.try_get_fragment(next_idx) {
                         self.listener = None;
                         self.next_fragment = next_idx + 1;
@@ -891,6 +923,74 @@ mod tests {
             Poll::Ready(Some(Err(StreamError::Cancelled)))
         );
         assert!(stream.before_rearmed_listener_poll.is_none());
+    }
+
+    /// #5785: a cancel() between the re-arm loop's cancellation check and its
+    /// fresh listener must still be observed, not left Pending with no wake.
+    #[test]
+    fn test_rearm_cancellation_before_listen_is_observed() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        // Wake the listener without data or cancelling this consumer.
+        handle.fork().cancel();
+
+        stream.before_rearm_listen = Some(Box::new(move || handle.cancel()));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Err(StreamError::Cancelled)))
+        );
+        assert!(
+            stream.before_rearm_listen.is_none(),
+            "race hook did not run"
+        );
+    }
+
+    /// #5785: the final fragment arriving after `assemble()`'s checks and
+    /// before its wait is picked up at once, not after the inactivity timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_assemble_final_fragment_in_check_window() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let producer = handle.clone();
+        let mut pending = Some(Bytes::from_static(b"x"));
+        let started = tokio::time::Instant::now();
+        let data = handle
+            .assemble_inner(|| {
+                if let Some(last) = pending.take() {
+                    producer.push_fragment(1, last).unwrap();
+                }
+            })
+            .await
+            .expect("assembles");
+        assert_eq!(data, b"x".to_vec());
+        assert!(
+            started.elapsed() < STREAM_INACTIVITY_TIMEOUT,
+            "the fragment waited out the inactivity timeout ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// #5785: a cancel() in the same window ends `assemble()` at once.
+    #[tokio::test(start_paused = true)]
+    async fn test_assemble_cancel_in_check_window() {
+        let handle = StreamHandle::new(make_stream_id(), 2);
+        let canceller = handle.clone();
+        let mut once = true;
+        let started = tokio::time::Instant::now();
+        let out = handle
+            .assemble_inner(|| {
+                if std::mem::take(&mut once) {
+                    canceller.cancel();
+                }
+            })
+            .await;
+        assert!(matches!(out, Err(StreamError::Cancelled)), "{out:?}");
+        assert!(
+            started.elapsed() < STREAM_INACTIVITY_TIMEOUT,
+            "the cancel waited out the inactivity timeout ({:?})",
+            started.elapsed()
+        );
     }
 
     #[test]
