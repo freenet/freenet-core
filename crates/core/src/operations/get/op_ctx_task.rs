@@ -1591,11 +1591,6 @@ async fn drive_get_with_assembly_retry(
         };
 
         let stream_start = tokio::time::Instant::now();
-        // The header proved the contract exists and the body is now
-        // streaming in; keep a client GET's shutdown drain waiting for
-        // the assembly (#5838). Its inactivity timeout still ends a
-        // stalled stream.
-        crate::node::extend_client_op_drain(crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP);
         match assemble_and_cache_stream(
             op_manager,
             peer_addr,
@@ -2179,6 +2174,14 @@ async fn assemble_and_cache_stream(
     // Hosting attribution for the store below; see `cache_contract_locally`.
     cause: crate::ring::HostingCause,
 ) -> Result<StreamProgress, AssemblyFailure> {
+    // The header proved the contract exists and the body is streaming in;
+    // keep a client GET's shutdown drain waiting for the assembly while it
+    // runs (#5838). The stream's inactivity timeout still ends a stall, and
+    // the extension ends with this function, so a fall-back retry after a
+    // failed assembly is not held for. A no-op on the sub-op path.
+    let _drain_extension =
+        crate::node::extend_client_op_drain(crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP);
+
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
     // stream is left orphaned for GC), so the retry path is exercised

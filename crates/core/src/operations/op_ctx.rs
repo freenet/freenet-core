@@ -669,6 +669,13 @@ async fn await_streaming_attempt(
     use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
+    // A streaming transfer may legitimately run past the default
+    // shutdown-drain window while it makes progress; keep a client op's
+    // drain waiting for it, up to this attempt's hard ceiling, for as
+    // long as the attempt runs (#5838). The inactivity timeout below
+    // still ends a stalled transfer.
+    let _drain_extension = crate::node::extend_client_op_drain(STREAMING_ATTEMPT_TIMEOUT_CAP);
+
     let handle = progress.handle();
     // NOTE: deliberately NOT resetting the progress clock here, though
     // `StreamProgress` is built once per OPERATION and cloned per attempt so a
@@ -793,13 +800,6 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // up on EVERY exit (success, stall, ceiling, error) AND if this
             // future is cancelled or panics mid-`await`. It cannot leak.
             Some(progress) => {
-                // A streaming transfer may legitimately run past the
-                // default drain window while it makes progress; keep a
-                // client op's shutdown drain waiting for it (#5838). Its
-                // inactivity timeout still ends a stalled transfer.
-                crate::node::extend_client_op_drain(
-                    crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
-                );
                 let _progress_guard = crate::operations::stream_progress::StreamProgressGuard::new(
                     op_manager.stream_progress_registry().clone(),
                     attempt_tx,
@@ -2366,6 +2366,63 @@ mod tests {
         );
         assert_eq!(result.unwrap().unwrap().id(), &tx);
         producer.await.expect("producer task panicked");
+    }
+
+    /// #5838: a streaming attempt run by a client-op driver must push that
+    /// op's shutdown-drain deadline out to the attempt's hard ceiling, or
+    /// a healthy transfer older than `OPERATION_TTL` is abandoned at
+    /// SIGTERM. Drives the real `await_streaming_attempt` inside the real
+    /// `with_client_op_drain` scope, so a broken scope (whose extend would
+    /// be a silent no-op) fails here.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_attempt_extends_client_op_drain_deadline() {
+        use crate::node::op_state_manager_test_support::{admit_test_client_op, deadlines};
+        use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
+
+        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        let before = registry.latest_deadline().expect("op is registered");
+
+        let peer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            // Reply only after the observer below has sampled the deadline.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("reply channel accepts the reply");
+        });
+        let started = tokio::time::Instant::now();
+        let during = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let observed = during.clone();
+        let observer_registry = registry.clone();
+        // Sample the deadline while the attempt is in flight.
+        let observer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            *observed.lock() = observer_registry.latest_deadline();
+        });
+        let result = crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            await_streaming_attempt(&mut ctx, dummy_reply_with_tx(tx), &progress),
+        )
+        .await;
+        assert!(result.is_ok());
+        observer.await.expect("observer task panicked");
+        peer.await.expect("peer task panicked");
+
+        let in_flight = during.lock().expect("op is registered during the attempt");
+        assert!(
+            in_flight >= started + STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "while the streaming attempt runs, the drain deadline must reach \
+             its hard ceiling (before {before:?}, during {in_flight:?})"
+        );
+        assert_eq!(
+            registry.latest_deadline(),
+            Some(before),
+            "once the attempt ends, the extension must be dropped and the \
+             previous deadline restored"
+        );
     }
 
     /// Progress flows for 40 s then stops. The inactivity timeout MUST fire

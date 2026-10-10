@@ -418,8 +418,9 @@ impl Clone for OpManager {
 /// a branch can't leak count.
 ///
 /// The shutdown drain in `ShutdownHandle::shutdown` reads the counter
-/// via [`OpManager::inflight_client_op_count`] and waits for it to
-/// reach zero before letting the node tear down.
+/// and waits for it to reach zero before letting the node tear down,
+/// or until every op still counted is past its drain deadline in
+/// [`ClientOpDeadlines`] (#5838).
 pub(crate) struct ClientOpGuard {
     counter: Arc<AtomicUsize>,
     deadlines: Arc<ClientOpDeadlines>,
@@ -430,10 +431,9 @@ pub(crate) struct ClientOpGuard {
 /// client-originated driver, keyed by a monotonically increasing id.
 ///
 /// Each op gets a drain deadline of admission time plus
-/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, a
-/// non-streaming op has outlived its first attempt and is retrying
-/// against a route that already failed it, and the drain stops waiting
-/// for it. A driver that enters a phase which can legitimately take
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, the op
+/// is retrying, or still waiting on a peer that never answered, and the
+/// drain stops waiting for it. A driver that enters a phase which can legitimately take
 /// longer while making progress (a streaming PUT transfer, a GET stream
 /// assembly) pushes its deadline out with [`extend_client_op_drain`].
 /// A summary-first PUT probe that never got a reply does not: that is
@@ -453,8 +453,8 @@ pub(crate) struct ClientOpDeadlines {
 #[derive(Default)]
 struct ClientOpDeadlinesInner {
     next_id: u64,
-    /// id -> (admission time, drain deadline)
-    ops: std::collections::HashMap<u64, (tokio::time::Instant, tokio::time::Instant)>,
+    /// id -> drain deadline
+    ops: std::collections::HashMap<u64, tokio::time::Instant>,
 }
 
 /// Drain window for a client op whose driver does not set one:
@@ -466,21 +466,35 @@ pub(crate) const DEFAULT_CLIENT_OP_DRAIN_WINDOW: std::time::Duration = crate::co
 
 impl ClientOpDeadlines {
     pub(crate) fn register(&self, window: std::time::Duration) -> u64 {
-        let now = tokio::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + window;
         let mut inner = self.inner.lock();
         let id = inner.next_id;
         inner.next_id += 1;
-        inner.ops.insert(id, (now, now + window));
+        inner.ops.insert(id, deadline);
         id
     }
 
     /// Push op `id`'s drain deadline out to at least `window` from now.
-    fn extend_from_now(&self, id: u64, window: std::time::Duration) {
+    /// Returns the deadline it replaced, for [`ClientOpDrainExtension`]
+    /// to restore.
+    pub(crate) fn extend_from_now(
+        &self,
+        id: u64,
+        window: std::time::Duration,
+    ) -> Option<tokio::time::Instant> {
         let until = tokio::time::Instant::now() + window;
-        if let Some((_, deadline)) = self.inner.lock().ops.get_mut(&id) {
-            if *deadline < until {
-                *deadline = until;
-            }
+        let mut inner = self.inner.lock();
+        let deadline = inner.ops.get_mut(&id)?;
+        let prior = *deadline;
+        if *deadline < until {
+            *deadline = until;
+        }
+        Some(prior)
+    }
+
+    fn restore(&self, id: u64, prior: tokio::time::Instant) {
+        if let Some(deadline) = self.inner.lock().ops.get_mut(&id) {
+            *deadline = prior;
         }
     }
 
@@ -490,12 +504,7 @@ impl ClientOpDeadlines {
 
     /// The latest drain deadline among in-flight ops, if any.
     pub(crate) fn latest_deadline(&self) -> Option<tokio::time::Instant> {
-        self.inner
-            .lock()
-            .ops
-            .values()
-            .map(|(_, deadline)| *deadline)
-            .max()
+        self.inner.lock().ops.values().copied().max()
     }
 }
 
@@ -557,13 +566,38 @@ pub(crate) async fn with_client_op_drain<F: std::future::Future>(
 /// Called by a client-op driver when it starts a phase that can
 /// legitimately run past [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] while making
 /// progress: a streaming PUT transfer or a GET stream assembly, both
-/// bounded by their own inactivity timeouts. Lets the shutdown drain
-/// keep waiting for the op for up to `window` from now (#5838).
+/// bounded by their own inactivity timeouts. While the returned value is
+/// alive, the shutdown drain keeps waiting for the op for up to `window`
+/// from the call (#5838). Dropping it restores the previous deadline, so
+/// an op that falls back to ordinary retries after a failed stream is not
+/// held for.
 ///
 /// A no-op outside a client-op driver (relay drivers share the same
-/// retry loop and have no drain entry).
-pub(crate) fn extend_client_op_drain(window: std::time::Duration) {
-    let _not_a_client_op = CLIENT_OP_DRAIN.try_with(|h| h.deadlines.extend_from_now(h.id, window));
+/// streaming attempt code and have no drain entry).
+#[must_use = "the extension lasts only while the returned value is alive"]
+pub(crate) fn extend_client_op_drain(window: std::time::Duration) -> ClientOpDrainExtension {
+    let extended = CLIENT_OP_DRAIN
+        .try_with(|h| {
+            h.deadlines
+                .extend_from_now(h.id, window)
+                .map(|prior| (h.clone(), prior))
+        })
+        .ok()
+        .flatten();
+    ClientOpDrainExtension { extended }
+}
+
+/// Scope of one [`extend_client_op_drain`] call.
+pub(crate) struct ClientOpDrainExtension {
+    extended: Option<(ClientOpDrainHandle, tokio::time::Instant)>,
+}
+
+impl Drop for ClientOpDrainExtension {
+    fn drop(&mut self) {
+        if let Some((handle, prior)) = self.extended.take() {
+            handle.deadlines.restore(handle.id, prior);
+        }
+    }
 }
 
 impl Drop for ClientOpGuard {
@@ -5646,6 +5680,36 @@ mod tests {
         );
     }
 
+    /// `extend_from_now` only ever pushes a deadline out: a later, shorter
+    /// extension (e.g. a GET assembly after a streaming PUT phase) must
+    /// not pull it back in.
+    #[tokio::test(start_paused = true)]
+    async fn client_op_deadline_extension_never_shortens() {
+        let deadlines = ClientOpDeadlines::default();
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
+        let initial = deadlines.latest_deadline().unwrap();
+        assert_eq!(
+            deadlines.extend_from_now(id, std::time::Duration::from_secs(1)),
+            Some(initial)
+        );
+        assert_eq!(deadlines.latest_deadline().unwrap(), initial);
+        deadlines.extend_from_now(id, std::time::Duration::from_secs(600));
+        let extended = deadlines.latest_deadline().unwrap();
+        assert!(extended > initial);
+        assert_eq!(
+            deadlines.extend_from_now(id, std::time::Duration::from_secs(5)),
+            Some(extended)
+        );
+        assert_eq!(deadlines.latest_deadline().unwrap(), extended);
+        assert_eq!(
+            deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)),
+            None,
+            "an unknown op has nothing to extend"
+        );
+        deadlines.unregister(id);
+        assert!(deadlines.latest_deadline().is_none());
+    }
+
     /// Source-grep pin (#5838): a counted client op must always have a
     /// drain deadline. `ClientOpGuard::new` registers the deadline
     /// before the SeqCst counter bump, and `Drop` decrements before
@@ -5655,12 +5719,27 @@ mod tests {
     /// exercise the intended order.
     #[test]
     fn client_op_deadline_registered_while_counted() {
-        let op_state = include_str!("op_state_manager.rs");
-        let new_body = op_state
-            .split("fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("ClientOpGuard::new body must be findable");
+        // Production code only, so an anchor that moves cannot match this
+        // test's own string literals; method bodies end at their
+        // 4-space-indented closing brace.
+        let src = include_str!("op_state_manager.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("test module must be locatable")
+            .0;
+        let method_body = |sig: &str| -> &str {
+            let (_, after) = production
+                .split_once(sig)
+                .unwrap_or_else(|| panic!("{sig} not found in production code"));
+            after
+                .split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("end of {sig} not found"))
+                .0
+        };
+
+        let new_body = method_body(
+            "    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {",
+        );
         let register = new_body
             .find("deadlines.register(")
             .expect("ClientOpGuard::new must register a drain deadline");
@@ -5672,11 +5751,13 @@ mod tests {
             "ClientOpGuard::new must register the deadline BEFORE the counter bump"
         );
 
-        let drop_body = op_state
-            .split("impl Drop for ClientOpGuard {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("ClientOpGuard::drop body must be findable");
+        let (_, after_impl) = production
+            .split_once("impl Drop for ClientOpGuard {")
+            .expect("impl Drop for ClientOpGuard not found in production code");
+        let drop_body = after_impl
+            .split_once("\n    }\n")
+            .expect("end of ClientOpGuard::drop not found")
+            .0;
         let decrement = drop_body
             .find("self.counter.fetch_sub(1,")
             .expect("ClientOpGuard::drop must decrement the counter");
@@ -5970,5 +6051,19 @@ mod tests {
              after load_hosting_cache so restored hosted contracts serve locally and \
              rejoin anti-entropy (#4780)",
         );
+    }
+}
+
+/// Test-only access to real `ClientOpGuard`s from outside `crate::node`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn deadlines() -> Arc<ClientOpDeadlines> {
+        Arc::new(ClientOpDeadlines::default())
+    }
+
+    pub(crate) fn admit_test_client_op(deadlines: &Arc<ClientOpDeadlines>) -> ClientOpGuard {
+        ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone())
     }
 }

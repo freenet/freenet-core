@@ -87,6 +87,8 @@ pub use network_bridge::{EventLoopExitReason, NetworkStats, reset_channel_id_cou
 use crate::topology::rate::Rate;
 use crate::transport::{TransportKeypair, TransportPublicKey};
 pub(crate) use op_state_manager::OpManager;
+#[cfg(test)]
+pub(crate) use op_state_manager::test_support as op_state_manager_test_support;
 pub(crate) use op_state_manager::{extend_client_op_drain, with_client_op_drain};
 
 mod network_bridge;
@@ -205,10 +207,11 @@ impl ShutdownHandle {
     /// the drain can react promptly when the counter clears.
     ///
     /// The deadline cut (#5838): an op's drain deadline is its admission
-    /// time plus its first-attempt timeout (`OPERATION_TTL`, or longer
-    /// for a streaming PUT). Past it, the op is retrying against a route
-    /// that already failed it, so holding the shutdown for it mostly
-    /// buys a 30 s stop. On framework a SIGTERM caught 14 River PUTs
+    /// time plus `OPERATION_TTL`, pushed out for as long as it is in a
+    /// streaming PUT transfer or a GET stream assembly. Past it, the op
+    /// is retrying, or still waiting on a peer that never answered (such
+    /// as an unanswered summary-first probe, #5839), so holding the
+    /// shutdown for it mostly buys a 30 s stop. On framework a SIGTERM caught 14 River PUTs
     /// that were all 68-119 s old; the drain ran its full 30 s and 8
     /// were still unfinished.
     ///
@@ -261,7 +264,9 @@ impl ShutdownHandle {
                     return true;
                 }
                 if !self.has_drainable_client_op() {
-                    return false;
+                    // The last op may have finished between the two
+                    // checks; report that rather than an abandonment.
+                    return self.inflight_client_ops.load(Ordering::SeqCst) == 0;
                 }
                 tick.tick().await;
             }
@@ -10262,15 +10267,17 @@ mod tests {
             let streaming = admit(&counter, &deadlines);
             // In its summary-first probe for 50 s, then the transfer starts.
             tokio::time::advance(Duration::from_secs(50)).await;
-            op_state_manager::with_client_op_drain(streaming.drain_handle(), async {
-                op_state_manager::extend_client_op_drain(
-                    crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
-                );
-            })
-            .await;
+            let transfer =
+                op_state_manager::with_client_op_drain(streaming.drain_handle(), async {
+                    op_state_manager::extend_client_op_drain(
+                        crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+                    )
+                })
+                .await;
             tokio::time::advance(Duration::from_secs(40)).await;
             let finisher = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(12)).await;
+                drop(transfer);
                 drop(streaming);
             });
 
@@ -10289,31 +10296,77 @@ mod tests {
             ));
         }
 
-        /// Relay drivers share `drive_retry_loop` and so call
-        /// `extend_client_op_drain` too; outside a client-op scope it
-        /// must do nothing (and not panic), and it only ever extends the
-        /// op that installed the scope.
+        /// `extend_client_op_drain` reaches only the op whose driver
+        /// installed the scope, and outside any scope (relay drivers share
+        /// the streaming attempt code) it does nothing and does not panic.
         #[tokio::test(start_paused = true)]
         async fn extend_client_op_drain_only_touches_the_scoped_op() {
             let (handle, counter, deadlines, mut rx) =
                 make_handle_with_deadlines(Duration::from_secs(30));
             let other = admit(&counter, &deadlines);
-            op_state_manager::extend_client_op_drain(Duration::from_secs(600));
+            // Unscoped: a no-op.
+            let _unscoped = op_state_manager::extend_client_op_drain(Duration::from_secs(600));
             let scoped = admit(&counter, &deadlines);
-            op_state_manager::with_client_op_drain(scoped.drain_handle(), async {}).await;
-            drop(scoped);
+            let extension = op_state_manager::with_client_op_drain(scoped.drain_handle(), async {
+                op_state_manager::extend_client_op_drain(Duration::from_secs(600))
+            })
+            .await;
             tokio::time::advance(
                 op_state_manager::DEFAULT_CLIENT_OP_DRAIN_WINDOW + Duration::from_secs(1),
             )
             .await;
 
+            // `scoped` is extended, so the drain waits; it finishes after
+            // 3 s and the drain must then stop at once, because `other`
+            // was never extended and is past its deadline.
+            let finisher = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drop(extension);
+                drop(scoped);
+            });
             let start = tokio::time::Instant::now();
             handle.shutdown().await;
+            let elapsed = start.elapsed();
+            finisher.await.expect("finisher must not panic");
             assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "an unscoped extend must not have extended `other`"
+                elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+                "the drain must wait only for the scoped (extended) op; \
+                 waited {elapsed:?}"
+            );
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "`other` is still in flight"
             );
             drop(other);
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// An extended deadline never lets the drain run past
+        /// `drain_timeout`, the bound systemd's `TimeoutStopSec` is sized
+        /// against.
+        #[tokio::test(start_paused = true)]
+        async fn extended_op_is_still_bounded_by_drain_timeout() {
+            let (handle, counter, deadlines, mut rx) =
+                make_handle_with_deadlines(Duration::from_secs(30));
+            let streaming = admit(&counter, &deadlines);
+            let _transfer =
+                op_state_manager::with_client_op_drain(streaming.drain_handle(), async {
+                    op_state_manager::extend_client_op_drain(Duration::from_secs(600))
+                })
+                .await;
+
+            let start = tokio::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31),
+                "the drain must stop at drain_timeout (30 s); waited {elapsed:?}"
+            );
+            drop(streaming);
             assert!(matches!(
                 rx.recv().await.expect("Disconnect must be sent"),
                 NodeEvent::Disconnect { .. }
@@ -10327,43 +10380,59 @@ mod tests {
         /// be cut off at shutdown (the #4291 mirror-push failure).
         #[test]
         fn streaming_phases_extend_the_client_op_drain() {
-            let op_ctx = include_str!("operations/op_ctx.rs");
-            let streaming_arm = op_ctx
-                .split("Some(progress) => {")
-                .nth(1)
-                .and_then(|s| s.split("await_streaming_attempt(").next())
-                .expect("drive_retry_loop's streaming arm must be findable");
-            assert!(
-                streaming_arm.contains("extend_client_op_drain("),
-                "the streaming PUT attempt must extend the client-op drain deadline"
-            );
-
+            // A live (non-comment) call, so commenting it out goes red.
+            fn calls(code: &str, needle: &str) -> bool {
+                code.lines()
+                    .any(|l| l.contains(needle) && !l.trim_start().starts_with("//"))
+            }
+            // Production code only (an anchor that moves must not match a
+            // test module's string literals), and free-function bodies end
+            // at their column-0 closing brace.
+            fn production(src: &'static str) -> &'static str {
+                src.split_once("\n#[cfg(test)]\nmod ")
+                    .expect("test module must be locatable")
+                    .0
+            }
+            fn fn_body(src: &'static str, sig: &str) -> &'static str {
+                let (_, after) = production(src)
+                    .split_once(sig)
+                    .unwrap_or_else(|| panic!("{sig} not found in production code"));
+                after
+                    .split_once("\n}\n")
+                    .unwrap_or_else(|| panic!("end of {sig} not found"))
+                    .0
+            }
+            for (what, src, sig) in [
+                (
+                    "the streaming PUT attempt",
+                    include_str!("operations/op_ctx.rs"),
+                    "\nasync fn await_streaming_attempt(",
+                ),
+                (
+                    "GET stream assembly",
+                    include_str!("operations/get/op_ctx_task.rs"),
+                    "\nasync fn assemble_and_cache_stream(",
+                ),
+            ] {
+                assert!(
+                    calls(fn_body(src, sig), "let _drain_extension =")
+                        && calls(fn_body(src, sig), "extend_client_op_drain("),
+                    "{what} must hold a client-op drain extension for its duration"
+                );
+            }
             let get = include_str!("operations/get/op_ctx_task.rs");
-            let before_assembly = get
-                .split("match assemble_and_cache_stream(")
-                .next()
-                .and_then(|s| s.rsplit("let stream_start").next())
-                .expect("GET assembly call must be findable");
-            assert!(
-                before_assembly.contains("extend_client_op_drain("),
-                "GET stream assembly must extend the client-op drain deadline"
-            );
 
             for (name, src, start) in [
                 (
                     "put",
                     include_str!("operations/put/op_ctx_task.rs"),
-                    "pub(crate) async fn start_client_put(",
+                    "\npub(crate) async fn start_client_put(",
                 ),
-                ("get", get, "pub(crate) async fn start_client_get("),
+                ("get", get, "\npub(crate) async fn start_client_get("),
             ] {
-                let body = src
-                    .split(start)
-                    .nth(1)
-                    .and_then(|s| s.split("\n    Ok(client_tx)").next())
-                    .expect("start_client_* body must be findable");
+                let body = fn_body(src, start);
                 assert!(
-                    body.contains("with_client_op_drain("),
+                    calls(body, "with_client_op_drain("),
                     "start_client_{name} must run its driver inside with_client_op_drain"
                 );
             }

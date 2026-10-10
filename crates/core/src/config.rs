@@ -1878,7 +1878,7 @@ pub struct Config {
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
     /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
-    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// 45s in the generated unit (30s drain + 15s peer-teardown
     /// headroom) — raise both in lockstep if you raise this value;
     /// `TimeoutStopSec` is the hard ceiling at which systemd
     /// SIGKILLs the process.
