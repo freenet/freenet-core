@@ -90,7 +90,7 @@ pub(crate) use op_state_manager::OpManager;
 #[cfg(test)]
 pub(crate) use op_state_manager::test_support as op_state_manager_test_support;
 pub(crate) use op_state_manager::{
-    CLIENT_OP_TAIL_DRAIN_WINDOW, note_client_op_progress, with_client_op_drain,
+    note_client_op_phase_end, note_client_op_progress, with_client_op_drain,
 };
 
 mod network_bridge;
@@ -10473,15 +10473,12 @@ mod tests {
                 "GET stream assembly must go through assemble_noting_progress"
             );
             let assemble_and_cache = fn_body(get, "\nasync fn assemble_and_cache_stream(");
-            let claim_note = assemble_and_cache
-                .find("note_client_op_progress(STREAM_CLAIM_TIMEOUT)")
-                .expect("the GET stream claim wait must note client-op progress");
-            let claim = assemble_and_cache
-                .find(".claim_or_wait(")
-                .expect("assemble_and_cache_stream must claim the stream");
             assert!(
-                claim_note < claim,
-                "the claim-wait note must come before the claim wait"
+                calls(
+                    assemble_and_cache,
+                    "let handle = match claim_noting_progress("
+                ),
+                "the GET stream claim must go through claim_noting_progress"
             );
 
             for (name, src, start) in [

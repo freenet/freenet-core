@@ -2147,45 +2147,72 @@ async fn cache_contract_locally(
     state_matches || put_persisted
 }
 
+/// Await `phase`, calling `on_tick` at once and then once a second while
+/// it is still pending. Used to keep a client GET's shutdown-drain
+/// deadline (#5838) just ahead of a stream phase for exactly as long as
+/// the phase is alive.
+async fn await_with_ticks<T>(
+    phase: impl std::future::Future<Output = T>,
+    mut on_tick: impl FnMut(),
+) -> T {
+    tokio::pin!(phase);
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut phase => return result,
+            _ = tick.tick() => on_tick(),
+        }
+    }
+}
+
+/// Drain window refreshed each second while a stream phase is pending:
+/// a second of tick spacing plus a second of slack, so the deadline
+/// lapses within about 2 s of the phase ending.
+const PENDING_PHASE_DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await a GET stream `claim`, keeping a client GET's shutdown drain
+/// waiting for it only while the claim is still waiting (#5838). The
+/// claim's own bound is `STREAM_CLAIM_TIMEOUT`; once it resolves, the
+/// extension lapses within [`PENDING_PHASE_DRAIN_WINDOW`], so a stream
+/// that then stalls is not held for. A no-op on the sub-op path, which
+/// has no client-op scope.
+async fn claim_noting_progress<T>(claim: impl std::future::Future<Output = T>) -> T {
+    await_with_ticks(claim, || {
+        crate::node::note_client_op_progress(PENDING_PHASE_DRAIN_WINDOW)
+    })
+    .await
+}
+
 /// Await a stream's `assembly`, noting client-op progress (#5838) when it
 /// starts and whenever `received_fragments` has grown since the last
-/// check (once a second), with the transport's own stall window, and with
-/// the tail window when assembly succeeds. The shutdown drain then keeps
-/// waiting for a client GET whose body is streaming in, and stops soon
-/// after the stream stalls. A no-op on the sub-op path, which has no client-op
-/// scope. Called as `assemble_noting_progress(handle.assemble(), || ...)`.
+/// check (once a second), with the transport's own stall window plus the
+/// check spacing, and with the tail window when assembly succeeds. The
+/// shutdown drain then keeps waiting for a client GET whose body is
+/// streaming in, and stops soon after the stream stalls. A no-op on the
+/// sub-op path, which has no client-op scope.
 async fn assemble_noting_progress<T, E>(
     assembly: impl std::future::Future<Output = Result<T, E>>,
     received_fragments: impl Fn() -> usize,
 ) -> Result<T, E> {
-    // The transport's own stall rule for an inbound stream.
-    const FRAGMENT_WINDOW: std::time::Duration =
-        crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
-    // Assembly is under way: it is live until its own inactivity timeout,
-    // so keep a client GET's shutdown drain waiting for it on the same
-    // terms (#5838).
-    crate::node::note_client_op_progress(FRAGMENT_WINDOW);
-    tokio::pin!(assembly);
-    let mut seen = received_fragments();
-    let mut check = tokio::time::interval(std::time::Duration::from_secs(1));
-    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            result = &mut assembly => {
-                if result.is_ok() {
-                    crate::node::note_client_op_progress(crate::node::CLIENT_OP_TAIL_DRAIN_WINDOW);
-                }
-                return result;
-            }
-            _ = check.tick() => {
-                let received = received_fragments();
-                if received > seen {
-                    seen = received;
-                    crate::node::note_client_op_progress(FRAGMENT_WINDOW);
-                }
-            }
+    // The transport's own stall rule for an inbound stream, plus the
+    // one-second spacing of the checks below.
+    const FRAGMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(
+        crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() + 1,
+    );
+    let mut seen: Option<usize> = None;
+    let result = await_with_ticks(assembly, || {
+        let received = received_fragments();
+        if seen.is_none_or(|seen| received > seen) {
+            seen = Some(received);
+            crate::node::note_client_op_progress(FRAGMENT_WINDOW);
         }
+    })
+    .await;
+    if result.is_ok() {
+        crate::node::note_client_op_phase_end();
     }
+    result
 }
 
 /// Claim an orphan stream, await assembly, deserialize the payload,
@@ -2232,14 +2259,12 @@ async fn assemble_and_cache_stream(
         });
     }
 
-    // The header proved the contract exists; the stream may still be
-    // waiting to be claimed. Keep a client GET's shutdown drain waiting for
-    // as long as the claim itself would (#5838).
-    crate::node::note_client_op_progress(STREAM_CLAIM_TIMEOUT);
-    let handle = match op_manager
-        .orphan_stream_registry()
-        .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
-        .await
+    let handle = match claim_noting_progress(op_manager.orphan_stream_registry().claim_or_wait(
+        peer_addr,
+        stream_id,
+        STREAM_CLAIM_TIMEOUT,
+    ))
+    .await
     {
         Ok(h) => h,
         Err(OrphanStreamError::AlreadyClaimed) => {
@@ -6830,6 +6855,49 @@ mod tests {
         );
     }
 
+    /// #5838: a client GET's stream claim keeps the drain waiting only
+    /// while it is pending. Once it resolves, the extension must lapse
+    /// within a couple of seconds, so a stream that then stalls is not
+    /// held for the whole drain (the round-6 review finding).
+    #[tokio::test(start_paused = true)]
+    async fn claim_wait_holds_the_drain_only_while_pending() {
+        use crate::node::op_state_manager_test_support::{admit_test_client_op, deadlines};
+        use std::time::Duration;
+
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let t0 = tokio::time::Instant::now();
+
+        let mid = Arc::new(parking_lot::Mutex::new(None));
+        let observer = {
+            let mid = mid.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(t0 + Duration::from_millis(10_500)).await;
+                *mid.lock() = registry.latest_deadline();
+            })
+        };
+        crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            claim_noting_progress(tokio::time::sleep(Duration::from_secs(20))),
+        )
+        .await;
+        let resolved = tokio::time::Instant::now();
+        observer.await.unwrap();
+
+        assert!(
+            mid.lock().unwrap() > t0 + Duration::from_millis(10_500),
+            "a pending claim must keep the deadline ahead of now"
+        );
+        let after = registry.latest_deadline().unwrap();
+        assert!(
+            after <= resolved + Duration::from_secs(2),
+            "once the claim resolves the extension must lapse within ~2 s, \
+             not run on to the claim's own 60 s bound"
+        );
+    }
+
     /// #5838: starting assembly, each check that sees new fragments, and
     /// success must each extend a client GET's shutdown-drain deadline by
     /// the progress window; checks that see no new fragments must not.
@@ -6838,7 +6906,9 @@ mod tests {
         use crate::node::op_state_manager_test_support::{
             TAIL_WINDOW, admit_test_client_op, deadlines,
         };
-        use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT as FRAGMENT_WINDOW;
+        const FRAGMENT_WINDOW: Duration = Duration::from_secs(
+            crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() + 1,
+        );
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 

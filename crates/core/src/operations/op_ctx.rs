@@ -705,8 +705,10 @@ async fn await_streaming_attempt(
             // Arm 1: terminal reply (unchanged semantics).
             reply = &mut round_trip => {
                 // The transfer ended with a reply: give the op's tail
-                // (finalize, deliver the result) its drain window (#5838).
-                crate::node::note_client_op_progress(crate::node::CLIENT_OP_TAIL_DRAIN_WINDOW);
+                // (finalize, deliver the result, or the retry a rejection
+                // leads to; the reply kind is not distinguished) its drain
+                // window (#5838).
+                crate::node::note_client_op_phase_end();
                 return Ok(reply);
             }
             // Arm 3: hard ceiling.
@@ -2442,9 +2444,8 @@ mod tests {
             "a fragment must extend the drain deadline"
         );
         assert!(
-            registry.latest_deadline().unwrap() >= t0 + Duration::from_secs(5) + PROGRESS_WINDOW
-                && registry.latest_deadline().unwrap() >= replied + TAIL_WINDOW,
-            "the final reply must not shorten the deadline and must give the tail its window"
+            registry.latest_deadline().unwrap() == replied + TAIL_WINDOW,
+            "the final reply must give the op's tail exactly its window"
         );
     }
 

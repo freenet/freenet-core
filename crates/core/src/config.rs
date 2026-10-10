@@ -1871,12 +1871,13 @@ pub struct Config {
     /// Each op is waited for only until its own drain deadline: 60 s
     /// (`OPERATION_TTL`) after it was admitted, pushed out by streaming
     /// activity to whatever that phase's own liveness rule allows (240 s
-    /// of silence for a streaming PUT attempt, 60 s for a GET stream
-    /// claim, 5 s between a GET stream's fragments) and to 60 s after a
+    /// of silence for a streaming PUT attempt, a GET stream claim while it
+    /// is pending, about 6 s between a GET stream's fragments) and to 60 s after a
     /// streaming phase ends. An op past that deadline is retrying,
     /// stalled, or waiting on a peer that never answered, and is not
     /// waited for (#5838). Client UPDATE and SUBSCRIBE ops have no
-    /// streaming phase and get the 60 s window only.
+    /// streaming phase and get the 60 s window only. Every wait is still
+    /// bounded by this setting.
     ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which

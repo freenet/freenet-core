@@ -341,9 +341,9 @@ pub(crate) struct OpManager {
     /// connections. The drain is bounded by `config.shutdown_drain_secs`
     /// and by each op's drain deadline (`inflight_client_op_deadlines`).
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
-    /// Drain deadlines of the same drivers, so the drain can stop
-    /// waiting for ones that are already past their first attempt
-    /// deadline (#5838). See [`ClientOpDeadlines`].
+    /// Drain deadlines of the same drivers (admission + `OPERATION_TTL`,
+    /// pushed out by streaming progress), so the drain can stop waiting
+    /// for ones past theirs (#5838). See [`ClientOpDeadlines`].
     pub(crate) inflight_client_op_deadlines: Arc<ClientOpDeadlines>,
     /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
     /// begins, so `start_client_{put,get,update,subscribe}` can fail
@@ -475,7 +475,8 @@ impl ClientOpDeadlines {
     }
 
     /// Push op `id`'s drain deadline out to at least `window` from now.
-    /// Never pulls it in. Returns whether the op was found.
+    /// Never pulls it in. Returns whether the op was found (production
+    /// ignores it: an op that has already finished needs nothing).
     pub(crate) fn extend_from_now(&self, id: u64, window: std::time::Duration) -> bool {
         let until = tokio::time::Instant::now() + window;
         let mut inner = self.inner.lock();
@@ -486,6 +487,16 @@ impl ClientOpDeadlines {
             *deadline = until;
         }
         true
+    }
+
+    /// Set op `id`'s drain deadline to exactly `window` from now, for
+    /// the end of a phase whose longer window should not carry over.
+    /// `now + window` is never earlier than the admission deadline as
+    /// long as `window >= DEFAULT_CLIENT_OP_DRAIN_WINDOW`.
+    pub(crate) fn set_from_now(&self, id: u64, window: std::time::Duration) {
+        if let Some(deadline) = self.inner.lock().ops.get_mut(&id) {
+            *deadline = tokio::time::Instant::now() + window;
+        }
     }
 
     pub(crate) fn unregister(&self, id: u64) {
@@ -595,6 +606,21 @@ pub(crate) fn note_client_op_progress(window: std::time::Duration) {
         }
         h.last_noted.set(Some(until));
         h.deadlines.extend_from_now(h.id, window);
+    });
+}
+
+/// Called when a streaming phase ends (a PUT attempt's reply, a GET
+/// assembly's completion): sets the op's drain deadline to
+/// [`CLIENT_OP_TAIL_DRAIN_WINDOW`] from now, replacing the phase's longer
+/// window, so the tail (finalize, deliver, a blocking subscribe, or the
+/// retry a rejection leads to) gets exactly the window a fresh op gets
+/// (#5838). Never throttled. A no-op outside a client-op scope.
+pub(crate) fn note_client_op_phase_end() {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        h.last_noted.set(Some(
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        ));
+        h.deadlines.set_from_now(h.id, CLIENT_OP_TAIL_DRAIN_WINDOW);
     });
 }
 
@@ -5695,6 +5721,37 @@ mod tests {
         assert!(!deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)));
         deadlines.unregister(id);
         assert!(deadlines.latest_deadline().is_none());
+    }
+
+    /// A phase end lands even right after a fragment note (it is never
+    /// throttled), and it REPLACES a longer phase window: the tail after
+    /// a 240 s streaming PUT window gets exactly the tail window.
+    #[tokio::test(start_paused = true)]
+    async fn phase_end_lands_after_a_fragment_note_and_replaces_a_longer_window() {
+        let deadlines = Arc::new(ClientOpDeadlines::default());
+        let guard = ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone());
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(5));
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+            "a phase end 100 ms after a fragment note must land and set the tail window"
+        );
+        // A longer phase window does not carry over into the tail.
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(240));
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        );
     }
 
     /// Source-grep pin (#5838): a counted client op must always have a
