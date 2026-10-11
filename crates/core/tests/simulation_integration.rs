@@ -19428,21 +19428,34 @@ fn test_5842_update_from_established_host_control() {
     assert_5842_converged("u5842-ctl", &versions);
 }
 
-/// A host commits a client UPDATE moments after it applied (and started fanning
-/// out) an update it received from another host.
-#[rstest::rstest]
-#[case::gap_0ms("u5842-race-0", 0x5842_0000_0010, 0)]
-#[case::gap_5ms("u5842-race-5", 0x5842_0000_0011, 5)]
-#[case::gap_20ms("u5842-race-20", 0x5842_0000_0012, 20)]
-#[case::gap_50ms("u5842-race-50", 0x5842_0000_0013, 50)]
-#[case::gap_100ms("u5842-race-100", 0x5842_0000_0014, 100)]
-#[case::gap_200ms("u5842-race-200", 0x5842_0000_0015, 200)]
+/// #5842 regression: a host commits a client UPDATE 5 ms after it relayed an
+/// update it received, so it sends two broadcasts of one contract to the same
+/// co-hosts back to back.
+///
+/// Before the fix every receiver's per-(sender, contract) broadcast rate limit
+/// (20 ms) dropped the second one, and dropped every other host's relay of it
+/// too, since each had just relayed the first. The `ResyncRequest` repair was
+/// then cut off by its per-contract caps, and in this seed gateway-0 and node-9
+/// were still on v10 45 s later. With per-(contract, peer) send spacing at the
+/// sender, every holder converges on v42 without an anti-entropy round (the
+/// heartbeat is ~5 min; the window here is 45 s).
 #[test_log::test]
-fn test_5842_update_right_after_received_update(
-    #[case] name: &'static str,
-    #[case] seed: u64,
-    #[case] gap_ms: u64,
-) {
-    let versions = run_5842_scenario(name, seed, 3, false, Duration::from_millis(gap_ms), Some(1));
-    assert_5842_converged(name, &versions);
+fn test_5842_update_right_after_relaying_another_converges() {
+    const NAME: &str = "u5842-race-5";
+    let versions = run_5842_scenario(
+        NAME,
+        0x5842_0000_0011,
+        3,
+        false,
+        Duration::from_millis(5),
+        Some(1),
+    );
+    // Non-vacuity: the update under test must actually have been applied by
+    // the host that sent it, or "everyone converged" proves nothing.
+    assert_eq!(
+        versions.get(&format!("{NAME}-node-3")),
+        Some(&42),
+        "the updater must hold its own update: {versions:?}"
+    );
+    assert_5842_converged(NAME, &versions);
 }

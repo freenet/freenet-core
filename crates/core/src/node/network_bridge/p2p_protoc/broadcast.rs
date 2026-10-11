@@ -793,6 +793,28 @@ impl P2pConnManager {
         }
     }
 
+    #[cfg(feature = "simulation_tests")]
+    /// The timer half of the simulation fan-out's #5842 spacing: wait, then
+    /// run the fan-out for the legs it held back.
+    ///
+    /// A plain `fn` returning a boxed `Send` future on purpose. Spawning
+    /// `broadcast_state_to_peers` from inside itself would make its own future
+    /// type part of its body, and the compiler cannot then prove it `Send`;
+    /// this concrete boxed type breaks that cycle.
+    fn broadcast_held_legs(
+        bridge: P2pBridge,
+        op_manager: Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        held: crate::operations::update::BroadcastTargetResult,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            tokio::time::sleep(wait).await;
+            Self::broadcast_state_to_peers(bridge, &op_manager, key, new_state, held).await;
+        })
+    }
+
     /// Send state change broadcasts to interested peers.
     ///
     /// Used only in simulation tests for inline (deterministic) broadcast ordering.
@@ -864,6 +886,10 @@ impl P2pConnManager {
                 freenet_stdlib::prelude::StateSummary<'static>,
             )>,
         > = None;
+        // Targets this contract was broadcast to too recently (#5842), and the
+        // longest any of them must still wait. Sent by a timer below.
+        let mut held: Vec<crate::ring::PeerKeyLocation> = Vec::new();
+        let mut held_for = Duration::ZERO;
 
         for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
@@ -871,6 +897,15 @@ impl P2pConnManager {
             };
 
             let peer_key = PeerKey::from(target.pub_key().clone());
+
+            // #5842: the same per-(contract, peer) spacing the production queue
+            // applies in `drain_lane`. Sending inside it gets the second
+            // broadcast dropped by the receiver's rate limiter.
+            if let Some(wait) = op_manager.broadcast_spacing.remaining(key.id(), &peer_key) {
+                held.push(target.clone());
+                held_for = held_for.max(wait);
+                continue;
+            }
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -1212,7 +1247,37 @@ impl P2pConnManager {
                         crate::ring::interest::SummaryPopulationSource::Delivery,
                     );
                 }
+                op_manager
+                    .broadcast_spacing
+                    .record_sent(key.id(), &peer_key);
             }
+        }
+
+        // #5842: send the held legs once their spacing has passed, whether or
+        // not anything else happens in the meantime. The re-run reads the
+        // CURRENT state (the delta arm diffs the store, the full-state arm takes
+        // a snapshot), so a held leg carries the newest state when it goes, and
+        // it re-checks the spacing in case another fan-out sent to the peer
+        // first.
+        if !held.is_empty() {
+            let deferred = crate::operations::update::BroadcastTargetResult {
+                targets: held,
+                proximity_found: 0,
+                proximity_resolve_failed: 0,
+                interest_found: 0,
+                interest_resolve_failed: 0,
+                skipped_self: 0,
+                skipped_sender: 0,
+                skipped_covered: 0,
+            };
+            GlobalExecutor::spawn(Self::broadcast_held_legs(
+                bridge.clone(),
+                op_manager.clone(),
+                key,
+                new_state.clone(),
+                deferred,
+                held_for,
+            ));
         }
 
         // Emit broadcast emitted telemetry (issue #3622)

@@ -201,6 +201,11 @@ pub(crate) struct OpManager {
     /// because that event carries no provenance — see
     /// [`crate::ring::broadcast_coverage::BroadcastCoverageStore`].
     pub broadcast_coverage: Arc<crate::ring::broadcast_coverage::BroadcastCoverageStore>,
+    /// When each `(contract, peer)` pair last finished a broadcast, so the
+    /// fan-out never sends two of one contract to one peer closer together
+    /// than the receiver's rate limit allows (#5842). See
+    /// [`crate::node::network_bridge::broadcast_spacing`].
+    pub broadcast_spacing: Arc<crate::node::network_bridge::broadcast_spacing::BroadcastSpacing>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
     /// broadcast fan-out path and drained by a periodic background task that
     /// emits an INFO `update_propagation_summary` line per window. Restores
@@ -381,6 +386,7 @@ impl Clone for OpManager {
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             broadcast_coverage: self.broadcast_coverage.clone(),
+            broadcast_spacing: self.broadcast_spacing.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
@@ -799,6 +805,14 @@ impl OpManager {
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             broadcast_coverage: Arc::new(
                 crate::ring::broadcast_coverage::BroadcastCoverageStore::new(),
+            ),
+            // The spacing waits on tokio time (`tokio::time::sleep_until`), so
+            // it reads the same clock rather than the hosting override, which
+            // sims advance by hand.
+            broadcast_spacing: Arc::new(
+                crate::node::network_bridge::broadcast_spacing::BroadcastSpacing::new(Arc::new(
+                    InstantTimeSrc::new(),
+                )),
             ),
             update_propagation_stats,
             pending_broadcasts: Arc::new(

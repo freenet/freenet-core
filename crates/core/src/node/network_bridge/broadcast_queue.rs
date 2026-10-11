@@ -707,6 +707,7 @@ mod queue {
     use crate::node::OpManager;
     use crate::ring::{PeerKey, PeerKeyLocation};
 
+    use super::super::broadcast_spacing::BroadcastSpacing;
     use super::super::p2p_protoc::P2pBridge;
     use super::FanoutTargets;
     use super::{QueueScheduling, QueuedPayloadClass, SendLanePermit, broadcast_to_single_peer};
@@ -804,6 +805,18 @@ mod queue {
             state_size,
             delta_send_expected(interest_manager, delta_incompat, key, target),
         )
+    }
+
+    /// What [`QueueState::pop_ready`] found for a lane.
+    enum PopReady {
+        Ready(BroadcastEntry),
+        /// Entries are queued but none may be sent yet. `wake_in` is the
+        /// shortest remaining spacing among them; `None` means every blocked
+        /// entry waits on an in-flight send, whose completion wakes the lane.
+        Blocked {
+            wake_in: Option<std::time::Duration>,
+        },
+        Empty,
     }
 
     /// A pending broadcast entry in the queue.
@@ -1019,6 +1032,60 @@ mod queue {
             Some(entry)
         }
 
+        /// Pop the oldest entry queued for `lane` that may be SENT now (#5842):
+        /// no send for its `(contract, peer)` is in flight, and the previous one
+        /// finished at least `BROADCAST_PEER_SPACING` ago. An entry that is not
+        /// ready stays queued, so a newer state for the pair still replaces it.
+        fn pop_ready(
+            &mut self,
+            lane: QueuedPayloadClass,
+            now: Instant,
+            spacing: &BroadcastSpacing,
+        ) -> PopReady {
+            let order = match lane {
+                QueuedPayloadClass::Small => &self.small_order,
+                QueuedPayloadClass::Large => &self.large_order,
+            };
+            let mut blocked = false;
+            let mut wake_in: Option<std::time::Duration> = None;
+            let mut ready = None;
+            for (seq, key) in order {
+                if self.active.contains_key(key) {
+                    // Woken when that send finishes; see `ActiveSendGuard`.
+                    blocked = true;
+                    continue;
+                }
+                let peer = PeerKey::from(key.1.pub_key().clone());
+                if let Some(wait) = spacing.remaining(key.0.id(), &peer) {
+                    blocked = true;
+                    wake_in = Some(wake_in.map_or(wait, |w| w.min(wait)));
+                    continue;
+                }
+                ready = Some(*seq);
+                break;
+            }
+            let Some(seq) = ready else {
+                return if blocked {
+                    PopReady::Blocked { wake_in }
+                } else {
+                    PopReady::Empty
+                };
+            };
+            let key = self
+                .order_mut(lane)
+                .remove(&seq)
+                .expect("seq was read from this order map under the same lock");
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("order maps and entries are mutated together");
+            debug_assert_eq!(entry.lane, lane, "entry popped from the wrong lane");
+            if matches!(lane, QueuedPayloadClass::Small) {
+                self.set_small_queued(self.small_queued.saturating_sub(1), now);
+            }
+            PopReady::Ready(entry)
+        }
+
         /// Drop the globally oldest entry across both lanes (capacity eviction).
         fn evict_oldest(&mut self, now: Instant) -> Option<BroadcastEntry> {
             let oldest_small = self.small_order.keys().next().copied();
@@ -1104,9 +1171,31 @@ mod queue {
         queue: Arc<Mutex<QueueState>>,
         key: DedupeKey,
         tracked: bool,
+        /// Stamped and woken when the send ends, however it ends (#5842): the
+        /// pair's next send must wait out the spacing from HERE, and a lane
+        /// holding that next send has nothing else to wake it.
+        group: LaneGroup,
+        spaced: bool,
     }
 
     impl ActiveSendGuard {
+        /// Start the pair's spacing interval and wake both lanes. Runs exactly
+        /// once per send, from `finish` or from `Drop`.
+        ///
+        /// Stamped even when the send turned out to be a converged-peer skip:
+        /// the queue cannot see that from here, and the cost is that the pair's
+        /// next real send waits at most one spacing interval.
+        fn space(&mut self) {
+            if self.spaced {
+                return;
+            }
+            self.spaced = true;
+            let peer = PeerKey::from(self.key.1.pub_key().clone());
+            self.group.spacing.record_sent(self.key.0.id(), &peer);
+            self.group.small_notify.notify_one();
+            self.group.large_notify.notify_one();
+        }
+
         /// Normal completion path: update the refcount directly and disarm the
         /// cancellation fallback. The caller releases its semaphore permit
         /// first, so diagnostic cleanup never holds scheduler capacity idle.
@@ -1115,23 +1204,42 @@ mod queue {
                 self.queue.lock().await.untrack_active(&self.key);
                 self.tracked = false;
             }
+            // After the untrack, so a lane woken here sees the pair idle.
+            self.space();
         }
     }
 
     impl Drop for ActiveSendGuard {
         fn drop(&mut self) {
             if !self.tracked {
+                self.space();
                 return;
             }
-            if let Ok(mut queue) = self.queue.try_lock() {
-                queue.untrack_active(&self.key);
+            let untracked_now = match self.queue.try_lock() {
+                Ok(mut queue) => {
+                    queue.untrack_active(&self.key);
+                    true
+                }
+                Err(_) => false,
+            };
+            if untracked_now {
+                self.space();
                 return;
             }
             let queue = self.queue.clone();
             let key = self.key.clone();
+            let group = self.group.clone();
+            // Stamp now; the wakeup must follow the untrack or a woken lane
+            // would still see the pair in flight and park with nothing left to
+            // wake it.
+            let peer = PeerKey::from(key.1.pub_key().clone());
+            group.spacing.record_sent(key.0.id(), &peer);
+            self.spaced = true;
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     queue.lock().await.untrack_active(&key);
+                    group.small_notify.notify_one();
+                    group.large_notify.notify_one();
                 });
             }
         }
@@ -1343,6 +1451,7 @@ mod queue {
                 upgrade_slots,
                 small_notify: self.small_notify.clone(),
                 large_notify: self.large_notify.clone(),
+                spacing: op_manager.broadcast_spacing.clone(),
             };
 
             let spawn_lane = |lane| {
@@ -1398,6 +1507,9 @@ mod queue {
         upgrade_slots: Arc<Semaphore>,
         small_notify: Arc<Notify>,
         large_notify: Arc<Notify>,
+        /// Per-`(contract, peer)` send spacing (#5842), shared with the
+        /// simulation fan-out through `OpManager::broadcast_spacing`.
+        spacing: Arc<BroadcastSpacing>,
     }
 
     impl LaneGroup {
@@ -1484,10 +1596,20 @@ mod queue {
 
             // Drain all available entries
             let mut drained_any = false;
+            // Set when the lane still holds entries that may not be sent yet:
+            // how long until the nearest one may (#5842).
+            let mut wake_in: Option<std::time::Duration> = None;
             loop {
                 let (entry, active_tracked) = {
                     let mut q = queue.lock().await;
-                    let entry = q.pop_lane(lane, Instant::now());
+                    let entry = match q.pop_ready(lane, Instant::now(), &group.spacing) {
+                        PopReady::Ready(entry) => Some(entry),
+                        PopReady::Blocked { wake_in: next } => {
+                            wake_in = next;
+                            None
+                        }
+                        PopReady::Empty => None,
+                    };
                     let active_tracked = entry.as_ref().is_none_or(|entry| {
                         let tracked = q.track_active((entry.key, entry.target.clone()));
                         if !tracked {
@@ -1526,6 +1648,8 @@ mod queue {
                     queue: queue.clone(),
                     key: (entry.key, entry.target.clone()),
                     tracked: active_tracked,
+                    group: group.clone(),
+                    spaced: false,
                 };
                 let permit = semaphore.clone().acquire_owned().await;
                 let hol_metrics = hol_block.as_ref().and_then(HolBlockHandle::finish_now);
@@ -1575,8 +1699,19 @@ mod queue {
             }
 
             if !drained_any {
-                // This lane was empty, wait for new entries
-                notified.await;
+                // Nothing could be sent: wait for an enqueue, a finished send
+                // (`ActiveSendGuard` wakes both lanes), or the end of the
+                // nearest spacing interval. The timer is what sends a held
+                // state when nothing else happens (#5842).
+                match wake_in {
+                    Some(wait) => {
+                        tokio::select! {
+                            () = notified => {}
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                    }
+                    None => notified.await,
+                }
                 // ...which may have been the sibling drain shutting us down
                 // rather than an enqueue. `LaneDrainGuard` would shut the
                 // sibling down on the way out regardless; the explicit call
@@ -1599,6 +1734,12 @@ mod queue {
     mod observation_tests {
         use super::*;
         use std::time::Duration;
+
+        fn test_spacing() -> Arc<BroadcastSpacing> {
+            Arc::new(BroadcastSpacing::new(Arc::new(
+                crate::util::time_source::InstantTimeSrc::new(),
+            )))
+        }
 
         #[test]
         fn hol_integral_includes_small_entries_arriving_during_wait() {
@@ -1850,6 +1991,7 @@ mod queue {
                 upgrade_slots,
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let workers = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
                 .into_iter()
@@ -1991,6 +2133,7 @@ mod queue {
                 upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let worker = tokio::spawn(drain_lane(
@@ -2049,6 +2192,119 @@ mod queue {
                  delivered to"
             );
             assert_ne!(*dispatched, *superseded);
+
+            worker.abort();
+        }
+
+        /// #5842: the queue never runs two sends for one `(contract, peer)` at
+        /// once, and the next one waits out `BROADCAST_PEER_SPACING` after the
+        /// previous finished. Then it goes on its own, with nothing else
+        /// enqueued, carrying the newest state. A different peer is not held.
+        ///
+        /// Before the fix the second send was dispatched while the first was
+        /// still in flight, so the receiver saw two broadcasts of one contract
+        /// milliseconds apart and its rate limiter dropped the second.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn a_pair_sends_one_at_a_time_and_the_held_state_goes_after_the_spacing() {
+            use super::super::super::broadcast_spacing::BROADCAST_PEER_SPACING;
+
+            let queue = BroadcastQueue::new();
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(4)),
+                large_pool: Arc::new(Semaphore::new(4)),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
+            };
+            // The first dispatch holds its send open until released; the rest
+            // complete at once.
+            let release = Arc::new(Notify::new());
+            let first = Arc::new(AtomicBool::new(true));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = {
+                let release = release.clone();
+                tokio::spawn(drain_lane(
+                    QueuedPayloadClass::Small,
+                    queue.queue.clone(),
+                    group,
+                    move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                        let tx = tx.clone();
+                        let release = release.clone();
+                        let hold = first.swap(false, Ordering::SeqCst);
+                        async move {
+                            let _scheduling = scheduling;
+                            drop(tx.send((
+                                entry.target.clone(),
+                                entry.new_state.size(),
+                                tokio::time::Instant::now(),
+                            )));
+                            if hold {
+                                release.notified().await;
+                            }
+                        }
+                    },
+                ))
+            };
+            async fn next<T>(
+                rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+            ) -> Result<Option<T>, tokio::time::error::Elapsed> {
+                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            }
+
+            let key = contract(58);
+            let peer = PeerKeyLocation::random();
+            let other = PeerKeyLocation::random();
+            let enqueue = |target: &PeerKeyLocation, size: usize| {
+                queue.enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(size),
+                    super::super::no_fanout(),
+                )
+            };
+
+            enqueue(&peer, 1).await;
+            let (to, size, _) = next(&mut rx).await.unwrap().unwrap();
+            assert_eq!((to, size), (peer.clone(), 1));
+
+            // Two newer states for the busy pair, and one for another peer.
+            enqueue(&peer, 2).await;
+            enqueue(&peer, 3).await;
+            enqueue(&other, 9).await;
+            let (to, size, _) = next(&mut rx).await.unwrap().unwrap();
+            assert_eq!(
+                (to, size),
+                (other.clone(), 9),
+                "another peer must not wait behind the busy pair"
+            );
+            assert!(
+                next(&mut rx).await.is_err(),
+                "a second send for the pair must not start while the first is in flight"
+            );
+
+            // tokio time: under `start_paused` it is the clock the spacing
+            // and its timer run on.
+            let finished = tokio::time::Instant::now();
+            release.notify_one();
+            let (to, size, sent_at) = next(&mut rx)
+                .await
+                .expect("the held state must go when the spacing ends, with nothing else enqueued")
+                .unwrap();
+            assert_eq!(to, peer);
+            assert_eq!(size, 3, "the held entry carries the newest state");
+            assert!(
+                sent_at.duration_since(finished) >= BROADCAST_PEER_SPACING,
+                "sent {:?} after the previous send finished; the spacing is {:?}",
+                sent_at.duration_since(finished),
+                BROADCAST_PEER_SPACING
+            );
+            assert!(
+                next(&mut rx).await.is_err(),
+                "the superseded state is never sent"
+            );
 
             worker.abort();
         }
@@ -2157,6 +2413,7 @@ mod queue {
                 upgrade_slots: Arc::new(Semaphore::new(2)),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let (tx, mut ran) = tokio::sync::mpsc::unbounded_channel();
             let workers: Vec<_> = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
@@ -2266,6 +2523,7 @@ mod queue {
                 upgrade_slots: upgrade_slots.clone(),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             // Large-lane sends HOLD their permit until the test releases them,
             // so the large pool stays saturated and every small send mispredicts
