@@ -29,6 +29,9 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(any(test, feature = "simulation_tests"))]
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
@@ -72,6 +75,11 @@ type PairKey = (ContractInstanceId, PeerKey);
 /// expires on its own within one interval.
 pub(crate) struct BroadcastSpacing {
     last_sent: DashMap<PairKey, Instant>,
+    /// Pairs with a send in progress on a path that has no queue of its own
+    /// (the simulation fan-out). The production queue tracks this in its own
+    /// `active` map. An entry lives only as long as its [`SendClaim`].
+    #[cfg(any(test, feature = "simulation_tests"))]
+    in_flight: DashMap<PairKey, ()>,
     time_source: DynTimeSource,
     spacing: Duration,
     prune_at: AtomicUsize,
@@ -86,6 +94,8 @@ impl BroadcastSpacing {
     pub(crate) fn with_spacing(time_source: DynTimeSource, spacing: Duration) -> Self {
         Self {
             last_sent: DashMap::new(),
+            #[cfg(any(test, feature = "simulation_tests"))]
+            in_flight: DashMap::new(),
             time_source,
             spacing,
             prune_at: AtomicUsize::new(PRUNE_AT),
@@ -143,6 +153,32 @@ impl BroadcastSpacing {
         self.last_sent.insert(key, now);
     }
 
+    /// Claim `(contract, peer)` for a send, or say how long to wait. The
+    /// claim blocks other sends to the pair until it is dropped, and dropping
+    /// it starts the spacing interval: the interval runs from the END of the
+    /// send, however long the send took.
+    #[cfg(any(test, feature = "simulation_tests"))]
+    pub(crate) fn try_begin(
+        self: &Arc<Self>,
+        contract: &ContractInstanceId,
+        peer: &PeerKey,
+    ) -> Result<SendClaim, Duration> {
+        let key = (*contract, peer.clone());
+        if let Some(wait) = self.remaining(contract, peer) {
+            return Err(wait);
+        }
+        match self.in_flight.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(self.spacing),
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(());
+                Ok(SendClaim {
+                    spacing: self.clone(),
+                    key,
+                })
+            }
+        }
+    }
+
     fn prune(&self, now: Instant) {
         let spacing = self.spacing;
         self.last_sent
@@ -160,9 +196,26 @@ impl BroadcastSpacing {
     }
 }
 
+/// A send in progress for one `(contract, peer)`, from
+/// [`BroadcastSpacing::try_begin`]. Dropping it stamps the pair and then
+/// releases it, in that order, so no other send can see the pair as free
+/// before its interval has started.
+#[cfg(any(test, feature = "simulation_tests"))]
+pub(crate) struct SendClaim {
+    spacing: Arc<BroadcastSpacing>,
+    key: PairKey,
+}
+
+#[cfg(any(test, feature = "simulation_tests"))]
+impl Drop for SendClaim {
+    fn drop(&mut self) {
+        self.spacing.record_sent(&self.key.0, &self.key.1);
+        self.spacing.in_flight.remove(&self.key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::transport::TransportKeypair;
@@ -223,8 +276,7 @@ mod tests {
             "\n    }\n}\n",
         );
         for needle in [
-            "op_manager.broadcast_spacing.remaining(key.id(), &peer_key)",
-            ".record_sent(key.id(), &peer_key)",
+            "op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)",
             "Self::broadcast_held_legs(",
         ] {
             assert!(
@@ -232,6 +284,18 @@ mod tests {
                 "the simulation fan-out must apply the spacing: missing `{needle}`"
             );
         }
+
+        // The targeted heal shares the queue in production; the simulation
+        // calls the send directly, so it must take the same claim.
+        let heal = region(
+            SIM_SRC,
+            "    pub(super) async fn handle_sync_state_to_peer(",
+            "\n    }\n",
+        );
+        assert!(
+            heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)"),
+            "the simulation heal path must apply the spacing"
+        );
     }
 
     /// #5842: a full-state leg must send the state its summary describes, on
@@ -277,6 +341,29 @@ mod tests {
             fetch < summarize,
             "the summary must be taken after the state is read, in the same arm"
         );
+    }
+
+    #[test]
+    fn a_claimed_pair_waits_for_the_send_to_end_and_then_the_interval() {
+        let clock = SharedMockTimeSource::new();
+        let spacing = Arc::new(BroadcastSpacing::new(Arc::new(clock.clone())));
+        let p = peer();
+        let claim = spacing.try_begin(&contract(1), &p).expect("free pair");
+        // A long send: the claim outlives the interval and still blocks.
+        clock.advance_time(BROADCAST_PEER_SPACING * 3);
+        assert!(spacing.try_begin(&contract(1), &p).is_err(), "in flight");
+        assert!(
+            spacing.try_begin(&contract(1), &peer()).is_ok(),
+            "other pair"
+        );
+        drop(claim);
+        assert_eq!(
+            spacing.try_begin(&contract(1), &p).err(),
+            Some(BROADCAST_PEER_SPACING),
+            "the interval starts when the send ends"
+        );
+        clock.advance_time(BROADCAST_PEER_SPACING);
+        assert!(spacing.try_begin(&contract(1), &p).is_ok());
     }
 
     #[test]

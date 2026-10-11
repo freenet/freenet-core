@@ -780,16 +780,45 @@ impl P2pConnManager {
         }
         #[cfg(feature = "simulation_tests")]
         {
-            super::super::broadcast_queue::broadcast_to_single_peer(
-                &self.bridge,
-                op_manager,
-                key,
-                new_state,
-                target,
-                None,
-                super::super::broadcast_queue::no_fanout(),
-            )
-            .await;
+            // #5842: the same per-pair spacing as the fan-out. Production gets
+            // it from the shared queue; here a heal that would land inside the
+            // interval is handed to the held-legs timer instead.
+            let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
+            match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(_claim) => {
+                    super::super::broadcast_queue::broadcast_to_single_peer(
+                        &self.bridge,
+                        op_manager,
+                        key,
+                        new_state,
+                        target,
+                        None,
+                        super::super::broadcast_queue::no_fanout(),
+                    )
+                    .await;
+                }
+                Err(wait) => {
+                    crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
+                    let held = crate::operations::update::BroadcastTargetResult {
+                        targets: vec![target],
+                        proximity_found: 0,
+                        proximity_resolve_failed: 0,
+                        interest_found: 0,
+                        interest_resolve_failed: 0,
+                        skipped_self: 0,
+                        skipped_sender: 0,
+                        skipped_covered: 0,
+                    };
+                    GlobalExecutor::spawn(Self::broadcast_held_legs(
+                        self.bridge.clone(),
+                        op_manager.clone(),
+                        key,
+                        new_state,
+                        held,
+                        wait,
+                    ));
+                }
+            }
         }
     }
 
@@ -901,19 +930,21 @@ impl P2pConnManager {
             // #5842: the same per-(contract, peer) spacing the production queue
             // applies in `drain_lane`. Sending inside it gets the second
             // broadcast dropped by the receiver's rate limiter.
-            if let Some(wait) = op_manager.broadcast_spacing.remaining(key.id(), &peer_key) {
-                crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
-                held.push(target.clone());
-                held_for = held_for.max(wait);
-                continue;
-            }
-            // Claim the pair before the awaits below (snapshot, delta, send).
-            // A held-legs task or another fan-out that runs in between must see
-            // it as sent, or both send back to back. Re-stamped on success, and
-            // like production a converged skip still counts as a send.
-            op_manager
-                .broadcast_spacing
-                .record_sent(key.id(), &peer_key);
+            //
+            // The claim is held across the awaits below (snapshot, delta, send)
+            // and released at the end of this iteration, which stamps the pair:
+            // a held-legs task or another fan-out cannot start a second send to
+            // it meanwhile, and the interval runs from the end of this one. Like
+            // production, a converged skip still counts as a send.
+            let _claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(claim) => claim,
+                Err(wait) => {
+                    crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
+                    held.push(target.clone());
+                    held_for = held_for.max(wait);
+                    continue;
+                }
+            };
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -1255,9 +1286,6 @@ impl P2pConnManager {
                         crate::ring::interest::SummaryPopulationSource::Delivery,
                     );
                 }
-                op_manager
-                    .broadcast_spacing
-                    .record_sent(key.id(), &peer_key);
             }
         }
 
