@@ -2836,7 +2836,7 @@ impl Ring {
 
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
-    const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
+    pub(crate) const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
 
     /// Stop spawning mid-cycle when remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 75% full).

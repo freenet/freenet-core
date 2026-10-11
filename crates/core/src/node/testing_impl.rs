@@ -2041,7 +2041,9 @@ impl SimNetwork {
     /// Opt this simulation into advertising startup-hosted contracts
     /// (`SeedHostedContract`) through the neighbor-hosting mesh, so the
     /// terminal advertisement consult (hosting redesign piece C, invariant 5)
-    /// can find a seeded off-path host.
+    /// can find a seeded off-path host. An advertising seed also registers
+    /// local hosting interest, as production host formation does, so it
+    /// serves the copy it advertises (#5846).
     ///
     /// OFF by default: a seeded host does NOT advertise (the harness's
     /// historical behavior), so a key-routed GET to a non-hosting region still

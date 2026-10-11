@@ -33,21 +33,41 @@
 //! - **Pull, not push.** The state moves because the peer that will host it
 //!   asked for it, over the ordinary GET path. The holder never sends state
 //!   unasked and never routes a PUT toward the key.
-//! - **Proof of holding.** The requester must be a connected peer that
-//!   advertises hosting the contract. A peer cannot be talked into fetching
-//!   from someone that does not claim to have it.
+//! - **Claimed holding.** The requester must be a connected peer that
+//!   advertises hosting the contract. That advertisement is the requester's
+//!   own claim and is not verified, so a peer can make us fetch a contract it
+//!   chooses. What bounds that is the rate limit below and the eviction
+//!   budget the fetched copy competes in; it is no more than the same peer
+//!   could place with a PUT, which every hop stores.
 //! - **Keyward only.** This peer must be strictly closer to the key than the
 //!   requester, so the new upstream relation is a strict descent toward the key
 //!   (acyclic, design §4) and the requester's computed upstream becomes us.
 //! - **Single-target.** One request makes at most one new host: the peer that
 //!   received it from the holder. Deeper hops see a requester that does not
-//!   advertise the contract and answer NotFound as before.
-//! - **Rate-limited on the receiving side** ([`StrandedRecoveryLimiter`]), so
-//!   neither one requester nor many stranded holders at once can turn it into
+//!   advertise the contract and answer NotFound as before. (A holder that
+//!   retries a refused or timed-out subscribe at another neighbour sends a new
+//!   request; each is bounded the same way.)
+//! - **Rate-limited on the receiving side** ([`StrandedRecoveryLimiter`]):
+//!   token buckets bound how many recoveries start, and at most
+//!   [`MAX_IN_FLIGHT_FETCHES`] fetches run at once, which bounds the bytes.
+//!   Neither one requester nor many stranded holders at once can turn it into
 //!   a fetch storm (#4630, the 0.2.87 migration storm).
+//!
+//! ## Accepted residual: a NotFound is not proof of absence
+//!
+//! The wire answer is `Subscribed` or `NotFound`, nothing finer. A `NotFound`
+//! from deeper in the search can mean a deeper hop ran out of HTL, timed out
+//! or was refused, not that no host exists. So a recovery can create a host
+//! while a real one exists past a cut-short search: two mesh components for a
+//! while. That is the case design §5d(a) already accepts ("no closer peers" is
+//! a local statement): the components merge through the contract's
+//! commutative merge once they connect, and the recovered copy is the holder's
+//! current state, not a stale one. Only a timeout at the FIRST hop is
+//! excluded, because that one this peer can see.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -71,6 +91,12 @@ pub(crate) const PER_REQUESTER_REFILL_INTERVAL: Duration = Duration::from_secs(1
 /// success the contract is local, so further subscribes are local hits and
 /// never reach this gate; this only bounds repeated failed attempts.
 pub(crate) const PER_CONTRACT_REFILL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Recovery fetches one node runs at once. The token buckets bound how many
+/// recoveries start; this bounds the BYTES in flight, since a recovery pulls a
+/// whole contract state (up to `MAX_STATE_SIZE`). With two at a time a slow or
+/// large fetch paces further recoveries instead of piling them up.
+pub(crate) const MAX_IN_FLIGHT_FETCHES: usize = 2;
 
 /// Why a terminus did not attempt the backward bootstrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +166,16 @@ pub(crate) struct StrandedRecoveryLimiter {
     per_requester: TokenBucketLimiter<SocketAddr>,
     per_contract: TokenBucketLimiter<ContractInstanceId>,
     global: TokenBucketLimiter<()>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// A held recovery-fetch slot; released on drop, on every exit path.
+pub(crate) struct InFlightFetch(Arc<AtomicUsize>);
+
+impl Drop for InFlightFetch {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl StrandedRecoveryLimiter {
@@ -158,7 +194,21 @@ impl StrandedRecoveryLimiter {
                 MAX_TRACKED_KEYS,
             ),
             global: TokenBucketLimiter::new(time_source, GLOBAL_BURST, GLOBAL_REFILL_INTERVAL, 1),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Claim one of the [`MAX_IN_FLIGHT_FETCHES`] fetch slots, or `None` when
+    /// they are all taken. Claimed BEFORE [`Self::admit`], so a request refused
+    /// for lack of a slot spends no tokens.
+    pub(crate) fn try_begin_fetch(&self) -> Option<InFlightFetch> {
+        let claimed = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_IN_FLIGHT_FETCHES).then_some(n + 1)
+            })
+            .is_ok();
+        claimed.then(|| InFlightFetch(self.in_flight.clone()))
     }
 
     /// Consume one attempt for `(requester, contract)`. `false` means skip the
@@ -309,6 +359,34 @@ mod tests {
             .filter(|n| l.admit(addr(*n), contract(*n)))
             .count();
         assert_eq!(admitted, 1);
+    }
+
+    #[test]
+    fn fetch_slots_are_capped_and_released_on_drop() {
+        let (l, _clock) = limiter();
+        let slots: Vec<_> = (0..MAX_IN_FLIGHT_FETCHES)
+            .map(|_| l.try_begin_fetch().expect("a free slot"))
+            .collect();
+        assert!(
+            l.try_begin_fetch().is_none(),
+            "no more than MAX_IN_FLIGHT_FETCHES at once"
+        );
+        drop(slots);
+        assert!(
+            l.try_begin_fetch().is_some(),
+            "slots come back when fetches end"
+        );
+    }
+
+    #[test]
+    fn cleanup_drops_idle_buckets_and_keeps_behaviour() {
+        let (l, clock) = limiter();
+        assert!(l.admit(addr(1), contract(1)));
+        clock.advance_time(Duration::from_secs(600));
+        l.cleanup();
+        assert_eq!(l.per_requester.len(), 0);
+        assert_eq!(l.per_contract.len(), 0);
+        assert!(l.admit(addr(1), contract(1)), "a swept key starts fresh");
     }
 
     #[test]

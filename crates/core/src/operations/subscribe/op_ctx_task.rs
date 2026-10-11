@@ -1959,11 +1959,10 @@ async fn drive_relay_subscribe(
     // `finalize_info` (Fix A): the `(key, responder)` to run host-formation with
     // AFTER the Subscribed ACK is bubbled upstream. `None` when the outcome was
     // not Subscribed (nothing to become a host of).
-    // `search_exhausted`: every peer we asked answered a clean NotFound, so
-    // nothing beyond us is known to host the contract. Only then may we recover
-    // from a stranded requester; after a timeout a host may still exist.
+    // `empty_search`: see [`search_exhausted`]; it gates the stranded-holder
+    // recovery below.
     #[allow(clippy::type_complexity)]
-    let (result, bubble_hop_count, consult_outcome, finalize_info, search_exhausted): (
+    let (result, bubble_hop_count, consult_outcome, finalize_info, empty_search): (
         SubscribeMsgResult,
         usize,
         Option<bool>,
@@ -1979,7 +1978,7 @@ async fn drive_relay_subscribe(
             hop_count,
             None,
             Some((key, responder)),
-            false,
+            search_exhausted(ForwardKind::Subscribed, None),
         ),
         SubscribeForwardOutcome::NotFound { hop_count } => {
             let visited_snapshot = new_visited.clone();
@@ -2017,6 +2016,7 @@ async fn drive_relay_subscribe(
                         &mut recorder,
                     )
                     .await;
+                    let consult_kind = consult_outcome.kind();
                     match consult_outcome {
                         SubscribeForwardOutcome::Subscribed {
                             key,
@@ -2027,23 +2027,21 @@ async fn drive_relay_subscribe(
                             hop_count,
                             Some(true),
                             Some((key, responder)),
-                            false,
+                            search_exhausted(ForwardKind::NotFound, Some(consult_kind)),
                         ),
                         SubscribeForwardOutcome::NotFound { hop_count } => (
                             SubscribeMsgResult::NotFound,
                             hop_count,
                             Some(false),
                             None,
-                            true,
+                            search_exhausted(ForwardKind::NotFound, Some(consult_kind)),
                         ),
-                        // The advertised host did not answer: it may still hold
-                        // the contract, so this is not an exhausted search.
                         SubscribeForwardOutcome::Failed { hop_count } => (
                             SubscribeMsgResult::NotFound,
                             hop_count,
                             Some(false),
                             None,
-                            false,
+                            search_exhausted(ForwardKind::NotFound, Some(consult_kind)),
                         ),
                     }
                 }
@@ -2054,7 +2052,7 @@ async fn drive_relay_subscribe(
                         hop_count,
                         Some(false),
                         None,
-                        true,
+                        search_exhausted(ForwardKind::NotFound, None),
                     )
                 }
             }
@@ -2065,13 +2063,19 @@ async fn drive_relay_subscribe(
             // waiter on the reused tx that a late reply from the timed-out
             // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
             // consulting — the same outcome as before the consult existed.
-            (SubscribeMsgResult::NotFound, hop_count, None, None, false)
+            (
+                SubscribeMsgResult::NotFound,
+                hop_count,
+                None,
+                None,
+                search_exhausted(ForwardKind::Failed, None),
+            )
         }
     };
 
     // The search beyond us came back empty. If the requester holds the
     // contract, become its host instead of answering NotFound (§5d(b), #5846).
-    if search_exhausted {
+    if empty_search {
         if let Some(key) =
             recover_from_stranded_requester(op_manager, incoming_tx, instance_id, upstream_addr)
                 .await
@@ -2126,6 +2130,43 @@ async fn drive_relay_subscribe(
     }
 
     send_result
+}
+
+/// What one forward of this relay's search came back with, for
+/// [`search_exhausted`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardKind {
+    Subscribed,
+    NotFound,
+    /// No reply: timeout, send failure, or an unexpected variant.
+    Failed,
+}
+
+/// Whether this relay's search beyond itself came back EMPTY, which is the
+/// only time the stranded-holder recovery may run (#5846). True when the
+/// greedy forward answered a clean NotFound and the terminal consult either
+/// had no advertised host to try or that host also answered NotFound. False
+/// whenever any peer we asked did not answer: a host may still exist there,
+/// and recovering would form a second mesh component next to it.
+///
+/// This sees only the replies THIS relay received. A NotFound can itself hide
+/// a deeper timeout or HTL exhaustion, since the wire has nothing finer; that
+/// residual is documented on `crate::ring::stranded_recovery`.
+fn search_exhausted(greedy: ForwardKind, consult: Option<ForwardKind>) -> bool {
+    matches!(
+        (greedy, consult),
+        (ForwardKind::NotFound, None | Some(ForwardKind::NotFound))
+    )
+}
+
+impl SubscribeForwardOutcome {
+    fn kind(&self) -> ForwardKind {
+        match self {
+            Self::Subscribed { .. } => ForwardKind::Subscribed,
+            Self::NotFound { .. } => ForwardKind::NotFound,
+            Self::Failed { .. } => ForwardKind::Failed,
+        }
+    }
 }
 
 /// Outcome of a single SUBSCRIBE relay forward, normalized so the driver can
@@ -2401,6 +2442,13 @@ async fn relay_subscribe_send_response(
 ///
 /// Returns `None` whenever any condition fails or the state does not arrive;
 /// the caller then answers NotFound exactly as before this recovery existed.
+///
+/// The fetch happens BEFORE the relay answers upstream, the deliberate
+/// exception to operations.md's "forward upstream before contract-handling
+/// work": the answer is `Subscribed` only if we hold the state (a host must
+/// not claim to host before it can serve, invariant 1), and the key it
+/// carries comes from the fetched contract. It does not stack across a chain:
+/// only the hop whose requester holds the contract recovers.
 async fn recover_from_stranded_requester(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
@@ -2442,11 +2490,21 @@ async fn recover_from_stranded_requester(
     let requester = requester?;
 
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
-    if !op_manager
-        .ring
-        .stranded_recovery_limiter
-        .admit(upstream_addr, instance_id)
-    {
+    let limiter = &op_manager.ring.stranded_recovery_limiter;
+    // Fetch slot first: a request turned away for lack of one spends no tokens.
+    let Some(_fetch_slot) = limiter.try_begin_fetch() else {
+        tracing::info!(
+            tx = %incoming_tx,
+            %instance_id,
+            requester = %upstream_addr,
+            "SUBSCRIBE: stranded-holder recovery skipped, fetch slots busy; answering NotFound"
+        );
+        if let Some(addr) = own_addr {
+            crate::ring::topology_registry::record_stranded_recovery_rate_limited(addr);
+        }
+        return None;
+    };
+    if !limiter.admit(upstream_addr, instance_id) {
         tracing::info!(
             tx = %incoming_tx,
             %instance_id,
@@ -2459,41 +2517,59 @@ async fn recover_from_stranded_requester(
         return None;
     }
 
-    match super::fetch_contract_if_missing(op_manager, instance_id, Some(requester)).await {
-        Ok(Some(key)) => {
-            tracing::info!(
-                tx = %incoming_tx,
-                contract = %key,
-                requester = %upstream_addr,
-                "SUBSCRIBE: no host beyond us; pulled the contract back from the \
-                 stranded requester and hosting it (§5d(b))"
-            );
-            if let Some(addr) = own_addr {
-                crate::ring::topology_registry::record_stranded_recovery(addr);
-            }
-            Some(key)
-        }
-        Ok(None) => {
-            tracing::info!(
-                tx = %incoming_tx,
-                %instance_id,
-                requester = %upstream_addr,
-                "SUBSCRIBE: stranded-holder recovery fetch did not return state; \
-                 answering NotFound"
-            );
-            None
-        }
-        Err(err) => {
-            tracing::warn!(
-                tx = %incoming_tx,
-                %instance_id,
-                requester = %upstream_addr,
-                error = %err,
-                "SUBSCRIBE: stranded-holder recovery fetch hit an infrastructure error"
-            );
-            None
+    // Ask the requester and nobody else (routing toward the key just found
+    // nothing), and wait for the GET's own outcome rather than a fixed window:
+    // a large state can take longer than `CONTRACT_WAIT_TIMEOUT_MS`, and giving
+    // up early would leave the GET to finish in the background, host the copy
+    // with no downstream, and send the holder on to pull it again from its next
+    // neighbour. The GET's attempt is bounded by `OPERATION_TTL`; the outer
+    // timeout is only a backstop for a wedged task.
+    let (_get_tx, outcome_rx) = crate::operations::get::op_ctx_task::start_pinned_sub_op_get(
+        op_manager,
+        instance_id,
+        requester,
+    );
+    let outcome = tokio::time::timeout(OPERATION_TTL * 2, outcome_rx).await;
+    let found = matches!(
+        outcome,
+        Ok(Ok(
+            crate::operations::get::op_ctx_task::SubOpGetOutcome::Found(_)
+        ))
+    );
+    let key = if found {
+        crate::operations::has_contract(op_manager, instance_id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let result = if key.is_some() {
+        "recovered"
+    } else {
+        "fetch_failed"
+    };
+    tracing::info!(
+        tx = %incoming_tx,
+        %instance_id,
+        requester = %upstream_addr,
+        result,
+        "SUBSCRIBE: no host beyond us; stranded-holder recovery from the requester (§5d(b))"
+    );
+    // Both outcomes are bounded by the limiter above, so this cannot flood.
+    crate::tracing::telemetry::send_standalone_event(
+        "stranded_recovery",
+        serde_json::json!({
+            "contract": instance_id.to_string(),
+            "result": result,
+        }),
+    );
+    if key.is_some() {
+        if let Some(addr) = own_addr {
+            crate::ring::topology_registry::record_stranded_recovery(addr);
         }
     }
+    key
 }
 
 /// Answer `Subscribed` for a contract [`recover_from_stranded_requester`] just
@@ -3461,6 +3537,29 @@ mod tests {
         );
     }
 
+    /// The recovery runs only on an EMPTY search (#5846): every peer this relay
+    /// asked answered NotFound. Any unanswered forward (greedy or consult)
+    /// means a host may still exist, so no recovery.
+    #[test]
+    fn search_is_exhausted_only_when_every_asked_peer_answered_not_found() {
+        use ForwardKind::{Failed, NotFound, Subscribed};
+        let cases = [
+            ((NotFound, None), true),
+            ((NotFound, Some(NotFound)), true),
+            ((NotFound, Some(Failed)), false),
+            ((NotFound, Some(Subscribed)), false),
+            ((Failed, None), false),
+            ((Subscribed, None), false),
+        ];
+        for ((greedy, consult), expected) in cases {
+            assert_eq!(
+                search_exhausted(greedy, consult),
+                expected,
+                "greedy={greedy:?} consult={consult:?}"
+            );
+        }
+    }
+
     /// Pin (#5846, stranded-holder recovery): `drive_relay_subscribe` tries the
     /// recovery only where the search beyond it came back EMPTY: at the
     /// no-candidate terminus, and after the forward when `search_exhausted`
@@ -3495,11 +3594,44 @@ mod tests {
             "first recovery belongs to the no-candidate terminus"
         );
         let gate = relay
-            .find("if search_exhausted {")
-            .expect("the post-forward recovery must be gated on search_exhausted");
+            .match_indices("if empty_search {")
+            .map(|(i, _)| i)
+            .find(|i| {
+                let line_start = relay[..*i].rfind('\n').map_or(0, |n| n + 1);
+                relay[line_start..*i].trim().is_empty()
+            })
+            .expect("the post-forward recovery must be gated on `if empty_search {`");
+        let open = gate + relay[gate..].find('{').expect("block");
+        let mut depth = 0usize;
+        let mut close = open;
+        for (i, c) in relay[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
         assert!(
-            calls[1] > gate,
-            "the post-forward recovery must sit inside `if search_exhausted`"
+            calls[1] > open && calls[1] < close,
+            "the post-forward recovery must sit inside `if empty_search {{ .. }}`"
+        );
+        assert!(
+            relay.contains(
+                "let (result, bubble_hop_count, consult_outcome, finalize_info, empty_search)"
+            ),
+            "empty_search must be the value the outcome match computes"
+        );
+        assert!(
+            !relay.contains("Some((key, responder)),\n            true,")
+                && relay.matches("search_exhausted(ForwardKind::").count() == 6,
+            "every arm of the outcome match must take its empty-search value from \
+             `search_exhausted`, not a literal"
         );
 
         let host = body_of("async fn host_recovered_contract(");

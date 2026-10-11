@@ -12633,6 +12633,8 @@ fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
 /// 7 is the far holder, 8 is another far peer.
 const STRANDED_CLUSTER: std::ops::RangeInclusive<usize> = 1..=6;
 const STRANDED_HOLDER_NO: usize = 7;
+/// Where nodes 1..=6 sit relative to the key in the ordinary scenario.
+const STRANDED_TIGHT_CLUSTER: [f64; 6] = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010];
 
 struct StrandedRun {
     result: freenet::dev_tool::ControlledSimulationResult,
@@ -12650,17 +12652,24 @@ struct StrandedRun {
 /// UPDATEs the first contract from v1 to v2.
 ///
 /// The six-peer cluster sits on the first contract's key; further contracts
-/// (the storm test) have keys within 0.03 of it.
+/// (the storm test) have keys within 0.03 of it. Peer addresses follow peer
+/// locations, which follow that key, so each test passes its own
+/// `contract_seed`: two runs with the same one would share addresses and
+/// cross-wire when they run concurrently in one process (#5676).
 ///
 /// Placement migration is pinned OFF: it is the holding-driven push the
 /// hosting invariants forbid, and it would place the contract on its own.
-/// Seeded hosts advertise, as a production holder does once it has the
-/// contract, so the holder's neighbours know it holds it.
+/// With `holder_advertises` the seeded holder advertises, as a production
+/// holder does once it has the contract, so its neighbours know it holds it.
+#[allow(clippy::too_many_arguments)]
 fn run_stranded_holder(
     network_name: &'static str,
     seed: u64,
+    contract_seed: u8,
+    cluster_offsets: [f64; 6],
     contracts: u8,
     holder_subscribes: bool,
+    holder_advertises: bool,
     holder_updates: bool,
     op_interval: Duration,
     post_wait: Duration,
@@ -12673,7 +12682,7 @@ fn run_stranded_holder(
     // test) are test contracts whose keys fall within 0.03 of it, so their
     // subscribes from the holder all land on the same few cluster peers, which
     // is what loads one peer's receiving-side rate limit.
-    let first = SimOperation::create_test_contract(0x5D);
+    let first = SimOperation::create_test_contract(contract_seed);
     let key_loc = Location::from(&first.key()).as_f64();
     let ring_dist = |a: f64, b: f64| {
         let d = (a - b).abs();
@@ -12682,7 +12691,7 @@ fn run_stranded_holder(
     let mut containers = vec![first];
     containers.extend(
         (0..=u8::MAX)
-            .filter(|seed| *seed != 0x5D)
+            .filter(|seed| *seed != contract_seed)
             .map(SimOperation::create_test_contract)
             .filter(|c| ring_dist(Location::from(&c.key()).as_f64(), key_loc) < 0.03)
             .take(usize::from(contracts) - 1),
@@ -12702,10 +12711,7 @@ fn run_stranded_holder(
     let state_v2 = SimOperation::create_crdt_state(2, 0x52);
 
     let wrap = |x: f64| x.rem_euclid(1.0);
-    let mut node_locations: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
-        .iter()
-        .map(|o| wrap(key_loc + o))
-        .collect();
+    let mut node_locations: Vec<f64> = cluster_offsets.iter().map(|o| wrap(key_loc + o)).collect();
     node_locations.push(wrap(key_loc + 0.40)); // node 7: the holder
     node_locations.push(wrap(key_loc + 0.70)); // node 8
     let num_nodes = node_locations.len();
@@ -12726,8 +12732,14 @@ fn run_stranded_holder(
         .await
     });
     sim.disable_placement_migration();
-    sim.enable_seeded_host_advertisements();
+    if holder_advertises {
+        sim.enable_seeded_host_advertisements();
+    }
     sim.with_controlled_op_interval(op_interval);
+    // Every peer must have joined before the holder acts: an op fired before
+    // its node joined is rejected and never retried, which would read as "no
+    // recovery" for the wrong reason (and make the negative controls vacuous).
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
 
     let holder = NodeLabel::node(network_name, STRANDED_HOLDER_NO);
     let mut operations: Vec<ScheduledOperation> = containers
@@ -12824,7 +12836,10 @@ fn test_stranded_holder_reroots_near_key_by_backward_bootstrap() {
     let run = run_stranded_holder(
         NETWORK_NAME,
         0x5D_B000_0001,
+        0x5D,
+        STRANDED_TIGHT_CLUSTER,
         1,
+        true,
         true,
         true,
         Duration::from_secs(60),
@@ -12833,6 +12848,10 @@ fn test_stranded_holder_reroots_near_key_by_backward_bootstrap() {
     let key = run.keys[0];
     let holder = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, STRANDED_HOLDER_NO);
 
+    assert!(
+        run.result.node_open_connections(&holder) > 0,
+        "the holder never joined, so its subscribe never ran"
+    );
     assert!(
         run.result.is_node_hosting(&holder, &key),
         "the holder must still host its contract"
@@ -12846,9 +12865,11 @@ fn test_stranded_holder_reroots_near_key_by_backward_bootstrap() {
     // The near-key copy came from the recovery itself, not from some other
     // path that happened to place it.
     let (recoveries, _) = stranded_recovery_totals(&run.result);
+    // One, because in this dense topology the first hop is already the root,
+    // so nothing recurses; a topology that recurses legitimately makes more.
     assert_eq!(
         recoveries, 1,
-        "one subscribe from one holder must make exactly one new host (single-target)"
+        "one subscribe from one holder, landing on the root, makes one new host"
     );
 
     // The UPDATE reached every near-key host through the ordinary fan-out.
@@ -12880,13 +12901,21 @@ fn test_stranded_holder_without_demand_is_not_rerooted() {
     let run = run_stranded_holder(
         NETWORK_NAME,
         0x5D_B000_0005,
+        0x6D,
+        STRANDED_TIGHT_CLUSTER,
         1,
         false,
+        true,
         false,
         Duration::from_secs(60),
         Duration::from_secs(150),
     );
     let key = run.keys[0];
+    let holder = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, STRANDED_HOLDER_NO);
+    assert!(
+        run.result.node_open_connections(&holder) > 0,
+        "the holder never joined, so this control proves nothing"
+    );
     let near = stranded_near_key_hosts(&run, NETWORK_NAME, &key);
     assert!(
         near.is_empty(),
@@ -12899,12 +12928,45 @@ fn test_stranded_holder_without_demand_is_not_rerooted() {
     );
 }
 
+/// Negative control (#5846): the holder has demand (its client subscribes)
+/// but does NOT advertise hosting the contract, so no peer can tell it holds
+/// it and none may pull from it. The recovery's "claimed holding" gate, end to
+/// end.
+#[test_log::test]
+fn test_stranded_holder_that_does_not_advertise_is_not_pulled_from() {
+    const NETWORK_NAME: &str = "stranded-holder-unadvertised";
+    let run = run_stranded_holder(
+        NETWORK_NAME,
+        0x5D_B000_0006,
+        0x7D,
+        STRANDED_TIGHT_CLUSTER,
+        1,
+        true,
+        false,
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(90),
+    );
+    let key = run.keys[0];
+    let holder = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, STRANDED_HOLDER_NO);
+    assert!(
+        run.result.node_open_connections(&holder) > 0,
+        "the holder never joined, so this control proves nothing"
+    );
+    let near = stranded_near_key_hosts(&run, NETWORK_NAME, &key);
+    assert!(
+        near.is_empty(),
+        "nobody may pull from a holder that does not advertise, but these host it: {near:?}"
+    );
+    assert_eq!(stranded_recovery_totals(&run.result).0, 0);
+}
+
 /// Storm bound (#5846): one holder with many stranded contracts, all
-/// subscribed at once. The receiving side's rate limit must hold the burst
-/// (some recoveries are refused and answered NotFound, so the holder's renewal
-/// retries them later), and no request may make more than one new host: the
-/// total number of recoveries never exceeds the number of contracts, however
-/// often the holder asks.
+/// subscribed within seconds. Their keys sit in one region served by two
+/// peers, so those two first hops take every subscribe, and their
+/// receiving-side limits must engage: some recoveries are refused (answered
+/// NotFound) and left to the holder's later renewals. The limit delays, it must
+/// not starve: by the end every contract has a host besides the holder.
 #[test_log::test]
 fn test_many_stranded_contracts_recover_without_a_storm() {
     const NETWORK_NAME: &str = "stranded-holder-many";
@@ -12912,45 +12974,56 @@ fn test_many_stranded_contracts_recover_without_a_storm() {
     let run = run_stranded_holder(
         NETWORK_NAME,
         0x5D_B000_0004,
+        0x8D,
+        // Only nodes 1 and 2 sit at the key; 3..=6 are spread between it and
+        // the holder. Every subscribe's first hop is then node 1 or 2, so with
+        // 12 contracts one of them receives at least 6 from the holder, more
+        // than the per-requester burst of 4: the limit must engage.
+        [-0.003, 0.003, 0.15, 0.20, 0.25, 0.30],
         CONTRACTS,
+        true,
         true,
         false,
         Duration::from_secs(1),
-        Duration::from_secs(120),
+        // Past the seeded lease's renewal point (8 min lease, renewed within
+        // its last 2 min), so refused contracts get their retry.
+        Duration::from_secs(480),
     );
-    let (recoveries, rate_limited) = stranded_recovery_totals(&run.result);
-    tracing::info!(recoveries, rate_limited, "many stranded contracts");
+    let (recoveries, refused) = stranded_recovery_totals(&run.result);
+    tracing::info!(recoveries, refused, "many stranded contracts");
     assert!(
-        rate_limited >= 1,
-        "{CONTRACTS} subscribes from one holder within seconds must exceed the \
-         per-requester burst ({}) and be rate-limited at least once",
-        4
+        refused >= 1,
+        "{CONTRACTS} subscribes within seconds into one key region must hit a \
+         receiving-side limit at least once"
     );
+    let holder = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, STRANDED_HOLDER_NO);
+    let unrecovered: Vec<usize> = run
+        .keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| {
+            !run.result
+                .captured_node_labels()
+                .iter()
+                .any(|label| *label != holder && run.result.is_node_hosting(label, key))
+        })
+        .map(|(i, _)| i)
+        .collect();
     assert!(
-        recoveries <= u64::from(CONTRACTS),
-        "{recoveries} recoveries for {CONTRACTS} contracts: some request made more than \
-         one new host"
+        unrecovered.is_empty(),
+        "the rate limit starved these contracts (no host besides the holder): {unrecovered:?}"
     );
-    assert!(recoveries >= 1, "no contract was recovered at all");
-    for metrics in run.result.renewal_metrics.values() {
-        assert!(
-            metrics.max_cycle_batch <= 10,
-            "a node started {} renewals in one cycle, above the per-cycle cap",
-            metrics.max_cycle_batch
-        );
-    }
 }
 
-/// §5d(b) recovery on a sparse ring, where the holder is several hops from the
-/// key (#5846). Fifteen peers spread evenly around the ring with at most five
-/// connections each; the one farthest from the key holds the contract with a
-/// client subscription, and nobody else has it.
+/// §5d(b) recovery on a sparse ring (#5846): four peers tight around the key
+/// and eleven spread over the rest of the ring, at most four connections each
+/// and HTL 4, so the holder (half a ring away) is not a neighbour of the key
+/// region. Only the holder has the contract, with a client subscription.
 ///
-/// The holder's subscribe makes its first closer hop a host. That peer now has
-/// demand (the holder is its downstream) but no host closer to the key, so it
-/// re-roots the same way, and so on: the chain re-forms hop by hop until the
-/// peer nearest the key hosts. A reader on the far side of the ring then GETs
-/// the contract and finds it near the key on the first attempt.
+/// The holder's subscribe makes its first closer hop a host. If that peer has
+/// no host closer to the key and is not the root, it re-roots the same way
+/// (in this topology it turns out to be the root already). A reader a quarter
+/// ring away on the other side then GETs the contract.
 ///
 /// Returns `(run, recoveries, reader NotFound labels, reader got state,
 /// nearest-to-key peer hosts)`.
@@ -13000,6 +13073,7 @@ fn run_sparse_stranded_holder(
     });
     sim.disable_placement_migration();
     sim.enable_seeded_host_advertisements();
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
     // Time for the chain to re-form hop by hop (each new host re-roots after
     // the renewal path's 0-15 s jitter) before the reader asks.
     sim.with_controlled_op_interval(Duration::from_secs(150));
@@ -13091,7 +13165,9 @@ fn run_sparse_stranded_holder(
 ///
 /// The far GET is a liveness check, NOT the discriminating assertion: at this
 /// size, a GET finds the holder by routing or by the terminal consult even
-/// before the fix (measured: zero NotFound first hops on main too). Nor does
+/// before the fix (measured: zero NotFound first hops on main too), and with
+/// the fix it can still try a near-key peer that is not the new host first, so
+/// its NotFound count is logged, not asserted. Nor does
 /// this topology force the multi-hop recursion: with these connections the
 /// holder's first closer hop is already the local root, so one recovery
 /// suffices. The recursion's guards are unit-tested on
@@ -13112,9 +13188,9 @@ fn test_stranded_holder_recovery_on_sparse_ring_places_contract_near_key() {
         reader_has_state,
         "the far reader's GET did not get the state"
     );
-    assert_eq!(
-        not_found, 0,
-        "the far GET hit {not_found} NotFound first hop(s)"
+    tracing::info!(
+        not_found,
+        "far GET NotFound first hops (informational, see the doc above)"
     );
 }
 
