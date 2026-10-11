@@ -659,7 +659,7 @@ fn bandwidth_section(history: &[RateSample]) -> String {
                 String::new()
             };
             format!(
-                r#"<p class="bw-now"><span>Last second:</span><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span>{stale}</p>{chart}"#,
+                r#"<p class="bw-now"><span>Latest:</span><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span>{stale}</p>{chart}"#,
                 // Decimal units, like every speed chart on the dashboard; the
                 // card's lifetime totals above use binary units (format_bytes).
                 up = super::charts::fmt_speed(latest.up_bytes_per_sec),
@@ -673,7 +673,7 @@ fn bandwidth_section(history: &[RateSample]) -> String {
         r#"<div class="bw-section">
                 <h3>Transfer rate, last minute</h3>
                 {body}
-                <p class="bw-note">Freenet traffic only, as encrypted UDP datagrams without UDP or IP headers. Upload counts every datagram sent; download counts only datagrams from established connections, so inbound connection setup is not included.</p>
+                <p class="bw-note">Freenet traffic only, as encrypted UDP datagrams without UDP or IP headers. Upload counts every datagram sent; download counts only datagrams authenticated with a session key, so the first packets of a connection's setup are not included.</p>
             </div>"#
     )
 }
@@ -778,13 +778,6 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
         }
         d
     };
-    write!(
-        svg,
-        r#"<path d="{}" class="bw-line-down"/><path d="{}" class="bw-line-up"/>"#,
-        path(|s| s.down_bytes_per_sec),
-        path(|s| s.up_bytes_per_sec),
-    )
-    .ok();
     if !narrow {
         // An invisible column per sample, one sampling interval wide and
         // kept inside the plot, so hovering anywhere above a point shows
@@ -818,6 +811,15 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
             .ok();
         }
     }
+    // Lines after the hover columns, so a highlighted column sits behind
+    // them; the lines ignore the pointer so the column still gets the hover.
+    write!(
+        svg,
+        r#"<path d="{}" class="bw-line-down"/><path d="{}" class="bw-line-up"/>"#,
+        path(|s| s.down_bytes_per_sec),
+        path(|s| s.up_bytes_per_sec),
+    )
+    .ok();
     svg.push_str("</svg>");
     svg
 }

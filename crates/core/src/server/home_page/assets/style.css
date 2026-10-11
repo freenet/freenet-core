@@ -853,11 +853,13 @@ svg.mchart text {
   border-top: 2px dashed var(--text-secondary);
 }
 svg.mchart .bw-line-up {
+  pointer-events: none;
   fill: none;
   stroke: var(--accent-primary);
   stroke-width: 2;
 }
 svg.mchart .bw-line-down {
+  pointer-events: none;
   fill: none;
   stroke: var(--text-secondary);
   stroke-width: 2;

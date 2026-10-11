@@ -12,8 +12,9 @@
 //! comment on the counters in `metrics.rs`). Both count whole UDP datagrams,
 //! encrypted, without UDP or IP headers. Upload counts every datagram a
 //! successful `send_to` put on the wire. Download counts only datagrams that
-//! authenticated against an established connection, so inbound handshake and
-//! probe traffic is not in it while the outbound side of it is in upload.
+//! decrypted with a symmetric session key, which includes a handshake's
+//! completion ACK but not intro packets or anything unauthenticated, while
+//! the outbound side of those is in upload.
 //!
 //! A sample is the average over the interval since the previous one. That is
 //! one second while the sampler keeps up; after a stall of up to [`WINDOW`]
@@ -92,10 +93,10 @@ pub(crate) struct BandwidthHistory {
 /// the dashboard read so their timestamps share one epoch. `RealTime` counts
 /// from when this is created and follows tokio's clock, so it agrees with a
 /// sampler's `tokio::time::interval` in the runtime that created it,
-/// including under paused test time. The process-wide instance is first
-/// touched by a real node (the sampler, or a dashboard request, which needs
-/// an initialised `network_status`); a paused runtime that touched it first
-/// and then advanced would leave later runtimes reading zero elapsed time.
+/// including under paused test time. If a paused runtime were the first to
+/// touch the process-wide instance and then advanced, later runtimes would
+/// read zero elapsed time and record nothing; nothing under paused time
+/// touches it today (the tests here build their own instance).
 pub(crate) struct SharedBandwidthHistory {
     clock: RealTime,
     history: Mutex<BandwidthHistory>,
@@ -433,9 +434,6 @@ mod tests {
         assert_eq!(counted, 38_000.0);
     }
 
-    /// The real sampler loop, under paused tokio time, fills the history it
-    /// is given. Uses its own history rather than the process-wide one so
-    /// nodes running in the same test process cannot interfere.
     /// Sent becomes upload and received becomes download, read at the
     /// shared clock.
     #[tokio::test(start_paused = true)]
@@ -450,6 +448,9 @@ mod tests {
         assert_eq!(recent[0].down_bytes_per_sec, 500.0);
     }
 
+    /// The real sampler loop, under paused tokio time, fills the history it
+    /// is given. Uses its own history rather than the process-wide one so
+    /// nodes running in the same test process cannot interfere.
     #[tokio::test(start_paused = true)]
     async fn sampler_loop_fills_the_history() {
         let history = SharedBandwidthHistory::new();

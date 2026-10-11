@@ -1005,10 +1005,17 @@ mod tests {
                 x >= 62.0 && x + w <= 590.0 + 0.1,
                 "rect {x}+{w} outside plot"
             );
-            // One sampling interval (528 / 60 = 8.8) or less, trimmed at
-            // the edges rather than shifted over a neighbour.
+            // One sampling interval (528 / 60 = 8.8) or less.
             assert!(w <= 8.8 + 0.1, "rect {x}+{w} wider than one interval");
         }
+        // The edge columns are trimmed to half an interval rather than
+        // shifted inward over the neighbouring sample's point.
+        let widths: Vec<&str> = html
+            .split(r#"class="bw-hit""#)
+            .map(|chunk| chunk.rsplit("width=\"").next().unwrap())
+            .collect();
+        assert!(widths[0].starts_with("4.4\""), "oldest column: {html}");
+        assert!(widths[3].starts_with("4.4\""), "newest column: {html}");
     }
 
     /// A stalled sampler leaves an old newest sample; the headline says how
