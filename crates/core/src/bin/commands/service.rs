@@ -2065,7 +2065,7 @@ mod tests {
             // mentions the pattern. The behavioral harness proves the decisions;
             // this proves both units carry the checks.
             assert!(
-                pre.contains("systemctl show -p MainPID")
+                pre.contains("timeout 5 systemctl show -p MainPID")
                     && pre.contains("[ \"$$mp\" = \"$$pid\" ]; } && s=1;"),
                 "{which} ExecStartPre must spare another service's main process"
             );
@@ -2389,7 +2389,8 @@ echo "RC=$?"
         /// manager does not know answers `MainPID=0`, as real systemd does.
         main_pid: Option<&'a str>,
         /// Which `.service` of the cgroup path `main_pid` answers for (every
-        /// other one answers 0). `None` = the deepest one.
+        /// other one answers 0). `None` = the last one listed (a harness
+        /// default; the pre-flight itself asks about every one).
         main_pid_unit: Option<&'a str>,
         /// The holder ignores SIGTERM and only dies on SIGKILL.
         ignores_term: bool,
@@ -2520,6 +2521,7 @@ echo "RC=$?"
                 format!(
                     "[ \"$# $1 $2 $3\" = \"4 show -p MainPID\" ] || exit 3; \
                      [ -f \"{f}/systemctl_down\" ] && exit 1; \
+                     echo \"$4\" >> \"{f}/queries\"; \
                      cat \"{f}/units/$4\" 2>/dev/null && exit 0; \
                      echo \"$4\" >> \"{f}/unknown_units\"; echo MainPID=0\n",
                     f = fix.display()
@@ -2551,7 +2553,7 @@ echo "RC=$?"
                  cp \"{fixd}/proc/$1/comm_after_term\" \"{fixd}/proc/$1/comm\"; return 0;; \
                  -KILL|-9) : > \"$s.KILL\"; return 0;; \
                  *) return 0;; esac; }}\n\
-                 sleep() {{ echo >> \"{fixd}/sleeps\"; }}\n\
+                 sleep() {{ echo \"$1\" >> \"{fixd}/sleeps\"; }}\n\
                  echo $$ > \"{fixd}/self\"; d=\"{fixd}/proc/$$\"; mkdir \"$d\"; \
                  echo \"$$ (sh) S 1 1 1 0 -1\" > \"$d/stat\"; echo freenet > \"$d/comm\"; \
                  echo \"sh -c freenet network\" > \"$d/args\"; : > \"$d/environ\"; \
@@ -2658,9 +2660,23 @@ echo "RC=$?"
                     .exists(),
                 "the pre-flight signalled its own sh"
             );
-            let sleeps = std::fs::read_to_string(fix.join("sleeps"))
-                .map(|s| s.lines().count())
-                .unwrap_or(0);
+            let sleeps = std::fs::read_to_string(fix.join("sleeps")).unwrap_or_default();
+            assert!(
+                sleeps.lines().all(|l| l == "1"),
+                "every wait step must be `sleep 1`: {sleeps:?}"
+            );
+            let sleeps = sleeps.lines().count();
+            // One MainPID query per distinct unit: cgroup v1 repeats the same
+            // path on every controller line.
+            let queries = std::fs::read_to_string(fix.join("queries")).unwrap_or_default();
+            let mut distinct: Vec<&str> = queries.lines().collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                queries.lines().count(),
+                "a unit was queried twice: {queries:?}"
+            );
             let reaped: Vec<Reaped> = pids
                 .iter()
                 .map(|pid| {
@@ -2791,9 +2807,10 @@ echo "RC=$?"
                 "0::/system.slice/hosted.service/payload\n",
                 // A unit name may contain ':'.
                 "0::/system.slice/a:b.service\n",
-                // cgroup v1: several hierarchy lines; the LAST `.service` line
-                // names the unit.
+                // cgroup v1: several hierarchy lines, naming different units
+                // and repeating one.
                 "12:pids:/system.slice/other.service\n\
+                 5:cpu,cpuacct:/system.slice/freenet.service\n\
                  1:name=systemd:/system.slice/freenet.service\n",
             ];
             if !system_unit {

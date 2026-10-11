@@ -523,11 +523,13 @@ Environment={fast_crash_marker}=1
 #     never killed.
 #   * neither its command line nor its environment sets the WS API port or
 #     the config dir (--ws-api-port / WS_API_PORT, --config-dir / CONFIG_DIR).
-#     A node started with either is a deliberately separate instance (a
-#     developer's test node, a second peer), not this unit's node; killing it
-#     on every start and every auto-update restart would be wrong. If such a
-#     node does hold this unit's port, the unit stands down via exit 43 as
-#     before.
+#     A node with its own WS port or config dir is a deliberately separate
+#     instance (a developer's test node, a second peer), not this unit's node;
+#     killing it on every start and every auto-update restart would be wrong.
+#     If such a node does hold this unit's port, the unit stands down via exit
+#     43 as before. A node set apart only by other settings (e.g. a different
+#     --network-port) still uses the default WS port and config, so it is
+#     treated as this unit's node.
 #   * it is not the main process of ANOTHER systemd service. Under the SYSTEM
 #     manager PID 1 forks a Type=simple service directly, so a healthy node
 #     supervised by the system unit (or by any other service) also has PPID 1.
