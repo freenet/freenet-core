@@ -1843,6 +1843,10 @@ pub struct NetworkStatusSnapshot {
     pub bytes_uploaded: u64,
     /// Cumulative bytes downloaded (lifetime, never reset).
     pub bytes_downloaded: u64,
+    /// Upload and download rates over the last minute, oldest first, from
+    /// the 1 Hz sampler of the two counters above. At most
+    /// `bandwidth_history::MAX_SAMPLES` entries.
+    pub bandwidth_history: Vec<crate::transport::bandwidth_history::RateSample>,
     /// Overall node health level for the "everything looks good" indicator.
     pub health: HealthLevel,
     /// Live ring-level statistics: connection count, hosted contracts.
@@ -2485,6 +2489,7 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
+        bandwidth_history: crate::transport::bandwidth_history::BANDWIDTH_HISTORY.recent(),
         health,
         ring_stats,
         transport_snapshot,

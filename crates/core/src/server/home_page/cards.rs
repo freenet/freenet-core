@@ -1,4 +1,5 @@
 use super::*;
+use crate::transport::bandwidth_history::RateSample;
 
 /// Format a success share so the ROUNDING never asserts something false.
 ///
@@ -613,6 +614,7 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
     format!(
         r#"<div class="card">
             <h2>Data Transfer</h2>
+            {bandwidth}
             <div class="transfer-stat">
                 <span class="transfer-label">Uploaded</span>
                 <span class="transfer-value">{uploaded}{peak_tput}</span>
@@ -626,6 +628,7 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
             {cwnd_str}
             {slowdown_str}
         </div>"#,
+        bandwidth = bandwidth_section(&snap.bandwidth_history),
         uploaded = format_bytes(snap.bytes_uploaded),
         peak_tput = peak_tput,
         downloaded = format_bytes(snap.bytes_downloaded),
@@ -634,6 +637,167 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
         cwnd_str = cwnd_str,
         slowdown_str = slowdown_str,
     )
+}
+
+/// The last minute of upload and download rates (#5152), drawn from the
+/// node's 1 Hz bandwidth sampler. Ported from the browser-side chart in #5218
+/// by @Je3r.
+fn bandwidth_section(history: &[RateSample]) -> String {
+    let body = match history.last() {
+        // One sample is a dot, not a line; wait for the second.
+        Some(latest) if history.len() >= 2 => format!(
+            r#"<p class="bw-now"><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span></p>{chart}"#,
+            up = super::charts::fmt_speed(latest.up_bytes_per_sec),
+            down = super::charts::fmt_speed(latest.down_bytes_per_sec),
+            chart = super::charts::responsive(|width| bandwidth_chart(width, history)),
+        ),
+        _ => r#"<p class="empty">Measuring transfer rates&hellip;</p>"#.to_string(),
+    };
+    format!(
+        r#"<div class="bw-section">
+                <h3>Transfer rate, last minute</h3>
+                {body}
+                <p class="bw-note">Freenet traffic only. Upload counts every UDP payload byte sent; download counts payload bytes from authenticated packets. UDP and IP headers are not included.</p>
+            </div>"#
+    )
+}
+
+/// Upper end and step of a linear rate axis: 1, 2 or 5 times a power of ten,
+/// about three steps to the top. An idle node gets a 0 to 1 KB/s axis rather
+/// than a zero-height one.
+pub(super) fn rate_axis(max: f64) -> (f64, f64) {
+    let max = if max.is_finite() { max.max(1e3) } else { 1e3 };
+    let rough = max / 3.0;
+    let magnitude = 10f64.powf(rough.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * magnitude)
+        .find(|&step| step >= rough)
+        .unwrap_or(10.0 * magnitude);
+    ((max / step).ceil() * step, step)
+}
+
+/// The rate chart at one width. Upload is the solid line, download dashed;
+/// the x axis runs from one minute ago to now. At phone width the points
+/// carry no tooltips, which a touch screen cannot show anyway.
+fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
+    use super::charts::{fmt_speed, tooltip};
+    use std::fmt::Write;
+
+    let narrow = width < 450.0;
+    let (h, left, right, top, bottom) = (150.0, 62.0, 10.0, 8.0, 22.0);
+    let plot_w = width - left - right;
+    let plot_h = h - top - bottom;
+    let window = crate::transport::bandwidth_history::WINDOW.as_secs_f64();
+    let peak = history
+        .iter()
+        .map(|s| s.up_bytes_per_sec.max(s.down_bytes_per_sec))
+        .fold(0.0, f64::max);
+    let (y_max, step) = rate_axis(peak);
+    let x = |s: &RateSample| left + (1.0 - s.age.as_secs_f64() / window).clamp(0.0, 1.0) * plot_w;
+    let y = |v: f64| top + (1.0 - (v / y_max).clamp(0.0, 1.0)) * plot_h;
+
+    let mut svg = format!(
+        r#"<svg viewBox="0 0 {width} {h}" class="mchart" role="img" aria-label="Upload and download rate over the last minute">"#
+    );
+    let mut tick = 0.0;
+    while tick <= y_max + step / 2.0 {
+        write!(
+            svg,
+            r#"<line x1="{left}" x2="{:.1}" y1="{yy:.1}" y2="{yy:.1}" class="grid"/><text x="{:.1}" y="{:.1}" text-anchor="end">{}</text>"#,
+            width - right,
+            left - 6.0,
+            y(tick) + 3.0,
+            fmt_speed(tick),
+            yy = y(tick),
+        )
+        .ok();
+        tick += step;
+    }
+    write!(
+        svg,
+        r#"<line x1="{left}" x2="{:.1}" y1="{yy:.1}" y2="{yy:.1}" class="ax"/>"#,
+        width - right,
+        yy = h - bottom
+    )
+    .ok();
+    let labels: &[(f64, &str)] = if narrow {
+        &[(60.0, "1 min ago"), (30.0, "30 s"), (0.0, "now")]
+    } else {
+        &[
+            (60.0, "1 min ago"),
+            (45.0, "45 s"),
+            (30.0, "30 s"),
+            (15.0, "15 s"),
+            (0.0, "now"),
+        ]
+    };
+    for &(ago, label) in labels {
+        let anchor = if ago >= window {
+            "start"
+        } else if ago == 0.0 {
+            "end"
+        } else {
+            "middle"
+        };
+        write!(
+            svg,
+            r#"<text x="{:.1}" y="{:.1}" text-anchor="{anchor}">{label}</text>"#,
+            left + (1.0 - ago / window) * plot_w,
+            h - bottom + 14.0
+        )
+        .ok();
+    }
+    let path = |rate: fn(&RateSample) -> f64| -> String {
+        let mut d = String::new();
+        for (i, s) in history.iter().enumerate() {
+            write!(
+                d,
+                "{}{:.1},{:.1}",
+                if i == 0 { "M" } else { " L" },
+                x(s),
+                y(rate(s))
+            )
+            .ok();
+        }
+        d
+    };
+    write!(
+        svg,
+        r#"<path d="{}" class="bw-line-down"/><path d="{}" class="bw-line-up"/>"#,
+        path(|s| s.down_bytes_per_sec),
+        path(|s| s.up_bytes_per_sec),
+    )
+    .ok();
+    if !narrow {
+        // An invisible column per sample, so hovering anywhere above a point
+        // shows both rates at that moment.
+        let col = (plot_w / history.len().max(1) as f64).max(4.0);
+        for s in history {
+            let ago = s.age.as_secs_f64().round();
+            let when = if ago < 1.0 {
+                "now".to_string()
+            } else {
+                format!("{ago:.0} s ago")
+            };
+            write!(
+                svg,
+                r#"<rect x="{:.1}" y="{top}" width="{col:.1}" height="{plot_h}" class="bw-hit">{}</rect>"#,
+                x(s) - col / 2.0,
+                tooltip(
+                    &format!(
+                        "{when}: upload {}, download {}",
+                        fmt_speed(s.up_bytes_per_sec),
+                        fmt_speed(s.down_bytes_per_sec)
+                    ),
+                    narrow
+                ),
+            )
+            .ok();
+        }
+    }
+    svg.push_str("</svg>");
+    svg
 }
 
 pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {

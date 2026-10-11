@@ -887,6 +887,9 @@ impl NodeP2P {
         // always-on like the RTT aggregator: they only read atomics + the
         // bandwidth handle and emit one OTLP event per second each (no
         // I/O). Observation only.
+        // Feeds the dashboard's bandwidth chart (#5152): two atomic loads
+        // per second into a fixed-size buffer.
+        crate::transport::bandwidth_history::spawn_sampler(&background_task_monitor);
         crate::transport::shadow_demand::spawn_demand_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,

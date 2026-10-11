@@ -261,6 +261,7 @@ mod tests {
             gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
+            bandwidth_history: Vec::new(),
             health: HealthLevel::Connecting,
             ring_stats: RingStatsSnapshot::default(),
             fair_queue: Default::default(),
@@ -911,6 +912,74 @@ mod tests {
             !html.contains("avg)"),
             "must not present the sentinel 0 as a measured average; got: {html}"
         );
+    }
+
+    fn rate(age_secs: u64, up: f64, down: f64) -> crate::transport::bandwidth_history::RateSample {
+        crate::transport::bandwidth_history::RateSample {
+            age: std::time::Duration::from_secs(age_secs),
+            up_bytes_per_sec: up,
+            down_bytes_per_sec: down,
+        }
+    }
+
+    /// Fewer than two samples cannot draw a line, so the card says it is
+    /// measuring instead of showing an empty or one-point chart.
+    #[test]
+    fn transfer_card_says_measuring_until_two_samples() {
+        for history in [vec![], vec![rate(0, 1e3, 2e3)]] {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = history;
+            let html = build_transfer_card(&Some(snap));
+            assert!(html.contains("Measuring transfer rates"), "{html}");
+            assert!(!html.contains("bw-line-up"), "{html}");
+        }
+    }
+
+    /// The chart draws both directions at both widths, labels the latest
+    /// rates, and its tooltips report the sampled values.
+    #[test]
+    fn transfer_card_draws_bandwidth_chart() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![
+            rate(2, 1_000.0, 250_000.0),
+            rate(1, 3_000.0, 500_000.0),
+            rate(0, 2_000.0, 125_000.0),
+        ];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("class=\"bw-line-up\"").count(), 2, "{html}");
+        assert_eq!(html.matches("class=\"bw-line-down\"").count(), 2, "{html}");
+        assert!(html.contains("Upload <b>2 KB/s</b>"), "{html}");
+        assert!(html.contains("Download <b>125 KB/s</b>"), "{html}");
+        assert!(
+            html.contains("<title>1 s ago: upload 3 KB/s, download 500 KB/s</title>"),
+            "{html}"
+        );
+        assert!(!html.contains("NaN"), "{html}");
+    }
+
+    /// The y axis tops out at or above the largest rate in either direction,
+    /// so no line is clipped; an idle node still gets a usable axis.
+    #[test]
+    fn bandwidth_rate_axis_covers_the_peak() {
+        for peak in [
+            0.0,
+            1.0,
+            999.0,
+            1_000.0,
+            1_001.0,
+            7_300.0,
+            2.5e6,
+            9.99e8,
+            f64::NAN,
+        ] {
+            let (top, step) = cards::rate_axis(peak);
+            assert!(top.is_finite() && step > 0.0, "peak {peak}: {top} {step}");
+            if peak.is_finite() {
+                assert!(top >= peak, "peak {peak} clipped by axis top {top}");
+            }
+            let steps = top / step;
+            assert!((1.0..=4.0).contains(&steps), "peak {peak}: {steps} steps");
+        }
     }
 
     #[test]
