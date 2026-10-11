@@ -2788,19 +2788,30 @@ impl Drop for SubOpGetCompletionGuard {
     }
 }
 
-async fn drive_sub_op_get(
-    op_manager: &Arc<OpManager>,
+/// The retry driver for a sub-op GET. `initial_target`, when given, is pinned
+/// as the first attempt's first hop; otherwise the first hop is the ring's
+/// closest candidate, as for any GET.
+fn sub_op_driver<'a>(
+    op_manager: &'a Arc<OpManager>,
     tx: Transaction,
     instance_id: ContractInstanceId,
-    return_contract_code: bool,
     initial_target: Option<PeerKeyLocation>,
-) -> SubOpGetOutcome {
+) -> GetRetryDriver<'a> {
     let htl = op_manager.ring.max_hops_to_live;
 
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         tried.push(own_addr);
     }
+    // A caller-named target must be PINNED as the first attempt's first hop.
+    // The attempt is sent to our own loopback relay, which otherwise picks the
+    // first hop by ring ranking and never consults `current_target`, so a
+    // "targeted" GET went greedily toward the key (#5846: a stranded-holder
+    // recovery fetching from the requester was routed away from it). The pin
+    // covers the first attempt only; `advance` clears it, so a target that
+    // answers NotFound falls back to ordinary routing as documented on
+    // `start_targeted_sub_op_get`.
+    let first_hop_pin = initial_target.as_ref().and_then(|peer| peer.socket_addr());
     let initial_target = initial_target.or_else(|| {
         op_manager
             .ring
@@ -2837,7 +2848,7 @@ async fn drive_sub_op_get(
         },
     };
 
-    let mut driver = GetRetryDriver {
+    GetRetryDriver {
         op_manager,
         instance_id,
         htl,
@@ -2859,8 +2870,18 @@ async fn drive_sub_op_get(
         not_found_hops: Vec::new(),
         asked_hops: Vec::new(),
         guesses_exhausted: false,
-        first_hop_pin: None,
-    };
+        first_hop_pin,
+    }
+}
+
+async fn drive_sub_op_get(
+    op_manager: &Arc<OpManager>,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    return_contract_code: bool,
+    initial_target: Option<PeerKeyLocation>,
+) -> SubOpGetOutcome {
+    let mut driver = sub_op_driver(op_manager, tx, instance_id, initial_target);
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
         op_manager,
@@ -5142,7 +5163,8 @@ mod tests {
 
         for entry in [
             "async fn drive_client_get_inner",
-            "async fn drive_sub_op_get",
+            // The sub-op driver's initial pick lives in its constructor.
+            "fn sub_op_driver<'a>(",
             "fn advance_to_next_peer",
             "fn relay_advance_to_next_peer",
         ] {
@@ -11465,6 +11487,9 @@ mod route_attempt_driver_tests {
         /// Ring peers, by ring order, given one routing event of their own
         /// before the GET, after the outside ones.
         history_for: Vec<usize>,
+        /// Run a sub-op GET targeted at this ring peer (by ring order), as
+        /// `start_targeted_sub_op_get` does, instead of a client GET.
+        sub_op_target: Option<usize>,
     }
 
     /// The outcome of a scripted-ring GET.
@@ -11637,7 +11662,17 @@ mod route_attempt_driver_tests {
             },
         );
         let client_tx = Transaction::new::<GetMsg>();
-        let mut driver = driver_as_client(&op_manager, client_tx, instance_id);
+        let mut driver = match setup.sub_op_target {
+            Some(i) => {
+                let target = ring_peers
+                    .iter()
+                    .find(|p| addr(p) == order[i])
+                    .cloned()
+                    .expect("a ring peer");
+                sub_op_driver(&op_manager, client_tx, instance_id, Some(target))
+            }
+            None => driver_as_client(&op_manager, client_tx, instance_id),
+        };
         let (outcome, _) = run(&op_manager, client_tx, &mut driver).await;
         let hops = hops.lock().clone();
         let pins = pins.lock().clone();
@@ -12057,6 +12092,58 @@ mod route_attempt_driver_tests {
         assert!(run.done, "the pinned peer answers: {:?}", run.hops);
     }
 
+    /// A targeted sub-op GET asks its target first (#5846). The attempt goes
+    /// to our own loopback relay, which picks the first hop by ring ranking
+    /// unless the retry loop pins one, so before the fix a "targeted" GET went
+    /// to the peer closest to the key and never to the target. Three peers; the
+    /// target is the FARTHEST from the key, so ranking alone never picks it
+    /// first, and it answers Found.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_targeted_sub_op_get_asks_its_target_first() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-targeted-sub-op",
+            vec![vec![S::NotFound], vec![S::NotFound], vec![S::Found]],
+            RingSetup {
+                sub_op_target: Some(2),
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        let target = run.order[2];
+        assert_eq!(
+            run.hops,
+            vec![target],
+            "the first attempt goes to the target"
+        );
+        assert_eq!(run.pins, vec![Some(target)]);
+        assert!(run.done, "the target answers: {:?}", run.hops);
+    }
+
+    /// The pin covers the first attempt only: a target that answers NotFound
+    /// is not asked again, and the next attempt is routed as usual, as
+    /// `start_targeted_sub_op_get` documents.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_targeted_sub_op_get_falls_back_to_routing_after_a_not_found() {
+        use Scripted as S;
+        let run = run_scripted_ring(
+            "get-targeted-sub-op-fallback",
+            vec![vec![S::Found], vec![S::NotFound], vec![S::NotFound]],
+            RingSetup {
+                sub_op_target: Some(2),
+                ..RingSetup::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            run.hops,
+            vec![run.order[2], run.order[0]],
+            "target first, then the ring's closest candidate"
+        );
+        assert_eq!(run.pins, vec![Some(run.order[2]), None]);
+        assert!(run.done, "the routed attempt finds it: {:?}", run.hops);
+    }
+
     /// A callback dropped on this node is retried on the same peer without
     /// spending the retry budget, and it does not count as an attempt on the
     /// peer either: no verdict came from it. One peer: its first attempt ends
@@ -12355,7 +12442,7 @@ mod route_attempt_driver_tests {
         let body = |sig: &str| production_fn_body(src, sig);
         let client = body("async fn drive_client_get_inner(");
         assert!(client.contains("recorder: RouteAttemptRecorder::new("));
-        let sub_op = body("async fn drive_sub_op_get(");
+        let sub_op = body("fn sub_op_driver<'a>(");
         assert!(sub_op.contains("recorder: RouteAttemptRecorder::disabled("));
         let relay = body("async fn drive_relay_get_inner<CB>(");
         let loopback = relay

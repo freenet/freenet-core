@@ -254,6 +254,13 @@ pub struct RenewalMetrics {
     /// in-use contracts would record N here (the thundering-herd the #3763
     /// hollow-relay firefight fought).
     pub max_reroot_batch: u64,
+    /// Stranded-holder recoveries this node completed (#5846, design §5d(b)):
+    /// it received a subscribe from a holder, found no host beyond it, pulled
+    /// the state back from the holder and became a host.
+    pub stranded_recoveries: u64,
+    /// Stranded-holder recoveries this node passed the gate for but refused
+    /// because its receiving-side rate limit was spent.
+    pub stranded_recoveries_rate_limited: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -308,6 +315,28 @@ pub fn record_reroot_batch(peer_addr: SocketAddr, batch_size: u64) {
         if batch_size > entry.max_reroot_batch {
             entry.max_reroot_batch = batch_size;
         }
+    }
+}
+
+/// Record a completed stranded-holder recovery (#5846). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .stranded_recoveries += 1;
+    }
+}
+
+/// Record a stranded-holder recovery refused by the rate limit (#5846). No-op
+/// outside a simulation context (no current network name).
+pub fn record_stranded_recovery_rate_limited(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .stranded_recoveries_rate_limited += 1;
     }
 }
 
