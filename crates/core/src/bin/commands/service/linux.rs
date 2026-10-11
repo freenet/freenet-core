@@ -32,15 +32,14 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
     "if [ \"$$cg\" != \"$$mycg\" ]; then ",
-    "u=$$(echo \"$$cg\" | grep \"[.]service$$\" | tail -n 1); ",
+    "u=$$(echo \"$$cg\" | grep -oE \"[^/:]*[.]service(/|$$)\" | tail -n 1 | cut -d/ -f1); ",
     "if [ -n \"$$u\" ]; then ",
-    "u=$${u##*/}; ",
     "mp=$$(timeout 5 systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
     "[ -z \"$$mp\" ] && continue; ",
     "[ \"$$mp\" = \"$$pid\" ] && continue; ",
     "fi; ",
     "fi; ",
-    "echo \"freenet pre-flight: stopping orphaned node $$pid: $$args\" >&2; ",
+    "echo \"freenet pre-flight: stopping orphaned node $$pid\" >&2; ",
     "kill -TERM \"$$pid\" 2>/dev/null && v=\"$$v $$pid\"; ",
     "done; ",
     "w=0; while [ -n \"$$v\" ] && [ $$w -lt 45 ]; do ",
@@ -532,15 +531,17 @@ Environment={fast_crash_marker}=1
 #   * it is not the main process of ANOTHER systemd service. Under the SYSTEM
 #     manager PID 1 forks a Type=simple service directly, so a healthy node
 #     supervised by the system unit (or by any other service) also has PPID 1.
-#     For a process in a different `.service` cgroup the pre-flight asks the
-#     SYSTEM manager (only it can be the parent of a PPID==1 service process)
+#     For a process in a different cgroup whose path names a `.service` (the
+#     deepest one, so a service that delegates a sub-cgroup still counts), the
+#     pre-flight asks the SYSTEM manager (only it can be the parent of a PPID==1 service process)
 #     for that unit's MainPID and spares the process if it matches, or if the
 #     manager cannot be asked within 5s. An orphan left behind in some other
 #     service's cgroup (e.g. started from cron), whose unit reports another
 #     MainPID or none (0), is still reaped. Under the system unit a leftover in
 #     this unit's own cgroup also has PPID 1 and is reaped. An unreadable /proc
 #     entry, or no procps `ps`, means "skip": this path errs towards not killing.
-# Each victim is logged to the journal before it is signalled.
+# Each victim's PID is logged to the journal before it is signalled (not its
+# command line, which may hold secrets and, under dash, backslash escapes).
 # Known limit: on a desktop session the user manager is the child subreaper
 # for terminals it spawned, so a node orphaned there gets the manager, not
 # PID 1, as parent and is not reaped. #5187 was an SSH session (PPID 1).
@@ -548,7 +549,8 @@ Environment={fast_crash_marker}=1
 # TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL
 # (re-checking the comm first, so a recycled PID is not killed), then up to 5s
 # more for the kernel to release the port before ExecStart binds. Worst case is
-# ~50s plus up to 5s per MainPID query, inside the TimeoutStartSec set below.
+# ~50s plus up to 5s per MainPID query, which stays inside the TimeoutStartSec
+# set below unless more than a dozen candidates each need a query.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
@@ -767,9 +769,11 @@ Environment={fast_crash_marker}=1
 # Orphan self-heal (issues #3967, #5187): the SAME pre-flight as the user unit
 # (generated from one constant, so the two cannot drift); see the comment there
 # for the reap conditions and the systemd $$ / % escaping. The cgroup condition
-# matters most HERE: this unit's own healthy node has PPID 1, so PPID alone
-# cannot tell it apart from an orphan. A leftover in this unit's own cgroup also
-# has PPID 1 here, and is reaped.
+# matters here because under the system manager EVERY service's main process
+# has PPID 1: another system service running a node as this user (e.g. a hosted
+# node) must be told apart from an orphan by its MainPID. (This unit's own node
+# does not exist yet when the pre-flight runs; a leftover in this unit's own
+# cgroup, normally already killed by KillMode=control-group, is reaped.)
 {orphan_reap_preflight}
 ExecStart={binary} network
 # Bounds the whole start, ExecStartPre included. The orphan pre-flight above

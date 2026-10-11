@@ -1988,7 +1988,6 @@ mod tests {
                 "$$comm",
                 "$$args",
                 "$$mp",
-                "$${u##*/}",
             ] {
                 assert!(
                     pre.contains(needle),
@@ -2393,6 +2392,8 @@ echo "RC=$?"
         ignores_kill: bool,
         /// After SIGTERM its PID is reused by a process with this comm.
         comm_after_term: Option<&'a str>,
+        /// SIGTERM fails (EPERM / already gone).
+        term_fails: bool,
     }
 
     #[cfg(target_os = "linux")]
@@ -2416,6 +2417,7 @@ echo "RC=$?"
         ignores_term: false,
         ignores_kill: false,
         comm_after_term: None,
+        term_fails: false,
     };
 
     /// What the reaper did to a holder.
@@ -2484,12 +2486,21 @@ echo "RC=$?"
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         for (name, src) in [
-            ("pgrep", format!("cat \"{}/pids\"\n", fix.display())),
-            // ps -o args= -p PID
+            // Each shim insists on the exact call shape the body uses, so a
+            // changed flag (e.g. dropping `-u`) fails the baseline case.
+            (
+                "pgrep",
+                format!(
+                    "[ \"$*\" = \"-f -u $(id -u) freenet network\" ] || exit 3; \
+                     cat \"{f}/pids\" \"{f}/self\"\n",
+                    f = fix.display()
+                ),
+            ),
             (
                 "ps",
                 format!(
-                    "for a in \"$@\"; do p=\"$a\"; done; cat \"{}/proc/$p/args\" 2>/dev/null\n",
+                    "[ \"$1 $2 $3\" = \"-o args= -p\" ] || exit 3; \
+                     cat \"{}/proc/$4/args\" 2>/dev/null\n",
                     fix.display()
                 ),
             ),
@@ -2504,7 +2515,10 @@ echo "RC=$?"
                     f = fix.display()
                 ),
             ),
-            ("timeout", "shift\nexec \"$@\"\n".to_string()),
+            (
+                "timeout",
+                "[ \"$1\" = 5 ] || exit 3\nshift\nexec \"$@\"\n".to_string(),
+            ),
         ] {
             let p = bin.join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{src}")).unwrap();
@@ -2522,12 +2536,16 @@ echo "RC=$?"
                  -0) [ -f \"$s.KILL\" ] && [ ! -f \"{fixd}/proc/$1/ignores_kill\" ] && return 1; \
                  [ -f \"$s.TERM\" ] && [ ! -f \"{fixd}/proc/$1/ignores_term\" ] && return 1; \
                  return 0;; \
-                 -TERM|-15) : > \"$s.TERM\"; \
+                 -TERM|-15) [ -f \"{fixd}/proc/$1/term_fails\" ] && return 1; : > \"$s.TERM\"; \
                  [ -f \"{fixd}/proc/$1/comm_after_term\" ] && \
                  cp \"{fixd}/proc/$1/comm_after_term\" \"{fixd}/proc/$1/comm\"; return 0;; \
                  -KILL|-9) : > \"$s.KILL\"; return 0;; \
                  *) return 0;; esac; }}\n\
-                 sleep() {{ echo >> \"{fixd}/sleeps\"; }}\n{body}\n"
+                 sleep() {{ echo >> \"{fixd}/sleeps\"; }}\n\
+                 echo $$ > \"{fixd}/self\"; d=\"{fixd}/proc/$$\"; mkdir \"$d\"; \
+                 echo \"$$ (sh) S 1 1 1 0 -1\" > \"$d/stat\"; echo freenet > \"$d/comm\"; \
+                 echo \"sh -c freenet network\" > \"$d/args\"; : > \"$d/environ\"; \
+                 echo 0::/user.slice/session-9.scope > \"$d/cgroup\"\n{body}\n"
             ),
         )
         .unwrap();
@@ -2569,17 +2587,21 @@ echo "RC=$?"
                 if let Some(comm) = h.comm_after_term {
                     std::fs::write(d.join("comm_after_term"), format!("{comm}\n")).unwrap();
                 }
+                if h.term_fails {
+                    std::fs::write(d.join("term_fails"), "").unwrap();
+                }
                 match h.main_pid {
                     None => std::fs::write(fix.join("systemctl_down"), "").unwrap(),
                     Some(mp) => {
-                        // The unit the body derives: the LAST line ending in
-                        // `.service`, its last path component.
+                        // The unit the body derives: the deepest `.service`
+                        // path component of the last line that has one.
                         let unit = h
                             .cgroup
                             .lines()
-                            .rev()
-                            .find(|l| l.ends_with(".service"))
-                            .and_then(|l| l.rsplit('/').next());
+                            .filter_map(|l| {
+                                l.split(['/', ':']).rev().find(|c| c.ends_with(".service"))
+                            })
+                            .next_back();
                         if let Some(unit) = unit {
                             let mp = if mp == "SELF" { pid.as_str() } else { mp };
                             std::fs::write(fix.join("units").join(unit), format!("MainPID={mp}\n"))
@@ -2598,19 +2620,19 @@ echo "RC=$?"
                 out.status.success(),
                 "pre-flight body exited non-zero: {stderr}"
             );
-            // The only output is the per-victim journal line; anything else
-            // (e.g. `[: unexpected operator`) is a broken body that the unit's
-            // `-` prefix would hide.
+            // The pre-flight's own sh was offered by pgrep as a perfect target
+            // and must never be signalled.
+            let self_pid = std::fs::read_to_string(fix.join("self")).unwrap();
             assert!(
-                stderr
-                    .lines()
-                    .all(|l| l.starts_with("freenet pre-flight: stopping orphaned node ")),
-                "unexpected pre-flight output: {stderr}"
+                !fix.join("sig")
+                    .join(format!("{}.TERM", self_pid.trim()))
+                    .exists(),
+                "the pre-flight signalled its own sh"
             );
             let sleeps = std::fs::read_to_string(fix.join("sleeps"))
                 .map(|s| s.lines().count())
                 .unwrap_or(0);
-            let reaped = pids
+            let reaped: Vec<Reaped> = pids
                 .iter()
                 .map(|pid| {
                     let s = fix.join("sig").join(pid);
@@ -2625,6 +2647,21 @@ echo "RC=$?"
                     }
                 })
                 .collect();
+            // The only output is one journal line per holder the pre-flight
+            // tried to stop; anything else (e.g. `[: unexpected operator`) is a
+            // broken body that the unit's `-` prefix would hide.
+            let expected: Vec<String> = pids
+                .iter()
+                .zip(holders)
+                .zip(&reaped)
+                .filter(|((_, h), r)| **r != Reaped::Spared || h.term_fails)
+                .map(|((pid, _), _)| format!("freenet pre-flight: stopping orphaned node {pid}"))
+                .collect();
+            assert_eq!(
+                stderr.lines().collect::<Vec<_>>(),
+                expected,
+                "pre-flight output must be exactly one log line per victim"
+            );
             (reaped, sleeps)
         }
     }
@@ -2721,6 +2758,8 @@ echo "RC=$?"
             // PPID 1, so only the cgroup + MainPID tell it apart.
             let mut service_cgroups = vec![
                 "0::/system.slice/freenet-hosted.service\n",
+                // A service that delegates a sub-cgroup to its payload.
+                "0::/system.slice/hosted.service/payload\n",
                 // cgroup v1: several hierarchy lines; the LAST `.service` line
                 // names the unit.
                 "12:pids:/system.slice/other.service\n\
@@ -2848,6 +2887,19 @@ echo "RC=$?"
                 one(ReapCase { args: "", ..o }),
                 Spared,
                 "{which}: an unreadable command line must not lead to a kill"
+            );
+
+            // A failed SIGTERM (EPERM, already gone) costs no wait and no KILL.
+            assert_eq!(
+                run(
+                    own,
+                    &[ReapCase {
+                        term_fails: true,
+                        ..o
+                    }]
+                ),
+                (vec![Spared], 0),
+                "{which}: a holder that could not be signalled must not be waited on"
             );
 
             // A holder that exits on SIGTERM costs no wait at all.
