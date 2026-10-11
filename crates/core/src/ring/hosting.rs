@@ -8295,17 +8295,16 @@ mod tests {
 
     /// `Ring` copies each `DiskUsageStats` gauge into two places: the
     /// `RouterSnapshot` telemetry fields and the dashboard `HostingSnapshot`.
-    /// All are `u64`, so a swapped pair (the database size reported as state,
-    /// say) compiles and passes every test that sets the struct fields
-    /// directly. Building a `Ring` here is not practical, so this pins the
-    /// assignment text, whitespace-stripped so a rustfmt re-wrap cannot rot it.
-    /// The scrape is cross-file (`ring.rs`), so it cannot match its own needles.
+    /// The fields share types, so a swapped pair (the database size reported
+    /// as state, say) compiles and passes every test that sets the struct
+    /// fields directly. Building a `Ring` here is not practical, so this pins
+    /// the assignment text. Comments are stripped first, so a commented-out
+    /// assignment does not satisfy it, and whitespace is stripped so a rustfmt
+    /// re-wrap cannot rot it. The scrape is cross-file (`ring.rs`), so it
+    /// cannot match its own needles.
     #[test]
     fn ring_copies_each_disk_gauge_into_its_own_field() {
-        let ring: String = include_str!("../ring.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let ring = strip_comments_and_whitespace(include_str!("../ring.rs"));
         for (telemetry_field, dashboard_field, gauge) in [
             (
                 "hosting_disk_state_bytes",
@@ -8330,19 +8329,54 @@ mod tests {
                 "total_bytes",
             ),
         ] {
-            let telemetry = format!("snapshot.{telemetry_field}=Some(disk.{gauge});");
+            // The two reported gauges are already `Option` (None until first
+            // measured); the others are wrapped here.
+            let reported = matches!(gauge, "db_file_bytes" | "webapp_cache_bytes");
+            let telemetry = if reported {
+                format!("snapshot.{telemetry_field}=disk.{gauge};")
+            } else {
+                format!("snapshot.{telemetry_field}=Some(disk.{gauge});")
+            };
             assert_eq!(
                 ring.matches(&telemetry).count(),
                 1,
                 "ring.rs must set `{telemetry_field}` from `{gauge}` exactly once"
             );
-            let dashboard = format!("let{dashboard_field}=disk.map(|d|d.{gauge});");
+            let dashboard = if reported {
+                format!("let{dashboard_field}=disk.and_then(|d|d.{gauge});")
+            } else {
+                format!("let{dashboard_field}=disk.map(|d|d.{gauge});")
+            };
             assert_eq!(
                 ring.matches(&dashboard).count(),
                 1,
                 "ring.rs must derive `{dashboard_field}` from `{gauge}` exactly once"
             );
         }
+    }
+
+    /// `src` with `//` line comments and `/* */` block comments removed, then
+    /// all whitespace removed. String literals are not special-cased: a `//`
+    /// inside one truncates that line, which can only remove needles, so the
+    /// pins using this fail closed rather than passing vacuously.
+    fn strip_comments_and_whitespace(src: &str) -> String {
+        let mut no_block = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(start) = rest.find("/*") {
+            no_block.push_str(&rest[..start]);
+            rest = match rest[start..].find("*/") {
+                Some(end) => &rest[start + end + 2..],
+                None => "",
+            };
+        }
+        no_block.push_str(rest);
+        no_block
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
     }
 
     // --- Dashboard disk-usage panel population (follow-up to #4683/#4702) ----
@@ -8382,11 +8416,20 @@ mod tests {
         use std::io::Write;
         const CHUNK: usize = 64 * 1024;
 
+        // Pseudo-random content so transparent compression cannot collapse
+        // the fixture's allocation.
         fn write_file(path: &std::path::Path, len: usize) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut state: u32 = 0x9E37_79B9;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
             std::fs::File::create(path)
                 .unwrap()
-                .write_all(&vec![7u8; len])
+                .write_all(&bytes)
                 .unwrap();
         }
         fn alloc(path: &std::path::Path) -> u64 {
@@ -8436,7 +8479,7 @@ mod tests {
         write_file(&webapp_file, 44 * CHUNK);
         let (dbf, web) = (alloc(&db_file), alloc(&webapp_file));
         assert!(
-            dbf > seeded.db_file_bytes && web > seeded.webapp_cache_bytes,
+            Some(dbf) > seeded.db_file_bytes && Some(web) > seeded.webapp_cache_bytes,
             "every reported gauge must actually grow, or a dropped refresh would \
              be invisible"
         );
@@ -8444,9 +8487,14 @@ mod tests {
         manager.refresh_disk_usage();
 
         let stats = manager.disk_usage_stats().expect("seeded");
-        assert_eq!(stats.db_file_bytes, dbf, "the sweep must re-measure the db");
         assert_eq!(
-            stats.webapp_cache_bytes, web,
+            stats.db_file_bytes,
+            Some(dbf),
+            "the sweep must re-measure the db"
+        );
+        assert_eq!(
+            stats.webapp_cache_bytes,
+            Some(web),
             "the sweep must re-measure the webapp cache"
         );
         // Budgeted gauges count apparent length, unchanged by #5007.
@@ -8483,7 +8531,10 @@ mod tests {
             blind.hosting_budget_bytes()
         );
         // And the inputs really were different, so the equality is not vacuous.
-        assert_eq!(measured.disk_usage_stats().unwrap().db_file_bytes, 40 * GIB);
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().db_file_bytes,
+            Some(40 * GIB)
+        );
         // Linear region, not a clamp: 0.5 * (3 + 10) GiB.
         assert_eq!(blind.disk_budget_bytes(), 13 * GIB / 2);
     }

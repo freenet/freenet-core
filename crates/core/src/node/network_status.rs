@@ -2147,7 +2147,8 @@ pub struct HostingSnapshot {
     /// `Some(0)`, which means seeded-and-empty.
     pub disk_state_bytes: Option<u64>,
     /// Allocated size of the storage backend's database directory (#5007).
-    /// `disk_db_bytes - disk_state_bytes` is roughly the database's dead space.
+    /// `disk_db_bytes - disk_state_bytes` is the database's dead space plus its
+    /// overhead and any migration backup beside it. `None` until first measured.
     /// Reported only: NOT part of `disk_total_bytes` (#5853). Same seeded-gate
     /// semantics as `disk_state_bytes`.
     pub disk_db_bytes: Option<u64>,

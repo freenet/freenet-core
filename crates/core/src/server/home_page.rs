@@ -2923,7 +2923,7 @@ mod tests {
         // space, and the webapp cache, marked as not counted in "disk used".
         assert!(
             html.contains(
-                "not counted in disk used: database file: 100.0 MB (dead space: 60.0 MB)"
+                "not counted in disk used: database file: 100.0 MB (60.0 MB more than state"
             ),
             "tooltip must show the measured database size and its dead space — got:\n{html}"
         );
@@ -2950,6 +2950,51 @@ mod tests {
                  — got:\n{html}"
             );
         }
+    }
+
+    /// A reported gauge that has not been measured yet (`None` until its
+    /// directory is first read, #5007) shows as "not measured" without hiding
+    /// the budgeted breakdown, and an allocated database smaller than the
+    /// logical state shows a 0 difference rather than wrapping.
+    #[test]
+    fn hosting_card_disk_breakdown_with_unmeasured_and_small_db() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        // Non-empty hosting fields: an empty snapshot renders no card at all.
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry("A", false)],
+            disk_state_bytes: Some(40 * 1024 * 1024),
+            disk_db_bytes: None,
+            disk_wasm_bytes: Some(20 * 1024 * 1024),
+            disk_compile_cache_bytes: Some(5 * 1024 * 1024),
+            disk_webapp_cache_bytes: None,
+            disk_total_bytes: Some(65 * 1024 * 1024),
+            disk_budget_bytes: Some(500 * 1024 * 1024),
+            ..Default::default()
+        };
+        let db_measured = snap.hosting.disk_db_bytes.replace(30 * 1024 * 1024);
+        assert_eq!(db_measured, None);
+        let mut unmeasured = base_snapshot();
+        unmeasured.hosting = HostingSnapshot {
+            disk_db_bytes: None,
+            ..snap.hosting.clone()
+        };
+        let html = build_hosting_card(&Some(unmeasured));
+        assert!(
+            html.contains("State: 40.0 MB")
+                && html.contains("database file: not measured")
+                && html.contains("Webapp cache: not measured"),
+            "unmeasured gauges must not hide the breakdown — got:\n{html}"
+        );
+
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("database file: 30.0 MB (0 B more than state"),
+            "a database smaller than state must not wrap — got:\n{html}"
+        );
     }
 
     /// The resident-overhead axis (#5325, #5647) renders as MEMORY in bytes.

@@ -2166,10 +2166,10 @@ impl Ring {
             let disk_usage = ring.hosting_manager.disk_usage_stats();
             if let Some(disk) = disk_usage {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
-                snapshot.hosting_disk_db_bytes = Some(disk.db_file_bytes);
+                snapshot.hosting_disk_db_bytes = disk.db_file_bytes;
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
-                snapshot.hosting_disk_webapp_cache_bytes = Some(disk.webapp_cache_bytes);
+                snapshot.hosting_disk_webapp_cache_bytes = disk.webapp_cache_bytes;
                 snapshot.hosting_disk_total_bytes = Some(disk.total_bytes);
             }
 
@@ -5324,10 +5324,10 @@ impl Ring {
         // usage.
         let disk = self.hosting_manager.disk_usage_stats();
         let disk_state_bytes = disk.map(|d| d.state_bytes);
-        let disk_db_bytes = disk.map(|d| d.db_file_bytes);
+        let disk_db_bytes = disk.and_then(|d| d.db_file_bytes);
         let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
         let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
-        let disk_webapp_cache_bytes = disk.map(|d| d.webapp_cache_bytes);
+        let disk_webapp_cache_bytes = disk.and_then(|d| d.webapp_cache_bytes);
         let disk_total_bytes = disk.map(|d| d.total_bytes);
         // `disk_budget_bytes` starts at `u64::MAX` until the first 60s
         // recompute installs a real value (see `HostingManager::

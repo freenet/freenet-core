@@ -164,15 +164,25 @@ pub(crate) struct DiskUsageStats {
     /// Wasmtime compile-cache bytes (`du` of the relocated cache dir).
     pub compile_cache_bytes: u64,
     /// Allocated size of the storage backend's database directory (#5007),
-    /// shallow walk. REPORTED ONLY: not part of `total_bytes`. 0 before the
-    /// first measurement.
-    pub db_file_bytes: u64,
+    /// shallow walk. REPORTED ONLY: not part of `total_bytes`. `None` until a
+    /// walk has succeeded, so a directory that was never readable is not
+    /// reported as an empty one.
+    pub db_file_bytes: Option<u64>,
     /// Allocated size of the unpacked-webapp cache (#5007). REPORTED ONLY: not
-    /// part of `total_bytes`.
-    pub webapp_cache_bytes: u64,
+    /// part of `total_bytes`. `None` until a walk has succeeded.
+    pub webapp_cache_bytes: Option<u64>,
     /// `state_bytes + wasm_bytes + compile_cache_bytes`, the aggregate the disk
     /// budget bounds. Excludes `db_file_bytes` and `webapp_cache_bytes` (#5853).
     pub total_bytes: u64,
+}
+
+/// Sentinel stored in a reported gauge until its first successful walk.
+const UNMEASURED: u64 = u64::MAX;
+
+/// Read a reported gauge, mapping [`UNMEASURED`] to `None`.
+fn measured(gauge: &AtomicU64) -> Option<u64> {
+    let bytes = gauge.load(Ordering::Relaxed);
+    (bytes != UNMEASURED).then_some(bytes)
 }
 
 /// Exact state-size index with incrementally maintained fixed-cardinality
@@ -268,9 +278,11 @@ pub(crate) struct DiskUsageTracker {
     /// now that the admission gate reads it (#4702).
     state_sizes: Mutex<StateSizeIndex>,
     /// Allocated size of the database directory (#5007). Reported only, never
-    /// read by [`Self::total_bytes`] or any admission gate.
+    /// read by [`Self::total_bytes`] or any admission gate. [`UNMEASURED`]
+    /// until a walk succeeds.
     db_file_bytes: AtomicU64,
     /// Allocated size of the unpacked-webapp cache (#5007). Reported only.
+    /// [`UNMEASURED`] until a walk succeeds.
     webapp_cache_bytes: AtomicU64,
     /// Edge-trigger flags for "the last walk of this directory failed", one per
     /// reported gauge, so a warning about one directory cannot suppress a
@@ -291,8 +303,8 @@ impl DiskUsageTracker {
             compile_cache_bytes: AtomicU64::new(0),
             seeded: AtomicBool::new(false),
             state_sizes: Mutex::new(StateSizeIndex::default()),
-            db_file_bytes: AtomicU64::new(0),
-            webapp_cache_bytes: AtomicU64::new(0),
+            db_file_bytes: AtomicU64::new(UNMEASURED),
+            webapp_cache_bytes: AtomicU64::new(UNMEASURED),
             db_file_measure_failed: AtomicBool::new(false),
             webapp_cache_measure_failed: AtomicBool::new(false),
             paths,
@@ -349,8 +361,8 @@ impl DiskUsageTracker {
             state_limit_bytes,
             wasm_bytes,
             compile_cache_bytes,
-            db_file_bytes: self.db_file_bytes.load(Ordering::Relaxed),
-            webapp_cache_bytes: self.webapp_cache_bytes.load(Ordering::Relaxed),
+            db_file_bytes: measured(&self.db_file_bytes),
+            webapp_cache_bytes: measured(&self.webapp_cache_bytes),
             total_bytes: state_bytes
                 .saturating_add(wasm_bytes)
                 .saturating_add(compile_cache_bytes),
@@ -710,7 +722,9 @@ impl DiskUsageTracker {
     ///
     /// A failed walk keeps the gauge's previous value and warns, because a 0
     /// published for an unreadable database directory would read in telemetry
-    /// as a healthy node with no dead space, with nothing to contradict it.
+    /// as a healthy node with no dead space, with nothing to contradict it. If
+    /// no walk has succeeded yet, the previous value is [`UNMEASURED`], which
+    /// [`DiskUsageTracker::stats`] reports as `None`.
     /// `NotFound` is a legitimate 0 (a store not created yet). The warning is
     /// edge-triggered per gauge, so a permanently unreadable directory logs
     /// once rather than once per 60s sweep, and logs again if the condition
@@ -738,7 +752,7 @@ impl DiskUsageTracker {
                         measurement = what,
                         dir = %dir.display(),
                         error = %err,
-                        retained_bytes = gauge.load(Ordering::Relaxed),
+                        retained_bytes = ?measured(gauge),
                         "could not measure a hosting disk-usage directory; keeping \
                          the previous measurement rather than reporting 0"
                     );
@@ -1538,10 +1552,11 @@ mod tests {
     /// directory and webapp cache are, the budgeted aggregate and all three
     /// admission gates answer exactly as a tracker that never measured them.
     ///
-    /// The database size is injected at 40 GiB, past the 32 GiB budget cap, so
-    /// charging it anywhere flips a decision. Each gate is probed at its exact
-    /// admit/refuse boundary computed from the UNMEASURED figure, so even a
-    /// partial charge (one gate, or a fraction) turns an admit into a refusal.
+    /// The database size is injected at 40 GiB. Each gate is probed at its
+    /// exact admit/refuse boundary computed from the figure WITHOUT it, so
+    /// charging any part of it to any gate turns an admit into a refusal. (The
+    /// eviction-budget side, where the 32 GiB cap matters, is
+    /// `measured_db_size_does_not_change_the_eviction_budget` in `hosting.rs`.)
     #[test]
     fn reported_gauges_never_enter_the_budget_or_admission() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -1560,8 +1575,15 @@ mod tests {
         measured.set_db_file_bytes_for_test(40 * GIB);
 
         let s = measured.stats();
-        assert_eq!(s.db_file_bytes, 40 * GIB, "the database size is reported");
-        assert!(s.webapp_cache_bytes > 0, "the webapp cache is reported");
+        assert_eq!(
+            s.db_file_bytes.unwrap(),
+            40 * GIB,
+            "the database size is reported"
+        );
+        assert!(
+            s.webapp_cache_bytes.unwrap() > 0,
+            "the webapp cache is reported"
+        );
         assert_eq!(measured.total_bytes(), blind.total_bytes());
         assert_eq!(s.total_bytes, blind.stats().total_bytes);
         assert_eq!(s.total_bytes, 1000);
@@ -1620,6 +1642,46 @@ mod tests {
         // Over budget on the budgeted figure (100 > 50); growth by 1 byte must
         // be refused even though it would fit inside the measured file.
         assert!(t.admit_state_update(&test_key(1), 101, 50).is_err());
+        // Shrinking and holding stay admitted while over budget, as on main.
+        assert!(t.admit_state_update(&test_key(1), 100, 50).is_ok());
+        assert!(t.admit_state_update(&test_key(1), 99, 50).is_ok());
+    }
+
+    /// A directory that has NEVER been readable reports `None`, not 0: there is
+    /// no previous measurement to keep, and 0 would read as a node with no dead
+    /// space. The warning edge flag is set by the failure, cleared by the
+    /// first success, and is per gauge.
+    #[test]
+    fn a_directory_never_measured_reports_none_and_flags_are_per_gauge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let webapp = dir.path().join("webapp");
+        // A FILE where the directory should be: ENOTDIR, fails for root too.
+        write_file(&db, 8);
+        write_file(&webapp.join("aaaa").join("index.html"), 4096);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            webapp_cache_dir: webapp,
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        assert_eq!(t.stats().db_file_bytes, None, "never measured is not 0");
+        assert!(t.stats().webapp_cache_bytes.is_some());
+        assert!(t.db_file_measure_failed.load(Ordering::Relaxed));
+        assert!(
+            !t.webapp_cache_measure_failed.load(Ordering::Relaxed),
+            "one directory's failure must not set the other's flag"
+        );
+
+        std::fs::remove_file(&db).unwrap();
+        write_file(&db.join("db"), 4096);
+        t.refresh_db_file();
+        assert_eq!(t.stats().db_file_bytes, Some(alloc(&db.join("db"))));
+        assert!(
+            !t.db_file_measure_failed.load(Ordering::Relaxed),
+            "a success re-arms the warning for the next failure"
+        );
     }
 
     /// [`du_walk`] keeps counting APPARENT length. It feeds the budgeted WASM
@@ -1669,7 +1731,7 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed(std::iter::empty());
-        let measured = t.stats().db_file_bytes;
+        let measured = t.stats().db_file_bytes.unwrap();
         assert_eq!(measured, alloc(&db.join("db")));
         assert!(
             measured < APPARENT / 2,
@@ -1690,8 +1752,8 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().db_file_bytes, alloc(&db.join("db")));
-        assert!(t.stats().db_file_bytes > 1);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), alloc(&db.join("db")));
+        assert!(t.stats().db_file_bytes.unwrap() > 1);
     }
 
     /// A walk that CANNOT read the database directory keeps the previous value
@@ -1709,7 +1771,7 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed([(test_key(1), 10)]);
-        let measured = t.stats().db_file_bytes;
+        let measured = t.stats().db_file_bytes.unwrap();
         assert!(
             measured > 0,
             "fixture must measure something to then retain"
@@ -1720,7 +1782,7 @@ mod tests {
         assert!(std::fs::read_dir(&db).is_err(), "fixture must make it fail");
 
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, measured);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), measured);
         assert_eq!(t.total_bytes(), 10, "and the budgeted figure is unaffected");
     }
 
@@ -1736,13 +1798,13 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed(std::iter::empty());
-        let measured = t.stats().webapp_cache_bytes;
+        let measured = t.stats().webapp_cache_bytes.unwrap();
         assert!(measured > 0);
 
         std::fs::remove_dir_all(&webapp).unwrap();
         write_file(&webapp, 8);
         t.refresh_webapp_cache();
-        assert_eq!(t.stats().webapp_cache_bytes, measured);
+        assert_eq!(t.stats().webapp_cache_bytes.unwrap(), measured);
     }
 
     /// A directory that does not exist is a measurement of zero, not a failure:
@@ -1758,11 +1820,15 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed(std::iter::empty());
-        assert!(t.stats().db_file_bytes > 0);
+        assert!(t.stats().db_file_bytes.unwrap() > 0);
 
         std::fs::remove_dir_all(&db).unwrap();
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, 0, "gone means zero, not retained");
+        assert_eq!(
+            t.stats().db_file_bytes.unwrap(),
+            0,
+            "gone means zero, not retained"
+        );
     }
 
     /// A recoverable failure does not poison the gauge: once the directory is
@@ -1778,19 +1844,19 @@ mod tests {
             ..nonexistent_paths()
         });
         t.seed(std::iter::empty());
-        let first = t.stats().db_file_bytes;
+        let first = t.stats().db_file_bytes.unwrap();
 
         std::fs::remove_dir_all(&db).unwrap();
         write_file(&db, 8);
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, first);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), first);
 
         std::fs::remove_file(&db).unwrap();
         write_file(&db.join("db"), 512 * 1024);
         let grown = alloc(&db.join("db"));
         assert!(grown > first);
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, grown);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), grown);
     }
 
     /// `db_dir` in Network mode contains the `local/` subtree, whose bytes
@@ -1811,7 +1877,7 @@ mod tests {
         let siblings = alloc(&db.join("db")) + alloc(&db.join("db.backup"));
         assert!(alloc(&db.join("local").join("db")) > 0);
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().db_file_bytes, siblings);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), siblings);
     }
 
     #[test]
@@ -1826,13 +1892,13 @@ mod tests {
         });
         let seeded = alloc(&db.join("db"));
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().db_file_bytes, seeded);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), seeded);
 
         write_file(&db.join("db"), 256 * 1024);
         let grown = alloc(&db.join("db"));
         assert!(grown > seeded, "fixture must actually grow the allocation");
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, grown);
+        assert_eq!(t.stats().db_file_bytes.unwrap(), grown);
     }
 
     #[test]
@@ -1849,12 +1915,12 @@ mod tests {
         let seeded = alloc(&webapp.join("aaaa").join("index.html"))
             + alloc(&webapp.join("bbbb").join("app.js"));
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().webapp_cache_bytes, seeded);
+        assert_eq!(t.stats().webapp_cache_bytes.unwrap(), seeded);
 
         write_file(&webapp.join("cccc").join("app.js"), 50);
         let grown = seeded + alloc(&webapp.join("cccc").join("app.js"));
         t.refresh_webapp_cache();
-        assert_eq!(t.stats().webapp_cache_bytes, grown);
+        assert_eq!(t.stats().webapp_cache_bytes.unwrap(), grown);
     }
 
     /// Four same-typed paths, each of which must feed exactly one gauge.
@@ -1889,8 +1955,8 @@ mod tests {
         let s = t.stats();
         assert_eq!(s.wasm_bytes, wasm);
         assert_eq!(s.compile_cache_bytes, compile);
-        assert_eq!(s.db_file_bytes, dbf);
-        assert_eq!(s.webapp_cache_bytes, web);
+        assert_eq!(s.db_file_bytes.unwrap(), dbf);
+        assert_eq!(s.webapp_cache_bytes.unwrap(), web);
         assert_eq!(
             s.total_bytes,
             wasm + compile,

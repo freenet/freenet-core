@@ -1577,7 +1577,19 @@ pub mod test {
         let cutoff = FULL
             .find(concat!("pub mod ", "test {"))
             .expect("handler.rs must have a test module");
-        FULL[..cutoff]
+        // Drop `/* */` block comments too, so a call wrapped in one cannot
+        // satisfy the pin.
+        let mut production = String::with_capacity(cutoff);
+        let mut rest = &FULL[..cutoff];
+        while let Some(start) = rest.find(concat!("/", "*")) {
+            production.push_str(&rest[..start]);
+            rest = match rest[start..].find(concat!("*", "/")) {
+                Some(end) => &rest[start + end + 2..],
+                None => "",
+            };
+        }
+        production.push_str(rest);
+        production
             .lines()
             .map(|line| line.split("//").next().unwrap_or(""))
             .collect::<String>()
