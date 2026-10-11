@@ -8,11 +8,16 @@
 //! sample is taken, so a dashboard request only copies at most
 //! [`MAX_SAMPLES`] small values and does no work that grows with uptime.
 //!
-//! What the rates measure is exactly what the counters measure: upload is
-//! every byte a successful `send_to` put on the wire, download is bytes from
-//! packets that authenticated against an established session (see the
-//! comment on the counters in `metrics.rs`). UDP and IP headers are not
-//! counted in either direction.
+//! What the rates measure is exactly what the counters measure (see the
+//! comment on the counters in `metrics.rs`). Both count whole UDP datagrams,
+//! encrypted, without UDP or IP headers. Upload counts every datagram a
+//! successful `send_to` put on the wire. Download counts only datagrams that
+//! authenticated against an established connection, so inbound handshake and
+//! probe traffic is not in it while the outbound side of it is in upload.
+//!
+//! A sample is the average over the interval since the previous one. That is
+//! one second while the sampler keeps up; after a stall of up to [`WINDOW`]
+//! one point averages the whole stall. A longer stall restarts the series.
 //!
 //! The approach and the edge cases handled here (counter resets, backward
 //! clocks, gaps longer than the window, bursts of samples) follow the
@@ -85,8 +90,12 @@ pub(crate) struct BandwidthHistory {
 
 /// [`BandwidthHistory`] behind a lock, with the clock both the sampler and
 /// the dashboard read so their timestamps share one epoch. `RealTime` counts
-/// from when this is created and follows tokio's clock, so it agrees with
-/// the sampler's `tokio::time::interval` under paused test time too.
+/// from when this is created and follows tokio's clock, so it agrees with a
+/// sampler's `tokio::time::interval` in the runtime that created it,
+/// including under paused test time. The process-wide instance is first
+/// touched by a real node (the sampler, or a dashboard request, which needs
+/// an initialised `network_status`); a paused runtime that touched it first
+/// and then advanced would leave later runtimes reading zero elapsed time.
 pub(crate) struct SharedBandwidthHistory {
     clock: RealTime,
     history: Mutex<BandwidthHistory>,
@@ -193,21 +202,35 @@ impl SharedBandwidthHistory {
     /// newer one, which looks like a backward clock or a decreasing counter
     /// and would clear the series.
     fn sample(&self) {
+        self.sample_with(|| {
+            (
+                TRANSPORT_METRICS.cumulative_bytes_sent(),
+                TRANSPORT_METRICS.cumulative_bytes_received(),
+            )
+        });
+    }
+
+    /// [`Self::sample`] with the `(sent, received)` reading supplied, so a
+    /// test can drive it without the process-wide counters.
+    fn sample_with(&self, read: impl FnOnce() -> (u64, u64)) {
         let mut history = self.history.lock();
-        let sent = TRANSPORT_METRICS.cumulative_bytes_sent();
-        let received = TRANSPORT_METRICS.cumulative_bytes_received();
+        let (sent, received) = read();
         history.record(self.clock.now(), sent, received);
     }
 
     /// The last minute of rates, oldest first. At most [`MAX_SAMPLES`] items.
+    /// Reads the clock under the lock too, so a sample recorded just before
+    /// is never newer than `now`.
     pub(crate) fn recent(&self) -> Vec<RateSample> {
-        let now = self.clock.now();
-        self.history.lock().recent(now)
+        let history = self.history.lock();
+        history.recent(self.clock.now())
     }
 }
 
 /// Spawn the 1 Hz sampler and register it with the `BackgroundTaskMonitor`.
-/// It only loads two atomics and takes an uncontended lock per tick.
+/// Each tick loads two atomics under an uncontended lock. Its exit would be
+/// fatal to the node (the monitor treats any exit so), and it has no exit or
+/// panic path.
 pub(crate) fn spawn_sampler(monitor: &BackgroundTaskMonitor) {
     let handle = tokio::spawn(run_sampler(&BANDWIDTH_HISTORY));
     monitor.register("bandwidth_history_sampler", handle);
@@ -365,8 +388,12 @@ mod tests {
         h.record(Duration::ZERO, 0, 0);
         h.record(WINDOW, 6_000, 0);
         assert_eq!(h.recent(WINDOW)[0].up_bytes_per_sec, 100.0);
-        h.record(WINDOW * 2 + Duration::from_nanos(1), 9_000, 0);
-        assert!(h.recent(WINDOW * 2).is_empty());
+        let later = WINDOW * 2 + Duration::from_nanos(1);
+        h.record(later, 9_000, 0);
+        h.record(later + secs(1.0), 9_100, 0);
+        let recent = h.recent(later + secs(1.0));
+        assert_eq!(recent.len(), 1, "only the post-restart sample");
+        assert_eq!(recent[0].up_bytes_per_sec, 100.0);
 
         // A sample exactly WINDOW old is still shown.
         let mut h = BandwidthHistory::default();
@@ -409,6 +436,20 @@ mod tests {
     /// The real sampler loop, under paused tokio time, fills the history it
     /// is given. Uses its own history rather than the process-wide one so
     /// nodes running in the same test process cannot interfere.
+    /// Sent becomes upload and received becomes download, read at the
+    /// shared clock.
+    #[tokio::test(start_paused = true)]
+    async fn sample_records_sent_as_upload_and_received_as_download() {
+        let history = SharedBandwidthHistory::new();
+        history.sample_with(|| (1_000, 50_000));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        history.sample_with(|| (3_000, 50_500));
+        let recent = history.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].up_bytes_per_sec, 2_000.0);
+        assert_eq!(recent[0].down_bytes_per_sec, 500.0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sampler_loop_fills_the_history() {
         let history = SharedBandwidthHistory::new();

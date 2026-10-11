@@ -639,6 +639,10 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
     )
 }
 
+/// The sampler runs every second, so a newest sample older than this means it
+/// has stalled.
+const BANDWIDTH_STALE_AFTER_SECS: u64 = 3;
+
 /// The last minute of upload and download rates (#5152), drawn from the
 /// node's 1 Hz bandwidth sampler. Ported from the browser-side chart in #5218
 /// by @Je3r.
@@ -646,17 +650,18 @@ fn bandwidth_section(history: &[RateSample]) -> String {
     let body = match history.last() {
         // One sample is a dot, not a line; wait for the second.
         Some(latest) if history.len() >= 2 => {
-            // The sampler runs every second, so an older newest sample means
-            // it has stalled; say how old the headline figures are rather
-            // than present them as current.
+            // Say how old the headline figures are rather than present a
+            // stalled sampler's last reading as current.
             let age = latest.age.as_secs();
-            let stale = if age > 3 {
+            let stale = if age > BANDWIDTH_STALE_AFTER_SECS {
                 format!(r#"<span class="bw-stale">as of {age} s ago</span>"#)
             } else {
                 String::new()
             };
             format!(
-                r#"<p class="bw-now"><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span>{stale}</p>{chart}"#,
+                r#"<p class="bw-now"><span>Last second:</span><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span>{stale}</p>{chart}"#,
+                // Decimal units, like every speed chart on the dashboard; the
+                // card's lifetime totals above use binary units (format_bytes).
                 up = super::charts::fmt_speed(latest.up_bytes_per_sec),
                 down = super::charts::fmt_speed(latest.down_bytes_per_sec),
                 chart = super::charts::responsive(|width| bandwidth_chart(width, history)),
@@ -668,7 +673,7 @@ fn bandwidth_section(history: &[RateSample]) -> String {
         r#"<div class="bw-section">
                 <h3>Transfer rate, last minute</h3>
                 {body}
-                <p class="bw-note">Freenet traffic only. Upload counts every UDP payload byte sent; download counts payload bytes from authenticated packets. UDP and IP headers are not included.</p>
+                <p class="bw-note">Freenet traffic only, as encrypted UDP datagrams without UDP or IP headers. Upload counts every datagram sent; download counts only datagrams from established connections, so inbound connection setup is not included.</p>
             </div>"#
     )
 }
@@ -787,6 +792,10 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
         let col =
             plot_w * crate::transport::bandwidth_history::SAMPLE_INTERVAL.as_secs_f64() / window;
         for s in history {
+            // Trimmed rather than shifted at the plot edges, so an edge
+            // column never covers its neighbour's point.
+            let x0 = (x(s) - col / 2.0).max(left);
+            let x1 = (x(s) + col / 2.0).min(width - right);
             let ago = s.age.as_secs_f64().round();
             let when = if ago < 1.0 {
                 "now".to_string()
@@ -795,8 +804,8 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
             };
             write!(
                 svg,
-                r#"<rect x="{:.1}" y="{top}" width="{col:.1}" height="{plot_h}" class="bw-hit">{}</rect>"#,
-                (x(s) - col / 2.0).clamp(left, width - right - col),
+                r#"<rect x="{x0:.1}" y="{top}" width="{:.1}" height="{plot_h}" class="bw-hit">{}</rect>"#,
+                (x1 - x0).max(0.0),
                 tooltip(
                     &format!(
                         "{when}: upload {}, download {}",

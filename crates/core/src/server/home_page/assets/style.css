@@ -867,8 +867,7 @@ svg.mchart .bw-hit {
   fill: transparent;
 }
 svg.mchart .bw-hit:hover {
-  fill: var(--border-color);
-  opacity: 0.4;
+  fill: var(--bg-tertiary);
 }
 .bw-note {
   margin: 0.3rem 0 0;

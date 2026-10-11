@@ -2489,6 +2489,9 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         gateway_only_persisting,
         bytes_uploaded,
         bytes_downloaded,
+        // Aged against the sampler's own clock, not `now`: the history is
+        // timestamped by that clock, so a test passing a future `now` still
+        // sees ages as of the present.
         bandwidth_history: crate::transport::bandwidth_history::BANDWIDTH_HISTORY.recent(),
         health,
         ring_stats,

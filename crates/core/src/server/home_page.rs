@@ -980,9 +980,14 @@ mod tests {
     #[test]
     fn bandwidth_chart_tooltips_are_desktop_only_and_inside_the_plot() {
         let mut snap = base_snapshot();
-        snap.bandwidth_history = vec![rate(1, 1.0, 1.0), rate(0, 2.0, 2.0)];
+        snap.bandwidth_history = vec![
+            rate(60, 1.0, 1.0),
+            rate(59, 1.0, 1.0),
+            rate(1, 1.0, 1.0),
+            rate(0, 2.0, 2.0),
+        ];
         let html = build_transfer_card(&Some(snap));
-        assert_eq!(html.matches("<title>").count(), 2, "{html}");
+        assert_eq!(html.matches("<title>").count(), 4, "{html}");
         assert!(html.contains("<title>now: upload"), "{html}");
         let narrow = html
             .split(r#"<div class="w-narrow">"#)
@@ -995,10 +1000,14 @@ mod tests {
                 v[..v.find('"').unwrap()].parse().unwrap()
             };
             let (x, w) = (attr("x"), attr("width"));
+            // Attributes are printed to 0.1, so allow that much rounding.
             assert!(
-                x >= 62.0 && x + w <= 590.0 + 1e-6,
+                x >= 62.0 && x + w <= 590.0 + 0.1,
                 "rect {x}+{w} outside plot"
             );
+            // One sampling interval (528 / 60 = 8.8) or less, trimmed at
+            // the edges rather than shifted over a neighbour.
+            assert!(w <= 8.8 + 0.1, "rect {x}+{w} wider than one interval");
         }
     }
 
@@ -1006,14 +1015,15 @@ mod tests {
     /// old instead of presenting it as the current rate.
     #[test]
     fn bandwidth_headline_flags_stale_samples() {
-        let mut snap = base_snapshot();
-        snap.bandwidth_history = vec![rate(2, 1.0, 1.0), rate(1, 1.0, 1.0)];
-        let fresh = build_transfer_card(&Some(snap));
+        let card = |newest: u64| {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = vec![rate(newest + 1, 1.0, 1.0), rate(newest, 1.0, 1.0)];
+            build_transfer_card(&Some(snap))
+        };
+        let fresh = card(3);
         assert!(!fresh.contains("bw-stale"), "{fresh}");
-        let mut snap = base_snapshot();
-        snap.bandwidth_history = vec![rate(41, 1.0, 1.0), rate(40, 1.0, 1.0)];
-        let stale = build_transfer_card(&Some(snap));
-        assert!(stale.contains("as of 40 s ago"), "{stale}");
+        assert!(card(4).contains("as of 4 s ago"));
+        assert!(card(40).contains("as of 40 s ago"));
     }
 
     /// The y axis tops out at or above the largest rate in either direction,
