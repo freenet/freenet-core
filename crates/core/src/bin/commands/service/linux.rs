@@ -27,12 +27,12 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
     "args=$$(ps -o args= -p \"$$pid\" 2>/dev/null); ",
     "case \"$$args\" in \"\"|*--ws-api-port*|*--config-dir*) continue ;; esac; ",
-    "[ -r /proc/$$pid/environ ] || continue; ",
-    "grep -qaE \"(^|[^A-Z_])(WS_API_PORT|CONFIG_DIR)=\" /proc/$$pid/environ 2>/dev/null && continue; ",
+    "grep -qaE \"(^|[^A-Z_])(WS_API_PORT|CONFIG_DIR)=\" /proc/$$pid/environ 2>/dev/null; ",
+    "[ $$? -eq 1 ] || continue; ",
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
     "if [ \"$$cg\" != \"$$mycg\" ]; then ",
-    "u=$$(echo \"$$cg\" | grep -oE \"[^/:]*[.]service(/|$$)\" | tail -n 1 | cut -d/ -f1); ",
+    "u=$$(echo \"$$cg\" | grep -oE \"[^/]*[.]service(/|$$)\" | tail -n 1 | cut -d/ -f1); ",
     "if [ -n \"$$u\" ]; then ",
     "mp=$$(timeout 5 systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
     "[ -z \"$$mp\" ] && continue; ",
@@ -542,9 +542,11 @@ Environment={fast_crash_marker}=1
 #     entry, or no procps `ps`, means "skip": this path errs towards not killing.
 # Each victim's PID is logged to the journal before it is signalled (not its
 # command line, which may hold secrets and, under dash, backslash escapes).
-# Known limit: on a desktop session the user manager is the child subreaper
-# for terminals it spawned, so a node orphaned there gets the manager, not
-# PID 1, as parent and is not reaped. #5187 was an SSH session (PPID 1).
+# Known limit: the user manager is the child subreaper for processes it
+# spawned itself (e.g. a desktop terminal), so a node orphaned under one of
+# those gets the manager, not PID 1, as parent and is not reaped. #5187 was an
+# SSH session (PPID 1). A process under a scope whose own spawner has PPID 1
+# (e.g. a tmux server) does reach PID 1 and is reaped like a session orphan.
 # Every victim gets SIGTERM, then up to 45s to exit (the same budget as
 # TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL
 # (re-checking the comm first, so a recycled PID is not killed), then up to 5s

@@ -1988,6 +1988,7 @@ mod tests {
                 "$$comm",
                 "$$args",
                 "$$mp",
+                "$$?",
             ] {
                 assert!(
                     pre.contains(needle),
@@ -2013,6 +2014,7 @@ mod tests {
                 "\"$comm\"",
                 "\"$args\"",
                 "\"$mp\"",
+                "[ $? -eq",
             ] {
                 assert!(
                     !pre.contains(bad),
@@ -2441,7 +2443,7 @@ echo "RC=$?"
     /// `/proc`), `pgrep`/`ps`/`systemctl` are PATH shims answering from that
     /// tree, and `kill`/`sleep` are shell functions (functions beat the
     /// builtins) that record signals per PID and make the wait loops instant.
-    /// `run(own_cgroup, holders)` gives holder `i` the PID `4242 + i` and
+    /// `run(own_cgroup, holders)` gives holder `i` the PID `5_000_000 + i` and
     /// reports what happened to each, plus how many 1s sleeps the body took.
     ///
     /// Linux-only because the unit generators are `#[cfg(target_os = "linux")]`.
@@ -2504,14 +2506,17 @@ echo "RC=$?"
                     fix.display()
                 ),
             ),
-            // systemctl show -p MainPID UNIT (system manager only: a
-            // `--user` query is not expected and fails the shim).
+            // systemctl show -p MainPID UNIT (system manager only). An unknown
+            // unit answers MainPID=0 like real systemd, and is recorded: the
+            // harness fails if the body asked about a unit the case did not
+            // register, i.e. derived the wrong unit from the cgroup.
             (
                 "systemctl",
                 format!(
-                    "for a in \"$@\"; do [ \"$a\" = --user ] && exit 2; u=\"$a\"; done; \
+                    "[ \"$# $1 $2 $3\" = \"4 show -p MainPID\" ] || exit 3; \
                      [ -f \"{f}/systemctl_down\" ] && exit 1; \
-                     cat \"{f}/units/$u\" 2>/dev/null || echo MainPID=0\n",
+                     cat \"{f}/units/$4\" 2>/dev/null && exit 0; \
+                     echo \"$4\" >> \"{f}/unknown_units\"; echo MainPID=0\n",
                     f = fix.display()
                 ),
             ),
@@ -2557,7 +2562,13 @@ echo "RC=$?"
                 std::fs::create_dir_all(fix.join(sub)).unwrap();
             }
             std::fs::write(fix.join("own_cgroup"), own_cgroup).unwrap();
-            let pids: Vec<String> = (0..holders.len()).map(|i| (4242 + i).to_string()).collect();
+            // Above the kernel's PID_MAX_LIMIT (2^22): no real process can
+            // have these PIDs, so they cannot collide with the harness sh's
+            // own, and a `kill` that ever escaped the shell function would
+            // fail with ESRCH instead of hitting something.
+            let pids: Vec<String> = (0..holders.len())
+                .map(|i| (5_000_000 + i).to_string())
+                .collect();
             std::fs::write(fix.join("pids"), pids.join("\n") + "\n").unwrap();
             for (pid, h) in pids.iter().zip(holders) {
                 let d = fix.join("proc").join(pid);
@@ -2598,9 +2609,7 @@ echo "RC=$?"
                         let unit = h
                             .cgroup
                             .lines()
-                            .filter_map(|l| {
-                                l.split(['/', ':']).rev().find(|c| c.ends_with(".service"))
-                            })
+                            .filter_map(|l| l.split('/').rev().find(|c| c.ends_with(".service")))
                             .next_back();
                         if let Some(unit) = unit {
                             let mp = if mp == "SELF" { pid.as_str() } else { mp };
@@ -2610,15 +2619,22 @@ echo "RC=$?"
                     }
                 }
             }
-            let out = std::process::Command::new("sh")
+            // The units run /bin/sh; pin the locale the regexes see.
+            let out = std::process::Command::new("/bin/sh")
                 .arg(&harness_path)
                 .env("PATH", &path_env)
+                .env("LC_ALL", "C")
                 .output()
                 .expect("failed to run systemd heal harness");
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 out.status.success(),
                 "pre-flight body exited non-zero: {stderr}"
+            );
+            let unknown = std::fs::read_to_string(fix.join("unknown_units")).unwrap_or_default();
+            assert!(
+                unknown.is_empty(),
+                "pre-flight queried units the case did not register: {unknown}"
             );
             // The pre-flight's own sh was offered by pgrep as a perfect target
             // and must never be signalled.
@@ -2760,6 +2776,10 @@ echo "RC=$?"
                 "0::/system.slice/freenet-hosted.service\n",
                 // A service that delegates a sub-cgroup to its payload.
                 "0::/system.slice/hosted.service/payload\n",
+                // A unit name may contain ':'.
+                "0::/system.slice/a:b.service\n",
+                // The deepest `.service` in one path names the unit.
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n",
                 // cgroup v1: several hierarchy lines; the LAST `.service` line
                 // names the unit.
                 "12:pids:/system.slice/other.service\n\
@@ -2861,15 +2881,17 @@ echo "RC=$?"
                 "{which}: a session orphan must not depend on a MainPID query"
             );
 
-            // A scope nested under a `.service` ancestor is not a service.
+            // A scope nested under `user@UID.service` (e.g. a tmux server
+            // with PPID 1 spawned it) is attributed to that service; its
+            // MainPID is the user manager, so the node is an orphan.
             assert_eq!(
                 one(ReapCase {
                     cgroup: "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n",
-                    main_pid: Some("0"),
+                    main_pid: Some("1376"),
                     ..o
                 }),
                 Terminated,
-                "{which}: only a cgroup ENDING in .service is a service"
+                "{which}: an orphan under a user-manager scope must be reaped"
             );
 
             // Unreadable /proc entries err towards NOT killing.
@@ -2935,12 +2957,15 @@ echo "RC=$?"
             // Its PID reused by something else during the grace period: no
             // SIGKILL for the newcomer.
             assert_eq!(
-                one(ReapCase {
-                    ignores_term: true,
-                    comm_after_term: Some("bash"),
-                    ..o
-                }),
-                Terminated,
+                run(
+                    own,
+                    &[ReapCase {
+                        ignores_term: true,
+                        comm_after_term: Some("bash"),
+                        ..o
+                    }]
+                ),
+                (vec![Terminated], 50),
                 "{which}: a recycled PID must not get SIGKILL"
             );
 
