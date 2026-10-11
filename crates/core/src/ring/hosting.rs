@@ -1317,6 +1317,15 @@ impl HostingManager {
         }
     }
 
+    /// Test-only: install a measured webapp-cache size on the configured
+    /// tracker.
+    #[cfg(test)]
+    pub(crate) fn set_webapp_cache_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_webapp_cache_bytes_for_test(bytes);
+        }
+    }
+
     // =========================================================================
     // Pending Reclamation Retry Queue
     // =========================================================================
@@ -8355,13 +8364,21 @@ mod tests {
         }
     }
 
-    /// `src` with `//` line comments and `/* */` block comments removed, then
-    /// all whitespace removed. String literals are not special-cased: a `//`
-    /// inside one truncates that line, which can only remove needles, so the
-    /// pins using this fail closed rather than passing vacuously.
+    /// `src` with `//` line comments removed first, then `/* */` block
+    /// comments, then all whitespace. Line comments go first so a `/*` inside
+    /// one (`/// contracts_dir/*.wasm`) cannot open a block that swallows code.
+    /// String literals are not special-cased, and an unterminated `/*` drops
+    /// the rest of the file: either can only remove text, which turns the
+    /// presence and exactly-once checks red. Do not use this for an ABSENCE
+    /// check, which removed text would satisfy.
     fn strip_comments_and_whitespace(src: &str) -> String {
-        let mut no_block = String::with_capacity(src.len());
-        let mut rest = src;
+        let no_line: String = src
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut no_block = String::with_capacity(no_line.len());
+        let mut rest = no_line.as_str();
         while let Some(start) = rest.find("/*") {
             no_block.push_str(&rest[..start]);
             rest = match rest[start..].find("*/") {
@@ -8370,13 +8387,7 @@ mod tests {
             };
         }
         no_block.push_str(rest);
-        no_block
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .collect::<String>()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect()
+        no_block.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     // --- Dashboard disk-usage panel population (follow-up to #4683/#4702) ----
@@ -8521,6 +8532,7 @@ mod tests {
         let measured = HostingManager::new(64 * GIB);
         measured.seed_disk_tracker_for_test(rows);
         measured.set_db_file_bytes_for_test(40 * GIB);
+        measured.set_webapp_cache_bytes_for_test(20 * GIB);
         let measured_effective = measured.recompute_effective_budget(available);
 
         assert!(blind_effective.is_some());

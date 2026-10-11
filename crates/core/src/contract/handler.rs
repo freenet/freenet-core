@@ -1554,8 +1554,16 @@ pub mod test {
         // The substitution template must not exist on this path at all: the
         // process-wide webapp-cache default would measure some other node's
         // directory (or the developer's) instead of this one's.
+        // Checked against the RAW production text, not the comment-stripped
+        // one: stripping can only remove text, which an absence check would
+        // read as a pass. A mention in a comment fails this, which is the safe
+        // direction.
+        const FULL: &str = include_str!("handler.rs");
+        let raw_production = &FULL[..FULL
+            .find(concat!("pub mod ", "test {"))
+            .expect("handler.rs must have a test module")];
         assert!(
-            !src.contains(concat!("default_webapp", "_cache_dir")),
+            !raw_production.contains(concat!("default_webapp", "_cache_dir")),
             "the node's disk accounting must never resolve the process-wide \
              webapp cache default — it has to measure the directory this node \
              actually serves from"
@@ -1577,10 +1585,17 @@ pub mod test {
         let cutoff = FULL
             .find(concat!("pub mod ", "test {"))
             .expect("handler.rs must have a test module");
-        // Drop `/* */` block comments too, so a call wrapped in one cannot
-        // satisfy the pin.
-        let mut production = String::with_capacity(cutoff);
-        let mut rest = &FULL[..cutoff];
+        // Line comments first, so a `/*` inside one cannot open a block that
+        // swallows code; then `/* */` blocks, so a call wrapped in one cannot
+        // satisfy the pin. Both can only remove text, which turns the
+        // presence and exactly-once checks red.
+        let no_line = FULL[..cutoff]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut production = String::with_capacity(no_line.len());
+        let mut rest = no_line.as_str();
         while let Some(start) = rest.find(concat!("/", "*")) {
             production.push_str(&rest[..start]);
             rest = match rest[start..].find(concat!("*", "/")) {
@@ -1589,13 +1604,7 @@ pub mod test {
             };
         }
         production.push_str(rest);
-        production
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .collect::<String>()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect()
+        production.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The balanced-parenthesis argument list of the (single) call to

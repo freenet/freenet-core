@@ -571,7 +571,8 @@ pub(crate) struct RouterSnapshotInfo {
     /// space, which made the sum under-count the footprint ~10x on a production
     /// peer), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
     /// cache. The webapp cache defaults to a per-USER directory, so several
-    /// peers run as one user report the same bytes. `None` until the tracker
+    /// peers run as one user report the same bytes. Both are allocated blocks
+    /// on unix and apparent length elsewhere. `None` until the tracker
     /// is configured and seeded (early startup), and for those two until their
     /// first successful walk. Per-node aggregate scalars.
     pub hosting_disk_state_bytes: Option<u64>,

@@ -294,7 +294,8 @@ pub(crate) struct DiskUsageTracker {
 }
 
 impl DiskUsageTracker {
-    /// Create an unseeded tracker. All counters start at zero; call
+    /// Create an unseeded tracker. The budgeted counters start at zero and the
+    /// two reported gauges at "not measured"; call
     /// [`Self::seed`] once before the counts are meaningful.
     pub(crate) fn new(paths: HostingDiskPaths) -> Self {
         Self {
@@ -810,6 +811,13 @@ impl DiskUsageTracker {
     pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
         self.db_file_bytes.store(bytes, Ordering::Relaxed);
     }
+
+    /// Test-only: install a measured webapp-cache size directly. See
+    /// [`Self::set_db_file_bytes_for_test`].
+    #[cfg(test)]
+    pub(crate) fn set_webapp_cache_bytes_for_test(&self, bytes: u64) {
+        self.webapp_cache_bytes.store(bytes, Ordering::Relaxed);
+    }
 }
 
 /// Recursively sum the byte size of every regular file under `dir`. A missing
@@ -918,6 +926,10 @@ fn file_disk_bytes(meta: &std::fs::Metadata) -> u64 {
 /// difference between "measured 0" and "could not measure": see
 /// [`DiskUsageTracker::store_measurement`]. An individual unreadable entry
 /// inside a readable directory still contributes 0 (best effort).
+///
+/// A symlink to a regular file is followed and counted (an operator may have
+/// moved the database file onto another disk and linked it back). Symlinks to
+/// directories are not, so the walk stays shallow.
 fn du_walk_shallow(dir: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     for entry in std::fs::read_dir(dir)? {
@@ -927,8 +939,13 @@ fn du_walk_shallow(dir: &Path) -> std::io::Result<u64> {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_file() {
-            if let Ok(meta) = entry.metadata() {
+        let meta = if file_type.is_symlink() {
+            std::fs::metadata(entry.path())
+        } else {
+            entry.metadata()
+        };
+        if let Ok(meta) = meta {
+            if meta.is_file() {
                 total = total.saturating_add(file_disk_bytes(&meta));
             }
         }
@@ -1828,6 +1845,51 @@ mod tests {
             t.stats().db_file_bytes.unwrap(),
             0,
             "gone means zero, not retained"
+        );
+    }
+
+    /// A directory that fails and then disappears re-arms the warning: the
+    /// `NotFound` arm clears the edge flag as well as reporting 0.
+    #[test]
+    fn a_failed_then_missing_directory_measures_zero_and_rearms_the_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        write_file(&db, 8); // ENOTDIR
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        assert!(t.db_file_measure_failed.load(Ordering::Relaxed));
+
+        std::fs::remove_file(&db).unwrap();
+        t.refresh_db_file();
+        assert_eq!(t.stats().db_file_bytes, Some(0));
+        assert!(!t.db_file_measure_failed.load(Ordering::Relaxed));
+    }
+
+    /// A database file symlinked from another disk is counted at its target's
+    /// size; a symlinked directory is not descended into.
+    #[cfg(unix)]
+    #[test]
+    fn db_measurement_follows_a_symlinked_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        let db = dir.path().join("db");
+        write_file(&elsewhere.join("db"), 64 * 1024);
+        write_file(&elsewhere.join("sub").join("big"), 256 * 1024);
+        std::fs::create_dir_all(&db).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("db"), db.join("db")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("sub"), db.join("sub")).unwrap();
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db,
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        assert_eq!(
+            t.stats().db_file_bytes.unwrap(),
+            alloc(&elsewhere.join("db"))
         );
     }
 

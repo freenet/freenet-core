@@ -2923,12 +2923,12 @@ mod tests {
         // space, and the webapp cache, marked as not counted in "disk used".
         assert!(
             html.contains(
-                "not counted in disk used: database file: 100.0 MB (60.0 MB more than state"
+                "not counted in disk used: database file: 100.0 MB (about 60.0 MB more than state"
             ),
             "tooltip must show the measured database size and its dead space — got:\n{html}"
         );
         assert!(
-            html.contains("Webapp cache: 7.0 MB"),
+            html.contains("this user): 7.0 MB"),
             "tooltip must report the webapp cache — got:\n{html}"
         );
         // The explanatory paragraph must name the pressures that can actually
@@ -2975,24 +2975,21 @@ mod tests {
             disk_budget_bytes: Some(500 * 1024 * 1024),
             ..Default::default()
         };
-        let db_measured = snap.hosting.disk_db_bytes.replace(30 * 1024 * 1024);
-        assert_eq!(db_measured, None);
         let mut unmeasured = base_snapshot();
-        unmeasured.hosting = HostingSnapshot {
-            disk_db_bytes: None,
-            ..snap.hosting.clone()
-        };
+        unmeasured.hosting = snap.hosting.clone();
         let html = build_hosting_card(&Some(unmeasured));
         assert!(
             html.contains("State: 40.0 MB")
                 && html.contains("database file: not measured")
-                && html.contains("Webapp cache: not measured"),
+                && html.contains("this user): not measured"),
             "unmeasured gauges must not hide the breakdown — got:\n{html}"
         );
 
+        snap.hosting.disk_db_bytes = Some(30 * 1024 * 1024);
+
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("database file: 30.0 MB (0 B more than state"),
+            html.contains("database file: 30.0 MB (about 0 B more than state"),
             "a database smaller than state must not wrap — got:\n{html}"
         );
     }

@@ -4863,9 +4863,9 @@ impl Ring {
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen);
         // Disk-usage accounting (#4683): maintain the aggregate on-disk state
-        // total by signed delta (`new − previous_for_key`). Observational only
-        // in this PR — no admission/eviction decision reads it yet. No-op until
-        // the tracker is seeded.
+        // total by signed delta (`new − previous_for_key`). Read by the
+        // eviction floor and the admission gates since #4702. No-op until the
+        // tracker is seeded.
         self.hosting_manager
             .record_state_write(contract, state_size as u64);
         self.report_contract_resource_usage(
@@ -4877,8 +4877,7 @@ impl Ring {
 
     /// Subtract a reclaimed contract's state bytes from the aggregate disk-usage
     /// tracker (#4683). Called from the executor's reclaim path on successful
-    /// state deletion. Observational only in this PR; no-op until the tracker is
-    /// seeded.
+    /// state deletion. No-op until the tracker is seeded.
     pub(crate) fn record_state_removed(&self, contract: &ContractKey) {
         self.hosting_manager.record_state_removed(contract);
     }

@@ -1819,8 +1819,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             // read once; say so rather than hiding the budgeted breakdown.
             let db = match h.disk_db_bytes {
                 Some(db) => format!(
-                    "{} ({} more than state: dead space, database overhead and \
-                     any migration backup)",
+                    "{} (about {} more than state: dead space, other tables, \
+                     database overhead and any migration backup)",
                     format_bytes(db),
                     format_bytes(db.saturating_sub(state)),
                 ),
@@ -1832,7 +1832,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             format!(
                 "State: {state} · WASM: {wasm} · Compile cache: {cache}. Measured \
                  but not counted in disk used: database file: {db} · Webapp \
-                 cache: {webapp}",
+                 cache (shared by every node run as this user): {webapp}",
                 state = format_bytes(state),
                 wasm = format_bytes(wasm),
                 cache = format_bytes(cache),
