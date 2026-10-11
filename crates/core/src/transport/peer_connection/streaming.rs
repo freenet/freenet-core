@@ -221,6 +221,8 @@ impl StreamHandle {
             before_rearmed_listener_poll: None,
             #[cfg(test)]
             before_rearm_listen: None,
+            #[cfg(test)]
+            before_listen: None,
         }
     }
 
@@ -274,6 +276,8 @@ impl StreamHandle {
             before_rearmed_listener_poll: None,
             #[cfg(test)]
             before_rearm_listen: None,
+            #[cfg(test)]
+            before_listen: None,
         }
     }
 
@@ -423,8 +427,9 @@ impl StreamHandle {
             match tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, listener).await {
                 Ok(()) => { /* fragment arrived or stream cancelled — loop to check */ }
                 Err(_) => {
-                    // Re-check before declaring timeout — a fragment may have arrived
-                    // in the race window between is_complete()/listen() above (TOCTOU).
+                    // Re-check before declaring timeout. The listener is created
+                    // before the checks above, so this is a last check rather than
+                    // the fix for a missed notification (#5785).
                     if self.sync.read().cancelled {
                         crate::node::network_status::record_stream_recv_abort_cancelled(
                             Some(self.buffer.inserted_count() as u32),
@@ -502,6 +507,10 @@ pub struct StreamingInboundStream {
     /// fresh listener is created (#5785).
     #[cfg(test)]
     before_rearm_listen: Option<Box<dyn FnOnce() + Send + Sync>>,
+    /// Inject an event after the first-poll checks, before the listener is
+    /// created (#5785).
+    #[cfg(test)]
+    before_listen: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StreamingInboundStream {
@@ -527,6 +536,45 @@ impl StreamingInboundStream {
     #[allow(dead_code)]
     pub fn is_auto_reclaim(&self) -> bool {
         self.auto_reclaim
+    }
+
+    /// Whether the stream has ended: every advertised byte has been yielded
+    /// and slot `next_idx` is empty. See the comment where `poll_next` first
+    /// checks it.
+    fn reached_end(&self, next_idx: u32) -> bool {
+        self.handle.buffer.is_complete()
+            && self.handle.buffer.get(next_idx).is_none()
+            && self.bytes_read >= self.handle.buffer.total_bytes()
+    }
+
+    /// The checks that must follow every `listen()` (the event_listener
+    /// pattern): cancellation, the next fragment, and the end of the stream.
+    /// Any of the three can become true between a check made before
+    /// `listen()` and the `listen()` itself, and that change notifies no
+    /// listener, so skipping one leaves the poll `Pending` with no wake
+    /// (#5785). The end of the stream is the easy one to miss: `insert()`
+    /// makes the slot readable before it advances the contiguous frontier
+    /// that `is_complete()` reads, so a consumer can yield the last fragment
+    /// and then see `is_complete()` still false.
+    ///
+    /// Returns the poll result when one applies, with the listener cleared.
+    #[allow(clippy::type_complexity)]
+    fn recheck(&mut self, next_idx: u32) -> Option<Poll<Option<Result<Bytes, StreamError>>>> {
+        if self.handle.sync.read().cancelled {
+            self.listener = None;
+            return Some(Poll::Ready(Some(Err(StreamError::Cancelled))));
+        }
+        if let Some(data) = self.try_get_fragment(next_idx) {
+            self.listener = None;
+            self.next_fragment = next_idx + 1;
+            self.bytes_read += data.len() as u64;
+            return Some(Poll::Ready(Some(Ok(data))));
+        }
+        if self.reached_end(next_idx) {
+            self.listener = None;
+            return Some(Poll::Ready(None));
+        }
+        None
     }
 
     /// Tries to get the next fragment, either taking or cloning based on auto_reclaim.
@@ -593,10 +641,7 @@ impl Stream for StreamingInboundStream {
         // which is where the guard that would make the agreement universal
         // belongs — it is a production behaviour change and wants its own
         // review rather than a late addition here.
-        if self.handle.buffer.is_complete()
-            && self.handle.buffer.get(next_idx).is_none()
-            && self.bytes_read >= self.handle.buffer.total_bytes()
-        {
+        if self.reached_end(next_idx) {
             return Poll::Ready(None);
         }
 
@@ -622,21 +667,19 @@ impl Stream for StreamingInboundStream {
         // cancel() also fires buffer.notifier().notify(), so the listener
         // covers both data arrival and cancellation.
         if self.listener.is_none() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_listen.take() {
+                hook();
+            }
             self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
         }
 
         // Re-check after listener creation (the event_listener pattern):
-        // if a fragment arrived between the fast-path check and listen(),
-        // we catch it here instead of missing the notification.
-        if self.handle.sync.read().cancelled {
-            self.listener = None;
-            return Poll::Ready(Some(Err(StreamError::Cancelled)));
-        }
-        if let Some(data) = self.try_get_fragment(next_idx) {
-            self.listener = None;
-            self.next_fragment = next_idx + 1;
-            self.bytes_read += data.len() as u64;
-            return Poll::Ready(Some(Ok(data)));
+        // a cancel, a fragment, or the end of the stream that landed between
+        // the checks above and listen() is caught here instead of being
+        // missed.
+        if let Some(ready) = self.recheck(next_idx) {
+            return ready;
         }
 
         // Poll the listener. The listener is guaranteed to be Some here
@@ -647,13 +690,8 @@ impl Stream for StreamingInboundStream {
                     // Notified — clear listener and re-check buffer inline
                     // (avoids wake_by_ref spin-loop).
                     self.listener = None;
-                    if self.handle.sync.read().cancelled {
-                        return Poll::Ready(Some(Err(StreamError::Cancelled)));
-                    }
-                    if let Some(data) = self.try_get_fragment(next_idx) {
-                        self.next_fragment = next_idx + 1;
-                        self.bytes_read += data.len() as u64;
-                        return Poll::Ready(Some(Ok(data)));
+                    if let Some(ready) = self.recheck(next_idx) {
+                        return ready;
                     }
                     // Spurious notification. Create a fresh listener,
                     // re-check, and register waker.
@@ -662,19 +700,12 @@ impl Stream for StreamingInboundStream {
                         hook();
                     }
                     self.listener = Some(Box::pin(self.handle.buffer.notifier().listen()));
-                    // Listener first, then BOTH conditions (#5785): a cancel()
-                    // between the check at the top of this loop and listen()
+                    // Listener first, then every condition (#5785): a change
+                    // between the checks at the top of this loop and listen()
                     // notified no one, so the fresh listener never fires for
-                    // it — checked here, it is seen.
-                    if self.handle.sync.read().cancelled {
-                        self.listener = None;
-                        return Poll::Ready(Some(Err(StreamError::Cancelled)));
-                    }
-                    if let Some(data) = self.try_get_fragment(next_idx) {
-                        self.listener = None;
-                        self.next_fragment = next_idx + 1;
-                        self.bytes_read += data.len() as u64;
-                        return Poll::Ready(Some(Ok(data)));
+                    // it. Checked here, it is seen.
+                    if let Some(ready) = self.recheck(next_idx) {
+                        return ready;
                     }
                     #[cfg(test)]
                     if let Some(hook) = self.before_rearmed_listener_poll.take() {
@@ -990,6 +1021,79 @@ mod tests {
             started.elapsed() < STREAM_INACTIVITY_TIMEOUT,
             "the cancel waited out the inactivity timeout ({:?})",
             started.elapsed()
+        );
+    }
+
+    /// #5785, end of stream: `insert()` makes the last fragment readable
+    /// before it advances the frontier `is_complete()` reads, then notifies.
+    /// A consumer that yields the fragment in that gap sees the stream as not
+    /// yet ended and waits. Returns a stream that has yielded fragment 1 of a
+    /// 1-fragment stream whose frontier has not advanced.
+    fn stream_past_last_fragment_before_frontier() -> (StreamHandle, StreamingInboundStream) {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        handle
+            .buffer
+            .store_slot_for_test(1, Bytes::from_static(b"x"));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
+        );
+        assert!(!handle.buffer.is_complete(), "frontier must lag the slot");
+        (handle, stream)
+    }
+
+    /// The frontier advances and notifies after the re-arm loop's checks and
+    /// before its fresh listener is polled: that poll is Ready, and the loop's
+    /// next pass must end the stream instead of arming another listener that
+    /// nothing will ever notify.
+    #[test]
+    fn test_end_of_stream_notified_before_listener_poll_is_observed() {
+        let (handle, mut stream) = stream_past_last_fragment_before_frontier();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        // Wake the listener without data or cancelling this consumer: a fork
+        // has its own cancellation state but shares the buffer's notifier.
+        handle.fork().cancel();
+        let finisher = handle.clone();
+        stream.before_rearmed_listener_poll =
+            Some(Box::new(move || finisher.buffer.finish_insert_for_test()));
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert!(
+            stream.before_rearmed_listener_poll.is_none(),
+            "race hook did not run"
+        );
+    }
+
+    /// The frontier advances and notifies between the first-poll checks and
+    /// listen(): the check after listen() must end the stream.
+    #[test]
+    fn test_end_of_stream_before_listen_is_observed() {
+        let (handle, mut stream) = stream_past_last_fragment_before_frontier();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let finisher = handle.clone();
+        stream.before_listen = Some(Box::new(move || finisher.buffer.finish_insert_for_test()));
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert!(stream.before_listen.is_none(), "race hook did not run");
+    }
+
+    /// The same, between the re-arm loop's checks and its fresh listen().
+    #[test]
+    fn test_end_of_stream_before_rearm_listen_is_observed() {
+        let (handle, mut stream) = stream_past_last_fragment_before_frontier();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        // Wake the listener without data or cancelling this consumer: a fork
+        // has its own cancellation state but shares the buffer's notifier.
+        handle.fork().cancel();
+        let finisher = handle.clone();
+        stream.before_rearm_listen =
+            Some(Box::new(move || finisher.buffer.finish_insert_for_test()));
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert!(
+            stream.before_rearm_listen.is_none(),
+            "race hook did not run"
         );
     }
 

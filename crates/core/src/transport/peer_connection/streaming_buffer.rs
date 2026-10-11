@@ -246,6 +246,24 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
         }
     }
 
+    /// Test-only first half of [`Self::insert`]: the fragment becomes readable
+    /// but the contiguous frontier has not advanced and no listener is
+    /// notified. [`Self::finish_insert_for_test`] is the second half.
+    #[cfg(test)]
+    pub(crate) fn store_slot_for_test(&self, fragment_number: u32, data: Bytes) {
+        let idx = (fragment_number - 1) as usize;
+        let prev = self.fragments[idx].swap(Box::into_raw(Box::new(data)), Ordering::AcqRel);
+        assert!(prev.is_null(), "slot {fragment_number} was already filled");
+    }
+
+    /// Test-only second half of [`Self::insert`]: advance the frontier, then
+    /// notify, in that order.
+    #[cfg(test)]
+    pub(crate) fn finish_insert_for_test(&self) {
+        self.advance_frontier();
+        self.data_available.notify(usize::MAX);
+    }
+
     /// Advances the contiguous fragment frontier using lock-free CAS.
     ///
     /// This is called after each successful insert to track how many
