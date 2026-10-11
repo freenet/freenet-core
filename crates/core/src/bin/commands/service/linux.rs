@@ -9,6 +9,39 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 const SYSTEM_SERVICE_PATH: &str = "/etc/systemd/system/freenet.service";
 
+/// The `ExecStartPre` orphan reaper shared VERBATIM by the user and system
+/// units (#3967, #5187). The reap conditions and the escaping rules are
+/// documented in the user unit template, next to where it is rendered. It is
+/// substituted as a `format!` ARGUMENT, so its braces are literal and its `$$`
+/// is the systemd escape that collapses to one `$` for `/bin/sh`.
+#[cfg(target_os = "linux")]
+const ORPHAN_REAP_PREFLIGHT: &str = concat!(
+    "ExecStartPre=-/bin/sh -c '",
+    "self=$$$$; mycg=$$(cat /proc/$$self/cgroup 2>/dev/null); v=\"\"; ",
+    "for pid in $$(pgrep -f -u \"$$(id -u)\" \"freenet network\" 2>/dev/null); do ",
+    "[ \"$$pid\" = \"$$self\" ] && continue; ",
+    "[ \"$$pid\" = \"1\" ] && continue; ",
+    "ppid=$$(sed \"s/.*) //\" /proc/$$pid/stat 2>/dev/null | cut -d\" \" -f2); ",
+    "[ \"$$ppid\" = \"1\" ] || continue; ",
+    "comm=$$(cat /proc/$$pid/comm 2>/dev/null); ",
+    "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
+    "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
+    "[ -n \"$$cg\" ] || continue; ",
+    "if [ \"$$cg\" != \"$$mycg\" ] && echo \"$$cg\" | grep -q \"[.]service$$\"; then continue; fi; ",
+    "kill -TERM \"$$pid\" 2>/dev/null && v=\"$$v $$pid\"; ",
+    "done; ",
+    "w=0; while [ -n \"$$v\" ] && [ $$w -lt 45 ]; do ",
+    "a=\"\"; for p in $$v; do kill -0 \"$$p\" 2>/dev/null && a=\"$$a $$p\"; done; v=$$a; ",
+    "[ -z \"$$v\" ] && break; sleep 1; w=$$((w+1)); ",
+    "done; ",
+    "for p in $$v; do kill -KILL \"$$p\" 2>/dev/null || true; done; ",
+    "w=0; while [ -n \"$$v\" ] && [ $$w -lt 5 ]; do ",
+    "a=\"\"; for p in $$v; do kill -0 \"$$p\" 2>/dev/null && a=\"$$a $$p\"; done; v=$$a; ",
+    "[ -z \"$$v\" ] && break; sleep 1; w=$$((w+1)); ",
+    "done",
+    "'"
+);
+
 /// Check if a system-wide Freenet service is installed.
 #[cfg(target_os = "linux")]
 fn has_system_service() -> bool {
@@ -454,31 +487,48 @@ Environment=FREENET_SUPERVISED=1
 # (auto-updated but not reinstalled) or the mac/Windows wrapper keeps emitting the
 # self-healing exit 42 instead of a 45 the supervisor would mishandle.
 Environment={fast_crash_marker}=1
-# Orphan self-heal (issue #3967): RestartPreventExitStatus=43 below means an
-# exit 43 ("another instance already running") never restarts the unit. That is
-# correct for a legitimate second instance, but an init-adopted ORPHANED
-# `freenet network` (PPID==1) holding the port wedges the unit permanently:
-# ExecStart exits 43, the unit reports success-but-dead, and the orphan runs
-# UNSUPERVISED forever — no Restart= on crash, no systemctl control, and (if it
-# is an old binary) stale assets served indefinitely. This pre-flight runs
-# before every start and kills ANY init-adopted orphan, regardless of version:
-# an earlier revision compared `Freenet version:` lines and spared a
-# current-version orphan, but that just wedges the unit into the unsupervised
-# state — when the operator starts this unit, a PPID==1 holder is always wrong.
-# A user-run `freenet network` (parented by a live shell, PPID!=1) is left
-# alone; it wins the port and the unit stands down via exit 43 as designed.
+# Orphan self-heal (issues #3967, #5187): RestartPreventExitStatus=43 below
+# means an exit 43 ("another instance already running") never restarts the
+# unit. That is correct for a legitimate second instance, but an init-adopted
+# ORPHANED `freenet network` (PPID==1, e.g. one that outlived a dead login
+# session) holding the port wedges the unit permanently: ExecStart exits 43, the
+# unit reports success-but-dead, and the orphan runs UNSUPERVISED forever (no
+# Restart= on crash, no systemctl control, no auto-update). This pre-flight runs
+# before every start and reaps such an orphan REGARDLESS of its version: an
+# earlier revision spared a current-version orphan, which is exactly that wedge.
+# A process is reaped only when ALL of these hold:
+#   * its PPID is 1 (init adopted it). A `freenet network` still parented by a
+#     live shell or terminal is left alone; it wins the port and this unit
+#     stands down via exit 43 as designed. Note that `nohup`/`disown` followed
+#     by a logout DOES reparent to PID 1, so a deliberately detached node with
+#     no supervisor is reaped: starting this unit means this unit should own it.
+#   * its comm (executable name) contains "freenet", so a `screen`/`tmux`
+#     server or a wrapper shell whose argv merely mentions "freenet network" is
+#     never killed.
+#   * it is NOT inside another systemd SERVICE's cgroup. Under the SYSTEM
+#     manager PID 1 forks a Type=simple service directly, so a healthy node
+#     supervised by the system unit also has PPID 1; when both the user and the
+#     system unit are installed for one user, PPID alone would let one unit's
+#     pre-flight kill the other's live node. A process in this unit's OWN
+#     cgroup (a leftover systemd failed to kill) is still reaped. An unreadable
+#     cgroup file means "skip": this path errs towards not killing.
+# Every victim gets SIGTERM, then up to 45s to exit (the same budget as
+# TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL,
+# then up to 5s more for the kernel to release the port before ExecStart binds.
+# Worst case is ~50s, inside systemd's default 90s TimeoutStartSec.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
-# here (systemd collapses $$ -> a single $ for sh). Self-match guards: the
-# pre-flight sh's OWN argv contains the literal "freenet network" (it is the
-# substring `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ ->
-# the sh's $$) and PID 1 from the holder loop.
-# PPID is read after the final ')' in /proc/PID/stat (comm is parenthesized) so
-# a comm containing whitespace can't shift the field; `cut` (not awk) extracts
-# the field so the line carries no backslash escapes for journald to warn
-# about. The '-' prefix means a failure here never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | cut -d" " -f2); if [ "$$ppid" = "1" ]; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
+# here (systemd collapses $$ -> a single $ for sh); systemd also expands
+# %-specifiers, so the body uses no '%'. Self-match guards: the pre-flight sh's
+# OWN argv contains the literal "freenet network" (it is the substring
+# `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ -> the sh's
+# $$) and PID 1 from the holder loop. PPID is read after the final ')' in
+# /proc/PID/stat (comm is parenthesized) so a comm containing whitespace can't
+# shift the field; `cut` (not awk) extracts the field so the line carries no
+# backslash escapes for journald to warn about. The '-' prefix means a failure
+# here never blocks the start.
+{orphan_reap_preflight}
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
@@ -516,7 +566,8 @@ RestartMaxDelaySec=300
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
 # to finish, then (2) closing peer connections. The 15s headroom over
 # the default drain covers peer-connection teardown + spawn-task
-# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep, and
+# the orphan pre-flight's 45s SIGTERM wait above with it.
 TimeoutStopSec=45
 
 # Auto-update / crash-loop rollback / boot-crash self-heal: run `freenet update`
@@ -635,6 +686,7 @@ WantedBy=default.target
         log_dir = log_dir.display(),
         fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
         post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+        orphan_reap_preflight = ORPHAN_REAP_PREFLIGHT,
     )
 }
 
@@ -673,17 +725,12 @@ Environment=FREENET_SUPERVISED=1
 # node emits exit 45 only when this is present (this unit handles 45); otherwise it
 # keeps the self-healing exit 42.
 Environment={fast_crash_marker}=1
-# Orphan self-heal (issue #3967): see the matching comment in the user unit
-# (including the systemd $$-escaping and the PPID-after-final-')' parse). The
-# self-PID and PID-1 skips exclude the pre-flight's own sh (whose argv contains
-# the literal "freenet network"). RestartPreventExitStatus=43 means an exit 43
-# never restarts the unit, so an init-adopted orphan (PPID==1) holding the port
-# would wedge the unit into success-but-dead and run unsupervised forever. This
-# pre-flight kills ANY such orphan regardless of version (an earlier revision
-# spared current-version orphans, which is exactly the wedge); a user-run
-# instance (PPID!=1) is always left alone. The '-' prefix means a failure here
-# never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | cut -d" " -f2); if [ "$$ppid" = "1" ]; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
+# Orphan self-heal (issues #3967, #5187): the SAME pre-flight as the user unit
+# (generated from one constant, so the two cannot drift); see the comment there
+# for the reap conditions and the systemd $$ / % escaping. The cgroup condition
+# matters most HERE: this unit's own healthy node has PPID 1, so PPID alone
+# cannot tell it apart from an orphan.
+{orphan_reap_preflight}
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
@@ -721,7 +768,8 @@ RestartMaxDelaySec=300
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
 # to finish, then (2) closing peer connections. The 15s headroom over
 # the default drain covers peer-connection teardown + spawn-task
-# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep, and
+# the orphan pre-flight's 45s SIGTERM wait above with it.
 TimeoutStopSec=45
 
 # Auto-update / crash-loop rollback / boot-crash self-heal: run `freenet update`
@@ -842,6 +890,7 @@ WantedBy=multi-user.target
         home = home_dir.display(),
         fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
         post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+        orphan_reap_preflight = ORPHAN_REAP_PREFLIGHT,
     )
 }
 

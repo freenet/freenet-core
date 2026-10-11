@@ -1956,6 +1956,19 @@ mod tests {
             ),
         ];
 
+        let preflights: Vec<&str> = units
+            .iter()
+            .map(|(_, unit)| {
+                unit.lines()
+                    .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(
+            preflights[0], preflights[1],
+            "user and system units must carry the identical orphan pre-flight"
+        );
+
         for (which, unit) in units {
             let pre = unit
                 .lines()
@@ -1964,7 +1977,16 @@ mod tests {
 
             // Post-render the file on disk MUST carry the systemd-level `$$`
             // form for the shell identifiers the pre-flight relies on.
-            for needle in ["$$pid", "$$ppid", "$$self", "$$(id -u)"] {
+            for needle in [
+                "$$pid",
+                "$$ppid",
+                "$$self",
+                "$$(id -u)",
+                "$$w",
+                "$$v",
+                "$$cg",
+                "$$comm",
+            ] {
                 assert!(
                     pre.contains(needle),
                     "{which} ExecStartPre must double shell dollars (missing `{needle}`); \
@@ -1979,7 +2001,15 @@ mod tests {
             // NB: we cannot blanket-assert absence of `$(id -u)` because the
             // VALID doubled form `$$(id -u)` contains it as a substring; the
             // `$$(id -u)` presence check above covers that identifier instead.
-            for bad in ["/proc/$pid/", "\"$pid\"", "\"$ppid\"", "\"$self\""] {
+            for bad in [
+                "/proc/$pid/",
+                "\"$pid\"",
+                "\"$ppid\"",
+                "\"$self\"",
+                "[ $w -lt",
+                "\"$cg\"",
+                "\"$comm\"",
+            ] {
                 assert!(
                     !pre.contains(bad),
                     "{which} ExecStartPre contains bare single-`$` `{bad}` that systemd \
@@ -2023,18 +2053,56 @@ mod tests {
                  (#3967 round-2 RE-REVIEW)"
             );
 
-            // MUST-FIX #3: kill is gated on PPID==1 (init-adopted orphan).
-            // The former version-compare gate is deliberately GONE: sparing a
-            // current-version orphan wedges the unit into success-but-dead
-            // with the node unsupervised. Render-level check.
+            // MUST-FIX #3: a reap requires PPID==1 (init-adopted orphan).
             assert!(
-                pre.contains("if [ \"$$ppid\" = \"1\" ]; then"),
+                pre.contains("[ \"$$ppid\" = \"1\" ] || continue;"),
                 "{which} ExecStartPre must require PPID==1 before killing (#3967 MUST-FIX 3)"
             );
+            // #5187: the version gate is GONE. Sparing a current-version
+            // orphan wedges the unit into success-but-dead with the node
+            // unsupervised. Pin the mechanism (running a binary to read its
+            // version), not the variable names a reintroduced gate would use.
             assert!(
-                !pre.contains("$$ondisk") && !pre.contains("$$hv"),
-                "{which} ExecStartPre must not version-gate the orphan kill — a \
-                 same-version orphan wedges the unit into unsupervised mode"
+                !pre.contains("--version") && !pre.contains("/exe"),
+                "{which} ExecStartPre must not version-gate the orphan kill; a \
+                 same-version orphan wedges the unit into unsupervised mode (#5187)"
+            );
+            // #5188 review: a node supervised by ANOTHER systemd service (the
+            // system unit's healthy node has PPID 1) must be skipped, and the
+            // victim must be a freenet binary, not a screen/sh whose argv
+            // mentions the pattern. The behavioral harness proves the decisions;
+            // this proves both units carry the checks.
+            assert!(
+                pre.contains("grep -q \"[.]service$$\"; then continue; fi;"),
+                "{which} ExecStartPre must skip a process in another service's cgroup"
+            );
+            assert!(
+                pre.contains("case \"$$comm\" in *freenet*) ;; *) continue ;; esac;"),
+                "{which} ExecStartPre must only kill a freenet binary"
+            );
+            // #5187 secondary: systemd C-unescapes Exec lines and journald warns
+            // "Ignoring unknown escape sequences" on every daemon-reload when
+            // one carries a backslash.
+            assert!(
+                !pre.contains('\\'),
+                "{which} ExecStartPre must contain no backslash (#5187)"
+            );
+            // systemd expands %-specifiers in Exec lines (`%s` is the user's
+            // shell), so a printf format would be silently rewritten.
+            assert!(
+                !pre.contains('%'),
+                "{which} ExecStartPre must contain no '%' (systemd specifier)"
+            );
+            // The SIGTERM wait must cover the node's shutdown drain, i.e. match
+            // the TimeoutStopSec this unit gives its own node.
+            let stop_secs = unit
+                .lines()
+                .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+                .unwrap_or_else(|| panic!("{which} unit must set TimeoutStopSec"));
+            assert!(
+                pre.contains(&format!("[ $$w -lt {stop_secs} ]; do a=")),
+                "{which} ExecStartPre must wait TimeoutStopSec={stop_secs}s after \
+                 SIGTERM before SIGKILL"
             );
 
             // Now emulate systemd's `$$` -> `$` collapse and confirm the body
@@ -2295,29 +2363,76 @@ echo "RC=$?"
         );
     }
 
+    /// One holder process as the systemd ExecStartPre reaper sees it.
+    #[cfg(target_os = "linux")]
+    struct ReapCase<'a> {
+        /// `Freenet version:` the holder's binary reports. The pre-flight is
+        /// version-blind; the shims are kept so a reintroduced version gate
+        /// makes the same-version regression test fail.
+        holder_ver: &'a str,
+        /// PPID field of the holder's `/proc/PID/stat`. `None` = stat unreadable.
+        ppid: Option<&'a str>,
+        /// Contents of the holder's `/proc/PID/comm`.
+        comm: &'a str,
+        /// Contents of the holder's `/proc/PID/cgroup`.
+        cgroup: &'a str,
+        /// Contents of the pre-flight sh's own `/proc/PID/cgroup`.
+        own_cgroup: &'a str,
+        /// The holder ignores SIGTERM and only dies on SIGKILL.
+        ignores_term: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    const USER_UNIT_CGROUP: &str =
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/freenet.service\n";
+    #[cfg(target_os = "linux")]
+    const SYSTEM_UNIT_CGROUP: &str = "0::/system.slice/freenet.service\n";
+    #[cfg(target_os = "linux")]
+    const SESSION_CGROUP: &str = "0::/user.slice/user-1000.slice/session-3.scope\n";
+
+    /// A same-version node that outlived its login session (#5187): init
+    /// adopted it, it sits in the dead session's scope, not in any service.
+    #[cfg(target_os = "linux")]
+    fn session_orphan() -> ReapCase<'static> {
+        ReapCase {
+            holder_ver: "1.0.0 (current)",
+            ppid: Some("1"),
+            comm: "freenet",
+            cgroup: SESSION_CGROUP,
+            own_cgroup: USER_UNIT_CGROUP,
+            ignores_term: false,
+        }
+    }
+
+    /// What the reaper did to the holder.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, PartialEq, Eq)]
+    enum Reaped {
+        Spared,
+        /// SIGTERM was enough.
+        Terminated,
+        /// SIGTERM was ignored for the whole wait, so SIGKILL followed.
+        Killed,
+    }
+
     /// Shared harness for the systemd ExecStartPre self-heal DECISION tests
-    /// (#3967). The render + `sh -n` test proves the inline body PARSES; the
-    /// tests built on this harness prove it DECIDES correctly.
+    /// (#3967, #5187). The render + `sh -n` test proves the inline body PARSES;
+    /// the tests built on this harness prove it DECIDES correctly.
     ///
-    /// Extracts the `ExecStartPre` `/bin/sh -c '...'` body from the rendered
-    /// user unit, collapses systemd's `$$` -> `$`, and returns the on-disk
-    /// binary path plus a `run(holder_version, holder_ppid, pgrep_pid)`
-    /// closure that executes the body under `sh` with PATH-shimmed
-    /// `pgrep`/`readlink`/`timeout` and a `kill` shell function (functions
-    /// beat the builtin) recording kills to a marker; it returns whether the
-    /// holder was killed. The version machinery is deliberately kept even
-    /// though the current pre-flight is version-blind: if a version gate is
-    /// ever reintroduced, the same-version regression test below fails.
+    /// Renders the requested unit, extracts the `ExecStartPre` `/bin/sh -c '...'`
+    /// body, collapses systemd's `$$` -> `$`, and points every `/proc` read at
+    /// fixture files driven by a [`ReapCase`]. `pgrep`/`readlink`/`timeout` are
+    /// PATH shims; `kill` and `sleep` are shell functions (functions beat the
+    /// builtins) that record signals to marker files and make the wait loops
+    /// instant. Returns a `run` closure reporting what happened to the holder.
     ///
     /// Linux-only because it exercises the `/proc`-based systemd inline path
     /// and the unit generators are `#[cfg(target_os = "linux")]`.
     #[cfg(target_os = "linux")]
     fn systemd_heal_harness(
         dir: &std::path::Path,
-    ) -> (
-        std::path::PathBuf,
-        impl Fn(&str, &str, Option<&str>) -> bool,
-    ) {
+        system_unit: bool,
+    ) -> impl Fn(&ReapCase<'_>) -> Reaped {
         use std::os::unix::fs::PermissionsExt;
 
         let chmod_x = |p: &std::path::Path| {
@@ -2325,7 +2440,6 @@ echo "RC=$?"
         };
 
         // On-disk binary baked into the unit (the binary the unit would launch).
-        // Prints a FIXED current version. Lives at one path...
         let ondisk_bin = dir.join("freenet");
         std::fs::write(
             &ondisk_bin,
@@ -2334,9 +2448,8 @@ echo "RC=$?"
         .unwrap();
         chmod_x(&ondisk_bin);
 
-        // ...the holder binary lives at a DIFFERENT path (this is the whole
-        // point: a #3967 orphan runs an old/different binary). Its version is
-        // env-controlled so we can drive match vs mismatch.
+        // The holder binary lives at a DIFFERENT path (a #3967 orphan runs an
+        // old/different binary). Its version is env-controlled.
         let holder_bin = dir.join("old").join("freenet");
         std::fs::create_dir_all(holder_bin.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2346,10 +2459,12 @@ echo "RC=$?"
         .unwrap();
         chmod_x(&holder_bin);
 
-        // Render the user unit and carve out the ExecStartPre `/bin/sh -c '...'`
-        // body, then collapse `$$` -> `$` exactly as systemd does before exec.
         let log_dir = dir.join("logs");
-        let unit = generate_user_service_file(&ondisk_bin, &log_dir);
+        let unit = if system_unit {
+            generate_system_service_file(&ondisk_bin, &log_dir, "test", dir)
+        } else {
+            generate_user_service_file(&ondisk_bin, &log_dir)
+        };
         let pre = unit
             .lines()
             .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
@@ -2360,9 +2475,6 @@ echo "RC=$?"
             .expect("ExecStartPre quoting unexpected")
             .replace("$$", "$");
 
-        // PATH shims. `pgrep` emits the holder pid; `readlink -f /proc/PID/exe`
-        // maps to the holder binary; `timeout` drops the duration and execs the
-        // rest. `kill`/`sleep` are overridden as shell FUNCTIONS in the harness.
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         let write_shim = |name: &str, src: String| {
@@ -2370,10 +2482,7 @@ echo "RC=$?"
             std::fs::write(&p, format!("#!/bin/sh\n{src}")).unwrap();
             chmod_x(&p);
         };
-        write_shim("pgrep", "echo \"${PGREP_PID:-4242}\"\n".to_string());
-        // readlink: -f <on-disk binary path> passes through (so `bin=` would
-        // resolve if it existed); /proc/PID/exe -> the holder binary; otherwise
-        // echo the last arg. The exe!=bin path is what the round-1 anchor broke.
+        write_shim("pgrep", "echo 4242\n".to_string());
         write_shim(
             "readlink",
             format!(
@@ -2384,109 +2493,223 @@ echo "RC=$?"
         );
         write_shim("timeout", "shift\nexec \"$@\"\n".to_string());
 
-        // `sed`/`awk`/`grep`/`id` come from the real PATH; the /proc/PID/stat
-        // read is shimmed via a fake stat file the body reads. Replace the
-        // `/proc/$pid/stat` literal with our fixture so PPID is controllable.
+        // Point each /proc read at a fixture. Every literal must be present,
+        // or the body would read the REAL /proc and the case would test
+        // nothing; assert that instead of silently passing.
         let stat_file = dir.join("stat");
-        // Format mirrors /proc/PID/stat: "PID (comm) STATE PPID ...". The body
-        // does `sed "s/.*) //"` then `awk '{print $2}'`, so PPID must be field 2
-        // AFTER the final ')'. We park a comm WITH spaces to also keep the
-        // round-1 MUST-FIX 6 (whitespace-comm) honest.
-        let body = body.replace("/proc/$pid/stat", &stat_file.display().to_string());
-        // The readlink call also references /proc/$pid/exe; leave it so the
-        // shim's */proc/*/exe arm fires.
+        let comm_file = dir.join("comm");
+        let cgroup_file = dir.join("cgroup");
+        let own_cgroup_file = dir.join("own_cgroup");
+        let mut body = body;
+        for (literal, fixture) in [
+            ("/proc/$pid/stat", &stat_file),
+            ("/proc/$pid/comm", &comm_file),
+            ("/proc/$pid/cgroup", &cgroup_file),
+            ("/proc/$self/cgroup", &own_cgroup_file),
+        ] {
+            assert!(
+                body.contains(literal),
+                "ExecStartPre no longer reads `{literal}`; update the harness"
+            );
+            body = body.replace(literal, &fixture.display().to_string());
+        }
 
-        let killed_marker = dir.join("killed");
+        let term_marker = dir.join("got_term");
+        let kill_marker = dir.join("got_kill");
         let harness_path = dir.join("harness.sh");
         let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
-        // Returns (holder_was_killed). HOLDER_PPID drives the fake stat file's
-        // PPID field; HOLDER_VER drives the holder binary's version.
-        let run = move |holder_ver: &str, holder_ppid: &str, pgrep_pid: Option<&str>| -> bool {
-            std::fs::remove_file(&killed_marker).ok();
-            std::fs::write(
-                &stat_file,
-                format!("4242 (freenet network) S {holder_ppid} 1 1 0 -1\n"),
-            )
-            .unwrap();
+        move |case: &ReapCase<'_>| -> Reaped {
+            for m in [&term_marker, &kill_marker, &stat_file] {
+                std::fs::remove_file(m).ok();
+            }
+            if let Some(ppid) = case.ppid {
+                // "PID (comm) STATE PPID ...": a comm WITH spaces keeps the
+                // parse-after-the-final-')' requirement honest.
+                std::fs::write(
+                    &stat_file,
+                    format!("4242 (freenet network) S {ppid} 1 1 0 -1\n"),
+                )
+                .unwrap();
+            }
+            std::fs::write(&comm_file, format!("{}\n", case.comm)).unwrap();
+            std::fs::write(&cgroup_file, case.cgroup).unwrap();
+            std::fs::write(&own_cgroup_file, case.own_cgroup).unwrap();
+            // The holder is alive until it got a signal that kills it.
+            let dead = if case.ignores_term {
+                format!("[ -f \"{k}\" ]", k = kill_marker.display())
+            } else {
+                format!(
+                    "{{ [ -f \"{t}\" ] || [ -f \"{k}\" ]; }}",
+                    t = term_marker.display(),
+                    k = kill_marker.display()
+                )
+            };
             let harness = format!(
                 "#!/bin/sh\nkill() {{ sig=\"\"; case \"$1\" in -*) sig=\"$1\"; shift;; esac; \
-                 case \"$sig\" in -0) [ -f \"{marker}\" ] && return 1; return 0;; \
-                 -TERM|-15|-KILL|-9) : > \"{marker}\"; return 0;; *) return 0;; esac; }}\n\
+                 case \"$sig\" in -0) {dead} && return 1; return 0;; \
+                 -TERM|-15) : > \"{t}\"; return 0;; -KILL|-9) : > \"{k}\"; return 0;; \
+                 *) return 0;; esac; }}\n\
                  sleep() {{ :; }}\n{body}\n",
-                marker = killed_marker.display(),
-                body = body,
+                t = term_marker.display(),
+                k = kill_marker.display(),
             );
             std::fs::write(&harness_path, harness).unwrap();
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg(&harness_path)
+            let out = std::process::Command::new("sh")
+                .arg(&harness_path)
                 .env("PATH", &path_env)
-                .env("HOLDER_VER", holder_ver);
-            if let Some(p) = pgrep_pid {
-                cmd.env("PGREP_PID", p);
+                .env("HOLDER_VER", case.holder_ver)
+                .output()
+                .expect("failed to run systemd heal harness");
+            assert!(
+                out.status.success(),
+                "pre-flight body exited non-zero: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            match (term_marker.exists(), kill_marker.exists()) {
+                (false, false) => Reaped::Spared,
+                (true, false) => Reaped::Terminated,
+                (true, true) => Reaped::Killed,
+                (false, true) => panic!("SIGKILL without a preceding SIGTERM"),
             }
-            cmd.output().expect("failed to run systemd heal harness");
-            killed_marker.exists()
-        };
-        (ondisk_bin, run)
+        }
     }
 
     /// Behavioral regression for the systemd self-heal decision (#3967,
-    /// round-2 RE-REVIEW): an init-adopted orphan (PPID==1) is killed, a
-    /// user-parented holder (PPID!=1) is deferred to.
+    /// #5187), on BOTH units: which holders are reaped and which are spared.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_systemd_execstartpre_heal_decision_behavior() {
-        use std::os::unix::fs::PermissionsExt;
+        for system_unit in [false, true] {
+            let which = if system_unit { "system" } else { "user" };
+            let own_cgroup = if system_unit {
+                SYSTEM_UNIT_CGROUP
+            } else {
+                USER_UNIT_CGROUP
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            let run = systemd_heal_harness(tmp.path(), system_unit);
+            let orphan = ReapCase {
+                own_cgroup,
+                ..session_orphan()
+            };
 
-        let tmp = tempfile::tempdir().unwrap();
-        let (ondisk_bin, run) = systemd_heal_harness(tmp.path());
+            // An OLD-version orphan at a different exe path: the #3967 case.
+            assert_eq!(
+                run(&ReapCase {
+                    holder_ver: "0.9.0 (old)",
+                    ..orphan
+                }),
+                Reaped::Terminated,
+                "{which}: an old-version PPID==1 orphan must be reaped (#3967)"
+            );
 
-        // (a) ROUND-2 CORE: orphan (PPID==1) running an OLD version at a
-        // DIFFERENT exe path than the on-disk binary -> MUST be KILLED. The
-        // round-1 `exe != bin` anchor skipped exactly this case.
-        assert!(
-            run("0.9.0 (old)", "1", None),
-            "systemd self-heal must KILL an old-version PPID==1 orphan whose exe \
-             path differs from the on-disk binary (round-2 RE-REVIEW: the \
-             exe==bin anchor wrongly skipped it)"
-        );
+            // Still parented by a live shell: it wins the port, we stand down.
+            assert_eq!(
+                run(&ReapCase {
+                    ppid: Some("4321"),
+                    ..orphan
+                }),
+                Reaped::Spared,
+                "{which}: a shell-parented (PPID!=1) holder must be left alone"
+            );
 
-        // (b) same-version PPID==1 orphan -> KILLED; covered by the dedicated
-        // regression test test_systemd_execstartpre_kills_same_version_orphan.
+            // A `screen -dmS x freenet network` server or a wrapper shell has
+            // the pattern in its argv but is not a freenet binary.
+            for comm in ["screen", "sh", "tmux: server"] {
+                assert_eq!(
+                    run(&ReapCase { comm, ..orphan }),
+                    Reaped::Spared,
+                    "{which}: a PPID==1 `{comm}` whose argv mentions `freenet network` \
+                     must not be killed"
+                );
+            }
 
-        // (c) version-mismatched but USER-parented (PPID!=1) -> DEFER.
-        assert!(
-            !run("0.9.0 (old)", "4321", None),
-            "systemd self-heal must DEFER to a user-parented (PPID!=1) holder (#3967 MUST-FIX 3)"
-        );
+            // The OTHER unit's live node. Under the system manager a healthy
+            // Type=simple node has PPID 1, so only the cgroup tells it apart.
+            let other_unit = if system_unit {
+                USER_UNIT_CGROUP
+            } else {
+                SYSTEM_UNIT_CGROUP
+            };
+            assert_eq!(
+                run(&ReapCase {
+                    cgroup: other_unit,
+                    ..orphan
+                }),
+                Reaped::Spared,
+                "{which}: a node supervised by another systemd service must never \
+                 be killed, even with PPID 1 (#5188 review blocker)"
+            );
+            // Same, on a cgroup v1 host (several hierarchy lines).
+            assert_eq!(
+                run(&ReapCase {
+                    cgroup: "12:pids:/system.slice/freenet.service\n\
+                             1:name=systemd:/system.slice/freenet.service\n",
+                    own_cgroup: "12:pids:/user.slice/user-1000.slice/user@1000.service\n\
+                                 1:name=systemd:/user.slice/user-1000.slice/user@1000.service/freenet.service\n",
+                    ..orphan
+                }),
+                Reaped::Spared,
+                "{which}: the service-cgroup check must also work on cgroup v1"
+            );
 
-        // (d) on-disk binary UNREADABLE -> still KILLED. The pre-flight no
-        // longer reads any version (the version gate was exactly the #3967
-        // same-version wedge), so an unreadable on-disk binary cannot spare a
-        // PPID==1 orphan.
-        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            run("0.9.0 (old)", "1", None),
-            "systemd self-heal must KILL a PPID==1 orphan even when the on-disk \
-             version is unreadable — the pre-flight is version-blind"
-        );
+            // A leftover systemd failed to kill in THIS unit's own cgroup is
+            // still an orphan to reap.
+            assert_eq!(
+                run(&ReapCase {
+                    cgroup: own_cgroup,
+                    ..orphan
+                }),
+                Reaped::Terminated,
+                "{which}: a PPID==1 leftover in this unit's own cgroup must be reaped"
+            );
+
+            // Unreadable /proc entries err towards NOT killing.
+            assert_eq!(
+                run(&ReapCase {
+                    ppid: None,
+                    ..orphan
+                }),
+                Reaped::Spared,
+                "{which}: an unreadable /proc/PID/stat must not lead to a kill"
+            );
+            assert_eq!(
+                run(&ReapCase {
+                    cgroup: "",
+                    ..orphan
+                }),
+                Reaped::Spared,
+                "{which}: an unreadable /proc/PID/cgroup must not lead to a kill"
+            );
+
+            // A holder that ignores SIGTERM for the whole wait gets SIGKILL.
+            assert_eq!(
+                run(&ReapCase {
+                    ignores_term: true,
+                    ..orphan
+                }),
+                Reaped::Killed,
+                "{which}: a holder that ignores SIGTERM must be escalated to SIGKILL"
+            );
+        }
     }
 
-    /// Regression for the same-version orphan wedge (#3967 follow-up): a
-    /// SAME-VERSION init-adopted orphan (PPID==1) MUST be killed. The earlier
-    /// pre-flight version-compared and deferred to a same-version holder,
-    /// which wedged the unit into success-but-dead (ExecStart exits 43, no
-    /// restart) with the node running unsupervised forever.
+    /// Regression for the same-version orphan wedge (#5187): a SAME-VERSION
+    /// init-adopted orphan (PPID==1) MUST be reaped. The earlier pre-flight
+    /// version-compared and deferred to a same-version holder, which wedged
+    /// the unit into success-but-dead (ExecStart exits 43, no restart) with
+    /// the node running unsupervised forever.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_systemd_execstartpre_kills_same_version_orphan() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_ondisk_bin, run) = systemd_heal_harness(tmp.path());
-        assert!(
-            run("1.0.0 (current)", "1", None),
-            "systemd self-heal must KILL a same-version PPID==1 orphan — sparing \
-             it wedges the unit into success-but-dead / unsupervised mode (#3967)"
+        let run = systemd_heal_harness(tmp.path(), false);
+        assert_eq!(
+            run(&session_orphan()),
+            Reaped::Terminated,
+            "systemd self-heal must reap a same-version PPID==1 orphan; sparing \
+             it wedges the unit into success-but-dead / unsupervised mode (#5187)"
         );
     }
 
