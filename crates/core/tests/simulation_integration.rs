@@ -19248,3 +19248,201 @@ fn test_evicted_contracts_keep_no_interest_records() {
         "reconciliation dropped no records anywhere; the scenario did not exercise it"
     );
 }
+
+// =============================================================================
+// #5842: UPDATE from a peer that has just started hosting a contract
+// =============================================================================
+
+/// Drives one #5842 scenario and returns, per node holding the contract at the
+/// end of the run, the CRDT version of its copy.
+///
+/// Established hosts (nodes 1-5) PUT/subscribe first. Then `updater` GETs the
+/// contract with `subscribe: true` and, `gap` later, sends a client UPDATE with
+/// version 42. The post-operation wait is far below the ~5 min InterestSync
+/// heartbeat, so only live fan-out can deliver the update.
+fn run_5842_scenario(
+    name: &'static str,
+    seed: u64,
+    updater: usize,
+    updater_gets_first: bool,
+    gap: Duration,
+    prior_update_from: Option<usize>,
+) -> BTreeMap<String, u64> {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const NODES: usize = 10;
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let (mut sim, _logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(name, 1, NODES, 7, 3, 10, 4, seed).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    sim.with_controlled_op_interval(gap);
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+
+    let contract = SimOperation::create_test_contract(0x58);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // `AdvanceHostingClock` with no controllable clock is a no-op that the
+    // client follows with a fixed 3s settle, so it doubles as a spacer that is
+    // independent of `gap`.
+    let spacer = |n: usize| {
+        (0..n).map(|_| {
+            ScheduledOperation::new(
+                NodeLabel::gateway(name, 0),
+                SimOperation::AdvanceHostingClock {
+                    duration: Duration::ZERO,
+                },
+            )
+        })
+    };
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::node(name, 1),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x58),
+            subscribe: true,
+        },
+    )];
+    operations.extend(spacer(3));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+        operations.extend(spacer(1));
+    }
+    // Let subscriptions, hosting advertisements and summaries settle.
+    operations.extend(spacer(10));
+    if updater_gets_first {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, updater),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    if let Some(prior) = prior_update_from {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, prior),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10, 0x58),
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        NodeLabel::node(name, updater),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(42, 0x58),
+        },
+    ));
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(45),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "[{name}] simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let mut versions = BTreeMap::new();
+    for (label, storage) in &result.node_storages {
+        if let Some(state) = storage.get_stored_state(&contract_key) {
+            let bytes = state.as_ref();
+            let version = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            versions.insert(label.to_string(), version);
+        }
+    }
+    versions
+}
+
+fn assert_5842_converged(name: &str, versions: &BTreeMap<String, u64>) {
+    tracing::info!(?versions, "[{name}] final versions");
+    let stale: Vec<_> = versions.iter().filter(|(_, v)| **v != 42).collect();
+    assert!(
+        versions.contains_key(&format!("{name}-node-1")) && versions.len() >= 6,
+        "[{name}] expected the five established hosts plus the updater to hold \
+         the contract, got {versions:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "[{name}] #5842: hosts still on an old version 45s after the update, with \
+         no anti-entropy round in the window: {stale:?} (all: {versions:?})"
+    );
+}
+
+#[test_log::test]
+fn test_5842_update_from_fresh_host_reaches_established_hosts() {
+    let versions = run_5842_scenario(
+        "u5842-fresh",
+        0x5842_0000_0001,
+        9,
+        true,
+        Duration::from_secs(1),
+        None,
+    );
+    assert_5842_converged("u5842-fresh", &versions);
+}
+
+#[test_log::test]
+fn test_5842_update_from_fresh_host_before_subscribe_completes() {
+    let versions = run_5842_scenario(
+        "u5842-fast",
+        0x5842_0000_0002,
+        9,
+        true,
+        Duration::from_millis(100),
+        None,
+    );
+    assert_5842_converged("u5842-fast", &versions);
+}
+
+#[test_log::test]
+fn test_5842_update_from_established_host_control() {
+    let versions = run_5842_scenario(
+        "u5842-ctl",
+        0x5842_0000_0003,
+        3,
+        false,
+        Duration::from_secs(1),
+        None,
+    );
+    assert_5842_converged("u5842-ctl", &versions);
+}
+
+/// A host commits a client UPDATE moments after it applied (and started fanning
+/// out) an update it received from another host.
+#[rstest::rstest]
+#[case::gap_0ms("u5842-race-0", 0x5842_0000_0010, 0)]
+#[case::gap_5ms("u5842-race-5", 0x5842_0000_0011, 5)]
+#[case::gap_20ms("u5842-race-20", 0x5842_0000_0012, 20)]
+#[case::gap_50ms("u5842-race-50", 0x5842_0000_0013, 50)]
+#[case::gap_100ms("u5842-race-100", 0x5842_0000_0014, 100)]
+#[case::gap_200ms("u5842-race-200", 0x5842_0000_0015, 200)]
+#[test_log::test]
+fn test_5842_update_right_after_received_update(
+    #[case] name: &'static str,
+    #[case] seed: u64,
+    #[case] gap_ms: u64,
+) {
+    let versions = run_5842_scenario(name, seed, 3, false, Duration::from_millis(gap_ms), Some(1));
+    assert_5842_converged(name, &versions);
+}
