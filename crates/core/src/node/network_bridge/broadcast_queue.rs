@@ -876,7 +876,9 @@ mod queue {
         /// actively sending. Since #5842 this also BLOCKS: `pop_ready` will not
         /// start a second send for a pair while one is in flight, so a queued
         /// newer state for it waits (and keeps being replaced) until the first
-        /// finishes and the spacing interval passes.
+        /// finishes and the spacing interval passes. Best-effort: a pair that
+        /// `track_active` refuses (the map at `DEFAULT_MAX_QUEUE_DEPTH`) is not
+        /// blocked while in flight; it is still stamped when it finishes.
         active: HashMap<DedupeKey, u64>,
         /// Number of entries queued in the small lane. Maintained under the
         /// queue lock so head-of-line observation is O(1).
@@ -2294,7 +2296,9 @@ mod queue {
                         let unwind = first.swap(false, Ordering::SeqCst);
                         async move {
                             let _scheduling = scheduling;
-                            drop(tx.send(entry.new_state.size()));
+                            // See `spawn_lanes` for why this spelling.
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = tx.send((entry.new_state.size(), tokio::time::Instant::now()));
                             if unwind {
                                 release.notified().await;
                                 panic!("the first send unwinds (expected by this test)");
@@ -2319,15 +2323,26 @@ mod queue {
                 if size == 1 {
                     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .map(|(size, _)| size);
                     assert_eq!(got, Some(1));
                 }
             }
+            let unwound_at = tokio::time::Instant::now();
             release.notify_one();
-            let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let (size, sent_at) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
-                .expect("the held state must go after the unwound send");
-            assert_eq!(got, Some(2));
+                .expect("the held state must go after the unwound send")
+                .unwrap();
+            assert_eq!(size, 2);
+            // The unwind path must stamp the pair too, or the held state goes
+            // straight after the send ahead of it.
+            assert!(
+                sent_at.duration_since(unwound_at)
+                    >= super::super::super::broadcast_spacing::BROADCAST_PEER_SPACING,
+                "the held state went {:?} after the unwind",
+                sent_at.duration_since(unwound_at)
+            );
 
             worker.abort();
         }
@@ -2376,6 +2391,28 @@ mod queue {
                 .evict_oldest(Instant::now(), &spacing)
                 .expect("with only held entries left, the oldest still goes");
             assert_eq!(evicted.target, held_peer);
+
+            // A pair with a send in flight is held too, though never stamped.
+            let (busy_peer, idle_peer) = (distinct(47205), distinct(47206));
+            for (seq, target) in [(2u64, busy_peer.clone()), (3, idle_peer.clone())] {
+                queue.push_new(
+                    (key, target.clone()),
+                    BroadcastEntry {
+                        key,
+                        target,
+                        new_state: state(1),
+                        fanout: super::super::no_fanout(),
+                        state_size: 1,
+                        lane: QueuedPayloadClass::Small,
+                        seq,
+                    },
+                );
+            }
+            assert!(queue.track_active((key, busy_peer.clone())));
+            let evicted = queue
+                .evict_oldest(Instant::now(), &spacing)
+                .expect("an entry is evicted");
+            assert_eq!(evicted.target, idle_peer, "an in-flight pair is held");
         }
 
         /// #5842: the queue never runs two sends for one `(contract, peer)` at
@@ -4360,6 +4397,15 @@ pub(super) async fn broadcast_to_single_peer(
     // received. An older recorded summary costs at most a redundant send; a
     // newer one loses an update.
     let (payload, sent_summary, sent_state_size) = match payload {
+        // `our_summary` is `None` when the summary query already failed,
+        // usually a handler timeout. Asking the same handler again would only
+        // hold this leg's permit for a second timeout; there is no summary to
+        // record either way.
+        DeltaOrFullState::FullState(_) if our_summary.is_none() => (
+            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+            None,
+            new_state.size(),
+        ),
         DeltaOrFullState::FullState(_) => match get_contract_snapshot(op_manager, &key).await {
             Some((state, summary)) => (
                 DeltaOrFullState::FullState(state.as_ref().to_vec()),
@@ -6022,21 +6068,6 @@ mod tests {
         );
     }
 
-    /// #5842: a full-state send must never record a summary NEWER than the
-    /// state it put on the wire.
-    ///
-    /// Shape of the bug: a fan-out for state S1 is queued; before its leg runs,
-    /// a second write commits S2. The leg sent `new_state` (S1) as full state
-    /// but sent, and cached as the peer's summary, the CURRENT summary (S2's).
-    /// The sender then believed the peer held S2, so S2's own fan-out to that
-    /// peer took the "already converged" skip and the peer never got S2 until
-    /// anti-entropy, 5 to 75 minutes later.
-    ///
-    /// The stand-in contract handler holds S2 as the stored state, and is asked
-    /// to broadcast S1 then S2 to a peer whose summary it has never seen
-    /// (the full-state arm). Whatever went on the wire, the summary cached for
-    /// the peer must be the summary of bytes it was actually sent, and the peer
-    /// must end up having been sent S2.
     /// One full-state leg for S1 then one for S2 to a peer whose summary was
     /// never seen, with S2 already stored throughout. Returns every full state
     /// put on the wire with the summary sent alongside it, the summary cached
@@ -6224,10 +6255,24 @@ mod tests {
         StateSummary::from(vec![0xA0 | state[0]])
     }
 
+    /// #5842: a full-state send must never record a summary NEWER than the
+    /// state it put on the wire.
+    ///
+    /// Shape of the bug: a fan-out for state S1 is queued; before its leg runs,
+    /// a second write commits S2. The leg sent `new_state` (S1) as full state
+    /// but sent, and cached as the peer's summary, the CURRENT summary (S2's).
+    /// The sender then believed the peer held S2, so S2's own fan-out to that
+    /// peer took the "already converged" skip and the peer never got S2 until
+    /// anti-entropy, 5 to 75 minutes later.
+    ///
+    /// The stand-in contract handler holds S2 as the stored state, and is asked
+    /// to broadcast S1 then S2 to a peer whose summary it has never seen
+    /// (the full-state arm). Whatever went on the wire, the summary cached for
+    /// the peer must be the summary of bytes it was actually sent, and the peer
+    /// must end up having been sent S2.
     #[tokio::test(flavor = "current_thread")]
     async fn full_state_send_never_records_a_summary_newer_than_the_bytes_sent() {
         let (sent, recorded, _s1, s2) = run_two_full_state_legs(true).await;
-        assert_eq!(sent.len(), recorded.len().min(sent.len()));
         // After each leg that sent something, the summary cached for the peer
         // describes the last state it was sent, never a newer one.
         let mut last_sent: Option<&Vec<u8>> = None;

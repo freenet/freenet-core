@@ -806,7 +806,7 @@ impl OpManager {
             broadcast_coverage: Arc::new(
                 crate::ring::broadcast_coverage::BroadcastCoverageStore::new(),
             ),
-            // The spacing waits on tokio time (`tokio::time::sleep_until`), so
+            // The spacing waits on tokio time (`tokio::time::sleep`), so
             // it reads the same clock rather than the hosting override, which
             // sims advance by hand.
             broadcast_spacing: Arc::new(
