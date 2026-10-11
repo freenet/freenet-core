@@ -1165,6 +1165,8 @@ impl RetryDriver for GetRetryDriver<'_> {
         // A pin is chosen for one attempt: the one this call sets up.
         self.first_hop_pin = None;
         if self.pinned_only {
+            // A pinned-only GET's budget is its one target, so its give-up is
+            // reported as the retry budget being spent.
             self.exhaustion_reason = Some(crate::tracing::GetExhaustionReason::RetryBudget);
             return AdvanceOutcome::Exhausted;
         }
@@ -2687,7 +2689,6 @@ pub(crate) fn start_sub_op_get(
         instance_id,
         return_contract_code,
         None,
-        false,
         Some(out_tx),
     ));
 
@@ -2731,7 +2732,6 @@ pub(crate) fn start_targeted_sub_op_get(
         instance_id,
         true, // auto-fetch always wants the contract code
         Some(target),
-        false,
         None,
     ));
 
@@ -2743,23 +2743,48 @@ pub(crate) fn start_targeted_sub_op_get(
 /// key is already known to find nothing: the stranded-holder recovery
 /// (#5846), which pulls state back from the subscribe's requester. A routed
 /// fallback there would only send futile GETs into the empty key region.
-pub(crate) fn start_pinned_sub_op_get(
+///
+/// The whole fetch, streaming included, is cancelled at `deadline`, and
+/// `keep_alive` (the caller's fetch slot) is dropped only when the task ends,
+/// so a slot can never be freed while its fetch still runs.
+///
+/// "Nobody else" holds for this node's retry loop. Two narrow exceptions: if
+/// `target` stops being a routing candidate before the attempt (disconnects,
+/// turns transient) our loopback relay sends the one attempt to its own best
+/// candidate instead; and if `target` has no copy it serves, its relay forwards
+/// once more, since the request carries HTL 2 (the smallest that lets `target`
+/// check its own store), and the next hop answers on HTL 0.
+pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
     target: PeerKeyLocation,
+    deadline: std::time::Duration,
+    keep_alive: G,
 ) -> (Transaction, tokio::sync::oneshot::Receiver<SubOpGetOutcome>) {
     let op_manager = Arc::new(op_manager.clone());
     let tx = Transaction::new::<GetMsg>();
     let (out_tx, out_rx) = tokio::sync::oneshot::channel();
-    GlobalExecutor::spawn(run_sub_op_get(
-        op_manager,
-        tx,
-        instance_id,
-        true,
-        Some(target),
-        true,
-        Some(out_tx),
-    ));
+    GlobalExecutor::spawn(async move {
+        let _keep_alive = keep_alive;
+        let _completion_guard = SubOpGetCompletionGuard {
+            op_manager: op_manager.clone(),
+            tx,
+        };
+        let outcome = match tokio::time::timeout(
+            deadline,
+            drive_sub_op_get(&op_manager, tx, instance_id, true, Some(target), true),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                SubOpGetOutcome::NotFound(format!("pinned fetch exceeded {}s", deadline.as_secs()))
+            }
+        };
+        // Receiver drop is acceptable: the caller may have given up.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = out_tx.send(outcome);
+    });
     (tx, out_rx)
 }
 
@@ -2769,7 +2794,6 @@ async fn run_sub_op_get(
     instance_id: ContractInstanceId,
     return_contract_code: bool,
     initial_target: Option<PeerKeyLocation>,
-    pinned_only: bool,
     out_tx: Option<tokio::sync::oneshot::Sender<SubOpGetOutcome>>,
 ) {
     // RAII guard: same loopback-cleanup as ClientGetCompletionGuard (#4066).
@@ -2784,7 +2808,7 @@ async fn run_sub_op_get(
         instance_id,
         return_contract_code,
         initial_target,
-        pinned_only,
+        false,
     )
     .await;
 
@@ -2830,6 +2854,9 @@ impl Drop for SubOpGetCompletionGuard {
     }
 }
 
+/// HTL of a pinned-only sub-op GET; see `sub_op_driver`.
+const PINNED_ONLY_HTL: usize = 2;
+
 /// The retry driver for a sub-op GET. `initial_target`, when given, is pinned
 /// as the first attempt's first hop; otherwise the first hop is the ring's
 /// closest candidate, as for any GET. With `pinned_only` the GET asks that
@@ -2841,7 +2868,14 @@ fn sub_op_driver<'a>(
     initial_target: Option<PeerKeyLocation>,
     pinned_only: bool,
 ) -> GetRetryDriver<'a> {
-    let htl = op_manager.ring.max_hops_to_live;
+    // A pinned-only fetch needs only the target to look at its own store: the
+    // attempt goes loopback relay (2) -> target (1), and a target with nothing
+    // to serve forwards to a hop that answers on HTL 0 instead of walking on.
+    let htl = if pinned_only {
+        PINNED_ONLY_HTL
+    } else {
+        op_manager.ring.max_hops_to_live
+    };
 
     let mut tried: Vec<std::net::SocketAddr> = Vec::new();
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
@@ -12224,6 +12258,98 @@ mod route_attempt_driver_tests {
         assert_eq!(run.hops, vec![run.order[2]], "only the target is asked");
         assert!(!run.done, "a NotFound from the target ends the GET");
         assert_eq!(run.exhausted, Some(RetryBudget));
+    }
+
+    /// A pinned fetch is cancelled at its deadline even when its target never
+    /// answers, and the caller's slot (`keep_alive`) lives exactly as long as
+    /// the fetch: held while it runs, released when it ends (#5846). A slot
+    /// freed while the fetch still ran would let a slow peer pile up fetches.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_pinned_sub_op_get_is_cancelled_at_its_deadline_and_holds_its_slot_until_then() {
+        let (op_manager, rx, peers, _guards) =
+            op_manager_with_peers("get-pinned-deadline", 1).await;
+        let target = peers[0].clone();
+        let hop = target.clone();
+        let _served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, _, _| Step {
+                hop: Some(hop.clone()),
+                answer: Answer::Never,
+            },
+        );
+        let slot = Arc::new(());
+        let held = Arc::downgrade(&slot);
+        let deadline = std::time::Duration::from_secs(5);
+        let (_tx, outcome) = start_pinned_sub_op_get(
+            &op_manager,
+            ContractInstanceId::new([91u8; 32]),
+            target,
+            deadline,
+            slot,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            held.upgrade().is_some(),
+            "the slot is held while the fetch runs"
+        );
+
+        let outcome = outcome.await.expect("the fetch reports an outcome");
+        assert!(
+            matches!(&outcome, SubOpGetOutcome::NotFound(cause) if cause.contains("exceeded")),
+            "the deadline ends the fetch: {outcome:?}"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            held.upgrade().is_none(),
+            "the slot is released when the fetch ends"
+        );
+    }
+
+    /// `start_pinned_sub_op_get` really runs pinned-only: when its target
+    /// answers NotFound it does not go on to the other peer, which would have
+    /// answered Found. Two peers; each hop is picked by the real loopback-relay
+    /// selection.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn start_pinned_sub_op_get_does_not_fall_back_after_a_not_found() {
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-pinned-entry", 2).await;
+        let instance_id = ContractInstanceId::new([92u8; 32]);
+        let target = peers[1].clone();
+        let target_addr = addr(&target);
+        let view = op_manager.clone();
+        let served = serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, _| {
+                let (peer, peer_addr) =
+                    loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
+                let answer = if peer_addr == target_addr {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else {
+                    Answer::Reply(found(msg, instance_id))
+                };
+                Step {
+                    hop: Some(peer),
+                    answer,
+                }
+            },
+        );
+        let (_tx, outcome) = start_pinned_sub_op_get(
+            &op_manager,
+            instance_id,
+            target,
+            std::time::Duration::from_secs(120),
+            (),
+        );
+        let outcome = outcome.await.expect("the fetch reports an outcome");
+        assert!(
+            matches!(outcome, SubOpGetOutcome::NotFound(_)),
+            "a pinned-only fetch must not route on to another peer: {outcome:?}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1, "only the target is asked");
     }
 
     /// A callback dropped on this node is retried on the same peer without

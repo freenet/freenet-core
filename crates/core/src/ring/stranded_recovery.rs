@@ -48,8 +48,10 @@
 //!   retries a refused or timed-out subscribe at another neighbour sends a new
 //!   request; each is bounded the same way.)
 //! - **Rate-limited on the receiving side** ([`StrandedRecoveryLimiter`]):
-//!   token buckets bound how many recoveries start, and at most
-//!   [`MAX_IN_FLIGHT_FETCHES`] fetches run at once, which bounds the bytes.
+//!   token buckets bound how many recoveries start; at most
+//!   [`MAX_IN_FLIGHT_FETCHES`] fetches run at once, one per requester and one
+//!   per contract, each cancelled at [`FETCH_DEADLINE`], which bounds the
+//!   bytes.
 //!   Neither one requester nor many stranded holders at once can turn it into
 //!   a fetch storm (#4630, the 0.2.87 migration storm).
 //!
@@ -67,7 +69,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -95,8 +96,31 @@ pub(crate) const PER_CONTRACT_REFILL_INTERVAL: Duration = Duration::from_secs(30
 /// Recovery fetches one node runs at once. The token buckets bound how many
 /// recoveries start; this bounds the BYTES in flight, since a recovery pulls a
 /// whole contract state (up to `MAX_STATE_SIZE`). With two at a time a slow or
-/// large fetch paces further recoveries instead of piling them up.
+/// large fetch paces further recoveries instead of piling them up. A slot is
+/// held by the fetch task itself, for at most [`FETCH_DEADLINE`], so it cannot
+/// be freed while the fetch is still running.
 pub(crate) const MAX_IN_FLIGHT_FETCHES: usize = 2;
+
+/// Longest a recovery fetch may run, streaming included; it is cancelled at
+/// this point. Long enough for a large state over a slow uplink, short enough
+/// that a peer trickling bytes cannot hold a fetch slot for longer.
+pub(crate) const FETCH_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Why [`StrandedRecoveryLimiter::try_admit`] refused a recovery. Each cause is
+/// counted separately: the remedies differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// All [`MAX_IN_FLIGHT_FETCHES`] fetch slots are taken.
+    SlotsBusy,
+    /// This requester already has a fetch in flight here. One per requester,
+    /// so a single peer cannot hold every slot.
+    RequesterBusy,
+    /// This contract is already being fetched here, so a second fetch of the
+    /// same state would only duplicate the upload.
+    ContractBusy,
+    /// A token bucket (per requester, per contract or node-wide) is empty.
+    RateLimited,
+}
 
 /// Why a terminus did not attempt the backward bootstrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,15 +190,23 @@ pub(crate) struct StrandedRecoveryLimiter {
     per_requester: TokenBucketLimiter<SocketAddr>,
     per_contract: TokenBucketLimiter<ContractInstanceId>,
     global: TokenBucketLimiter<()>,
-    in_flight: Arc<AtomicUsize>,
+    /// The fetches in flight, at most [`MAX_IN_FLIGHT_FETCHES`] entries.
+    in_flight: Arc<parking_lot::Mutex<Vec<(SocketAddr, ContractInstanceId)>>>,
 }
 
-/// A held recovery-fetch slot; released on drop, on every exit path.
-pub(crate) struct InFlightFetch(Arc<AtomicUsize>);
+/// A held recovery-fetch slot; released on drop, on every exit path. Moved
+/// into the fetch task so it lives exactly as long as the fetch.
+pub(crate) struct InFlightFetch {
+    in_flight: Arc<parking_lot::Mutex<Vec<(SocketAddr, ContractInstanceId)>>>,
+    entry: (SocketAddr, ContractInstanceId),
+}
 
 impl Drop for InFlightFetch {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut in_flight = self.in_flight.lock();
+        if let Some(i) = in_flight.iter().position(|e| *e == self.entry) {
+            in_flight.swap_remove(i);
+        }
     }
 }
 
@@ -194,31 +226,46 @@ impl StrandedRecoveryLimiter {
                 MAX_TRACKED_KEYS,
             ),
             global: TokenBucketLimiter::new(time_source, GLOBAL_BURST, GLOBAL_REFILL_INTERVAL, 1),
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
-    /// Claim one of the [`MAX_IN_FLIGHT_FETCHES`] fetch slots, or `None` when
-    /// they are all taken. Claimed BEFORE [`Self::admit`], so a request refused
-    /// for lack of a slot spends no tokens.
-    pub(crate) fn try_begin_fetch(&self) -> Option<InFlightFetch> {
-        let claimed = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_IN_FLIGHT_FETCHES).then_some(n + 1)
-            })
-            .is_ok();
-        claimed.then(|| InFlightFetch(self.in_flight.clone()))
-    }
-
-    /// Consume one attempt for `(requester, contract)`. `false` means skip the
-    /// recovery and answer NotFound as before; the holder retries on its next
-    /// renewal. A refusal can spend tokens in the narrower buckets it passed,
-    /// which only ever makes recovery rarer, never more frequent.
-    pub(crate) fn admit(&self, requester: SocketAddr, contract: ContractInstanceId) -> bool {
-        self.per_requester.check_and_record(requester)
+    /// Admit one recovery for `(requester, contract)`, returning the fetch slot
+    /// to hold for the fetch's lifetime. A refusal means skip the recovery and
+    /// answer NotFound as before; the holder retries on its next renewal.
+    ///
+    /// The slot is checked first and the token buckets only if one is free, so
+    /// a request refused for lack of a slot spends no tokens. Within the
+    /// buckets a refusal can spend tokens in the narrower ones it passed, which
+    /// only ever makes recovery rarer, never more frequent.
+    pub(crate) fn try_admit(
+        &self,
+        requester: SocketAddr,
+        contract: ContractInstanceId,
+    ) -> Result<InFlightFetch, Refusal> {
+        // Hold the lock across the bucket checks so two requests cannot both
+        // pass the slot checks and then both insert.
+        let mut in_flight = self.in_flight.lock();
+        if in_flight.len() >= MAX_IN_FLIGHT_FETCHES {
+            return Err(Refusal::SlotsBusy);
+        }
+        if in_flight.iter().any(|(r, _)| *r == requester) {
+            return Err(Refusal::RequesterBusy);
+        }
+        if in_flight.iter().any(|(_, c)| *c == contract) {
+            return Err(Refusal::ContractBusy);
+        }
+        let admitted = self.per_requester.check_and_record(requester)
             && self.per_contract.check_and_record(contract)
-            && self.global.check_and_record(())
+            && self.global.check_and_record(());
+        if !admitted {
+            return Err(Refusal::RateLimited);
+        }
+        in_flight.push((requester, contract));
+        Ok(InFlightFetch {
+            in_flight: self.in_flight.clone(),
+            entry: (requester, contract),
+        })
     }
 
     /// Drop idle, fully-refilled buckets. Called from the Ring reaper.
@@ -309,6 +356,11 @@ mod tests {
         ContractInstanceId::new([n; 32])
     }
 
+    /// Admit and immediately end the fetch: exercises the token buckets alone.
+    fn admit(l: &StrandedRecoveryLimiter, r: SocketAddr, c: ContractInstanceId) -> bool {
+        l.try_admit(r, c).is_ok()
+    }
+
     fn limiter() -> (StrandedRecoveryLimiter, SharedMockTimeSource) {
         let clock = SharedMockTimeSource::new();
         (StrandedRecoveryLimiter::new(Arc::new(clock.clone())), clock)
@@ -317,11 +369,11 @@ mod tests {
     #[test]
     fn one_attempt_per_contract_per_cycle() {
         let (l, clock) = limiter();
-        assert!(l.admit(addr(1), contract(1)));
+        assert!(admit(&l, addr(1), contract(1)));
         // A second holder of the same contract inside the cycle is refused.
-        assert!(!l.admit(addr(2), contract(1)));
+        assert!(!admit(&l, addr(2), contract(1)));
         clock.advance_time(PER_CONTRACT_REFILL_INTERVAL);
-        assert!(l.admit(addr(2), contract(1)));
+        assert!(admit(&l, addr(2), contract(1)));
     }
 
     #[test]
@@ -330,18 +382,18 @@ mod tests {
         let burst = PER_REQUESTER_BURST as u8;
         for c in 0..burst {
             assert!(
-                l.admit(addr(1), contract(c)),
+                admit(&l, addr(1), contract(c)),
                 "attempt {c} within the burst"
             );
         }
         assert!(
-            !l.admit(addr(1), contract(burst)),
+            !admit(&l, addr(1), contract(burst)),
             "one requester cannot exceed its burst"
         );
         // Another requester is unaffected.
-        assert!(l.admit(addr(2), contract(burst + 1)));
+        assert!(admit(&l, addr(2), contract(burst + 1)));
         clock.advance_time(PER_REQUESTER_REFILL_INTERVAL);
-        assert!(l.admit(addr(1), contract(burst + 2)));
+        assert!(admit(&l, addr(1), contract(burst + 2)));
     }
 
     #[test]
@@ -350,13 +402,13 @@ mod tests {
         // node-wide bucket can bound this.
         let (l, clock) = limiter();
         let admitted = (0..100u8)
-            .filter(|n| l.admit(addr(*n), contract(*n)))
+            .filter(|n| admit(&l, addr(*n), contract(*n)))
             .count();
         assert_eq!(admitted, GLOBAL_BURST as usize);
         // Steady state: one more per refill interval, however many ask.
         clock.advance_time(GLOBAL_REFILL_INTERVAL);
         let admitted = (100..200u8)
-            .filter(|n| l.admit(addr(*n), contract(*n)))
+            .filter(|n| admit(&l, addr(*n), contract(*n)))
             .count();
         assert_eq!(admitted, 1);
     }
@@ -364,29 +416,69 @@ mod tests {
     #[test]
     fn fetch_slots_are_capped_and_released_on_drop() {
         let (l, _clock) = limiter();
-        let slots: Vec<_> = (0..MAX_IN_FLIGHT_FETCHES)
-            .map(|_| l.try_begin_fetch().expect("a free slot"))
+        let held: Vec<_> = (0..MAX_IN_FLIGHT_FETCHES as u8)
+            .map(|n| l.try_admit(addr(n), contract(n)).expect("a free slot"))
             .collect();
-        assert!(
-            l.try_begin_fetch().is_none(),
+        assert_eq!(
+            l.try_admit(addr(50), contract(50)).err(),
+            Some(Refusal::SlotsBusy),
             "no more than MAX_IN_FLIGHT_FETCHES at once"
         );
-        drop(slots);
+        drop(held);
         assert!(
-            l.try_begin_fetch().is_some(),
+            l.try_admit(addr(50), contract(50)).is_ok(),
             "slots come back when fetches end"
         );
     }
 
     #[test]
+    fn one_fetch_per_requester_and_per_contract() {
+        let (l, _clock) = limiter();
+        let _held = l.try_admit(addr(1), contract(1)).expect("free");
+        assert_eq!(
+            l.try_admit(addr(1), contract(2)).err(),
+            Some(Refusal::RequesterBusy),
+            "one peer cannot hold every slot"
+        );
+        assert_eq!(
+            l.try_admit(addr(2), contract(1)).err(),
+            Some(Refusal::ContractBusy),
+            "a contract already being fetched is not fetched twice"
+        );
+    }
+
+    #[test]
+    fn a_busy_slot_refusal_spends_no_tokens() {
+        let (l, _clock) = limiter();
+        let _held: Vec<_> = (0..MAX_IN_FLIGHT_FETCHES as u8)
+            .map(|n| l.try_admit(addr(n), contract(n)).expect("a free slot"))
+            .collect();
+        // Many refused attempts from one requester while the slots are busy...
+        for c in 100..150u8 {
+            assert_eq!(
+                l.try_admit(addr(9), contract(c)).err(),
+                Some(Refusal::SlotsBusy)
+            );
+        }
+        drop(_held);
+        // ...leave its whole burst intact.
+        for c in 0..PER_REQUESTER_BURST as u8 {
+            assert!(
+                admit(&l, addr(9), contract(200 + c)),
+                "token {c} still there"
+            );
+        }
+    }
+
+    #[test]
     fn cleanup_drops_idle_buckets_and_keeps_behaviour() {
         let (l, clock) = limiter();
-        assert!(l.admit(addr(1), contract(1)));
+        assert!(admit(&l, addr(1), contract(1)));
         clock.advance_time(Duration::from_secs(600));
         l.cleanup();
         assert_eq!(l.per_requester.len(), 0);
         assert_eq!(l.per_contract.len(), 0);
-        assert!(l.admit(addr(1), contract(1)), "a swept key starts fresh");
+        assert!(admit(&l, addr(1), contract(1)), "a swept key starts fresh");
     }
 
     #[test]
@@ -395,12 +487,12 @@ mod tests {
         let burst = PER_REQUESTER_BURST as u8;
         // One requester tries far more than its burst.
         for c in 0..50u8 {
-            l.admit(addr(1), contract(c));
+            admit(&l, addr(1), contract(c));
         }
         // It used only `burst` node-wide tokens, so other requesters still get
         // the rest of the node-wide burst.
         let others = (100..200u8)
-            .filter(|n| l.admit(addr(*n), contract(*n)))
+            .filter(|n| admit(&l, addr(*n), contract(*n)))
             .count();
         assert_eq!(others, GLOBAL_BURST as usize - burst as usize);
     }

@@ -259,8 +259,11 @@ pub struct RenewalMetrics {
     /// the state back from the holder and became a host.
     pub stranded_recoveries: u64,
     /// Stranded-holder recoveries this node passed the gate for but refused
-    /// because its receiving-side rate limit was spent.
+    /// because a token bucket was empty.
     pub stranded_recoveries_rate_limited: u64,
+    /// Stranded-holder recoveries refused because a fetch slot was busy: all
+    /// taken, or this requester or contract already had a fetch in flight.
+    pub stranded_recoveries_refused_busy: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -329,14 +332,20 @@ pub fn record_stranded_recovery(peer_addr: SocketAddr) {
     }
 }
 
-/// Record a stranded-holder recovery refused by the rate limit (#5846). No-op
+/// Record a stranded-holder recovery refused by the receiving-side limits
+/// (#5846): `rate_limited` for an empty token bucket, otherwise a busy fetch
+/// slot (all taken, or this requester or contract already fetching). No-op
 /// outside a simulation context (no current network name).
-pub fn record_stranded_recovery_rate_limited(peer_addr: SocketAddr) {
+pub fn record_stranded_recovery_refused(peer_addr: SocketAddr, rate_limited: bool) {
     if let Some(network_name) = get_current_network_name() {
-        RENEWAL_METRICS_REGISTRY
+        let mut entry = RENEWAL_METRICS_REGISTRY
             .entry((network_name, peer_addr))
-            .or_default()
-            .stranded_recoveries_rate_limited += 1;
+            .or_default();
+        if rate_limited {
+            entry.stranded_recoveries_rate_limited += 1;
+        } else {
+            entry.stranded_recoveries_refused_busy += 1;
+        }
     }
 }
 

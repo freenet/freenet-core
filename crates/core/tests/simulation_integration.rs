@@ -12667,6 +12667,7 @@ fn run_stranded_holder(
     seed: u64,
     contract_seed: u8,
     cluster_offsets: [f64; 6],
+    state_len: usize,
     contracts: u8,
     holder_subscribes: bool,
     holder_advertises: bool,
@@ -12707,7 +12708,9 @@ fn run_stranded_holder(
     for key in &keys {
         freenet::dev_tool::register_crdt_contract(*key.id());
     }
-    let state_v1 = SimOperation::create_crdt_state(1, 0x51);
+    // CRDT encoding is [version: u64 LE][data]; `state_len` sizes the data.
+    let mut state_v1 = 1u64.to_le_bytes().to_vec();
+    state_v1.extend((0..state_len).map(|i| (i % 251) as u8));
     let state_v2 = SimOperation::create_crdt_state(2, 0x52);
 
     let wrap = |x: f64| x.rem_euclid(1.0);
@@ -12732,6 +12735,11 @@ fn run_stranded_holder(
         .await
     });
     sim.disable_placement_migration();
+    // Sims run with streaming off unless asked; a large state should travel
+    // the way production sends it (production's threshold is 64 KiB).
+    if state_len > 64 * 1024 {
+        sim.with_streaming_threshold(64 * 1024);
+    }
     if holder_advertises {
         sim.enable_seeded_host_advertisements();
     }
@@ -12803,16 +12811,17 @@ fn stranded_near_key_hosts(
         .collect()
 }
 
-/// `(completed recoveries, recoveries refused by the rate limit)` across all
-/// peers of a run.
+/// `(completed recoveries, recoveries refused by a receiving-side limit)`
+/// across all peers of a run. Refusals count both an empty token bucket and a
+/// busy fetch slot.
 fn stranded_recovery_totals(result: &freenet::dev_tool::ControlledSimulationResult) -> (u64, u64) {
     result
         .renewal_metrics
         .values()
-        .fold((0, 0), |(done, limited), m| {
+        .fold((0, 0), |(done, refused), m| {
             (
                 done + m.stranded_recoveries,
-                limited + m.stranded_recoveries_rate_limited,
+                refused + m.stranded_recoveries_rate_limited + m.stranded_recoveries_refused_busy,
             )
         })
 }
@@ -12838,6 +12847,7 @@ fn test_stranded_holder_reroots_near_key_by_backward_bootstrap() {
         0x5D_B000_0001,
         0x5D,
         STRANDED_TIGHT_CLUSTER,
+        128,
         1,
         true,
         true,
@@ -12889,6 +12899,66 @@ fn test_stranded_holder_reroots_near_key_by_backward_bootstrap() {
     }
 }
 
+/// A state large enough to stream (#5846, round-2 review): 512 KiB with the
+/// production streaming threshold, so the pinned-only recovery fetch goes
+/// through stream assembly. The near-key host must hold the holder's exact
+/// state, from exactly one recovery. (In-memory transfer is fast, so this does
+/// not exercise a fetch slower than any timeout; the fetch deadline and slot
+/// lifetime are unit-tested.)
+#[test_log::test]
+fn test_stranded_holder_recovers_a_large_streamed_state() {
+    const NETWORK_NAME: &str = "stranded-holder-large";
+    const STATE_LEN: usize = 512 * 1024;
+    let run = run_stranded_holder(
+        NETWORK_NAME,
+        0x5D_B000_0007,
+        0x9D,
+        STRANDED_TIGHT_CLUSTER,
+        STATE_LEN,
+        1,
+        true,
+        true,
+        false,
+        Duration::from_secs(90),
+        Duration::from_secs(60),
+    );
+    let key = run.keys[0];
+    let holder = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, STRANDED_HOLDER_NO);
+    assert!(
+        run.result.node_open_connections(&holder) > 0,
+        "the holder never joined"
+    );
+    let holder_state = run
+        .result
+        .node_storages
+        .get(&holder)
+        .and_then(|s| s.get_stored_state(&key))
+        .expect("the holder keeps its state");
+    assert!(holder_state.size() > STATE_LEN, "the state really is large");
+    let near = stranded_near_key_hosts(&run, NETWORK_NAME, &key);
+    assert!(
+        !near.is_empty(),
+        "the large state was not recovered near the key"
+    );
+    for n in &near {
+        let stored = run
+            .result
+            .node_storages
+            .get(&freenet::dev_tool::NodeLabel::node(NETWORK_NAME, *n))
+            .and_then(|s| s.get_stored_state(&key));
+        assert_eq!(
+            stored.as_ref().map(freenet::tracing::state_hash_short),
+            Some(freenet::tracing::state_hash_short(&holder_state)),
+            "near-key host node {n} holds a different state"
+        );
+    }
+    assert_eq!(
+        stranded_recovery_totals(&run.result).0,
+        1,
+        "one pull, not one per attempt"
+    );
+}
+
 /// Negative control (#5846): a holder with NO demand does not trigger the
 /// recovery. Same topology as the positive test (its own seed, so the two can
 /// run concurrently in one process without colliding ports, #5676), but the
@@ -12903,6 +12973,7 @@ fn test_stranded_holder_without_demand_is_not_rerooted() {
         0x5D_B000_0005,
         0x6D,
         STRANDED_TIGHT_CLUSTER,
+        128,
         1,
         false,
         true,
@@ -12940,6 +13011,7 @@ fn test_stranded_holder_that_does_not_advertise_is_not_pulled_from() {
         0x5D_B000_0006,
         0x7D,
         STRANDED_TIGHT_CLUSTER,
+        128,
         1,
         true,
         false,
@@ -12980,6 +13052,7 @@ fn test_many_stranded_contracts_recover_without_a_storm() {
         // 12 contracts one of them receives at least 6 from the holder, more
         // than the per-requester burst of 4: the limit must engage.
         [-0.003, 0.003, 0.15, 0.20, 0.25, 0.30],
+        128,
         CONTRACTS,
         true,
         true,

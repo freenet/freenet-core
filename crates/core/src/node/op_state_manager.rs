@@ -4345,6 +4345,86 @@ mod tests {
         assert!(!op_manager.spawn_stranded_recovery_reroot(key));
     }
 
+    /// With the event loop's notification channel more than half full the
+    /// recovery re-root waits for the renewal loop, the same backpressure that
+    /// loop applies to itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_backs_off_under_event_loop_pressure() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-pressure").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x63);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        let sender = op_manager.to_event_listener.notifications_sender();
+        let half = sender.max_capacity() / crate::ring::Ring::RENEWAL_DEFER_CAPACITY_FRACTION;
+        while sender.capacity() >= half {
+            sender
+                .try_send(either::Either::Right(
+                    crate::message::NodeEvent::TransactionCompleted(
+                        crate::message::Transaction::new::<
+                            crate::operations::subscribe::SubscribeMsg,
+                        >(),
+                    ),
+                ))
+                .expect("channel has room");
+        }
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(
+            op_manager.ring.can_request_subscription(&key),
+            "a skipped re-root must not claim the slot"
+        );
+    }
+
+    /// The live state that feeds the recovery gate: the requester's hosting
+    /// advertisement and the ban list reach `RecoveryInputs`, and a peer that
+    /// is not connected yields no requester at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_inputs_read_advertisement_and_ban_list() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-inputs").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x64);
+        let iid = *key.id();
+        let requester = crate::transport::TransportKeypair::new();
+        let requester_addr: std::net::SocketAddr = "127.0.0.1:37001".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&requester_addr),
+            requester_addr,
+            requester.public().clone(),
+            false,
+        ));
+        let inputs = |addr| {
+            crate::operations::subscribe::op_ctx_task::stranded_recovery_inputs(
+                &op_manager,
+                iid,
+                addr,
+            )
+        };
+
+        let (before, peer) = inputs(requester_addr);
+        assert!(peer.is_some(), "a connected requester resolves");
+        assert!(!before.requester_advertises);
+        assert!(!before.banned);
+
+        register_hub_cohosting(&op_manager, requester.public(), &[iid]);
+        assert!(inputs(requester_addr).0.requester_advertises);
+
+        let _ = op_manager.ring.contract_ban_list.ban(
+            iid,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+        assert!(inputs(requester_addr).0.banned);
+
+        let stranger: std::net::SocketAddr = "127.0.0.1:37002".parse().unwrap();
+        let (unknown, peer) = inputs(stranger);
+        assert!(peer.is_none());
+        assert!(unknown.requester_location.is_none());
+    }
+
     /// No demand, no re-root: a copy with a lease but no local client, no
     /// downstream and no recent access is torn down by the reconcile
     /// controller, never re-rooted (the anti-storm interest gate).
