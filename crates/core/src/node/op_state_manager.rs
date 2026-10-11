@@ -4326,6 +4326,28 @@ mod tests {
         assert!(op_manager.spawn_stranded_recovery_reroot(key));
     }
 
+    /// A contract in subscription backoff (a recent failed renewal or
+    /// re-root) is not re-rooted early: the per-contract backoff is one of the
+    /// storm guards the renewal loop applies too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_respects_subscription_backoff() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-backoff").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x65);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        assert!(op_manager.ring.mark_subscription_pending(key));
+        op_manager.ring.complete_subscription_request(&key, false);
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "precondition: the failure put the contract in backoff"
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
     /// A banned contract is never re-rooted.
     #[tokio::test(flavor = "current_thread")]
     async fn stranded_recovery_reroot_skips_a_banned_contract() {

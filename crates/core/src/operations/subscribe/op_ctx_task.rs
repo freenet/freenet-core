@@ -2471,13 +2471,32 @@ async fn recover_from_stranded_requester(
     // `decide` only passes a connected requester.
     let requester = requester?;
 
+    use crate::ring::stranded_recovery::{FETCH_DEADLINE, Refusal};
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
-    let fetch_slot = match op_manager
-        .ring
-        .stranded_recovery_limiter
-        .try_admit(upstream_addr, instance_id)
-    {
+    let limiter = &op_manager.ring.stranded_recovery_limiter;
+    let fetch_slot = match limiter.try_admit(upstream_addr, instance_id) {
         Ok(slot) => slot,
+        Err(Refusal::AlreadyFetching) => {
+            // The requester gave up on an earlier attempt while our fetch of the
+            // same state kept running. Wait for that fetch rather than answer
+            // NotFound, which would send it on to pull the state again at
+            // another neighbour. The original attempt's driver finishes the
+            // host formation; this one only answers the retry.
+            tracing::info!(
+                tx = %incoming_tx,
+                %instance_id,
+                requester = %upstream_addr,
+                "SUBSCRIBE: stranded-holder recovery already fetching for this requester; waiting"
+            );
+            return super::wait_for_contract_with_timeout(
+                op_manager,
+                instance_id,
+                FETCH_DEADLINE.as_millis() as u64,
+            )
+            .await
+            .ok()
+            .flatten();
+        }
         Err(refusal) => {
             tracing::info!(
                 tx = %incoming_tx,
@@ -2487,13 +2506,7 @@ async fn recover_from_stranded_requester(
                 "SUBSCRIBE: stranded-holder recovery refused; answering NotFound"
             );
             if let Some(addr) = own_addr {
-                crate::ring::topology_registry::record_stranded_recovery_refused(
-                    addr,
-                    matches!(
-                        refusal,
-                        crate::ring::stranded_recovery::Refusal::RateLimited
-                    ),
-                );
+                crate::ring::topology_registry::record_stranded_recovery_refused(addr, refusal);
             }
             return None;
         }
@@ -2505,34 +2518,40 @@ async fn recover_from_stranded_requester(
     // up early would leave the GET to finish in the background, host the copy
     // with no downstream, and send the holder on to pull it again from its next
     // neighbour. The fetch task holds `fetch_slot` and is cancelled at
-    // `FETCH_DEADLINE`, so the slot bounds the fetch itself, not just this
-    // wait; the outer timeout below is only a backstop for a wedged task.
-    let deadline = crate::ring::stranded_recovery::FETCH_DEADLINE;
+    // `FETCH_DEADLINE`; the outer timeout below is only a backstop for a
+    // wedged task.
+    let started = tokio::time::Instant::now();
     let (_get_tx, outcome_rx) = crate::operations::get::op_ctx_task::start_pinned_sub_op_get(
         op_manager,
         instance_id,
         requester,
-        deadline,
+        FETCH_DEADLINE,
         fetch_slot,
     );
-    let outcome = tokio::time::timeout(deadline + Duration::from_secs(10), outcome_rx).await;
+    let outcome = tokio::time::timeout(FETCH_DEADLINE + Duration::from_secs(10), outcome_rx).await;
     use crate::operations::get::op_ctx_task::SubOpGetOutcome;
-    let (key, failure) = match outcome {
+    // `failure` is a fixed label: it goes to the central telemetry collector,
+    // and a free-form cause can carry a peer's address.
+    let (key, failure, detail) = match outcome {
         Ok(Ok(SubOpGetOutcome::Found(_))) => {
             match crate::operations::has_contract(op_manager, instance_id).await {
-                Ok(Some(key)) => (Some(key), None),
-                Ok(None) => (None, Some("fetched but not in the local store".to_string())),
-                Err(err) => (None, Some(format!("local store lookup failed: {err}"))),
+                Ok(Some(key)) => (Some(key), None, String::new()),
+                Ok(None) => (None, Some("not_stored"), String::new()),
+                Err(err) => (None, Some("store_lookup"), err.to_string()),
             }
         }
-        Ok(Ok(SubOpGetOutcome::NotFound(cause))) => (None, Some(cause)),
-        Ok(Ok(SubOpGetOutcome::Infra(err))) => (None, Some(err.to_string())),
-        Ok(Err(_)) => (
-            None,
-            Some("fetch task ended without an outcome".to_string()),
-        ),
-        Err(_) => (None, Some("fetch outlived its backstop".to_string())),
+        Ok(Ok(SubOpGetOutcome::NotFound(cause))) if started.elapsed() >= FETCH_DEADLINE => {
+            (None, Some("deadline"), cause)
+        }
+        Ok(Ok(SubOpGetOutcome::NotFound(cause))) => (None, Some("not_found"), cause),
+        Ok(Ok(SubOpGetOutcome::Infra(err))) => (None, Some("infra"), err.to_string()),
+        Ok(Err(_)) => (None, Some("task_lost"), String::new()),
+        Err(_) => (None, Some("deadline"), "backstop".to_string()),
     };
+    if failure == Some("deadline") {
+        // The sender keeps sending after we cancel; do not ask it again soon.
+        limiter.record_deadline(upstream_addr, instance_id);
+    }
     let result = if key.is_some() {
         "recovered"
     } else {
@@ -2543,7 +2562,8 @@ async fn recover_from_stranded_requester(
         %instance_id,
         requester = %upstream_addr,
         result,
-        failure = failure.as_deref().unwrap_or(""),
+        failure = failure.unwrap_or(""),
+        detail,
         "SUBSCRIBE: no host beyond us; stranded-holder recovery from the requester (§5d(b))"
     );
     // Only admitted recoveries reach here, so the limiter bounds this event.
@@ -3698,7 +3718,26 @@ mod tests {
             "the new host must re-root toward the key (§5d(b): the process recurses), \
              as a statement, not in a comment"
         );
+        let finalize_at = host
+            .find("finalize_host_subscribe(")
+            .expect("becomes a host");
+        let reroot_at = host
+            .find("op_manager.spawn_stranded_recovery_reroot(key);")
+            .expect("re-roots");
+        assert!(
+            finalize_at < reroot_at,
+            "re-root only after host formation: before it the holder is not yet our \
+             downstream, so the reconcile gate sees no demand and skips the re-root"
+        );
         let recover = body_of("async fn recover_from_stranded_requester(");
+        let squashed: String = recover.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squashed.contains(
+                "start_pinned_sub_op_get(op_manager,instance_id,requester,FETCH_DEADLINE,fetch_slot,)"
+            ),
+            "the fetch slot must be moved into the fetch task, so it lives exactly as \
+             long as the fetch"
+        );
         assert!(
             recover.contains("send_standalone_event(\n        \"stranded_recovery\""),
             "each admitted recovery must emit the `stranded_recovery` telemetry event, \

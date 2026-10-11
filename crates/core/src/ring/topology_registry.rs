@@ -333,18 +333,25 @@ pub fn record_stranded_recovery(peer_addr: SocketAddr) {
 }
 
 /// Record a stranded-holder recovery refused by the receiving-side limits
-/// (#5846): `rate_limited` for an empty token bucket, otherwise a busy fetch
-/// slot (all taken, or this requester or contract already fetching). No-op
-/// outside a simulation context (no current network name).
-pub fn record_stranded_recovery_refused(peer_addr: SocketAddr, rate_limited: bool) {
+/// (#5846), under its cause: an empty token bucket, or anything that is not a
+/// rate (a busy slot, or a pair in its deadline backoff). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery_refused(
+    peer_addr: SocketAddr,
+    refusal: crate::ring::stranded_recovery::Refusal,
+) {
+    use crate::ring::stranded_recovery::Refusal;
     if let Some(network_name) = get_current_network_name() {
         let mut entry = RENEWAL_METRICS_REGISTRY
             .entry((network_name, peer_addr))
             .or_default();
-        if rate_limited {
-            entry.stranded_recoveries_rate_limited += 1;
-        } else {
-            entry.stranded_recoveries_refused_busy += 1;
+        match refusal {
+            Refusal::RateLimited => entry.stranded_recoveries_rate_limited += 1,
+            Refusal::SlotsBusy
+            | Refusal::RequesterBusy
+            | Refusal::ContractBusy
+            | Refusal::RecentlyTimedOut
+            | Refusal::AlreadyFetching => entry.stranded_recoveries_refused_busy += 1,
         }
     }
 }

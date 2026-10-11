@@ -36,9 +36,10 @@
 //! - **Claimed holding.** The requester must be a connected peer that
 //!   advertises hosting the contract. That advertisement is the requester's
 //!   own claim and is not verified, so a peer can make us fetch a contract it
-//!   chooses. What bounds that is the rate limit below and the eviction
-//!   budget the fetched copy competes in; it is no more than the same peer
-//!   could place with a PUT, which every hop stores.
+//!   chooses and, through the re-root, place it along the way to the key, each
+//!   copy with one downstream. That is what the same peer can already do with
+//!   a PUT followed by a SUBSCRIBE; the rate limits below and the eviction
+//!   budget the copies compete in bound it.
 //! - **Keyward only.** This peer must be strictly closer to the key than the
 //!   requester, so the new upstream relation is a strict descent toward the key
 //!   (acyclic, design §4) and the requester's computed upstream becomes us.
@@ -50,8 +51,11 @@
 //! - **Rate-limited on the receiving side** ([`StrandedRecoveryLimiter`]):
 //!   token buckets bound how many recoveries start; at most
 //!   [`MAX_IN_FLIGHT_FETCHES`] fetches run at once, one per requester and one
-//!   per contract, each cancelled at [`FETCH_DEADLINE`], which bounds the
-//!   bytes.
+//!   per contract, each cancelled at [`FETCH_DEADLINE`]. That bounds the
+//!   fetches this node waits on and assembles, not the bytes on the wire: a
+//!   cancelled fetch does not stop its sender, so a pair whose fetch hit the
+//!   deadline is not fetched again for [`DEADLINE_BACKOFF`], which is what
+//!   stops a holder re-uploading a state too large for the link.
 //!   Neither one requester nor many stranded holders at once can turn it into
 //!   a fetch storm (#4630, the 0.2.87 migration storm).
 //!
@@ -98,7 +102,9 @@ pub(crate) const PER_CONTRACT_REFILL_INTERVAL: Duration = Duration::from_secs(30
 /// whole contract state (up to `MAX_STATE_SIZE`). With two at a time a slow or
 /// large fetch paces further recoveries instead of piling them up. A slot is
 /// held by the fetch task itself, for at most [`FETCH_DEADLINE`], so it cannot
-/// be freed while the fetch is still running.
+/// be freed while the fetch is still running. It bounds fetches waited on and
+/// assembled here, not bytes still arriving after a cancel; see
+/// [`DEADLINE_BACKOFF`].
 pub(crate) const MAX_IN_FLIGHT_FETCHES: usize = 2;
 
 /// Longest a recovery fetch may run, streaming included; it is cancelled at
@@ -106,10 +112,24 @@ pub(crate) const MAX_IN_FLIGHT_FETCHES: usize = 2;
 /// that a peer trickling bytes cannot hold a fetch slot for longer.
 pub(crate) const FETCH_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a (requester, contract) pair is not fetched again after a fetch of
+/// it hit [`FETCH_DEADLINE`].
+pub(crate) const DEADLINE_BACKOFF: Duration = Duration::from_secs(600);
+
 /// Why [`StrandedRecoveryLimiter::try_admit`] refused a recovery. Each cause is
 /// counted separately: the remedies differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
+    /// This very (requester, contract) fetch is already running here: the
+    /// requester gave up on an earlier attempt and retried. The caller waits
+    /// for that fetch instead of answering NotFound, so the retry does not
+    /// send the holder on to pull the same state at another neighbour.
+    AlreadyFetching,
+    /// A fetch of this contract from this requester hit [`FETCH_DEADLINE`]
+    /// within [`DEADLINE_BACKOFF`]. Cancelling a fetch does not stop the
+    /// sender, so retrying a state too large for this link would only make
+    /// the holder upload it again and again.
+    RecentlyTimedOut,
     /// All [`MAX_IN_FLIGHT_FETCHES`] fetch slots are taken.
     SlotsBusy,
     /// This requester already has a fetch in flight here. One per requester,
@@ -192,6 +212,11 @@ pub(crate) struct StrandedRecoveryLimiter {
     global: TokenBucketLimiter<()>,
     /// The fetches in flight, at most [`MAX_IN_FLIGHT_FETCHES`] entries.
     in_flight: Arc<parking_lot::Mutex<Vec<(SocketAddr, ContractInstanceId)>>>,
+    /// Pairs whose fetch hit the deadline, with when they may be tried again.
+    /// Entries only expire (nothing refreshes them), so refusing new ones at
+    /// the cap cannot starve anyone for longer than [`DEADLINE_BACKOFF`].
+    timed_out: dashmap::DashMap<(SocketAddr, ContractInstanceId), tokio::time::Instant>,
+    time_source: Arc<dyn TimeSource + Send + Sync>,
 }
 
 /// A held recovery-fetch slot; released on drop, on every exit path. Moved
@@ -225,8 +250,26 @@ impl StrandedRecoveryLimiter {
                 PER_CONTRACT_REFILL_INTERVAL,
                 MAX_TRACKED_KEYS,
             ),
-            global: TokenBucketLimiter::new(time_source, GLOBAL_BURST, GLOBAL_REFILL_INTERVAL, 1),
+            global: TokenBucketLimiter::new(
+                time_source.clone(),
+                GLOBAL_BURST,
+                GLOBAL_REFILL_INTERVAL,
+                1,
+            ),
             in_flight: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            timed_out: dashmap::DashMap::new(),
+            time_source,
+        }
+    }
+
+    /// Remember that the fetch of `contract` from `requester` hit
+    /// [`FETCH_DEADLINE`], so it is not tried again for [`DEADLINE_BACKOFF`].
+    pub(crate) fn record_deadline(&self, requester: SocketAddr, contract: ContractInstanceId) {
+        if self.timed_out.len() < MAX_TRACKED_KEYS {
+            self.timed_out.insert(
+                (requester, contract),
+                self.time_source.now() + DEADLINE_BACKOFF,
+            );
         }
     }
 
@@ -246,6 +289,16 @@ impl StrandedRecoveryLimiter {
         // Hold the lock across the bucket checks so two requests cannot both
         // pass the slot checks and then both insert.
         let mut in_flight = self.in_flight.lock();
+        if in_flight.contains(&(requester, contract)) {
+            return Err(Refusal::AlreadyFetching);
+        }
+        if self
+            .timed_out
+            .get(&(requester, contract))
+            .is_some_and(|until| self.time_source.now() < *until)
+        {
+            return Err(Refusal::RecentlyTimedOut);
+        }
         if in_flight.len() >= MAX_IN_FLIGHT_FETCHES {
             return Err(Refusal::SlotsBusy);
         }
@@ -273,6 +326,8 @@ impl StrandedRecoveryLimiter {
         self.per_requester.cleanup();
         self.per_contract.cleanup();
         self.global.cleanup();
+        let now = self.time_source.now();
+        self.timed_out.retain(|_, until| now < *until);
     }
 }
 
@@ -445,6 +500,33 @@ mod tests {
             Some(Refusal::ContractBusy),
             "a contract already being fetched is not fetched twice"
         );
+    }
+
+    #[test]
+    fn a_retry_of_the_same_fetch_is_told_it_is_already_running() {
+        let (l, _clock) = limiter();
+        let _held = l.try_admit(addr(1), contract(1)).expect("free");
+        assert_eq!(
+            l.try_admit(addr(1), contract(1)).err(),
+            Some(Refusal::AlreadyFetching)
+        );
+    }
+
+    #[test]
+    fn a_fetch_that_hit_the_deadline_is_not_retried_for_the_backoff() {
+        let (l, clock) = limiter();
+        l.record_deadline(addr(1), contract(1));
+        assert_eq!(
+            l.try_admit(addr(1), contract(1)).err(),
+            Some(Refusal::RecentlyTimedOut)
+        );
+        // Other pairs are unaffected.
+        assert!(admit(&l, addr(1), contract(2)));
+        assert!(admit(&l, addr(2), contract(1)));
+        clock.advance_time(DEADLINE_BACKOFF);
+        l.cleanup();
+        assert!(l.timed_out.is_empty(), "expired entries are swept");
+        assert!(admit(&l, addr(1), contract(1)), "retried after the backoff");
     }
 
     #[test]

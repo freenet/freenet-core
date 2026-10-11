@@ -2379,13 +2379,25 @@ async fn assemble_and_cache_stream(
         None
     };
 
-    // This helper runs on the client-driver (originator) side. The relay
-    // driver also claims streams now (the `Terminal::Streaming` arm, #4307),
-    // but it uses its own inline assemble+cache with `local_client_access =
-    // false`; this path is the originator, which IS the client requester, so
-    // the sticky `local_client_access` flag applies here.
-    let state_stored =
-        cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
+    // This helper runs on the originator side. The relay driver also claims
+    // streams now (the `Terminal::Streaming` arm, #4307), but it uses its own
+    // inline assemble+cache with `local_client_access = false`. The originator
+    // is the client requester for a client GET, so the sticky
+    // `local_client_access` flag applies there; a sub-op GET (auto-fetch, a
+    // subscribe's body fetch, the stranded-holder recovery) has no client, and
+    // marking it would make every large fetch look like local demand: renewed
+    // and kept from cost eviction for no one (#5846). Its inline path already
+    // passes `false`.
+    let is_client_requester = !matches!(cause, crate::ring::HostingCause::SubOpGet);
+    let state_stored = cache_contract_locally(
+        op_manager,
+        payload.key,
+        state,
+        contract,
+        is_client_requester,
+        cause,
+    )
+    .await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
@@ -2752,8 +2764,9 @@ pub(crate) fn start_targeted_sub_op_get(
 /// `target` stops being a routing candidate before the attempt (disconnects,
 /// turns transient) our loopback relay sends the one attempt to its own best
 /// candidate instead; and if `target` has no copy it serves, its relay forwards
-/// once more, since the request carries HTL 2 (the smallest that lets `target`
-/// check its own store), and the next hop answers on HTL 0.
+/// once more (plus up to `MAX_TERMINAL_CONSULT_HOSTS` advertised hosts), since
+/// the request carries HTL 2, the smallest that lets `target` check its own
+/// store, and those hops answer on HTL 0 without checking theirs.
 pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
@@ -8509,10 +8522,15 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            stream_normalized.contains("true"),
-            "assemble_and_cache_stream must pass `true` for is_client_requester \
-             (stream is only claimed by the client-originating driver). Call \
-             window: {stream_window}"
+            stream_normalized.contains("is_client_requester,"),
+            "assemble_and_cache_stream must pass `is_client_requester` (true for \
+             a client GET, false for a sub-op GET). Call window: {stream_window}"
+        );
+        assert!(
+            stream_body.contains(
+                "let is_client_requester = !matches!(cause, crate::ring::HostingCause::SubOpGet);"
+            ),
+            "only a sub-op GET's streamed store may skip the local-client-access mark"
         );
     }
 
@@ -12319,11 +12337,16 @@ mod route_attempt_driver_tests {
         let target = peers[1].clone();
         let target_addr = addr(&target);
         let view = op_manager.clone();
+        let htls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_htls = htls.clone();
         let served = serve_attempts(
             op_manager.clone(),
             rx,
             crate::message::TransactionType::Get,
             move |_, msg, _| {
+                if let NetMessage::V1(NetMessageV1::Get(GetMsg::Request { htl, .. })) = msg {
+                    seen_htls.lock().push(*htl);
+                }
                 let (peer, peer_addr) =
                     loopback_relay_pick(&view, msg).expect("the relay finds a candidate");
                 let answer = if peer_addr == target_addr {
@@ -12350,6 +12373,14 @@ mod route_attempt_driver_tests {
             "a pinned-only fetch must not route on to another peer: {outcome:?}"
         );
         assert_eq!(served.load(Ordering::SeqCst), 1, "only the target is asked");
+        assert_eq!(
+            *htls.lock(),
+            // Literal on purpose: 2 is the smallest HTL that lets the target
+            // check its own store (loopback relay 2 -> target 1); anything
+            // larger lets a target with nothing to serve start a routed walk.
+            vec![2],
+            "a pinned fetch carries only enough HTL for the target to check its store"
+        );
     }
 
     /// A callback dropped on this node is retried on the same peer without

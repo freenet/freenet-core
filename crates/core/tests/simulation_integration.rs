@@ -12957,6 +12957,17 @@ fn test_stranded_holder_recovers_a_large_streamed_state() {
         1,
         "one pull, not one per attempt"
     );
+    // The recovering peer has no client: the streamed fetch must not count as
+    // local demand there (it would be renewed and kept for no one).
+    for n in &near {
+        assert!(
+            !run.result.node_has_recent_local_client_access(
+                &freenet::dev_tool::NodeLabel::node(NETWORK_NAME, *n),
+                &key
+            ),
+            "the recovery's streamed fetch marked local client access on node {n}"
+        );
+    }
 }
 
 /// Negative control (#5846): a holder with NO demand does not trigger the
@@ -13064,6 +13075,11 @@ fn test_many_stranded_contracts_recover_without_a_storm() {
     );
     let (recoveries, refused) = stranded_recovery_totals(&run.result);
     tracing::info!(recoveries, refused, "many stranded contracts");
+    assert!(
+        recoveries <= u64::from(CONTRACTS),
+        "{recoveries} recoveries for {CONTRACTS} contracts: a contract was pulled more \
+         than once"
+    );
     assert!(
         refused >= 1,
         "{CONTRACTS} subscribes within seconds into one key region must hit a \

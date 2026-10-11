@@ -732,6 +732,21 @@ impl ControlledSimulationResult {
             .map(|ring| ring.originator_route_timeout_count())
     }
 
+    /// Whether `label`'s node counted recent local client access for `key` at
+    /// the end of the run (the demand signal a GET or PUT by its own client
+    /// sets). Returns `false` if the node never published its Ring. Used to
+    /// check that a fetch with no client behind it did not manufacture local
+    /// demand (#5846).
+    pub fn node_has_recent_local_client_access(
+        &self,
+        label: &NodeLabel,
+        key: &ContractKey,
+    ) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.has_recent_local_client_access(key))
+    }
+
     /// Whether `label`'s node was actively receiving updates for `key` (has a
     /// live network/client subscription keeping the copy fresh) at the end of the
     /// run. Returns `false` if the node never published its Ring. The serve-DURING
