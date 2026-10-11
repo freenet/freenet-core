@@ -25,19 +25,19 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "[ \"$$ppid\" = \"1\" ] || continue; ",
     "comm=$$(cat /proc/$$pid/comm 2>/dev/null); ",
     "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
-    "args=$$(ps -o args= -p \"$$pid\" 2>/dev/null); ",
+    "args=$$(ps -ww -o args= -p \"$$pid\" 2>/dev/null); ",
     "case \"$$args\" in \"\"|*--ws-api-port*|*--config-dir*) continue ;; esac; ",
     "grep -qaE \"(^|[^A-Z_])(WS_API_PORT|CONFIG_DIR)=\" /proc/$$pid/environ 2>/dev/null; ",
     "[ $$? -eq 1 ] || continue; ",
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
     "if [ \"$$cg\" != \"$$mycg\" ]; then ",
-    "u=$$(echo \"$$cg\" | grep -oE \"[^/]*[.]service(/|$$)\" | tail -n 1 | cut -d/ -f1); ",
-    "if [ -n \"$$u\" ]; then ",
+    "s=0; ",
+    "for u in $$(grep -oE \"[^/]*[.]service(/|$$)\" /proc/$$pid/cgroup 2>/dev/null | cut -d/ -f1 | sort -u); do ",
     "mp=$$(timeout 5 systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
-    "[ -z \"$$mp\" ] && continue; ",
-    "[ \"$$mp\" = \"$$pid\" ] && continue; ",
-    "fi; ",
+    "{ [ -z \"$$mp\" ] || [ \"$$mp\" = \"$$pid\" ]; } && s=1; ",
+    "done; ",
+    "[ $$s = 1 ] && continue; ",
     "fi; ",
     "echo \"freenet pre-flight: stopping orphaned node $$pid\" >&2; ",
     "kill -TERM \"$$pid\" 2>/dev/null && v=\"$$v $$pid\"; ",
@@ -531,11 +531,12 @@ Environment={fast_crash_marker}=1
 #   * it is not the main process of ANOTHER systemd service. Under the SYSTEM
 #     manager PID 1 forks a Type=simple service directly, so a healthy node
 #     supervised by the system unit (or by any other service) also has PPID 1.
-#     For a process in a different cgroup whose path names a `.service` (the
-#     deepest one, so a service that delegates a sub-cgroup still counts), the
-#     pre-flight asks the SYSTEM manager (only it can be the parent of a PPID==1 service process)
-#     for that unit's MainPID and spares the process if it matches, or if the
-#     manager cannot be asked within 5s. An orphan left behind in some other
+#     For a process in a different cgroup, the pre-flight asks the SYSTEM
+#     manager (only it can be the parent of a PPID==1 service process) for the
+#     MainPID of EVERY `.service` named in its cgroup path (so a service that
+#     delegates a sub-cgroup, even one itself named `*.service`, still counts)
+#     and spares the process if any of them is this process, or if the manager
+#     cannot be asked within 5s. An orphan left behind in some other
 #     service's cgroup (e.g. started from cron), whose unit reports another
 #     MainPID or none (0), is still reaped. Under the system unit a leftover in
 #     this unit's own cgroup also has PPID 1 and is reaped. An unreadable /proc
@@ -552,7 +553,7 @@ Environment={fast_crash_marker}=1
 # (re-checking the comm first, so a recycled PID is not killed), then up to 5s
 # more for the kernel to release the port before ExecStart binds. Worst case is
 # ~50s plus up to 5s per MainPID query, which stays inside the TimeoutStartSec
-# set below unless more than a dozen candidates each need a query.
+# set below unless more than a dozen such queries are needed.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
@@ -567,8 +568,8 @@ Environment={fast_crash_marker}=1
 # here never blocks the start.
 {orphan_reap_preflight}
 ExecStart={binary} network
-# Bounds the whole start, ExecStartPre included. The orphan pre-flight above
-# can take ~50s. A start timeout fails the start and runs an unplanned
+# systemd applies this to ExecStartPre commands too, and the orphan pre-flight
+# above can take ~50s. A start timeout fails the start and runs an unplanned
 # ExecStopPost `freenet update` (an empty $EXIT_STATUS is not counted as a
 # crash), so leave headroom instead of relying on the distribution's
 # DefaultTimeoutStartSec.
@@ -778,8 +779,8 @@ Environment={fast_crash_marker}=1
 # cgroup, normally already killed by KillMode=control-group, is reaped.)
 {orphan_reap_preflight}
 ExecStart={binary} network
-# Bounds the whole start, ExecStartPre included. The orphan pre-flight above
-# can take ~50s. A start timeout fails the start and runs an unplanned
+# systemd applies this to ExecStartPre commands too, and the orphan pre-flight
+# above can take ~50s. A start timeout fails the start and runs an unplanned
 # ExecStopPost `freenet update` (an empty $EXIT_STATUS is not counted as a
 # crash), so leave headroom instead of relying on the distribution's
 # DefaultTimeoutStartSec.

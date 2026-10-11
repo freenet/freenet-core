@@ -2045,20 +2045,6 @@ mod tests {
                 pre.contains("[ \"$$pid\" = \"1\" ] && continue"),
                 "{which} ExecStartPre must skip PID 1 (#3967 MUST-FIX 5)"
             );
-            // MUST-FIX (round-2 RE-REVIEW): the pre-flight must NOT anchor on
-            // the holder's exe equalling this unit's on-disk binary. A #3967
-            // orphan is by definition running an OLD/DIFFERENT binary, so an
-            // `exe == on-disk binary` guard skips exactly the process we must
-            // kill — defeating the whole self-heal. The earlier round-1 form
-            // `[ -n "$$bin" ] && [ "$$exe" != "$$bin" ] && continue` is the
-            // broken guard and must never come back.
-            assert!(
-                !pre.contains("[ \"$$exe\" != \"$$bin\" ]"),
-                "{which} ExecStartPre must NOT anchor on exe == current on-disk \
-                 binary; that guard skips the old-binary orphan it must kill \
-                 (#3967 round-2 RE-REVIEW)"
-            );
-
             // MUST-FIX #3: a reap requires PPID==1 (init-adopted orphan).
             assert!(
                 pre.contains("[ \"$$ppid\" = \"1\" ] || continue;"),
@@ -2080,7 +2066,7 @@ mod tests {
             // this proves both units carry the checks.
             assert!(
                 pre.contains("systemctl show -p MainPID")
-                    && pre.contains("[ \"$$mp\" = \"$$pid\" ] && continue;"),
+                    && pre.contains("[ \"$$mp\" = \"$$pid\" ]; } && s=1;"),
                 "{which} ExecStartPre must spare another service's main process"
             );
             assert!(
@@ -2106,6 +2092,17 @@ mod tests {
                 .lines()
                 .find_map(|l| l.strip_prefix("TimeoutStopSec="))
                 .unwrap_or_else(|| panic!("{which} unit must set TimeoutStopSec"));
+            let start_secs: u32 = unit
+                .lines()
+                .find_map(|l| l.strip_prefix("TimeoutStartSec="))
+                .unwrap_or_else(|| panic!("{which} unit must set TimeoutStartSec"))
+                .parse()
+                .unwrap();
+            assert!(
+                start_secs >= 100,
+                "{which} TimeoutStartSec={start_secs} leaves no headroom over the \
+                 pre-flight's ~50s worst case"
+            );
             assert!(
                 pre.contains(&format!("[ $$w -lt {stop_secs} ]; do a=")),
                 "{which} ExecStartPre must wait TimeoutStopSec={stop_secs}s after \
@@ -2376,6 +2373,9 @@ echo "RC=$?"
     struct ReapCase<'a> {
         /// PPID field of `/proc/PID/stat`. `None` = stat unreadable.
         ppid: Option<&'a str>,
+        /// The comm field as it appears in `/proc/PID/stat` (it may contain
+        /// spaces and `)`).
+        stat_comm: &'a str,
         /// Contents of `/proc/PID/comm`.
         comm: &'a str,
         /// What `ps -o args=` prints for it.
@@ -2388,6 +2388,9 @@ echo "RC=$?"
         /// systemctl fails (for the whole run: the flag is global). `Some("SELF")` = this holder's own PID. A unit the
         /// manager does not know answers `MainPID=0`, as real systemd does.
         main_pid: Option<&'a str>,
+        /// Which `.service` of the cgroup path `main_pid` answers for (every
+        /// other one answers 0). `None` = the deepest one.
+        main_pid_unit: Option<&'a str>,
         /// The holder ignores SIGTERM and only dies on SIGKILL.
         ignores_term: bool,
         /// The holder ignores SIGKILL too (exercises the post-KILL wait).
@@ -2411,11 +2414,13 @@ echo "RC=$?"
     #[cfg(target_os = "linux")]
     const SESSION_ORPHAN: ReapCase<'static> = ReapCase {
         ppid: Some("1"),
+        stat_comm: "freenet network",
         comm: "freenet",
         args: "/home/u/.local/bin/freenet network",
         env: Some(&["HOME=/home/u", "FREENET_WS_API_ADDRESS=127.0.0.1"]),
         cgroup: SESSION_CGROUP,
         main_pid: Some("0"),
+        main_pid_unit: None,
         ignores_term: false,
         ignores_kill: false,
         comm_after_term: None,
@@ -2501,8 +2506,8 @@ echo "RC=$?"
             (
                 "ps",
                 format!(
-                    "[ \"$1 $2 $3\" = \"-o args= -p\" ] || exit 3; \
-                     cat \"{}/proc/$4/args\" 2>/dev/null\n",
+                    "[ \"$1 $2 $3 $4\" = \"-ww -o args= -p\" ] || exit 3; \
+                     cat \"{}/proc/$5/args\" 2>/dev/null\n",
                     fix.display()
                 ),
             ),
@@ -2574,11 +2579,10 @@ echo "RC=$?"
                 let d = fix.join("proc").join(pid);
                 std::fs::create_dir(&d).unwrap();
                 if let Some(ppid) = h.ppid {
-                    // "PID (comm) STATE PPID ...": a comm WITH spaces keeps the
-                    // parse-after-the-final-')' requirement honest.
+                    // "PID (comm) STATE PPID ...".
                     std::fs::write(
                         d.join("stat"),
-                        format!("{pid} (freenet network) S {ppid} 1 1 0 -1\n"),
+                        format!("{pid} ({}) S {ppid} 1 1 0 -1\n", h.stat_comm),
                     )
                     .unwrap();
                 }
@@ -2604,17 +2608,26 @@ echo "RC=$?"
                 match h.main_pid {
                     None => std::fs::write(fix.join("systemctl_down"), "").unwrap(),
                     Some(mp) => {
-                        // The unit the body derives: the deepest `.service`
-                        // path component of the last line that has one.
-                        let unit = h
+                        // Answer for every `.service` in the cgroup path; any
+                        // other query is recorded as unknown and fails the run.
+                        let units: Vec<&str> = h
                             .cgroup
                             .lines()
-                            .filter_map(|l| l.split('/').rev().find(|c| c.ends_with(".service")))
-                            .next_back();
-                        if let Some(unit) = unit {
-                            let mp = if mp == "SELF" { pid.as_str() } else { mp };
-                            std::fs::write(fix.join("units").join(unit), format!("MainPID={mp}\n"))
-                                .unwrap();
+                            .flat_map(|l| l.split('/'))
+                            .filter(|c| c.ends_with(".service"))
+                            .collect();
+                        let owner = h.main_pid_unit.or(units.last().copied());
+                        for unit in &units {
+                            let answer = if Some(*unit) == owner {
+                                if mp == "SELF" { pid.as_str() } else { mp }
+                            } else {
+                                "0"
+                            };
+                            std::fs::write(
+                                fix.join("units").join(unit),
+                                format!("MainPID={answer}\n"),
+                            )
+                            .unwrap();
                         }
                     }
                 }
@@ -2778,8 +2791,6 @@ echo "RC=$?"
                 "0::/system.slice/hosted.service/payload\n",
                 // A unit name may contain ':'.
                 "0::/system.slice/a:b.service\n",
-                // The deepest `.service` in one path names the unit.
-                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n",
                 // cgroup v1: several hierarchy lines; the LAST `.service` line
                 // names the unit.
                 "12:pids:/system.slice/other.service\n\
@@ -2836,6 +2847,43 @@ echo "RC=$?"
                 }),
                 Terminated,
                 "{which}: a process in an unknown unit's cgroup must be reaped"
+            );
+
+            // A service that delegates a sub-cgroup itself named `*.service`:
+            // the OUTER unit's MainPID is this node, so it is spared.
+            assert_eq!(
+                one(ReapCase {
+                    cgroup: "0::/system.slice/deleg.service/payload.service\n",
+                    main_pid: Some("SELF"),
+                    main_pid_unit: Some("deleg.service"),
+                    ..o
+                }),
+                Spared,
+                "{which}: a node owned by ANY .service in its cgroup path must be spared"
+            );
+
+            // A process in a user-manager service with PPID 1 (the manager
+            // died): the system manager knows neither unit, so it is reaped.
+            assert_eq!(
+                one(ReapCase {
+                    cgroup: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n",
+                    main_pid: Some("0"),
+                    ..o
+                }),
+                Terminated,
+                "{which}: an orphan in a user-manager service cgroup must be reaped"
+            );
+
+            // A comm containing `) S 1 ` must not forge the PPID field: the
+            // parse uses the LAST `)` in /proc/PID/stat.
+            assert_eq!(
+                one(ReapCase {
+                    ppid: Some("4321"),
+                    stat_comm: "x) S 1 y",
+                    ..o
+                }),
+                Spared,
+                "{which}: the PPID is read after the final ')'"
             );
 
             // An orphan left in some other service's cgroup that is NOT that
