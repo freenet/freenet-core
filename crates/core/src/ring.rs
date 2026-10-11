@@ -2156,11 +2156,11 @@ impl Ring {
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
-            // Aggregate on-disk usage gauges (#4683, #5007): logical state
-            // (delta-tracked) + the measured database file + WASM blobs +
-            // wasmtime compile cache + the measured webapp cache. `state` vs
-            // `db` is the pair that makes the #5007 under-count legible in
-            // central telemetry: their difference is the database's dead space.
+            // Aggregate on-disk usage gauges (#4683): state (delta-tracked) +
+            // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
+            // Plus two gauges reported but NOT in that sum (#5007, #5853): the
+            // measured database directory, whose difference from `state` is the
+            // database's dead space, and the unpacked-webapp cache.
             // `None` until the tracker is configured and seeded (early startup),
             // in which case the fields stay unset.
             let disk_usage = ring.hosting_manager.disk_usage_stats();
@@ -3748,15 +3748,17 @@ impl Ring {
             // hosting-cache write lock (the du-walks would stall cache readers).
             // First tick lazily seeds the tracker from the true on-disk state
             // total; every tick re-walks the four `du`-measured totals (WASM
-            // blobs, compile cache, the storage backend's database file and the
-            // webapp cache, #5007) so telemetry stays fresh. These feed live
-            // decisions since #4702: the eviction floor and the pre-write
-            // admission gate both read the aggregate.
+            // blobs, compile cache, the storage backend's database directory and
+            // the webapp cache, #5007) so telemetry stays fresh. The WASM and
+            // compile-cache totals feed live decisions since #4702 (the eviction
+            // floor and the pre-write admission gate read the aggregate); the
+            // database and webapp-cache measurements are reported only (#5853).
             //
             // The seed + refresh are synchronous, blocking disk I/O: recursive
             // `std::fs` walks of `contracts_dir`, the wasmtime cache dir and the
             // webapp cache plus a shallow walk of `db_dir` on every tick, plus a
-            // one-time sync redb `load_all_hosting_metadata` on the seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
+            // one-time sync redb `load_all_hosting_metadata` on the seeding
+            // tick. `contracts_dir` is unbounded and non-self-pruning, so
             // on a node hosting many contracts the walk can run for a while with
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline

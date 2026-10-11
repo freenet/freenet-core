@@ -561,17 +561,17 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_evicted_unread_age_secs_sum: Option<u64>,
     /// Aggregate on-disk usage gauges (#4683, #5007), populated by `Ring` from
     /// the `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
-    /// `hosting_disk_state_bytes` is the delta-tracked *logical* state total;
-    /// `hosting_disk_db_bytes` is the measured size of the storage backend's
-    /// database directory (their difference is the database's dead space, the
-    /// ~10x under-count #5007 fixed); `hosting_disk_wasm_bytes` is the
-    /// `du`-measured WASM-blob total; `hosting_disk_compile_cache_bytes` is the
-    /// relocated wasmtime compile-cache total; `hosting_disk_total_bytes` is
-    /// `max(state, db) + wasm + compile_cache` — the aggregate the disk budget
-    /// bounds. `hosting_disk_webapp_cache_bytes` is the unpacked-webapp cache,
-    /// reported but deliberately NOT part of the budgeted total (#5012 caps it
-    /// separately; see `ring/hosting/disk_usage.rs`). `None` until the tracker
-    /// is configured and seeded (early startup). Per-node aggregate scalars.
+    /// `hosting_disk_state_bytes` is the delta-tracked persisted-state total;
+    /// `hosting_disk_wasm_bytes` is the `du`-measured WASM-blob total;
+    /// `hosting_disk_compile_cache_bytes` is the relocated wasmtime compile-cache
+    /// total; `hosting_disk_total_bytes` is their sum, the aggregate the disk
+    /// budget bounds. Reported but NOT in that sum (#5007, #5853):
+    /// `hosting_disk_db_bytes`, the allocated size of the storage backend's
+    /// database directory (its difference from state is the database's dead
+    /// space, which made the sum under-count the footprint ~10x on a production
+    /// peer), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
+    /// cache. `None` until the tracker is configured and seeded (early
+    /// startup). Per-node aggregate scalars.
     pub hosting_disk_state_bytes: Option<u64>,
     pub hosting_disk_db_bytes: Option<u64>,
     pub hosting_disk_wasm_bytes: Option<u64>,

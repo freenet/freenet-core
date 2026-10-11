@@ -125,10 +125,8 @@ pub struct ConfigArgs {
     /// few GiB BELOW the disk budget. The disk budget is the smaller of
     /// `--hosting-disk-pct` of the space available to Freenet (Freenet's own
     /// usage plus free space) and `--max-hosting-disk` (default 32 GiB), and it
-    /// counts WASM code, the compile cache (up to about 512 MiB) and the
-    /// database file's unreclaimed free space as well as state, so the headroom
-    /// is for those. Free space inside the database file is given back by the
-    /// compaction that runs at startup. If this value is not at least that
+    /// counts WASM code and the compile cache (up to about 512 MiB) as well as
+    /// state, so the headroom is for those. If this value is not at least that
     /// far below the disk budget, the node can stop accepting new contracts
     /// and state growth instead of evicting to make room. For example, with
     /// 40 GiB available and default settings the disk budget is
@@ -149,10 +147,10 @@ pub struct ConfigArgs {
     // The "keep this below the disk budget" advice exists because eviction
     // compares STATE bytes against `min(this, disk_budget)` while the admission
     // gates (`admit_state_write` / `admit_state_update` / `admit_wasm_write`)
-    // refuse against `disk_budget` using max(state, database file) + WASM +
-    // compile cache (#5007). Whenever this value is within (WASM + compile
-    // cache + database dead space) of disk_budget, or above it, there is a
-    // band where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
+    // refuse against `disk_budget` using state + WASM + compile cache. Whenever
+    // this value is within (WASM + compile cache) of disk_budget, or above it,
+    // there is a band — state in (disk_budget - WASM - cache, min(this,
+    // disk_budget)] — where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
     // `--max-hosting-disk` flag, because `disk_budget = min(pct * (freenet_used
     // + free), cap)`: an operator giving "half the disk" at the default pct hits
     // the band via the pct term no matter how high the cap is set.
@@ -163,9 +161,8 @@ pub struct ConfigArgs {
 
     /// Fraction (0.0 to 1.0) of the disk space available to Freenet (Freenet's
     /// own usage plus the free space on the data-dir mount) used to size the
-    /// disk budget. The disk budget bounds the database file (contract state
-    /// plus its unreclaimed space), WASM code and the compile cache together,
-    /// and also caps
+    /// disk budget. The disk budget bounds contract state, WASM code and the
+    /// compile cache together (database overhead is extra), and also caps
     /// `--max-hosting-storage`, which should be kept a few GiB below it.
     /// Default: 0.5.
     // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
@@ -174,13 +171,12 @@ pub struct ConfigArgs {
 
     /// Upper limit in bytes on the disk budget, so a host with a very large
     /// data disk does not get an unbounded budget. It bounds contract state,
-    /// WASM code and the compile cache together, measured by the size of the
-    /// database file rather than only the state inside it.
+    /// WASM code and the compile cache together (database overhead is extra).
     /// To contribute more than about 32 GiB of state, raise this so the disk
     /// budget stays a few GiB above `--max-hosting-storage`. Raising it has no
     /// effect if `--hosting-disk-pct` of the available disk space is already the
-    /// smaller limit; raise that instead, leaving room for anything else on
-    /// the disk. Default: 32 GiB.
+    /// smaller limit; raise that instead, leaving room for database overhead
+    /// and anything else on the disk. Default: 32 GiB.
     // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
@@ -1753,9 +1749,6 @@ pub struct Config {
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
     /// This bounds tracked contract state only — WASM code blobs and ReDb/
     /// SQLite database overhead are additional and not counted against it.
-    /// The separate aggregate DISK budget (`hosting-disk-pct` /
-    /// `max-hosting-disk`) does count them, including the database file's own
-    /// footprint since #5007.
     ///
     /// The default is capability-relative (RAM-scaled): `clamp(total_ram / 8,
     /// 128 MiB, 1 GiB)`, so a memory-constrained host gets a proportionally

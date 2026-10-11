@@ -4083,7 +4083,7 @@ mod tests {
         info.hosting_disk_wasm_bytes = Some(409);
         info.hosting_disk_compile_cache_bytes = Some(419);
         info.hosting_disk_webapp_cache_bytes = Some(433);
-        info.hosting_disk_total_bytes = Some(1259);
+        info.hosting_disk_total_bytes = Some(1229);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_disk_state_bytes", 401),
@@ -4094,7 +4094,7 @@ mod tests {
             ("hosting_disk_wasm_bytes", 409),
             ("hosting_disk_compile_cache_bytes", 419),
             ("hosting_disk_webapp_cache_bytes", 433),
-            ("hosting_disk_total_bytes", 1259),
+            ("hosting_disk_total_bytes", 1229),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

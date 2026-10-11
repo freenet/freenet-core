@@ -364,11 +364,10 @@ fn try_acquire_cache_lock(
 /// the last 15-30 distinct webapps the user actually browsed — far more than a
 /// browsing session touches — while cutting >90% of the observed footprint.
 /// This LRU cap is the only thing that bounds these bytes. Since #5007
-/// `ring/hosting/disk_usage.rs` also measures and reports the cache, but it
-/// deliberately does NOT charge it against the hosting disk budget (hosting
-/// eviction has no lever on webapp entries, and the cache may sit on a different
-/// mount than the one the budget's free-space term measures) — see that module's
-/// "The webapp cache is reported, not budgeted".
+/// `ring/hosting/disk_usage.rs` also measures and reports the cache, but does
+/// NOT charge it against the hosting disk budget (#5853 tracks whether it
+/// should; hosting eviction has no lever on webapp entries, and the cache may
+/// sit on a different mount than the one the budget's free-space term measures).
 const WEBAPP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How long an entry is protected from eviction after this process last served

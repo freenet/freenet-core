@@ -2886,15 +2886,14 @@ mod tests {
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
             contracts: vec![mk_hosted_entry("A", false)],
-            // #5007: the database file is far bigger than the live rows — the
-            // gap is dead space, and `disk_total_bytes` is built on the file
-            // (100 MB), not the rows (40 MB).
+            // #5007: the database directory is far bigger than the live rows;
+            // the gap is dead space. It is reported, not part of the total.
             disk_state_bytes: Some(40 * 1024 * 1024),
             disk_db_bytes: Some(100 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
             disk_webapp_cache_bytes: Some(7 * 1024 * 1024),
-            disk_total_bytes: Some(125 * 1024 * 1024),
+            disk_total_bytes: Some(65 * 1024 * 1024),
             disk_budget_bytes: Some(500 * 1024 * 1024),
             ..Default::default()
         };
@@ -2904,36 +2903,33 @@ mod tests {
             "seeded snapshot must not show 'measuring…' — got:\n{html}"
         );
         assert!(
-            html.contains("125.0 MB"),
+            html.contains("65.0 MB"),
             "disk-used total tile — got:\n{html}"
         );
         assert!(html.contains("500.0 MB"), "disk-budget tile — got:\n{html}");
-        // Headroom = budget(500) - used(125) = 375 MB.
+        // Headroom = budget(500) - used(65) = 435 MB.
         assert!(
-            html.contains("375.0 MB"),
+            html.contains("435.0 MB"),
             "disk-headroom tile (budget - used) — got:\n{html}"
         );
         // Breakdown surfaced in the title tooltip.
         assert!(
-            html.contains("State (logical): 40.0 MB")
+            html.contains("State: 40.0 MB")
                 && html.contains("WASM: 20.0 MB")
                 && html.contains("Compile cache: 5.0 MB"),
             "per-component breakdown in tooltip — got:\n{html}"
         );
-        // #5007: the tooltip must separate the LOGICAL row total from the
-        // MEASURED database size and name the gap. That gap is the whole bug —
-        // an operator seeing only "state: 40 MB" against 125 MB of disk used
-        // has no way to tell where the rest went, or that a restart (startup
-        // compaction) is what reclaims it.
+        // #5007: the tooltip reports the measured database size and its dead
+        // space, and the webapp cache, marked as not counted in "disk used".
         assert!(
-            html.contains("Database file: 100.0 MB (dead space: 60.0 MB)"),
+            html.contains(
+                "not counted in disk used: database file: 100.0 MB (dead space: 60.0 MB)"
+            ),
             "tooltip must show the measured database size and its dead space — got:\n{html}"
         );
-        // And the webapp cache must be visible AND marked as excluded, so "disk
-        // used" not moving when it grows reads as deliberate.
         assert!(
-            html.contains("Webapp cache: 7.0 MB (not budgeted)"),
-            "tooltip must report the webapp cache and mark it unbudgeted — got:\n{html}"
+            html.contains("Webapp cache: 7.0 MB"),
+            "tooltip must report the webapp cache — got:\n{html}"
         );
         // The explanatory paragraph must name the pressures that can actually
         // trigger a sweep. It used to claim the floor was "min(RAM budget,

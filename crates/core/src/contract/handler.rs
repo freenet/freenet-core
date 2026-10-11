@@ -111,11 +111,11 @@ impl ContractHandler for NetworkContractHandler {
         // This must be done before loading the cache so evictions work correctly
         let storage = executor.state_store().inner().clone();
         op_manager.ring.set_hosting_storage(storage.clone());
-        // Aggregate disk-usage tracker paths (#4683, #5007). This is the ONLY
-        // place the tracker learns where the node's bytes live, so a directory
-        // missing here is a directory nothing measures, bounds, or reports —
-        // which is exactly how the database file's dead space and the whole
-        // webapp cache stayed invisible until #5007. Seeded lazily on the first
+        // Aggregate disk-usage tracker paths (#4683, #5007): the mode-resolved
+        // contracts dir (WASM blobs) and the relocated wasmtime compile-cache
+        // dir, which the disk budget counts, plus the database dir and the
+        // webapp cache, which are measured and reported only. This is the only
+        // place the tracker learns these paths. Seeded lazily on the first
         // sweep tick. Pinned by
         // `hosting_disk_paths_are_installed_from_the_node_config`.
         op_manager.ring.set_hosting_disk_paths(
@@ -1488,15 +1488,11 @@ pub mod test {
     /// Call-site pin: the disk-usage tracker must be installed with all four of
     /// the node's own directories (#4683, #5007).
     ///
-    /// This one call is the entire boundary between "measured" and "invisible".
     /// The tracker cannot walk a directory it was never given, so a field
-    /// dropped here — or wired to the wrong accessor — silently reproduces
-    /// exactly the two blind spots #5007 exists to close: a database whose dead
-    /// space nothing sees (~10x under-count on a production peer) and a webapp
-    /// cache nothing measures at all (1236 MiB on one machine). Both consumers
-    /// of the resulting figure, the `min(ram, disk)` eviction floor (#4683) and
-    /// the pre-write admission gate (#4702), then decide on a number that is an
-    /// order of magnitude wrong, and every other test in the tree stays green.
+    /// dropped here, or wired to the wrong accessor, silently reproduces the
+    /// blind spots #5007 closes (a database whose dead space nothing reports, a
+    /// webapp cache nothing measures), or mis-sizes the budgeted WASM and
+    /// compile-cache gauges, while every other test stays green.
     ///
     /// Nothing else can catch it. The `HostingDiskPaths` fields are all
     /// `PathBuf`, so the type system permits both omission (via struct-update
@@ -1544,15 +1540,14 @@ pub mod test {
                 concat!("config.ws_api.webapp_cache", "_dir"),
             ),
         ] {
+            // Field and accessor must be ADJACENT, so a transposition (two
+            // fields swapping accessors) fails here as well as an omission.
+            // Whitespace is already stripped from `args`.
+            let pair = format!("{field}{accessor}");
             assert!(
-                args.contains(field),
-                "the disk tracker must be installed with `{field}`; found \
-                 arguments `{args}`"
-            );
-            assert!(
-                args.contains(accessor),
-                "`{field}` must be resolved from the node's config via \
-                 `{accessor}`; found arguments `{args}`"
+                args.contains(&pair),
+                "the disk tracker must be installed with `{field}` resolved from \
+                 the node's config via `{accessor}`; found arguments `{args}`"
             );
         }
 
