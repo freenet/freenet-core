@@ -27,13 +27,14 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
     "args=$$(ps -o args= -p \"$$pid\" 2>/dev/null); ",
     "case \"$$args\" in \"\"|*--ws-api-port*|*--config-dir*) continue ;; esac; ",
+    "grep -qaE \"(^|[^A-Z_])(WS_API_PORT|CONFIG_DIR)=\" /proc/$$pid/environ 2>/dev/null && continue; ",
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
     "if [ \"$$cg\" != \"$$mycg\" ]; then ",
     "u=$$(echo \"$$cg\" | grep \"[.]service$$\" | tail -n 1); ",
     "if [ -n \"$$u\" ]; then ",
     "u=$${u##*/}; ",
-    "mp=$$(systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
+    "mp=$$(timeout 5 systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
     "[ -z \"$$mp\" ] && continue; ",
     "[ \"$$mp\" = \"$$pid\" ] && continue; ",
     "fi; ",
@@ -519,25 +520,32 @@ Environment={fast_crash_marker}=1
 #   * its comm (executable name) contains "freenet", so a `screen`/`tmux`
 #     server or a wrapper shell whose argv merely mentions "freenet network" is
 #     never killed.
-#   * its command line sets neither --ws-api-port nor --config-dir. A node
-#     started with either is a deliberately separate instance (a developer's
-#     test node, a second peer), not this unit's node; killing it on every
-#     start and every auto-update restart would be wrong. If such a node does
-#     hold this unit's port, the unit stands down via exit 43 as before.
+#   * neither its command line nor its environment sets the WS API port or
+#     the config dir (--ws-api-port / WS_API_PORT, --config-dir / CONFIG_DIR).
+#     A node started with either is a deliberately separate instance (a
+#     developer's test node, a second peer), not this unit's node; killing it
+#     on every start and every auto-update restart would be wrong. If such a
+#     node does hold this unit's port, the unit stands down via exit 43 as
+#     before.
 #   * it is not the main process of ANOTHER systemd service. Under the SYSTEM
 #     manager PID 1 forks a Type=simple service directly, so a healthy node
 #     supervised by the system unit (or by any other service) also has PPID 1.
 #     For a process in a different `.service` cgroup the pre-flight asks the
-#     system manager for that unit's MainPID and spares the process if it
-#     matches, or if the manager cannot be asked. An orphan left behind in
-#     some other service's cgroup (e.g. started from cron) is still reaped, and
-#     so is a leftover in this unit's own cgroup. An unreadable /proc entry
-#     means "skip": this path errs towards not killing.
+#     SYSTEM manager (only it can be the parent of a PPID==1 service process)
+#     for that unit's MainPID and spares the process if it matches, or if the
+#     manager cannot be asked within 5s. An orphan left behind in some other
+#     service's cgroup (e.g. started from cron), whose unit reports another
+#     MainPID or none (0), is still reaped. Under the system unit a leftover in
+#     this unit's own cgroup also has PPID 1 and is reaped. An unreadable /proc
+#     entry means "skip": this path errs towards not killing.
+# Known limit: on a desktop session the user manager is the child subreaper
+# for terminals it spawned, so a node orphaned there gets the manager, not
+# PID 1, as parent and is not reaped. #5187 was an SSH session (PPID 1).
 # Every victim gets SIGTERM, then up to 45s to exit (the same budget as
 # TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL
 # (re-checking the comm first, so a recycled PID is not killed), then up to 5s
 # more for the kernel to release the port before ExecStart binds. Worst case is
-# ~50s, inside the TimeoutStartSec set below.
+# ~50s plus up to 5s per MainPID query, inside the TimeoutStartSec set below.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
@@ -553,9 +561,10 @@ Environment={fast_crash_marker}=1
 {orphan_reap_preflight}
 ExecStart={binary} network
 # Bounds the whole start, ExecStartPre included. The orphan pre-flight above
-# can take ~50s; a start timeout would run ExecStopPost with an empty
-# $EXIT_STATUS that the rollback logic counts as a crash, so leave headroom
-# over that instead of relying on the distribution's DefaultTimeoutStartSec.
+# can take ~50s. A start timeout fails the start and runs an unplanned
+# ExecStopPost `freenet update` (an empty $EXIT_STATUS is not counted as a
+# crash), so leave headroom instead of relying on the distribution's
+# DefaultTimeoutStartSec.
 TimeoutStartSec=120
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
@@ -761,9 +770,10 @@ Environment={fast_crash_marker}=1
 {orphan_reap_preflight}
 ExecStart={binary} network
 # Bounds the whole start, ExecStartPre included. The orphan pre-flight above
-# can take ~50s; a start timeout would run ExecStopPost with an empty
-# $EXIT_STATUS that the rollback logic counts as a crash, so leave headroom
-# over that instead of relying on the distribution's DefaultTimeoutStartSec.
+# can take ~50s. A start timeout fails the start and runs an unplanned
+# ExecStopPost `freenet update` (an empty $EXIT_STATUS is not counted as a
+# crash), so leave headroom instead of relying on the distribution's
+# DefaultTimeoutStartSec.
 TimeoutStartSec=120
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual

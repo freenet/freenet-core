@@ -2379,13 +2379,20 @@ echo "RC=$?"
         comm: &'a str,
         /// What `ps -o args=` prints for it.
         args: &'a str,
+        /// Its environment, one `NAME=value` per entry.
+        env: &'a [&'a str],
         /// Contents of `/proc/PID/cgroup`.
         cgroup: &'a str,
         /// What `systemctl show -p MainPID <unit of cgroup>` answers. `None` =
-        /// systemctl fails. `Some("SELF")` = this holder's own PID.
+        /// systemctl fails. `Some("SELF")` = this holder's own PID. A unit the
+        /// manager does not know answers `MainPID=0`, as real systemd does.
         main_pid: Option<&'a str>,
         /// The holder ignores SIGTERM and only dies on SIGKILL.
         ignores_term: bool,
+        /// The holder ignores SIGKILL too (exercises the post-KILL wait).
+        ignores_kill: bool,
+        /// After SIGTERM its PID is reused by a process with this comm.
+        comm_after_term: Option<&'a str>,
     }
 
     #[cfg(target_os = "linux")]
@@ -2403,9 +2410,12 @@ echo "RC=$?"
         ppid: Some("1"),
         comm: "freenet",
         args: "/home/u/.local/bin/freenet network",
+        env: &["HOME=/home/u", "FREENET_WS_API_ADDRESS=127.0.0.1"],
         cgroup: SESSION_CGROUP,
         main_pid: Some("0"),
         ignores_term: false,
+        ignores_kill: false,
+        comm_after_term: None,
     };
 
     /// What the reaper did to a holder.
@@ -2430,14 +2440,14 @@ echo "RC=$?"
     /// tree, and `kill`/`sleep` are shell functions (functions beat the
     /// builtins) that record signals per PID and make the wait loops instant.
     /// `run(own_cgroup, holders)` gives holder `i` the PID `4242 + i` and
-    /// reports what happened to each.
+    /// reports what happened to each, plus how many 1s sleeps the body took.
     ///
     /// Linux-only because the unit generators are `#[cfg(target_os = "linux")]`.
     #[cfg(target_os = "linux")]
     fn systemd_heal_harness(
         dir: &std::path::Path,
         system_unit: bool,
-    ) -> impl Fn(&str, &[ReapCase<'_>]) -> Vec<Reaped> {
+    ) -> impl Fn(&str, &[ReapCase<'_>]) -> (Vec<Reaped>, usize) {
         use std::os::unix::fs::PermissionsExt;
 
         let log_dir = dir.join("logs");
@@ -2483,15 +2493,18 @@ echo "RC=$?"
                     fix.display()
                 ),
             ),
-            // systemctl show -p MainPID UNIT
+            // systemctl show -p MainPID UNIT (system manager only: a
+            // `--user` query is not expected and fails the shim).
             (
                 "systemctl",
                 format!(
-                    "for a in \"$@\"; do u=\"$a\"; done; f=\"{}/units/$u\"; \
-                     [ -f \"$f\" ] || exit 1; cat \"$f\"\n",
-                    fix.display()
+                    "for a in \"$@\"; do [ \"$a\" = --user ] && exit 2; u=\"$a\"; done; \
+                     [ -f \"{f}/systemctl_down\" ] && exit 1; \
+                     cat \"{f}/units/$u\" 2>/dev/null || echo MainPID=0\n",
+                    f = fix.display()
                 ),
             ),
+            ("timeout", "shift\nexec \"$@\"\n".to_string()),
         ] {
             let p = bin.join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{src}")).unwrap();
@@ -2506,19 +2519,21 @@ echo "RC=$?"
                 "#!/bin/sh\nkill() {{ sig=\"\"; case \"$1\" in -*) sig=\"$1\"; shift;; esac; \
                  s=\"{fixd}/sig/$1\"; \
                  case \"$sig\" in \
-                 -0) [ -f \"$s.KILL\" ] && return 1; \
+                 -0) [ -f \"$s.KILL\" ] && [ ! -f \"{fixd}/proc/$1/ignores_kill\" ] && return 1; \
                  [ -f \"$s.TERM\" ] && [ ! -f \"{fixd}/proc/$1/ignores_term\" ] && return 1; \
                  return 0;; \
-                 -TERM|-15) : > \"$s.TERM\"; return 0;; \
+                 -TERM|-15) : > \"$s.TERM\"; \
+                 [ -f \"{fixd}/proc/$1/comm_after_term\" ] && \
+                 cp \"{fixd}/proc/$1/comm_after_term\" \"{fixd}/proc/$1/comm\"; return 0;; \
                  -KILL|-9) : > \"$s.KILL\"; return 0;; \
                  *) return 0;; esac; }}\n\
-                 sleep() {{ :; }}\n{body}\n"
+                 sleep() {{ echo >> \"{fixd}/sleeps\"; }}\n{body}\n"
             ),
         )
         .unwrap();
         let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
-        move |own_cgroup: &str, holders: &[ReapCase<'_>]| -> Vec<Reaped> {
+        move |own_cgroup: &str, holders: &[ReapCase<'_>]| -> (Vec<Reaped>, usize) {
             std::fs::remove_dir_all(&fix).ok();
             for sub in ["proc", "sig", "units"] {
                 std::fs::create_dir_all(fix.join(sub)).unwrap();
@@ -2540,21 +2555,34 @@ echo "RC=$?"
                 }
                 std::fs::write(d.join("comm"), format!("{}\n", h.comm)).unwrap();
                 std::fs::write(d.join("args"), format!("{}\n", h.args)).unwrap();
+                let environ: String = h.env.iter().map(|e| format!("{e}\0")).collect();
+                std::fs::write(d.join("environ"), environ).unwrap();
                 std::fs::write(d.join("cgroup"), h.cgroup).unwrap();
                 if h.ignores_term {
                     std::fs::write(d.join("ignores_term"), "").unwrap();
                 }
-                if let Some(mp) = h.main_pid {
-                    let unit = h
-                        .cgroup
-                        .lines()
-                        .filter(|l| l.ends_with(".service"))
-                        .last()
-                        .and_then(|l| l.rsplit('/').next());
-                    if let Some(unit) = unit {
-                        let mp = if mp == "SELF" { pid.as_str() } else { mp };
-                        std::fs::write(fix.join("units").join(unit), format!("MainPID={mp}\n"))
-                            .unwrap();
+                if h.ignores_kill {
+                    std::fs::write(d.join("ignores_kill"), "").unwrap();
+                }
+                if let Some(comm) = h.comm_after_term {
+                    std::fs::write(d.join("comm_after_term"), format!("{comm}\n")).unwrap();
+                }
+                match h.main_pid {
+                    None => std::fs::write(fix.join("systemctl_down"), "").unwrap(),
+                    Some(mp) => {
+                        // The unit the body derives: the LAST line ending in
+                        // `.service`, its last path component.
+                        let unit = h
+                            .cgroup
+                            .lines()
+                            .rev()
+                            .find(|l| l.ends_with(".service"))
+                            .and_then(|l| l.rsplit('/').next());
+                        if let Some(unit) = unit {
+                            let mp = if mp == "SELF" { pid.as_str() } else { mp };
+                            std::fs::write(fix.join("units").join(unit), format!("MainPID={mp}\n"))
+                                .unwrap();
+                        }
                     }
                 }
             }
@@ -2568,7 +2596,11 @@ echo "RC=$?"
                 "pre-flight body exited non-zero: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            pids.iter()
+            let sleeps = std::fs::read_to_string(fix.join("sleeps"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            let reaped = pids
+                .iter()
                 .map(|pid| {
                     let s = fix.join("sig").join(pid);
                     match (
@@ -2581,7 +2613,8 @@ echo "RC=$?"
                         (false, true) => panic!("SIGKILL without a preceding SIGTERM"),
                     }
                 })
-                .collect()
+                .collect();
+            (reaped, sleeps)
         }
     }
 
@@ -2600,7 +2633,7 @@ echo "RC=$?"
             };
             let tmp = tempfile::tempdir().unwrap();
             let run = systemd_heal_harness(tmp.path(), system_unit);
-            let one = |case: ReapCase<'_>| run(own, &[case]).remove(0);
+            let one = |case: ReapCase<'_>| run(own, &[case]).0.remove(0);
             let o = SESSION_ORPHAN;
 
             assert_eq!(
@@ -2642,17 +2675,32 @@ echo "RC=$?"
                     "{which}: `{args}` is a separate instance and must not be killed"
                 );
             }
+            for env in [
+                &["A=1", "WS_API_PORT=7801"][..],
+                &["CONFIG_DIR=/srv/p2"][..],
+            ] {
+                assert_eq!(
+                    one(ReapCase { env, ..o }),
+                    Spared,
+                    "{which}: a node configured by {env:?} is a separate instance"
+                );
+            }
 
             // The OTHER unit's live node, and any other service's main
             // process. Under the system manager a healthy Type=simple node has
             // PPID 1, so only the cgroup + MainPID tell it apart.
-            for cgroup in [
-                other,
+            let mut service_cgroups = vec![
                 "0::/system.slice/freenet-hosted.service\n",
-                // cgroup v1: several hierarchy lines.
-                "12:pids:/system.slice/freenet.service\n\
+                // cgroup v1: several hierarchy lines; the LAST `.service` line
+                // names the unit.
+                "12:pids:/system.slice/other.service\n\
                  1:name=systemd:/system.slice/freenet.service\n",
-            ] {
+            ];
+            if !system_unit {
+                // The system unit's own live node, seen from the user unit.
+                service_cgroups.push(other);
+            }
+            for cgroup in service_cgroups {
                 assert_eq!(
                     one(ReapCase {
                         cgroup,
@@ -2675,6 +2723,32 @@ echo "RC=$?"
                 );
             }
 
+            // The USER unit's live node, seen from the system unit: the user
+            // manager is its parent, so PPID alone spares it.
+            if system_unit {
+                assert_eq!(
+                    one(ReapCase {
+                        ppid: Some("1376"),
+                        cgroup: other,
+                        ..o
+                    }),
+                    Spared,
+                    "system: the user unit's node (parented by the user manager) must be spared"
+                );
+            }
+
+            // A PPID==1 process in a cgroup whose unit the system manager does
+            // not know (MainPID=0) is not anyone's main process: reaped.
+            assert_eq!(
+                one(ReapCase {
+                    cgroup: "0::/system.slice/gone.service\n",
+                    main_pid: Some("0"),
+                    ..o
+                }),
+                Terminated,
+                "{which}: a process in an unknown unit's cgroup must be reaped"
+            );
+
             // An orphan left in some other service's cgroup that is NOT that
             // service's main process (e.g. `@reboot nohup freenet network &`
             // from cron) is still the #3967 case and is reaped.
@@ -2692,7 +2766,7 @@ echo "RC=$?"
             assert_eq!(
                 one(ReapCase {
                     cgroup: own,
-                    main_pid: None,
+                    main_pid: Some("0"),
                     ..o
                 }),
                 Terminated,
@@ -2703,7 +2777,7 @@ echo "RC=$?"
             assert_eq!(
                 one(ReapCase {
                     cgroup: "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n",
-                    main_pid: None,
+                    main_pid: Some("0"),
                     ..o
                 }),
                 Terminated,
@@ -2727,14 +2801,46 @@ echo "RC=$?"
                 "{which}: an unreadable command line must not lead to a kill"
             );
 
-            // A holder that ignores SIGTERM for the whole wait gets SIGKILL.
+            // A holder that exits on SIGTERM costs no wait at all.
+            assert_eq!(run(own, &[o]), (vec![Terminated], 0));
+
+            // A holder that ignores SIGTERM gets the full 45s grace (the unit's
+            // TimeoutStopSec), then SIGKILL; it dies at once, so no settle wait.
+            assert_eq!(
+                run(
+                    own,
+                    &[ReapCase {
+                        ignores_term: true,
+                        ..o
+                    }]
+                ),
+                (vec![Killed], 45),
+                "{which}: SIGTERM, 45s grace, then SIGKILL"
+            );
+            // One that survives SIGKILL too gets the 5s settle wait, then the
+            // pre-flight gives up and lets ExecStart report it.
+            assert_eq!(
+                run(
+                    own,
+                    &[ReapCase {
+                        ignores_term: true,
+                        ignores_kill: true,
+                        ..o
+                    }]
+                ),
+                (vec![Killed], 50),
+                "{which}: the post-SIGKILL wait is bounded at 5s"
+            );
+            // Its PID reused by something else during the grace period: no
+            // SIGKILL for the newcomer.
             assert_eq!(
                 one(ReapCase {
                     ignores_term: true,
+                    comm_after_term: Some("bash"),
                     ..o
                 }),
-                Killed,
-                "{which}: a holder that ignores SIGTERM must be escalated to SIGKILL"
+                Terminated,
+                "{which}: a recycled PID must not get SIGKILL"
             );
 
             // Several holders at once: each is decided on its own, and the
@@ -2759,7 +2865,7 @@ echo "RC=$?"
                         },
                     ]
                 ),
-                vec![Terminated, Spared, Killed, Spared],
+                (vec![Terminated, Spared, Killed, Spared], 45),
                 "{which}: mixed holders must each get their own decision"
             );
         }
@@ -2779,7 +2885,7 @@ echo "RC=$?"
         let tmp = tempfile::tempdir().unwrap();
         let run = systemd_heal_harness(tmp.path(), false);
         assert_eq!(
-            run(USER_UNIT_CGROUP, &[SESSION_ORPHAN]),
+            run(USER_UNIT_CGROUP, &[SESSION_ORPHAN]).0,
             vec![Reaped::Terminated],
             "systemd self-heal must reap a same-version PPID==1 orphan; sparing \
              it wedges the unit into success-but-dead / unsupervised mode (#5187)"
