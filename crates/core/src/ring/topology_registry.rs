@@ -334,7 +334,7 @@ pub fn record_stranded_recovery(peer_addr: SocketAddr) {
 
 /// Record a stranded-holder recovery refused by the receiving-side limits
 /// (#5846), under its cause: an empty token bucket, or anything that is not a
-/// rate (a busy slot, or a pair in its deadline backoff). No-op outside a
+/// rate (a busy slot, or a pair in its failed-fetch backoff). No-op outside a
 /// simulation context (no current network name).
 pub fn record_stranded_recovery_refused(
     peer_addr: SocketAddr,
@@ -350,7 +350,7 @@ pub fn record_stranded_recovery_refused(
             Refusal::SlotsBusy
             | Refusal::RequesterBusy
             | Refusal::ContractBusy
-            | Refusal::RecentlyTimedOut
+            | Refusal::RecentlyFailed
             | Refusal::AlreadyFetching => entry.stranded_recoveries_refused_busy += 1,
         }
     }

@@ -2471,32 +2471,11 @@ async fn recover_from_stranded_requester(
     // `decide` only passes a connected requester.
     let requester = requester?;
 
-    use crate::ring::stranded_recovery::{FETCH_DEADLINE, Refusal};
+    use crate::ring::stranded_recovery::FETCH_DEADLINE;
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     let limiter = &op_manager.ring.stranded_recovery_limiter;
     let fetch_slot = match limiter.try_admit(upstream_addr, instance_id) {
         Ok(slot) => slot,
-        Err(Refusal::AlreadyFetching) => {
-            // The requester gave up on an earlier attempt while our fetch of the
-            // same state kept running. Wait for that fetch rather than answer
-            // NotFound, which would send it on to pull the state again at
-            // another neighbour. The original attempt's driver finishes the
-            // host formation; this one only answers the retry.
-            tracing::info!(
-                tx = %incoming_tx,
-                %instance_id,
-                requester = %upstream_addr,
-                "SUBSCRIBE: stranded-holder recovery already fetching for this requester; waiting"
-            );
-            return super::wait_for_contract_with_timeout(
-                op_manager,
-                instance_id,
-                FETCH_DEADLINE.as_millis() as u64,
-            )
-            .await
-            .ok()
-            .flatten();
-        }
         Err(refusal) => {
             tracing::info!(
                 tx = %incoming_tx,
@@ -2517,15 +2496,21 @@ async fn recover_from_stranded_requester(
     // a large state can take longer than `CONTRACT_WAIT_TIMEOUT_MS`, and giving
     // up early would leave the GET to finish in the background, host the copy
     // with no downstream, and send the holder on to pull it again from its next
-    // neighbour. The fetch task holds `fetch_slot` and is cancelled at
-    // `FETCH_DEADLINE`; the outer timeout below is only a backstop for a
-    // wedged task.
-    let started = tokio::time::Instant::now();
+    // neighbour. The fetch task holds `fetch_slot`, is cancelled at
+    // `FETCH_DEADLINE`, and records a failure (the pair's backoff) before it
+    // releases the slot, so no retry slips in between; the outer timeout below
+    // is only a backstop for a wedged task.
+    let failure_limiter = op_manager.ring.stranded_recovery_limiter.clone();
     let (_get_tx, outcome_rx) = crate::operations::get::op_ctx_task::start_pinned_sub_op_get(
         op_manager,
         instance_id,
         requester,
         FETCH_DEADLINE,
+        move |found| {
+            if !found {
+                failure_limiter.record_failed_fetch(upstream_addr, instance_id);
+            }
+        },
         fetch_slot,
     );
     let outcome = tokio::time::timeout(FETCH_DEADLINE + Duration::from_secs(10), outcome_rx).await;
@@ -2540,17 +2525,15 @@ async fn recover_from_stranded_requester(
                 Err(err) => (None, Some("store_lookup"), err.to_string()),
             }
         }
-        Ok(Ok(SubOpGetOutcome::NotFound(cause))) if started.elapsed() >= FETCH_DEADLINE => {
-            (None, Some("deadline"), cause)
-        }
         Ok(Ok(SubOpGetOutcome::NotFound(cause))) => (None, Some("not_found"), cause),
         Ok(Ok(SubOpGetOutcome::Infra(err))) => (None, Some("infra"), err.to_string()),
         Ok(Err(_)) => (None, Some("task_lost"), String::new()),
-        Err(_) => (None, Some("deadline"), "backstop".to_string()),
+        Err(_) => (None, Some("backstop"), String::new()),
     };
-    if failure == Some("deadline") {
-        // The sender keeps sending after we cancel; do not ask it again soon.
-        limiter.record_deadline(upstream_addr, instance_id);
+    if key.is_none() {
+        // Found by the GET but not in the store (the task counted it as found),
+        // or no outcome at all: back off here too.
+        limiter.record_failed_fetch(upstream_addr, instance_id);
     }
     let result = if key.is_some() {
         "recovered"
@@ -3733,10 +3716,11 @@ mod tests {
         let squashed: String = recover.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             squashed.contains(
-                "start_pinned_sub_op_get(op_manager,instance_id,requester,FETCH_DEADLINE,fetch_slot,)"
+                "FETCH_DEADLINE,move|found|{if!found{failure_limiter.record_failed_fetch(upstream_addr,instance_id);}},fetch_slot,)"
             ),
             "the fetch slot must be moved into the fetch task, so it lives exactly as \
-             long as the fetch"
+             long as the fetch, and a failed fetch must record its backoff from \
+             inside the task, before the slot is released"
         );
         assert!(
             recover.contains("send_standalone_event(\n        \"stranded_recovery\""),

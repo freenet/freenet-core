@@ -1491,9 +1491,9 @@ async fn drive_get_with_assembly_retry(
     driver: &mut GetRetryDriver<'_>,
     emit_route_failure_on_retry: bool,
     // Hosting attribution for the streamed store this wrapper performs. Both the
-    // client driver and the sub-op driver use this wrapper, and the stream store
-    // is unconditionally `is_client_requester = true`, so the flag cannot tell
-    // them apart — the caller names itself instead. Telemetry only.
+    // client driver and the sub-op driver use this wrapper, so the caller names
+    // itself. It also decides the store's `is_client_requester`: only
+    // `ClientGet` marks local client access (#5846).
     cause: crate::ring::HostingCause,
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
@@ -1930,10 +1930,9 @@ fn stored_state_and_code_match(
 ///    cache too (`get.rs:2278, 2370`).
 ///
 /// `cause` names WHY this store may begin hosting (client GET, relay transit,
-/// or a sub-op fetch). It is TELEMETRY ONLY and is threaded from the call site
-/// because only the call site knows which driver it is: `is_client_requester`
-/// cannot stand in for it, since the streaming originator path passes `true`
-/// for BOTH the client and the sub-op driver.
+/// or a sub-op fetch). Here it is telemetry only, threaded from the call site
+/// because only the call site knows which driver it is (the streamed path
+/// derives `is_client_requester` from it; see `assemble_and_cache_stream`).
 // NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
 // peer stores a contract because a GET routed through it, and a routed GET is a
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
@@ -2388,7 +2387,7 @@ async fn assemble_and_cache_stream(
     // marking it would make every large fetch look like local demand: renewed
     // and kept from cost eviction for no one (#5846). Its inline path already
     // passes `false`.
-    let is_client_requester = !matches!(cause, crate::ring::HostingCause::SubOpGet);
+    let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);
     let state_stored = cache_contract_locally(
         op_manager,
         payload.key,
@@ -2756,9 +2755,11 @@ pub(crate) fn start_targeted_sub_op_get(
 /// (#5846), which pulls state back from the subscribe's requester. A routed
 /// fallback there would only send futile GETs into the empty key region.
 ///
-/// The whole fetch, streaming included, is cancelled at `deadline`, and
-/// `keep_alive` (the caller's fetch slot) is dropped only when the task ends,
-/// so a slot can never be freed while its fetch still runs.
+/// The whole fetch, streaming included, is cancelled at `deadline`.
+/// `on_done(found)` runs when the fetch ends, before the outcome is sent and
+/// before `keep_alive` (the caller's fetch slot) is dropped, so whatever it
+/// records is in place before the slot can be reused; the slot is never freed
+/// while its fetch still runs.
 ///
 /// "Nobody else" holds for this node's retry loop. Two narrow exceptions: if
 /// `target` stops being a routing candidate before the attempt (disconnects,
@@ -2772,6 +2773,7 @@ pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
     instance_id: ContractInstanceId,
     target: PeerKeyLocation,
     deadline: std::time::Duration,
+    on_done: impl FnOnce(bool) + Send + 'static,
     keep_alive: G,
 ) -> (Transaction, tokio::sync::oneshot::Receiver<SubOpGetOutcome>) {
     let op_manager = Arc::new(op_manager.clone());
@@ -2794,6 +2796,7 @@ pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
                 SubOpGetOutcome::NotFound(format!("pinned fetch exceeded {}s", deadline.as_secs()))
             }
         };
+        on_done(matches!(outcome, SubOpGetOutcome::Found(_)));
         // Receiver drop is acceptable: the caller may have given up.
         #[allow(clippy::let_underscore_must_use)]
         let _ = out_tx.send(outcome);
@@ -8486,10 +8489,10 @@ mod tests {
 
     /// The `client_driver`-side callsite (drive_client_get_inner's
     /// InlineFound arm) must pass `true`. Streaming assembly
-    /// (`assemble_and_cache_stream`) also must pass `true` — the stream
-    /// is only claimed by the client driver.
+    /// (`assemble_and_cache_stream`) serves both the client driver and the
+    /// sub-op driver, so it passes `true` only for a client GET (#5846).
     #[test]
-    fn client_driver_and_streaming_callsites_pass_is_client_requester_true() {
+    fn client_driver_and_streaming_callsites_mark_client_access_only_for_a_client() {
         let src = production_source();
         // Client driver InlineFound arm.
         let drive_body = extract_fn_body(src, "async fn drive_client_get_inner(");
@@ -8528,9 +8531,9 @@ mod tests {
         );
         assert!(
             stream_body.contains(
-                "let is_client_requester = !matches!(cause, crate::ring::HostingCause::SubOpGet);"
+                "let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);"
             ),
-            "only a sub-op GET's streamed store may skip the local-client-access mark"
+            "only a client GET's streamed store may mark local client access"
         );
     }
 
@@ -12299,12 +12302,18 @@ mod route_attempt_driver_tests {
         );
         let slot = Arc::new(());
         let held = Arc::downgrade(&slot);
+        let done: Arc<parking_lot::Mutex<Option<(bool, bool)>>> = Arc::default();
+        let seen_done = done.clone();
+        let held_at_done = held.clone();
         let deadline = std::time::Duration::from_secs(5);
         let (_tx, outcome) = start_pinned_sub_op_get(
             &op_manager,
             ContractInstanceId::new([91u8; 32]),
             target,
             deadline,
+            move |found| {
+                *seen_done.lock() = Some((found, held_at_done.upgrade().is_some()));
+            },
             slot,
         );
 
@@ -12323,6 +12332,12 @@ mod route_attempt_driver_tests {
         assert!(
             held.upgrade().is_none(),
             "the slot is released when the fetch ends"
+        );
+        assert_eq!(
+            *done.lock(),
+            Some((false, true)),
+            "on_done reports the failure while the slot is still held, so what it \
+             records is in place before the slot can be reused"
         );
     }
 
@@ -12365,6 +12380,7 @@ mod route_attempt_driver_tests {
             instance_id,
             target,
             std::time::Duration::from_secs(120),
+            |_| {},
             (),
         );
         let outcome = outcome.await.expect("the fetch reports an outcome");
