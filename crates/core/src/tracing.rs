@@ -36,12 +36,18 @@ use crate::node::OpManager;
 /// An append-only log for network events.
 mod aof;
 
+pub(crate) use aof::reclaim_orphaned_event_log;
+
 /// Event aggregation across multiple nodes for debugging and testing.
 pub mod event_aggregator;
 
 /// Telemetry reporting to central collector.
 pub mod telemetry;
 pub use telemetry::TelemetryReporter;
+
+/// Standards-configured OpenTelemetry SDK metrics pipeline. Strictly isolated
+/// from `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
+pub mod otel;
 
 /// Automatic state verification through telemetry linearization.
 pub mod state_verifier;
@@ -95,8 +101,8 @@ pub(crate) use register::{
 pub use register::{EventFlushHandle, NetLogMessage};
 // NEW_RECORDS_TS is needed by metrics_client's opentelemetry_tracer
 pub(crate) use event_kind::{
-    ConnectEvent, GetEvent, GetTerminalOutcome, PutEvent, StreamAbortCause, SubscribeEvent,
-    UpdateEvent,
+    ConnectEvent, GetEvent, GetExhaustionReason, GetTerminalOutcome, PutEvent, StreamAbortCause,
+    SubscribeEvent, UpdateEvent,
 };
 pub use event_kind::{
     ConnectionType, DisconnectReason, EventKind, HostingStoppedReason, InterestSyncEvent,
@@ -503,9 +509,17 @@ pub struct ClientGetOutcomeSummary {
     /// `requests_sent` (attempts >= 1) with no network round-trip, so
     /// classifying by `attempts` over-counts those loopback completions as
     /// network successes (#4852 P2).
+    ///
+    /// Known bias in the other direction: `GetMsg::ResponseStreaming` carries
+    /// no hop count, so a streamed (> 64 KB) success always has
+    /// `hop_count == None` and lands in `local_successes`. This count
+    /// therefore UNDER-reports network successes where large contracts
+    /// dominate (#5471).
     pub network_successes: u64,
     /// Subset of `successes` served locally with no forward network hop
-    /// (`hop_count` None or 0) — includes loopback local completions.
+    /// (`hop_count` None or 0) — includes loopback local completions and,
+    /// per the caveat on `network_successes`, streamed successes that did
+    /// traverse the network but carry no hop count (#5471).
     pub local_successes: u64,
 }
 
@@ -812,6 +826,7 @@ mod get_outcome_summary_tests {
                 fragments_received: None,
                 total_fragments: None,
                 stream_abort_cause: None,
+                exhaustion_reason: None,
                 elapsed_ms: 10,
                 timestamp: 100,
             }),
@@ -962,6 +977,7 @@ mod get_outcome_summary_tests {
                 fragments_received: None,
                 total_fragments: None,
                 stream_abort_cause: None,
+                exhaustion_reason: None,
                 elapsed_ms: 10,
                 timestamp: 100,
             }),

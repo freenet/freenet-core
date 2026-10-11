@@ -144,6 +144,7 @@ impl<R> MemoryEventsGen<R> {
             notification_channel,
             token: None,
             origin_contract: None,
+            connection_scope: ConnectionScope::Local,
             user_context: None,
         }
         .into_owned()

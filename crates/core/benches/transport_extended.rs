@@ -141,7 +141,7 @@ pub fn bench_high_latency_sustained(c: &mut Criterion) {
                         // Send from A to B
                         let send_result = conn_a.send(message).await;
                         let sent_ok = match send_result {
-                            Ok(()) => true,
+                            Ok(_bytes_sent) => true,
                             Err(e) => {
                                 eprintln!("sustained send failed: {:?}", e);
                                 false

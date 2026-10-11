@@ -51,10 +51,14 @@ pub enum DeserializationFmt {
 #[derive(clap::Parser, Clone)]
 #[clap(name = "Freenet Local Development Node Environment")]
 #[clap(author = "The Freenet Project Inc.")]
+// The group members are clap *arg ids*, which the derive takes verbatim from the
+// Rust field names. They are not the kebab-cased `--long` spellings: naming those
+// here made clap treat them as nested groups, fail to find any, and panic out of
+// `Command::unroll_args_in_group` on every invocation including `--help` (#5362).
 #[clap(group(
     ArgGroup::new("output")
         .required(true)
-        .args(&["output-file", "terminal-output"])
+        .args(["output_file", "terminal_output"])
 ))]
 pub struct ExecutorConfig {
     /// Cleanups all state which was created locally during execution

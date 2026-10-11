@@ -79,6 +79,15 @@
 <a id="same-origin-link" href="page2.html">In-contract page 2</a>
 
 <!--
+  Same-origin link to a page with NO <title> element at all
+  (fixture-webapp/no-title.html). Locks in title_sync.js's documented choice
+  to leave the tab on the PREVIOUS page's title rather than resetting it —
+  see the comment on that fixture and on the `if (!title || ...)` guard in
+  path_handlers/assets/title_sync.js.
+-->
+<a id="no-title-link" href="no-title.html">In-contract page with no title</a>
+
+<!--
   Download link. The interceptor must NOT intercept links carrying a
   `download` attribute; `handleAnchorClick` early-returns on `download`
   (path_handlers.rs:2013), so no open_url / navigate postMessage is sent and

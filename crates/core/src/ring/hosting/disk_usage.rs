@@ -646,7 +646,12 @@ impl DiskUsageTracker {
 /// directory (not yet created) or an unreadable entry contributes 0 rather than
 /// erroring — the refresh path is best-effort telemetry, unlike the fail-loud
 /// state seed.
-fn du_walk(dir: &Path) -> u64 {
+///
+/// `pub(crate)` (re-exported as `ring::disk_directory_size_bytes`, #5014) so
+/// the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`) can
+/// measure a prior run's cache directory without duplicating this walk.
+pub(crate) fn du_walk(dir: &Path) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {

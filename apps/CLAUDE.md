@@ -1,50 +1,24 @@
 # Freenet Applications
 
-## Trigger-Action Rules
+## WHEN creating a new app
 
-### WHEN creating a new app
+Follow `freenet-ping/`'s layout (`app/`, `contracts/`, `types/`): define the
+interface in `types/` first, implement contract logic in `contracts/`, then
+build with `cargo run -p fdev -- build`.
 
-```
-1. Create directory structure:
-   app-name/
-   ├── app/          # Application binary
-   ├── contracts/    # WASM contracts
-   └── types/        # Shared type definitions
-
-2. Define interface first in types/
-3. Implement contract logic in contracts/
-4. Build with: cargo run -p fdev -- build
-```
-
-### WHEN building contracts
-
-```
-cargo run -p fdev -- build
-```
-
-### WHEN testing an app
+## WHEN testing an app
 
 ```
 Need quick local test?
   → cargo run -p fdev -- test --gateways 1 --nodes 3 single-process
 
 Need realistic network test?
-  → cargo run -p fdev -- test --gateways 1 --nodes 5 multi-process
+  → cargo run -p fdev -- test --gateways 1 --nodes 5 network
 ```
 
-### WHEN deploying
+## WHEN deploying
 
-```
-1. Build: cargo run -p fdev -- build
-2. Test locally first
-3. See https://freenet.org/resources/manual/ for publishing
-```
-
-## Available Apps
-
-| App | Purpose | Use as reference for |
-|-----|---------|---------------------|
-| `freenet-ping/` | Pub-sub demo | Simple contract + CLI |
-
+Build (`cargo run -p fdev -- build`), test locally, then see
+https://freenet.org/resources/manual/ for publishing.
 
 > **Note:** `freenet-email-app` has been extracted to its own repo: https://github.com/freenet/freenet-email

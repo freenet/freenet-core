@@ -56,6 +56,8 @@ pub(super) fn install_service(system: bool) -> Result<()> {
     println!("Freenet will start automatically when you log in.");
     println!("A system tray icon will appear with status and controls.");
 
+    super::super::url_handler::register_for_install();
+
     Ok(())
 }
 
@@ -119,6 +121,8 @@ pub(super) fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> R
     stop_and_remove_service(system)?;
 
     println!("Freenet autostart uninstalled.");
+
+    super::super::url_handler::unregister_for_uninstall();
 
     if super::purge::should_purge(purge, keep_data)? {
         super::purge::purge_data_dirs(false)?;

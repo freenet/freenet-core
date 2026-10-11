@@ -1,0 +1,17 @@
+[package]
+name = "test-contract-conformance"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+trace = ["freenet-stdlib/trace"]

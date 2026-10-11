@@ -7,6 +7,13 @@ mod cache;
 mod contract;
 mod contract_metering;
 mod execution_handling;
+// Gated because every test in it installs a `tracing` capture, and
+// `tracing_subscriber` is only a dependency under `trace`. Gating the module
+// rather than each test keeps its shared fixture from becoming dead code in a
+// build without the feature. CI always has it (the test job passes
+// `--features trace,...`).
+#[cfg(feature = "trace")]
+mod host_clock;
 mod time;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -50,6 +57,44 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .with_extension("wasm");
     info!("output file: {output_file:?}");
     Ok(std::fs::read(output_file)?)
+}
+
+/// Append a WASM custom section carrying `tag`, yielding a module that is
+/// byte-distinct (so it compiles to its own `Module` with its own code memory)
+/// but semantically identical to `code`.
+///
+/// Custom sections are `id=0` followed by a LEB128 payload length; the payload
+/// is a name (LEB128 length + bytes) plus arbitrary data, and they may appear
+/// after any other section.
+///
+/// Tests that need N genuinely different modules must go through this. Varying
+/// the PARAMETERS no longer produces distinct compiled modules — that
+/// duplication is exactly what #5268 removed — so a byte-eviction test built on
+/// distinct params would pass while measuring nothing.
+pub(crate) fn code_variant(code: &[u8], tag: &str) -> Vec<u8> {
+    fn leb128(mut value: u32, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    let name = b"freenet-test-variant";
+    let mut payload = Vec::new();
+    leb128(name.len() as u32, &mut payload);
+    payload.extend_from_slice(name);
+    payload.extend_from_slice(tag.as_bytes());
+
+    let mut out = code.to_vec();
+    out.push(0x00); // custom section id
+    leb128(payload.len() as u32, &mut out);
+    out.extend_from_slice(&payload);
+    out
 }
 
 pub(crate) struct TestSetup {

@@ -780,17 +780,68 @@ impl P2pConnManager {
         }
         #[cfg(feature = "simulation_tests")]
         {
-            super::super::broadcast_queue::broadcast_to_single_peer(
-                &self.bridge,
-                op_manager,
-                key,
-                new_state,
-                target,
-                None,
-                super::super::broadcast_queue::no_fanout(),
-            )
-            .await;
+            // #5842: the same per-pair spacing as the fan-out. Production gets
+            // it from the shared queue; here a heal that would land inside the
+            // interval is handed to the held-legs timer instead.
+            let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
+            match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(_claim) => {
+                    super::super::broadcast_queue::broadcast_to_single_peer(
+                        &self.bridge,
+                        op_manager,
+                        key,
+                        new_state,
+                        target,
+                        None,
+                        super::super::broadcast_queue::no_fanout(),
+                    )
+                    .await;
+                }
+                Err(wait) => {
+                    crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
+                    let held = crate::operations::update::BroadcastTargetResult {
+                        targets: vec![target],
+                        proximity_found: 0,
+                        proximity_resolve_failed: 0,
+                        interest_found: 0,
+                        interest_resolve_failed: 0,
+                        skipped_self: 0,
+                        skipped_sender: 0,
+                        skipped_covered: 0,
+                    };
+                    GlobalExecutor::spawn(Self::broadcast_held_legs(
+                        self.bridge.clone(),
+                        op_manager.clone(),
+                        key,
+                        new_state,
+                        held,
+                        wait,
+                    ));
+                }
+            }
         }
+    }
+
+    #[cfg(feature = "simulation_tests")]
+    /// The timer half of the simulation fan-out's #5842 spacing: wait, then
+    /// run the fan-out for the legs it held back.
+    ///
+    /// A plain `fn` returning a boxed `Send` future on purpose. Spawning
+    /// `broadcast_state_to_peers` from inside itself would make its own future
+    /// type part of its body, and the compiler cannot then prove it `Send`;
+    /// this concrete boxed type breaks that cycle.
+    fn broadcast_held_legs(
+        bridge: P2pBridge,
+        op_manager: Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        held: crate::operations::update::BroadcastTargetResult,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            tokio::time::sleep(wait).await;
+            Self::broadcast_state_to_peers(bridge, &op_manager, key, new_state, held).await;
+        })
     }
 
     /// Send state change broadcasts to interested peers.
@@ -856,6 +907,18 @@ impl P2pConnManager {
         // `Summaries` handler's per-message MAX_STALENESS_PROBES_PER_SUMMARIES
         // cap (see `broadcast_queue::fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
+        // The state+summary snapshot full-state legs send (#5842), read at most
+        // once per fan-out and only if some leg needs it.
+        let mut full_state_snapshot: Option<
+            Option<(
+                freenet_stdlib::prelude::WrappedState,
+                freenet_stdlib::prelude::StateSummary<'static>,
+            )>,
+        > = None;
+        // Targets this contract was broadcast to too recently (#5842), and the
+        // longest any of them must still wait. Sent by a timer below.
+        let mut held: Vec<crate::ring::PeerKeyLocation> = Vec::new();
+        let mut held_for = Duration::ZERO;
 
         for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
@@ -863,6 +926,25 @@ impl P2pConnManager {
             };
 
             let peer_key = PeerKey::from(target.pub_key().clone());
+
+            // #5842: the same per-(contract, peer) spacing the production queue
+            // applies in `drain_lane`. Sending inside it gets the second
+            // broadcast dropped by the receiver's rate limiter.
+            //
+            // The claim is held across the awaits below (snapshot, delta, send)
+            // and released at the end of this iteration, which stamps the pair:
+            // a held-legs task or another fan-out cannot start a second send to
+            // it meanwhile, and the interval runs from the end of this one. Like
+            // production, a converged skip still counts as a send.
+            let _claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(claim) => claim,
+                Err(wait) => {
+                    crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
+                    held.push(target.clone());
+                    held_for = held_for.max(wait);
+                    continue;
+                }
+            };
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -962,6 +1044,35 @@ impl P2pConnManager {
                 ),
             };
 
+            // #5842: a full-state payload and the summary sent and cached with
+            // it must describe the same state. See the production twin in
+            // `broadcast_queue::broadcast_to_single_peer` for why `new_state`
+            // plus the summary read above can disagree. One snapshot serves
+            // every full-state leg of this fan-out.
+            let (payload, sent_summary) = match payload {
+                crate::message::DeltaOrFullState::FullState(_) => {
+                    if full_state_snapshot.is_none() {
+                        full_state_snapshot = Some(
+                            super::super::broadcast_queue::get_contract_snapshot(op_manager, &key)
+                                .await,
+                        );
+                    }
+                    match full_state_snapshot.as_ref().and_then(Option::as_ref) {
+                        Some((state, summary)) => (
+                            crate::message::DeltaOrFullState::FullState(state.as_ref().to_vec()),
+                            Some(summary.clone()),
+                        ),
+                        None => (
+                            crate::message::DeltaOrFullState::FullState(
+                                new_state.as_ref().to_vec(),
+                            ),
+                            None,
+                        ),
+                    }
+                }
+                delta @ crate::message::DeltaOrFullState::Delta(_) => (delta, our_summary.clone()),
+            };
+
             // Save payload size before moving it into the message
             let payload_size = payload.size();
 
@@ -973,7 +1084,7 @@ impl P2pConnManager {
                 );
 
             let send_result = if use_streaming {
-                let sender_summary_bytes = our_summary
+                let sender_summary_bytes = sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default();
@@ -1044,7 +1155,7 @@ impl P2pConnManager {
                     Ok(()) => {
                         // The metadata message went out; the streamed full state is
                         // the actual payload. The success arm below caches
-                        // `our_summary` for this peer (FIX 1 of #4145), which is only
+                        // `sent_summary` for this peer (FIX 1 of #4145), which is only
                         // correct if the STATE was sent — so this branch's result must
                         // reflect the stream send, not just the metadata send. If
                         // `send_stream` fails, a streamed full state that never landed
@@ -1082,7 +1193,7 @@ impl P2pConnManager {
                         id: update_tx,
                         key,
                         payload,
-                        sender_summary_bytes: our_summary
+                        sender_summary_bytes: sent_summary
                             .as_ref()
                             .map(|s| s.as_ref().to_vec())
                             .unwrap_or_default(),
@@ -1093,7 +1204,7 @@ impl P2pConnManager {
                         key,
                         payload,
                         // Include our summary so peer doesn't echo back
-                        sender_summary_bytes: our_summary
+                        sender_summary_bytes: sent_summary
                             .as_ref()
                             .map(|s| s.as_ref().to_vec())
                             .unwrap_or_default(),
@@ -1120,10 +1231,10 @@ impl P2pConnManager {
                     op_manager
                         .interest_manager
                         .record_delta_send(new_state.size(), payload_size);
-                    crate::config::GlobalTestMetrics::record_delta_send();
+                    crate::config::GlobalTestMetrics::record_delta_send(payload_size);
                 } else {
                     op_manager.interest_manager.record_full_state_send();
-                    crate::config::GlobalTestMetrics::record_full_state_send();
+                    crate::config::GlobalTestMetrics::record_full_state_send(payload_size);
                 }
 
                 // Issue #3046: Refresh the peer's interest TTL on every successful
@@ -1167,7 +1278,7 @@ impl P2pConnManager {
                 // #4952: upsert so the sim path mirrors production
                 // (`record_delivery_to_interest`) — an untracked co-host must
                 // escape full state after one delivered broadcast in sims too.
-                if let Some(summary) = &our_summary {
+                if let Some(summary) = &sent_summary {
                     op_manager.interest_manager.upsert_peer_summary_from(
                         &key,
                         &peer_key,
@@ -1176,6 +1287,35 @@ impl P2pConnManager {
                     );
                 }
             }
+        }
+
+        // #5842: send the held legs once their spacing has passed, whether or
+        // not anything else happens in the meantime. The re-run reads the
+        // CURRENT state (the delta arm diffs the store, the full-state arm takes
+        // a snapshot), so a held leg carries the newest state when it goes, and
+        // it re-checks the spacing in case another fan-out sent to the peer
+        // first.
+        if !held.is_empty() {
+            let deferred = crate::operations::update::BroadcastTargetResult {
+                targets: held,
+                proximity_found: 0,
+                proximity_resolve_failed: 0,
+                interest_found: 0,
+                interest_resolve_failed: 0,
+                skipped_self: 0,
+                skipped_sender: 0,
+                skipped_covered: 0,
+            };
+            // A short-lived timer task, like the no-target retry above; it
+            // ends after one fan-out, so it is not registered with a monitor.
+            GlobalExecutor::spawn(Self::broadcast_held_legs(
+                bridge.clone(),
+                op_manager.clone(),
+                key,
+                new_state.clone(),
+                deferred,
+                held_for,
+            ));
         }
 
         // Emit broadcast emitted telemetry (issue #3622)

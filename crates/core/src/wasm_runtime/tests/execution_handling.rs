@@ -1,7 +1,11 @@
 //! Tests for WASM execution handling edge cases.
 //!
-//! These tests verify the behavior of the sync polling loop in `handle_execution_call`,
-//! including timeout handling, panic recovery, and store management.
+//! These tests exercise a SIMULATED wait loop (`simulate_execution_polling`),
+//! covering timeout handling, panic recovery, and store management in the
+//! abstract. They do not call production code. The real wait,
+//! `execute_wasm_blocking` in `engine/wasmtime_engine.rs`, no longer polls: it
+//! waits on a channel and wakes on completion. Its behaviour is pinned by the
+//! stub-job tests in that file's test module.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -285,47 +289,6 @@ fn test_store_lost_on_timeout() {
 
     // Store is lost because we didn't join the thread
     assert!(store_lost.load(Ordering::SeqCst));
-}
-
-// =============================================================================
-// Polling Interval Tests
-// =============================================================================
-
-#[test]
-fn test_polling_does_not_spin() {
-    let poll_count = Arc::new(AtomicU32::new(0));
-    let poll_count_clone = poll_count.clone();
-
-    // Thread that takes 100ms
-    let handle = thread::spawn(move || -> Result<i64, &'static str> {
-        thread::sleep(Duration::from_millis(100));
-        Ok(42)
-    });
-
-    let timeout = Duration::from_millis(500);
-    let start = Instant::now();
-
-    loop {
-        poll_count_clone.fetch_add(1, Ordering::SeqCst);
-        if handle.is_finished() {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            panic!("Should not timeout");
-        }
-        thread::sleep(Duration::from_millis(10)); // 10ms sleep between polls
-    }
-
-    let _join = handle.join();
-
-    // With 10ms polling interval and 100ms execution, we should have ~10-15 polls
-    // (not hundreds or thousands which would indicate spinning)
-    let polls = poll_count.load(Ordering::SeqCst);
-    assert!(
-        (5..=20).contains(&polls),
-        "Expected 5-20 polls, got {}",
-        polls
-    );
 }
 
 // =============================================================================

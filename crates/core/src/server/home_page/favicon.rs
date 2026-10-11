@@ -16,11 +16,11 @@ use super::*;
 pub fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     // Color is pre-encoded for data URI (# → %23) to avoid scanning the entire SVG.
     let color = match snap {
-        None => "%239e9e9e",                              // grey — starting up
-        Some(s) if s.open_connections > 0 => "%230abab5", // teal — connected
-        Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "%238b0000", // dark red — NAT problems
-        Some(s) if !s.failures.is_empty() => "%23f44336", // red — connection issues
-        Some(_) => "%23fbbf24",                           // amber — connecting
+        None => "%239e9e9e",                                   // grey — starting up
+        Some(s) if s.open_connections > 0 => "%230abab5",      // teal — connected
+        Some(s) if s.nat_stats.looks_blocked() => "%238b0000", // dark red — NAT problems
+        Some(s) if !s.failures.is_empty() => "%23f44336",      // red — connection issues
+        Some(_) => "%23fbbf24",                                // amber — connecting
     };
 
     format!(
@@ -52,8 +52,7 @@ pub fn build_dashboard_title(snap: &Option<network_status::NetworkStatusSnapshot
     match snap {
         Some(s) if s.open_connections > 0 => format!("({}) Dashboard", s.open_connections),
         Some(s)
-            if s.health == network_status::HealthLevel::Trouble
-                || (s.nat_stats.attempts > 0 && s.nat_stats.successes == 0) =>
+            if s.health == network_status::HealthLevel::Trouble || s.nat_stats.looks_blocked() =>
         {
             "\u{26A0} Dashboard".to_string()
         }

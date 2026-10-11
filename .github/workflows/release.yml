@@ -49,6 +49,77 @@ jobs:
             echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
           fi
 
+      # The crates.io credential is checked HERE, in the first job, because the
+      # publish that needs it now runs at the very END of the pipeline -- after
+      # the bump PR, the tag, ~30 minutes of cross-compilation and macOS
+      # notarization, and Gate A. Discovering a missing token at that point
+      # costs the whole run and a tag, which is F3's shape reappearing one step
+      # further down. Fail before anything has been created.
+      #
+      # PRESENCE ONLY. Deliberately no live-validity probe -- do NOT add one.
+      #
+      # #5342 added exactly that: a probe of `https://crates.io/api/v1/me` with
+      # the token in an `Authorization` header, treating 401/403 as "expired,
+      # revoked, or lacks publish scope" and exiting 1. It fired unconditionally
+      # and blocked EVERY release, including the 0.2.128 cut, because
+      # `/api/v1/me` is a session-COOKIE endpoint that never accepts API tokens
+      # at all. Measured directly against crates.io:
+      #
+      #   /api/v1/me  with a VALID token   -> HTTP 403
+      #   /api/v1/me  with NO auth header  -> HTTP 403
+      #   body: {"errors":[{"detail":"this action can only be performed on the
+      #          crates.io website"}]}
+      #
+      # So the probe could not distinguish a good token from a bad one from no
+      # token at all: a gate no input could turn green.
+      #
+      # And there is no replacement endpoint. Every read endpoint on the API was
+      # measured with a valid token ("good") and an invalid one ("bad"):
+      #
+      #   /api/v1/me                     good=403 bad=403
+      #   /api/v1/me/updates             good=403 bad=403
+      #   /api/v1/me/tokens              good=403 bad=403
+      #   /api/v1/tokens                 good=404 bad=404
+      #   /api/v1/me/crates              good=404 bad=404
+      #   /api/v1/crates/freenet/owners  good=200 bad=200   <- PUBLIC endpoint
+      #   /api/private/session           good=405 bad=405
+      #
+      # NONE discriminates. In particular do not "fix" this by switching to
+      # `/api/v1/crates/<crate>/owners`: it answers 200 for an invalid token and
+      # for no auth, which is the same defect inverted -- a gate no input can
+      # turn RED, which is worse, because it reports success it never checked.
+      #
+      # What that costs us, stated plainly: a token that is PRESENT but expired
+      # or wrong-scope is no longer detected here. It surfaces at the publish
+      # step, which under the #5342 ordering is after Gate A and after the full
+      # build -- expensive, and exactly the cost the probe was meant to avoid.
+      # That is a real loss. It is strictly better than a gate that blocks every
+      # release, and until crates.io exposes a token-authenticated read endpoint
+      # there is no third option. `cargo publish` itself is the only operation
+      # that validates the credential, and it is not idempotent, so it cannot be
+      # run as a probe.
+      #
+      # The remaining check is still worth its place: a missing secret is the
+      # common real failure (an unset or rotated-away repo secret), it is
+      # deterministic, and it costs nothing to catch here.
+      #
+      # Sibling, same shape, already correct: cross-compile.yml's "Check the
+      # crates.io credential is present" is presence-only for these reasons.
+      #
+      # Pinned by scripts/release_canary_wiring_test.sh (assertion 2b-quater),
+      # which fails if a validity probe is re-added or the refusal is removed.
+      - name: Verify the crates.io token before anything is created
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error title=CARGO_REGISTRY_TOKEN not set::The crates.io publish runs at the END of the release (in cross-compile.yml, after Gate A), so without this secret the release would fail after the tag, the binaries and ~30 minutes of cross-compilation. Set the CARGO_REGISTRY_TOKEN repo secret and re-run. See AGENTS.md and docs/RELEASING.md."
+            exit 1
+          fi
+          echo "✅ CARGO_REGISTRY_TOKEN is present. Its live validity is NOT checked here; see the comment above this step for why crates.io offers no endpoint that could."
+
       - name: Resolve + validate version
         id: validate
         run: |
@@ -224,6 +295,11 @@ jobs:
       actions: read
       contents: read
       pull-requests: read
+    # The single immutable commit the rest of the pipeline builds, publishes
+    # and tags. Everything downstream MUST check this out explicitly instead of
+    # re-resolving `main`, which moves while this job waits (#5233).
+    outputs:
+      release_sha: ${{ steps.release_sha.outputs.sha }}
 
     steps:
       - name: Checkout code
@@ -238,73 +314,109 @@ jobs:
           PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
         run: scripts/wait_for_release_pr.sh
 
-  publish_crates:
-    name: Publish to crates.io
+      - name: Resolve the release commit
+        id: release_sha
+        env:
+          # Same least-privilege rationale as the waiter above: read-only PR and
+          # compare lookups that emit no workflow-triggering event.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only lookup
+          PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
+          LAUNCH_SHA: ${{ github.sha }}
+        run: scripts/resolve_release_sha.sh
+
+  # The crates.io publish itself does NOT happen here. It happens in
+  # cross-compile.yml's `attach-to-release` job, AFTER the blocking auto-update
+  # pre-flight canary (Gate A, #5222) has passed. This job keeps only the
+  # reversible half.
+  #
+  # WHY THE PUBLISH MOVED (#5288 / the 0.2.124 loss). The order used to be
+  # publish-to-crates.io -> tag -> build -> Gate A -> un-draft, so the one step
+  # that can never be undone ran before the gate that decides whether to ship at
+  # all. When Gate A blocked v0.2.124, its crates were already on crates.io and
+  # its GitHub release could only ever stay a draft: the version number was
+  # spent, and 0.2.125 had to be cut in its place. Under the new order a Gate A
+  # block costs a TAG, which is deletable, and a re-run instead of a release.
+  #
+  # What stays here is the DRY RUN, which is not irreversible and which fails
+  # early -- before the tag is pushed and before ~an hour of cross-compilation
+  # and macOS notarization. It catches the packaging class of break (a
+  # `include_str!` path outside the crate, #4240) at the cheapest point.
+  #
+  # freenet only. `cargo publish --dry-run -p fdev` resolves `freenet` from the
+  # REGISTRY (crates/fdev/Cargo.toml carries `version = "0.2.x"` next to the
+  # path dep), so it cannot succeed until this release's freenet is actually
+  # published -- which now happens in cross-compile.yml. Attempting it here
+  # would fail every release for a reason that is not a bug.
+  verify_publishable:
+    name: Verify crates are publishable (dry run)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [validate, wait_for_pr]
     if: always() && (needs.wait_for_pr.result == 'success' || inputs.dry_run)
+    env:
+      # NEVER `ref: main` here — see #5233. The `|| github.sha` fallback is not
+      # a convenience: an empty `ref:` makes actions/checkout default to the
+      # branch, which would reinstate the bug. It is reachable only on the
+      # dry-run-with-failed-wait path, and it is NOT benign there — the launch
+      # commit predates the version bump, so the verifier below aborts on
+      # purpose rather than dry-running the wrong tree.
+      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
 
-      - name: Pull latest changes
-        run: git pull origin main
+      - name: Verify the checkout is the validated release commit
+        run: bash scripts/verify_release_checkout.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
 
-      - name: Publish freenet to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # No CARGO_REGISTRY_TOKEN here on purpose: a dry run does not upload, and
+      # this job must not be able to publish even by accident. The real publish
+      # lives in cross-compile.yml's `attach-to-release`, downstream of Gate A,
+      # and that is the only place the token belongs.
+      - name: Verify freenet packages cleanly (dry run)
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "📦 [DRY RUN] Verifying freenet ${{ needs.validate.outputs.version }} can be published to crates.io..."
-            cargo publish -p freenet --dry-run
-            echo "✅ freenet dry-run successful (would publish)"
-          else
-            echo "📦 Publishing freenet ${{ needs.validate.outputs.version }} to crates.io..."
-            cargo publish -p freenet
-            echo "✅ freenet published successfully"
-          fi
-
-      - name: Wait for crates.io propagation
-        if: ${{ !inputs.dry_run }}
-        run: |
-          echo "⏳ Waiting 30s for crates.io to propagate..."
-          sleep 30
-
-      - name: Publish fdev to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "📦 [DRY RUN] Verifying fdev ${{ needs.validate.outputs.fdev_version }} can be published to crates.io..."
-            cargo publish -p fdev --dry-run
-            echo "✅ fdev dry-run successful (would publish)"
-          else
-            echo "📦 Publishing fdev ${{ needs.validate.outputs.fdev_version }} to crates.io..."
-            cargo publish -p fdev
-            echo "✅ fdev published successfully"
-          fi
+          echo "📦 [DRY RUN] Verifying freenet ${{ needs.validate.outputs.version }} can be published to crates.io..."
+          cargo publish -p freenet --dry-run
+          echo "✅ freenet dry-run successful (the real publish runs after Gate A, in cross-compile.yml)"
 
   create_release:
     name: Create GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [validate, publish_crates]
-    if: always() && (needs.publish_crates.result == 'success' || inputs.dry_run)
+    # `wait_for_pr` is in `needs` only to carry `release_sha` through; the
+    # ordering it implies is already enforced via `verify_publishable`.
+    needs: [validate, wait_for_pr, verify_publishable]
+    if: always() && (needs.verify_publishable.result == 'success' || inputs.dry_run)
+    env:
+      # The tag MUST land on the same commit that was published to crates.io.
+      # `ref: main` here meant the tag could point at a tree nobody validated
+      # and that no published artifact was built from (#5233).
+      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
           fetch-depth: 0
           # `token:` is what `git push` uses later in this job to push the
           # `v$VERSION` tag. The tag push MUST use RELEASE_PAT (when set)
@@ -313,8 +425,8 @@ jobs:
           # anti-recursion safeguard (same root cause as #4118).
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull latest changes
-        run: git pull origin main
+      - name: Verify the checkout is the validated release commit
+        run: bash scripts/verify_release_checkout.sh
 
       - name: Generate release notes
         id: release_notes
@@ -333,9 +445,13 @@ jobs:
             NOTES="Release $VERSION"
           else
             # Generate notes using GitHub's API
+            # The tag does not exist yet at this point, so `target_commitish`
+            # decides which commits the notes describe. Pin it to the commit
+            # actually being released, not to `main` — otherwise the notes can
+            # describe commits that are not in the release (#5233).
             NOTES=$(gh api repos/:owner/:repo/releases/generate-notes \
               -f tag_name="v$VERSION" \
-              -f target_commitish=main \
+              -f target_commitish="$RELEASE_SHA" \
               -f previous_tag_name="$PREV_VERSION" \
               --jq '.body')
           fi
@@ -372,7 +488,10 @@ jobs:
             --title "v$VERSION" \
             --notes-file "${{ steps.release_notes.outputs.notes_file }}" \
             --draft
-          echo "✅ Created draft GitHub release v$VERSION (will be published after binaries are attached)"
+          echo "✅ Created draft GitHub release v$VERSION"
+          echo "   cross-compile.yml now: attaches binaries -> runs Gate A -> publishes to"
+          echo "   crates.io -> un-drafts. Nothing irreversible has happened yet; if Gate A"
+          echo "   blocks, delete this tag and re-cut rather than burning the version."
 
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
@@ -394,11 +513,18 @@ jobs:
     steps:
       - name: Release completed
         run: |
-          echo "🎉 Release ${{ needs.validate.outputs.version }} completed!"
+          echo "🎉 Release ${{ needs.validate.outputs.version }} is cut and tagged."
           echo
-          echo "Summary:"
-          echo "  - freenet ${{ needs.validate.outputs.version }} published to crates.io"
-          echo "  - fdev ${{ needs.validate.outputs.fdev_version }} published to crates.io"
-          echo "  - GitHub release created: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
-          echo "  - Cross-compilation workflow will run automatically"
+          echo "Done here:"
+          echo "  - version bump merged, tag v${{ needs.validate.outputs.version }} pushed"
+          echo "  - DRAFT GitHub release created: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
+          echo
+          echo "Still to happen, in cross-compile.yml (triggered by the tag):"
+          echo "  - cross-compile + attach binaries"
+          echo "  - Gate A: auto-update pre-flight on the binary about to ship (BLOCKING)"
+          echo "  - publish freenet ${{ needs.validate.outputs.version }} and fdev ${{ needs.validate.outputs.fdev_version }} to crates.io"
+          echo "  - un-draft the release, which fires the downstream cascade"
+          echo
+          echo "The crates.io publish is deliberately downstream of Gate A: until it runs,"
+          echo "nothing about this release is irreversible."
           echo "  - Binaries will be attached when workflow completes"

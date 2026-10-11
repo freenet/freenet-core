@@ -217,6 +217,8 @@ impl StreamHandle {
             bytes_read: 0,
             auto_reclaim: false,
             listener: None,
+            #[cfg(test)]
+            before_rearmed_listener_poll: None,
         }
     }
 
@@ -266,6 +268,8 @@ impl StreamHandle {
             bytes_read: 0,
             auto_reclaim: true,
             listener: None,
+            #[cfg(test)]
+            before_rearmed_listener_poll: None,
         }
     }
 
@@ -475,6 +479,9 @@ pub struct StreamingInboundStream {
     /// Uses the buffer's `event_listener::Event` which is fired by every
     /// `buffer.insert()` — independent of which handle called `push_fragment`.
     listener: Option<Pin<Box<EventListener>>>,
+    /// Inject an arrival after the re-armed listener's buffer check, before its poll.
+    #[cfg(test)]
+    before_rearmed_listener_poll: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StreamingInboundStream {
@@ -533,10 +540,43 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(None); // Stream complete
         }
 
-        // If the stream has enough data but this fragment slot is empty, we're done.
-        // The overflow slot (allocated for potential metadata overhead in fragment #1)
-        // may not be used when fragment #1 has full payload capacity.
-        if self.handle.buffer.is_complete() && self.handle.buffer.get(next_idx).is_none() {
+        // If every advertised byte has been yielded and this fragment slot is
+        // empty, we're done. The overflow slot (allocated for potential metadata
+        // overhead in fragment #1) may not be used when fragment #1 has full
+        // payload capacity, so it can stay empty forever.
+        //
+        // `is_complete()` alone is NOT sufficient to end the stream: it is
+        // `contiguous >= min_complete_fragments`, the BASE fragment count. When
+        // the sender embeds metadata in fragment #1 (fix #2757) that fragment
+        // carries a reduced payload, so the sender emits `base + 1` fragments —
+        // and `is_complete()` therefore fires one fragment EARLY, while the
+        // final overflow fragment is still in flight. Ending here on that signal
+        // truncates the stream: `pipe_stream` (the relay forwarding path, see
+        // `outbound_stream.rs`) stops forwarding short of the
+        // `total_length_bytes` it advertised, and the downstream peer waits in
+        // `assemble()` for a fragment that will never be sent until its
+        // inactivity timeout fires.
+        //
+        // The byte count is the discriminator, exactly as in `assemble()` (which
+        // keeps waiting when `is_complete()` is true but the assembled length is
+        // short). They consume the same buffer and must reach the same
+        // conclusion about when a stream has ended.
+        //
+        // Scope, precisely: this brings the two paths into agreement at THIS
+        // exit. The `next_idx > total_fragments` exit above is still unguarded,
+        // and a sender that filled every `base + 1` slot with short payloads
+        // would leave through it with `bytes_read < total_bytes` — where
+        // `assemble()` returns `None` (a failure) but this returns
+        // `Ready(None)` (a success), and `pipe_stream` reports a successful
+        // transfer with a short byte count. No conforming sender does that:
+        // `send_stream` fragments `stream_to_send` exactly. Tracked as #5445,
+        // which is where the guard that would make the agreement universal
+        // belongs — it is a production behaviour change and wants its own
+        // review rather than a late addition here.
+        if self.handle.buffer.is_complete()
+            && self.handle.buffer.get(next_idx).is_none()
+            && self.bytes_read >= self.handle.buffer.total_bytes()
+        {
             return Poll::Ready(None);
         }
 
@@ -583,7 +623,7 @@ impl Stream for StreamingInboundStream {
         // (set above), but we use if-let to satisfy the no-unwrap rule.
         if let Some(listener) = self.listener.as_mut() {
             match listener.as_mut().poll(cx) {
-                Poll::Ready(()) => {
+                Poll::Ready(()) => loop {
                     // Notified — clear listener and re-check buffer inline
                     // (avoids wake_by_ref spin-loop).
                     self.listener = None;
@@ -604,14 +644,21 @@ impl Stream for StreamingInboundStream {
                         self.bytes_read += data.len() as u64;
                         return Poll::Ready(Some(Ok(data)));
                     }
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_rearmed_listener_poll.take() {
+                        hook();
+                    }
                     if let Some(new_listener) = self.listener.as_mut() {
                         match new_listener.as_mut().poll(cx) {
-                            Poll::Ready(()) => self.listener = None,
-                            Poll::Pending => {}
+                            // Notification can arrive after the re-check but
+                            // before this first poll, without waking our task.
+                            // Consume it by looping to re-check, never by
+                            // returning Pending with no registered listener.
+                            Poll::Ready(()) => {}
+                            Poll::Pending => return Poll::Pending,
                         }
                     }
-                    Poll::Pending
-                }
+                },
                 Poll::Pending => Poll::Pending,
             }
         } else {
@@ -703,6 +750,147 @@ mod tests {
 
     fn make_stream_id() -> StreamId {
         StreamId::next()
+    }
+
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Drive the second-listener race without threads, timers, or an executor.
+    fn check_rearmed_listener_arrival(final_fragment: bool, auto_reclaim: bool) {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::sync::atomic::Ordering;
+
+        let fragment_count = if final_fragment { 2 } else { 3 };
+        let handle = StreamHandle::new(
+            make_stream_id(),
+            (FRAGMENT_PAYLOAD_SIZE * fragment_count) as u64,
+        );
+        let fork = handle.fork();
+        let mut stream = if auto_reclaim {
+            fork.stream_with_reclaim()
+        } else {
+            fork.stream()
+        };
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let first = Bytes::from(vec![1; FRAGMENT_PAYLOAD_SIZE]);
+        handle.push_fragment(1, first.clone()).unwrap();
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(first)))
+        );
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+
+        // Wake the old listener without supplying the missing fragment #2.
+        if final_fragment {
+            // Cancellation of a different fork shares the buffer notification,
+            // but must not cancel this consumer (nor its producer).
+            handle.fork().cancel();
+        } else {
+            handle
+                .push_fragment(3, Bytes::from(vec![3; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+        }
+        assert!(counter.0.swap(0, Ordering::SeqCst) > 0);
+
+        let expected = Bytes::from(vec![2; FRAGMENT_PAYLOAD_SIZE]);
+        let arriving = expected.clone();
+        let producer = handle.clone();
+        stream.before_rearmed_listener_poll = Some(Box::new(move || {
+            assert!(producer.push_fragment(2, arriving).unwrap());
+        }));
+
+        let result = Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(
+            stream.before_rearmed_listener_poll.is_none(),
+            "race hook did not run"
+        );
+        assert!(
+            result.is_ready() || counter.0.load(Ordering::SeqCst) > 0,
+            "fragment #2 is buffered, but poll_next returned Pending without a wake; listener present: {}",
+            stream.listener.is_some()
+        );
+        let result = if result.is_pending() {
+            Pin::new(&mut stream).poll_next(&mut cx)
+        } else {
+            result
+        };
+        assert_eq!(result, Poll::Ready(Some(Ok(expected))));
+        assert_eq!(stream.bytes_read(), (2 * FRAGMENT_PAYLOAD_SIZE) as u64);
+        if !final_fragment {
+            assert_eq!(
+                Pin::new(&mut stream).poll_next(&mut cx),
+                Poll::Ready(Some(Ok(Bytes::from(vec![3; FRAGMENT_PAYLOAD_SIZE]))))
+            );
+        }
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+    }
+
+    #[test]
+    fn test_rearmed_listener_next_fragment_arrival() {
+        for auto_reclaim in [false, true] {
+            check_rearmed_listener_arrival(false, auto_reclaim);
+        }
+    }
+
+    #[test]
+    fn test_rearmed_listener_final_fragment_arrival() {
+        for auto_reclaim in [false, true] {
+            check_rearmed_listener_arrival(true, auto_reclaim);
+        }
+    }
+
+    #[test]
+    fn test_rearmed_listener_spurious_notification_registers_waker() {
+        use std::sync::atomic::Ordering;
+
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        handle.fork().cancel();
+        assert!(counter.0.swap(0, Ordering::SeqCst) > 0);
+
+        let unrelated = handle.fork();
+        stream.before_rearmed_listener_poll = Some(Box::new(move || unrelated.cancel()));
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        assert!(stream.before_rearmed_listener_poll.is_none());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert!(stream.listener.is_some());
+
+        // After two unrelated notifications, Pending must retain a live waker.
+        let data = Bytes::from_static(b"x");
+        handle.push_fragment(1, data.clone()).unwrap();
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(data)))
+        );
+    }
+
+    #[test]
+    fn test_rearmed_listener_cancellation_is_observed() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        handle.fork().cancel();
+
+        stream.before_rearmed_listener_poll = Some(Box::new(move || handle.cancel()));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Err(StreamError::Cancelled)))
+        );
+        assert!(stream.before_rearmed_listener_poll.is_none());
     }
 
     #[test]
@@ -891,20 +1079,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_inbound_stream_basic() {
-        let handle = StreamHandle::new(make_stream_id(), 15);
+        // The advertised total must equal the bytes actually pushed. This said
+        // 15 while pushing 5, which no sender ever does -- `send_stream` sets
+        // `total_length_bytes` from `stream_to_send.len()` and `pipe_stream`
+        // forwards `inbound_handle.total_bytes()`, so both are exact. The
+        // inconsistency was invisible while `poll_next` ended a stream on
+        // `is_complete()` alone, and it is worth noting that `assemble()`
+        // already rejected this same buffer (its length check fails at 5 of
+        // 15 bytes): the two paths disagreed, which is the defect the
+        // `bytes_read >= total_bytes()` conjunct fixes.
+        let payload = Bytes::from_static(b"hello");
+        let handle = StreamHandle::new(make_stream_id(), payload.len() as u64);
 
-        // Push all fragments
-        handle
-            .push_fragment(1, Bytes::from_static(b"hello"))
-            .unwrap();
+        handle.push_fragment(1, payload.clone()).unwrap();
 
         let mut stream = handle.stream();
         let chunk = stream.next().await;
         assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(chunk.unwrap().unwrap(), payload);
 
-        // Stream should be exhausted
-        let chunk = stream.next().await;
+        // Stream should be exhausted. Bounded so a regression that stops the
+        // stream ending reports THAT, rather than hanging until nextest's
+        // 240 s slow-timeout kills the process with no diagnosis.
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect(
+                "stream never ended: every advertised byte was delivered, so `poll_next` must \
+                 return Ready(None) rather than waiting for the unused overflow slot",
+            );
         assert!(chunk.is_none());
     }
 
@@ -1308,10 +1510,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_bytes_read_tracking() {
-        let handle = StreamHandle::new(make_stream_id(), 15);
-        handle
-            .push_fragment(1, Bytes::from_static(b"hello world!!!"))
-            .unwrap();
+        // Advertised total must equal the bytes pushed, as at
+        // `test_streaming_inbound_stream_basic`. This said 15 while pushing 14.
+        // It does not hang today only because it polls once and never reaches
+        // the terminal poll -- so it is a landmine rather than a failure: the
+        // next person to add an end-of-stream assertion here rediscovers the
+        // hang instead of the bug they were chasing.
+        let payload = Bytes::from_static(b"hello world!!!");
+        let handle = StreamHandle::new(make_stream_id(), payload.len() as u64);
+        handle.push_fragment(1, payload).unwrap();
 
         let mut stream = handle.stream();
         assert_eq!(stream.bytes_read(), 0);
@@ -1739,5 +1946,223 @@ mod tests {
         assert!(result.is_ok(), "assemble should succeed: {:?}", result);
         let data = result.unwrap();
         assert_eq!(data.len(), total as usize);
+    }
+
+    /// Regression test: the `Stream` impl must wait for the overflow fragment
+    /// instead of silently ending the stream early.
+    ///
+    /// Counterpart to `test_assemble_waits_for_overflow_fragment` above. That
+    /// test pins the `assemble()` path, which was fixed after it truncated
+    /// River web-app payloads. `poll_next` had the same defect and was NOT
+    /// fixed, and it is the path relays use: `pipe_stream` forwards a GET/PUT
+    /// response hop-by-hop via `inbound_handle.stream()`.
+    ///
+    /// The mechanism: `is_complete()` is `contiguous >= min_complete_fragments`,
+    /// which is the base fragment count. When the sender embeds metadata in
+    /// fragment #1 (fix #2757) that fragment carries a reduced payload, so the
+    /// sender emits `base + 1` fragments. `is_complete()` therefore fires one
+    /// fragment EARLY — while the final overflow fragment is still in flight.
+    /// A consumer polling in that window saw `is_complete() && get(next) == None`
+    /// and returned `Poll::Ready(None)`, ending the relayed stream short of its
+    /// advertised `total_length_bytes`. The downstream peer then sits in
+    /// `assemble()` waiting for a fragment that will never be sent and fails
+    /// with `StreamError::InactivityTimeout` — "stream assembly: no fragments
+    /// received within inactivity timeout".
+    ///
+    /// Polling is driven manually with a no-op waker so the assertion lands on
+    /// the exact poll in that window; there is no sleep and no timing race.
+    #[test]
+    fn test_stream_waits_for_overflow_fragment() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        // Same shape as the sender: fragment #1 carries a reduced payload
+        // because metadata is embedded, so `base + 1` fragments are needed.
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        let reduced_payload = FRAGMENT_PAYLOAD_SIZE / 2;
+        let remaining = total as usize - reduced_payload;
+        let overflow_size = remaining - 2 * FRAGMENT_PAYLOAD_SIZE;
+
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; reduced_payload]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // The buffer reports complete (3 contiguous >= min_complete_fragments)
+        // even though the bytes present are short of `total`.
+        assert!(handle.is_complete());
+        assert!(handle.try_assemble().is_none());
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut stream = handle.stream();
+
+        let mut yielded = 0usize;
+        for expected in [
+            reduced_payload,
+            FRAGMENT_PAYLOAD_SIZE,
+            FRAGMENT_PAYLOAD_SIZE,
+        ] {
+            match stream.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    assert_eq!(data.len(), expected);
+                    yielded += data.len();
+                }
+                other @ (Poll::Ready(_) | Poll::Pending) => {
+                    panic!("expected fragment of {expected} bytes, got {other:?}")
+                }
+            }
+        }
+
+        // The defect: with the overflow fragment not yet arrived, this poll
+        // returned `Ready(None)` and the relay ended the stream having
+        // forwarded only `yielded` of `total` bytes.
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => panic!(
+                "stream ended early: forwarded {yielded} of {total} bytes. \
+                 `is_complete()` fires at the base fragment count, so the \
+                 overflow fragment was still in flight; ending here truncates \
+                 the relayed stream and strands the downstream peer in \
+                 assemble() until its inactivity timeout."
+            ),
+            other => panic!("expected Pending while awaiting the overflow fragment, got {other:?}"),
+        }
+
+        // Overflow arrives: the stream must deliver it and only then end.
+        handle
+            .push_fragment(4, Bytes::from(vec![4u8; overflow_size]))
+            .unwrap();
+
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                assert_eq!(data.len(), overflow_size);
+                yielded += data.len();
+            }
+            other @ (Poll::Ready(_) | Poll::Pending) => {
+                panic!("expected the overflow fragment, got {other:?}")
+            }
+        }
+
+        assert_eq!(
+            yielded, total as usize,
+            "the stream must forward every advertised byte"
+        );
+        assert!(matches!(stream.poll_next_unpin(&mut cx), Poll::Ready(None)));
+    }
+
+    /// The contract this fix establishes, stated where a future debugger will
+    /// find it: **a stream short of its advertised total stalls; it does not
+    /// end.**
+    ///
+    /// This case used to live in the tree by accident.
+    /// `test_streaming_inbound_stream_basic` advertised 15 bytes while pushing
+    /// 5, and correcting that data removed the only in-tree artefact of the
+    /// behaviour. Without something naming it, the next person to hit a stall
+    /// while debugging has every incentive to "fix" it by re-widening the
+    /// condition — which is precisely the truncation #5270 removed, restored.
+    ///
+    /// The stall is deliberate. It is what makes `poll_next` agree with
+    /// `assemble()`, which returns `None` for this same buffer rather than
+    /// handing back a short result. Ending the stream instead would forward a
+    /// truncated payload while reporting success, and strand the downstream
+    /// peer in `assemble()` until its inactivity timeout. A caller that cannot
+    /// wait forever bounds the wait — `pipe_stream` wraps this in a `select!`
+    /// against `STREAM_INACTIVITY_TIMEOUT` and reports a diagnostic failure.
+    /// No conforming sender produces this shape: `send_stream` sets
+    /// `total_length_bytes` from `stream_to_send.len()`.
+    #[test]
+    fn a_stream_short_of_its_advertised_total_stalls_rather_than_ending_early() {
+        use futures::StreamExt;
+
+        let payload = Bytes::from_static(b"hello");
+        // Advertise three times what we deliver.
+        let total = (payload.len() * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+        handle.push_fragment(1, payload.clone()).unwrap();
+
+        // The buffer calls itself complete: one contiguous fragment meets the
+        // base count for a total this small. That is the trap the byte check
+        // exists for.
+        assert!(handle.is_complete());
+        assert!(
+            handle.try_assemble().is_none(),
+            "assemble() must refuse a buffer short of its total — if this ever \
+             returns Some, the two paths have diverged again"
+        );
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut stream = handle.stream();
+
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(Ok(data))) => assert_eq!(data, payload),
+            other @ (Poll::Ready(_) | Poll::Pending) => {
+                panic!("the delivered fragment must come out first, got {other:?}")
+            }
+        }
+
+        assert!(
+            matches!(stream.poll_next_unpin(&mut cx), Poll::Pending),
+            "a stream short of its advertised total must STALL, not end. Ending \
+             here returns Ready(None) to `pipe_stream`, which forwards a \
+             truncated payload and reports a successful transfer, and the \
+             downstream peer then waits in assemble() for a fragment that will \
+             never arrive. If you are here because something is stalling, the \
+             bug is upstream — a sender advertising more than it sent — not \
+             this condition."
+        );
+    }
+
+    /// The early-end path must still fire when the overflow slot is genuinely
+    /// unused, or every such stream would hang until its inactivity timeout.
+    ///
+    /// This is the case the `is_complete() && get(next).is_none()` check exists
+    /// for: when fragment #1 carries a full payload the sender emits exactly
+    /// `base` fragments and the extra allocated slot stays empty forever.
+    #[test]
+    fn test_stream_ends_when_overflow_slot_unused() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut stream = handle.stream();
+
+        let mut yielded = 0usize;
+        for _ in 0..2 {
+            match stream.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(Ok(data))) => yielded += data.len(),
+                other @ (Poll::Ready(_) | Poll::Pending) => {
+                    panic!("expected a fragment, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(yielded, total as usize);
+
+        // All advertised bytes delivered and slot 3 will never be filled: the
+        // stream must end rather than wait.
+        assert!(
+            matches!(stream.poll_next_unpin(&mut cx), Poll::Ready(None)),
+            "stream must end once every advertised byte has been forwarded, \
+             even though the allocated overflow slot is still empty"
+        );
     }
 }

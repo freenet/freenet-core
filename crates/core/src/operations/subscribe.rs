@@ -174,12 +174,17 @@ pub(super) enum InitialRequest {
 /// is bypassed entirely and `holder` is used as the target directly (a directed
 /// subscribe, e.g. driven by a received `SubscribeHint`). The peer-not-joined
 /// check still applies. There are no alternatives in this mode.
+///
+/// `log_as` says whether this selection is the one that routes, for the routing
+/// dataset: a pre-check whose network result is discarded passes `Unlogged`,
+/// and then writes no bypass lines either.
 pub(super) async fn prepare_initial_request(
     op_manager: &OpManager,
     id: Transaction,
     instance_id: ContractInstanceId,
     is_renewal: bool,
     first_hop: Option<PeerKeyLocation>,
+    log_as: crate::router::dataset::DecisionLog,
 ) -> Result<InitialRequest, OpError> {
     let own_addr = match op_manager.ring.connection_manager.peer_addr() {
         Ok(addr) => addr,
@@ -230,12 +235,22 @@ pub(super) async fn prepare_initial_request(
             phase = "directed_first_hop",
             "Using caller-supplied first hop for subscription (bypassing ring selection)"
         );
+        if log_as != crate::router::dataset::DecisionLog::Unlogged {
+            crate::router::dataset::record_bypass(
+                crate::node::network_status::OpType::Subscribe,
+                crate::ring::Location::from(&instance_id),
+                &holder,
+                crate::router::dataset::UncapturedReason::DirectedFirstHop,
+            );
+        }
         (holder, Vec::new())
     } else {
-        let mut candidates =
-            op_manager
-                .ring
-                .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
+        let mut candidates = op_manager.ring.k_closest_potentially_hosting(
+            log_as,
+            &instance_id,
+            &visited,
+            MAX_BREADTH,
+        );
 
         // First try the best candidates from k_closest_potentially_hosting.
         // If that returns empty, fall back to any available connection.
@@ -274,6 +289,14 @@ pub(super) async fn prepare_initial_request(
                         phase = "fallback_routing",
                         "Using fallback connection for subscription (k_closest returned empty)"
                     );
+                    if log_as != crate::router::dataset::DecisionLog::Unlogged {
+                        crate::router::dataset::record_bypass(
+                            crate::node::network_status::OpType::Subscribe,
+                            crate::ring::Location::from(&instance_id),
+                            &target,
+                            crate::router::dataset::UncapturedReason::AnyConnectionFallback,
+                        );
+                    }
                     target
                 }
                 None => {
@@ -295,6 +318,14 @@ pub(super) async fn prepare_initial_request(
                             phase = "bootstrap_gateway",
                             "subscribe: ring empty — routing initial request via configured gateway"
                         );
+                        if log_as != crate::router::dataset::DecisionLog::Unlogged {
+                            crate::router::dataset::record_bypass(
+                                crate::node::network_status::OpType::Subscribe,
+                                crate::ring::Location::from(&instance_id),
+                                &gateway,
+                                crate::router::dataset::UncapturedReason::BootstrapGateway,
+                            );
+                        }
                         gateway
                     } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                         // No gateway either - fall back to local completion only if isolated.
@@ -473,15 +504,13 @@ pub(super) async fn fetch_contract_if_missing(
 ///    the body is locally present after step 4*. Announcing without a
 ///    body would tell neighbors to forward UPDATEs to a peer that
 ///    cannot validate or store them. If the body lands later via the
-///    sub-op GET's own cache path, `get/op_ctx_task.rs` calls
-///    `announce_contract_hosted` there *on first-time cache* (gated
-///    on `is_new && put_persisted`). A niche case where the contract
-///    was previously hosted then evicted, the lease expires, and the
-///    re-subscribe fetch then times out, would not re-trigger the
-///    announce via that fallback — neighbors learn we host the
-///    contract again either through the next renewal cycle's
-///    finalization (if the body has arrived by then) or via UPDATE
-///    delivery + auto-fetch.
+///    sub-op GET's own cache path, `get/op_ctx_task.rs` announces
+///    there when that cache newly hosts the contract with its state
+///    held locally, whether persisted now or already on disk (#5780).
+///    If the re-subscribe fetch times out, that fallback does not run
+///    and neighbors learn we host the contract again either through
+///    the next renewal cycle's finalization (if the body has arrived
+///    by then) or via UPDATE delivery + auto-fetch.
 /// 6. Register the contract in our local interest manager (so inbound
 ///    `ChangeInterests` for this contract get processed) and broadcast
 ///    a `ChangeInterests` so connected peers learn we became interested.

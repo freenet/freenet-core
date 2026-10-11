@@ -79,3 +79,7 @@ logs/
 
 # Local-only: release-agent binary staged for install.sh (built per-machine)
 scripts/release-agent/freenet-release-agent
+
+# Nix build symlinks (`nix build` writes ./result, `nix build -o` ./result-*)
+/result
+/result-*

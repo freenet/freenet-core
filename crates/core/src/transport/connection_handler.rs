@@ -353,10 +353,11 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     /// `GATEWAY_ACK_VERSION_MIN_VERSION`, `None` is production behaviour.
     ///
     /// It takes `bandwidth_limit` too rather than hardcoding `None`. An earlier
-    /// shape had the caller branch between this and `new_test_with_bandwidth`,
-    /// which meant passing a floor override silently discarded any bandwidth
-    /// limit — a trap that would have surfaced as a throughput test which
-    /// mysteriously failed to throttle.
+    /// shape had the caller branch between this and a bandwidth-only
+    /// constructor, which meant passing a floor override silently discarded any
+    /// bandwidth limit — a trap that would have surfaced as a throughput test
+    /// which mysteriously failed to throttle. That second constructor is gone;
+    /// this is the one knob-bearing test constructor.
     #[cfg(any(test, feature = "bench"))]
     pub(crate) fn new_test_with_options(
         socket_addr: SocketAddr,
@@ -376,28 +377,6 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             None,
             None,
             ack_version_floor_override,
-        )?;
-        Ok((handler, receiver))
-    }
-
-    #[cfg(any(test, feature = "bench"))]
-    pub(crate) fn new_test_with_bandwidth(
-        socket_addr: SocketAddr,
-        socket: Arc<S>,
-        keypair: TransportKeypair,
-        is_gateway: bool,
-        bandwidth_limit: Option<usize>,
-    ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        let (handler, receiver, _listen_handle) = Self::config_listener(
-            socket,
-            keypair,
-            is_gateway,
-            socket_addr,
-            bandwidth_limit,
-            None,
-            None,
-            None,
-            None,
         )?;
         Ok((handler, receiver))
     }

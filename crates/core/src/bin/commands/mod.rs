@@ -1,5 +1,6 @@
 pub mod auto_update;
 pub mod daemon_control;
+pub mod open_link;
 pub mod report;
 pub mod rollback;
 pub mod secrets_cmd;
@@ -8,6 +9,7 @@ pub mod setup_wizard;
 pub mod tray;
 pub mod uninstall;
 pub mod update;
+pub mod url_handler;
 
 /// Open a URL in the default browser (platform-specific).
 ///

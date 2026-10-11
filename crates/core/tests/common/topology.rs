@@ -1,9 +1,10 @@
 //! Topology analysis utilities for validating small-world network properties.
 //!
 //! A small-world network should exhibit:
-//! 1. High clustering coefficient (peers connected to nearby peers)
+//! 1. Short-range bias: most connections go to nearby ring locations (a Kleinberg 1/d
+//!    distribution puts roughly 85% of connections within ring distance 0.2)
 //! 2. Short average path length
-//! 3. Connections primarily to peers with similar ring locations
+//! 3. Some long-range links, so greedy routing reaches distant locations quickly
 
 use anyhow::Result;
 use freenet_test_network::TestNetwork;

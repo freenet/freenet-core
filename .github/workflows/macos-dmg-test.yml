@@ -50,12 +50,16 @@ jobs:
           gh release download "$TAG" --repo "${{ github.repository }}" \
             --pattern 'freenet-aarch64-apple-darwin.tar.gz' \
             --pattern 'freenet-x86_64-apple-darwin.tar.gz' \
+            --pattern 'fdev-aarch64-apple-darwin.tar.gz' \
+            --pattern 'fdev-x86_64-apple-darwin.tar.gz' \
             --dir download
           mkdir -p bin-arm64 bin-x86_64
           tar -xzf download/freenet-aarch64-apple-darwin.tar.gz -C bin-arm64
           tar -xzf download/freenet-x86_64-apple-darwin.tar.gz  -C bin-x86_64
-          chmod +x bin-arm64/freenet bin-x86_64/freenet
-          file bin-arm64/freenet bin-x86_64/freenet
+          tar -xzf download/fdev-aarch64-apple-darwin.tar.gz    -C bin-arm64
+          tar -xzf download/fdev-x86_64-apple-darwin.tar.gz     -C bin-x86_64
+          chmod +x bin-arm64/freenet bin-x86_64/freenet bin-arm64/fdev bin-x86_64/fdev
+          file bin-arm64/freenet bin-x86_64/freenet bin-arm64/fdev bin-x86_64/fdev
 
       - name: Install packaging dependencies
         run: brew install create-dmg librsvg
@@ -104,6 +108,8 @@ jobs:
           VERSION: ${{ steps.tag.outputs.tag }}
           FREENET_ARM64_BIN: bin-arm64/freenet
           FREENET_X86_BIN: bin-x86_64/freenet
+          FREENET_ARM64_FDEV_BIN: bin-arm64/fdev
+          FREENET_X86_FDEV_BIN: bin-x86_64/fdev
           CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
           ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
           ASC_API_ISSUER_ID: ${{ secrets.APPLE_ASC_API_KEY_ISSUER_ID }}

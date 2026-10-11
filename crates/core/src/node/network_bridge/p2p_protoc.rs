@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
@@ -32,9 +31,10 @@ use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
     BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
-    global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
@@ -52,6 +52,11 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
+mod zombie_sweep;
+
+use zombie_sweep::ZombieSweepState;
+#[cfg(test)]
+use zombie_sweep::{TransportActivity, is_zombie};
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -221,6 +226,18 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
             gateways,
         }
+    }
+
+    /// A bridge whose outbound messages land on `sender`, for tests that drive
+    /// the real send path and read what it put on the wire.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(sender: Sender<P2pBridgeEvent>, op_manager: Arc<OpManager>) -> Self {
+        Self::new(
+            sender,
+            op_manager,
+            crate::tracing::DynamicRegister::new(vec![]),
+            Arc::new(Vec::new()),
+        )
     }
 
     /// Wake any drivers whose downstream peer just disconnected.
@@ -519,67 +536,18 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
+    /// When the remote last sent a request over this transport (see
+    /// `zombie_sweep::is_link_use_request`), shared with the transport's
+    /// `peer_connection_listener`, which stamps each request as it receives it.
+    /// The zombie sweep judges a transport that was never promoted to the ring
+    /// by this rather than by `created_at`, so a link the remote is still
+    /// sending requests over is not collected out from under it (#5654), within
+    /// the per-IP and global caps in `zombie_sweep`.
+    link_use: zombie_sweep::LinkUseStamp,
     /// The remote peer's negotiated protocol version, if known.
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
-}
-
-/// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring, not pending reservation, and not a gateway.
-///
-/// Gateway connections are exempt below a 1-hour absolute cap because they
-/// are intentionally transient (never promoted to ring) but actively needed
-/// for routing (#3595).
-///
-/// Two thresholds for non-gateway connections:
-/// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
-///
-/// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
-///   reservation. Must be greater than `PENDING_RESERVATION_TTL` (60s) so that a
-///   connection isn't immediately killed after its reservation expires. Previous
-///   hardcoded value of 300s caused gateways to accumulate ~250 zombie transports,
-///   overwhelming the packet processing channel and dropping keepalive packets.
-/// - `absolute_zombie_threshold` = `transient_ttl * 6`: overrides `has_pending` to
-///   break the refresh cycle where `connection_maintenance()` perpetually renews
-///   pending reservations on gateway transports. Previous hardcoded value of 600s
-///   allowed zombie transports to linger far too long.
-fn is_zombie(
-    created_at_elapsed: Duration,
-    in_ring: bool,
-    has_pending: bool,
-    is_gateway: bool,
-    transient_ttl: Duration,
-) -> bool {
-    let zombie_threshold = transient_ttl * 3;
-    let absolute_zombie_threshold = transient_ttl * 6;
-
-    if in_ring {
-        return false;
-    }
-    // Gateway transient connections are intentionally not promoted to ring,
-    // but the node needs them for routing. Without this exemption, gateways
-    // enter a zombie→prune→reconnect→zombie death spiral that breaks all
-    // streaming transfers (#3595).
-    //
-    // The exemption is time-bounded: truly dead gateway connections (no
-    // traffic for 1 hour) are still cleaned up. The transport-level idle
-    // timeout is the primary backstop, but this ensures no permanent leaks.
-    /// Gateway connections get a generous exemption window (1 hour) because they
-    /// are intentionally transient but needed for routing. The transport-level
-    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
-    /// gateways; this threshold is the safety net.
-    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
-    if is_gateway && created_at_elapsed < GATEWAY_ZOMBIE_EXEMPTION {
-        return false;
-    }
-    if created_at_elapsed > zombie_threshold && !has_pending {
-        return true;
-    }
-    if created_at_elapsed > absolute_zombie_threshold {
-        return true;
-    }
-    false
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -678,6 +646,26 @@ fn collect_contract_states<O: ContractPresenceOracle + ?Sized>(
     states
 }
 
+/// Whole seconds elapsed between `started_at` and `clock`'s current instant.
+///
+/// Backs `NodeInfo::uptime_seconds` in the node-diagnostics reply. Truncates
+/// toward zero, so a node younger than one second reports `0` — that is the
+/// only case in which a healthy node legitimately reports zero uptime.
+///
+/// Saturating rather than panicking: `Instant` subtraction underflows if the
+/// clock reports an instant before `started_at`. Wall-clock `InstantTimeSrc` is
+/// monotonic and cannot do that, but an injected test clock can be constructed
+/// at an earlier epoch, and a diagnostics query must never take the node down.
+///
+/// Measures MONOTONIC time, which does not advance while the host is
+/// suspended. A laptop peer resumed after an overnight suspend therefore
+/// reports the time it was actually running, not wall-clock time since start.
+/// That is the more useful number for "how long has this node been serving",
+/// which is what the field is read for.
+fn uptime_seconds(clock: &DynTimeSource, started_at: Instant) -> u64 {
+    clock.now().saturating_duration_since(started_at).as_secs()
+}
+
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
@@ -697,6 +685,17 @@ pub(in crate::node) struct P2pConnManager {
     listening_ip: IpAddr,
     listening_port: u16,
     is_gateway: bool,
+    /// Clock backing `NodeInfo::uptime_seconds` in the node-diagnostics reply.
+    ///
+    /// Always a wall-clock [`InstantTimeSrc`], including under simulation — see
+    /// the rationale at its construction in `build`. Held as a
+    /// [`DynTimeSource`] rather than a bare `Instant` so the computation goes
+    /// through the `TimeSource` abstraction and stays unit-testable.
+    uptime_clock: DynTimeSource,
+    /// Instant this node's network event loop was constructed, read from
+    /// [`Self::uptime_clock`]. `NodeInfo::uptime_seconds` is the elapsed time
+    /// since this point.
+    started_at: Instant,
     /// If set, will sent the location over network messages.
     ///
     /// It will also determine whether to trust the location of peers sent in network messages or derive them from IP.
@@ -1076,9 +1075,14 @@ pub(crate) fn version_supports_hash_first_summaries(
 /// must equal the floor.
 ///
 /// RELEASE-TIME ACTION: when the release carrying this feature is cut, set this
-/// to `Some(BROADCAST_TARGET_LIST_MIN_VERSION)` and freeze both.
+/// to a LITERAL `Some((major, minor, patch))` of that release and freeze both.
+///
+/// Write the literal, NOT `Some(BROADCAST_TARGET_LIST_MIN_VERSION)`. Naming the
+/// constant compiles, passes, and reads as tidier, but it makes the guard's
+/// `shipped == floor` assertion compare the floor against itself, so that arm
+/// can never fail again, which is the entire point of the guard.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 120));
 
 /// Version floor for the originator target list on broadcast (#5147).
 ///
@@ -1230,6 +1234,24 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .try_set_own_addr(advertised_addr);
+        #[cfg(not(feature = "simulation_tests"))]
+        let broadcast_spacing = bridge.op_manager.broadcast_spacing.clone();
+
+        // Uptime is measured from here — the last step of node construction,
+        // immediately before the event loop starts serving. Reading `now()` once
+        // and storing the instant (rather than re-deriving a start time later)
+        // keeps `uptime_seconds` monotonic for the life of the process.
+        //
+        // Deliberately NOT `config.hosting_time_source_override`, even though
+        // that is the node's injectable clock and `OpManager` sources the
+        // interest manager from it. Simulations freeze and jump that clock to
+        // drive hosting TTL and eviction, so borrowing it here would make a sim
+        // node report either a frozen 0 or a 24h uptime seconds after boot.
+        // Uptime and hosting TTL are unrelated concerns; injectability lives at
+        // the `uptime_seconds` helper boundary, which is where the unit tests
+        // drive a mock clock.
+        let uptime_clock: DynTimeSource = Arc::new(InstantTimeSrc::new());
+        let started_at = uptime_clock.now();
 
         Ok(P2pConnManager {
             gateways,
@@ -1243,6 +1265,8 @@ impl P2pConnManager {
             listening_ip: listener_ip,
             listening_port: listen_port,
             is_gateway: config.is_gateway,
+            uptime_clock,
+            started_at,
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
@@ -1269,13 +1293,15 @@ impl P2pConnManager {
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
-            broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
+            broadcast_queue: super::broadcast_queue::BroadcastQueue::with_spacing(
+                broadcast_spacing,
+            ),
         })
     }
 
-    /// Runs the event listener with `UdpSocket` (production mode).
+    /// Runs the event listener with `UdpTransportSocket` (production mode).
     ///
-    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
+    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpTransportSocket>`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
@@ -1285,7 +1311,7 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        self.run_event_listener_with_socket::<UdpSocket>(
+        self.run_event_listener_with_socket::<UdpTransportSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
@@ -1297,7 +1323,7 @@ impl P2pConnManager {
     /// Runs the event listener with a configurable socket type.
     ///
     /// This is the generic version that allows using different socket implementations:
-    /// - `UdpSocket` for production
+    /// - `UdpTransportSocket` for production
     /// - `InMemorySocket` for testing
     ///
     /// The socket type only affects connection establishment. Once connections are
@@ -1324,6 +1350,8 @@ impl P2pConnManager {
             listening_ip,
             listening_port,
             is_gateway,
+            uptime_clock,
+            started_at,
             this_location,
             check_version,
             bandwidth_limit,
@@ -1412,6 +1440,11 @@ impl P2pConnManager {
             listening_ip,
             listening_port,
             is_gateway,
+            // Carried across the destructure/rebuild, NOT re-read from the clock:
+            // re-reading here would restart the uptime measurement at event-loop
+            // entry and silently under-report it for the life of the process.
+            uptime_clock,
+            started_at,
             this_location,
             check_version,
             bandwidth_limit,
@@ -1443,6 +1476,7 @@ impl P2pConnManager {
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
         // Monitor both the event stream AND the UDP listen task.
@@ -1477,43 +1511,52 @@ impl P2pConnManager {
                     ));
                 },
 
-                maybe_result = StreamExt::next(&mut select_stream) => {
-                    let Some(result) = maybe_result else {
-                        break;
-                    };
-                    result
+                // Also wakes for a zombie sweep backlog deadline, so a backlog
+                // drains on a quiet node (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                    match wake {
+                        zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
+                        zombie_sweep::LoopWake::Event(None) => break,
+                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                    }
                 },
             };
 
-            loop_iteration_count += 1;
+            let event = if let Some(result) = result {
+                loop_iteration_count += 1;
 
-            let event_type = match &result {
-                priority_select::SelectResult::Notification(_) => "notification",
-                priority_select::SelectResult::OpExecution(_) => "op_execution",
-                priority_select::SelectResult::PeerConnection(_) => "peer_connection",
-                priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
-                priority_select::SelectResult::Handshake(_) => "handshake",
-                priority_select::SelectResult::NodeController(_) => "node_controller",
-                priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
-                priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                let event_type = match &result {
+                    priority_select::SelectResult::Notification(_) => "notification",
+                    priority_select::SelectResult::OpExecution(_) => "op_execution",
+                    priority_select::SelectResult::PeerConnection(_) => "peer_connection",
+                    priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
+                    priority_select::SelectResult::Handshake(_) => "handshake",
+                    priority_select::SelectResult::NodeController(_) => "node_controller",
+                    priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
+                    priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                };
+
+                let process_start = Instant::now();
+
+                // Process the result using the existing handler
+                let event = ctx
+                    .process_select_result(result, &mut state, &handshake_cmd_sender)
+                    .await?;
+
+                let elapsed = process_start.elapsed();
+                if elapsed > SLOW_EVENT_THRESHOLD {
+                    slow_event_count += 1;
+                    tracing::warn!(
+                        event_type,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Slow event loop iteration"
+                    );
+                }
+                event
+            } else {
+                // Woken only for a zombie sweep backlog slice; it runs below.
+                EventResult::Continue
             };
-
-            let process_start = Instant::now();
-
-            // Process the result using the existing handler
-            let event = ctx
-                .process_select_result(result, &mut state, &handshake_cmd_sender)
-                .await?;
-
-            let elapsed = process_start.elapsed();
-            if elapsed > SLOW_EVENT_THRESHOLD {
-                slow_event_count += 1;
-                tracing::warn!(
-                    event_type,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Slow event loop iteration"
-                );
-            }
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
@@ -1556,52 +1599,19 @@ impl P2pConnManager {
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
 
-                // Zombie transport cleanup: remove connections older than 3× transient_ttl
-                // that haven't been promoted to ring and have no pending reservation.
-                // An absolute threshold of 6× transient_ttl overrides pending reservations
-                // to catch gateway transports stuck in a pending-refresh cycle.
-                //
-                // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
-                // instead of drop_connection_by_addr to avoid a circular deadlock
-                // with the handshake driver (#3519). We also cap the batch size to
-                // limit event loop latency — each zombie cleanup involves topology
-                // pruning and orphaned transaction handling. With a 100ms timeout
-                // per zombie, 64 zombies = ~6.4s worst case per cycle.
-                // Remaining zombies will be cleaned up in the next 30s cycle.
-                const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
-                let transient_ttl = op_manager.ring.connection_manager.transient_ttl();
-                let zombie_addrs: Vec<SocketAddr> = ctx
-                    .connections
-                    .iter()
-                    .filter(|(addr, entry)| {
-                        let is_gateway = ctx
-                            .gateways
-                            .iter()
-                            .any(|gw| gw.socket_addr() == Some(**addr));
-                        is_zombie(
-                            entry.created_at.elapsed(),
-                            op_manager.ring.connection_manager.is_in_ring(**addr),
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .has_connection_or_pending(**addr),
-                            is_gateway,
-                            transient_ttl,
-                        )
-                    })
-                    .map(|(addr, _)| *addr)
-                    .take(MAX_ZOMBIE_CLEANUP_PER_CYCLE)
-                    .collect();
-                if !zombie_addrs.is_empty() {
-                    tracing::info!(
-                        zombie_count = zombie_addrs.len(),
-                        "Cleaning up zombie transports (not promoted to ring)"
-                    );
+                // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
+                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports. Both this tick and
+                // the backlog check below use `ZombieSweepState::slice_due`, so no
+                // slice starts within the required spacing of the previous one.
+                if zombie_sweep_state.slice_due(Instant::now(), true) {
+                    ctx.sweep_zombie_transports(
+                        &handshake_cmd_sender,
+                        &mut zombie_sweep_state,
+                        true,
+                    )
+                    .await;
                 }
-                for addr in &zombie_addrs {
-                    ctx.drop_zombie_connection(*addr, &handshake_cmd_sender)
-                        .await;
-                }
+                zombie_sweep_state.report(Instant::now());
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1629,6 +1639,9 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
+            } else if zombie_sweep_state.slice_due(Instant::now(), false) {
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
+                    .await;
             }
 
             match event {
@@ -2520,11 +2533,14 @@ impl P2pConnManager {
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
                                         peer_id: ctx.key_pair.public().to_string(),
-                                        is_gateway: self.is_gateway,
+                                        is_gateway: ctx.is_gateway,
                                         location: location.map(|loc| format!("{:.6}", loc.0)),
                                         listening_address: addr
                                             .map(|peer_addr| peer_addr.to_string()),
-                                        uptime_seconds: 0, // TODO: implement actual uptime tracking
+                                        uptime_seconds: uptime_seconds(
+                                            &ctx.uptime_clock,
+                                            ctx.started_at,
+                                        ),
                                     });
                                 }
 
@@ -3323,6 +3339,7 @@ async fn peer_connection_listener(
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
+    link_use: zombie_sweep::LinkUseStamp,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3463,6 +3480,10 @@ async fn peer_connection_listener(
                                 msg_type = %net_message,
                                 "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
                             );
+                            // Stamp a request BEFORE queueing it: the event loop
+                            // may not dequeue it for a while, and the zombie sweep
+                            // must already see this transport as in use (#5654).
+                            zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -4354,6 +4375,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4365,6 +4387,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4385,12 +4408,20 @@ pub(crate) mod tests {
     const TEST_TRANSIENT_TTL: Duration = Duration::from_secs(30);
     // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s
 
+    /// A transport whose remote has sent no request since it was established.
+    /// Every test below uses this, so each keeps its pre-#5654 meaning: for such
+    /// a transport the idle-time thresholds are exactly the old age thresholds.
+    /// The #5654 behaviour is tested in `zombie_sweep::tests`.
+    fn never_used(age: Duration) -> super::TransportActivity {
+        super::TransportActivity::never_used(age)
+    }
+
     #[test]
     fn test_zombie_detection_ignores_young_connections() {
         // Connection younger than zombie threshold (90s) should never be a zombie
         let elapsed = Duration::from_secs(60);
         assert!(
-            !super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Young connection should not be zombie"
         );
     }
@@ -4400,7 +4431,7 @@ pub(crate) mod tests {
         // In-ring connection should never be a zombie regardless of age
         let elapsed = Duration::from_secs(400);
         assert!(
-            !super::is_zombie(elapsed, true, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, false, false, TEST_TRANSIENT_TTL),
             "Ring connection should not be zombie"
         );
     }
@@ -4410,7 +4441,7 @@ pub(crate) mod tests {
         // Old connection that isn't in ring, no pending → zombie
         let elapsed = Duration::from_secs(91); // > 90s
         assert!(
-            super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Old unpromoted connection should be zombie"
         );
     }
@@ -4420,7 +4451,7 @@ pub(crate) mod tests {
         // Old connection not in ring, but has pending reservation → not zombie (under absolute)
         let elapsed = Duration::from_secs(120); // > 90s but < 180s
         assert!(
-            !super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Connection with pending reservation below absolute threshold should not be zombie"
         );
     }
@@ -4431,7 +4462,7 @@ pub(crate) mod tests {
         // The absolute threshold (180s) overrides has_pending
         let elapsed = Duration::from_secs(181);
         assert!(
-            super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Absolute threshold should override has_pending"
         );
     }
@@ -4441,7 +4472,7 @@ pub(crate) mod tests {
         // Connection 181s old, in_ring=true → NOT zombie
         let elapsed = Duration::from_secs(181);
         assert!(
-            !super::is_zombie(elapsed, true, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, true, false, TEST_TRANSIENT_TTL),
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
@@ -4450,7 +4481,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_threshold() {
         // Exactly 90s, no pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(90),
+            never_used(Duration::from_secs(90)),
             false,
             false,
             false,
@@ -4462,7 +4493,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_absolute() {
         // Exactly 180s, has_pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(180),
+            never_used(Duration::from_secs(180)),
             false,
             true,
             false,
@@ -4476,14 +4507,14 @@ pub(crate) mod tests {
         // classified as zombies within the 1-hour gateway exemption (#3595).
         let elapsed = Duration::from_secs(400); // Well past normal absolute threshold (180s)
         assert!(
-            !super::is_zombie(elapsed, false, false, true, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection should not be zombie within exemption window"
         );
 
         // But truly stale gateway connections (>1 hour) ARE cleaned up.
         let stale = Duration::from_secs(3601);
         assert!(
-            super::is_zombie(stale, false, false, true, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(stale), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection past 1-hour cap should be zombie"
         );
     }
@@ -4495,7 +4526,7 @@ pub(crate) mod tests {
         let large_ttl = Duration::from_secs(120);
         // 200s: not zombie even without pending (< 360s)
         assert!(!super::is_zombie(
-            Duration::from_secs(200),
+            never_used(Duration::from_secs(200)),
             false,
             false,
             false,
@@ -4503,7 +4534,7 @@ pub(crate) mod tests {
         ));
         // 400s: zombie without pending (> 360s)
         assert!(super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             false,
             false,
@@ -4511,7 +4542,7 @@ pub(crate) mod tests {
         ));
         // 400s with pending: not zombie (< 720s)
         assert!(!super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             true,
             false,
@@ -4519,7 +4550,7 @@ pub(crate) mod tests {
         ));
         // 721s: zombie even with pending (> 720s)
         assert!(super::is_zombie(
-            Duration::from_secs(721),
+            never_used(Duration::from_secs(721)),
             false,
             true,
             false,
@@ -5791,6 +5822,133 @@ pub(crate) mod tests {
         );
     }
 
+    /// `uptime_seconds` reports whole seconds of elapsed time, and in
+    /// particular reports a NON-zero value once the node has been up for at
+    /// least a second.
+    ///
+    /// This is the unit-level half of the #5223 regression: the diagnostics
+    /// reply hardcoded `uptime_seconds: 0`, so `freenet service report` claimed
+    /// zero uptime for nodes that had been running for hours (reports R7JSRK,
+    /// WEWYWY, R7W5NC).
+    #[test]
+    fn uptime_seconds_reports_elapsed_time() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let started_at = crate::util::time_source::TimeSource::now(&clock);
+        let dyn_clock: super::DynTimeSource = Arc::new(clock.clone());
+
+        // A node that has just started reports 0 — the ONE case where zero is
+        // the honest answer.
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 0);
+
+        // Sub-second uptime still truncates to 0 (boundary just below 1s).
+        clock.advance_time(Duration::from_millis(999));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 0);
+
+        // Crossing one second must report 1, not 0.
+        clock.advance_time(Duration::from_millis(1));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 1);
+
+        // The seven-hour case from report R7JSRK: the node had been up ~7h and
+        // reported 0. It must report the real elapsed seconds.
+        clock.advance_time(Duration::from_secs(7 * 3600) - Duration::from_secs(1));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 7 * 3600);
+    }
+
+    /// A clock that reports an instant BEFORE `started_at` must yield 0 rather
+    /// than panicking on `Instant` subtraction underflow. Unreachable with the
+    /// production monotonic clock, but a diagnostics query must never be able
+    /// to take the node down.
+    #[test]
+    fn uptime_seconds_saturates_when_clock_precedes_start() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let epoch = crate::util::time_source::TimeSource::now(&clock);
+        let started_at = epoch + Duration::from_secs(60);
+        let dyn_clock: super::DynTimeSource = Arc::new(clock);
+
+        assert_eq!(
+            super::uptime_seconds(&dyn_clock, started_at),
+            0,
+            "a clock behind `started_at` must saturate to 0, not panic"
+        );
+    }
+
+    /// Source pin: the node-diagnostics reply must COMPUTE `uptime_seconds`,
+    /// never hardcode it.
+    ///
+    /// #5223: the field was `uptime_seconds: 0, // TODO: implement actual
+    /// uptime tracking` for the field's whole lifetime, so every uploaded
+    /// diagnostic report claimed zero uptime. The unit tests above cover the
+    /// helper, but only this pin fails if a future edit re-inlines a literal at
+    /// the call site — which is exactly how the bug existed.
+    ///
+    /// The scan is bounded to the `NodeInfo { .. }` literal in the
+    /// `QueryNodeDiagnostics` handler so it cannot pass vacuously by matching
+    /// some later occurrence (see AGENTS.md on source-scrape pins).
+    #[test]
+    fn node_diagnostics_computes_uptime_rather_than_hardcoding_it() {
+        let src = production_src();
+        const ANCHOR: &str = "response.node_info = Some(NodeInfo {";
+        let start = src.find(ANCHOR).expect(
+            "QueryNodeDiagnostics handler must build `response.node_info = Some(NodeInfo {`",
+        );
+        let rest = &src[start + ANCHOR.len()..];
+        let end = rest
+            .find("});")
+            .expect("the NodeInfo literal must be closed by `});`");
+        let node_info_literal = &rest[..end];
+
+        assert!(
+            node_info_literal.contains("uptime_seconds: uptime_seconds("),
+            "NodeInfo.uptime_seconds must be computed via the `uptime_seconds` \
+             helper. Found instead:\n{node_info_literal}"
+        );
+        assert!(
+            !node_info_literal.contains("uptime_seconds: 0"),
+            "NodeInfo.uptime_seconds must not be hardcoded to 0 — that is the \
+             #5223 bug (reports R7JSRK / WEWYWY / R7W5NC all read 0 uptime on \
+             nodes that had been up for hours). Found:\n{node_info_literal}"
+        );
+    }
+
+    /// Source pin: the `ctx` rebuild at event-loop entry must CARRY the start
+    /// instant across, never re-read it from the clock.
+    ///
+    /// `run_event_listener_with_socket` destructures `self` and rebuilds a
+    /// `P2pConnManager` for the loop. Writing `started_at: uptime_clock.now()`
+    /// there instead of the `started_at` shorthand would restart the
+    /// measurement at event-loop entry, silently under-reporting uptime by the
+    /// whole node-construction window for the life of the process.
+    ///
+    /// Nothing else catches this: uptime measured from event-loop entry is
+    /// still non-zero and still increasing, so both the end-to-end test and the
+    /// pin above stay green. The hazard is documented at that call site; this
+    /// is the check that makes the documentation load-bearing.
+    #[test]
+    fn event_loop_ctx_carries_start_instant_rather_than_re_reading_it() {
+        let src = production_src();
+        const ANCHOR: &str = "let mut ctx = P2pConnManager {";
+        let start = src
+            .find(ANCHOR)
+            .expect("run_event_listener_with_socket must rebuild `let mut ctx = P2pConnManager {`");
+        let rest = &src[start + ANCHOR.len()..];
+        let end = rest
+            .find("\n        };")
+            .expect("the ctx rebuild literal must be closed by `};`");
+        let ctx_literal = &rest[..end];
+
+        assert!(
+            ctx_literal.contains("started_at,"),
+            "the ctx rebuild must carry `started_at` through by shorthand. \
+             Found:\n{ctx_literal}"
+        );
+        assert!(
+            !ctx_literal.contains("started_at:"),
+            "the ctx rebuild must NOT re-initialise `started_at` — re-reading \
+             the clock here restarts the uptime measurement at event-loop \
+             entry. Found:\n{ctx_literal}"
+        );
+    }
+
     /// Production source ONLY (everything before the `mod tests` block).
     /// We deliberately do not use `strip_cfg_test_regions` here: these pins
     /// reference the very `.send(...)` substrings they forbid, inside their
@@ -6194,5 +6352,254 @@ pub(crate) mod tests {
              all — the re-broadcast conditional should be fully removed, not \
              just its call site. Block:\n{body}"
         );
+    }
+    /// Deterministic reproduction of the "failed notifying, channel closed"
+    /// leak on originator-loopback PUT (the #4111 forbidden marker,
+    /// v0.2.118 field reports).
+    ///
+    /// Sequence modelled (no timing, no threads):
+    ///   1. The originator's `send_and_await` registers a LIVE waiter under
+    ///      `tx` (`install_pending_op_callback` observes a live callback and
+    ///      inserts it).
+    ///   2. The relay driver — running on the SAME node (originator
+    ///      loopback) — emits a payload for the SAME `tx` through the
+    ///      op-execution channel (`send_fire_and_forget` forward, or
+    ///      `send_local_loopback` Response). Its dummy callback is designed
+    ///      to be observed closed, but the receiver half only drops when the
+    ///      producer's poll finishes; the event loop runs on a different OS
+    ///      thread and can dequeue the payload inside the enqueue→drop
+    ///      window (observed in the field on a starved 1-CPU gateway:
+    ///      `is_closed()` returned false). That state is modelled here by
+    ///      holding the dummy receiver alive across the install call.
+    ///   3. The producer's poll finishes: the dummy receiver drops.
+    ///   4. The terminal Response arrives; the bypass looks up
+    ///      `pending_op_results[tx]` and forwards via
+    ///      `try_forward_driver_reply`.
+    ///
+    /// Pre-fix behaviour: step 2's insert CLOBBERS the live waiter, dropping
+    /// the originator's sender — the driver's `recv()` yields `None`
+    /// (surfaced as `OpError::NotificationError`, i.e. "failed notifying,
+    /// channel closed"), and step 4's `try_send` hits the closed dummy
+    /// (`err=channel closed` with a callback still registered). The PUT
+    /// itself succeeded — an infrastructure leak misreported as a failure.
+    ///
+    /// Contract pinned: an op-execution payload must NEVER displace a LIVE
+    /// `pending_op_results` waiter.
+    #[tokio::test]
+    async fn op_execution_payload_must_not_clobber_live_waiter() {
+        use crate::message::MessageStats; // for `msg.id()`
+        use crate::transport::ExpectedInboundTracker;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // Step 1: the originator's live waiter (send_and_await's callback).
+        let (originator_sender, mut originator_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, originator_sender);
+        assert!(
+            state.pending_op_results.contains_key(&tx),
+            "precondition: the originator's live waiter must be installed"
+        );
+
+        // Step 2: the relay's dummy callback for the SAME tx, observed while
+        // its receiver is still alive.
+        let (dummy_sender, dummy_receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, dummy_sender);
+
+        // Step 3: the producer's poll finishes — the dummy receiver drops.
+        drop(dummy_receiver);
+
+        // The originator's driver must still be wired: its `recv()` must NOT
+        // resolve to `None` (that is `OpError::NotificationError` — the
+        // forbidden "failed notifying, channel closed" leak).
+        match originator_rx.try_recv() {
+            Err(TryRecvError::Empty) => {} // still connected, still waiting — correct
+            Err(TryRecvError::Disconnected) => panic!(
+                "originator's waiter channel was closed by the dummy-callback \
+                 install: the driver's recv() yields None -> NotificationError \
+                 -> the client sees 'failed notifying, channel closed' for a \
+                 PUT that succeeded (the #4111 forbidden marker)"
+            ),
+            Ok(other) => panic!("no reply was sent yet, got {other:?}"),
+        }
+
+        // Step 4: the Response arrives and the bypass forwards it to the
+        // registered callback (mirrors `process_message`'s clone-then-forward).
+        let reply = crate::message::NetMessage::V1(crate::message::NetMessageV1::Aborted(tx));
+        let cb = state.pending_op_results.get(&tx).cloned();
+        let handled = crate::node::try_forward_driver_reply(cb.as_ref(), reply, "put");
+        assert!(handled, "a callback must be registered for the tx");
+
+        // The originator must actually RECEIVE the terminal reply.
+        match originator_rx.try_recv() {
+            Ok(crate::node::WaiterReply::Reply(msg)) => {
+                assert_eq!(msg.id(), &tx, "forwarded reply must carry the tx");
+            }
+            other => panic!(
+                "originator never received the terminal reply (got {other:?}): \
+                 the reply was forwarded into the clobbering dummy callback \
+                 whose receiver is gone (try_send err=channel closed)"
+            ),
+        }
+    }
+
+    /// A REFUSED newcomer's sender must be DROPPED, not parked.
+    ///
+    /// The guard's contract is not only "the incumbent survives" — it is also
+    /// that the refused caller learns it was refused. Dropping the sender makes
+    /// the newcomer's `recv()` yield `None`, which is what drives the ~360ms
+    /// infra-retry in `op_ctx.rs`. A refactor that stashed skipped senders
+    /// anywhere — a retry queue, a side map, even a stray clone held in a local
+    /// — would silently convert every skip into a full-`OPERATION_TTL` hang,
+    /// and every other test in this module would still pass: they all assert
+    /// about the INCUMBENT, and none observes what became of the newcomer.
+    #[tokio::test]
+    async fn install_pending_op_callback_drops_a_refused_newcomer() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // A live incumbent holds the slot.
+        let (incumbent_tx_, _incumbent_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        state.pending_op_results.insert(tx, incumbent_tx_);
+
+        // The newcomer is refused. Keep its RECEIVER so we can observe the
+        // sender's fate; the function must not retain the sender anywhere.
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let (newcomer_tx, mut newcomer_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, newcomer_tx);
+
+        assert!(
+            !state
+                .pending_op_results
+                .get(&tx)
+                .expect("incumbent must still hold the slot")
+                .is_closed(),
+            "the live incumbent must survive the refusal"
+        );
+
+        // `None`, not `Empty`: every clone of the sender is gone, so the
+        // newcomer's driver fails fast and retries instead of hanging to TTL.
+        assert!(
+            matches!(newcomer_rx.try_recv(), Err(TryRecvError::Disconnected)),
+            "a refused newcomer's sender must be dropped, not parked — otherwise \
+             its recv() blocks until OPERATION_TTL instead of failing fast"
+        );
+    }
+
+    /// Branch 1 of `install_pending_op_callback`: an incoming callback that is
+    /// ALREADY closed is never inserted.
+    ///
+    /// This is the pre-existing #3100 bound — the driver task can be cancelled
+    /// between `op_execution_sender.send()` and the event loop reaching the
+    /// payload (simulation teardown drops driver futures), and inserting a dead
+    /// sender would hold the slot until the 60s sweep. Guarded end-to-end by
+    /// `test_pending_op_results_bounded`, but only through a full simulation;
+    /// this pins the decision itself.
+    #[tokio::test]
+    async fn install_pending_op_callback_skips_a_closed_incoming_callback() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        let (sender, receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        drop(receiver); // the driver was cancelled before we got here
+        assert!(
+            sender.is_closed(),
+            "precondition: the callback must be closed"
+        );
+
+        super::dispatch::install_pending_op_callback(&mut state, tx, sender);
+
+        assert!(
+            !state.pending_op_results.contains_key(&tx),
+            "a closed callback must not occupy a pending_op_results slot: it \
+             would be held until the 60s sweep, which is the #3100 unbounded \
+             growth this skip exists to prevent"
+        );
+    }
+
+    /// Branch 3 of `install_pending_op_callback`, the sub-case the live-waiter
+    /// guard puts at risk: a CLOSED incumbent must still be replaced.
+    ///
+    /// The guard refuses to displace a live waiter only. If it were ever
+    /// loosened to `pending_op_results.get(&tx).is_some()` — dropping the
+    /// `!existing.is_closed()` predicate — dead entries would accumulate in the
+    /// map, reintroducing #3100 by the other door. That mutation passes
+    /// `op_execution_payload_must_not_clobber_live_waiter`, whose incumbent is
+    /// live; this test is what fails it.
+    #[tokio::test]
+    async fn install_pending_op_callback_replaces_a_closed_incumbent() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // A stale incumbent whose receiver is already gone.
+        let (stale_sender, stale_receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, stale_sender);
+        drop(stale_receiver);
+        assert!(
+            state.pending_op_results[&tx].is_closed(),
+            "precondition: the incumbent must be closed"
+        );
+
+        // A live callback for the same tx must take the slot.
+        let (fresh_sender, mut fresh_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, fresh_sender);
+
+        assert!(
+            !state.pending_op_results[&tx].is_closed(),
+            "a closed incumbent must be replaced, not preserved: keeping it \
+             strands the slot and strands this waiter"
+        );
+
+        // And the slot must be wired to the NEW waiter, not merely non-closed.
+        let reply = crate::message::NetMessage::V1(crate::message::NetMessageV1::Aborted(tx));
+        use crate::message::MessageStats; // for `msg.id()`
+
+        let cb = state.pending_op_results.get(&tx).cloned();
+        crate::node::try_forward_driver_reply(cb.as_ref(), reply, "put");
+        // Assert the reply ARRIVED, not merely that the map had an entry.
+        // `try_forward_driver_reply` returns true for any Some(callback) — a
+        // try_send that fails Closed or Full is swallowed into a debug! — and
+        // `!matches!(.., Err(Empty))` also passes on Err(Disconnected) and on
+        // Ok(PeerDisconnected). A refactor that dropped `fresh_sender` instead
+        // of installing it would satisfy both and still be wrong.
+        match fresh_rx.try_recv() {
+            Ok(crate::node::WaiterReply::Reply(msg)) => {
+                assert_eq!(msg.id(), &tx, "the replacing waiter got the wrong tx");
+            }
+            other => {
+                panic!("the replacing waiter never received the terminal reply (got {other:?})")
+            }
+        }
+    }
+
+    /// Branch 3 of `install_pending_op_callback`, plain case: no existing
+    /// entry and a live callback inserts.
+    ///
+    /// Asserted as a precondition inside
+    /// `op_execution_payload_must_not_clobber_live_waiter`; stated separately
+    /// so the extracted function's branch coverage is legible on its own.
+    #[tokio::test]
+    async fn install_pending_op_callback_inserts_when_the_slot_is_empty() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        let (sender, _rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, sender);
+
+        assert!(
+            state.pending_op_results.contains_key(&tx),
+            "a live callback must take an empty slot"
+        );
+        assert!(!state.pending_op_results[&tx].is_closed());
     }
 }

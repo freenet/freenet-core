@@ -3,7 +3,8 @@ use std::{
     fs::{self, File},
     future::Future,
     io::{Read, Write},
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
@@ -112,92 +113,151 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
 
-    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
-    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
-    /// This bounds tracked contract state only — WASM code blobs and ReDb/
-    /// SQLite database overhead are additional and not counted against it.
-    /// Default: 1 GiB.
+    /// Budget in bytes for hosted contract state. Once it is exceeded,
+    /// contracts are evicted (least valuable first) and their on-disk state is
+    /// reclaimed. This counts contract state only, which is kept on disk (only
+    /// memory-bounded caches of it are held in RAM); WASM code blobs and
+    /// database overhead are extra. Default: one eighth of the memory available
+    /// to the node (system RAM, or the cgroup limit if lower), clamped to
+    /// 128 MiB - 1 GiB.
+    ///
+    /// Set it higher to contribute more disk to the network, but keep it a
+    /// few GiB BELOW the disk budget. The disk budget is the smaller of
+    /// `--hosting-disk-pct` of the space available to Freenet (Freenet's own
+    /// usage plus free space) and `--max-hosting-disk` (default 32 GiB), and it
+    /// counts WASM code and the compile cache (up to about 512 MiB) as well as
+    /// state, so the headroom is for those. If this value is not at least that
+    /// far below the disk budget, the node can stop accepting new contracts
+    /// and state growth instead of evicting to make room. For example, with
+    /// 40 GiB available and default settings the disk budget is
+    /// min(0.5 x 40 GiB, 32 GiB) = 20 GiB, so set this to about 17 GiB; on a
+    /// larger disk the 32 GiB cap binds unless `--max-hosting-disk` is raised
+    /// too. Allow more headroom if the node hosts many contracts with distinct
+    /// code, since WASM grows with those. The number of contracts hosted is
+    /// limited separately by available memory, so raising this does not make a
+    /// node take on more contracts than its memory can hold.
+    // Internal: the explicit value is passed to `HostingManager` unclamped;
+    // only the DEFAULT is RAM-scaled. (One exception: a config.toml value of
+    // exactly 1 GiB is the legacy flat-default sentinel and re-derives from RAM,
+    // see `ConfigArgs::build`; a CLI or env value of 1 GiB still wins.) The
+    // resident-overhead (contract-count) budget derives from
+    // `budget_for_ram(total_ram)`, not from this value, so an override cannot
+    // move it. Pinned by `explicit_state_budget_above_ram_clamp_survives_recompute`.
+    //
+    // The "keep this below the disk budget" advice exists because eviction
+    // compares STATE bytes against `min(this, disk_budget)` while the admission
+    // gates (`admit_state_write` / `admit_state_update` / `admit_wasm_write`)
+    // refuse against `disk_budget` using state + WASM + compile cache. Whenever
+    // this value is within (WASM + compile cache) of disk_budget, or above it,
+    // there is a band — state in (disk_budget - WASM - cache, min(this,
+    // disk_budget)] — where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
+    // `--max-hosting-disk` flag, because `disk_budget = min(pct * (freenet_used
+    // + free), cap)`: an operator giving "half the disk" at the default pct hits
+    // the band via the pct term no matter how high the cap is set.
+    // That mismatch is a code gap (#5652); until it is fixed the help text must
+    // steer operators away from it.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
-    /// Fraction (0.0–1.0) of the disk capacity *available to Freenet*
-    /// (`used + free` on the data-dir mount) used to size the aggregate disk
-    /// budget (#4683). The disk budget is the second floor on hosting eviction:
-    /// `effective_budget = min(ram_budget, disk_budget)`. Default: 0.5.
+    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (Freenet's
+    /// own usage plus the free space on the data-dir mount) used to size the
+    /// disk budget. The disk budget bounds contract state, WASM code and the
+    /// compile cache together (database overhead is extra), and also caps
+    /// `--max-hosting-storage`, which should be kept a few GiB below it.
+    /// Default: 0.5.
+    // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
     #[arg(long, env = "HOSTING_DISK_PCT")]
     pub hosting_disk_pct: Option<f64>,
 
-    /// Hard upper clamp in bytes for the aggregate disk budget (#4683). Mirrors
-    /// `--max-hosting-storage` for disk: the disk budget never exceeds this even
-    /// on a host with a very large data disk. Default: 32 GiB.
+    /// Upper limit in bytes on the disk budget, so a host with a very large
+    /// data disk does not get an unbounded budget. It bounds contract state,
+    /// WASM code and the compile cache together (database overhead is extra).
+    /// To contribute more than about 32 GiB of state, raise this so the disk
+    /// budget stays a few GiB above `--max-hosting-storage`. Raising it has no
+    /// effect if `--hosting-disk-pct` of the available disk space is already the
+    /// smaller limit; raise that instead, leaving room for database overhead
+    /// and anything else on the disk. Default: 32 GiB.
+    // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
 
-    /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
-    /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
-    /// footprint under their `users/<user_id>/` tree, summed across every
-    /// delegate — both the active secret-value blobs AND the `.keys`
-    /// enumeration registry (so many/large keys are charged too) — so a visitor
-    /// cannot fill the node's disk. Per-user secret-value snapshots are disabled
-    /// (hosted users are transient and don't need overwrite history), so there
-    /// is no `.snapshots/` growth to charge. REJECT-on-full (never evict —
-    /// secrets are authoritative identity/room keys, not a cache). Default:
-    /// 4 MiB. `0` disables enforcement. Has NO effect outside hosted mode —
-    /// local single-user secrets are never quota-checked (and keep snapshots).
+    /// Fraction (0.0 to 1.0) of this node's memory limit that hosted contracts
+    /// may hold in RAM (mainly the summaries neighbours send so the node can
+    /// keep each hosted contract up to date). The limit is physical RAM, or a
+    /// smaller cgroup / systemd `MemoryMax` limit when one applies; the budget
+    /// is never below 64 MiB. Past it, the node stops hosting its
+    /// least-demanded contracts. A separate axis from `--max-hosting-storage`,
+    /// which bounds state bytes on disk. Default: 0.125.
+    // Internal (#5647): before #5647 this was a share of LIVE spare memory added
+    // to current RSS, applied to a count-based estimate; a persisted
+    // non-default value now means a share of the whole limit. The 1/8 default
+    // matches this codebase's other RAM-scaled budgets.
+    #[arg(long, env = "HOSTING_MEM_SHARE")]
+    pub hosting_mem_share: Option<f64>,
+
+    /// Per-user secret-storage quota in bytes, for hosted mode. Limits the total
+    /// on-disk size of one hosted user's secrets across all delegates, so a
+    /// visitor cannot fill the node's disk. Writes past the quota are rejected;
+    /// nothing is evicted, since secrets are identity and room keys rather than
+    /// a cache. Default: 4 MiB. Use `0` to disable enforcement. Outside hosted
+    /// mode the quota is ignored: local single-user secrets are never
+    /// quota-checked.
+    // Internal (#4561, P5 of #4381): charges both the secret-value blobs and the
+    // `.keys` enumeration registry under `users/<user_id>/`, so many or large
+    // keys count too. Per-user snapshots are disabled (hosted users are
+    // transient), so there is no `.snapshots/` growth to charge. Local
+    // single-user secrets keep their snapshots.
     #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
     pub per_user_secret_quota_bytes: Option<u64>,
 
-    /// Inactivity TTL, in seconds, after which a HOSTED user's entire
-    /// per-user data is reclaimed by a background sweep (#4561, P5 of #4381).
-    /// Keeps a public "try Freenet" node a transient demo with bounded storage:
-    /// a visitor who walks away has their namespace reclaimed after this many
-    /// real-calendar seconds of inactivity (durable across restarts). Default:
-    /// 2_592_000 (30 days). `0` disables the sweep entirely. Has NO effect
-    /// outside hosted mode — Local single-user data is never enumerated or
-    /// reclaimed (it lives outside the `users/<id>/` tree the sweep touches).
+    /// Seconds of inactivity after which a hosted user's data is reclaimed by a
+    /// background sweep. This keeps a public "try Freenet" node's storage
+    /// bounded: a visitor who walks away has their namespace reclaimed. The
+    /// clock is real calendar time and survives restarts. Default: 2_592_000
+    /// (30 days). Use `0` to disable the sweep. Ignored outside hosted mode.
+    // Internal (#4561, P5 of #4381): Local single-user data lives outside the
+    // `users/<id>/` tree the sweep walks, so it is never enumerated.
     #[arg(long = "per-user-inactive-ttl", env = "PER_USER_INACTIVE_TTL")]
     pub per_user_inactive_ttl_secs: Option<u64>,
 
-    /// How often, in seconds, the inactive-user reclaim sweep runs (#4561).
-    /// Only relevant when hosted mode is on and `per-user-inactive-ttl` is
-    /// non-zero. Default: 3_600 (hourly) — far finer than the 30-day TTL, so
-    /// reclamation lag is negligible while keeping the sweep's disk-walk cost
-    /// trivial. Must be > 0; `0` is treated as the default.
+    /// How often, in seconds, the inactive-user reclaim sweep runs. Only used
+    /// when hosted mode is on and `--per-user-inactive-ttl` is non-zero.
+    /// Default: 3_600 (hourly), which is fine-grained next to the 30-day
+    /// default TTL while keeping the sweep's disk walk cheap. A value of `0` is
+    /// treated as the default.
     #[arg(
         long = "inactive-user-sweep-interval",
         env = "INACTIVE_USER_SWEEP_INTERVAL"
     )]
     pub inactive_user_sweep_interval_secs: Option<u64>,
 
-    /// Byte budget for the compiled-WASM **contract** module cache. The
-    /// **delegate** cache gets a fraction of this value
-    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
-    /// ceiling is ~1.25× this. When a cache's tracked compiled-byte total would
-    /// exceed its budget on insert, least-recently-used modules are evicted
-    /// until it fits. Bounding by bytes (not entry count) stops a node hosting
-    /// many contracts from thrashing the cache and recompiling on every access
-    /// (issue #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`); set this to override.
+    /// Byte budget for the compiled-WASM contract module cache. The delegate
+    /// cache gets a quarter of this on top, so the combined ceiling is about
+    /// 1.25 times the value you set. When a cache would exceed its budget on
+    /// insert, least-recently-used modules are dropped until it fits. When
+    /// unset, the default scales with system RAM: total RAM / 8, clamped to
+    /// between 64 MiB and 4 GiB.
+    // Internal (#4441): the delegate fraction is
+    // `DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4. Bounding by bytes
+    // rather than entry count is what stops a node hosting many contracts from
+    // thrashing the cache and recompiling on every access.
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 
     /// Write the local append-only diagnostic event log (`_EVENT_LOG`).
     ///
-    /// Default: ON in `local` mode, OFF in `network` mode. Local mode is a
-    /// single-node development mode where the log is the point (and where
-    /// `fdev verify-state` consumes `_EVENT_LOG_LOCAL`); network mode is what
-    /// end users run, where the log costs real disk for a capability nothing
-    /// currently harvests.
+    /// On by default in `local` mode, off in `network` mode. Local mode is a
+    /// single-node development mode where the log is the whole point; in
+    /// network mode it costs real disk for something nothing currently reads.
     ///
-    /// This log is a PURELY LOCAL forensic record. It is NOT the telemetry that
-    /// feeds telemetry.freenet.org — that is a separate `TelemetryReporter`
-    /// sink fed in-memory off the same event stream, and it is unaffected by
-    /// this flag. Nothing in the node reads this log back to make decisions,
-    /// and `freenet service report` does not include it.
-    ///
-    /// Measured on a live 0.2.111 peer, writing it costs ~61 MiB/hour of
-    /// appends and accounted for 95% of every fsync the process issued
-    /// (#4968). Enable it on nodes you operate and want to post-mortem.
+    /// The log stays on this machine. It is separate from the telemetry that
+    /// feeds telemetry.freenet.org, which this flag does not affect, and
+    /// `freenet service report` does not include it. On a live peer, writing it
+    /// cost around 61 MiB per hour and accounted for 95% of the process's
+    /// fsyncs, so turn it on for nodes you operate and expect to post-mortem.
+    // Internal (#4968): `fdev verify-state` consumes `_EVENT_LOG_LOCAL`. The
+    // telemetry sink is a separate in-memory `TelemetryReporter` fed off the
+    // same event stream. The measurement above was on a live 0.2.111 peer.
     #[arg(
         long = "enable-event-log",
         env = "FREENET_ENABLE_EVENT_LOG",
@@ -206,34 +266,37 @@ pub struct ConfigArgs {
     )]
     pub enable_event_log: Option<bool>,
 
-    /// Seconds to wait on graceful shutdown for in-flight client
-    /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
-    /// down peer connections. Set to 0 to disable. Default: 30s. See
-    /// `Config::shutdown_drain_secs` for the full rationale.
+    /// Seconds to wait on shutdown for in-flight client operations
+    /// (PUT, GET, UPDATE, SUBSCRIBE) to finish before peer connections are torn
+    /// down. Set to 0 to disable. Default: 30.
+    // See `Config::shutdown_drain_secs` for the full rationale.
     #[arg(long, env = "SHUTDOWN_DRAIN_SECS")]
     pub shutdown_drain_secs: Option<u64>,
 
-    /// Disable the node's automatic self-update check. Default: **false** — a
-    /// normal release node auto-updates and MUST NOT set this, or it stops
-    /// receiving security/protocol updates (which Freenet ships frequently).
+    /// Turn off the node's automatic update check. Off by default, and a normal
+    /// release node must not set it: with it set, the node stops picking up the
+    /// security and protocol updates Freenet ships frequently.
     ///
-    /// Intended ONLY for bespoke from-source deployments that intentionally run
-    /// *ahead* of the latest release (e.g. try.freenet.org). Such a build would
-    /// otherwise detect the newer published release, exit 42 to request an
-    /// update, and either be reinstalled as the stock release (clobbering its
-    /// unreleased build) or crash-loop under a plain restart-on-failure unit.
-    /// A dirty/dev build is already exempt via `build_info::GIT_DIRTY`; this
-    /// covers the clean-but-unofficial case that `GIT_DIRTY` misses (#4690).
-    ///
-    /// Plain boolean flag with no `env` binding: a truthy env value is easy to
-    /// leave set by accident, and silently disabling auto-update fleet-wide is
-    /// the exact failure this must avoid. The one bespoke deployment sets it
-    /// explicitly in its service `ExecStart`.
+    /// This is for deployments built from source that deliberately run ahead of
+    /// the latest release, such as try.freenet.org. Without it, such a build
+    /// spots the newer published release, exits with code 42 to request an
+    /// update, and is then either replaced by the stock release or left
+    /// restart-looping. Builds from a dirty working tree already skip the check.
+    // Internal (#4690): dirty builds are exempt via `build_info::GIT_DIRTY`;
+    // this flag covers the clean-but-unofficial case `GIT_DIRTY` misses.
+    //
+    // Deliberately a plain boolean flag with no `env` binding: a truthy env
+    // value is easy to leave set by accident, and silently disabling
+    // auto-update fleet-wide is the exact failure this must avoid. The one
+    // bespoke deployment sets it explicitly in its service `ExecStart`.
     #[arg(long = "disable-auto-update")]
     pub disable_auto_update: bool,
 
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
+
+    #[command(flatten)]
+    pub otel: OtelArgs,
 }
 
 impl Default for ConfigArgs {
@@ -266,7 +329,15 @@ impl Default for ConfigArgs {
                 bbr_startup_rate: None,    // Uses default from BBR config
             },
             ws_api: WebsocketApiArgs {
-                address: Some(default_listening_address()),
+                // `None`, NOT an explicit address: this is the "operator said
+                // nothing" state, so it must fall through to
+                // `resolve_ws_api_address` and land on loopback. Pinning
+                // `Some(default_listening_address())` here took the Explicit
+                // branch and silently reinstated the wildcard bind for every
+                // programmatic composition (GHSA-824h-7x5x-wfmf). Contrast
+                // `network_api.address` above, which SHOULD stay `::`: that is
+                // the overlay transport, which does have to accept peers.
+                address: None,
                 ws_api_port: Some(default_ws_api_port()),
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
@@ -286,6 +357,7 @@ impl Default for ConfigArgs {
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -294,6 +366,7 @@ impl Default for ConfigArgs {
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 }
@@ -521,32 +594,88 @@ impl ConfigArgs {
         if !dir.exists() {
             return Ok(None);
         }
-        let mut read_dir = std::fs::read_dir(dir)?;
-        let config_args: Option<(String, String)> = read_dir.find_map(|e| {
-            if let Ok(e) = e {
-                if e.path().is_dir() {
-                    return None;
-                }
-                let filename = e.file_name().to_string_lossy().into_owned();
-                let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-                if let Some(ext) = ext {
-                    if filename.starts_with("config") {
-                        match ext.as_str() {
-                            "toml" => {
-                                tracing::debug!(filename = %filename, "Found configuration file");
-                                return Some((filename, ext));
+
+        // Prefer an exact `config.toml` / `config.json` match over any other
+        // `config*` name (e.g. `config.bak.toml`). `read_dir`'s iteration order
+        // is not guaranteed, so the fuzzy fallback below could otherwise
+        // silently pick up a backup file instead of the real config. This pass
+        // deliberately does not touch `read_dir` at all, so it is immune to
+        // iteration-order nondeterminism by construction rather than by luck
+        // — which is what `read_config_finds_exact_config_without_listing_the_directory`
+        // pins. (#5038)
+        const EXACT_NAMES: &[(&str, &str)] = &[("config.toml", "toml"), ("config.json", "json")];
+        let mut config_args: Option<(String, String)> = None;
+        for (filename, ext) in EXACT_NAMES {
+            if dir.join(filename).is_file() {
+                tracing::debug!(filename = %filename, "Found exact configuration file");
+                config_args = Some((filename.to_string(), ext.to_string()));
+                break;
+            }
+        }
+
+        // toml now wins over json deterministically, where the old fuzzy scan
+        // took whichever `read_dir` yielded first. That is the point of the
+        // fix, but it has a sharp edge worth saying out loud: `build()` writes
+        // `config.toml` unconditionally, so a `config.json` operator gets one
+        // created beside theirs on first boot and from then on their json is
+        // never read again. Silently preferring one of two present configs is
+        // the same invisible-config failure this fix exists to remove, so say
+        // which one won.
+        if matches!(config_args.as_ref(), Some((name, _)) if name == "config.toml")
+            && dir.join("config.json").is_file()
+        {
+            tracing::warn!(
+                "both config.toml and config.json are present in {}; loading config.toml \
+                 and IGNORING config.json. Remove whichever is not the one you edit.",
+                dir.display()
+            );
+        }
+
+        if config_args.is_none() {
+            let mut read_dir = std::fs::read_dir(dir)?;
+            config_args = read_dir.find_map(|e| {
+                if let Ok(e) = e {
+                    if e.path().is_dir() {
+                        return None;
+                    }
+                    let filename = e.file_name().to_string_lossy().into_owned();
+                    let ext = filename.rsplit('.').next().map(|s| s.to_owned());
+                    if let Some(ext) = ext {
+                        if filename.starts_with("config") {
+                            match ext.as_str() {
+                                "toml" => {
+                                    // `warn`, not `debug`: #5038 is about a
+                                    // config that is invisibly not the one you
+                                    // edited. Loading `config.bak.toml` because
+                                    // no `config.toml` exists is exactly that,
+                                    // and at debug level nobody sees it.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.toml if it is the one you edit."
+                                    );
+                                    return Some((filename, ext));
+                                }
+                                "json" => {
+                                    // Same reasoning as the `toml` arm above.
+                                    // A fuzzy-matched `config*.json` is just as
+                                    // invisibly-not-the-file-you-edited.
+                                    tracing::warn!(
+                                        filename = %filename,
+                                        "no exact config.toml/config.json found; falling back to this \
+                                         config* file. Rename it to config.json if it is the one you edit."
+                                    );
+                                    return Some((filename, ext));
+                                }
+                                _ => {}
                             }
-                            "json" => {
-                                return Some((filename, ext));
-                            }
-                            _ => {}
                         }
                     }
                 }
-            }
 
-            None
-        });
+                None
+            });
+        }
 
         match config_args {
             Some((filename, ext)) => {
@@ -708,11 +837,59 @@ impl ConfigArgs {
             }
         };
 
+        // Set when the config.toml merge below discards an auto-derivable
+        // `ws-api-address`; reported after resolution, and only if the bind
+        // actually narrowed. Also carries the address FAMILY forward, which the
+        // re-derivation must not change. See the merge site.
+        let mut dropped_persisted_wildcard: Option<IpAddr> = None;
+
+        // Captured BEFORE the merge below, because the merge folds a PERSISTED
+        // `allowed-source-cidrs` back into `self` and `build()` then persists
+        // whatever it resolves. Reading the merged value would make the
+        // auto-widen sticky: one boot with the flag would pin the node to the
+        // wildcard bind forever, and REMOVING the flag would never narrow it
+        // again — the hardening would permanently miss every node that ever set
+        // an allow-list. The address itself already gets exactly this
+        // treatment; the grant that widens it has to match.
+        let cidrs_granted_this_boot = self.ws_api.allowed_source_cidrs.clone();
+
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
             self.secrets.merge(cfg.secrets);
             self.mode.get_or_insert(cfg.mode);
-            self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            // GHSA-824h-7x5x-wfmf upgrade migration. `build()` persists the
+            // RESOLVED config, so every node that has ever booted in network
+            // mode already has the old auto-default written into its
+            // config.toml as a literal `ws-api-address`. A plain get_or_insert
+            // would merge that back and pin the whole existing fleet to the
+            // wildcard bind forever — the hardening would reach fresh installs
+            // only, which is no hardening at all.
+            //
+            // The sentinel is "a value this code could have written itself"
+            // (`is_auto_derivable_ws_api_address`), which is why it includes
+            // the loopback default and not just the wildcards: persisting the
+            // post-migration `::1` and then reading it back as an operator
+            // choice would permanently disable the auto-widen remedy the
+            // release note points people at. Any OTHER persisted value
+            // (`127.0.0.1`, a specific interface IP) this code never writes on
+            // its own, so it is an explicit choice and is preserved unchanged.
+            //
+            // CLI/env values are parsed into `self` BEFORE this merge, so
+            // `--ws-api-address ::` still wins on every boot. Accepted,
+            // release-note-worthy edge: an operator who hand-edited a wildcard
+            // into config.toml with no CLI flag and no allow-list is
+            // indistinguishable from the old auto-default and gets re-derived
+            // to loopback. The remedy is one flag.
+            if !is_auto_derivable_ws_api_address(cfg.ws_api.address) {
+                self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            } else if self.ws_api.address.is_none() {
+                // Only note it if the re-derivation actually CHANGES the bind.
+                // A node with an overlay/proxy grant drops the persisted
+                // wildcard here and auto-widens straight back to it, and
+                // announcing "ignoring your address" on every boot of a node
+                // whose bind never moved is how a log line gets tuned out.
+                dropped_persisted_wildcard = Some(cfg.ws_api.address);
+            }
             self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
             self.ws_api
                 .token_ttl_seconds
@@ -847,6 +1024,7 @@ impl ConfigArgs {
             // these are new fields, so a plain get_or_insert is correct.
             self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
             self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
+            self.hosting_mem_share.get_or_insert(cfg.hosting_mem_share);
             // #4968. `cfg.enable_event_log` is itself an Option, so an older
             // config.toml with no such key merges as `None` and leaves the
             // mode-dependent default intact rather than pinning `false`.
@@ -892,7 +1070,9 @@ impl ConfigArgs {
             if !cfg.telemetry.enabled {
                 self.telemetry.enabled = false;
             }
-            if self.telemetry.endpoint.is_none() {
+            if self.telemetry.endpoint.is_none()
+                && cfg.telemetry.endpoint != LEGACY_TELEMETRY_ENDPOINT
+            {
                 self.telemetry
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
@@ -911,6 +1091,17 @@ impl ConfigArgs {
             if cfg.telemetry.iface_tx_enabled {
                 self.telemetry.iface_tx_enabled = true;
             }
+            // Kept separate from the telemetry merge above on purpose: the two
+            // features are independent. Unlike reference-ping/iface-tx this
+            // merge is bidirectional — `--otel-telemetry-enabled=false` parses
+            // to `Some(false)` and must override a config.toml that says true.
+            self.otel.enabled.get_or_insert(cfg.otel.enabled);
+            if let Some(endpoint) = cfg.otel.endpoint {
+                self.otel.endpoint.get_or_insert(endpoint);
+            }
+            // Always emitted (non-Option in OtelConfig), so merge
+            // unconditionally; the CLI value still wins via get_or_insert.
+            self.otel.auth_mode.get_or_insert(cfg.otel.auth_mode);
         }
 
         // Validate the effective config (CLI + values merged from config.toml).
@@ -1207,6 +1398,34 @@ impl ConfigArgs {
             gateways = cli_gateways;
         }
 
+        // --- client (HTTP/WebSocket) API exposure ---------------------------
+        // Resolved before the `Config` literal so the bind address, the host
+        // allowlist and the hosted-mode flag are all in scope together: the
+        // exposure warning below needs all three, and the auto-widen decision
+        // needs to be logged, which a struct-literal field initializer cannot
+        // do cleanly.
+        let ws_api_allowed_hosts = self.ws_api.allowed_host.clone().unwrap_or_default();
+        let ws_api_hosted_mode = self.ws_api.hosted_mode.unwrap_or(false);
+        let (ws_api_address, ws_api_address_source) = resolve_ws_api_address(
+            mode,
+            self.ws_api.address,
+            cidrs_granted_this_boot.as_deref(),
+            dropped_persisted_wildcard,
+        );
+        // Recorded, NOT logged: `build()` runs before `set_logger`, so anything
+        // emitted here has no subscriber. `Config::log_client_api_exposure()`
+        // reports it after the subscriber exists. See `WsApiExposure`.
+        let ws_api_exposure = WsApiExposure {
+            source: ws_api_address_source,
+            // Recorded when the re-derivation actually MOVED the bind, in
+            // either direction; `log_client_api_exposure` picks the message
+            // from which way it went. A value that re-derives to itself (the
+            // steady state from boot 2 onward) is not reported at all, because
+            // re-announcing an unchanged bind every boot is how a log line gets
+            // tuned out.
+            dropped_persisted_address: dropped_persisted_wildcard
+                .filter(|persisted| *persisted != ws_api_address),
+        };
         let this = Config {
             mode,
             peer_id,
@@ -1266,12 +1485,7 @@ impl ConfigArgs {
                 skip_load_from_network: self.network_api.skip_load_from_network,
             },
             ws_api: WebsocketApiConfig {
-                address: {
-                    self.ws_api.address.unwrap_or_else(|| match mode {
-                        OperationMode::Local => default_local_address(),
-                        OperationMode::Network => default_listening_address(),
-                    })
-                },
+                address: ws_api_address,
                 port: self.ws_api.ws_api_port.unwrap_or(default_ws_api_port()),
                 token_ttl_seconds: self
                     .ws_api
@@ -1281,7 +1495,7 @@ impl ConfigArgs {
                     .ws_api
                     .token_cleanup_interval_seconds
                     .unwrap_or(default_token_cleanup_interval_seconds()),
-                allowed_hosts: self.ws_api.allowed_host.unwrap_or_default(),
+                allowed_hosts: ws_api_allowed_hosts,
                 allowed_source_cidrs: self
                     .ws_api
                     .allowed_source_cidrs
@@ -1304,7 +1518,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
-                hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
+                hosted_mode: ws_api_hosted_mode,
                 per_user_op_rate_limit: self
                     .ws_api
                     .per_user_op_rate_limit
@@ -1323,6 +1537,9 @@ impl ConfigArgs {
                 // Runtime-only: resolve the unpacked-webapp cache so the HTTP
                 // layer knows which directory its LRU sweep may delete from.
                 webapp_cache_dir: default_webapp_cache_dir(),
+                // Runtime-only: this boot's exposure decision, replayed by
+                // `Config::log_client_api_exposure()` once logging exists.
+                exposure: ws_api_exposure,
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1347,6 +1564,9 @@ impl ConfigArgs {
             max_hosting_disk: self
                 .max_hosting_disk
                 .unwrap_or(crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES),
+            hosting_mem_share: self
+                .hosting_mem_share
+                .unwrap_or(crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
@@ -1390,6 +1610,14 @@ impl ConfigArgs {
                 is_test_environment: self.id.is_some(),
                 reference_ping_enabled: self.telemetry.reference_ping_enabled,
                 iface_tx_enabled: self.telemetry.iface_tx_enabled,
+            },
+            otel: OtelConfig {
+                enabled: self.otel.enabled.unwrap_or(false),
+                endpoint: self.otel.endpoint,
+                auth_mode: self.otel.auth_mode.unwrap_or_default(),
+                // Same --id rule as telemetry: simulated networks and
+                // integration tests must not ship data to a collector.
+                is_test_environment: self.id.is_some(),
             },
         };
 
@@ -1554,6 +1782,11 @@ pub struct Config {
     /// operator override survives a flag-less restart.
     #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
     pub max_hosting_disk: u64,
+    /// Fraction (0.0-1.0) of the node's memory limit (cgroup-aware) that hosted
+    /// contracts may hold in RAM (#5647). Default 0.125 (1/8). Persisted so an
+    /// operator override survives a flag-less restart.
+    #[serde(default = "default_hosting_mem_share", rename = "hosting-mem-share")]
+    pub hosting_mem_share: f64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
     /// secret-value blobs + the `.keys` enumeration registry) under their
@@ -1625,15 +1858,32 @@ pub struct Config {
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+
+    /// OpenTelemetry SDK metrics exporter settings. Strictly isolated from
+    /// `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
+    #[serde(flatten)]
+    pub otel: OtelConfig,
+
     /// Maximum seconds to wait on graceful shutdown for in-flight
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
+    ///
+    /// Each op is waited for only until its own drain deadline: 60 s
+    /// (`OPERATION_TTL`) after it was admitted, pushed out by streaming
+    /// activity to whatever that phase's own liveness rule allows (240 s
+    /// of silence for a streaming PUT attempt, a GET stream claim while it
+    /// is pending, about 6 s between a GET stream's fragments) and to 60 s after a
+    /// streaming phase ends. An op past that deadline is retrying,
+    /// stalled, or waiting on a peer that never answered, and is not
+    /// waited for (#5838). Client UPDATE and SUBSCRIBE ops have no
+    /// streaming phase and get the 60 s window only. Every wait is still
+    /// bounded by this setting.
     ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
     /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
-    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// 45s in the generated unit (30s drain + 15s peer-teardown
     /// headroom) — raise both in lockstep if you raise this value;
     /// `TimeoutStopSec` is the hard ceiling at which systemd
     /// SIGKILLs the process.
@@ -1662,6 +1912,54 @@ pub struct Config {
 /// Default graceful-shutdown drain window.
 fn default_shutdown_drain_secs() -> u64 {
     30
+}
+
+/// Number of `Executor<Runtime>` workers the `RuntimePool` runs.
+///
+/// Reserve one logical core for the Tokio event loop and OS scheduling. WASM
+/// execution is CPU-bound, so the pool naturally can't exceed useful
+/// parallelism. Capped at 16 to stay well within the max_blocking_threads limit
+/// (see [`default_max_blocking_threads`]), preventing the executor pool from
+/// exhausting the blocking pool. `FREENET_RUNTIME_POOL_SIZE` overrides it
+/// (useful for tests).
+///
+/// This is CPU-derived, and `MemoryMax` does not constrain CPU count — a 20-core
+/// laptop inside a 2 GiB cgroup gets 16 workers. Anything sized PER WORKER must
+/// therefore compose its ceiling against the memory limit rather than assume the
+/// product is affordable (#5268 defect 3), which is why this lives here as one
+/// shared source: `RuntimePool::new` sizes the pool from it and the per-worker
+/// cache budgets divide by it.
+pub(crate) fn runtime_pool_size() -> NonZeroUsize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
+    let override_value = std::env::var(RUNTIME_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    resolve_pool_size(cores, override_value)
+}
+
+/// Env var overriding [`runtime_pool_size`] (useful for tests).
+const RUNTIME_POOL_SIZE_ENV: &str = "FREENET_RUNTIME_POOL_SIZE";
+
+/// Upper bound on the executor pool, keeping it well within
+/// [`default_max_blocking_threads`].
+const MAX_RUNTIME_POOL_SIZE: usize = 16;
+
+/// Pure clamp math behind [`runtime_pool_size`], split out so its boundaries are
+/// unit-testable without mutating the process-global environment (which would
+/// race every other test in the binary) or depending on the test host's core
+/// count.
+///
+/// `cores` is `None` when the OS cannot report parallelism; `override_value` is
+/// the parsed env var when set.
+fn resolve_pool_size(cores: Option<usize>, override_value: Option<usize>) -> NonZeroUsize {
+    let from_cores = cores
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .clamp(1, MAX_RUNTIME_POOL_SIZE);
+    let resolved = override_value
+        .map(|n| n.clamp(1, MAX_RUNTIME_POOL_SIZE))
+        .unwrap_or(from_cores);
+    NonZeroUsize::new(resolved).expect("clamped to at least 1")
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
@@ -1695,6 +1993,14 @@ fn default_hosting_disk_pct() -> f64 {
 /// [`crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES`] (32 GiB).
 fn default_max_hosting_disk() -> u64 {
     crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
+}
+
+/// Default fraction of the node's memory limit that hosted contracts may hold
+/// in RAM (#5647): resolves to
+/// [`crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`] (0.125), the single
+/// source of truth shared with the sizing math.
+fn default_hosting_mem_share() -> f64 {
+    crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
 }
 
 /// `skip_serializing_if` predicate for [`Config::max_hosting_storage`]: true
@@ -1752,6 +2058,132 @@ impl Config {
     pub fn paths(&self) -> Arc<ConfigPaths> {
         self.config_paths.clone()
     }
+
+    /// Report how the client (HTTP/WebSocket) API's exposure was decided.
+    ///
+    /// **Call this AFTER [`set_logger`].** These messages cannot live in
+    /// `ConfigArgs::build()`, which runs before the global tracing subscriber
+    /// is installed: emitted there they would be silently dropped, and the
+    /// operator whose LAN clients just stopped connecting would get no
+    /// explanation at all. `build()` records the decision on
+    /// [`WebsocketApiConfig::exposure`] and this replays it.
+    ///
+    /// Three independent things get reported, in the order an operator needs
+    /// them: what changed for this node, why the bind is wide if it is, and
+    /// whether the resulting exposure is dangerous.
+    pub fn log_client_api_exposure(&self) {
+        let address = self.ws_api.address;
+
+        // These three were UNNAMESPACED (`WS_API_ADDRESS`, `ALLOWED_HOST`,
+        // `ALLOWED_SOURCE_CIDRS`) until GHSA-824h-7x5x-wfmf. That was survivable
+        // while a network-mode node bound `::` anyway and they only shaped which
+        // Host headers it accepted; it is not now that `--ws-api-address`
+        // decides the socket directly, at the highest precedence, and
+        // `--allowed-source-cidrs` decides whether it is wide. A stray value in
+        // a shared container, CI runner or systemd environment could open the
+        // API. They are namespaced, and a leftover old-style variable is
+        // REPORTED rather than ignored — otherwise a working deployment goes
+        // loopback-only with no explanation.
+        for (legacy, replacement) in [
+            ("WS_API_ADDRESS", "FREENET_WS_API_ADDRESS"),
+            ("ALLOWED_HOST", "FREENET_ALLOWED_HOST"),
+            ("ALLOWED_SOURCE_CIDRS", "FREENET_ALLOWED_SOURCE_CIDRS"),
+        ] {
+            if std::env::var_os(legacy).is_some() && std::env::var_os(replacement).is_none() {
+                tracing::warn!(
+                    legacy,
+                    replacement,
+                    "The environment variable `{legacy}` is no longer read (it was \
+                     unnamespaced, and it can now decide whether the client API listens \
+                     beyond this machine). Rename it to `{replacement}`."
+                );
+            }
+        }
+        // These two branches report the SAME event — a persisted address was
+        // dropped and re-derived — in the two directions it can go. They are
+        // deliberately separate messages rather than one message plus a filter,
+        // and the history is worth keeping.
+        //
+        // An earlier cut emitted only the narrowing text and fired it whenever
+        // anything was dropped, so a node that dropped a loopback value and then
+        // auto-widened printed "clients on other machines can no longer reach
+        // this node" directly above "bound to all interfaces". The fix applied to
+        // that contradiction was to SUPPRESS the first line for the widening
+        // case — which silenced the only notice that a node someone had pinned
+        // to loopback was now listening on every interface, and that widening
+        // then went unnoticed through two further rounds of review.
+        //
+        // The lesson, because the next person to hit a noisy contradiction will
+        // reach for the same fix: a contradictory pair of log lines is evidence
+        // that the code does two DIFFERENT things on one path. Make each message
+        // say which one happened. Never silence one of them — the branch you
+        // suppress is the one nobody will hear about again.
+        if let Some(persisted) = self.ws_api.exposure.dropped_persisted_address {
+            if address.is_loopback() {
+                // warn!, not info!: this fires on ONE boot and never again (from
+                // boot 2 the persisted value re-derives to itself and is not
+                // reported). For a remote gateway whose operator finds out days
+                // later when a client fails, this line is the whole
+                // explanation, so it must not rank below the exposure warning
+                // that fires for the comparatively safe case.
+                tracing::warn!(
+                    %persisted,
+                    resolved = %address,
+                    "The client API now defaults to loopback, so the `ws-api-address` \
+                     previously auto-written to config.toml has been re-derived. Clients \
+                     on OTHER machines can no longer reach this node's API. If they \
+                     should, add --ws-api-address :: to the node's invocation and KEEP it \
+                     there — a value only persisted in config.toml is not enough, because \
+                     this code cannot tell its own past output from your choice. On a \
+                     systemd install add it with `systemctl edit` as a drop-in; do not \
+                     hand-edit the generated unit, which marks it user-modified and opts \
+                     this node out of future unit updates."
+                );
+            } else {
+                // The opposite direction, and the one a hardening change owes an
+                // operator loudly: their config named a LOOPBACK address, and we
+                // dropped it (this code writes that value itself, so it cannot be
+                // told from an operator's choice) and then widened on the CIDR
+                // grant. The socket is more exposed than the config it replaced.
+                tracing::warn!(
+                    %persisted,
+                    resolved = %address,
+                    "The loopback `ws-api-address` in config.toml was re-derived — this \
+                     code writes that value itself, so it cannot be distinguished from a \
+                     deliberate pin — and --allowed-source-cidrs then widened the bind. \
+                     The client API is now reachable from OTHER machines, which the \
+                     config file alone said it should not be. Pass --ws-api-address \
+                     explicitly to pin it either way."
+                );
+            }
+        }
+        if self.ws_api.exposure.source == WsApiAddressSource::AutoWidened {
+            tracing::info!(
+                %address,
+                "Client API bound to all interfaces because --allowed-source-cidrs is \
+                 set, preserving an invocation that relied on the old network-mode \
+                 default (that flag is inert on a loopback socket). The default is now \
+                 loopback; pass --ws-api-address explicitly to override this either \
+                 way, and keep the flag in the invocation — a grant left only in \
+                 config.toml does not widen a later boot."
+            );
+        }
+        if let Some(reason) = ws_api_shares_one_namespace_with_remote_clients(
+            self.ws_api.hosted_mode,
+            address,
+            &self.ws_api.allowed_hosts,
+        ) {
+            tracing::warn!(
+                %address,
+                allowed_hosts = ?self.ws_api.allowed_hosts,
+                hosted_mode = self.ws_api.hosted_mode,
+                "Client API exposure: {reason}. A connection that presents no per-user \
+                 token drives this node's SHARED namespace and can read and modify its \
+                 contract state, identities and keys. Bind loopback \
+                 (--ws-api-address ::1) unless you intend this."
+            );
+        }
+    }
 }
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
@@ -1791,16 +2223,17 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub is_gateway: bool,
 
-    /// Skip fetching the remote gateway index. The on-disk gateways.toml
-    /// cache is also skipped in two cases: (1) the node is a gateway
-    /// (--is-gateway), which always runs isolated under this flag (any
-    /// --gateways JSON entries are still honored); (2) an explicit
-    /// --gateway CLI entry is supplied, in which case the CLI entries
-    /// (plus any --gateways JSON entries) REPLACE the on-disk cache.
-    /// Otherwise — non-gateway peer with no --gateway CLI entry — the
-    /// on-disk gateways.toml is still read (and merged with any
-    /// --gateways JSON), preserving the contract used by test harnesses
-    /// (e.g. freenet-test-network) that pre-populate it via --config-dir.
+    /// Skip fetching the remote gateway index.
+    ///
+    /// The on-disk gateways.toml cache is also skipped in two cases: when the
+    /// node is a gateway (`--is-gateway`), which always runs isolated under this
+    /// flag, and when an explicit `--gateway` entry is supplied, in which case
+    /// the command-line entries replace the cache. A non-gateway peer with no
+    /// `--gateway` entry still reads gateways.toml.
+    // Any hidden `--gateways` JSON entries are honored in all three cases, and
+    // merged with the cache in the last one. That last case preserves the
+    // contract test harnesses rely on (e.g. freenet-test-network), which
+    // pre-populate gateways.toml via `--config-dir`.
     #[arg(long)]
     pub skip_load_from_network: bool,
 
@@ -1823,16 +2256,16 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub ignore_protocol_checking: bool,
 
-    /// Bandwidth limit for large streaming data transfers (in bytes per second).
-    /// NOTE: This only applies to the send_stream mechanism for large data transfers.
-    /// The general packet rate limiter is currently disabled due to reliability issues.
-    /// Default: 3 MB/s (3,000,000 bytes/second)
+    /// Bandwidth limit for large streaming data transfers, in bytes per second.
+    /// Applies only to the streaming path used for large transfers; the general
+    /// packet rate limiter is currently disabled for reliability reasons.
+    /// Default: 3 MB/s (3,000,000 bytes/second).
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across ALL connections (in bytes per second).
-    /// When set, individual connection rates are computed as: total / active_connections.
-    /// This overrides the per-connection bandwidth_limit.
+    /// Total bandwidth limit across all connections, in bytes per second. Each
+    /// connection is allowed total / active_connections. Overrides the
+    /// per-connection `--bandwidth-limit`.
     #[arg(long)]
     #[serde(
         rename = "total-bandwidth-limit",
@@ -2282,11 +2715,28 @@ fn default_bbr_startup_rate() -> Option<u64> {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
-    /// Address to bind to for the websocket API, default is :: (dual-stack)
+    /// Address to bind for the local HTTP/WebSocket client API.
+    ///
+    /// Defaults to loopback (`::1`, plus a `127.0.0.1` companion bind) in both
+    /// operation modes, since running as a network peer says nothing about
+    /// wanting this node's fully privileged control API reachable from other
+    /// machines. Pass `::`, or a specific interface address, to serve clients on
+    /// other hosts, and keep the flag in the node's invocation: a value left
+    /// only in config.toml is re-derived on the next boot.
+    ///
+    /// In network mode `--allowed-source-cidrs` widens this bind on its own,
+    /// because it is inert on a loopback socket and so can only have been set by
+    /// someone expecting non-local clients. `--allowed-host` does not widen it:
+    /// that is a Host-header allowlist, and it works on loopback, where a
+    /// same-host reverse proxy lives. A reverse proxy on a different host needs
+    /// this flag too.
+    ///
+    /// Security: anything that can reach this address and port can read and
+    /// modify your contract state, identities and keys.
     #[arg(
         name = "ws_api_address",
         long = "ws-api-address",
-        env = "WS_API_ADDRESS"
+        env = "FREENET_WS_API_ADDRESS"
     )]
     #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
@@ -2311,30 +2761,40 @@ pub struct WebsocketApiArgs {
 
     /// Additional hostname(s) to accept in the Host header for the local
     /// HTTP/WebSocket API (including the delegate permission-prompt
-    /// endpoints `/permission/pending`, `/permission/events`, and
+    /// endpoints `/permission/pending`, `/permission/events`,
+    /// `/permission/events/ws`, and
     /// `/permission/{nonce}/respond`).
     /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
     /// Can be specified multiple times. If omitted, only the machine's hostname and
     /// bound IP are accepted.
-    #[arg(long, env = "ALLOWED_HOST")]
+    #[arg(long, env = "FREENET_ALLOWED_HOST")]
     #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,
 
-    /// Additional source IP ranges (CIDR notation) permitted to reach the
+    /// Additional source IP ranges, in CIDR notation, allowed to reach the
     /// local HTTP/WebSocket API.
     ///
-    /// By default, only loopback and RFC1918 / IPv6 ULA ranges are accepted.
-    /// Use this to grant access from VPN overlays you control (e.g. Tailscale:
-    /// `--allowed-source-cidrs 100.64.0.0/10`). Can be specified multiple times.
+    /// This flag does two things, and the first is easy to miss:
     ///
-    /// SECURITY: Only add ranges you fully control. CGNAT space like
+    /// 1. Without `--ws-api-address`, in network mode, it binds the API to all
+    ///    interfaces. The source filter it relaxes never runs on a loopback
+    ///    socket, so the flag would otherwise do nothing.
+    /// 2. It then accepts the ranges named here on top of loopback and all of
+    ///    RFC1918 and IPv6 ULA, which are always accepted. It never narrows
+    ///    access: this is not an "only these sources" allowlist.
+    ///
+    /// So `--allowed-source-cidrs 100.64.0.0/10` on its own means: listen on
+    /// every interface, accept your entire local network, and accept that range
+    /// as well. Pass `--ws-api-address` too to keep the bind under your control.
+    ///
+    /// Security: only add ranges you fully control. CGNAT space such as
     /// `100.64.0.0/10` is shared between subscribers of some ISPs (Starlink,
-    /// T-Mobile, many cable carriers) and is only safe on an overlay network
-    /// such as Tailscale or WireGuard. Anything that can reach the API port
-    /// can access your contract state, keys, and client API.
+    /// T-Mobile, many cable carriers) and is safe only on an overlay network
+    /// such as Tailscale or WireGuard. Anything that can reach the API port can
+    /// access your contract state, keys, and client API.
     #[arg(
         long = "allowed-source-cidrs",
-        env = "ALLOWED_SOURCE_CIDRS",
+        env = "FREENET_ALLOWED_SOURCE_CIDRS",
         value_delimiter = ','
     )]
     #[serde(
@@ -2343,60 +2803,60 @@ pub struct WebsocketApiArgs {
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
 
-    /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
-    /// token (the `userToken` query parameter on the WebSocket upgrade) and
-    /// give that connection its own per-user delegate-secret namespace.
+    /// Opt in to hosted mode, off by default: honor the durable `userToken`
+    /// query parameter on the WebSocket upgrade and give each token its own
+    /// delegate-secret namespace. Turn it on only for a node you intend to
+    /// operate as a shared public proxy for untrusted users.
     ///
-    /// OFF by default. When off, `userToken` is ignored and every connection is
-    /// single-user, byte-for-byte today's behavior. Enable only on a node you
-    /// intend to operate as a shared public proxy for untrusted users.
+    /// While it is off, `userToken` is ignored and every connection is
+    /// single-user.
     ///
-    /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
-    /// hosted mode on, the durable `userToken` is honored ONLY over a **loopback**
-    /// connection carrying `X-Forwarded-Proto: https` — i.e. behind a
-    /// TLS-terminating reverse proxy colocated on the same host. The loopback
-    /// source proves the proxy→node hop is local; the `https` XFP is positive
-    /// evidence (set by the TLS terminator) that the browser→proxy hop used TLS.
+    /// Even with hosted mode on, a `userToken` is honored only on a loopback
+    /// connection carrying `X-Forwarded-Proto: https`, which means a
+    /// TLS-terminating reverse proxy on the same host. The loopback source shows
+    /// the proxy-to-node hop is local, and the `https` header is the TLS
+    /// terminator's evidence that the browser-to-proxy hop used TLS. Two cases
+    /// are refused with a `403`: any non-loopback source, whatever headers it
+    /// sends, and a loopback source without `X-Forwarded-Proto: https`, so a
+    /// plaintext loopback connection is refused too.
     ///
-    /// Everything else is **rejected** with `403` (fail-closed): a non-loopback
-    /// source, OR a loopback source without `X-Forwarded-Proto: https` (header
-    /// missing or `http`). A direct plaintext connection — even loopback — is
-    /// refused. `Host` is deliberately NOT consulted: it is proxy-rewritable
-    /// (nginx's default rewrites it to the upstream `127.0.0.1:7509`), so it
-    /// cannot grant trust; only the `https` XFP can.
+    /// The `Host` header plays no part in that decision, so `--allowed-host`
+    /// cannot make a token acceptable. It still governs which origins the node
+    /// accepts requests from, so it remains relevant to a hosted node's attack
+    /// surface.
     ///
-    /// OPERATOR NOTE (REQUIRED proxy config): front the node with a
-    /// TLS-terminating reverse proxy on the SAME host that connects over
-    /// loopback. The proxy MUST (a) SET / OVERWRITE `X-Forwarded-Proto` itself to
-    /// the real browser→proxy scheme, AND (b) STRIP any client-supplied
-    /// `X-Forwarded-*` headers, so a client cannot forge the TLS attestation.
-    /// Caddy does both by default. nginx requires
-    /// `proxy_set_header X-Forwarded-Proto $scheme;` (a literal `https` is fine
-    /// for an HTTPS-only server block) and must NOT pass through a client-supplied
-    /// `X-Forwarded-Proto` — nginx forwards unknown client headers by default, so
-    /// the explicit `proxy_set_header` overwrite is what stops pass-through.
+    /// Required proxy configuration: run a TLS-terminating reverse proxy on the
+    /// same host, connecting to the node over loopback. The proxy has to set
+    /// `X-Forwarded-Proto` itself to the real browser-facing scheme, and strip
+    /// any `X-Forwarded-*` headers the client sent, so that a client cannot
+    /// forge the TLS attestation. Caddy does both by default. nginx forwards
+    /// unknown client headers through by default, so it needs
+    /// `proxy_set_header X-Forwarded-Proto $scheme;`, which both sets the header
+    /// and stops the client's own copy being passed through. A literal `https`
+    /// works there too if the server block is HTTPS-only.
     ///
-    /// SECURITY NOTE (known limitation): the node trusts `X-Forwarded-Proto` from
-    /// a loopback source and cannot tell a header the proxy SET from one it merely
-    /// PASSED THROUGH from the client. If the proxy is misconfigured to forward a
-    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener, a
-    /// client could spoof it and the token would be honored over cleartext. The
-    /// node cannot detect this pass-through misconfiguration; correct proxy
-    /// configuration is the operator's responsibility.
+    /// Known limitation: the node cannot tell an `X-Forwarded-Proto` the proxy
+    /// set from one it passed through. A proxy misconfigured to forward a
+    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener
+    /// would let a client spoof it and use a token over cleartext. Configuring
+    /// the proxy correctly is the operator's responsibility.
     ///
-    /// A developer testing hosted mode locally must likewise front it with a TLS
-    /// proxy or send the header (`curl -H 'X-Forwarded-Proto: https'` from
-    /// loopback) — a plain plaintext loopback request is refused. A TLS terminator
-    /// on a **different** host (remote load balancer) is not supported today (its
-    /// source is not loopback) and would need future explicit trusted-proxy-IP
-    /// config.
+    /// Testing hosted mode locally needs the same setup, or the header sent by
+    /// hand (`curl -H 'X-Forwarded-Proto: https'` from loopback). A TLS
+    /// terminator on a different host, such as a remote load balancer, is not
+    /// supported, because its source address is not loopback.
     ///
-    /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
-    /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
-    /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as
-    /// `Option<bool>` (not a plain `bool` with `default_value`) so config-file /
-    /// env layering can still leave it unset (`None`) and the CLI only overrides
-    /// when actually present — `None` is then resolved to `false` in `build`.
+    /// Works as a bare flag: `--hosted-mode` turns it on, `--hosted-mode=false`
+    /// turns it off, and leaving it out keeps whatever the config file or
+    /// environment set.
+    // Internal (P2 of #4381, refuse-plaintext-token): `Host` is not consulted
+    // because a proxy can rewrite it (nginx's default rewrites it to the
+    // upstream `127.0.0.1:7509`), so it cannot grant trust; only the
+    // `X-Forwarded-Proto` header can.
+    //
+    // Kept as `Option<bool>` rather than a `bool` with `default_value` so
+    // config-file and env layering can leave it unset (`None`) and the CLI only
+    // overrides when actually present. `None` resolves to `false` in `build`.
     #[arg(
         long = "hosted-mode",
         env = "FREENET_HOSTED_MODE",
@@ -2406,29 +2866,30 @@ pub struct WebsocketApiArgs {
     #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
 
-    /// Sustained per-user operation rate limit (requests/second) for HOSTED
-    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user (one
-    /// `userToken`) can issue contract operations (GET/PUT/UPDATE/SUBSCRIBE) so
-    /// one visitor cannot flood the node's executor and network. Over-rate
-    /// requests are REJECTED at the WebSocket boundary (the client retries).
-    /// Default: 10 req/sec. `0` disables operation rate limiting. Has NO effect
-    /// outside hosted mode — local single-user requests are never rate-limited.
+    /// Sustained per-user operation rate limit, in requests per second, for
+    /// hosted mode. Limits how fast one hosted user (one `userToken`) can issue
+    /// contract operations (GET, PUT, UPDATE, SUBSCRIBE), so a single visitor
+    /// cannot flood the node's executor and network. Requests over the rate are
+    /// refused at the WebSocket boundary and the client retries. Default: 10.
+    /// Use `0` to disable. Ignored outside hosted mode.
+    // Internal: #4561, P5 of #4381.
     #[arg(long = "per-user-op-rate-limit", env = "PER_USER_OP_RATE_LIMIT")]
     pub per_user_op_rate_limit: Option<u64>,
 
-    /// Per-user operation burst capacity for HOSTED mode (#4561). The maximum
-    /// number of operations a user who has been idle can issue back-to-back
-    /// before being throttled to the sustained `--per-user-op-rate-limit`.
-    /// Default: 100. Paired with the rate limit above; only meaningful when
-    /// op rate limiting is enabled.
+    /// Per-user operation burst capacity for hosted mode: how many operations an
+    /// idle user can issue back to back before being throttled to
+    /// `--per-user-op-rate-limit`. Default: 100. Only meaningful when operation
+    /// rate limiting is on.
+    // Internal: #4561.
     #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
     pub per_user_op_burst: Option<u64>,
 
-    /// Minimum seconds between hosted-export downloads PER USER (#4561). The
-    /// export endpoint enumerates and re-encrypts every secret in the user's
-    /// scope, so it is far more expensive than a single op and gets a separate,
-    /// tighter limit. A request inside this window returns HTTP 429. Default:
-    /// 10s. `0` disables export rate limiting. Hosted-mode only.
+    /// Minimum seconds between hosted-export downloads, per user. The export
+    /// endpoint enumerates and re-encrypts every secret in the user's scope, so
+    /// it is far more expensive than a single operation and gets its own,
+    /// tighter limit. A request inside this window returns HTTP 429.
+    /// Default: 10. Use `0` to disable. Hosted mode only.
+    // Internal: #4561.
     #[arg(
         long = "per-user-export-min-interval-secs",
         env = "PER_USER_EXPORT_MIN_INTERVAL_SECS"
@@ -2436,14 +2897,39 @@ pub struct WebsocketApiArgs {
     pub per_user_export_min_interval_secs: Option<u64>,
 }
 
-/// Default telemetry endpoint (nova.locut.us OTLP collector).
-/// Using domain name for resilience to IP changes.
-pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
+/// Default telemetry endpoint (telemetry.freenet.org OTLP collector).
+/// Using domain name for resilience to IP changes. Deliberately the
+/// telemetry role name, not a gateway name (gw1/gw2.freenet.org) — coupling
+/// this to a gateway's name would drag the telemetry default along with any
+/// future gateway host move.
+///
+/// NOTE: every binary released before this change has the OLD default
+/// (`nova.locut.us:4318`) baked in and will keep sending telemetry there for
+/// as long as it runs. That DNS record must stay resolving to the collector
+/// indefinitely — changing this default does not retroactively update
+/// already-deployed peers, only builds made after this merges.
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://telemetry.freenet.org:4318";
+
+/// The endpoint `DEFAULT_TELEMETRY_ENDPOINT` used before 2026-09.
+///
+/// `build()` PERSISTS the resolved telemetry endpoint into `config.toml`, and
+/// the file value is merged back on every start — so without this sentinel an
+/// existing node keeps the old endpoint forever, even after auto-updating, and
+/// the change would reach FRESH INSTALLS ONLY. Same failure mode and same
+/// remedy as `LEGACY_FLAT_HOSTING_BUDGET_BYTES` above.
+///
+/// A FILE value equal to this exact string is treated as auto-derived rather
+/// than an operator choice, so it re-derives to the current default. An
+/// explicit `--telemetry-endpoint` or env var is parsed into `self` BEFORE the
+/// file merge and still wins, including if an operator genuinely wants this
+/// value.
+pub const LEGACY_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryArgs {
-    /// Enable telemetry reporting to help improve Freenet (default: true during alpha).
-    /// Telemetry includes operation timing and network topology data, but never contract content.
+    /// Send telemetry to help improve Freenet. On by default during alpha.
+    /// It covers operation timing and network topology. Contract content is
+    /// never included.
     #[arg(
         long = "telemetry-enabled",
         env = "FREENET_TELEMETRY_ENABLED",
@@ -2469,13 +2955,12 @@ pub struct TelemetryArgs {
     )]
     pub transport_snapshot_interval_secs: Option<u64>,
 
-    /// Enable the Phase 1.5 reference-ping shadow probe (#4074): a 1Hz
-    /// UDP DNS query to a fixed external target (default 1.1.1.1:53)
-    /// whose RTT is recorded alongside the per-peer overlay RTT so the
-    /// collector can disentangle overlay queueing from local uplink
-    /// contention. Opt-in: defaults to false. Production gateway
-    /// configs set this to true; developer machines and integration
-    /// tests leave it off so they don't fire DNS traffic from CI.
+    /// Send a reference ping once a second: a UDP DNS query to a fixed external
+    /// target (1.1.1.1:53 by default) whose round-trip time is recorded next to
+    /// the per-peer overlay RTT, so overlay queueing can be told apart from
+    /// local uplink contention. Off by default; production gateways turn it on.
+    // Internal (Phase 1.5 of #4074): stays off on developer machines and in
+    // integration tests so CI does not fire DNS traffic.
     #[arg(
         long = "reference-ping-enabled",
         env = "FREENET_REFERENCE_PING_ENABLED",
@@ -2487,13 +2972,14 @@ pub struct TelemetryArgs {
     )]
     pub reference_ping_enabled: bool,
 
-    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074): a 1Hz
-    /// read of `/proc/net/dev` (Linux) that emits aggregate interface tx
-    /// bytes and the derived `op = total - freenet_own` so the floor
-    /// analysis can attribute uplink saturation to Freenet vs the
-    /// operator's other traffic. Best-effort and opt-in: defaults to
-    /// false; production gateway configs set this to true. Like
-    /// reference-ping, it stays off on developer machines and in tests.
+    /// Report interface transmit totals once a second by reading
+    /// `/proc/net/dev` on Linux, along with how much of that traffic is not
+    /// Freenet's own, so uplink saturation can be attributed to Freenet or to
+    /// the operator's other traffic. Best-effort, and off by default;
+    /// production gateways turn it on.
+    // Internal (Phase 1.6 of #4074): emits aggregate tx bytes and the derived
+    // `op = total - freenet_own`. Like reference-ping, it stays off on
+    // developer machines and in tests.
     #[arg(
         long = "iface-tx-enabled",
         env = "FREENET_IFACE_TX_ENABLED",
@@ -2575,6 +3061,110 @@ fn default_iface_tx_enabled() -> bool {
     false
 }
 
+/// How the OTel exporter authenticates to the collector.
+///
+/// `freenet` sends a per-request `Authorization: Bearer
+/// freenet/<pubkey>/<audience>/<timestamp>/<signature>` token — an XEdDSA
+/// signature over the preceding fields, signed with the node's x25519
+/// transport secret — see `tracing::otel::bearer_token`. Future methods get
+/// new variants.
+///
+/// `disabled` is the DEFAULT and sends no `Authorization` header: pointing the
+/// exporter at your own collector must not ship a signed assertion of this
+/// node's identity somewhere it was never asked to. Operators exporting to a
+/// collector that verifies freenet tokens opt in explicitly; anyone else
+/// carries their own auth in `OTEL_EXPORTER_OTLP_HEADERS`, which the exporter
+/// never overwrites.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelAuthMode {
+    Freenet,
+    #[default]
+    Disabled,
+}
+
+/// CLI/file args for the OpenTelemetry SDK metrics exporter.
+///
+/// Strictly independent of [`TelemetryArgs`]: no shared field, no shared
+/// default, no fallback in either direction.
+#[derive(clap::Parser, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelArgs {
+    /// Enable the OpenTelemetry SDK metrics exporter. Independent of
+    /// `telemetry-enabled`; enabling or disabling one has no effect on the
+    /// other.
+    ///
+    /// `num_args`/`default_missing_value` rather than a bare flag: with an
+    /// `env` binding, clap's `SetTrue` action treats ANY value of the variable
+    /// as true, so `FREENET_OTEL_TELEMETRY_ENABLED=false` would silently turn
+    /// the exporter ON. This form accepts `--otel-telemetry-enabled`,
+    /// `--otel-telemetry-enabled=false`, and a properly parsed env value.
+    ///
+    /// `Option` and NO `default_value`, unlike the sibling telemetry flags:
+    /// with a default, "unset" and "explicitly false" are indistinguishable
+    /// after parsing, so `build()` cannot let `--otel-telemetry-enabled=false`
+    /// override a `config.toml` that says true — i.e. the off switch would not
+    /// work. `None` means "not given"; `build()` resolves it to `false`.
+    #[arg(
+        id = "otel_telemetry_enabled",
+        long = "otel-telemetry-enabled",
+        env = "FREENET_OTEL_TELEMETRY_ENABLED",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    #[serde(
+        rename = "otel-telemetry-enabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
+
+    /// OTLP/HTTP collector base URL (e.g. `http://collector:4318`).
+    ///
+    /// No clap `env =` binding on purpose. The standard
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
+    /// variables must take priority over this file-level value, and binding
+    /// them here would merge them into the config layer and invert that
+    /// precedence. They are resolved in `tracing::otel` instead.
+    #[arg(id = "otel_endpoint", long = "otel-endpoint")]
+    #[serde(rename = "otel-endpoint", skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Collector authentication method. `Option` so `build()` can tell "not
+    /// given on the CLI" from an explicit choice and merge the config-file
+    /// value; resolves to [`OtelAuthMode::default`] (`disabled`) when neither
+    /// sets it.
+    #[arg(id = "otel_auth_mode", long = "otel-auth-mode", value_enum)]
+    #[serde(rename = "otel-auth-mode", skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<OtelAuthMode>,
+}
+
+/// Resolved configuration for the OpenTelemetry SDK metrics exporter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelConfig {
+    /// Whether the SDK metrics exporter is enabled.
+    #[serde(default, rename = "otel-telemetry-enabled")]
+    pub enabled: bool,
+
+    /// Operator-configured OTLP/HTTP collector base URL, if any. `None` means
+    /// "let the SDK resolve it" — see `tracing::otel::resolve_metrics_endpoint`.
+    #[serde(
+        default,
+        rename = "otel-endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub endpoint: Option<String>,
+
+    /// Collector authentication method.
+    #[serde(default, rename = "otel-auth-mode")]
+    pub auth_mode: OtelAuthMode,
+
+    /// Whether this is a test environment (detected via `--id`). Mirrors
+    /// [`TelemetryConfig::is_test_environment`]; suppresses export so test
+    /// networks can't ship data to a collector.
+    #[serde(skip)]
+    pub is_test_environment: bool,
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -2591,7 +3181,12 @@ impl Default for TelemetryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiConfig {
     /// Address to bind to
-    #[serde(default = "default_listening_address", rename = "ws-api-address")]
+    /// The serde fallback is LOOPBACK, matching `resolve_ws_api_address`: a
+    /// `WebsocketApiConfig` deserialized outside `ConfigArgs::build()` must not
+    /// land on a wildcard listener just because the key was absent
+    /// (GHSA-824h-7x5x-wfmf). Inside `build()` either value is re-derived
+    /// anyway — both are `is_auto_derivable_ws_api_address`.
+    #[serde(default = "default_local_address", rename = "ws-api-address")]
     pub address: IpAddr,
 
     /// Port to expose api on
@@ -2672,6 +3267,16 @@ pub struct WebsocketApiConfig {
     #[serde(skip)]
     pub secrets_dir: std::path::PathBuf,
 
+    /// How this boot decided the client API's exposure. RUNTIME-ONLY
+    /// (`#[serde(skip)]`, same reason as `secrets_dir` above): it describes a
+    /// resolution, not operator-authored TOML.
+    ///
+    /// Populated by `ConfigArgs::build()` and reported by
+    /// [`Config::log_client_api_exposure`]. It is carried rather than logged
+    /// in place because `build()` runs before the tracing subscriber exists.
+    #[serde(skip)]
+    pub exposure: WsApiExposure,
+
     /// Directory holding unpacked web-contract bundles, derived in `build()`
     /// (see [`default_webapp_cache_dir`]). Runtime-only for the same reason as
     /// `secrets_dir` above: it is a resolved path, not operator-authored TOML.
@@ -2700,8 +3305,8 @@ pub struct WebsocketApiConfig {
     /// themselves, because both are real user-facing modes rather than test
     /// scaffolding:
     ///
-    /// - `HttpClientApi::as_router`, which `server::local_node::run_local_node`
-    ///   serves through. Its signature is public API and takes no cache root.
+    /// - `HttpClientApi::as_router`, the direct router-composition entry point.
+    ///   Its signature is public API and takes no cache root.
     /// - `WebsocketApiConfig::default()` / `From<SocketAddr>`, the fallback for
     ///   any serving config not produced by `build()`.
     ///
@@ -2822,6 +3427,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
             webapp_cache_dir: default_webapp_cache_dir(),
+            exposure: WsApiExposure::default(),
         }
     }
 }
@@ -2830,7 +3436,11 @@ impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_listening_address(),
+            // Loopback, matching `resolve_ws_api_address`'s default: a caller
+            // that composes this config without going through
+            // `ConfigArgs::build()` gets the safe bind rather than silently
+            // inheriting a wildcard listener (GHSA-824h-7x5x-wfmf).
+            address: default_local_address(),
             port: default_ws_api_port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
@@ -2842,6 +3452,7 @@ impl Default for WebsocketApiConfig {
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
             webapp_cache_dir: default_webapp_cache_dir(),
+            exposure: WsApiExposure::default(),
         }
     }
 }
@@ -2855,6 +3466,235 @@ const fn default_listening_address() -> IpAddr {
 #[inline]
 const fn default_local_address() -> IpAddr {
     IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
+/// How [`resolve_ws_api_address`] arrived at the client-API bind address.
+///
+/// Carried on the resolved [`WebsocketApiConfig`] rather than logged inline,
+/// because `build()` runs BEFORE the global tracing subscriber is installed.
+/// See [`WsApiExposure`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WsApiAddressSource {
+    /// The operator named an address (`--ws-api-address`, `FREENET_WS_API_ADDRESS`, or
+    /// a `ws-api-address` key in `config.toml` that this code could not itself
+    /// have written). Used verbatim.
+    ///
+    /// The default for a `WebsocketApiConfig` composed directly (tests, the
+    /// standalone server paths): such a caller always names its own address.
+    #[default]
+    Explicit,
+    /// No address given and nothing configured that only makes sense for a
+    /// non-local listener: loopback (`::1`, plus its `127.0.0.1` companion).
+    DefaultLoopback,
+    /// No address given, but in NETWORK mode with `--allowed-source-cidrs`
+    /// and/or `--allowed-host` set. Widened to the wildcard `::` so
+    /// invocations that were relying on the old network-mode default keep
+    /// working untouched.
+    AutoWidened,
+}
+
+/// How this boot decided the client API's exposure, for reporting once logging
+/// exists. RUNTIME-ONLY (`#[serde(skip)]`, like `WebsocketApiConfig::secrets_dir`):
+/// it describes this boot's resolution, not operator-authored TOML.
+///
+/// This exists because `ConfigArgs::build()` runs BEFORE
+/// [`set_logger`] installs the global subscriber (see `bin/freenet.rs`), so a
+/// `tracing::warn!` inside `build()` is emitted with no subscriber and goes
+/// nowhere. [`Config::log_client_api_exposure`] replays the decision after the
+/// subscriber exists. Do NOT move these messages back into `build()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WsApiExposure {
+    /// How the bind address was chosen.
+    pub source: WsApiAddressSource,
+    /// A `ws-api-address` this code could itself have auto-written, discarded
+    /// from `config.toml` during the merge so it could be re-derived.
+    ///
+    /// `Some` only when the operator supplied no address by flag or env AND the
+    /// re-derivation actually MOVED the bind. A value that re-derives to itself
+    /// — the steady state from the second boot onward — is not recorded, because
+    /// re-announcing an unchanged bind every boot is how a log line gets tuned
+    /// out. Which direction it moved selects the message; see
+    /// `Config::log_client_api_exposure`.
+    pub dropped_persisted_address: Option<IpAddr>,
+}
+
+/// True for any address [`resolve_ws_api_address`] could itself have produced,
+/// in this release or an earlier one: the two wildcards and the two loopbacks.
+///
+/// This is the migration sentinel. `build()` persists the RESOLVED config, so a
+/// `ws-api-address` in `config.toml` is just as likely to be this code's own
+/// past output as an operator's choice — and the two are indistinguishable by
+/// value. Treating the auto-derivable values as "not an operator choice" is
+/// what lets the resolution re-run each boot:
+///
+/// - `::` (the network-mode auto-default since #3648) and `0.0.0.0` (before it)
+///   must be re-derived, or the hardening would reach fresh installs only;
+/// - the loopbacks must be re-derived too, or the FIRST post-upgrade boot would
+///   persist loopback and thereby make it look explicit, permanently disabling
+///   the auto-widen remedy the release note and the startup log point at.
+///
+/// Enumerated exactly rather than tested with `is_loopback()`, so an operator
+/// who deliberately pinned some other loopback address (`127.0.0.5`, a
+/// per-service loopback alias) keeps it: this code never writes that, so it is
+/// a choice.
+fn is_auto_derivable_ws_api_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4 == Ipv4Addr::UNSPECIFIED || v4 == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(v6) => v6 == Ipv6Addr::UNSPECIFIED || v6 == Ipv6Addr::LOCALHOST,
+    }
+}
+
+/// The loopback / wildcard address in the same family as `family_hint`.
+///
+/// Re-derivation must never cross address families. The primary bind is FATAL
+/// while only the companion is best-effort (`server::serve_dual_stack`), so
+/// handing `::1` to a host with IPv6 disabled fails with EAFNOSUPPORT and the
+/// node does not start. That is unrecoverable rather than merely broken:
+/// `build()` rewrites `config.toml` BEFORE the bind is attempted, and
+/// `commands::rollback` does not snapshot config, so the crash-loop rollback
+/// restores the previous binary onto a config that now names an unbindable
+/// family and it dies identically — and rollback does not fire twice.
+///
+/// A node that persisted `0.0.0.0` (the pre-#3648 auto-default) has been
+/// binding IPv4 successfully for its whole life; that is the only evidence
+/// available about which families this host actually supports, so honour it.
+/// With no hint (a fresh install) the IPv6 default stands, which is the same
+/// exposure `main` already had — network mode defaulted to `::`.
+fn ws_api_default_for_family(family_hint: Option<IpAddr>, wildcard: bool) -> IpAddr {
+    match (family_hint, wildcard) {
+        (Some(IpAddr::V4(_)), false) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        (Some(IpAddr::V4(_)), true) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        (_, false) => default_local_address(),
+        (_, true) => default_listening_address(),
+    }
+}
+
+/// Whether a `--allowed-source-cidrs` list grants anything.
+///
+/// An empty list grants nothing, and neither does a list of blank strings:
+/// `FREENET_ALLOWED_SOURCE_CIDRS=` declared with no value in a docker-compose
+/// `.env`, a k8s ConfigMap, or a systemd `Environment=` line parses as
+/// `Some(vec![""])`, and reading that as "the operator wants non-local clients"
+/// would widen the bind on a node whose operator granted nothing.
+fn grants_anything(list: Option<&[String]>) -> bool {
+    list.is_some_and(|entries| entries.iter().any(|e| !e.trim().is_empty()))
+}
+
+/// Resolve the address the client (HTTP/WebSocket) API binds to.
+///
+/// The default is **loopback in both operation modes**. `OperationMode` still
+/// governs ring participation and `secrets_dir(mode)`; it deliberately does NOT
+/// govern who may drive the client API. Running as a network peer is a
+/// statement about the overlay, not consent to expose a fully-privileged
+/// control API (contract state, delegate secrets, key material) to every host
+/// that can route to this machine.
+///
+/// Auto-widening is a BACKWARD-COMPATIBILITY measure for one flag only.
+/// `--allowed-source-cidrs` is genuinely inert on a loopback socket — a
+/// non-private source can never reach `::1`, so the filter it relaxes never
+/// runs — which means an operator who set it and nothing else was relying on
+/// the old wide network-mode default. Widening preserves that with no action.
+///
+/// `--allowed-host` is deliberately NOT a trigger, though an earlier cut of
+/// this change made it one. It is a Host-header allowlist that is fully
+/// functional on loopback, and the same-host reverse proxy is its primary
+/// documented use — indeed the ONLY shape in which hosted mode's `userToken` is
+/// honoured at all, since `decide_user_token` requires a loopback source. So
+/// widening for it would bind every interface, for no functional gain, in the
+/// commonest proxy deployment there is. A proxy on a DIFFERENT host is a
+/// deliberate multi-machine choice whose operator passes `--ws-api-address`;
+/// the startup log says so.
+///
+/// `cidrs_granted_this_boot` must come from the CLI/env values captured BEFORE
+/// the `config.toml` merge. Reading the merged value would make the widen
+/// sticky: one boot with the flag would pin the node to the wildcard forever,
+/// and removing the flag would never narrow it back.
+///
+/// Widening is scoped to `OperationMode::Network` because local mode has always
+/// bound loopback, so there is no wide default to preserve and widening there
+/// would mean this hardening OPENED a socket that used to be closed. An
+/// explicit `--ws-api-address` always wins in either mode.
+fn resolve_ws_api_address(
+    mode: OperationMode,
+    explicit: Option<IpAddr>,
+    cidrs_granted_this_boot: Option<&[String]>,
+    family_hint: Option<IpAddr>,
+) -> (IpAddr, WsApiAddressSource) {
+    if let Some(addr) = explicit {
+        return (addr, WsApiAddressSource::Explicit);
+    }
+    let compat_widen =
+        matches!(mode, OperationMode::Network) && grants_anything(cidrs_granted_this_boot);
+    if compat_widen {
+        (
+            ws_api_default_for_family(family_hint, true),
+            WsApiAddressSource::AutoWidened,
+        )
+    } else {
+        (
+            ws_api_default_for_family(family_hint, false),
+            WsApiAddressSource::DefaultLoopback,
+        )
+    }
+}
+
+/// Whether startup should warn that the client API is reachable beyond this
+/// machine while connections can land in ONE shared secret namespace, and if
+/// so, why. `None` means stay quiet.
+///
+/// The shared namespace is the danger. `decide_user_token` hands a connection
+/// the node's single-user context whenever hosted mode is off **or the
+/// connection simply omits `userToken`** — so hosted mode ADDS a per-user
+/// namespace for well-behaved clients, it does not remove the shared one.
+///
+/// Two triggers:
+/// - a **non-loopback bind** warns regardless of hosted mode, because any host
+///   that can route to the address can omit a token and land in the shared
+///   namespace;
+/// - **`--allowed-host` on a loopback bind with hosted mode OFF** warns. That
+///   flag names a reverse proxy, and a proxy terminates the connection itself,
+///   so every visitor arrives wearing the proxy's source address and the node's
+///   own source-IP filters cannot tell them apart.
+///
+/// **Loopback + hosted mode stays quiet, and that is a known gap, not an
+/// assertion of safety.** A connection that omits `userToken` reads the shared
+/// namespace there too, and behind a public proxy that is any visitor;
+/// containment on the flagship deployment today is that the shared namespace is
+/// empty (measured: zero files outside `*/users/*`), which is a fact about
+/// current state rather than a structural guarantee. Making this branch fire
+/// only when the shared namespace actually holds something needs a probe of the
+/// secrets tree, which is a separate change with its own failure modes — it is
+/// tracked in advisory GHSA-824h-7x5x-wfmf §8, with the measured tree shape and
+/// the requirements, rather than bolted onto a default-hardening PR, because a
+/// probe that is wrong in either direction is worse than no warning: too eager
+/// and it fires on every boot of the flagship and trains operators to ignore the
+/// one signal there is.
+fn ws_api_shares_one_namespace_with_remote_clients(
+    hosted_mode: bool,
+    address: IpAddr,
+    allowed_hosts: &[String],
+) -> Option<&'static str> {
+    if !address.is_loopback() {
+        return Some(if hosted_mode {
+            "the client API is bound to a non-loopback address, and hosted mode does \
+             not close that: a connection which simply omits `userToken` still lands \
+             in this node's shared single-user namespace"
+        } else {
+            "the client API is bound to a non-loopback address, so any host that can \
+             route to it can drive this node"
+        });
+    }
+    if hosted_mode {
+        return None;
+    }
+    if !allowed_hosts.is_empty() {
+        return Some(
+            "--allowed-host names a reverse proxy in front of this node, and a proxy \
+             terminates the connection itself, so every visitor arrives looking local \
+             and the source-IP filters cannot tell them apart",
+        );
+    }
+    None
 }
 
 #[inline]
@@ -3330,7 +4170,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// host = "vega.locut.us"
+/// host = "gw1.freenet.org"
 /// port = 31337            # optional; defaults to 31337 when omitted
 /// ```
 ///
@@ -3338,7 +4178,7 @@ impl std::hash::Hash for GatewayConfig {
 ///
 /// ```toml
 /// [gateways.address]
-/// hostname = "vega.locut.us:31337"   # host[:port] packed into one string
+/// hostname = "gw1.freenet.org:31337"   # host[:port] packed into one string
 /// ```
 ///
 /// ```toml
@@ -3836,7 +4676,7 @@ impl GlobalSimulationTime {
     /// - Timestamp: Uses simulation time base + monotonic counter
     /// - Random: Uses seeded RNG from GlobalRng
     ///
-    /// When not in simulation mode, uses regular `Ulid::new()`.
+    /// When not in simulation mode, uses regular `Ulid::generate()`.
     pub fn new_ulid() -> ulid::Ulid {
         use ulid::Ulid;
 
@@ -3868,7 +4708,7 @@ impl GlobalSimulationTime {
             Ulid(ulid_value)
         } else {
             // Production mode: use standard ULID generation
-            Ulid::new()
+            Ulid::generate()
         }
     }
 }
@@ -3880,6 +4720,53 @@ impl GlobalSimulationTime {
 std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCE_NOOP_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCED_NOOP_GATE_CONNECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: treat every remote as running a release at or above
+/// `UNTRACKED_ACK_NOOP_MIN_VERSION` (#5795), so the receive-side "do not ack
+/// a capable peer's NoOps" gate is ON even though simulated peers all report
+/// the current, pre-floor crate version.
+///
+/// Thread-local, like [`SimulationTransportOpt`], so concurrent tests do not
+/// interfere: it applies to connections CREATED on the calling thread while
+/// enabled (the decision is fixed in `PeerConnection::new`). Honoured only in
+/// `test` / `testing` builds; a release binary ignores it. For a whole-suite
+/// local run, `FREENET_TEST_FORCE_NOOP_GATE=1` enables it on every thread.
+pub struct SimulationForceNoopGate;
+
+impl SimulationForceNoopGate {
+    /// Force the gate on for connections created on this thread.
+    pub fn enable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(true));
+    }
+
+    /// Stop forcing the gate on this thread.
+    pub fn disable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(false));
+    }
+
+    /// Number of connections created on this thread with the gate forced on,
+    /// so a test can prove the override actually reached the transport.
+    pub fn forced_connection_count() -> u64 {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.get())
+    }
+
+    /// Record one connection created with the gate forced on.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn record_forced_connection() {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Whether the gate is forced on for this thread.
+    pub fn is_enabled() -> bool {
+        static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.get())
+            || *FROM_ENV.get_or_init(|| {
+                std::env::var("FREENET_TEST_FORCE_NOOP_GATE").is_ok_and(|v| v == "1")
+            })
+    }
 }
 
 /// Opt-in transport timer optimization for large-scale simulations.
@@ -3953,7 +4840,12 @@ impl SimulationIdleTimeout {
 // Thread-local test metrics: allows parallel simulation tests without interference.
 std::thread_local! {
     static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// ResyncRequests emitted specifically because a DELTA FAILED TO APPLY —
+    /// the #2763 summary-caching signal, counted at the decision that makes it
+    /// rather than inferred from the total (#5510).
+    static GLOBAL_DELTA_FAILURE_RESYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out legs skipped because the peer's cached summary already matched
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
     static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3962,6 +4854,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     /// Fan-out legs dropped because the target was the delivering peer (#5147).
     static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Simulation fan-out legs held back by the per-pair spacing (#5842).
+    static GLOBAL_BROADCAST_LEGS_SPACED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Inbound broadcast payloads that reached a terminal classification
     /// (#5147). Denominator for the duplicate-delivery ratio.
     static GLOBAL_BROADCAST_DELIVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3970,13 +4864,18 @@ std::thread_local! {
     static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Recipients dropped from a proactive summary notification because they
     /// are advertised co-hosts the broadcast already covered (#4965).
     static GLOBAL_NOTIFICATION_COHOSTS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Recipients a proactive summary notification actually SENT to — the cost
+    /// side of the pair above, which only ever counted the saving.
+    static GLOBAL_NOTIFICATION_TARGETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Hosting advertisement retractions emitted on stop-hosting (eviction).
     // Advertisement-layer reliability + retraction, #4642 spec step 1.
     static GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4017,13 +4916,22 @@ std::thread_local! {
     // always decodes as `Other` — the receiver, which is the only side that can
     // judge agreement, cannot know which send site produced it. Entry count is
     // the best available proxy and needs no wire change: the notification and
-    // rejection emitters are single-entry BY CONSTRUCTION while both reply
-    // emitters are multi-entry (see `outbound_message_mix::SummariesDetail`).
+    // rejection emitters are single-entry BY CONSTRUCTION, and only
+    // `InterestsReply` — the ~5-min heartbeat — is genuinely multi-entry (see
+    // `outbound_message_mix::SummariesDetail`).
     //
-    // Known ambiguity, stated so the number is not over-read: a heartbeat reply
-    // for a peer pair sharing exactly ONE contract is also single-entry, so the
-    // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
-    // a clean partition. It is directional evidence, not attribution.
+    // Known contamination, stated so the number is not over-read, and it is
+    // larger than a heartbeat edge case: `ChangeInterestsReply` is single-entry
+    // 100% of the time (measured mean exactly 1.000, `max_entries` 1, over
+    // 418,476 messages on 1,284 peers), because `broadcast_change_interests`
+    // gossips one contract per message. Corrected 2026-08-12 (#5153 review F1) —
+    // this said "both reply emitters are multi-entry", which is what made the
+    // proxy look clean. A narrow heartbeat (a peer pair sharing exactly ONE
+    // contract) contaminates too, but is the smaller term. So the single bucket
+    // is "state-change-driven sites PLUS interest-churn replies PLUS narrow
+    // heartbeats": directional evidence, not attribution, and the send-side
+    // per-emitter census in `outbound_message_mix` is what makes the
+    // contamination subtractable rather than assumed.
     /// Peak size of the digest arm's per-hash local-summary cache (#4965).
     /// The observable for the RETENTION bound: the cache holds owned summary
     /// clones, so its peak entry count is what decides whether a hostile
@@ -4061,18 +4969,24 @@ impl GlobalTestMetrics {
     /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(0));
@@ -4106,8 +5020,34 @@ impl GlobalTestMetrics {
     }
 
     /// Returns the total number of ResyncRequests received since last reset.
+    ///
+    /// This is the TOTAL across every cause. Since #5510 there are several — a
+    /// delta that failed to apply, a queue-full broadcast drop, and a
+    /// rate-limited broadcast drop (with a fourth, the trailing coalesced
+    /// repair, once #5525 lands) — so a test that means "no delta failed" must
+    /// use [`Self::delta_failure_resyncs`] instead.
+    /// Asserting zero on this total makes any new, legitimate resync source
+    /// look like the #2763 regression.
     pub fn resync_requests() -> u64 {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
+    }
+
+    /// Records a ResyncRequest emitted because a DELTA FAILED TO APPLY.
+    ///
+    /// Recorded at the branch that makes that decision (the `is_delta &&
+    /// !queue_full` arm of the broadcast driver), never derived by subtracting
+    /// other causes from the total — the shape
+    /// `.claude/rules/bug-prevention-patterns.md` warns about, where a
+    /// subtraction silently absorbs every other cause and keeps reporting a
+    /// plausible number after the thing it claims to measure is gone.
+    pub fn record_delta_failure_resync() {
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// ResyncRequests emitted because a delta failed to apply — the precise
+    /// #2763 summary-caching signal.
+    pub fn delta_failure_resyncs() -> u64 {
+        GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.get())
     }
 
     /// Records that an UPDATE broadcast merge was skipped by the per-contract
@@ -4215,6 +5155,18 @@ impl GlobalTestMetrics {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(c.get() + 1));
     }
 
+    /// Records one simulation fan-out leg held back because its
+    /// `(contract, peer)` was sent to inside the spacing interval (#5842).
+    /// Counted by the check that holds it.
+    pub fn record_broadcast_leg_spaced() {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fan-out legs held back by the per-pair spacing since reset.
+    pub fn broadcast_legs_spaced() -> u64 {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.get())
+    }
+
     /// Fan-out legs dropped because the target was the delivering peer.
     pub fn broadcast_sender_skips() -> u64 {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.get())
@@ -4258,10 +5210,11 @@ impl GlobalTestMetrics {
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.get())
     }
 
-    /// Records that a delta was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = true.
-    pub fn record_delta_send() {
+    /// Records that a delta of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = true.
+    pub fn record_delta_send(payload_bytes: usize) {
         GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of delta sends since last reset.
@@ -4269,15 +5222,26 @@ impl GlobalTestMetrics {
         GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
-    /// Records that full state was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = false.
-    pub fn record_full_state_send() {
+    /// Payload bytes of every delta counted by [`Self::delta_sends`].
+    pub fn delta_send_bytes() -> u64 {
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.get())
+    }
+
+    /// Records that a full state of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = false.
+    pub fn record_full_state_send(payload_bytes: usize) {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
+    }
+
+    /// Payload bytes of every full state counted by [`Self::full_state_sends`].
+    pub fn full_state_send_bytes() -> u64 {
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.get())
     }
 
     pub fn record_pending_op_insert() {
@@ -4294,6 +5258,20 @@ impl GlobalTestMetrics {
 
     pub fn pending_op_removes() -> u64 {
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.get())
+    }
+
+    /// A waiter install was refused because a LIVE incumbent already held the tx.
+    ///
+    /// Expected to stay at zero: the invariant is one live waiter per tx per
+    /// node, so a non-zero count means either a genuine collision or that the
+    /// guard is refusing a legitimate waiter — the latter otherwise surfaces
+    /// only as a driver retry with nothing pointing back here.
+    pub fn record_pending_op_skip() {
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn pending_op_skips() -> u64 {
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.get())
     }
 
     /// Track high-water mark for pending_op_results size.
@@ -4331,6 +5309,34 @@ impl GlobalTestMetrics {
 
     pub fn notification_cohosts_skipped() -> u64 {
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.get())
+    }
+
+    /// A proactive summary notification ATTEMPTED to `n` recipients.
+    ///
+    /// Attempted, not delivered: `n` is the resolved recipient set, counted
+    /// once per notification round, before the per-peer enqueue can fail. That
+    /// matches what the cost question asks (how many messages this mechanism
+    /// puts on the wire) and matches its sibling `notification_cohosts_skipped`,
+    /// which is likewise an intent count. Do not read it as an ack.
+    ///
+    /// The cost half of the pair. `notification_cohosts_skipped` counts only
+    /// what the #4965 exclusion SAVED, so for as long as it stood alone the
+    /// simulation could see this mechanism getting cheaper and could not see it
+    /// getting more expensive.
+    ///
+    /// That asymmetry is not academic: #5190's fix restores notifications to
+    /// every peer the #5147 target list suppresses, and the A/B rig that exists
+    /// specifically to judge #5147 measured the 13 sends it saved while being
+    /// structurally blind to the ~429 messages it added. The trade could only
+    /// be argued, not measured. **A counter for a mechanism's saving needs its
+    /// twin for the mechanism's cost, or the rig can only ever return good
+    /// news.**
+    pub fn record_notification_targets(n: u64) {
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.set(c.get() + n));
+    }
+
+    pub fn notification_targets() -> u64 {
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.get())
     }
 
     /// A hosting advertisement retraction was emitted because this node stopped
@@ -4570,6 +5576,45 @@ impl GlobalTestMetrics {
     }
 }
 
+/// Install the logger for a short-lived CLI subcommand: stderr only, at
+/// `level`.
+///
+/// Separate from [`set_logger`] on purpose. `set_logger` serves the node, where
+/// output MUST keep going to the rolling log files (`freenet service report`
+/// collects them, and on Windows nothing captures stdout). Adding a "log to
+/// stderr instead" flag to that path would put a switch capable of silently
+/// disabling file logging on the node's only logging call — so the CLI gets its
+/// own entry point rather than a shared, mis-settable one.
+///
+/// See `tracing::tracer::init_cli_stderr_tracer` for why stderr specifically
+/// (#5244).
+pub fn set_cli_logger(level: tracing::level_filters::LevelFilter) {
+    #[cfg(feature = "trace")]
+    {
+        static CLI_LOGGER_SET: AtomicBool = AtomicBool::new(false);
+        if CLI_LOGGER_SET
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        // Best-effort: a CLI subcommand that cannot install a subscriber must
+        // still do its job. Failing the update because logging could not start
+        // would turn a diagnostics problem into an outage.
+        if let Err(e) = crate::tracing::tracer::init_cli_stderr_tracer(level) {
+            eprintln!("Warning: could not initialize logging for this command: {e}");
+        }
+    }
+    #[cfg(not(feature = "trace"))]
+    let _ = level;
+}
+
 pub fn set_logger(
     level: Option<tracing::level_filters::LevelFilter>,
     endpoint: Option<String>,
@@ -4681,6 +5726,41 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     Ok(gateways)
 }
 
+/// Test-only: build a `ConfigArgs` rooted at `dir` in the given mode, ready to
+/// `build()` into a real `Config` whose data dir is `dir`.
+///
+/// Lives at module level rather than inside `mod tests` so the event-log tests
+/// in `tracing::aof` and `node` can share one definition of "a config that
+/// builds" with the `#[cfg(test)]` config tests here — the three modules must
+/// agree on the shape or they stop testing the same thing.
+#[cfg(test)]
+pub(crate) fn event_log_test_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
+    ConfigArgs {
+        mode: Some(mode),
+        // A non-gateway network node with no gateways is rejected by
+        // `build()`, so the network-mode cases build as a gateway. That is
+        // the realistic shape anyway: a gateway IS a network-mode node, and
+        // it is exactly the kind of node we operate and want the log on.
+        network_api: {
+            let is_network = matches!(mode, OperationMode::Network);
+            NetworkArgs {
+                is_gateway: is_network,
+                // A gateway must declare a public address.
+                public_address: is_network.then(|| "203.0.113.1".parse().unwrap()),
+                public_port: is_network.then_some(31337),
+                skip_load_from_network: true,
+                ..Default::default()
+            }
+        },
+        config_paths: ConfigPathsArgs {
+            config_dir: Some(dir.to_path_buf()),
+            data_dir: Some(dir.to_path_buf()),
+            log_dir: Some(dir.to_path_buf()),
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
@@ -4691,6 +5771,37 @@ mod tests {
     use crate::transport::TransportKeypair;
 
     use super::*;
+
+    /// The pool size is the multiplier in every per-worker memory budget
+    /// (#5268 defect 3), so its clamp boundaries are load-bearing, not cosmetic:
+    /// the divisor the budgets use and the count the pool actually creates come
+    /// from this one function, and a mismatch between them WAS the defect.
+    ///
+    /// Exercised through the pure `resolve_pool_size` rather than the env-reading
+    /// wrapper: `FREENET_RUNTIME_POOL_SIZE` is process-global, so a test that set
+    /// it would race every other test in the binary.
+    #[test]
+    fn runtime_pool_size_clamps_cores_and_override() {
+        let size = |cores, over| resolve_pool_size(cores, over).get();
+
+        // One core is reserved for the event loop and OS scheduling.
+        assert_eq!(size(Some(20), None), 16, "capped at MAX");
+        assert_eq!(size(Some(17), None), 16, "exactly at MAX after the reserve");
+        assert_eq!(size(Some(8), None), 7);
+        assert_eq!(size(Some(2), None), 1, "vega's shape: 2 cores -> 1 worker");
+        // Never zero, however few cores are reported.
+        assert_eq!(size(Some(1), None), 1);
+        assert_eq!(size(Some(0), None), 1);
+        // Unknown parallelism falls back to a 4-core assumption.
+        assert_eq!(size(None, None), 3);
+
+        // The override wins, and is clamped the same way — a hostile or fat-
+        // fingered value must not multiply the per-worker budgets past MAX.
+        assert_eq!(size(Some(20), Some(1)), 1);
+        assert_eq!(size(Some(2), Some(16)), 16);
+        assert_eq!(size(Some(2), Some(9_999)), 16);
+        assert_eq!(size(Some(20), Some(0)), 1, "zero clamps up, never panics");
+    }
 
     // ---------------------------------------------------------------------
     // #5124 — `config.toml` key convention.
@@ -5197,6 +6308,230 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// REGRESSION for #5038: with both `config.toml` and a fuzzy-matching
+    /// `config.bak.toml` present, `read_config` must load the exact name.
+    ///
+    /// Read the regression power of this test honestly: it depends on the
+    /// order `read_dir` happens to yield, which is a property of the
+    /// filesystem, NOT of the order the files were written. Measured on ext4
+    /// (2000 trials per arm): insertion order makes no difference whatsoever,
+    /// and with `config.bak.toml` as the only decoy the UNFIXED code picked
+    /// `config.toml` anyway in 2000/2000 runs — i.e. this test on its own
+    /// would have passed against the bug. Extra decoys are therefore present
+    /// deliberately: ext4 orders entries by a per-filesystem hash seed, so the
+    /// more `config*.toml` names compete, the smaller the chance that the
+    /// exact one happens to come first. That lowers the odds of a vacuous
+    /// pass; it does not eliminate them.
+    ///
+    /// The guarantee itself is pinned deterministically, and without any
+    /// dependence on `read_dir` order, by
+    /// `read_config_finds_exact_config_without_listing_the_directory` below.
+    /// This test covers the ordinary case; that one covers the invariant.
+    #[test]
+    fn read_config_prefers_exact_config_toml_over_backup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let exact_toml = released_config_toml_without_secret_paths();
+        let decoy_toml = exact_toml.replace("log_level = \"debug\"", "log_level = \"trace\"");
+        assert_ne!(
+            exact_toml, decoy_toml,
+            "the substitution did not fire, so both files would carry the same \
+             log level and the assertion below could not distinguish them"
+        );
+
+        // `config.toml` is written FIRST on purpose. ext4 orders entries by a
+        // hash seed, so write order is irrelevant there — but tmpfs is
+        // insertion-ordered, and with the exact name written LAST the unfixed
+        // code returned it 400/400 on /dev/shm, i.e. this test passed against
+        // the bug. `tempfile::tempdir()` honours TMPDIR, so a runner with
+        // TMPDIR on tmpfs would silently neuter it. Writing it first makes the
+        // unfixed code pick a decoy on both filesystems.
+        fs::write(dir.join("config.toml"), &exact_toml).unwrap();
+        for decoy in [
+            "config.bak.toml",
+            "config.aaa.toml",
+            "config.0.toml",
+            "config.old.toml",
+            "config.orig.toml",
+        ] {
+            fs::write(dir.join(decoy), &decoy_toml).unwrap();
+        }
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Debug,
+            "read_config must load config.toml (log_level = debug), not a \
+             config.*.toml backup (trace)"
+        );
+    }
+
+    /// The #5038 guarantee, pinned so that it cannot pass by luck: when
+    /// `config.toml` is present, `read_config` must not list the directory at
+    /// all.
+    ///
+    /// The directory is made execute-only (`--x--x--x`), which on any POSIX
+    /// filesystem permits resolving and opening a path THROUGH it while
+    /// denying `readdir`. So the pre-fix implementation, whose very first act
+    /// is `std::fs::read_dir(dir)?`, fails here with `PermissionDenied` no
+    /// matter what order any filesystem would have returned — while the
+    /// exact-match pass, which only ever calls `Path::is_file` on the two
+    /// candidate names, is unaffected. Verified against the real code: the
+    /// unfixed body returns `Err(PermissionDenied)`, the fixed body returns
+    /// the config.
+    ///
+    /// Root bypasses POSIX permission checks, so under `euid == 0` the setup
+    /// cannot produce the fault and the test would assert nothing. Rather
+    /// than skip silently, it asserts that the denial actually happened, so a
+    /// root CI runner fails loudly instead of going quietly vacuous.
+    ///
+    /// Unix-only: the mechanism is POSIX directory permissions, and this crate
+    /// also builds for Windows.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_finds_exact_config_without_listing_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        fs::write(
+            dir.join("config.toml"),
+            released_config_toml_without_secret_paths(),
+        )
+        .unwrap();
+
+        let original = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o111)).unwrap();
+
+        // Everything between here and the restore must be panic-free, so the
+        // temp dir is always left deletable; collect results, assert after.
+        let listing = fs::read_dir(&dir).map(|_| ());
+        let read = ConfigArgs::read_config(&dir);
+
+        fs::set_permissions(&dir, original).unwrap();
+
+        // Root bypasses POSIX permission checks, so under `euid == 0` the setup
+        // cannot produce the fault and this test cannot assert anything.
+        //
+        // It SKIPS rather than failing, deliberately. `docker/test-runner`
+        // (what `/freenet:linux-test` drives) runs `cargo test --workspace` as
+        // root with no `--user`, so a hard assert breaks a supported local
+        // workflow — and the obvious "fix" for a broken test is to delete the
+        // assertion, which is the one real regression guard in this PR. The
+        // skip is loud rather than silent, and GitHub CI runs `test_unit` as a
+        // non-root runner user, so the guard is live where it actually gates.
+        if listing.is_ok() {
+            eprintln!(
+                "SKIPPING read_config_finds_exact_config_without_listing_the_directory: \
+                 readdir succeeded on a --x--x--x directory, so this is running as root \
+                 (euid 0) and the fault this test depends on cannot be produced. This \
+                 guard is exercised by the non-root GitHub CI run."
+            );
+            return;
+        }
+        assert_eq!(
+            listing.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied),
+            "readdir failed for a reason other than the permission fault this test \
+             sets up, so it is not exercising the exact-match pass"
+        );
+        let cfg = read
+            .expect("read_config must not list the directory when config.toml exists")
+            .expect("config.toml is present");
+        assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+    }
+
+    /// REGRESSION for the shadowing branch: with BOTH `config.toml` and
+    /// `config.json` present, `config.toml` wins — and that has to be pinned,
+    /// because it is a behaviour this PR CREATED. The old fuzzy scan took
+    /// whichever entry `read_dir` yielded first, so which format won was
+    /// arbitrary; now it is settled, permanently, in toml's favour.
+    ///
+    /// That matters more than it looks: `build()` writes `config.toml`
+    /// unconditionally, so a `config.json` operator gets one created beside
+    /// theirs on first boot and from boot two their json is never read again.
+    /// If that precedence is ever revisited, this test is where the decision
+    /// is recorded.
+    ///
+    /// The json decoy is DERIVED from the same fixture as the toml rather than
+    /// hand-written, so it is a genuinely loadable config. A hand-written
+    /// `{"log_level": "error"}` is not — it is missing required fields, and the
+    /// test would then pass because the json failed to parse rather than
+    /// because toml was preferred. The `decoy` assertion below exists to keep
+    /// that failure mode caught rather than assumed: it loads the json ALONE
+    /// first and requires it to carry the distinguishing value.
+    #[test]
+    fn read_config_prefers_config_toml_over_a_valid_config_json() {
+        let toml_src = released_config_toml_without_secret_paths();
+
+        // Round-trip the fixture through `toml::Value` into JSON so the decoy
+        // has exactly the fields a real config has, then flip the one value
+        // this test distinguishes on.
+        let mut value: toml::Value = toml::from_str(&toml_src).expect("fixture must parse as toml");
+        if let Some(table) = value.as_table_mut() {
+            table.insert(
+                "log_level".to_string(),
+                toml::Value::String("error".to_string()),
+            );
+        }
+        let json_src = serde_json::to_string(&value).expect("fixture must serialise as json");
+
+        // Prove the decoy is loadable ON ITS OWN, so the assertion below is
+        // about precedence and not about the json being unreadable.
+        let json_only = tempfile::tempdir().unwrap();
+        fs::write(json_only.path().join("config.json"), &json_src).unwrap();
+        let decoy = ConfigArgs::read_config(&json_only.path().to_path_buf())
+            .expect("the json decoy must itself be readable")
+            .expect("config.json is present");
+        assert_eq!(
+            decoy.log_level,
+            tracing::log::LevelFilter::Error,
+            "the decoy does not carry the log level this test distinguishes on"
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        fs::write(dir.join("config.toml"), &toml_src).unwrap();
+        fs::write(dir.join("config.json"), &json_src).unwrap();
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Debug,
+            "config.toml must win when both exact names are present; got the \
+             config.json value instead"
+        );
+    }
+
+    /// With no exact `config.toml` / `config.json`, the fuzzy fallback must
+    /// still find a `config*` file — the exact-match pass must not have
+    /// narrowed what `read_config` accepts.
+    #[test]
+    fn read_config_fuzzy_fallback_when_no_exact_match() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let backup_toml = released_config_toml_without_secret_paths()
+            .replace("log_level = \"debug\"", "log_level = \"warn\"");
+        fs::write(dir.join("config.bak.toml"), &backup_toml).unwrap();
+
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            cfg.log_level,
+            tracing::log::LevelFilter::Warn,
+            "fuzzy fallback should pick up config.bak.toml when no exact match exists"
+        );
+    }
+
     /// REGRESSION (found in review of this PR): a config that spells one key
     /// both ways must still boot, and must keep the value it had before the
     /// upgrade.
@@ -5495,7 +6830,7 @@ shutdown-drain-secs = 42
                    location = 0.25\n\
                    \n\
                    [gateways.address]\n\
-                   host = \"vega.locut.us\"\n\
+                   host = \"gw1.freenet.org\"\n\
                    port = 31337\n";
         assert!(
             toml::from_str::<Gateways>(doc).is_err(),
@@ -5875,7 +7210,7 @@ shutdown-drain-secs = 42
     fn gateways_toml_public_key_is_accepted_in_both_spellings() {
         for key in ["public_key", "public-key"] {
             let doc = format!(
-                "[[gateways]]\naddress = {{ host = \"vega.locut.us\", port = 31337 }}\n\
+                "[[gateways]]\naddress = {{ host = \"gw1.freenet.org\", port = 31337 }}\n\
                  {key} = \"/tmp/freenet-5124/vega.pub\"\n"
             );
             let gateways: Gateways = toml::from_str(&doc)
@@ -5886,6 +7221,164 @@ shutdown-drain-secs = 42
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn otel_args_default_is_off_and_endpointless() {
+        // The new pipeline exports nothing yet, so shipping it on would be a
+        // behavior change. Operators opt in explicitly.
+        let args = OtelArgs::default();
+        assert_eq!(
+            args.enabled, None,
+            "otel-telemetry-enabled unset must stay None so an explicit \
+             --otel-telemetry-enabled=false can override config.toml"
+        );
+        assert_eq!(args.endpoint, None, "no implicit collector");
+        assert_eq!(
+            args.auth_mode.unwrap_or_default(),
+            OtelAuthMode::Disabled,
+            "auth must default off: pointing the exporter at a collector must \
+             not ship a signed assertion of this node's identity unasked"
+        );
+    }
+
+    #[test]
+    fn otel_auth_mode_parses_from_cli_and_file() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert_eq!(none.otel.auth_mode, None, "unset on the CLI stays None");
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "disabled"])
+            .expect("disabled parse");
+        assert_eq!(off.otel.auth_mode, Some(OtelAuthMode::Disabled));
+        let on = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "freenet"])
+            .expect("freenet parse");
+        assert_eq!(on.otel.auth_mode, Some(OtelAuthMode::Freenet));
+
+        // The file spelling is the lowercase variant name.
+        let cfg: OtelConfig = toml::from_str("otel-auth-mode = \"disabled\"").unwrap();
+        assert_eq!(cfg.auth_mode, OtelAuthMode::Disabled);
+        let cfg: OtelConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.auth_mode,
+            OtelAuthMode::Disabled,
+            "absent key -> default"
+        );
+    }
+
+    #[test]
+    fn otel_flag_parses_from_cli() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert_eq!(none.otel.enabled, None, "no flag -> unset, not false");
+        let set = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled"])
+            .expect("flag parse");
+        assert_eq!(
+            set.otel.enabled,
+            Some(true),
+            "--otel-telemetry-enabled -> on"
+        );
+        // Explicit `=false` must parse and mean false. Without this form the flag
+        // would be a bare ArgAction::SetTrue, and clap turns ANY value of the bound
+        // env var — including "false" — into true.
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled=false"])
+            .expect("explicit false parse");
+        assert_eq!(
+            off.otel.enabled,
+            Some(false),
+            "--otel-telemetry-enabled=false -> off"
+        );
+        let with_ep = ConfigArgs::try_parse_from([
+            "freenet",
+            "--otel-endpoint",
+            "http://collector.example:4318",
+        ])
+        .expect("endpoint parse");
+        assert_eq!(
+            with_ep.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318")
+        );
+    }
+
+    /// C1 regression: the round-trip guard test above only round-trips the
+    /// serializer's OWN output, so a key-shape mismatch (nested `[otel]`
+    /// table vs. the flat keys the design spec and AGENTS.md document) is
+    /// invisible to it. Write the literal documented `config.toml` text and
+    /// confirm the flat keys actually parse into `Config::otel`.
+    #[tokio::test]
+    async fn otel_flat_config_toml_keys_are_honored() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Base build to create the on-disk secrets + a valid config.toml for
+        // every OTHER field (all of them are `#[serde(flatten)]`d scalars, so
+        // this baseline has no `[table]` headers at all).
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let base = tokio::fs::read_to_string(temp_dir.path().join("config.toml"))
+            .await
+            .unwrap();
+
+        // Strip whatever otel shape build() just wrote (pre-fix: a nested
+        // `[otel]` header + its two keys; post-fix: the two flat keys) so the
+        // literal lines appended below are unambiguous root-level keys.
+        let base: String = base
+            .lines()
+            .filter(|line| {
+                *line != "[otel]"
+                    && !line.starts_with("otel-telemetry-enabled")
+                    && !line.starts_with("otel-endpoint")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        // The literal config.toml the design spec (Configuration table) and
+        // AGENTS.md document: flat keys at the file root, no `[otel]` table.
+        let literal = format!(
+            "{base}otel-telemetry-enabled = true\notel-endpoint = \"http://collector.example:4318\"\n"
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), literal).unwrap();
+
+        let rebuilt = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            rebuilt.otel.enabled,
+            "documented flat `otel-telemetry-enabled` key must be honored"
+        );
+        assert_eq!(
+            rebuilt.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318"),
+            "documented flat `otel-endpoint` key must be honored"
+        );
+    }
+
+    #[tokio::test]
+    async fn otel_cli_false_overrides_a_config_file_that_says_true() {
+        // The off switch has to work: an operator who exports to a collector
+        // and then needs it stopped must be able to do it from the command
+        // line without editing config.toml. `Some(false)` from the CLI beats
+        // the file; `None` (flag absent) lets the file's `true` through.
+        let temp_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let base = tokio::fs::read_to_string(&path).await.unwrap();
+        let base: String = base
+            .lines()
+            .filter(|line| !line.starts_with("otel-telemetry-enabled"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&path, format!("{base}otel-telemetry-enabled = true\n")).unwrap();
+
+        // Flag absent first: build() rewrites config.toml, so the negative
+        // case has to run last or it would overwrite the seed.
+        let inherited = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            inherited.otel.enabled,
+            "with the flag absent, config.toml's `true` must still win"
+        );
+
+        let mut args = clap_bare_args(temp_dir.path());
+        args.otel.enabled = Some(false);
+        assert!(
+            !args.build().await.unwrap().otel.enabled,
+            "--otel-telemetry-enabled=false must override config.toml"
+        );
     }
 
     #[tokio::test]
@@ -5964,30 +7457,7 @@ shutdown-drain-secs = 42
     /// Build a `ConfigArgs` rooted at `dir` in the given mode. Shared by the
     /// #4968 event-log default tests so each case differs only in what it sets.
     fn event_log_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
-        ConfigArgs {
-            mode: Some(mode),
-            // A non-gateway network node with no gateways is rejected by
-            // `build()`, so the network-mode cases build as a gateway. That is
-            // the realistic shape anyway: a gateway IS a network-mode node, and
-            // it is exactly the kind of node we operate and want the log on.
-            network_api: {
-                let is_network = matches!(mode, OperationMode::Network);
-                NetworkArgs {
-                    is_gateway: is_network,
-                    // A gateway must declare a public address.
-                    public_address: is_network.then(|| "203.0.113.1".parse().unwrap()),
-                    public_port: is_network.then_some(31337),
-                    skip_load_from_network: true,
-                    ..Default::default()
-                }
-            },
-            config_paths: ConfigPathsArgs {
-                config_dir: Some(dir.to_path_buf()),
-                data_dir: Some(dir.to_path_buf()),
-                log_dir: Some(dir.to_path_buf()),
-            },
-            ..Default::default()
-        }
+        super::event_log_test_args(dir, mode)
     }
 
     /// #4968: a network-mode node (what end users run) must NOT write the local
@@ -6355,6 +7825,51 @@ shutdown-drain-secs = 42
             rebuilt.max_hosting_storage,
             crate::ring::default_hosting_budget_bytes(),
             "a config.toml without the key must re-derive the budget from live RAM"
+        );
+    }
+    /// The telemetry endpoint is PERSISTED into config.toml by `build()`, so
+    /// changing `DEFAULT_TELEMETRY_ENDPOINT` alone reaches FRESH INSTALLS ONLY —
+    /// an existing node merges its stored value back on every start and keeps
+    /// the old endpoint forever, even after auto-updating. Same shape as the
+    /// hosting-budget sentinel above.
+    ///
+    /// (a) a stored value equal to the legacy default must RE-DERIVE, and
+    /// (b) a genuinely operator-chosen value must SURVIVE.
+    #[tokio::test]
+    async fn legacy_telemetry_endpoint_re_derives_but_explicit_survives() {
+        // (a) upgrade boot with the legacy endpoint persisted.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        let cfg_path = legacy_dir.path().join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap();
+        let legacy = existing.replace(DEFAULT_TELEMETRY_ENDPOINT, LEGACY_TELEMETRY_ENDPOINT);
+        assert!(
+            legacy.contains(LEGACY_TELEMETRY_ENDPOINT),
+            "fixture must actually contain the legacy endpoint, got:\n{legacy}"
+        );
+        std::fs::write(&cfg_path, legacy).unwrap();
+        let upgraded = clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        assert_eq!(
+            upgraded.telemetry.endpoint, DEFAULT_TELEMETRY_ENDPOINT,
+            "a persisted LEGACY telemetry endpoint must re-derive on upgrade, \
+             otherwise this change reaches fresh installs only"
+        );
+
+        // (b) an operator's own endpoint must not be clobbered by the sentinel.
+        let custom_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(custom_dir.path()).build().await.unwrap();
+        let custom_path = custom_dir.path().join("config.toml");
+        let base = std::fs::read_to_string(&custom_path).unwrap();
+        let chosen = "http://otel.example.invalid:4318";
+        std::fs::write(
+            &custom_path,
+            base.replace(DEFAULT_TELEMETRY_ENDPOINT, chosen),
+        )
+        .unwrap();
+        let kept = clap_bare_args(custom_dir.path()).build().await.unwrap();
+        assert_eq!(
+            kept.telemetry.endpoint, chosen,
+            "an operator-chosen endpoint must survive; only the legacy default re-derives"
         );
     }
 
@@ -6881,6 +8396,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -6889,6 +8405,7 @@ shutdown-drain-secs = 42
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 
@@ -6990,6 +8507,12 @@ shutdown-drain-secs = 42
                 skip_load_from_network: true,
             },
             ws_api: WebsocketApiConfig {
+                // Deliberately NOT an auto-derivable address: this guard is
+                // about persisted-field round-tripping, so it must not also
+                // exercise the migration. Its green therefore says nothing
+                // about the sentinel — that is
+                // `auto_derivable_addresses_are_exactly_the_ones_this_code_writes`
+                // and `re_derivation_preserves_the_address_family`.
                 address: "10.1.2.4".parse().unwrap(),
                 port: 8123,
                 token_ttl_seconds: 4321,
@@ -7003,6 +8526,14 @@ shutdown-drain-secs = 42
                 // serde-skip runtime field; repopulated by build() and not
                 // asserted in the round-trip (bound to `_` in the destructure).
                 secrets_dir: std::path::PathBuf::new(),
+                // Runtime-only (`#[serde(skip)]`): describes THIS boot's
+                // resolution, so it is deliberately not round-tripped. Seeded
+                // non-default anyway so the guard below is not comparing two
+                // defaults.
+                exposure: WsApiExposure {
+                    source: WsApiAddressSource::AutoWidened,
+                    dropped_persisted_address: Some(default_listening_address()),
+                },
                 webapp_cache_dir: default_webapp_cache_dir(),
             },
             secrets: base.secrets.clone(),
@@ -7016,6 +8547,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: 123_456_789,
             hosting_disk_pct: 0.37,
             max_hosting_disk: 9_876_543_210,
+            hosting_mem_share: 0.21,
             per_user_secret_quota_bytes: 7_654_321,
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
@@ -7031,6 +8563,12 @@ shutdown-drain-secs = 42
                 is_test_environment: false, // #[serde(skip)] — derived from --id
                 reference_ping_enabled: true,
                 iface_tx_enabled: true,
+            },
+            otel: OtelConfig {
+                enabled: true,
+                endpoint: Some("http://example.invalid:4319".to_string()),
+                auth_mode: OtelAuthMode::Freenet, // non-default: default is Disabled
+                is_test_environment: false,       // #[serde(skip)] — derived from --id
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
@@ -7079,12 +8617,14 @@ shutdown-drain-secs = 42
             max_hosting_storage,
             hosting_disk_pct,
             max_hosting_disk,
+            hosting_mem_share,
             per_user_secret_quota_bytes,
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
             enable_event_log,
             telemetry,
+            otel,
             shutdown_drain_secs,
             // #[serde(skip)] runtime CLI/env flag — set from --disable-auto-update
             // at build() time, intentionally not persisted, so it does not
@@ -7106,6 +8646,10 @@ shutdown-drain-secs = 42
         );
         assert_eq!(hosting_disk_pct, seed.hosting_disk_pct, "hosting_disk_pct");
         assert_eq!(max_hosting_disk, seed.max_hosting_disk, "max_hosting_disk");
+        assert_eq!(
+            hosting_mem_share, seed.hosting_mem_share,
+            "hosting_mem_share"
+        );
         assert_eq!(
             per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
             "per_user_secret_quota_bytes"
@@ -7130,6 +8674,23 @@ shutdown-drain-secs = 42
         assert_eq!(
             shutdown_drain_secs, seed.shutdown_drain_secs,
             "shutdown_drain_secs"
+        );
+        let OtelConfig {
+            enabled: otel_enabled,
+            endpoint: otel_endpoint,
+            auth_mode: otel_auth_mode,
+            is_test_environment: _, // serde-skip, derived from --id
+        } = otel;
+        assert_eq!(otel_enabled, seed.otel.enabled, "otel.enabled");
+        assert_eq!(
+            otel_endpoint, seed.otel.endpoint,
+            "otel.endpoint — an operator's collector URL must survive the \
+             config.toml merge"
+        );
+        assert_eq!(
+            otel_auth_mode, seed.otel.auth_mode,
+            "otel.auth_mode — an operator's explicit choice must survive the \
+             config.toml merge, or auth silently reverts on restart"
         );
 
         let NetworkApiConfig {
@@ -7232,6 +8793,11 @@ shutdown-drain-secs = 42
             // serde-skip runtime field, repopulated by build() from
             // `default_webapp_cache_dir()` (env-overridable).
             webapp_cache_dir: _,
+            // serde-skip runtime field: how THIS boot resolved the client-API
+            // bind. Not config — it is an output of `build()`, re-derived every
+            // boot — so it deliberately does not round-trip. Its own coverage
+            // is `build_records_the_exposure_decision_for_later_reporting`.
+            exposure: _,
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
@@ -7457,7 +9023,7 @@ shutdown-drain-secs = 42
                     location: None,
                 },
                 GatewayConfig {
-                    address: Address::Hostname("technic.locut.us".to_string()),
+                    address: Address::Hostname("gw1.freenet.org".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
                 },
@@ -7470,8 +9036,12 @@ shutdown-drain-secs = 42
 
     // ---- Address deserialization: backward compat + new host/port form (#1388) ----
 
-    /// Legacy single-string form, exactly as it appears in the deployed
-    /// `https://freenet.org/keys/gateways.toml` today. MUST keep parsing.
+    /// Legacy single-string form, exactly as it appeared in the deployed
+    /// `https://freenet.org/keys/gateways.toml` for years (retired 2026-08-29,
+    /// replaced by role-based `gwN.freenet.org` names). MUST keep parsing —
+    /// peers holding a cached copy of the old file still need it. Deliberately
+    /// NOT updated to the new hostname: this pins the historical value real
+    /// deployments actually used, not an arbitrary example.
     #[test]
     fn test_address_deser_legacy_hostname_string() {
         let toml_str = r#"
@@ -7489,7 +9059,9 @@ shutdown-drain-secs = 42
     }
 
     /// Legacy single-string form without a port still parses (port is resolved
-    /// later by `parse_socket_addr`, which now defaults to 31337).
+    /// later by `parse_socket_addr`, which now defaults to 31337). Same
+    /// historical-value reasoning as the sibling test above: left as the real
+    /// pre-2026-08-29 deployed hostname on purpose.
     #[test]
     fn test_address_deser_legacy_hostname_string_no_port() {
         let toml_str = r#"
@@ -7528,14 +9100,14 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw1.freenet.org"
             port = 31337
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: 31337
             }
         );
@@ -7568,13 +9140,13 @@ shutdown-drain-secs = 42
             [[gateways]]
             public_key = "keys/public.vega.gw.pem"
             [gateways.address]
-            host = "vega.locut.us"
+            host = "gw1.freenet.org"
         "#;
         let gateways: Gateways = toml::from_str(toml_str).unwrap();
         assert_eq!(
             gateways.gateways[0].address,
             Address::Host {
-                host: "vega.locut.us".to_string(),
+                host: "gw1.freenet.org".to_string(),
                 port: DEFAULT_GATEWAY_PORT
             }
         );
@@ -7624,7 +9196,7 @@ shutdown-drain-secs = 42
         let gateways = Gateways {
             gateways: vec![GatewayConfig {
                 address: Address::Host {
-                    host: "vega.locut.us".to_string(),
+                    host: "gw1.freenet.org".to_string(),
                     port: 31337,
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
@@ -7636,7 +9208,8 @@ shutdown-drain-secs = 42
         // sibling keys), matching the new wire form in the issue — not nested
         // under a `[gateways.address.host]` sub-table (the derived enum form).
         assert!(
-            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            serialized.contains("host = \"gw1.freenet.org\"")
+                && serialized.contains("port = 31337"),
             "unexpected serialized form:\n{serialized}"
         );
         assert!(
@@ -7657,14 +9230,14 @@ shutdown-drain-secs = 42
     fn test_address_legacy_variants_serialize_unchanged() {
         let hostname = Gateways {
             gateways: vec![GatewayConfig {
-                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                address: Address::Hostname("gw1.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
         assert!(
-            s.contains("hostname = \"vega.locut.us:31337\""),
+            s.contains("hostname = \"gw1.freenet.org:31337\""),
             "legacy hostname form changed:\n{s}"
         );
 
@@ -8746,9 +10319,8 @@ shutdown-drain-secs = 42
     ///    precedent, not its safety.
     /// 2. It would not close the door it is aimed at. `HttpClientApi::as_router`
     ///    is the direct router-composition entry a test would reach for, and it
-    ///    resolves `default_webapp_cache_dir()` itself because
-    ///    `local_node::run_local_node` (a real user-facing mode) serves through
-    ///    it. Its signature is public API and carries no cache root.
+    ///    resolves `default_webapp_cache_dir()` itself. Its signature is public
+    ///    API and carries no cache root.
     /// 3. These constructors are the fallback for any future serving path that
     ///    is not `ConfigArgs::build()`, where an unbounded cache under an
     ///    arbitrary working directory would be strictly worse than a shared but
@@ -8811,5 +10383,779 @@ shutdown-drain-secs = 42
             i += 1;
         }
         panic!("unterminated body for {signature_prefix}");
+    }
+
+    // ------------------------------------------------------------------
+    // GHSA-824h-7x5x-wfmf — the client API defaults to loopback in BOTH
+    // operation modes.
+    //
+    // Before this change `OperationMode::Network` defaulted the client API to
+    // the wildcard `::`, so every host on the LAN could drive a fully
+    // privileged control API (contract state, delegate secrets, key material)
+    // on any node whose operator had done nothing but run `freenet network`.
+    // `OperationMode` still governs ring participation and `secrets_dir(mode)`;
+    // it no longer governs who may drive the client API.
+    // ------------------------------------------------------------------
+
+    /// Build a `ConfigArgs` in `mode` with everything unrelated to the client
+    /// API pinned to something inert, so a test can vary only the ws-api knobs.
+    fn ws_api_test_args(mode: OperationMode, config_dir: &std::path::Path) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(mode),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                // A public identity means the peer may bootstrap disjoint, so
+                // an empty gateway index is not a build error and the test
+                // stays focused on the ws-api resolution.
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_api_defaults_to_loopback_in_network_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(
+            cfg.ws_api.address,
+            default_local_address(),
+            "a plain `freenet network` node must NOT expose its client API to the LAN"
+        );
+        assert!(cfg.ws_api.address.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn ws_api_defaults_to_loopback_in_local_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let cfg = ws_api_test_args(OperationMode::Local, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, default_local_address());
+    }
+
+    #[tokio::test]
+    async fn ws_api_auto_widens_when_allowed_source_cidrs_is_set() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        // The canonical Tailscale invocation, which worked before this change
+        // only because the default happened to be `::`.
+        args.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(
+            cfg.ws_api.address,
+            default_listening_address(),
+            "--allowed-source-cidrs is a no-op on a loopback listener, so it must widen the bind"
+        );
+    }
+
+    /// `--allowed-host` must NOT widen the bind. It is a Host-header allowlist
+    /// that works perfectly on loopback, and the same-host reverse proxy is its
+    /// primary documented use — the only shape in which hosted mode honours
+    /// `userToken` at all, since `decide_user_token` requires a loopback source.
+    /// Widening for it would bind every interface in the commonest proxy
+    /// deployment for no functional gain.
+    #[tokio::test]
+    async fn allowed_host_alone_does_not_widen_the_bind() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        args.ws_api.allowed_host = Some(vec!["node.example.org".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, default_local_address());
+        assert_eq!(
+            cfg.ws_api.allowed_hosts.len(),
+            1,
+            "the allowlist still applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ws_api_address_is_never_auto_widened() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // This is try.freenet.org's exact shape: an explicit loopback bind
+        // behind a reverse proxy that is named with --allowed-host. The
+        // explicit flag must win, or the hardening would silently un-harden
+        // the one deployment that already did the right thing.
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        args.ws_api.address = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        args.ws_api.allowed_host = Some(vec!["try.freenet.org".to_string()]);
+        args.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// An empty allow-list grants nothing, so it must not be read as intent to
+    /// widen. This is not hypothetical: the config-file merge hands `build()`
+    /// the persisted `allowed-host = []` / `allowed-source-cidrs = []` that
+    /// every already-booted node has in its `config.toml`.
+    #[test]
+    fn empty_allow_lists_do_not_widen() {
+        for mode in [OperationMode::Network, OperationMode::Local] {
+            assert_eq!(
+                resolve_ws_api_address(mode, None, Some(&[]), None),
+                (default_local_address(), WsApiAddressSource::DefaultLoopback)
+            );
+            assert_eq!(
+                resolve_ws_api_address(mode, None, None, None),
+                (default_local_address(), WsApiAddressSource::DefaultLoopback)
+            );
+        }
+    }
+
+    /// `FREENET_ALLOWED_HOST=` declared with no value — routine in a docker-compose
+    /// `.env`, a k8s ConfigMap, or a systemd `Environment=` line — parses as
+    /// `Some(vec![""])`. Reading that as intent would widen the bind on a node
+    /// whose operator granted nothing.
+    #[test]
+    fn blank_allow_list_entries_do_not_widen() {
+        assert_eq!(
+            resolve_ws_api_address(
+                OperationMode::Network,
+                None,
+                Some(&[String::new(), "   ".to_string()]),
+                None,
+            ),
+            (default_local_address(), WsApiAddressSource::DefaultLoopback)
+        );
+    }
+
+    /// Local mode has ALWAYS bound loopback, so there is no wide default to
+    /// preserve there. Widening for it would mean this hardening OPENED a
+    /// socket that used to be closed — the exact thing it exists to prevent.
+    #[test]
+    fn local_mode_never_auto_widens() {
+        for hint in [None, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))] {
+            let (addr, source) = resolve_ws_api_address(
+                OperationMode::Local,
+                None,
+                Some(&["100.64.0.0/10".to_string()]),
+                hint,
+            );
+            assert_eq!(source, WsApiAddressSource::DefaultLoopback);
+            assert!(
+                addr.is_loopback(),
+                "local mode must stay loopback, got {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ws_api_address_reports_how_it_decided() {
+        let explicit = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        for mode in [OperationMode::Network, OperationMode::Local] {
+            assert_eq!(
+                resolve_ws_api_address(mode, Some(explicit), None, None),
+                (explicit, WsApiAddressSource::Explicit)
+            );
+        }
+        assert_eq!(
+            resolve_ws_api_address(
+                OperationMode::Network,
+                None,
+                Some(&["10.0.0.0/8".to_string()]),
+                None
+            ),
+            (default_listening_address(), WsApiAddressSource::AutoWidened)
+        );
+        // `--allowed-host` is deliberately NOT a widening trigger: it is fully
+        // functional on a loopback socket, where the same-host reverse proxy —
+        // the only shape in which hosted mode honours `userToken` — lives.
+        assert_eq!(
+            resolve_ws_api_address(OperationMode::Network, None, None, None),
+            (default_local_address(), WsApiAddressSource::DefaultLoopback)
+        );
+    }
+
+    /// The migration sentinel is "a value this code could have written", which
+    /// must include the loopback default — see
+    /// `remedy_still_works_after_the_upgrade_persisted_loopback`.
+    #[test]
+    fn auto_derivable_addresses_are_exactly_the_ones_this_code_writes() {
+        for auto in [
+            default_listening_address(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            default_local_address(),
+        ] {
+            assert!(is_auto_derivable_ws_api_address(auto), "{auto}");
+        }
+        // `127.0.0.1` is auto-derivable too: it is what an IPv4-family node
+        // re-derives to, so treating it as a choice would strand exactly the
+        // hosts B1 exists to protect.
+        assert!(is_auto_derivable_ws_api_address(IpAddr::V4(
+            Ipv4Addr::LOCALHOST
+        )));
+        // A deliberately-pinned loopback ALIAS is a choice — this code never
+        // writes one, which is why the sentinel enumerates instead of calling
+        // `is_loopback()`.
+        for chosen in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ] {
+            assert!(!is_auto_derivable_ws_api_address(chosen), "{chosen}");
+        }
+    }
+
+    /// The exposure warning fires on a non-loopback bind REGARDLESS of hosted
+    /// mode (an untokened connection reaches the shared namespace either way),
+    /// and additionally on (non-loopback bind OR
+    /// an `--allowed-host` reverse-proxy grant). Both triggers matter: a proxy
+    /// terminates the connection itself, so every visitor looks local to the
+    /// node's own source-IP filters even when the bind is `127.0.0.1`.
+    #[test]
+    fn exposure_warning_fires_only_when_one_namespace_is_reachable_remotely() {
+        let loopback = default_local_address();
+        let wildcard = default_listening_address();
+        let proxy = vec!["try.freenet.org".to_string()];
+
+        // Quiet: the default single-user desktop node.
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(false, loopback, &[]),
+            None
+        );
+        // Quiet: try.freenet.org's shape. A KNOWN GAP rather than a safety
+        // claim — an untokened connection reads the shared namespace here too.
+        // Containment today is that the namespace is empty; making the warning
+        // conditional on that needs a probe of the secrets tree, tracked
+        // separately so a probe that is wrong in either direction cannot ride
+        // in on a default-hardening change.
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(true, loopback, &proxy),
+            None
+        );
+
+        // Fires: reachable from other machines, one shared namespace. The
+        // reason names the bind, which is the thing to change.
+        let bind_reason = ws_api_shares_one_namespace_with_remote_clients(false, wildcard, &[])
+            .expect("a wildcard bind with hosted mode off must warn");
+        assert!(bind_reason.contains("non-loopback"), "{bind_reason}");
+
+        // Fires: hosted mode does NOT make a wide bind safe. `decide_user_token`
+        // returns the shared context whenever a connection omits `userToken`.
+        let hosted_wide = ws_api_shares_one_namespace_with_remote_clients(true, wildcard, &proxy)
+            .expect("a wildcard bind must warn even in hosted mode");
+        assert!(hosted_wide.contains("hosted mode does"), "{hosted_wide}");
+
+        // Fires: proxied with hosted mode off, the shape with no isolation.
+        let proxy_reason = ws_api_shares_one_namespace_with_remote_clients(false, loopback, &proxy)
+            .expect("a proxied node with hosted mode off must warn");
+        assert!(proxy_reason.contains("--allowed-host"), "{proxy_reason}");
+    }
+
+    /// `build()` persists the RESOLVED config, so every node that has already
+    /// booted in network mode carries the old auto-default
+    /// `ws-api-address = "::"` in its `config.toml`. Merging that back would
+    /// pin the entire existing fleet to the wildcard bind and leave the
+    /// hardening reaching fresh installs only.
+    #[tokio::test]
+    async fn persisted_legacy_wildcard_address_is_re_derived_to_loopback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // First boot on the OLD code: resolve to `::` and persist it.
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        let first_cfg = first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+        assert_eq!(first_cfg.ws_api.address, default_listening_address());
+        let persisted =
+            std::fs::read_to_string(temp_dir.path().join("config.toml")).expect("config persisted");
+        assert!(
+            persisted.contains(r#"ws-api-address = "::""#),
+            "test premise: the wildcard must actually be written to config.toml, got:\n{persisted}"
+        );
+
+        // Second boot on the NEW code, flag-less: the persisted `::` is
+        // recognised as the old auto-default and re-derived.
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(
+            cfg.ws_api.address,
+            default_local_address(),
+            "an upgrading node must stop exposing its client API to the LAN"
+        );
+    }
+
+    /// Re-derivation must PRESERVE THE ADDRESS FAMILY, because the primary bind
+    /// is fatal while only the companion is best-effort (`server.rs`
+    /// `serve_dual_stack`).
+    ///
+    /// A node installed before #3648 persisted `0.0.0.0`. Re-deriving that to
+    /// the IPv6 `::1` on a host with IPv6 disabled makes the primary bind fail
+    /// with EAFNOSUPPORT — and `build()` has already rewritten `config.toml`
+    /// before the bind is attempted, so the crash-loop rollback restores the
+    /// previous binary onto a config that now says `::1` and it dies the same
+    /// way. Rollback does not fire twice: the node is down for good. The
+    /// brick-safety mechanism becomes the brick, reached through a VALUE change
+    /// rather than the key change `code-style.md` already guards.
+    #[tokio::test]
+    async fn re_derivation_preserves_the_address_family() {
+        for (persisted, expected) in [
+            (
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let (_server, index_url) = empty_gateways_index_server();
+
+            let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+            first.ws_api.address = Some(persisted);
+            first
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("first build should succeed");
+
+            let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("second build should succeed");
+            assert_eq!(
+                cfg.ws_api.address, expected,
+                "persisted {persisted} must re-derive within its own family; \
+                 crossing families is a fatal bind on a single-stack host"
+            );
+        }
+    }
+
+    /// Same requirement for the auto-widen branch: an IPv4-family node that
+    /// applies the documented remedy must widen to `0.0.0.0`, not `::`.
+    #[tokio::test]
+    async fn auto_widen_preserves_the_address_family() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        let mut remedied = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        remedied.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = remedied
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(cfg.ws_api.address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    /// The migration keys on "a value this code could have written" and nothing
+    /// else: a specific interface address is never auto-written, so it is an
+    /// operator choice and must survive an upgrade untouched.
+    ///
+    /// Note `127.0.0.1` is deliberately NOT in this test any more. It became
+    /// auto-derivable when re-derivation started preserving the address family
+    /// — it is what an IPv4 node re-derives TO — so it round-trips to itself
+    /// rather than being preserved. Same observable value, different mechanism;
+    /// asserting it here would pass for the wrong reason. Its real coverage is
+    /// `auto_derivable_addresses_are_exactly_the_ones_this_code_writes`.
+    #[tokio::test]
+    async fn persisted_explicit_address_survives_the_migration() {
+        for chosen in [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5)),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let (_server, index_url) = empty_gateways_index_server();
+
+            let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+            first.ws_api.address = Some(chosen);
+            first
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("first build should succeed");
+
+            let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("second build should succeed");
+            assert_eq!(cfg.ws_api.address, chosen);
+        }
+    }
+
+    /// The upgrade path for a Tailscale-style node whose systemd unit passes
+    /// `--allowed-source-cidrs` on every boot: the migration drops the
+    /// persisted `::` and auto-widening puts it straight back. Zero operator
+    /// action, same bind as before the upgrade.
+    #[tokio::test]
+    async fn upgrading_node_with_cidr_grant_keeps_its_wildcard_bind() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        // Restart with the flag still in the invocation, as a service does.
+        let mut second = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        second.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = second
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(cfg.ws_api.address, default_listening_address());
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 1);
+    }
+
+    /// The auto-widen must NOT be sticky. A grant that only survives in
+    /// `config.toml` cannot widen a later boot, or one run with the flag would
+    /// pin the node to the wildcard forever and REMOVING the flag would never
+    /// narrow it again — the hardening would permanently miss every node that
+    /// ever set an allow-list.
+    #[tokio::test]
+    async fn a_persisted_cidr_grant_does_not_widen_a_later_flagless_boot() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let widened = first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+        assert_eq!(widened.ws_api.address, default_listening_address());
+
+        // Flag removed from the invocation; only config.toml still names it.
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(
+            cfg.ws_api.address,
+            default_local_address(),
+            "a grant the operator no longer passes must not keep the socket wide"
+        );
+        // The list itself still applies to the source filter; only the BIND
+        // decision is re-taken from this boot's flags.
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 1);
+    }
+
+    /// The exposure decision must survive onto the resolved `Config`, because
+    /// that is the only way it reaches a log: `build()` runs before the tracing
+    /// subscriber is installed, so anything it emits is dropped.
+    #[tokio::test]
+    async fn build_records_the_exposure_decision_for_later_reporting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        args.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let widened = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+        assert_eq!(
+            widened.ws_api.exposure.source,
+            WsApiAddressSource::AutoWidened
+        );
+        assert_eq!(widened.ws_api.exposure.dropped_persisted_address, None);
+
+        // A fresh dir, so the migration branch is the one under test.
+        let upgrade_dir = tempfile::tempdir().unwrap();
+        let mut first = ws_api_test_args(OperationMode::Network, upgrade_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+        let migrated = ws_api_test_args(OperationMode::Network, upgrade_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(
+            migrated.ws_api.exposure.dropped_persisted_address,
+            Some(default_listening_address()),
+            "the operator must be told their LAN clients just lost access"
+        );
+        assert_eq!(
+            migrated.ws_api.exposure.source,
+            WsApiAddressSource::DefaultLoopback
+        );
+
+        // Boot 3 in the same dir: the operator applies the documented remedy on
+        // an ALREADY-MIGRATED node — config.toml holds the post-migration
+        // loopback, and the CIDR grant arrives now. This is the sequence the
+        // startup message actually points operators at, and it only works
+        // because the sentinel treats loopback as auto-derivable: read back as
+        // an operator choice it would take the Explicit short-circuit and the
+        // remedy would silently do nothing.
+        let mut widened_later = ws_api_test_args(OperationMode::Network, upgrade_dir.path());
+        widened_later.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = widened_later
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("third build should succeed");
+        assert_eq!(cfg.ws_api.address, default_listening_address());
+        assert_eq!(cfg.ws_api.exposure.source, WsApiAddressSource::AutoWidened);
+        // Recorded, because the bind MOVED — and moved toward exposure. A
+        // hardening change that widens a node whose config named loopback owes
+        // the operator a loud line about it, which is why the notice is
+        // directional rather than suppressed here.
+        assert_eq!(
+            cfg.ws_api.exposure.dropped_persisted_address,
+            Some(default_local_address()),
+            "widening past a persisted loopback address must be reported, not silent"
+        );
+    }
+
+    /// D4 regression: the same remedy sequence, asserted on the BIND rather
+    /// than on the exposure record, and starting from a node that is already
+    /// migrated. `auto_widen_preserves_the_address_family` starts from a
+    /// persisted wildcard, which is the migration boot, not the remedy.
+    #[tokio::test]
+    async fn remedy_still_works_after_the_upgrade_persisted_loopback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // Boot 1: pre-upgrade node with the old wildcard auto-default.
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        // Boot 2: upgraded, flag-less. Re-derived to loopback and persisted.
+        let migrated = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(migrated.ws_api.address, default_local_address());
+        let persisted =
+            std::fs::read_to_string(temp_dir.path().join("config.toml")).expect("config persisted");
+        assert!(
+            persisted.contains(r#"ws-api-address = "::1""#),
+            "test premise: the loopback address must be persisted, got:\n{persisted}"
+        );
+
+        // Boot 3: the operator applies the documented remedy.
+        let mut remedied = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        remedied.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = remedied
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("third build should succeed");
+        assert_eq!(
+            cfg.ws_api.address,
+            default_listening_address(),
+            "the auto-widen remedy must still work once the migration has run"
+        );
+    }
+
+    /// The notice must fire ONCE. Its filter has two clauses, and only one of
+    /// them was covered: dropping `!persisted.is_loopback()` while keeping the
+    /// other passes every other test, yet makes the notice reappear on every
+    /// flagless boot forever — the tuned-out-log failure the migration comment
+    /// exists to avoid. Boot three times and assert the third is silent.
+    #[tokio::test]
+    async fn the_loss_of_access_notice_does_not_repeat_after_the_migration_boot() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        let migrated = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("migration boot should succeed");
+        assert_eq!(
+            migrated.ws_api.exposure.dropped_persisted_address,
+            Some(default_listening_address()),
+            "the migration boot must report the loss of access exactly once"
+        );
+
+        let steady = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("third build should succeed");
+        assert_eq!(steady.ws_api.address, default_local_address());
+        assert_eq!(
+            steady.ws_api.exposure.dropped_persisted_address, None,
+            "re-announcing an unchanged bind on every boot is how a log line \
+             gets tuned out"
+        );
+    }
+
+    /// Source pin: the resolver and the reporting path must actually be wired
+    /// in. A unit-tested pure function that nothing calls is a verification
+    /// that cannot fail.
+    ///
+    /// Both halves matter and they live in different functions: `build()` must
+    /// RESOLVE through the helper, and `Config::log_client_api_exposure` must
+    /// be the thing that reports it (it cannot be reported from `build()`,
+    /// which has no tracing subscriber yet).
+    #[test]
+    fn the_client_api_exposure_path_stays_wired_end_to_end() {
+        let src = production_source();
+
+        let build = extract_fn_body(
+            src,
+            "async fn build_with_gateways_index(mut self, gateways_index: &str)",
+        );
+        assert!(
+            build.contains("resolve_ws_api_address("),
+            "build_with_gateways_index no longer resolves the client-API bind through \
+             the shared helper"
+        );
+        assert!(
+            build.contains("exposure: ws_api_exposure"),
+            "build_with_gateways_index no longer records the exposure decision, so \
+             nothing downstream can report it"
+        );
+        // `build()` legitimately warns about other things (gateway dedup, source
+        // CIDRs), so pin the specific property: it must not CONSULT the exposure
+        // predicate, because anything it decided to say about exposure would be
+        // emitted before `set_logger` and silently dropped.
+        assert!(
+            !build.contains("ws_api_shares_one_namespace_with_remote_clients("),
+            "the exposure warning must NOT be decided in build(): it runs before \
+             set_logger, so the message would be silently dropped"
+        );
+
+        let report = extract_fn_body(src, "pub fn log_client_api_exposure(&self)");
+        assert!(
+            report.contains("ws_api_shares_one_namespace_with_remote_clients("),
+            "log_client_api_exposure no longer consults the exposure predicate"
+        );
+        assert!(
+            report.contains("tracing::warn!"),
+            "log_client_api_exposure no longer warns about a shared-namespace exposure"
+        );
+
+        // A re-derivation that MOVED the bind is reported in whichever direction
+        // it moved, and both branches must survive. The record-site filter is
+        // pinned above, so re-applying the old "suppress the contradiction" fix
+        // there fails — but deleting the widening `else` here achieves the same
+        // silence and is invisible to every behavioural test, because nothing
+        // asserts on emitted logs. That is the cannot-fail shape this function's
+        // own comment block warns about, so pin the selection by its message
+        // stems.
+        for (stem, direction) in [
+            ("can no longer reach this node's API", "narrowing"),
+            ("widened the bind", "widening"),
+        ] {
+            assert!(
+                report.contains(stem),
+                "log_client_api_exposure no longer reports the {direction} \
+                 re-derivation. Both directions must speak: silencing one is how \
+                 a node that got MORE exposed stopped saying so."
+            );
+        }
+
+        // Each renamed environment variable must keep its deprecation notice.
+        // Dropping a pair from the array is silent: the operator's old-style
+        // variable is then ignored with no explanation, which is exactly the
+        // failure the loop exists to prevent.
+        for legacy in ["WS_API_ADDRESS", "ALLOWED_HOST", "ALLOWED_SOURCE_CIDRS"] {
+            assert!(
+                report.contains(&format!("(\"{legacy}\", \"FREENET_{legacy}\")")),
+                "log_client_api_exposure no longer reports a leftover `{legacy}`; a \
+                 deployment relying on it goes loopback-only with no explanation"
+            );
+        }
+
+        // The mode-keyed DEFAULT must not come back. Pin it on the resolver's
+        // signature rather than on a text search of `build()`: `mode` is a
+        // legitimate input (it scopes the compat auto-widen), so what must stay
+        // true is that the no-flags branch is mode-independent — which the
+        // behavioural test `empty_allow_lists_do_not_widen` asserts for both
+        // modes. Here we only pin that the resolver is the single decision site.
+        let resolver = extract_fn_body(src, "fn resolve_ws_api_address(");
+        assert!(
+            resolver.contains("WsApiAddressSource::DefaultLoopback"),
+            "resolve_ws_api_address no longer has a loopback default branch"
+        );
+
+        // Cross-file: both helpers are called from exactly ONE place each, in a
+        // different file, so deleting a call site leaves every test in this
+        // module green while silently removing the only operator-facing signal
+        // (and, for the merge, the flags that decide the bind). Scraping the
+        // binary's source from HERE also avoids the self-match trap that an
+        // `include_str!("freenet.rs")` inside that file's own test module would
+        // hit, the same reason `production_source()` exists.
+        let main_src = include_str!("bin/freenet.rs");
+        let main_body = extract_fn_body(main_src, "fn freenet_main() -> anyhow::Result<()>");
+        for (needle, why) in [
+            (
+                "config.log_client_api_exposure()",
+                "nothing would report the client API's exposure — build() cannot, it \
+                 runs before set_logger",
+            ),
+            (
+                "merge_pre_subcommand_ws_api_args(",
+                "flags placed before the subcommand would be silently discarded, \
+                 leaving the node loopback-only against the operator's intent",
+            ),
+        ] {
+            assert!(
+                main_src.contains(needle),
+                "bin/freenet.rs no longer calls `{needle}`: {why}"
+            );
+        }
+        // The merge must run for BOTH subcommands, not just whichever one a
+        // refactor happened to keep.
+        assert_eq!(
+            main_body
+                .matches("merge_pre_subcommand_ws_api_args(")
+                .count(),
+            2,
+            "merge_pre_subcommand_ws_api_args must be called from the Network arm \
+             AND the Local arm"
+        );
     }
 }

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body>
+<!--
+  Deliberately has NO <title> element at all. document.title on a page like
+  this is the empty string, and title_sync.js's sendTitle() treats an empty
+  title as "nothing to report" rather than resetting the shell — the shell
+  keeps showing whatever title the PREVIOUS page set. This fixture exists to
+  lock that specific, documented tradeoff in place (see the comment on the
+  `if (!title || ...)` guard in path_handlers/assets/title_sync.js) — the
+  Playwright test that navigates here asserts the tab title does NOT change.
+-->
+<h1 id="no-title-page">No-title fixture page</h1>
+<a id="back-link" href="index.html">Back to index</a>
+</body>
+</html>

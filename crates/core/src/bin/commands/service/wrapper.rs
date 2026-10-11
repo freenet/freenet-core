@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
+use super::cli_symlinks::macos_ensure_cli_symlinks;
+#[cfg(target_os = "macos")]
 use super::launch_at_login::macos_launch_at_login_startup;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
@@ -18,7 +20,7 @@ use super::open_url_in_browser;
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
-    WRAPPER_MAX_PORT_CONFLICT_KILLS,
+    WRAPPER_MAX_PORT_CONFLICT_KILLS, WRAPPER_MIN_HEALTHY_RUNTIME_SECS,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::{
@@ -219,6 +221,29 @@ pub(super) enum WrapperAction {
     KillAndRetry,
     /// Wait (with jitter) then relaunch.
     BackoffAndRelaunch { secs: u64 },
+}
+
+/// When the child that just exited ran long enough to have been healthy, clear
+/// the failure count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES` (as the macOS
+/// launchd script does) and the backoff. Without it the count only reset on a
+/// successful update, so a node that runs for days and fails one update a day
+/// (a #3934 lockout retry, or an AV-locked binary) walked to the limit and the
+/// wrapper gave up for good.
+///
+/// The identical-failure streak is deliberately LEFT ALONE: the same failure
+/// after every healthy run (a version that dies after ten minutes, the same
+/// install failing day after day) is exactly the "stuck" condition that
+/// streak exists to report, and hiding it would hide a node stuck on an old
+/// version.
+///
+/// `runtime_secs` must be the child's own runtime, measured when it exited,
+/// not including the post-exit update: a quick crash followed by a slow failed
+/// update is not a healthy run.
+pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
+    if runtime_secs >= WRAPPER_MIN_HEALTHY_RUNTIME_SECS {
+        state.consecutive_failures = 0;
+        state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+    }
 }
 
 /// Pure function: given current state and exit info, determine the next action
@@ -544,6 +569,11 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
                     std::process::id()
                 ),
             );
+            // LaunchServices may have launched this copy to deliver a
+            // freenet:// link; open it rather than drop it (#5726).
+            #[cfg(target_os = "macos")]
+            super::super::tray::handle_links_sent_to_duplicate(std::time::Duration::from_secs(3));
+            #[cfg(not(target_os = "macos"))]
             return Ok(());
         }
         AcquireWrapperLockOutcome::UnavailableSoProceed => {
@@ -588,6 +618,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
         #[cfg(target_os = "macos")]
         macos_launch_at_login_startup(&log_dir);
 
+        // macOS: one-shot CLI symlink setup (`freenet`/`fdev` on PATH via
+        // /usr/local/bin). Runs on its OWN background thread, not inline
+        // here: unlike Launch at Login above, this can pop a blocking
+        // administrator-privileges password dialog (see cli_symlinks.rs),
+        // and that must never delay the tray icon from appearing.
+        #[cfg(target_os = "macos")]
+        {
+            let log_dir_for_cli_symlinks = log_dir.clone();
+            std::thread::spawn(move || {
+                macos_ensure_cli_symlinks(&log_dir_for_cli_symlinks);
+            });
+        }
+
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
             let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
@@ -630,8 +673,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// update subprocess silently fails to start and the wrapper falls into
 /// the exit-42 / update-failed / backoff-relaunch loop documented in
 /// #3934 (which was also the root cause of "Check for Updates" being
-/// broken in #3933). Null stdio is harmless on macOS/Linux because
-/// `--quiet` already suppresses all output.
+/// broken in #3933).
+///
+/// KNOWN GAP (#5244): nulling stderr also discards everything `freenet update`
+/// now reports about brick-safety — the WARN subscriber installed for the
+/// subcommand, and the two unconditional messages saying crash-loop rollback
+/// failed to arm. Under systemd those reach the journal; under this wrapper
+/// (Windows, and the macOS tray path) they go nowhere. `--quiet` no longer
+/// suppresses them, so the previous claim that nulling was harmless because
+/// "--quiet already suppresses all output" is no longer true. Fixing it means
+/// pointing stderr at the wrapper log (`log_wrapper_event`'s file) rather than
+/// at null — the Windows constraint above is about INHERITED invalid handles,
+/// not about needing null specifically — and threading a log dir through all
+/// five call sites.
 ///
 /// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
 /// the node's restart cycle (the node exited `code` and the wrapper is applying
@@ -895,6 +949,12 @@ fn run_wrapper_loop(
             cmd.stderr(std::process::Stdio::null());
         }
 
+        // Wall-clock time is right here: this measures how long a real child
+        // process ran, in bin-side supervisor code no simulation reaches.
+        let child_started = {
+            use std::time::Instant;
+            Instant::now()
+        };
         // Use spawn + polling so we can handle tray actions while child runs
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1014,6 +1074,13 @@ fn run_wrapper_loop(
             // Sleep briefly before polling again
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
+
+        // The child's own runtime, taken as it exits and before any update
+        // runs, so the updater's time is never counted as a healthy run.
+        // Applied here, before the tray Restart/Stop sentinels `continue`, so
+        // a healthy run ended from the tray also starts a fresh count.
+        let child_runtime_secs = child_started.elapsed().as_secs();
+        note_child_runtime(&mut state, child_runtime_secs);
 
         // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == SENTINEL_RESTART {

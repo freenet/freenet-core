@@ -345,8 +345,9 @@ impl Drop for Secrets {
 // (e.g. encrypting under one and decrypting under another without a
 // `register_delegate` round-trip) will fail. All current test sites
 // construct exactly one `SecretsStore::new(_, Default::default(), _)`
-// per test and route their crypto through the registered-cipher path,
-// so the non-reproducibility is invisible to them.
+// per test, and since #4146 their delegate crypto runs on the node-KEK-derived
+// DEK rather than on this cipher at all, so the non-reproducibility is
+// invisible to them.
 #[cfg(test)]
 impl Default for Secrets {
     fn default() -> Self {

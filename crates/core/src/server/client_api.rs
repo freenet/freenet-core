@@ -251,19 +251,17 @@ impl HttpClientApi {
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
         // (network mode) allow HTTP cookies — most home users lack TLS.
         let localhost = socket.ip().is_loopback() || socket.ip().is_unspecified();
-        let contract_web_path = std::env::temp_dir().join("freenet").join("webs");
-        std::fs::create_dir_all(&contract_web_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to create contract web directory at {}: {}. \
-                 This may happen if {} was created by another user. \
-                 Try: sudo rm -rf {}",
-                contract_web_path.display(),
-                e,
-                std::env::temp_dir().join("freenet").display(),
-                std::env::temp_dir().join("freenet").display(),
-            )
-        });
 
+        // NOTE: do NOT re-add a `create_dir_all` here. Until #5291 this function
+        // created `$TMPDIR/freenet/webs` and PANICKED the node if it could not —
+        // a directory that stopped being read in April 2025 when the real
+        // webapp cache moved to `webapp_cache` (and later to the XDG cache dir).
+        // The only surviving effect was aborting startup: it took down the
+        // v0.2.124 release canary, which stages its binary at `$TMPDIR/freenet`,
+        // so the mkdir hit ENOTDIR. Unpacked web contracts live under the
+        // config-driven `webapp_cache_dir` below, and `WebappCache::with_root`
+        // creates it — warning rather than aborting, which is the right
+        // response to a directory the node can serve everything else without.
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 
         let config = Config::new(localhost, webapp_cache_dir);
@@ -284,6 +282,11 @@ impl HttpClientApi {
             .route(
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
+            )
+            .route("/routing", axum::routing::get(home_page::routing))
+            .route(
+                "/contract/{key}",
+                axum::routing::get(home_page::contract_detail),
             )
             // Notification service worker, served at the origin root so its
             // default scope (`/`) covers every contract shell page. The shell
@@ -409,6 +412,7 @@ async fn notify_service_worker() -> impl IntoResponse {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpClientApiRequest>,
@@ -417,6 +421,7 @@ async fn web_home(
     api_version: ApiVersion,
     query_string: Option<String>,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -446,6 +451,7 @@ async fn web_home(
         None,
         rs,
         hosted_mode,
+        source_addr,
     )
     .await
 }
@@ -461,6 +467,7 @@ async fn web_home(
 /// freenet/freenet-core#3841). Both must issue the SAME credentials and
 /// headers; factoring it here keeps the deep-link path from drifting out
 /// of sync with the root path (e.g. forgetting the cookie or the CSP).
+#[allow(clippy::too_many_arguments)]
 async fn render_shell_response(
     key: String,
     config: &Config,
@@ -469,11 +476,43 @@ async fn render_shell_response(
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
     hosted_mode: bool,
+    // Peer address of the requesting connection, for the issuance audit log.
+    // `None` only where no `ConnectInfo` is installed (standalone test routers).
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
+
+    // AUDIT (GHSA-824h-7x5x-wfmf): this is THE issuance point for an
+    // app-identity auth token — the node mints one on request for ANY contract
+    // id, and whoever holds it is thereafter attested as that app. Record every
+    // issuance so the trail exists after the fact.
+    //
+    // `info!` deliberately, not `debug!`: the crate builds with
+    // `release_max_level_info`, so a `debug!` here would be compiled out of
+    // every shipped binary and the audit log would exist only in development.
+    //
+    // Ids and addresses ONLY. The token itself is never logged — it IS the
+    // credential — and neither is any key material.
+    //
+    // LOG THE PARSED ID, NEVER THE RAW PATH. `key` is an unvalidated
+    // `Path<String>` that axum has already percent-DECODED, and this route is
+    // exposed publicly through the hosted proxy, so logging it raw would let any
+    // internet user inject newlines (`%0A`) and forge entries inside the very
+    // audit trail this line exists to produce. Parsing first bounds the value to
+    // 32 base58-encoded bytes with no control characters. An unparseable key is
+    // not logged here at all — it cannot yield a token, and the request fails
+    // below.
+    if let Ok(instance_id) = ContractInstanceId::from_base58(&key) {
+        tracing::info!(
+            contract_id = %instance_id,
+            peer_addr = ?source_addr,
+            api_version = %api_version.prefix(),
+            "Issued app-identity auth token for a contract shell page"
+        );
+    }
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
@@ -561,6 +600,7 @@ async fn web_subpages(
     config: &Config,
     request_sender: HttpClientApiRequest,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -616,6 +656,7 @@ async fn web_subpages(
             Some(&last_path),
             request_sender,
             hosted_mode,
+            source_addr,
         )
         .await;
     }
@@ -1010,12 +1051,20 @@ impl ClientEventsProxy for HttpClientApi {
                         req,
                         auth_token,
                         origin_contract,
+                        // Forwarded explicitly rather than swallowed by `..`.
+                        // Every request on THIS proxy is node-internal today
+                        // (webapp-cache fetches, which carry no origin), so
+                        // dropping it would be inert — but the producers set it
+                        // deliberately, and a future client-facing request here
+                        // would otherwise lose its attestation silently.
+                        connection_scope,
                         user_context,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
                             .with_origin_contract(origin_contract)
+                            .with_connection_scope(connection_scope)
                             .with_user_context(user_context));
                     }
                 }
@@ -1082,6 +1131,117 @@ mod tests {
     fn dead_request_sender() -> HttpClientApiRequest {
         let (tx, _rx) = mpsc::channel(1);
         HttpClientApiRequest::from_sender(tx)
+    }
+
+    /// Regression for #5291: composing the router must not abort the process
+    /// because something in the system temp directory is in the way.
+    ///
+    /// `as_router_with_origin_contracts` used to `create_dir_all` a vestigial
+    /// `$TMPDIR/freenet/webs` and `panic!` on failure. Nothing had read that
+    /// directory since the real webapp cache was renamed in April 2025, so its
+    /// only remaining effect was to kill the node at startup when `$TMPDIR`
+    /// happened to hold a non-directory (or another user's) `freenet` entry.
+    /// That is exactly what blocked release v0.2.124: the auto-update canary
+    /// stages the binary it gates AT `$TMPDIR/freenet`, so the mkdir hit
+    /// ENOTDIR and the node exited 101 before the update check could run.
+    ///
+    /// Run in a **child process** (a re-exec of this test binary filtered to
+    /// this one test) for two reasons: the hostile condition is a process-wide
+    /// environment variable, which `set_var` makes unsound to install from a
+    /// test thread in edition 2024, and the failure mode is a `panic!` in a
+    /// non-async constructor, which a child's exit status observes directly.
+    /// The child fails every time without the fix and passes every time with
+    /// it.
+    #[test]
+    fn router_construction_survives_a_hostile_temp_dir() {
+        const CHILD_ENV: &str = "FREENET_TEST_5291_CHILD";
+        const CHILD_TEST: &str =
+            "server::client_api::tests::router_construction_survives_a_hostile_temp_dir";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Premise: the environment really is the hostile one the parent
+            // built. If `temp_dir()` ignored our variables the child would pass
+            // vacuously, so assert the collision exists before relying on it.
+            let clash = std::env::temp_dir().join("freenet");
+            assert!(
+                clash.is_file(),
+                "premise: {} must exist as a FILE for this child to reproduce \
+                 the #5291 condition; got metadata {:?}",
+                clash.display(),
+                std::fs::metadata(&clash)
+            );
+
+            let (api, _router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+            drop(api);
+            return;
+        }
+
+        let tmp = crate::util::tests::get_temp_dir();
+        // The obstruction: `$TMPDIR/freenet` exists, as a file.
+        std::fs::write(tmp.path().join("freenet"), b"not a directory")
+            .expect("stage the blocking file");
+
+        // Two cache roots, because the deleted mkdir was not the only
+        // `create_dir_all` this function reaches.
+        //
+        // `benign` keeps the child's REAL webapp cache off the developer's home
+        // cache while the obstruction sits where the DELETED mkdir used to
+        // point. That is the #5291 case proper.
+        //
+        // `obstructed` puts the cache root itself under the blocking file, so
+        // the surviving `create_dir_all` in `WebappCache::with_root` fails too.
+        // `with_root` is documented to warn and carry on, and
+        // `with_root_tolerates_a_root_that_is_not_a_directory` pins that
+        // directly — but a guard on `with_root` says nothing about the caller,
+        // and it is this function's job not to turn that warning back into a
+        // dead node. Without this case, making `with_root` fatal would
+        // reinstate the whole #5291 class with the test still green.
+        let benign = tmp.path().join("webapp_cache");
+        let obstructed = tmp.path().join("freenet").join("webapp_cache");
+
+        for (label, cache) in [("benign", &benign), ("obstructed", &obstructed)] {
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                // `temp_dir()` reads TMPDIR on unix and TMP/TEMP on Windows.
+                .env("TMPDIR", tmp.path())
+                .env("TMP", tmp.path())
+                .env("TEMP", tmp.path())
+                .env("FREENET_WEBAPP_CACHE_DIR", cache)
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "[{label}] composing the router must not panic when \
+                 $TMPDIR/freenet is not a directory (#5291).\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}",
+            );
+            // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+            // nothing, so without this the check goes vacuous the moment this
+            // function moves or is renamed.
+            assert!(
+                stdout.contains("1 passed"),
+                "[{label}] the child must actually have run {CHILD_TEST} — if \
+                 this function was renamed or moved, update CHILD_TEST.\n\
+                 stdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+        }
+
+        // The other half of the premise. The child asserts the TMPDIR knob took
+        // effect; this asserts the CACHE-ROOT knob did. If
+        // `FREENET_WEBAPP_CACHE_DIR` ever stopped being read, the obstructed
+        // case would quietly resolve to the ProjectDirs default, create it
+        // successfully, and pass while testing nothing.
+        assert!(
+            benign.is_dir(),
+            "premise: the child must honour FREENET_WEBAPP_CACHE_DIR — {} was \
+             never created, so the obstructed case did not exercise the \
+             surviving create_dir_all",
+            benign.display()
+        );
     }
 
     #[test]
@@ -1722,6 +1882,7 @@ mod tests {
                     &localhost_config(),
                     sender,
                     false,
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -1756,6 +1917,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -1776,6 +1938,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await;
         match res {
@@ -1826,6 +1989,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("web_subpages must convert the inner error into a response, not propagate it");
@@ -1905,6 +2069,7 @@ mod tests {
                     &localhost_config(),
                     dead_request_sender(),
                     false,
+                    None,
                 )
                 .await
                 .expect("web_subpages must respond, not propagate")

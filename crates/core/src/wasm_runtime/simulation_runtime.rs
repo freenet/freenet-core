@@ -127,6 +127,20 @@ impl InMemoryContractStore {
 
     /// Remove a contract by key.
     pub fn remove_contract(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
+        // Conform to `ContractStore::remove_contract`: removing a contract drops
+        // its delegate subscriptions, and those subscriptions may own
+        // `InterestManager` refcounts that must be given back (#5542). This
+        // backend diverged silently, so a simulation or mock-executor run that
+        // removed a contract left both the registry entry and the interest
+        // standing. Not caught by
+        // `delegate_interest::tests::every_subscription_removal_site_releases_its_interest`,
+        // which scrapes the three sites it knows about and cannot see a fourth.
+        // In memory only: this backend has no durable store.
+        super::delegate_subscriptions::remove_contract(
+            key.id(),
+            super::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+        super::delegate_interest::release_contract(key.id());
         let mut inner = self.inner.lock().unwrap();
         inner.instance_to_code.remove(key.id());
         // Only remove code if no other instances reference it
@@ -141,19 +155,21 @@ impl InMemoryContractStore {
         Ok(())
     }
 
-    /// Ensure a contract key is indexed (instance_id -> code_hash mapping exists).
-    pub fn ensure_key_indexed(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.instance_to_code.contains_key(key.id()) {
-            let code_hash = *key.code_hash();
-            // We don't have params here, so use empty. The code hash is the important part
-            // for lookup_key reconstruction.
-            inner
-                .instance_to_code
-                .insert(*key.id(), (code_hash, Parameters::from(Vec::<u8>::new())));
-        }
-        Ok(())
-    }
+    // NOTE: there is deliberately no `ensure_key_indexed` here. The executor's
+    // "code already stored, index this new instance" branch routes through
+    // `store_contract` on both backends — see `ContractStoreBridge::store_contract`.
+    // The removed helper also recorded EMPTY parameters for the instance, which
+    // `store_contract` gets right, so this backend became more faithful by
+    // losing it.
+    //
+    // But note what "single ingress" does and does not mean here. It is the
+    // single ingress on both backends; it is only GUARDED on the production one.
+    // The `store_contract` above performs no identity verification at all — the
+    // derivation check lives in `ContractStore::verify_contract_identity`, which
+    // this type does not use. So no simulation test and no mock-executor test can
+    // catch a mis-derived container, and a regression test for that behaviour
+    // cannot live here. It has to be a `ContractStore` unit test or a
+    // `crates/core/tests/` integration test against the real store.
 
     /// Clear all stored contracts (for testing).
     pub fn clear(&self) {

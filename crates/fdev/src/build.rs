@@ -105,10 +105,14 @@ fn compile_rust_wasm_lib(cli_config: &BuildToolConfig, work_dir: &Path) -> anyho
     let package_type = cli_config.package_type;
     tracing::info!("Compiling {package_type} with rust, args: {:?}", cmd_args);
 
-    // Set CARGO_TARGET_DIR if not already set to ensure consistent output location
+    // Set CARGO_TARGET_DIR if not already set to ensure consistent output location.
+    // Resolved from `work_dir` — the crate being built — so it lands in that crate's
+    // workspace rather than wherever fdev itself was compiled. `get_out_lib` below reads
+    // the same value, and the two must agree or the packaging step looks in the wrong
+    // place.
     let mut command = Command::new("cargo");
     if env::var("CARGO_TARGET_DIR").is_err() {
-        command.env("CARGO_TARGET_DIR", get_workspace_target_dir());
+        command.env("CARGO_TARGET_DIR", get_workspace_target_dir(work_dir));
     }
 
     tracing::info!(
@@ -158,7 +162,7 @@ fn get_out_lib(work_dir: &Path, cli_config: &BuildToolConfig) -> anyhow::Result<
     };
     let output_lib = env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| get_workspace_target_dir())
+        .unwrap_or_else(|_| get_workspace_target_dir(work_dir))
         .join(target)
         .join(opt_dir)
         .join(&package_name)

@@ -174,7 +174,7 @@ impl Transaction {
 impl<'a> arbitrary::Arbitrary<'a> for Transaction {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let ty: TransactionTypeId = u.arbitrary()?;
-        let bytes: u128 = Ulid::new().0;
+        let bytes: u128 = Ulid::generate().0;
         Ok(Self::update(ty.0, Ulid(bytes), None))
     }
 }
@@ -599,10 +599,32 @@ pub enum SummariesEmitter {
     /// every ~5-min heartbeat received.
     InterestsReply,
     /// `node::handle_interest_sync_message`, replying to a `ChangeInterests`
-    /// delta — also multi-entry, but driven by interest churn rather than by
-    /// the heartbeat clock. Kept apart from [`Self::InterestsReply`] so the
-    /// residual arm below stays a pure residual; folding the two would repeat,
-    /// one level down, exactly the conflation this tag exists to undo.
+    /// delta — driven by interest churn rather than by the heartbeat clock. Kept
+    /// apart from [`Self::InterestsReply`] so the residual arm below stays a pure
+    /// residual; folding the two would repeat, one level down, exactly the
+    /// conflation this tag exists to undo.
+    ///
+    /// **SINGLE-entry, essentially always — but by CALLER convention, not by
+    /// construction.** `broadcast_change_interests` takes `added: Vec<ContractKey>`
+    /// and every caller today passes at most one, yet nothing pins that; and the
+    /// reply loop's hash-collision path can yield 2+ entries on a u32 FNV-1a
+    /// collision. So this is an empirical property of the current call sites, and
+    /// it is deliberately left unpinned: the R4b instrument is robust either way
+    /// (a multi-entry reply simply classifies as `MultiEntry` and leaves the
+    /// single-entry population). Contrast the NOTIFICATION leg, whose identical
+    /// structural property IS pinned, by
+    /// `notification_leg_is_always_full_bytes_and_single_entry` — because `p` is
+    /// read off that leg, so drift there corrupts the measurement rather than
+    /// merely shrinking its denominator.
+    ///
+    /// Corrected 2026-08-12 (#5153 review
+    /// F1); this said "also multi-entry" and that was measurably false.
+    /// `operations::broadcast_change_interests` is called with one contract per
+    /// gossip, so the reply built for it carries one entry: mean **1.000**
+    /// entries/msg with `max_entries` **1** across 418,476 messages on 1,284
+    /// peers in one window. Load-bearing, not trivia — it is why message LENGTH
+    /// is not a clean proxy for "this is a notification", which the R4b
+    /// agreement-rate instrument depends on.
     ChangeInterestsReply,
     /// `operations::update::send_summary_back_on_rejection` — one entry, only
     /// when a rejected broadcast's summary already matched ours.
@@ -1191,8 +1213,10 @@ impl Display for NetMessage {
 // compile time, preventing a whole class of bugs that previously could
 // only surface at runtime (or worse, as UB via unreachable_unchecked).
 
-/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (24 bytes, with niche) = 40 bytes.
-/// Any change to this layout would break serialization compatibility and network protocol.
+/// Transaction layout: Ulid (16 bytes) + Option<Ulid> (32 bytes) = 48 bytes.
+/// `u128` has no niche, so `Option<Ulid>` cannot pack the discriminant and is
+/// 32 bytes, not 24. Any change to this layout would break serialization
+/// compatibility and network protocol.
 const _: () = {
     // Ulid is a newtype over u128 (16 bytes).
     assert!(std::mem::size_of::<ulid::Ulid>() == 16, "Ulid size changed");
@@ -1327,6 +1351,10 @@ mod tests {
         let bytes = bincode::serialize(&msg).expect("serialize SummaryDigests");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryDigests");
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a round-trip test asserts ONE variant; any other variant is a loud panic, not a silent fallthrough"
+        )]
         match decoded {
             InterestMessage::SummaryDigests { entries, .. } => {
                 assert_eq!(entries.len(), 2);
@@ -1349,10 +1377,10 @@ mod tests {
         let bytes = bincode::serialize(&req).expect("serialize SummaryRequest");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryRequest");
-        match decoded {
-            InterestMessage::SummaryRequest { hashes } => assert_eq!(hashes, vec![1, 2, 3]),
-            other => panic!("expected SummaryRequest, got {other:?}"),
-        }
+        let InterestMessage::SummaryRequest { hashes } = &decoded else {
+            panic!("expected SummaryRequest, got {decoded:?}");
+        };
+        assert_eq!(hashes, &vec![1, 2, 3]);
     }
 
     /// A `SummaryDigests` message must be dramatically smaller than the
@@ -1457,14 +1485,14 @@ mod tests {
 
     #[test]
     fn pack_transaction_type() {
-        let ts_0 = Ulid::new();
+        let ts_0 = Ulid::generate();
         std::thread::sleep(Duration::from_millis(1));
-        let tx = Transaction::update(TransactionType::Connect, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Connect, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Connect);
-        let tx = Transaction::update(TransactionType::Subscribe, Ulid::new(), None);
+        let tx = Transaction::update(TransactionType::Subscribe, Ulid::generate(), None);
         assert_eq!(tx.transaction_type(), TransactionType::Subscribe);
         std::thread::sleep(Duration::from_millis(1));
-        let ts_1 = Ulid::new();
+        let ts_1 = Ulid::generate();
         assert!(
             tx.id.timestamp_ms() > ts_0.timestamp_ms(),
             "{:?} <= {:?}",
@@ -1742,19 +1770,17 @@ mod tests {
         );
 
         let decoded: InterestMessage = bincode::deserialize(&notification).expect("deserialize");
-        match decoded {
-            InterestMessage::Summaries { entries, emitter } => {
-                assert_eq!(entries.len(), 1, "payload must survive the round trip");
-                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
-                assert_eq!(
-                    emitter,
-                    SummariesEmitter::Other,
-                    "a decoded message carries no provenance, so it must land \
-                     in the residual arm rather than claim an emitter"
-                );
-            }
-            other => panic!("expected Summaries, got {other:?}"),
-        }
+        let InterestMessage::Summaries { entries, emitter } = &decoded else {
+            panic!("expected Summaries, got {decoded:?}");
+        };
+        assert_eq!(entries.len(), 1, "payload must survive the round trip");
+        assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+        assert_eq!(
+            *emitter,
+            SummariesEmitter::Other,
+            "a decoded message carries no provenance, so it must land \
+             in the residual arm rather than claim an emitter"
+        );
     }
 
     #[test]
@@ -1788,6 +1814,73 @@ mod tests {
         assert!(
             display.contains(&tx.to_string()),
             "should include tx id: {display}"
+        );
+    }
+
+    /// Wire and at-rest format pin for `Transaction` (#4882).
+    ///
+    /// `Transaction.id` is a `ulid::Ulid`, and `ulid`'s `Serialize` emits the
+    /// 26-character Crockford base32 STRING, not the underlying `u128`. That
+    /// encoding is inherited from a third-party crate, so a dependency bump can
+    /// change it with no diff in this repo at all. If it ever flips to a raw
+    /// `u128` — a plausible upstream change — every peer's `NetMessage` decode
+    /// breaks and every existing `NetLogMessage` AOF segment
+    /// (`tracing/aof.rs::encode_log`) becomes undecodable, while CI stays green:
+    /// `Transaction`'s serde is derived structurally, and `NetMessageV1`
+    /// versioning does not cover a nested field's representation.
+    ///
+    /// Verified byte-identical under ulid 1.2.1 and 3.0.0 during the 3.0 bump.
+    ///
+    /// This compares against FIXED bytes on purpose. A round-trip test would
+    /// re-encode with the same version it decodes with, so it is self-consistent
+    /// by construction and cannot detect this class of change.
+    #[test]
+    fn transaction_bincode_encoding_is_pinned() {
+        const RAW: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF;
+        const ENCODED: &str = "014D2PF2DBSQQG28T5CY4TQKFF";
+
+        // The base32 alphabet and length the pin below is built on.
+        assert_eq!(
+            Ulid(RAW).to_string(),
+            ENCODED,
+            "ULID string encoding changed; the wire format changed with it"
+        );
+
+        fn expect_ulid_bytes(encoded: &str) -> Vec<u8> {
+            let mut v = Vec::new();
+            // bincode writes a str as a little-endian u64 length, then the bytes.
+            v.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+            v.extend_from_slice(encoded.as_bytes());
+            v
+        }
+
+        let mut expected = expect_ulid_bytes(ENCODED);
+        expected.push(0); // Option::None
+
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: None,
+        };
+        let actual = bincode::serialize(&tx).expect("serialize Transaction");
+        assert_eq!(
+            actual, expected,
+            "Transaction bincode encoding changed: this is a network protocol \
+             break AND makes existing event-log segments undecodable"
+        );
+        assert_eq!(actual.len(), 35, "Transaction encodes to 8 + 26 + 1 bytes");
+
+        // The parent arm too, since `Option<Ulid>` is the other half of the layout.
+        let mut expected_parent = expect_ulid_bytes(ENCODED);
+        expected_parent.push(1); // Option::Some
+        expected_parent.extend_from_slice(&expect_ulid_bytes("00000000000000000000000001"));
+        let tx = Transaction {
+            id: Ulid(RAW),
+            parent: Some(Ulid(1)),
+        };
+        assert_eq!(
+            bincode::serialize(&tx).expect("serialize Transaction"),
+            expected_parent,
+            "Transaction parent encoding changed"
         );
     }
 }

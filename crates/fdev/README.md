@@ -15,7 +15,7 @@ The Freenet Development Tool (`fdev`) is a command-line utility for creating, bu
 - **Website**: [freenet.org](https://freenet.org/)
 - **GitHub**: [github.com/freenet/freenet-core](https://github.com/freenet/freenet-core)
 - **Full Documentation**: See the [detailed README](https://github.com/freenet/freenet-core/blob/main/crates/fdev/README-FULL.md) in the repository
-- **Community**: [Matrix chat](https://matrix.to/#/#freenet:matrix.org)
+- **Community**: [Matrix chat](https://matrix.to/#/#freenet-locutus:matrix.org)
 
 ## Installation
 

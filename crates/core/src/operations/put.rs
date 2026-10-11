@@ -1020,7 +1020,8 @@ mod tests {
     fn put_msg_probe_response_serde_roundtrip() {
         let key = make_contract_key(4);
         // (holder_found, hop_count, holder_summary bytes, reverse_delta bytes)
-        let cases: [(bool, usize, Option<Vec<u8>>, Option<Vec<u8>>); 3] = [
+        type ProbeResponseCase = (bool, usize, Option<Vec<u8>>, Option<Vec<u8>>);
+        let cases: [ProbeResponseCase; 3] = [
             // No holder: both trailing fields absent.
             (false, 0usize, None, None),
             // Holder found, originator current-or-ahead: summary present, no

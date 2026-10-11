@@ -64,11 +64,11 @@ By default, `fdev` connects to a local Freenet node at `ws://127.0.0.1:7509`. Yo
 
 ```bash
 # Connect via gateway proxy (e.g. from CI/CD)
-fdev --node-url "ws://nova.locut.us:7520/SECRET/v1/contract/command?encodingProtocol=native" \
+fdev --node-url "ws://gw1.freenet.org:7520/SECRET/v1/contract/command?encodingProtocol=native" \
     website publish ./public/ --key my-site
 
 # Or via environment variable
-export FREENET_NODE_URL="ws://nova.locut.us:7520/SECRET/v1/contract/command?encodingProtocol=native"
+export FREENET_NODE_URL="ws://gw1.freenet.org:7520/SECRET/v1/contract/command?encodingProtocol=native"
 fdev website publish ./public/ --key my-site
 ```
 

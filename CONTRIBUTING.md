@@ -30,7 +30,30 @@ When in doubt about which bucket you're in, file an issue first. It costs you a 
 ## Before You Start
 
 - **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
-- **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet:matrix.org) before writing code.
+- **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet-locutus:matrix.org) before writing code.
+
+## Building with Nix (optional)
+
+An alternative to a local rustup install, not a requirement.
+
+```bash
+nix develop                  # dev shell: pinned toolchain, nextest, shellcheck, ...
+nix build .#freenet          # build only: the bare binary (result/bin/freenet)
+nix run .                    # run the supervised, self-updating node
+```
+
+The shell's toolchain is pinned to [`rust-toolchain.toml`](rust-toolchain.toml),
+so `cargo fmt` and `cargo clippy -- -D warnings` inside it agree with CI.
+
+Nix is also a supported **deployment** path, but only through one of the two
+outputs. `packages.freenet` is for **building and development** — CI, the dev
+shell, packaging. It is **not a way to run a peer**: nothing updates it, so a
+peer started from it falls behind every release and eventually stops working,
+which costs the network rather than whoever pinned it. To run a peer, use
+`packages.freenet-node` (the flake default). [`docs/nix.md`](docs/nix.md) has the
+full picture, including the store-path drift you accept by running the
+self-updating output and what this build does *not* tell you about the published
+release binaries.
 
 ## Quality Standards
 
@@ -57,7 +80,7 @@ We require the use of a frontier-class model (as of early 2026: Claude Opus 4, G
 
 ## Getting Help
 
-- [Matrix chat](https://matrix.to/#/#freenet:matrix.org) for questions and discussion
+- [Matrix chat](https://matrix.to/#/#freenet-locutus:matrix.org) for questions and discussion
 - [Issue tracker](https://github.com/freenet/freenet-core/issues) for bugs and feature requests
 - [API docs](https://docs.rs/freenet) for code reference
 - [Freenet manual](https://freenet.org/resources/manual/) for architecture overview
