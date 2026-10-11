@@ -295,14 +295,19 @@ const freloadStripDecision = new Function(
   );
   // The app's own params keep their bytes (review of #5750): re-serialising
   // through URLSearchParams would turn `%20` into `+`, `~` into `%7E` and a
-  // bare `flag` into `flag=` in the URL a person copies and the 4401 reload
-  // re-fetches, and shell_page forwards those bytes to the app unchanged.
+  // bare `flag` into `flag=` in the URL a person copies, and shell_page
+  // forwards those bytes to the app unchanged.
   check(
     'the other params keep their exact bytes',
     freloadStripDecision(
       `${base}?sig=a~b&q=x%20y&flag&_freload=${T}-0&p=1%2B1#h`,
       T,
     ).url === `${base}?sig=a~b&q=x%20y&flag&p=1%2B1#h`,
+  );
+  check(
+    'a pair starting with a literal ? is an app param, as the full query reads it',
+    freloadStripDecision(`${base}??a=1&?_freload=x&_freload=${T}-0`, T).url ===
+      `${base}??a=1&?_freload=x`,
   );
   check(
     'every _freload pair goes, an encoded name included',

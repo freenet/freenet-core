@@ -518,14 +518,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // pair, every other pair kept byte for byte. Re-serialising through
   // URLSearchParams would re-encode the app's own params (`%20` -> `+`, `~` ->
   // `%7E`, a bare `flag` -> `flag=`), and shell_page forwards them to the app
-  // unchanged: an app may read them raw or have signed them.
+  // unchanged: an app may read them raw or have signed them. Each pair is
+  // read behind a '?', since URLSearchParams strips one leading '?': a pair
+  // that itself starts with '?' is then read as the whole query reads it.
   function dropFreloadPairs(search) {
     var s = search.charAt(0) === '?' ? search.slice(1) : search;
     if (!s) return '';
     return s
       .split('&')
       .filter(function (p) {
-        return new URLSearchParams(p).get('_freload') === null;
+        return new URLSearchParams('?' + p).get('_freload') === null;
       })
       .join('&');
   }
@@ -557,7 +559,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     var raw = url.searchParams.get(PARAM);
     if (raw === null) return null;
-    url.search = dropFreloadPairs(url.search);
+    var rest = dropFreloadPairs(url.search);
+    url.search = rest ? '?' + rest : '';
     var dash = raw.indexOf('-');
     var ts = parseInt(dash >= 0 ? raw.slice(0, dash) : raw, 10);
     var c = dash >= 0 ? parseInt(raw.slice(dash + 1), 10) : 0;

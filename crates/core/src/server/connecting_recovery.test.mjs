@@ -139,6 +139,7 @@ for (const [query, want] of [
   ['?sig=a~b&q=x%20y&flag', '?sig=a~b&q=x%20y&flag&_freload=' + NOW + '-0'],
   ['?a=1&_freload=abc&b=2', '?a=1&b=2&_freload=' + NOW + '-0'],
   ['?_fre%6Coad=%E0%A4%A', '?_freload=' + NOW + '-0'],
+  ['??a=1&?_freload=x', '??a=1&?_freload=x&_freload=' + NOW + '-0'],
 ]) {
   const location = new URL(`http://localhost:7509${APP_PATH}${query}`);
   let replaced;
@@ -161,6 +162,29 @@ for (const [query, want] of [
   check(
     `stamping ${query} keeps the other params byte for byte (${replaced})`,
     replaced === `${location.origin}${APP_PATH}${want}`,
+  );
+}
+// dropFreloadPairs is copied into shell_bridge.js (the two assets are served
+// separately); the copies must not drift. Compared line by line, trimmed.
+{
+  const fnText = (text) => {
+    const i = text.indexOf('function dropFreloadPairs(');
+    const j = text.indexOf(".join('&');", i);
+    return i < 0 || j < 0
+      ? null
+      : text
+          .slice(i, j)
+          .split('\n')
+          .map((l) => l.trim())
+          .join('\n');
+  };
+  const bridge = readFileSync(
+    join(here, 'path_handlers/assets/shell_bridge.js'),
+    'utf8',
+  );
+  check(
+    'dropFreloadPairs is identical in connecting.html and shell_bridge.js',
+    fnText(src) !== null && fnText(src) === fnText(bridge),
   );
 }
 check(

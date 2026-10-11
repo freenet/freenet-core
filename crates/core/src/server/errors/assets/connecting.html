@@ -119,13 +119,16 @@
       // through URLSearchParams would re-encode the app's own params (`%20` ->
       // `+`, `~` -> `%7E`, a bare `flag` -> `flag=`), and shell_page forwards
       // them to the app unchanged: an app may read them raw or have signed them.
+      // Each pair is read behind a '?', since URLSearchParams strips one
+      // leading '?': a pair that itself starts with '?' is then read as the
+      // whole query reads it.
       function dropFreloadPairs(search) {
         var s = search.charAt(0) === '?' ? search.slice(1) : search;
         if (!s) return '';
         return s
           .split('&')
           .filter(function (p) {
-            return new URLSearchParams(p).get('_freload') === null;
+            return new URLSearchParams('?' + p).get('_freload') === null;
           })
           .join('&');
       }
@@ -153,7 +156,8 @@
           try {
             var u = new URL(location.href);
             var q = dropFreloadPairs(u.search);
-            u.search = (q ? q + '&' : '') + '_freload=' + Date.now() + '-0';
+            u.search =
+              '?' + (q ? q + '&' : '') + '_freload=' + Date.now() + '-0';
             window.location.replace(u.toString());
           } catch (e) {
             window.location.reload();
