@@ -25,16 +25,28 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "[ \"$$ppid\" = \"1\" ] || continue; ",
     "comm=$$(cat /proc/$$pid/comm 2>/dev/null); ",
     "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
+    "args=$$(ps -o args= -p \"$$pid\" 2>/dev/null); ",
+    "case \"$$args\" in \"\"|*--ws-api-port*|*--config-dir*) continue ;; esac; ",
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
-    "if [ \"$$cg\" != \"$$mycg\" ] && echo \"$$cg\" | grep -q \"[.]service$$\"; then continue; fi; ",
+    "if [ \"$$cg\" != \"$$mycg\" ]; then ",
+    "u=$$(echo \"$$cg\" | grep \"[.]service$$\" | tail -n 1); ",
+    "if [ -n \"$$u\" ]; then ",
+    "u=$${u##*/}; ",
+    "mp=$$(systemctl show -p MainPID \"$$u\" 2>/dev/null | cut -d= -f2); ",
+    "[ -z \"$$mp\" ] && continue; ",
+    "[ \"$$mp\" = \"$$pid\" ] && continue; ",
+    "fi; ",
+    "fi; ",
     "kill -TERM \"$$pid\" 2>/dev/null && v=\"$$v $$pid\"; ",
     "done; ",
     "w=0; while [ -n \"$$v\" ] && [ $$w -lt 45 ]; do ",
     "a=\"\"; for p in $$v; do kill -0 \"$$p\" 2>/dev/null && a=\"$$a $$p\"; done; v=$$a; ",
     "[ -z \"$$v\" ] && break; sleep 1; w=$$((w+1)); ",
     "done; ",
-    "for p in $$v; do kill -KILL \"$$p\" 2>/dev/null || true; done; ",
+    "for p in $$v; do ",
+    "case \"$$(cat /proc/$$p/comm 2>/dev/null)\" in *freenet*) kill -KILL \"$$p\" 2>/dev/null ;; esac; ",
+    "done; ",
     "w=0; while [ -n \"$$v\" ] && [ $$w -lt 5 ]; do ",
     "a=\"\"; for p in $$v; do kill -0 \"$$p\" 2>/dev/null && a=\"$$a $$p\"; done; v=$$a; ",
     "[ -z \"$$v\" ] && break; sleep 1; w=$$((w+1)); ",
@@ -500,22 +512,32 @@ Environment={fast_crash_marker}=1
 #   * its PPID is 1 (init adopted it). A `freenet network` still parented by a
 #     live shell or terminal is left alone; it wins the port and this unit
 #     stands down via exit 43 as designed. Note that `nohup`/`disown` followed
-#     by a logout DOES reparent to PID 1, so a deliberately detached node with
-#     no supervisor is reaped: starting this unit means this unit should own it.
+#     by a logout DOES reparent to PID 1, so a detached default node with no
+#     supervisor is reaped: starting this unit means this unit should own it.
+#     (Under the user manager, which is a child subreaper, a leftover from this
+#     unit's own cgroup has the manager as parent and is never reached here.)
 #   * its comm (executable name) contains "freenet", so a `screen`/`tmux`
 #     server or a wrapper shell whose argv merely mentions "freenet network" is
 #     never killed.
-#   * it is NOT inside another systemd SERVICE's cgroup. Under the SYSTEM
+#   * its command line sets neither --ws-api-port nor --config-dir. A node
+#     started with either is a deliberately separate instance (a developer's
+#     test node, a second peer), not this unit's node; killing it on every
+#     start and every auto-update restart would be wrong. If such a node does
+#     hold this unit's port, the unit stands down via exit 43 as before.
+#   * it is not the main process of ANOTHER systemd service. Under the SYSTEM
 #     manager PID 1 forks a Type=simple service directly, so a healthy node
-#     supervised by the system unit also has PPID 1; when both the user and the
-#     system unit are installed for one user, PPID alone would let one unit's
-#     pre-flight kill the other's live node. A process in this unit's OWN
-#     cgroup (a leftover systemd failed to kill) is still reaped. An unreadable
-#     cgroup file means "skip": this path errs towards not killing.
+#     supervised by the system unit (or by any other service) also has PPID 1.
+#     For a process in a different `.service` cgroup the pre-flight asks the
+#     system manager for that unit's MainPID and spares the process if it
+#     matches, or if the manager cannot be asked. An orphan left behind in
+#     some other service's cgroup (e.g. started from cron) is still reaped, and
+#     so is a leftover in this unit's own cgroup. An unreadable /proc entry
+#     means "skip": this path errs towards not killing.
 # Every victim gets SIGTERM, then up to 45s to exit (the same budget as
-# TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL,
-# then up to 5s more for the kernel to release the port before ExecStart binds.
-# Worst case is ~50s, inside systemd's default 90s TimeoutStartSec.
+# TimeoutStopSec below, which covers the node's shutdown drain) before SIGKILL
+# (re-checking the comm first, so a recycled PID is not killed), then up to 5s
+# more for the kernel to release the port before ExecStart binds. Worst case is
+# ~50s, inside the TimeoutStartSec set below.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
@@ -530,6 +552,11 @@ Environment={fast_crash_marker}=1
 # here never blocks the start.
 {orphan_reap_preflight}
 ExecStart={binary} network
+# Bounds the whole start, ExecStartPre included. The orphan pre-flight above
+# can take ~50s; a start timeout would run ExecStopPost with an empty
+# $EXIT_STATUS that the rollback logic counts as a crash, so leave headroom
+# over that instead of relying on the distribution's DefaultTimeoutStartSec.
+TimeoutStartSec=120
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
@@ -729,9 +756,15 @@ Environment={fast_crash_marker}=1
 # (generated from one constant, so the two cannot drift); see the comment there
 # for the reap conditions and the systemd $$ / % escaping. The cgroup condition
 # matters most HERE: this unit's own healthy node has PPID 1, so PPID alone
-# cannot tell it apart from an orphan.
+# cannot tell it apart from an orphan. A leftover in this unit's own cgroup also
+# has PPID 1 here, and is reaped.
 {orphan_reap_preflight}
 ExecStart={binary} network
+# Bounds the whole start, ExecStartPre included. The orphan pre-flight above
+# can take ~50s; a start timeout would run ExecStopPost with an empty
+# $EXIT_STATUS that the rollback logic counts as a crash, so leave headroom
+# over that instead of relying on the distribution's DefaultTimeoutStartSec.
+TimeoutStartSec=120
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
