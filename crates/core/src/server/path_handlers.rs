@@ -7708,6 +7708,31 @@ mod tests {
         );
     }
 
+    /// Call-site pins for the `_freload` hygiene in the shell bridge. The pure
+    /// helpers are unit-tested in `shell_bridge_reload.test.mjs`, but those
+    /// tests extract the helpers and cannot see whether the shell still calls
+    /// them: reverting the same-contract navigation to building the frame path
+    /// from `resolved.search` (which carries a link's stamp into the frame),
+    /// or dropping the load-time `stripFreload()` call, passes every node test.
+    #[test]
+    fn bridge_js_calls_the_freload_hygiene_helpers() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("var newIframePath = sameContractFramePath(")
+                && SHELL_BRIDGE_JS.contains("iframe.src = newIframePath;")
+                && SHELL_BRIDGE_JS.contains("iframePath: newIframePath"),
+            "same-contract navigation must build the frame src and \
+             history.state.iframePath from sameContractFramePath (drops _freload)"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("resolved.pathname + resolved.search"),
+            "the frame path must not be rebuilt from the raw resolved query"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("\n  stripFreload();\n"),
+            "the shell must drop the recovery stamp from the address bar on load"
+        );
+    }
+
     /// Drift pin: the JS recovery guard hardcodes the literal `4401`, but the
     /// SERVER side that emits the close frame uses the Rust constant
     /// `AUTH_TOKEN_INVALID_CLOSE_CODE` as its single source of truth. Nothing

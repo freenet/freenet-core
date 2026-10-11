@@ -514,6 +514,22 @@ function freenetBridge(authToken, userToken, hostedMode) {
     return { allow: true, url: url.toString() };
   }
 
+  // The query string `search` (as URL.search gives it) without any `_freload`
+  // pair, every other pair kept byte for byte. Re-serialising through
+  // URLSearchParams would re-encode the app's own params (`%20` -> `+`, `~` ->
+  // `%7E`, a bare `flag` -> `flag=`), and shell_page forwards them to the app
+  // unchanged: an app may read them raw or have signed them.
+  function dropFreloadPairs(search) {
+    var s = search.charAt(0) === '?' ? search.slice(1) : search;
+    if (!s) return '';
+    return s
+      .split('&')
+      .filter(function (p) {
+        return new URLSearchParams(p).get('_freload') === null;
+      })
+      .join('&');
+  }
+
   // Once this shell is served, the app link has answered and `_freload` has
   // done its job — but it stays in the address bar, so a link a person copies
   // from there carries it. Opened later, top-level, on a node still joining,
@@ -541,7 +557,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     var raw = url.searchParams.get(PARAM);
     if (raw === null) return null;
-    url.searchParams.delete(PARAM);
+    url.search = dropFreloadPairs(url.search);
     var dash = raw.indexOf('-');
     var ts = parseInt(dash >= 0 ? raw.slice(0, dash) : raw, 10);
     var c = dash >= 0 ? parseInt(raw.slice(dash + 1), 10) : 0;

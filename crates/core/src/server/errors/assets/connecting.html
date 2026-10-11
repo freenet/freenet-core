@@ -114,6 +114,21 @@
         // Recovery window elapsed (or a bad/future timestamp): stop looping.
         return atTop ? { action: 'dashboard' } : { action: 'giveup' };
       }
+      // The query string `search` (as URL.search gives it) without any
+      // `_freload` pair, every other pair kept byte for byte. Re-serialising
+      // through URLSearchParams would re-encode the app's own params (`%20` ->
+      // `+`, `~` -> `%7E`, a bare `flag` -> `flag=`), and shell_page forwards
+      // them to the app unchanged: an app may read them raw or have signed them.
+      function dropFreloadPairs(search) {
+        var s = search.charAt(0) === '?' ? search.slice(1) : search;
+        if (!s) return '';
+        return s
+          .split('&')
+          .filter(function (p) {
+            return new URLSearchParams(p).get('_freload') === null;
+          })
+          .join('&');
+      }
       // connecting-recovery-decision:END
       setTimeout(function () {
         var atTop;
@@ -137,7 +152,8 @@
         } else if (d.action === 'stamp') {
           try {
             var u = new URL(location.href);
-            u.searchParams.set('_freload', String(Date.now()) + '-0');
+            var q = dropFreloadPairs(u.search);
+            u.search = (q ? q + '&' : '') + '_freload=' + Date.now() + '-0';
             window.location.replace(u.toString());
           } catch (e) {
             window.location.reload();

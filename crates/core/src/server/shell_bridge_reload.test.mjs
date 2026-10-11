@@ -293,6 +293,22 @@ const freloadStripDecision = new Function(
     freloadStripDecision(`${base}?a=1&_freload=${T}-0&b=2#h`, T).url ===
       `${base}?a=1&b=2#h`,
   );
+  // The app's own params keep their bytes (review of #5750): re-serialising
+  // through URLSearchParams would turn `%20` into `+`, `~` into `%7E` and a
+  // bare `flag` into `flag=` in the URL a person copies and the 4401 reload
+  // re-fetches, and shell_page forwards those bytes to the app unchanged.
+  check(
+    'the other params keep their exact bytes',
+    freloadStripDecision(
+      `${base}?sig=a~b&q=x%20y&flag&_freload=${T}-0&p=1%2B1#h`,
+      T,
+    ).url === `${base}?sig=a~b&q=x%20y&flag&p=1%2B1#h`,
+  );
+  check(
+    'every _freload pair goes, an encoded name included',
+    freloadStripDecision(`${base}?_fre%6Coad=1-0&a=1&_freload=2-0`, T).url ===
+      `${base}?a=1`,
+  );
   // THE CONTROL: stripping a live count-2 window at once WOULD loosen the
   // cap — it hands out a fresh budget of 3 where the stamped URL has 1 left.
   const live = `${base}?_freload=${T - 5_000}-3`;

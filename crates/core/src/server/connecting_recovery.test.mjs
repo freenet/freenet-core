@@ -130,6 +130,39 @@ for (const elapsed of [0, WINDOW_MS - 1, WINDOW_MS, WINDOW_MS + 1]) {
       `${location.origin}${APP_PATH}?view=chat&_freload=${NOW}-0#message`,
   );
 }
+// The stamp must not re-encode the app's own params (review of #5750):
+// shell_page forwards them to the app byte for byte, so `%20` must not become
+// `+`, `~` must not become `%7E`, and a bare `flag` must not become `flag=`.
+// An unparseable stamp already present is replaced, never duplicated (a
+// second `_freload` behind a bad first one would never be read: a loop).
+for (const [query, want] of [
+  ['?sig=a~b&q=x%20y&flag', '?sig=a~b&q=x%20y&flag&_freload=' + NOW + '-0'],
+  ['?a=1&_freload=abc&b=2', '?a=1&b=2&_freload=' + NOW + '-0'],
+  ['?_fre%6Coad=%E0%A4%A', '?_freload=' + NOW + '-0'],
+]) {
+  const location = new URL(`http://localhost:7509${APP_PATH}${query}`);
+  let replaced;
+  location.replace = (url) => {
+    replaced = url;
+  };
+  location.reload = () => {
+    throw new Error('an unparseable stamp must be replaced, not retried');
+  };
+  const window = { location };
+  window.top = window.self = window;
+  runInNewContext(src.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    window,
+    location,
+    URL,
+    URLSearchParams,
+    Date: { now: () => NOW },
+    setTimeout: (fn) => fn(),
+  });
+  check(
+    `stamping ${query} keeps the other params byte for byte (${replaced})`,
+    replaced === `${location.origin}${APP_PATH}${want}`,
+  );
+}
 check(
   'no-JS fallback unchanged: the only meta refresh is the <noscript> dashboard one',
   /<noscript><meta http-equiv="refresh" content="3;url=\/" \/><\/noscript>/.test(
@@ -160,7 +193,12 @@ check(
   const search = '?_freload=' + (NOW - WINDOW_MS - 1) + '-1';
   check(
     'top-level recovery past window -> dashboard (bounded, no forever loop)',
-    connectingRecoveryDecision(search, true, NOW).action === 'dashboard',
+    connectingRecoveryDecision(search, true, NOW, '/').action === 'dashboard',
+  );
+  check(
+    'top-level app recovery past window -> dashboard too (bounded)',
+    connectingRecoveryDecision(search, true, NOW, APP_PATH).action ===
+      'dashboard',
   );
   check(
     'framed recovery past window -> giveup (stop, show reload-the-tab message)',
