@@ -113,19 +113,31 @@ impl BroadcastSpacing {
     /// Record that a broadcast of `contract` to `peer` finished now.
     pub(crate) fn record_sent(&self, contract: &ContractInstanceId, peer: &PeerKey) {
         let now = self.now();
-        let len = self.last_sent.len();
-        if len >= self.prune_at.load(Ordering::Relaxed) {
+        let key = (*contract, peer.clone());
+        if self.last_sent.len() >= self.prune_at.load(Ordering::Relaxed) {
             self.prune(now);
             // Re-arm at twice the surviving size, so a node that genuinely
             // broadcasts to many pairs per interval does not prune on every
-            // record.
+            // record. Capped at the ceiling: a trigger above it could never be
+            // reached again, and the map would stop pruning for good.
             let survivors = self.last_sent.len();
-            self.prune_at
-                .store((survivors * 2).max(PRUNE_AT), Ordering::Relaxed);
+            self.prune_at.store(
+                (survivors * 2).clamp(PRUNE_AT, MAX_TRACKED),
+                Ordering::Relaxed,
+            );
         }
-        let key = (*contract, peer.clone());
         if self.last_sent.len() >= MAX_TRACKED && !self.last_sent.contains_key(&key) {
-            self.untracked_total.fetch_add(1, Ordering::Relaxed);
+            // Every tracked pair is live (the prune above just ran at the
+            // ceiling), so this pair goes unspaced rather than grow the map.
+            let total = self.untracked_total.fetch_add(1, Ordering::Relaxed) + 1;
+            if total.is_power_of_two() {
+                tracing::info!(
+                    tracked = MAX_TRACKED,
+                    untracked_total = total,
+                    "Broadcast spacing table full: a broadcast went out unspaced \
+                     and may be dropped by the receiver's rate limiter (#5842)"
+                );
+            }
             return;
         }
         self.last_sent.insert(key, now);
@@ -242,15 +254,28 @@ mod tests {
                 "the {path} full-state arm must send a state+summary snapshot"
             );
         }
+        // `let snapshot = match contract_handler` is unique to the handling
+        // arm; the event's own name also appears in the queue-full responder,
+        // and anchoring there let this region span the GetSummaryQuery arm,
+        // whose `summarize_contract_state` call then satisfied the check.
         let arm = region(
             HANDLER_SRC,
-            "ContractHandlerEvent::GetStateAndSummaryQuery { key } => {",
+            "let snapshot = match contract_handler",
             "ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {",
         );
         assert!(
-            arm.contains(".fetch_contract(key, false)")
-                && arm.contains(".summarize_contract_state(key)"),
-            "the state and its summary must both be read inside this one handler arm"
+            !arm.contains("ContractHandlerEvent::GetSummaryQuery"),
+            "the region escaped the GetStateAndSummaryQuery arm"
+        );
+        let fetch = arm
+            .find(".fetch_contract(key, false)")
+            .expect("the arm must read the stored state");
+        let summarize = arm
+            .find(".summarize_contract_state(key)")
+            .expect("the arm must summarize in the same handler turn");
+        assert!(
+            fetch < summarize,
+            "the summary must be taken after the state is read, in the same arm"
         );
     }
 
@@ -302,6 +327,45 @@ mod tests {
             spacing.tracked(),
             1,
             "every stale pair dropped on the next record"
+        );
+    }
+
+    #[test]
+    fn a_prune_keeps_live_pairs_and_drops_only_expired_ones() {
+        let clock = SharedMockTimeSource::new();
+        let spacing = BroadcastSpacing::new(Arc::new(clock.clone()));
+        let (old, young) = (peer(), peer());
+        spacing.record_sent(&contract(1), &old);
+        clock.advance_time(Duration::from_millis(1));
+        spacing.record_sent(&contract(1), &young);
+        // `old` is exactly one interval old, `young` 1 ms short of it.
+        clock.advance_time(BROADCAST_PEER_SPACING - Duration::from_millis(1));
+        spacing.prune(spacing.now());
+        assert_eq!(spacing.tracked(), 1, "only the expired pair is dropped");
+        assert_eq!(
+            spacing.remaining(&contract(1), &young),
+            Some(Duration::from_millis(1)),
+            "the live pair keeps its stamp"
+        );
+    }
+
+    #[test]
+    fn the_prune_trigger_never_rises_above_the_ceiling() {
+        let clock = SharedMockTimeSource::new();
+        let spacing = BroadcastSpacing::new(Arc::new(clock.clone()));
+        // Fill to the ceiling with pairs that all stay live, forcing prunes
+        // that keep almost everything.
+        for i in 0..MAX_TRACKED {
+            spacing.record_sent(&contract((i % 251) as u8), &peer());
+        }
+        assert!(spacing.prune_at.load(Ordering::Relaxed) <= MAX_TRACKED);
+        // Once they expire, the next record must still prune them.
+        clock.advance_time(BROADCAST_PEER_SPACING);
+        spacing.record_sent(&contract(1), &peer());
+        assert_eq!(
+            spacing.tracked(),
+            1,
+            "the map must keep pruning at the ceiling"
         );
     }
 

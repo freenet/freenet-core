@@ -19389,6 +19389,10 @@ fn assert_5842_converged(name: &str, versions: &BTreeMap<String, u64>) {
     );
 }
 
+// The next three are characterization tests: they pass on main as well. They
+// record what #5842 ruled out (a peer that has just started hosting loses its
+// first UPDATE) and are not regression guards for the fix; that is
+// `test_5842_update_right_after_relaying_another_converges` below.
 #[test_log::test]
 fn test_5842_update_from_fresh_host_reaches_established_hosts() {
     let versions = run_5842_scenario(
@@ -19458,4 +19462,12 @@ fn test_5842_update_right_after_relaying_another_converges() {
         "the updater must hold its own update: {versions:?}"
     );
     assert_5842_converged(NAME, &versions);
+    // ...and the race must actually have happened in this seed: some leg was
+    // held back for spacing. If an unrelated change moves the seed off the
+    // race, this fails instead of the test passing for nothing.
+    assert!(
+        GlobalTestMetrics::broadcast_legs_spaced() > 0,
+        "no fan-out leg was spaced, so this seed no longer reproduces two \
+         back-to-back broadcasts of one contract to one peer"
+    );
 }

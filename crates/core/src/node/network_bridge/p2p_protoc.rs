@@ -1234,6 +1234,8 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .try_set_own_addr(advertised_addr);
+        #[cfg(not(feature = "simulation_tests"))]
+        let broadcast_spacing = bridge.op_manager.broadcast_spacing.clone();
 
         // Uptime is measured from here — the last step of node construction,
         // immediately before the event loop starts serving. Reading `now()` once
@@ -1291,7 +1293,9 @@ impl P2pConnManager {
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
-            broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
+            broadcast_queue: super::broadcast_queue::BroadcastQueue::with_spacing(
+                broadcast_spacing,
+            ),
         })
     }
 

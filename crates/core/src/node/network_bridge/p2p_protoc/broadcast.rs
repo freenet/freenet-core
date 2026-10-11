@@ -902,10 +902,18 @@ impl P2pConnManager {
             // applies in `drain_lane`. Sending inside it gets the second
             // broadcast dropped by the receiver's rate limiter.
             if let Some(wait) = op_manager.broadcast_spacing.remaining(key.id(), &peer_key) {
+                crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
                 held.push(target.clone());
                 held_for = held_for.max(wait);
                 continue;
             }
+            // Claim the pair before the awaits below (snapshot, delta, send).
+            // A held-legs task or another fan-out that runs in between must see
+            // it as sent, or both send back to back. Re-stamped on success, and
+            // like production a converged skip still counts as a send.
+            op_manager
+                .broadcast_spacing
+                .record_sent(key.id(), &peer_key);
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -1270,6 +1278,8 @@ impl P2pConnManager {
                 skipped_sender: 0,
                 skipped_covered: 0,
             };
+            // A short-lived timer task, like the no-target retry above; it
+            // ends after one fan-out, so it is not registered with a monitor.
             GlobalExecutor::spawn(Self::broadcast_held_legs(
                 bridge.clone(),
                 op_manager.clone(),
