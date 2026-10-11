@@ -645,12 +645,23 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
 fn bandwidth_section(history: &[RateSample]) -> String {
     let body = match history.last() {
         // One sample is a dot, not a line; wait for the second.
-        Some(latest) if history.len() >= 2 => format!(
-            r#"<p class="bw-now"><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span></p>{chart}"#,
-            up = super::charts::fmt_speed(latest.up_bytes_per_sec),
-            down = super::charts::fmt_speed(latest.down_bytes_per_sec),
-            chart = super::charts::responsive(|width| bandwidth_chart(width, history)),
-        ),
+        Some(latest) if history.len() >= 2 => {
+            // The sampler runs every second, so an older newest sample means
+            // it has stalled; say how old the headline figures are rather
+            // than present them as current.
+            let age = latest.age.as_secs();
+            let stale = if age > 3 {
+                format!(r#"<span class="bw-stale">as of {age} s ago</span>"#)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<p class="bw-now"><span class="bw-key"><span class="bw-swatch bw-swatch-up"></span>Upload <b>{up}</b></span><span class="bw-key"><span class="bw-swatch bw-swatch-down"></span>Download <b>{down}</b></span>{stale}</p>{chart}"#,
+                up = super::charts::fmt_speed(latest.up_bytes_per_sec),
+                down = super::charts::fmt_speed(latest.down_bytes_per_sec),
+                chart = super::charts::responsive(|width| bandwidth_chart(width, history)),
+            )
+        }
         _ => r#"<p class="empty">Measuring transfer rates&hellip;</p>"#.to_string(),
     };
     format!(
@@ -770,9 +781,11 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
     )
     .ok();
     if !narrow {
-        // An invisible column per sample, so hovering anywhere above a point
-        // shows both rates at that moment.
-        let col = (plot_w / history.len().max(1) as f64).max(4.0);
+        // An invisible column per sample, one sampling interval wide and
+        // kept inside the plot, so hovering anywhere above a point shows
+        // both rates at that moment.
+        let col =
+            plot_w * crate::transport::bandwidth_history::SAMPLE_INTERVAL.as_secs_f64() / window;
         for s in history {
             let ago = s.age.as_secs_f64().round();
             let when = if ago < 1.0 {
@@ -783,7 +796,7 @@ fn bandwidth_chart(width: f64, history: &[RateSample]) -> String {
             write!(
                 svg,
                 r#"<rect x="{:.1}" y="{top}" width="{col:.1}" height="{plot_h}" class="bw-hit">{}</rect>"#,
-                x(s) - col / 2.0,
+                (x(s) - col / 2.0).clamp(left, width - right - col),
                 tooltip(
                     &format!(
                         "{when}: upload {}, download {}",

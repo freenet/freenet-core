@@ -957,6 +957,65 @@ mod tests {
         assert!(!html.contains("NaN"), "{html}");
     }
 
+    /// Newest sample at the right edge, the peak at the top, zero on the
+    /// baseline, upload and download not swapped. Pinned on the desktop
+    /// chart: width 600, plot from x=62 to x=590 and y=8 to y=128.
+    #[test]
+    fn bandwidth_chart_geometry() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(1, 3_000.0, 0.0), rate(0, 1_500.0, 0.0)];
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            html.contains(r#"<path d="M581.2,8.0 L590.0,68.0" class="bw-line-up"/>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<path d="M581.2,128.0 L590.0,128.0" class="bw-line-down"/>"#),
+            "{html}"
+        );
+    }
+
+    /// Tooltips exist once per sample, on the desktop chart only, and their
+    /// hover columns stay inside the plot even with only two samples.
+    #[test]
+    fn bandwidth_chart_tooltips_are_desktop_only_and_inside_the_plot() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(1, 1.0, 1.0), rate(0, 2.0, 2.0)];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("<title>").count(), 2, "{html}");
+        assert!(html.contains("<title>now: upload"), "{html}");
+        let narrow = html
+            .split(r#"<div class="w-narrow">"#)
+            .nth(1)
+            .expect("narrow chart");
+        assert!(!narrow.contains("bw-hit"), "{narrow}");
+        for rect in html.split("<rect ").skip(1) {
+            let attr = |name: &str| -> f64 {
+                let v = rect.split(&format!("{name}=\"")).nth(1).unwrap();
+                v[..v.find('"').unwrap()].parse().unwrap()
+            };
+            let (x, w) = (attr("x"), attr("width"));
+            assert!(
+                x >= 62.0 && x + w <= 590.0 + 1e-6,
+                "rect {x}+{w} outside plot"
+            );
+        }
+    }
+
+    /// A stalled sampler leaves an old newest sample; the headline says how
+    /// old instead of presenting it as the current rate.
+    #[test]
+    fn bandwidth_headline_flags_stale_samples() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(2, 1.0, 1.0), rate(1, 1.0, 1.0)];
+        let fresh = build_transfer_card(&Some(snap));
+        assert!(!fresh.contains("bw-stale"), "{fresh}");
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(41, 1.0, 1.0), rate(40, 1.0, 1.0)];
+        let stale = build_transfer_card(&Some(snap));
+        assert!(stale.contains("as of 40 s ago"), "{stale}");
+    }
+
     /// The y axis tops out at or above the largest rate in either direction,
     /// so no line is clipped; an idle node still gets a usable axis.
     #[test]

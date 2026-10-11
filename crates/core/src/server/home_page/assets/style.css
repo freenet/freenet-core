@@ -830,6 +830,9 @@ svg.mchart text {
   font-size: 0.8rem;
   color: var(--text-secondary);
 }
+.bw-stale {
+  color: var(--text-muted);
+}
 .bw-now b {
   font-family: var(--font-mono);
   color: var(--text-primary);

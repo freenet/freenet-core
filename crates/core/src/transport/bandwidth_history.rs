@@ -32,7 +32,7 @@ use crate::simulation::{RealTime, TimeSource};
 pub(crate) const WINDOW: Duration = Duration::from_secs(60);
 
 /// How often the sampler reads the counters.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Samples closer together than this are folded into the next one rather
 /// than recorded. Slightly under [`SAMPLE_INTERVAL`] so ordinary timer jitter
@@ -84,7 +84,9 @@ pub(crate) struct BandwidthHistory {
 }
 
 /// [`BandwidthHistory`] behind a lock, with the clock both the sampler and
-/// the dashboard read so their timestamps share one epoch.
+/// the dashboard read so their timestamps share one epoch. `RealTime` counts
+/// from when this is created and follows tokio's clock, so it agrees with
+/// the sampler's `tokio::time::interval` under paused test time too.
 pub(crate) struct SharedBandwidthHistory {
     clock: RealTime,
     history: Mutex<BandwidthHistory>,
@@ -183,11 +185,18 @@ impl SharedBandwidthHistory {
     }
 
     /// Read the transfer counters and record them.
+    ///
+    /// The counters and the clock are read while holding the lock, so when
+    /// several samplers share this history (several nodes in one test
+    /// process), each reading is recorded in the order it was taken. Read
+    /// outside the lock, a sampler could record an older reading after a
+    /// newer one, which looks like a backward clock or a decreasing counter
+    /// and would clear the series.
     fn sample(&self) {
+        let mut history = self.history.lock();
         let sent = TRANSPORT_METRICS.cumulative_bytes_sent();
         let received = TRANSPORT_METRICS.cumulative_bytes_received();
-        let now = self.clock.now();
-        self.history.lock().record(now, sent, received);
+        history.record(self.clock.now(), sent, received);
     }
 
     /// The last minute of rates, oldest first. At most [`MAX_SAMPLES`] items.
@@ -200,15 +209,19 @@ impl SharedBandwidthHistory {
 /// Spawn the 1 Hz sampler and register it with the `BackgroundTaskMonitor`.
 /// It only loads two atomics and takes an uncontended lock per tick.
 pub(crate) fn spawn_sampler(monitor: &BackgroundTaskMonitor) {
-    let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            BANDWIDTH_HISTORY.sample();
-        }
-    });
+    let handle = tokio::spawn(run_sampler(&BANDWIDTH_HISTORY));
     monitor.register("bandwidth_history_sampler", handle);
+}
+
+/// Sample the transfer counters into `history` once per [`SAMPLE_INTERVAL`],
+/// forever. Cancellation-safe: dropping it between ticks loses nothing.
+async fn run_sampler(history: &SharedBandwidthHistory) {
+    let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        history.sample();
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +314,8 @@ mod tests {
         assert!(h.samples.len() <= MAX_SAMPLES);
         let now = secs(t - step);
         let recent = h.recent(now);
-        assert!(!recent.is_empty());
+        // About one sample per spacing across the window, not a trickle.
+        assert!(recent.len() >= 60, "{} samples", recent.len());
         assert!(recent.iter().all(|s| s.age <= WINDOW));
     }
 
@@ -314,6 +328,94 @@ mod tests {
         assert_eq!(h.recent(secs(60.5)).len(), 2);
         assert_eq!(h.recent(secs(61.5)).len(), 1);
         assert!(h.recent(secs(70.0)).is_empty());
+    }
+
+    #[test]
+    fn recent_is_oldest_first() {
+        let mut h = BandwidthHistory::default();
+        h.record(secs(0.0), 0, 0);
+        h.record(secs(1.0), 100, 0);
+        h.record(secs(2.0), 300, 0);
+        h.record(secs(3.0), 600, 0);
+        let recent = h.recent(secs(3.0));
+        let ages: Vec<_> = recent.iter().map(|s| s.age).collect();
+        assert_eq!(ages, vec![secs(2.0), secs(1.0), Duration::ZERO]);
+        let ups: Vec<_> = recent.iter().map(|s| s.up_bytes_per_sec).collect();
+        assert_eq!(ups, vec![100.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn spacing_and_window_boundaries() {
+        // Exactly MIN_SAMPLE_SPACING is a sample; a hair under is folded.
+        let mut h = BandwidthHistory::default();
+        h.record(Duration::ZERO, 0, 0);
+        h.record(MIN_SAMPLE_SPACING - Duration::from_nanos(1), 10, 10);
+        assert!(h.recent(MIN_SAMPLE_SPACING).is_empty());
+        h.record(MIN_SAMPLE_SPACING, 90, 90);
+        assert_eq!(h.recent(MIN_SAMPLE_SPACING).len(), 1);
+
+        // Equal timestamps measure nothing.
+        let mut h = BandwidthHistory::default();
+        h.record(secs(5.0), 0, 0);
+        h.record(secs(5.0), 100, 100);
+        assert!(h.recent(secs(5.0)).is_empty());
+
+        // A gap of exactly WINDOW is still a sample; one past it restarts.
+        let mut h = BandwidthHistory::default();
+        h.record(Duration::ZERO, 0, 0);
+        h.record(WINDOW, 6_000, 0);
+        assert_eq!(h.recent(WINDOW)[0].up_bytes_per_sec, 100.0);
+        h.record(WINDOW * 2 + Duration::from_nanos(1), 9_000, 0);
+        assert!(h.recent(WINDOW * 2).is_empty());
+
+        // A sample exactly WINDOW old is still shown.
+        let mut h = BandwidthHistory::default();
+        h.record(Duration::ZERO, 0, 0);
+        h.record(secs(1.0), 1, 1);
+        assert_eq!(h.recent(secs(1.0) + WINDOW).len(), 1);
+    }
+
+    #[test]
+    fn decrease_in_either_counter_restarts() {
+        let mut h = BandwidthHistory::default();
+        h.record(secs(0.0), 1_000, 1_000);
+        h.record(secs(1.0), 2_000, 2_000);
+        h.record(secs(2.0), 3_000, 5);
+        assert!(h.recent(secs(2.0)).is_empty());
+    }
+
+    /// Two samplers sharing the history half a tick apart (two nodes in one
+    /// process) still record about one sample a second, and every byte
+    /// counted lands in exactly one sample.
+    #[test]
+    fn two_interleaved_samplers_record_once_per_interval_and_keep_every_byte() {
+        let mut h = BandwidthHistory::default();
+        let mut total = 0u64;
+        for tick in 0..20u32 {
+            for offset in [0.0, 0.5] {
+                total += 1_000;
+                h.record(secs(tick as f64 + offset), total, total);
+            }
+        }
+        let now = secs(19.5);
+        let recent = h.recent(now);
+        assert_eq!(recent.len(), 19, "one sample per second after the baseline");
+        // Every sample spans 1 s, so the sum of rates is the bytes counted
+        // between the first reading (t=0) and the last accepted one (t=19).
+        let counted: f64 = recent.iter().map(|s| s.up_bytes_per_sec).sum();
+        assert_eq!(counted, 38_000.0);
+    }
+
+    /// The real sampler loop, under paused tokio time, fills the history it
+    /// is given. Uses its own history rather than the process-wide one so
+    /// nodes running in the same test process cannot interfere.
+    #[tokio::test(start_paused = true)]
+    async fn sampler_loop_fills_the_history() {
+        let history = SharedBandwidthHistory::new();
+        let ran = tokio::time::timeout(Duration::from_millis(3_500), run_sampler(&history)).await;
+        assert!(ran.is_err(), "the sampler loop runs until cancelled");
+        // Ticks at 0, 1, 2 and 3 s: one baseline, three samples.
+        assert_eq!(history.recent().len(), 3);
     }
 
     #[test]

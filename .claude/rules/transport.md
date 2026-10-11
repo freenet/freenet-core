@@ -185,6 +185,15 @@ from CI runners (which would perturb timing-sensitive multi-node
 tests — see PR #4292 root-cause). The shadow aggregator is
 always-on; only reference-ping is gated.
 
+### Dashboard bandwidth sampler (#5152)
+
+`transport/bandwidth_history.rs` runs one more always-on 1 Hz task
+(`bandwidth_history_sampler`), separate from the shadow telemetry
+above: it reads `TRANSPORT_METRICS.cumulative_bytes_sent/received` into
+a fixed-size, one-minute rate buffer that only the local dashboard's
+Data Transfer chart reads. It does not emit telemetry and nothing on the
+data path reads it.
+
 ### Shadow demand / queue / OS-counter / class telemetry (Phase 1.6)
 
 `transport/shadow_demand.rs` adds the *demand* side of the floor
