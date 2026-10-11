@@ -856,6 +856,14 @@ impl P2pConnManager {
         // `Summaries` handler's per-message MAX_STALENESS_PROBES_PER_SUMMARIES
         // cap (see `broadcast_queue::fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
+        // The state+summary snapshot full-state legs send (#5842), read at most
+        // once per fan-out and only if some leg needs it.
+        let mut full_state_snapshot: Option<
+            Option<(
+                freenet_stdlib::prelude::WrappedState,
+                freenet_stdlib::prelude::StateSummary<'static>,
+            )>,
+        > = None;
 
         for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
@@ -962,6 +970,35 @@ impl P2pConnManager {
                 ),
             };
 
+            // #5842: a full-state payload and the summary sent and cached with
+            // it must describe the same state. See the production twin in
+            // `broadcast_queue::broadcast_to_single_peer` for why `new_state`
+            // plus the summary read above can disagree. One snapshot serves
+            // every full-state leg of this fan-out.
+            let (payload, sent_summary) = match payload {
+                crate::message::DeltaOrFullState::FullState(_) => {
+                    if full_state_snapshot.is_none() {
+                        full_state_snapshot = Some(
+                            super::super::broadcast_queue::get_contract_snapshot(op_manager, &key)
+                                .await,
+                        );
+                    }
+                    match full_state_snapshot.as_ref().and_then(Option::as_ref) {
+                        Some((state, summary)) => (
+                            crate::message::DeltaOrFullState::FullState(state.as_ref().to_vec()),
+                            Some(summary.clone()),
+                        ),
+                        None => (
+                            crate::message::DeltaOrFullState::FullState(
+                                new_state.as_ref().to_vec(),
+                            ),
+                            None,
+                        ),
+                    }
+                }
+                delta @ crate::message::DeltaOrFullState::Delta(_) => (delta, our_summary.clone()),
+            };
+
             // Save payload size before moving it into the message
             let payload_size = payload.size();
 
@@ -973,7 +1010,7 @@ impl P2pConnManager {
                 );
 
             let send_result = if use_streaming {
-                let sender_summary_bytes = our_summary
+                let sender_summary_bytes = sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default();
@@ -1044,7 +1081,7 @@ impl P2pConnManager {
                     Ok(()) => {
                         // The metadata message went out; the streamed full state is
                         // the actual payload. The success arm below caches
-                        // `our_summary` for this peer (FIX 1 of #4145), which is only
+                        // `sent_summary` for this peer (FIX 1 of #4145), which is only
                         // correct if the STATE was sent — so this branch's result must
                         // reflect the stream send, not just the metadata send. If
                         // `send_stream` fails, a streamed full state that never landed
@@ -1082,7 +1119,7 @@ impl P2pConnManager {
                         id: update_tx,
                         key,
                         payload,
-                        sender_summary_bytes: our_summary
+                        sender_summary_bytes: sent_summary
                             .as_ref()
                             .map(|s| s.as_ref().to_vec())
                             .unwrap_or_default(),
@@ -1093,7 +1130,7 @@ impl P2pConnManager {
                         key,
                         payload,
                         // Include our summary so peer doesn't echo back
-                        sender_summary_bytes: our_summary
+                        sender_summary_bytes: sent_summary
                             .as_ref()
                             .map(|s| s.as_ref().to_vec())
                             .unwrap_or_default(),
@@ -1167,7 +1204,7 @@ impl P2pConnManager {
                 // #4952: upsert so the sim path mirrors production
                 // (`record_delivery_to_interest`) — an untracked co-host must
                 // escape full state after one delivered broadcast in sims too.
-                if let Some(summary) = &our_summary {
+                if let Some(summary) = &sent_summary {
                     op_manager.interest_manager.upsert_peer_summary_from(
                         &key,
                         &peer_key,

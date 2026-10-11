@@ -467,6 +467,57 @@ pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &Contr
     op_manager.ring.should_summarize_or_broadcast(key)
 }
 
+/// The stored state of `key` and its summary, read in one contract-handler
+/// turn so the summary describes exactly that state (#5842). `None` when the
+/// handler cannot produce both; the caller must then not record a summary for
+/// the state it sends.
+pub(super) async fn get_contract_snapshot(
+    op_manager: &OpManager,
+    key: &ContractKey,
+) -> Option<(WrappedState, freenet_stdlib::prelude::StateSummary<'static>)> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler_with_timeout(
+            ContractHandlerEvent::GetStateAndSummaryQuery { key: *key },
+            crate::ring::interest::BROADCAST_CH_TIMEOUT,
+        )
+        .await
+    {
+        Ok(ContractHandlerEvent::GetStateAndSummaryResponse {
+            snapshot: Ok(snapshot),
+            ..
+        }) => Some(snapshot),
+        Ok(ContractHandlerEvent::GetStateAndSummaryResponse {
+            snapshot: Err(error),
+            ..
+        }) => {
+            tracing::debug!(
+                contract = %key,
+                %error,
+                "Broadcast: could not read a state+summary snapshot"
+            );
+            None
+        }
+        Ok(other) => {
+            tracing::warn!(
+                contract = %key,
+                response = ?other,
+                "Unexpected response to GetStateAndSummaryQuery"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(
+                contract = %key,
+                %error,
+                "Broadcast: state+summary snapshot request failed"
+            );
+            None
+        }
+    }
+}
+
 /// Decision for one (contract, peer) fan-out send, derived WITHOUT any WASM
 /// call — a byte comparison plus the shared in-memory delta cache. See
 /// [`plan_fanout_send`].
@@ -3846,6 +3897,35 @@ pub(super) async fn broadcast_to_single_peer(
             )
         }
     };
+    // #5842: a FULL-STATE payload and the summary we send and record with it
+    // must describe the same state. `our_summary` was read from the store at
+    // the top of this function, but `new_state` is the state of the write that
+    // queued this leg; when a later write commits in between, the summary is
+    // NEWER than `new_state`. Recording that summary as the peer's made the
+    // later write's own fan-out skip this peer as "already converged", and the
+    // peer stayed behind until anti-entropy. So a full-state leg sends the
+    // stored state and its summary, read together in one handler turn.
+    //
+    // The delta arm needs no snapshot: `compute_delta` diffs the state stored
+    // when it runs, which is never older than the state `our_summary` was read
+    // from, so the summary recorded for the peer can only be OLDER than what it
+    // received. An older recorded summary costs at most a redundant send; a
+    // newer one loses an update.
+    let (payload, sent_summary) = match payload {
+        DeltaOrFullState::FullState(_) => match get_contract_snapshot(op_manager, &key).await {
+            Some((state, summary)) => (
+                DeltaOrFullState::FullState(state.as_ref().to_vec()),
+                Some(summary),
+            ),
+            // Without a snapshot we cannot say which state a summary describes,
+            // so send the queued state and record no summary for the peer.
+            None => (
+                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                None,
+            ),
+        },
+        delta @ DeltaOrFullState::Delta(_) => (delta, our_summary),
+    };
     let payload_size = payload.size();
     match (
         queued_class,
@@ -3908,7 +3988,7 @@ pub(super) async fn broadcast_to_single_peer(
     // summary — treating a drop as a delivery defeats the next summary-mismatch
     // round that would re-send the state.
     let send_result = if use_streaming {
-        let sender_summary_bytes = our_summary
+        let sender_summary_bytes = sent_summary
             .as_ref()
             .map(|s| s.as_ref().to_vec())
             .unwrap_or_default();
@@ -4030,7 +4110,7 @@ pub(super) async fn broadcast_to_single_peer(
                     sent_delta,
                     &key,
                     &peer_key,
-                    our_summary.as_ref(),
+                    sent_summary.as_ref(),
                     new_state.size(),
                     payload_size,
                 );
@@ -4090,7 +4170,7 @@ pub(super) async fn broadcast_to_single_peer(
                 id: update_tx,
                 key,
                 payload,
-                sender_summary_bytes: our_summary
+                sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default(),
@@ -4102,7 +4182,7 @@ pub(super) async fn broadcast_to_single_peer(
                 id: update_tx,
                 key,
                 payload,
-                sender_summary_bytes: our_summary
+                sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default(),
@@ -4154,7 +4234,7 @@ pub(super) async fn broadcast_to_single_peer(
                 sent_delta,
                 &key,
                 &peer_key,
-                our_summary.as_ref(),
+                sent_summary.as_ref(),
                 new_state.size(),
                 payload_size,
             );
@@ -5487,5 +5567,210 @@ mod tests {
             "the atomic peer-summary result must carry the reason through so \
              tracked and untracked missing-summary sends remain distinct"
         );
+    }
+
+    /// #5842: a full-state send must never record a summary NEWER than the
+    /// state it put on the wire.
+    ///
+    /// Shape of the bug: a fan-out for state S1 is queued; before its leg runs,
+    /// a second write commits S2. The leg sent `new_state` (S1) as full state
+    /// but sent, and cached as the peer's summary, the CURRENT summary (S2's).
+    /// The sender then believed the peer held S2, so S2's own fan-out to that
+    /// peer took the "already converged" skip and the peer never got S2 until
+    /// anti-entropy, 5 to 75 minutes later.
+    ///
+    /// The stand-in contract handler holds S2 as the stored state, and is asked
+    /// to broadcast S1 then S2 to a peer whose summary it has never seen
+    /// (the full-state arm). Whatever went on the wire, the summary cached for
+    /// the peer must be the summary of bytes it was actually sent, and the peer
+    /// must end up having been sent S2.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_state_send_never_records_a_summary_newer_than_the_bytes_sent() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::contract::{ContractHandlerEvent, StoreResponse};
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::PeerKeyLocation;
+
+        let s1 = WrappedState::new(vec![1u8; 32]);
+        let s2 = WrappedState::new(vec![2u8; 32]);
+        // The stand-in contract's summary function: one byte naming the state.
+        fn summary_of(state: &[u8]) -> StateSummary<'static> {
+            StateSummary::from(vec![0xA0 | state[0]])
+        }
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some("bq-5842-snapshot".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notifications, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:47100".parse().unwrap();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([58u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let _ = op_manager.ring.host_contract(
+            key,
+            32,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let peer_addr: SocketAddr = "127.0.0.1:47101".parse().unwrap();
+        let peer_pub = crate::transport::TransportPublicKey::from_bytes([7u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            peer_addr,
+            peer_pub.clone(),
+            false,
+        ));
+        let target = PeerKeyLocation::new(peer_pub.clone(), peer_addr);
+        let peer_key = PeerKey::from(peer_pub);
+
+        // The stand-in executor. The stored state is S2 throughout: the second
+        // write has already committed when the S1 leg runs.
+        let stored = s2.clone();
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "stand-in executor serving only the queries a \
+                              broadcast leg issues; anything else is a test bug"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(summary_of(stored.as_ref())),
+                        }
+                    }
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: Some(key),
+                        response: Ok(StoreResponse {
+                            state: Some(stored.clone()),
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+                        ContractHandlerEvent::GetStateAndSummaryResponse {
+                            key,
+                            snapshot: Ok((stored.clone(), summary_of(stored.as_ref()))),
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let fanout: super::FanoutTargets = Arc::new(vec![target.pub_key().clone()]);
+
+        // Every full state put on the wire to the peer, in order, with the
+        // summary the peer was told it describes.
+        let mut sent: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for new_state in [s1.clone(), s2.clone()] {
+            super::broadcast_to_single_peer(
+                &bridge,
+                &op_manager,
+                key,
+                new_state,
+                target.clone(),
+                None,
+                fanout.clone(),
+            )
+            .await;
+            while let Ok(ev) = bridge_rx.try_recv() {
+                let P2pBridgeEvent::Message(_, msg) = ev else {
+                    continue;
+                };
+                let NetMessage::V1(NetMessageV1::Update(update)) = *msg else {
+                    continue;
+                };
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "only the two inline broadcast variants carry a payload here"
+                )]
+                match update {
+                    UpdateMsg::BroadcastTo {
+                        payload: DeltaOrFullState::FullState(bytes),
+                        sender_summary_bytes,
+                        ..
+                    }
+                    | UpdateMsg::BroadcastToV2 {
+                        payload: DeltaOrFullState::FullState(bytes),
+                        sender_summary_bytes,
+                        ..
+                    } => sent.push((bytes, sender_summary_bytes)),
+                    other => panic!("expected an inline full-state broadcast, got {other:?}"),
+                }
+            }
+            // After each leg: the summary cached for the peer describes the
+            // last state it was sent, never a newer one.
+            if let Some((last_bytes, _)) = sent.last() {
+                assert_eq!(
+                    op_manager
+                        .interest_manager
+                        .get_peer_summary(&key, &peer_key),
+                    Some(summary_of(last_bytes)),
+                    "the peer was sent state {:?} but is recorded as holding \
+                     the summary of the stored state",
+                    last_bytes[0],
+                );
+            }
+        }
+
+        for (bytes, summary) in &sent {
+            assert_eq!(
+                summary.as_slice(),
+                summary_of(bytes).as_ref(),
+                "the summary on the wire must describe the state on the wire"
+            );
+        }
+        assert!(
+            sent.iter().any(|(bytes, _)| bytes == s2.as_ref()),
+            "the peer was never sent S2: the S2 fan-out was skipped as already \
+             converged (sent: {:?})",
+            sent.iter().map(|(b, _)| b[0]).collect::<Vec<_>>()
+        );
+
+        handler.abort();
+        drop((wait_for_event, task_monitor));
     }
 }

@@ -860,6 +860,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
         | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }

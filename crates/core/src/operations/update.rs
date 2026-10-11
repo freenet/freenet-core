@@ -1028,6 +1028,8 @@ pub(crate) async fn update_contract(
                             | ContractHandlerEvent::GetSummaryResponse { .. }
                             | ContractHandlerEvent::GetDeltaQuery { .. }
                             | ContractHandlerEvent::GetDeltaResponse { .. }
+                            | ContractHandlerEvent::GetStateAndSummaryQuery { .. }
+                            | ContractHandlerEvent::GetStateAndSummaryResponse { .. }
                             | ContractHandlerEvent::ClientDisconnect { .. }
                             | ContractHandlerEvent::EvictContract { .. } => None,
                         });

@@ -956,6 +956,22 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         delta: Result<StateDelta<'static>, ExecutorError>,
     },
+    /// Read a contract's stored state and its summary as one snapshot.
+    ///
+    /// Both come from a single turn of the contract-handling loop, which is
+    /// also where every state write runs, so no write can land between them.
+    /// A `GetQuery` followed by a `GetSummaryQuery` gives no such guarantee:
+    /// the summary can describe a state committed after the one returned.
+    /// The broadcast fan-out needs the pair to agree, because it records the
+    /// summary as what the peer now holds (#5842).
+    GetStateAndSummaryQuery {
+        key: ContractKey,
+    },
+    /// Response to a GetStateAndSummaryQuery
+    GetStateAndSummaryResponse {
+        key: ContractKey,
+        snapshot: Result<(WrappedState, StateSummary<'static>), ExecutorError>,
+    },
     /// A client has disconnected — clean up its entries in shared_summaries
     /// and shared_notifications. Fire-and-forget: no response is sent.
     ClientDisconnect {
@@ -1089,6 +1105,13 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::GetDeltaResponse { key, delta } => match delta {
                 Ok(_) => write!(f, "get delta response {{ {key} }}"),
                 Err(e) => write!(f, "get delta failed {{ {key}, error: {e} }}"),
+            },
+            ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+                write!(f, "get state and summary query {{ {key} }}")
+            }
+            ContractHandlerEvent::GetStateAndSummaryResponse { key, snapshot } => match snapshot {
+                Ok(_) => write!(f, "get state and summary response {{ {key} }}"),
+                Err(e) => write!(f, "get state and summary failed {{ {key}, error: {e} }}"),
             },
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")

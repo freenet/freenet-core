@@ -4330,6 +4330,12 @@ async fn send_queue_full_response(
             key: *key,
             delta: Err(make_err()),
         },
+        ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+            ContractHandlerEvent::GetStateAndSummaryResponse {
+                key: *key,
+                snapshot: Err(make_err()),
+            }
+        }
         // Export has a typed response variant, so deliver the queue-full error
         // through it (the HTTP export handler awaits this exact variant) rather
         // than dropping the sender and surfacing a generic NoEvHandlerResponse.
@@ -4358,6 +4364,7 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
+        | ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | ContractHandlerEvent::ClientDisconnect { .. }
         | ContractHandlerEvent::EvictContract { .. } => {
             channel.drop_waiting_response(rejected.id);
@@ -6513,6 +6520,46 @@ where
                 );
             }
         }
+        ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+            // Both reads run inside this one event, and every state write runs
+            // on this same loop, so the summary describes exactly the state
+            // returned with it (#5842). Do not split this into two events.
+            let snapshot = match contract_handler
+                .executor()
+                .fetch_contract(key, false)
+                .instrument(tracing::info_span!("fetch_contract", %key))
+                .await
+            {
+                Ok((Some(state), _)) => contract_handler
+                    .executor()
+                    .summarize_contract_state(key)
+                    .instrument(tracing::info_span!("summarize_contract_state", %key))
+                    .await
+                    .map(|summary| (state, summary)),
+                Ok((None, _)) => Err(ExecutorError::request(
+                    freenet_stdlib::client_api::ContractError::Get {
+                        key,
+                        cause: "contract state not found".into(),
+                    },
+                )),
+                Err(err) => Err(err),
+            };
+
+            if let Err(error) = contract_handler
+                .channel()
+                .send_to_sender(
+                    id,
+                    ContractHandlerEvent::GetStateAndSummaryResponse { key, snapshot },
+                )
+                .await
+            {
+                tracing::debug!(
+                    error = %error,
+                    contract = %key,
+                    "Failed to send GetStateAndSummary response (client may have disconnected)"
+                );
+            }
+        }
         ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
             let delta = contract_handler
                 .executor()
@@ -6577,7 +6624,8 @@ where
         | ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
-        | ContractHandlerEvent::GetDeltaResponse { .. } => {
+        | ContractHandlerEvent::GetDeltaResponse { .. }
+        | ContractHandlerEvent::GetStateAndSummaryResponse { .. } => {
             unreachable!("response events should not be received by the handler")
         }
     }

@@ -228,6 +228,18 @@ impl P2pBridge {
         }
     }
 
+    /// A bridge whose outbound messages land on `sender`, for tests that drive
+    /// the real send path and read what it put on the wire.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(sender: Sender<P2pBridgeEvent>, op_manager: Arc<OpManager>) -> Self {
+        Self::new(
+            sender,
+            op_manager,
+            crate::tracing::DynamicRegister::new(vec![]),
+            Arc::new(Vec::new()),
+        )
+    }
+
     /// Wake any drivers whose downstream peer just disconnected.
     ///
     /// For each orphaned tx, emit `NodeEvent::TransactionOrphaned`. The
